@@ -127,12 +127,6 @@ export function formatMissingToolMessage(tool: string, hintOverride?: string): s
   return `${tool} is not installed or not found on PATH. ${hint}`;
 }
 
-export function requireBackendTool(tool: string): void {
-  if (!commandExists(tool)) {
-    throw new MissingToolError(tool);
-  }
-}
-
 export function isMissingToolSpawnError(error: unknown): boolean {
   if (!error || typeof error !== "object") {
     return false;

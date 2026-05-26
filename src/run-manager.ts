@@ -51,11 +51,8 @@ import { taskDisplayLabel } from "./task-summary.js";
 
 const AUTO_STEER_DELAY_MS = 10_000;
 
-function missingBackendError(backend: BackendId, healthMessage: string): Error {
-  if (!commandExists(backend)) {
-    return new MissingToolError(backend);
-  }
-  return new Error(healthMessage);
+function missingBackendError(backend: BackendId, healthMessage: string): MissingToolError {
+  return new MissingToolError(backend, healthMessage);
 }
 
 export async function startRun(params: {

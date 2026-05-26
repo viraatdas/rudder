@@ -14,10 +14,7 @@ import { createAgentPane, killPane, normalizeTmuxDashboardLayout, paneExitStatus
 import { taskDisplayLabel } from "./task-summary.js";
 const AUTO_STEER_DELAY_MS = 10_000;
 function missingBackendError(backend, healthMessage) {
-    if (!commandExists(backend)) {
-        return new MissingToolError(backend);
-    }
-    return new Error(healthMessage);
+    return new MissingToolError(backend, healthMessage);
 }
 export async function startRun(params) {
     const repoRoot = findRepoRoot();
