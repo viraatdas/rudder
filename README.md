@@ -593,10 +593,28 @@ rudder --no-native
 
 ## Development
 
+Clone the repo and run the setup script to bootstrap your environment:
+
 ```bash
 git clone https://github.com/viraatdas/rudder.git
 cd rudder
-npm install
+./setup.sh
+```
+
+`setup.sh` verifies prerequisites (**Node >=20**, **git**, **npm**, **Rust**
+toolchain via `cargo`), installs npm dependencies (`npm ci` when a lockfile is
+present, otherwise `npm install`), runs the full build (`tsc` + `cargo build
+--release` + `copy-native`), runs `tsc --noEmit` as a type check, and smoke
+tests the built CLI with `node dist/index.js --version`. Any failed step exits
+non-zero with a message identifying which step failed. The script is
+idempotent — re-run it after pulling new changes.
+
+If you prefer to run the steps manually:
+
+```bash
+git clone https://github.com/viraatdas/rudder.git
+cd rudder
+npm ci                        # or: npm install
 cargo test --manifest-path native/Cargo.toml
 npm run check
 npm run build
