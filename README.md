@@ -224,6 +224,10 @@ agent worktree -> optional commit -> git merge --no-ff -> main checkout
 
 If a merge conflicts, Rudder leaves the merge in place and offers to start an
 AI resolver in the main checkout. It does not hide the conflicted git state.
+If `mergeStrategy` is set to `"rebase"`, Rudder first rebases the worktree onto
+the base branch and then fast-forward merges it. A rebase conflict is left in
+the agent worktree so you can resolve it there, run `git rebase --continue`,
+and retry sync or merge.
 
 ### Review Flow
 
@@ -401,6 +405,7 @@ process is still running.
 | `v` | Toggle the selected agent's review view |
 | `Esc` | Leave the review view when it is focused |
 | `r` | Restart the selected stopped agent in its worktree |
+| `u` | Sync the selected worktree by rebasing it onto its base branch without merging |
 | `m` | Merge the selected completed worktree |
 | `R` | Combine completed worktrees and start a Codex review-all agent when the agents pane or nav mode is active |
 | `M` | Merge all completed worktrees when the agents pane or nav mode is active |
@@ -422,6 +427,7 @@ through suggestions and `Enter` to choose one.
 | `/run <task>` | Start an implementation run even when plan mode is on |
 | `/review-all` | Combine completed worktrees and start a Codex review-all agent |
 | `/merge-all` | Merge all completed worktrees |
+| `/sync` | Rebase the selected worktree onto its base branch without merging |
 | `/login` | Open browser login for Rudder Cloud |
 | `/cloud` | Ask whether to onload the current Rudder workspace or start a fresh Fly worker |
 | `/cloud <name>` | Ask the same question, using the name for the fresh Fly worker |
@@ -534,10 +540,27 @@ Press `M` to merge all completed agents. Rudder asks for confirmation before
 merging. Clean merges become merge commits; if git reports conflicts, Rudder can
 open an agent in the main checkout to help resolve them.
 
+Set `mergeStrategy` in `~/.rudder/config.json` to choose the merge behavior:
+
+```json
+{ "mergeStrategy": "rebase" }
+```
+
+- `"merge"` is the default and keeps the existing `git merge --no-ff` flow.
+- `"rebase"` rebases the worktree branch onto the latest base branch ref first,
+  then merges with `git merge --ff-only`.
+
+Press `u`, run `/sync`, or use `rudder sync <runId>` to do only the rebase
+step. If the rebase hits conflicts, Rudder leaves the worktree mid-rebase and
+prints the conflicted files. Resolve them inside that worktree, run
+`git rebase --continue`, then retry `rudder sync <runId>` or
+`rudder merge <runId>`.
+
 Command-line equivalents:
 
 ```bash
 rudder merge <runId>
+rudder sync <runId>
 rudder cleanup
 ```
 
@@ -609,6 +632,7 @@ rudder logs <runId> --follow
 rudder stop <runId>
 rudder delete <runId>
 rudder merge <runId>
+rudder sync <runId>
 rudder cleanup
 ```
 

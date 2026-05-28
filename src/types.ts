@@ -68,6 +68,7 @@ export type RudderConfig = {
   version: 1;
   defaultBackend: BackendId;
   lastUsedBackend?: BackendId;
+  mergeStrategy: MergeStrategy;
   runPolicy: {
     sameCheckout: "single-active";
     concurrentPromptMode: "worktree" | "queue";
@@ -88,6 +89,8 @@ export type BackendId = "claude" | "codex" | "acpx";
 export type EffortLevel = "low" | "medium" | "high" | "xhigh" | "max";
 
 export type RunMode = "execute" | "plan";
+
+export type MergeStrategy = "merge" | "rebase";
 
 export type BackendConfig = {
   profileId?: string;
@@ -161,12 +164,23 @@ export type RunRecord = {
   };
   verification?: VerificationResult;
   merge?: MergeState;
+  sync?: SyncState;
 };
 
 export type MergeState = {
   status: "not-started" | "merged" | "conflict" | "failed";
   attemptedAt?: string;
   targetBranch?: string;
+  strategy?: MergeStrategy;
+  conflictKind?: "merge" | "rebase";
+  conflictedFiles?: string[];
+  error?: string;
+};
+
+export type SyncState = {
+  status: "not-started" | "synced" | "conflict" | "failed";
+  attemptedAt?: string;
+  baseBranch?: string;
   conflictedFiles?: string[];
   error?: string;
 };
@@ -189,7 +203,8 @@ export type RudderEvent = {
     | "run.completed"
     | "run.failed"
     | "run.cancelled"
-    | "merge.result";
+    | "merge.result"
+    | "sync.result";
   message?: string;
   data?: JsonValue;
 };

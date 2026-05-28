@@ -5,6 +5,7 @@ import type {
   BackendConfig,
   BackendId,
   EffortLevel,
+  MergeStrategy,
   RudderConfig,
   RunRecord,
   RudderEvent,
@@ -85,7 +86,7 @@ function worktreeDirName(runId: string, task?: string): string {
 export async function loadConfig(): Promise<RudderConfig> {
   const existing = await readJson<RudderConfig>(globalConfigPath());
   if (existing?.version === 1) {
-    return existing;
+    return normalizeConfig(existing);
   }
   return defaultConfig();
 }
@@ -94,6 +95,7 @@ export function defaultConfig(): RudderConfig {
   return {
     version: 1,
     defaultBackend: "claude",
+    mergeStrategy: "merge",
     runPolicy: {
       sameCheckout: "single-active",
       concurrentPromptMode: "worktree",
@@ -109,6 +111,31 @@ export function defaultConfig(): RudderConfig {
       acpx: { model: "gpt-5.5" },
     },
   };
+}
+
+function normalizeConfig(existing: RudderConfig): RudderConfig {
+  const defaults = defaultConfig();
+  return {
+    ...defaults,
+    ...existing,
+    mergeStrategy: parseMergeStrategy(existing.mergeStrategy),
+    runPolicy: {
+      ...defaults.runPolicy,
+      ...(existing.runPolicy ?? {}),
+    },
+    acpx: {
+      ...defaults.acpx,
+      ...(existing.acpx ?? {}),
+    },
+    backends: {
+      ...defaults.backends,
+      ...(existing.backends ?? {}),
+    },
+  };
+}
+
+function parseMergeStrategy(value: unknown): MergeStrategy {
+  return value === "rebase" ? "rebase" : "merge";
 }
 
 export async function saveConfig(config: RudderConfig): Promise<void> {

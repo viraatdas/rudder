@@ -13,7 +13,7 @@ import {
   outputPath,
   rememberBackendSelection,
 } from "./state.js";
-import { continueRun, deleteRun, mergeRun, startRun, stopRun } from "./run-manager.js";
+import { continueRun, deleteRun, mergeRun, startRun, stopRun, syncRun } from "./run-manager.js";
 import { taskDisplayLabel } from "./task-summary.js";
 import type { BackendId, RunRecord, RudderConfig, RudderEvent, RunStatus } from "./types.js";
 import { pathExists, shortenHome } from "./util.js";
@@ -77,6 +77,7 @@ const COMMANDS: CommandOption[] = [
   { name: "stop", detail: "stop the selected run", insert: "/stop" },
   { name: "delete", detail: "delete selected run and its worktree", insert: "/delete" },
   { name: "copy", detail: "copy selected worker transcript", insert: "/copy" },
+  { name: "sync", detail: "rebase the selected worktree without merging", insert: "/sync" },
   { name: "merge", detail: "merge the selected completed worktree", insert: "/merge" },
   { name: "merge-all", detail: "merge all completed worktrees", insert: "/merge-all" },
   { name: "clear", detail: "collapse all run cards", insert: "/clear" },
@@ -378,6 +379,22 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
     }
   }, [selectedRun]);
 
+  const syncSelectedRun = useCallback(async (runOverride?: UiRun) => {
+    const run = runOverride ?? selectedRun;
+    if (!run) {
+      setNotice("No agent selected");
+      return;
+    }
+    try {
+      const synced = await syncRun(run.id, { silent: true });
+      setNotice(syncNotice(synced));
+      await refresh();
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : String(error));
+      await refresh();
+    }
+  }, [refresh, selectedRun]);
+
   const handleCommand = useCallback(async (line: string) => {
     const [command = "", ...args] = line.slice(1).trim().split(/\s+/).filter(Boolean);
     switch (command) {
@@ -457,6 +474,10 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
         await copySelectedTranscript(resolveUiRun(runs, args[0] ?? selectedRun?.id));
         setInput("");
         return;
+      case "sync":
+        await syncSelectedRun(resolveUiRun(runs, args[0] ?? selectedRun?.id));
+        setInput("");
+        return;
       case "merge":
         requestMergeRun(resolveUiRun(runs, args[0] ?? selectedRun?.id), args.includes("--allow-dirty"));
         setInput("");
@@ -474,7 +495,7 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
         setNotice(`Unknown command: /${command}`);
         setInput("");
     }
-  }, [app, backend, copySelectedTranscript, refresh, requestDeleteSelectedRun, requestMergeAll, requestMergeRun, runs, selectedRun?.id]);
+  }, [app, backend, copySelectedTranscript, refresh, requestDeleteSelectedRun, requestMergeAll, requestMergeRun, runs, selectedRun?.id, syncSelectedRun]);
 
   const selectModelOption = useCallback((index: number) => {
     const option = modelOptions[index];
@@ -736,6 +757,10 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
       void runAction(selectedRun.id, async (id) => stopRun(id, { silent: true }), "Stopped", setNotice, refresh);
       return;
     }
+    if (input.length === 0 && value === "u" && selectedRun) {
+      void syncSelectedRun();
+      return;
+    }
     if (input.length === 0 && value === "m" && selectedRun) {
       requestMergeRun(selectedRun);
       return;
@@ -943,8 +968,8 @@ function Help(): React.ReactElement {
       <Text bold color="yellow">keys</Text>
       <Text><Text color="cyan">Option-1/2/3</Text> focus agents/worker/task   <Text color="cyan">Enter</Text> submit focused input   <Text color="cyan">j/k</Text> select run</Text>
       <Text><Text color="cyan">worker focus</Text> type to selected agent; running agents are interrupted on Enter   <Text color="cyan">n</Text> new task   <Text color="cyan">x</Text> expand   <Text color="cyan">l</Text> transcript</Text>
-      <Text><Text color="cyan">o</Text> model picker   <Text color="cyan">/</Text> command search   <Text color="cyan">dd</Text> delete   <Text color="cyan">y</Text> copy transcript   <Text color="cyan">s</Text> stop   <Text color="cyan">m/M</Text> merge</Text>
-      <Text color="gray">Slash: /backend claude|codex, /model, /model &lt;name&gt;, /agent, /interrupt, /new, /worktree, /stop, /delete, /copy, /merge, /merge-all, /exit</Text>
+      <Text><Text color="cyan">o</Text> model picker   <Text color="cyan">/</Text> command search   <Text color="cyan">dd</Text> delete   <Text color="cyan">y</Text> copy transcript   <Text color="cyan">s</Text> stop   <Text color="cyan">u</Text> sync   <Text color="cyan">m/M</Text> merge</Text>
+      <Text color="gray">Slash: /backend claude|codex, /model, /model &lt;name&gt;, /agent, /interrupt, /new, /worktree, /stop, /delete, /copy, /sync, /merge, /merge-all, /exit</Text>
     </Box>
   );
 }
@@ -1092,7 +1117,7 @@ function StatusDock(props: { notice: string }): React.ReactElement {
 function Footer(props: { focusPane: FocusPane }): React.ReactElement {
   return (
     <Box>
-      <Text color="gray">focus:{props.focusPane}  Opt-1/2/3 focus  / commands  o model  n new  c worker  dd delete  y copy  m/M merge  ? help</Text>
+      <Text color="gray">focus:{props.focusPane}  Opt-1/2/3 focus  / commands  o model  n new  c worker  u sync  dd delete  y copy  m/M merge  ? help</Text>
     </Box>
   );
 }
@@ -1192,6 +1217,11 @@ function buildWork(events: RudderEvent[], run: RunRecord): WorkItem[] {
     }
     if (event.type === "merge.result") {
       items.push({ label: "merge", detail: event.message, tone: event.message?.includes("conflict") ? "warning" : "success" });
+    }
+    if (event.type === "sync.result") {
+      const detail = event.message;
+      const tone = detail?.includes("conflict") || detail?.includes("failed") ? "warning" : "success";
+      items.push({ label: "sync", detail, tone });
     }
   }
   return compactWork(items);
@@ -1525,7 +1555,7 @@ function progressBar(percent: number): string {
 }
 
 function canMerge(run: UiRun): boolean {
-  return run.status === "completed" && run.worktree.enabled;
+  return (run.status === "completed" || (run.status === "merge-conflict" && run.merge?.conflictKind === "rebase")) && run.worktree.enabled;
 }
 
 function runSummary(run: UiRun): string {
@@ -1551,7 +1581,7 @@ function workerStateLabel(run: UiRun): string {
     return "needs permission";
   }
   if (run.status === "completed") {
-    return canMerge(run) ? "done  m merge" : "done";
+    return canMerge(run) ? "done  u sync  m merge" : "done";
   }
   if (run.status === "merged") {
     return "merged";
@@ -1566,6 +1596,17 @@ function workerStateLabel(run: UiRun): string {
     return "checking";
   }
   return "running";
+}
+
+function syncNotice(run: RunRecord): string {
+  if (run.sync?.status === "synced") {
+    return `Synced ${shortId(run.id)}`;
+  }
+  if (run.sync?.status === "conflict") {
+    const count = run.sync.conflictedFiles?.length || "unknown";
+    return `Sync conflict in ${count} file${count === 1 ? "" : "s"}; resolve in the worktree and run git rebase --continue`;
+  }
+  return `Sync failed: ${run.sync?.error ?? "unknown error"}`;
 }
 
 function agentRailSummary(run: UiRun): string {

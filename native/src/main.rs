@@ -59,6 +59,7 @@ const AGENT_PANE_HINTS: &[&str] = &[
     "Enter focus",
     "r rename",
     "v review",
+    "u sync",
     "R review all",
     "m merge",
     "M merge all",
@@ -151,6 +152,21 @@ impl AgentStatus {
             Self::Merged => "merged",
             Self::Failed => "failed",
             Self::Stopped => "stopped",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MergeStrategy {
+    Merge,
+    Rebase,
+}
+
+impl MergeStrategy {
+    fn parse(value: &str) -> Self {
+        match value {
+            "rebase" => Self::Rebase,
+            _ => Self::Merge,
         }
     }
 }
@@ -329,6 +345,7 @@ struct ReviewAllPremerge {
 }
 
 struct MergeConflictPrompt {
+    operation: ConflictOperation,
     task: String,
     conflicted_files: Vec<String>,
     error: String,
@@ -339,6 +356,12 @@ struct MergeConflictPrompt {
     /// The id of the agent whose merge stopped. We reuse its row for the AI
     /// conflict resolver so we never grow a fresh dashboard pane mid-merge.
     agent_id: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConflictOperation {
+    Merge,
+    Rebase,
 }
 
 struct AgentRun {
@@ -721,6 +744,7 @@ impl App {
             }
             KeyCode::Char('v') => self.toggle_worker_view(),
             KeyCode::Char('r') => self.start_rename_selected_agent(),
+            KeyCode::Char('u') => self.request_sync_selected_agent(),
             KeyCode::Up | KeyCode::Char('k') => self.select_previous_agent(),
             KeyCode::Down | KeyCode::Char('j') => self.select_next_agent(),
             KeyCode::Char('m') => self.request_merge_selected_agent(),
@@ -750,6 +774,7 @@ impl App {
             }
             KeyCode::Char('v') => self.toggle_worker_view(),
             KeyCode::Char('r') => self.start_rename_selected_agent(),
+            KeyCode::Char('u') => self.request_sync_selected_agent(),
             KeyCode::Char('R') => self.review_all_ready(),
             KeyCode::Char('M') => self.request_merge_all_ready(),
             KeyCode::Char('m') => self.request_merge_selected_agent(),
@@ -1236,7 +1261,7 @@ impl App {
                 self.task_cursor = 1;
                 self.picker_index = 0;
                 self.notice = Some(
-                    "type /plan, /rudder-plan, /model, /main|/m, /goal, /usage, or /cloud"
+                    "type /plan, /rudder-plan, /model, /main|/m, /sync, /goal, /usage, or /cloud"
                         .to_string(),
                 );
             }
@@ -2799,7 +2824,7 @@ impl App {
             }
             Some("/help") => {
                 self.notice = Some(
-                    "Option-1/2/3 pane  Enter start/focus  /plan  /rudder-plan  /model  /main|/m  /goal"
+                    "Option-1/2/3 pane  Enter start/focus  /plan  /rudder-plan  /model  /main|/m  /sync  /goal"
                         .to_string(),
                 );
                 true
@@ -2854,6 +2879,10 @@ impl App {
             }
             Some("/merge-all") => {
                 self.request_merge_all_ready();
+                true
+            }
+            Some("/sync") => {
+                self.request_sync_selected_agent();
                 true
             }
             Some("/review-all") => {
@@ -3469,6 +3498,46 @@ impl App {
         let _ = write_rudder_context(&self.cwd, &self.agents, None);
     }
 
+    fn request_sync_selected_agent(&mut self) {
+        if self.selected_is_main() {
+            self.notice = Some("main agent: sync disabled".to_string());
+            return;
+        }
+        let Some(run) = self.agents.get(self.selected_agent) else {
+            self.notice = Some("no agent selected".to_string());
+            return;
+        };
+        if run.status == AgentStatus::Running {
+            self.notice = Some("selected agent is still running".to_string());
+            return;
+        }
+        if run.status == AgentStatus::Merged {
+            self.notice = Some("selected agent is already merged".to_string());
+            return;
+        }
+        if run.worktree_branch.is_none() || run.worktree_path.is_none() {
+            self.notice = Some("selected agent has no worktree to sync".to_string());
+            return;
+        }
+        let task = run.task.clone();
+        let source_branch = run.worktree_branch.clone();
+        let worktree_path = run.worktree_path.clone();
+        let agent_id = Some(run.id.clone());
+        match self.sync_agent_at(self.selected_agent) {
+            Ok(()) => {
+                self.notice = Some("synced selected worktree".to_string());
+            }
+            Err(error) => self.handle_merge_error(
+                task,
+                error,
+                None,
+                source_branch,
+                worktree_path,
+                agent_id,
+            ),
+        }
+    }
+
     fn request_merge_selected_agent(&mut self) {
         if self.selected_is_main() {
             self.notice = Some("main agent: merge disabled".to_string());
@@ -3587,9 +3656,17 @@ impl App {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => self.start_conflict_resolution_agent(),
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    let rebase = self
+                        .conflict_prompt
+                        .as_ref()
+                        .is_some_and(|prompt| prompt.operation == ConflictOperation::Rebase);
                     self.conflict_prompt = None;
-                    self.notice =
-                        Some("resolve the merge conflicts manually, then commit".to_string());
+                    self.notice = Some(if rebase {
+                        "resolve the rebase conflicts in the worktree, then run git rebase --continue"
+                            .to_string()
+                    } else {
+                        "resolve the merge conflicts manually, then commit".to_string()
+                    });
                 }
                 _ => {}
             }
@@ -3671,29 +3748,67 @@ impl App {
         worktree_path: Option<PathBuf>,
         agent_id: Option<String>,
     ) {
-        let conflicted_files = conflicted_files(&self.cwd);
+        let mut operation = ConflictOperation::Merge;
+        let mut conflict_root = self.cwd.clone();
+        let mut conflicted_files = conflicted_files(&self.cwd);
+        if conflicted_files.is_empty() {
+            if let Some(path) = worktree_path.as_ref() {
+                let worktree_conflicts = conflicted_files(path);
+                if !worktree_conflicts.is_empty() {
+                    operation = ConflictOperation::Rebase;
+                    conflict_root = path.clone();
+                    conflicted_files = worktree_conflicts;
+                }
+            }
+        }
         if conflicted_files.is_empty() {
             let prefix = merged_before_error
                 .map(|count| format!("merge all stopped after {count}: "))
                 .unwrap_or_else(|| "merge stopped: ".to_string());
             self.notice = Some(format!("{prefix}{error}"));
+            if let Some(index) = agent_id
+                .as_deref()
+                .and_then(|id| self.agents.iter().position(|run| run.id == id))
+            {
+                if let Some(run) = self.agents.get_mut(index) {
+                    run.status = AgentStatus::Failed;
+                    run.last_error = Some(error.to_string());
+                    let _ = save_native_run_record(&self.cwd, run);
+                }
+            }
             return;
         }
 
         let count = conflicted_files.len();
         let target_branch = current_branch_at(&self.cwd);
         self.conflict_prompt = Some(MergeConflictPrompt {
+            operation,
             task,
             conflicted_files,
             error: error.to_string(),
-            repo_root: self.cwd.clone(),
+            repo_root: conflict_root,
             target_branch,
-            source_branch,
-            worktree_path,
-            agent_id,
+            source_branch: source_branch.clone(),
+            worktree_path: worktree_path.clone(),
+            agent_id: agent_id.clone(),
         });
+        if let Some(index) = agent_id
+            .as_deref()
+            .and_then(|id| self.agents.iter().position(|run| run.id == id))
+        {
+            if let Some(run) = self.agents.get_mut(index) {
+                run.status = AgentStatus::Stopped;
+                run.last_error = Some(error.to_string());
+                let _ = save_native_run_record(&self.cwd, run);
+            }
+        }
+        let operation_label = if operation == ConflictOperation::Rebase {
+            "rebase"
+        } else {
+            "merge"
+        };
         self.notice = Some(format!(
-            "merge conflict in {count} file{}: press y for AI help or n to resolve manually",
+            "{operation_label} conflict in {count} file{}: press y for AI help or n to resolve manually",
             if count == 1 { "" } else { "s" }
         ));
     }
@@ -3711,11 +3826,18 @@ impl App {
             .as_ref()
             .map(|p| p.task.clone())
             .unwrap_or_default();
+        let conflict_context = self.conflict_prompt.as_ref().map(|p| {
+            (
+                p.operation,
+                p.repo_root.clone(),
+                p.source_branch.clone(),
+                p.worktree_path.clone(),
+            )
+        });
         self.conflict_prompt = None;
 
         // Reuse the failing agent's row instead of spawning a new pane. The
-        // PTY is re-rooted to the repo root because that's where the merge
-        // conflicts live (the worktree got partially merged in already).
+        // PTY is rooted in the checkout that contains the conflicted operation.
         let target_index = agent_id
             .as_deref()
             .and_then(|id| self.agents.iter().position(|a| a.id == id));
@@ -3731,6 +3853,8 @@ impl App {
         let model = self.agents[index].model.clone();
         let effort = self.agents[index].effort;
         let terminal_size = self.agents[index].terminal_size.unwrap_or_default();
+        let (operation, resolver_cwd, source_branch, worktree_path) = conflict_context
+            .unwrap_or((ConflictOperation::Merge, self.cwd.clone(), None, None));
         let session_id = mint_session_id_for(backend);
         let command = agent_command(
             backend,
@@ -3742,12 +3866,12 @@ impl App {
         );
         let options = TerminalPaneOptions {
             size: terminal_size,
-            cwd: Some(self.cwd.clone()),
+            cwd: Some(resolver_cwd.clone()),
             ..TerminalPaneOptions::default()
         };
 
-        // Drop the old PTY (in the now-merged worktree) before spawning the
-        // new one in the repo root.
+        // Drop the old PTY before spawning the resolver in the checkout that
+        // contains the conflicted git operation.
         if let Some(run) = self.agents.get_mut(index) {
             run.terminal = None;
             run.review_terminal = None;
@@ -3758,11 +3882,16 @@ impl App {
                 let _ = terminal.drain_output();
                 let now = now_stamp();
                 if let Some(run) = self.agents.get_mut(index) {
-                    run.cwd = self.cwd.clone();
+                    run.cwd = resolver_cwd.clone();
                     run.terminal = Some(terminal);
                     run.status = AgentStatus::Running;
-                    run.worktree_path = None;
-                    run.worktree_branch = None;
+                    if operation == ConflictOperation::Rebase {
+                        run.worktree_path = worktree_path.or_else(|| Some(resolver_cwd.clone()));
+                        run.worktree_branch = source_branch;
+                    } else {
+                        run.worktree_path = None;
+                        run.worktree_branch = None;
+                    }
                     run.session_id = session_id;
                     run.completed_at = None;
                     run.last_output_at = Instant::now();
@@ -3772,12 +3901,28 @@ impl App {
                     run.user_input_notified = false;
                     run.last_error = None;
                     run.task = if original_task.is_empty() {
-                        "Resolve merge conflicts".to_string()
+                        if operation == ConflictOperation::Rebase {
+                            "Resolve rebase conflicts".to_string()
+                        } else {
+                            "Resolve merge conflicts".to_string()
+                        }
                     } else {
-                        format!("Resolve merge conflicts: {original_task}")
+                        format!(
+                            "Resolve {} conflicts: {original_task}",
+                            if operation == ConflictOperation::Rebase {
+                                "rebase"
+                            } else {
+                                "merge"
+                            }
+                        )
                     };
                     run.task_summary = format!(
-                        "merge conflicts \u{2192} {}",
+                        "{} conflicts \u{2192} {}",
+                        if operation == ConflictOperation::Rebase {
+                            "rebase"
+                        } else {
+                            "merge"
+                        },
                         summarize_task(&original_task)
                     );
                     run.turns.push(AgentTurn {
@@ -3831,6 +3976,38 @@ impl App {
             .as_ref()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "(unknown worktree)".to_string());
+        if prompt.operation == ConflictOperation::Rebase {
+            return Some(format!(
+                "A git rebase stopped with conflicts in the agent worktree.\n\
+\n\
+Where you are working\n\
+- You are running inside the conflicted worktree at: {repo}\n\
+- The worktree branch being rebased is: {source}\n\
+- The base branch is: {target}\n\
+\n\
+What was being attempted\n\
+- Original task on {source}: {task}\n\
+\n\
+What conflicted\n\
+{files}\n\
+\n\
+Git reported\n\
+{err}\n\
+\n\
+What to do\n\
+1. Run `git status` from {repo} to see the rebase state.\n\
+2. Resolve the conflict markers in the files above.\n\
+3. After every file is resolved, run relevant tests or checks if practical.\n\
+4. Stage the resolved files with `git add`.\n\
+5. Run `git rebase --continue` and report the result. Do not abort the rebase unless it is truly unresolvable.\n",
+                repo = repo,
+                target = target,
+                source = source,
+                task = prompt.task,
+                files = files,
+                err = prompt.error,
+            ));
+        }
         Some(format!(
             "A git merge stopped with conflicts and you are now the conflict resolver.\n\
 \n\
@@ -3882,7 +4059,16 @@ What to do\n\
 
         commit_pending_changes_for_run(run)?;
 
-        git_status_command(&self.cwd, &["merge", "--no-ff", &branch])?;
+        match merge_strategy() {
+            MergeStrategy::Merge => {
+                git_status_command(&self.cwd, &["merge", "--no-ff", &branch])?;
+            }
+            MergeStrategy::Rebase => {
+                let base_branch = current_branch_at(&self.cwd).unwrap_or_else(|| "HEAD".to_string());
+                rebase_worktree_onto_base(&self.cwd, &run.cwd, &base_branch)?;
+                git_status_command(&self.cwd, &["merge", "--ff-only", &branch])?;
+            }
+        }
         // Successful merge: keep the agent's row in the dashboard but flip it
         // to Merged so it appears in a dedicated section. Keep the worktree
         // path on the record and defer `git worktree remove` to delete, which
@@ -3890,6 +4076,22 @@ What to do\n\
         // Never touch the dedicated main agent.
         if index < self.agents.len() && !self.agents[index].is_main() {
             self.mark_agent_and_review_sources_merged(index, review_source_ids);
+        }
+        Ok(())
+    }
+
+    fn sync_agent_at(&mut self, index: usize) -> Result<()> {
+        let Some(run) = self.agents.get(index) else {
+            anyhow::bail!("no selected agent");
+        };
+        if run.worktree_branch.is_none() {
+            anyhow::bail!("selected agent is not in a worktree");
+        }
+        commit_pending_changes_for_run(run)?;
+        let base_branch = current_branch_at(&self.cwd).unwrap_or_else(|| "HEAD".to_string());
+        rebase_worktree_onto_base(&self.cwd, &run.cwd, &base_branch)?;
+        if let Some(run) = self.agents.get(index) {
+            save_native_run_record(&self.cwd, run)?;
         }
         Ok(())
     }
@@ -4552,6 +4754,17 @@ branch refs/heads/main\n";
             main_worktree_from_porcelain(output),
             Some(PathBuf::from("/repo/main"))
         );
+    }
+
+    #[test]
+    fn merge_strategy_defaults_to_merge_and_parses_rebase() {
+        let missing = serde_json::json!({});
+        let rebase = serde_json::json!({ "mergeStrategy": "rebase" });
+        let invalid = serde_json::json!({ "mergeStrategy": "squash" });
+
+        assert_eq!(config_merge_strategy(&missing), MergeStrategy::Merge);
+        assert_eq!(config_merge_strategy(&rebase), MergeStrategy::Rebase);
+        assert_eq!(config_merge_strategy(&invalid), MergeStrategy::Merge);
     }
 
     #[test]
@@ -7914,7 +8127,7 @@ fn render_task(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let default_hint = if app.plan_mode {
         "Enter plan  Up/Down history  Option-1/2/3 pane  /plan off"
     } else {
-        "Enter start  Up/Down history  Option-1/2/3 pane  /plan  /rudder-plan"
+        "Enter start  Up/Down history  Option-1/2/3 pane  /plan  /rudder-plan  /sync"
     };
     let hint = app.notice.as_deref().unwrap_or(default_hint);
     let inner_width = area.width.saturating_sub(2).max(1);
@@ -7948,7 +8161,7 @@ fn render_task(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 if app.plan_mode {
                     "Type a task to plan"
                 } else {
-                    "Type a task, /plan, or /rudder-plan"
+                    "Type a task, /plan, /rudder-plan, or /sync"
                 }
             } else {
                 line.as_str()
@@ -8015,7 +8228,7 @@ fn task_pane_height(app: &App, width: u16) -> u16 {
     let default_hint = if app.plan_mode {
         "Enter plan  Up/Down history  Option-1/2/3 pane  /plan off"
     } else {
-        "Enter start  Up/Down history  Option-1/2/3 pane  /plan  /rudder-plan"
+        "Enter start  Up/Down history  Option-1/2/3 pane  /plan  /rudder-plan  /sync"
     };
     let hint = app.notice.as_deref().unwrap_or(default_hint);
     let inner_width = width.saturating_sub(2).max(1);
@@ -8109,7 +8322,11 @@ fn render_merge_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
             vec![
                 Line::from(Span::styled(summary, app_style())),
                 Line::from(Span::styled(
-                    "This will run git merge into the current branch.",
+                    if merge_strategy() == MergeStrategy::Rebase {
+                        "This will rebase the worktree first, then fast-forward merge. Rebase conflicts stay in the worktree."
+                    } else {
+                        "This will run git merge into the current branch."
+                    },
                     app_style(),
                 )),
                 merge_confirm_hint_line(),
@@ -8118,12 +8335,21 @@ fn render_merge_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
         )
     } else if let Some(prompt) = &app.conflict_prompt {
         let files = prompt.conflicted_files.join(", ");
+        let operation_label = if prompt.operation == ConflictOperation::Rebase {
+            "Rebase"
+        } else {
+            "Merge"
+        };
         (
-            " merge conflict ",
+            if prompt.operation == ConflictOperation::Rebase {
+                " rebase conflict "
+            } else {
+                " merge conflict "
+            },
             vec![
                 Line::from(Span::styled(
                     format!(
-                        "Merge stopped with {} conflicted file{}.",
+                        "{operation_label} stopped with {} conflicted file{}.",
                         prompt.conflicted_files.len(),
                         if prompt.conflicted_files.len() == 1 {
                             ""
@@ -8643,7 +8869,7 @@ fn task_visible_input_count(app: &App, area: Rect, input_line_count: usize) -> u
     let default_hint = if app.plan_mode {
         "Enter plan  Up/Down history  Option-1/2/3 pane  /plan off"
     } else {
-        "Enter start  Up/Down history  Option-1/2/3 pane  /plan  /rudder-plan"
+        "Enter start  Up/Down history  Option-1/2/3 pane  /plan  /rudder-plan  /sync"
     };
     let hint = app.notice.as_deref().unwrap_or(default_hint);
     let hint_line_count = wrap_text(hint, task_inner_width(area)).len().max(1);
@@ -9027,6 +9253,21 @@ fn config_effort(config: &serde_json::Value, backend: Backend) -> Option<EffortL
     })
 }
 
+fn config_merge_strategy(config: &serde_json::Value) -> MergeStrategy {
+    config
+        .get("mergeStrategy")
+        .and_then(serde_json::Value::as_str)
+        .map(MergeStrategy::parse)
+        .unwrap_or(MergeStrategy::Merge)
+}
+
+fn merge_strategy() -> MergeStrategy {
+    load_rudder_config()
+        .as_ref()
+        .map(config_merge_strategy)
+        .unwrap_or(MergeStrategy::Merge)
+}
+
 fn save_model_defaults(backend: Backend, model: &str, effort: Option<EffortLevel>) -> Result<()> {
     let path = rudder_config_path().context("could not determine Rudder config path")?;
     let mut config = load_rudder_config().unwrap_or_else(default_config_value);
@@ -9119,6 +9360,8 @@ fn ensure_config_defaults(config: &mut serde_json::Value) {
         .or_insert(serde_json::json!(1));
     root.entry("defaultBackend".to_string())
         .or_insert(serde_json::json!("claude"));
+    root.entry("mergeStrategy".to_string())
+        .or_insert(serde_json::json!("merge"));
     root.entry("runPolicy".to_string()).or_insert_with(|| {
         serde_json::json!({
             "sameCheckout": "single-active",
@@ -9136,6 +9379,7 @@ fn default_config_value() -> serde_json::Value {
     serde_json::json!({
         "version": 1,
         "defaultBackend": "claude",
+        "mergeStrategy": "merge",
         "runPolicy": {
             "sameCheckout": "single-active",
             "concurrentPromptMode": "worktree",
@@ -10356,6 +10600,11 @@ fn command_suggestions() -> Vec<Suggestion> {
             label: "/merge-all".to_string(),
             detail: "merge all completed worktrees".to_string(),
             action: SuggestionAction::RunCommand("/merge-all".to_string()),
+        },
+        Suggestion {
+            label: "/sync".to_string(),
+            detail: "rebase selected worktree without merging".to_string(),
+            action: SuggestionAction::RunCommand("/sync".to_string()),
         },
         Suggestion {
             label: "/usage".to_string(),
@@ -12427,6 +12676,45 @@ fn git_status_command(cwd: &Path, args: &[&str]) -> Result<()> {
     } else {
         message
     });
+}
+
+fn rebase_worktree_onto_base(repo_root: &Path, worktree_path: &Path, base_branch: &str) -> Result<()> {
+    let base_ref = resolve_rebase_base_ref(repo_root, base_branch)?;
+    git_status_command(worktree_path, &["rebase", &base_ref])
+        .with_context(|| format!("rebase onto {base_ref} failed"))
+}
+
+fn resolve_rebase_base_ref(repo_root: &Path, base_branch: &str) -> Result<String> {
+    let branch = base_branch.trim();
+    if branch.is_empty() || branch == "HEAD" {
+        return current_commit_at(repo_root);
+    }
+
+    let mut fetched = false;
+    if git_status_command(repo_root, &["remote", "get-url", "origin"]).is_ok() {
+        fetched = git_status_command(repo_root, &["fetch", "origin", branch]).is_ok();
+    }
+
+    let remote_ref = format!("refs/remotes/origin/{branch}");
+    if ref_exists(repo_root, &remote_ref) {
+        return Ok(remote_ref);
+    }
+    if fetched && ref_exists(repo_root, "FETCH_HEAD") {
+        return Ok("FETCH_HEAD".to_string());
+    }
+    if ref_exists(repo_root, branch) {
+        return Ok(branch.to_string());
+    }
+    current_commit_at(repo_root)
+}
+
+fn current_commit_at(cwd: &Path) -> Result<String> {
+    git_output(cwd, ["rev-parse", "HEAD"]).map(|value| value.trim().to_string())
+}
+
+fn ref_exists(repo_root: &Path, reference: &str) -> bool {
+    let verify = format!("{reference}^{{commit}}");
+    git_output_args(repo_root, &["rev-parse", "--verify", &verify]).is_ok()
 }
 
 fn commit_pending_changes_for_run(run: &AgentRun) -> Result<()> {

@@ -7,7 +7,7 @@ import { permissionAttentionFromOutput, type AgentAttention } from "./agent-atte
 import { discoverEffortOptions, fallbackEffortOptions, type EffortOption } from "./effort.js";
 import { currentBranch, findRepoRoot } from "./git.js";
 import { discoverModelOptions, fallbackModelOptions, type ModelOption } from "./models.js";
-import { startNativePlan, startNativeRun, deleteRun, mergeRun, reconcileNativeTerminals, stopRun } from "./run-manager.js";
+import { startNativePlan, startNativeRun, deleteRun, mergeRun, reconcileNativeTerminals, stopRun, syncRun } from "./run-manager.js";
 import { listRuns, loadConfig, outputPath, rememberBackendSelection } from "./state.js";
 import {
   loadTmuxDashboardState,
@@ -51,6 +51,8 @@ const SLASH_COMMANDS: SlashCommand[] = [
   { label: "/plan", detail: "toggle Rudder read-only plan mode", value: "/plan" },
   { label: "/plan <task>", detail: "plan one task without toggling", value: "/plan ", complete: "/plan " },
   { label: "/run <task>", detail: "start implementation even when plan mode is on", value: "/run ", complete: "/run " },
+  { label: "/sync", detail: "rebase the selected worktree without merging", value: "/sync" },
+  { label: "/sync <run>", detail: "rebase a worktree without merging", value: "/sync ", complete: "/sync " },
   { label: "/model", detail: "pick from available models", value: "/model" },
   { label: "/model <id>", detail: "set model for new tasks", value: "/model ", complete: "/model " },
   { label: "/clear", detail: "clear the task input", value: "/clear" },
@@ -176,6 +178,15 @@ function AgentPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement
         .catch((error) => setNotice(error instanceof Error ? error.message : String(error)));
       return;
     }
+    if (chunk === "u" && selectedRun) {
+      void syncRun(selectedRun.id, { silent: true })
+        .then((synced) => {
+          setNotice(syncNotice(synced));
+          return refresh();
+        })
+        .catch((error) => setNotice(error instanceof Error ? error.message : String(error)));
+      return;
+    }
     if (chunk === "s" && selectedRun) {
       void stopRun(selectedRun.id, { silent: true }).then(refresh);
       return;
@@ -212,7 +223,7 @@ function AgentPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement
         </Box>
       ))}
       {notice ? <Text color={deleteIntent ? "red" : "yellow"}>{summarize(notice, width)}</Text> : null}
-      <Text color="gray">j/k select  Enter focus  m merge  dd delete</Text>
+      <Text color="gray">j/k select  Enter focus  u sync  m merge  dd delete</Text>
     </Box>
   );
 }
@@ -442,6 +453,10 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
       await startWorker(runTask);
       return;
     }
+    if (task === "/sync" || task.startsWith("/sync ")) {
+      await syncSelectedRun(task.slice("/sync".length).trim());
+      return;
+    }
     if (task.startsWith("/model ")) {
       const nextModel = task.slice("/model ".length).trim() || undefined;
       setModel(nextModel);
@@ -476,7 +491,7 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
     }
     if (task === "/help") {
       setTaskInput("");
-      setNotice("/plan toggles read-only planning, /run bypasses it, /backend claude|codex, /model");
+      setNotice("/plan toggles read-only planning, /run bypasses it, /sync rebases a worktree, /backend claude|codex, /model");
       return;
     }
     if (task === "/detach") {
@@ -543,6 +558,25 @@ function TaskPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement 
       await updateTmuxDashboardState(repoRoot, defaults.tmuxSessionName, { selectedRunId: run.id, backend, model, effort });
       setTaskInput("");
       setNotice("Read-only planner started");
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : String(error));
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  async function syncSelectedRun(runId: string): Promise<void> {
+    const state = await loadTmuxDashboardState(repoRoot, defaults.tmuxSessionName);
+    const targetRunId = runId || state?.selectedRunId;
+    if (!targetRunId) {
+      setNotice("Usage: /sync <run>");
+      return;
+    }
+    setSubmitting(true);
+    try {
+      const synced = await syncRun(targetRunId, { silent: true });
+      setTaskInput("");
+      setNotice(syncNotice(synced));
     } catch (error) {
       setNotice(error instanceof Error ? error.message : String(error));
     } finally {
@@ -939,7 +973,7 @@ function isExactRunnableCommand(input: string): boolean {
 }
 
 function resolveSlashCommand(input: string): SlashCommand | undefined {
-  if (!input.startsWith("/") || input.startsWith("/model ") || input.startsWith("/plan ") || input.startsWith("/run ")) {
+  if (!input.startsWith("/") || input.startsWith("/model ") || input.startsWith("/plan ") || input.startsWith("/run ") || input.startsWith("/sync ")) {
     return undefined;
   }
   if (isExactRunnableCommand(input)) {
@@ -972,6 +1006,17 @@ function stripControlInput(value: string): string {
 
 function shortId(id: string): string {
   return id.slice(0, 14);
+}
+
+function syncNotice(run: RunRecord): string {
+  if (run.sync?.status === "synced") {
+    return `synced ${shortId(run.id)}`;
+  }
+  if (run.sync?.status === "conflict") {
+    const count = run.sync.conflictedFiles?.length || "unknown";
+    return `sync conflict ${shortId(run.id)} (${count} file${count === 1 ? "" : "s"}); resolve in worktree and run git rebase --continue`;
+  }
+  return `sync failed ${shortId(run.id)}`;
 }
 
 function summarize(value: string, width: number): string {

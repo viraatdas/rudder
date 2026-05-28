@@ -10,6 +10,7 @@ import {
   startRun,
   statusRuns,
   stopRun,
+  syncRun,
   watchRun,
 } from "./run-manager.js";
 import { loadConfig, rememberBackendSelection } from "./state.js";
@@ -129,6 +130,9 @@ async function handleSlashCommand(line: string, state: ShellState): Promise<bool
       }
       await mergeRun(args[0], args.includes("--allow-dirty"));
       return false;
+    case "sync":
+      await syncRun(args[0]);
+      return false;
     case "cleanup":
       await cleanupRuns(args.includes("--force"));
       return false;
@@ -236,6 +240,7 @@ function printShellHelp(): void {
   /logs [run] [--follow]       Print saved output
   /stop <run>                  Cancel a run
   /merge <run>                 Merge a worktree run
+  /sync [run]                  Rebase a worktree onto its base branch; conflicts stay in that worktree
   /cleanup [--force]           Remove merged worktrees
   /doctor                      Check local tools and auth
   /exit                        Leave the shell
