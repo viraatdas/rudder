@@ -107,6 +107,7 @@ const TOOL_INSTALL_HINTS: Record<string, string> = {
   claude: "Install with `npm install -g @anthropic-ai/claude-code` (see https://github.com/anthropics/claude-code).",
   codex: "Install with `npm install -g @openai/codex` (see https://github.com/openai/codex).",
   acpx: "Install with `npm install -g acpx@latest` or run `rudder onboard`.",
+  jj: "Install Jujutsu and ensure `jj` is on PATH.",
 };
 
 export class MissingToolError extends Error {
@@ -125,12 +126,6 @@ export class MissingToolError extends Error {
 export function formatMissingToolMessage(tool: string, hintOverride?: string): string {
   const hint = hintOverride ?? TOOL_INSTALL_HINTS[tool] ?? "Please install it and ensure it is on your PATH.";
   return `${tool} is not installed or not found on PATH. ${hint}`;
-}
-
-export function requireBackendTool(tool: string): void {
-  if (!commandExists(tool)) {
-    throw new MissingToolError(tool);
-  }
 }
 
 export function isMissingToolSpawnError(error: unknown): boolean {

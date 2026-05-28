@@ -18,7 +18,6 @@ export declare class MissingToolError extends Error {
     constructor(tool: string, message?: string);
 }
 export declare function formatMissingToolMessage(tool: string, hintOverride?: string): string;
-export declare function requireBackendTool(tool: string): void;
 export declare function isMissingToolSpawnError(error: unknown): boolean;
 export declare function runCommand(command: string, args: string[], options?: {
     cwd?: string;

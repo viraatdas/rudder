@@ -7,6 +7,7 @@ import test from "node:test";
 
 import {
   mergeRunIntoCurrentBranch,
+  resolveRebaseBaseRef,
   syncRunWorktree,
 } from "../dist/git.js";
 import {
@@ -64,6 +65,24 @@ test("merge persists commit preparation failures before returning", async (t) =>
   assert.match(merged.merge?.error || "", /unfinished rebase/);
   assert.equal(saved?.status, "failed");
   assert.equal(saved?.merge?.status, "failed");
+});
+
+test("rebase base resolution prefers the checked-out local branch", async (t) => {
+  const repo = await setupRepo(t);
+  const remote = await fsp.mkdtemp(path.join(os.tmpdir(), "rudder-rebase-remote-"));
+  t.after(async () => {
+    await fsp.rm(remote, { recursive: true, force: true });
+  });
+  git(remote, "init", "--bare");
+  git(repo, "remote", "add", "origin", remote);
+  git(repo, "push", "-u", "origin", "main");
+  await fsp.writeFile(path.join(repo, "file.txt"), "base\nlocal target commit\n");
+  git(repo, "add", "file.txt");
+  git(repo, "commit", "-m", "local target commit");
+
+  const baseRef = await resolveRebaseBaseRef(repo, "main");
+
+  assert.equal(baseRef, "main");
 });
 
 async function setupRepo(t) {

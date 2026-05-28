@@ -43,6 +43,7 @@ npx @viraatdas/rudder@latest
 
 - Node.js 20 or newer
 - Git
+- Optional: Jujutsu (`jj`) for jj workspace mode
 - Claude Code and/or Codex installed and logged in
 - macOS, Linux, or another Unix-like terminal environment
 
@@ -216,7 +217,42 @@ main checkout
 injects a short prompt telling each agent to read it, so a new agent can see
 what other agents are doing without Rudder rewriting the user task.
 
-Merging is intentionally git-native:
+### Jujutsu Workspaces
+
+Rudder can use Jujutsu workspaces instead of git worktrees. In auto mode,
+Rudder selects jj when `jj root` succeeds or the checkout has a `.jj/`
+directory and the `jj` binary is available. Git worktree behavior stays the
+fallback everywhere else.
+
+Force a backend by adding the top-level `vcs` field in
+`~/.rudder/config.json`:
+
+```json
+{
+  "version": 1,
+  "vcs": "jj"
+}
+```
+
+Use `"git"` to force git worktrees even inside a jj-managed checkout. Omit
+`vcs` to keep auto-detection.
+
+When jj mode is active, Rudder creates task isolation with:
+
+```bash
+jj workspace add <path> --name rudder-...
+```
+
+Active runs appear in `jj workspace list`. Cleanup forgets the workspace with
+`jj workspace forget <name>` and removes the workspace directory. Merging a jj
+run creates a merge change in the current workspace with `jj new @ <run-change>`;
+if that produces conflicts, Rudder leaves the conflicted jj change in place for
+manual resolution. If you manually integrate a completed run with commands such
+as `jj squash`, `rudder cleanup` can still remove the completed workspace. If a
+workspace is forgotten but its change remains, clean it up with the usual jj
+commands such as `jj abandon`.
+
+For git worktree runs, merging is intentionally git-native:
 
 ```text
 agent worktree -> optional commit -> git merge --no-ff -> main checkout
@@ -648,10 +684,28 @@ rudder --no-native
 
 ## Development
 
+Clone the repo and run the setup script to bootstrap your environment:
+
 ```bash
 git clone https://github.com/viraatdas/rudder.git
 cd rudder
-npm install
+./setup.sh
+```
+
+`setup.sh` verifies prerequisites (**Node >=20**, **git**, **npm**, **Rust**
+toolchain via `cargo`), installs npm dependencies (`npm ci` when a lockfile is
+present, otherwise `npm install`), runs the full build (`tsc` + `cargo build
+--release` + `copy-native`), runs `tsc --noEmit` as a type check, and smoke
+tests the built CLI with `node dist/index.js --version`. Any failed step exits
+non-zero with a message identifying which step failed. The script is
+idempotent — re-run it after pulling new changes.
+
+If you prefer to run the steps manually:
+
+```bash
+git clone https://github.com/viraatdas/rudder.git
+cd rudder
+npm ci                        # or: npm install
 cargo test --manifest-path native/Cargo.toml
 npm run check
 npm run build

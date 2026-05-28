@@ -12690,6 +12690,10 @@ fn resolve_rebase_base_ref(repo_root: &Path, base_branch: &str) -> Result<String
         return current_commit_at(repo_root);
     }
 
+    if ref_exists(repo_root, branch) {
+        return Ok(branch.to_string());
+    }
+
     let mut fetched = false;
     if git_status_command(repo_root, &["remote", "get-url", "origin"]).is_ok() {
         fetched = git_status_command(repo_root, &["fetch", "origin", branch]).is_ok();
@@ -12701,9 +12705,6 @@ fn resolve_rebase_base_ref(repo_root: &Path, base_branch: &str) -> Result<String
     }
     if fetched && ref_exists(repo_root, "FETCH_HEAD") {
         return Ok("FETCH_HEAD".to_string());
-    }
-    if ref_exists(repo_root, branch) {
-        return Ok(branch.to_string());
     }
     current_commit_at(repo_root)
 }

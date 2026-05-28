@@ -1305,7 +1305,18 @@ async function mergeReadyRuns(
   setNotice(`Merging ${ready.length} run${ready.length === 1 ? "" : "s"}...`);
   let merged = 0;
   for (const run of ready) {
-    await mergeRun(run.id, allowDirty, { silent: true });
+    const result = await mergeRun(run.id, allowDirty, { silent: true });
+    if (result.merge?.status === "conflict") {
+      const files = result.merge.conflictedFiles ?? [];
+      setNotice(`Merge all stopped after ${merged}: conflict in ${shortId(run.id)} (${files.length || "unknown"} file${files.length === 1 ? "" : "s"})`);
+      await refresh();
+      return;
+    }
+    if (result.merge?.status !== "merged") {
+      setNotice(`Merge all stopped after ${merged}: failed in ${shortId(run.id)}: ${result.merge?.error ?? "unknown error"}`);
+      await refresh();
+      return;
+    }
     merged += 1;
   }
   setNotice(`Merged ${merged} run${merged === 1 ? "" : "s"}`);
