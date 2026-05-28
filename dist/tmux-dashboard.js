@@ -8,7 +8,7 @@ import { permissionAttentionFromOutput } from "./agent-attention.js";
 import { discoverEffortOptions, fallbackEffortOptions } from "./effort.js";
 import { currentBranch, findRepoRoot } from "./git.js";
 import { discoverModelOptions, fallbackModelOptions } from "./models.js";
-import { startNativePlan, startNativeRun, deleteRun, mergeRun, reconcileNativeTerminals, stopRun } from "./run-manager.js";
+import { startNativePlan, startNativeRun, deleteRun, mergeRun, reconcileNativeTerminals, stopRun, syncRun } from "./run-manager.js";
 import { listRuns, loadConfig, outputPath, rememberBackendSelection } from "./state.js";
 import { loadTmuxDashboardState, updateTmuxDashboardState, } from "./tmux-state.js";
 import { detachClient, resizePane, selectPane } from "./tmux.js";
@@ -23,6 +23,8 @@ const SLASH_COMMANDS = [
     { label: "/plan", detail: "toggle Rudder read-only plan mode", value: "/plan" },
     { label: "/plan <task>", detail: "plan one task without toggling", value: "/plan ", complete: "/plan " },
     { label: "/run <task>", detail: "start implementation even when plan mode is on", value: "/run ", complete: "/run " },
+    { label: "/sync", detail: "rebase the selected worktree without merging", value: "/sync" },
+    { label: "/sync <run>", detail: "rebase a worktree without merging", value: "/sync ", complete: "/sync " },
     { label: "/model", detail: "pick from available models", value: "/model" },
     { label: "/model <id>", detail: "set model for new tasks", value: "/model ", complete: "/model " },
     { label: "/clear", detail: "clear the task input", value: "/clear" },
@@ -130,9 +132,24 @@ function AgentPane({ defaults }) {
         if (chunk === "m" && selectedRun) {
             void mergeRun(selectedRun.id, false, { silent: true })
                 .then((merged) => {
-                setNotice(merged.merge?.status === "conflict"
-                    ? `merge conflict ${shortId(selectedRun.id)}`
-                    : `merged ${shortId(selectedRun.id)}`);
+                if (merged.merge?.status === "conflict") {
+                    setNotice(`merge conflict ${shortId(selectedRun.id)}`);
+                }
+                else if (merged.merge?.status === "merged") {
+                    setNotice(`merged ${shortId(selectedRun.id)}`);
+                }
+                else {
+                    setNotice(`merge failed ${shortId(selectedRun.id)}: ${merged.merge?.error ?? "unknown error"}`);
+                }
+                return refresh();
+            })
+                .catch((error) => setNotice(error instanceof Error ? error.message : String(error)));
+            return;
+        }
+        if (chunk === "u" && selectedRun) {
+            void syncRun(selectedRun.id, { silent: true })
+                .then((synced) => {
+                setNotice(syncNotice(synced));
                 return refresh();
             })
                 .catch((error) => setNotice(error instanceof Error ? error.message : String(error)));
@@ -154,7 +171,7 @@ function AgentPane({ defaults }) {
     const width = Math.max(24, size.columns);
     const maxRuns = Math.max(1, Math.floor((size.rows - 5) / 3));
     const visibleRuns = runs.slice(0, maxRuns);
-    return (_jsxs(Box, { flexDirection: "column", children: [_jsx(Text, { bold: true, children: "rudder" }), _jsx(Text, { color: "gray", children: summarize(`${shortenHome(repoRoot)} ${branch}`, width) }), _jsxs(Text, { children: ["agents ", _jsxs(Text, { color: "gray", children: [runs.length, " runs"] })] }), visibleRuns.length === 0 ? _jsx(Text, { color: "gray", children: "No agents yet." }) : visibleRuns.map((run) => (_jsxs(Box, { flexDirection: "column", children: [_jsxs(Text, { color: run.id === selectedRun?.id ? "cyan" : taskColor(run), children: [run.id === selectedRun?.id ? "> " : "  ", summarize(taskDisplayLabel(run, 80), width - 3)] }), _jsxs(Text, { children: [_jsxs(Text, { color: runStatusColor(run), children: ["  ", statusMark(run)] }), _jsxs(Text, { color: "gray", children: ["  ", run.backend, " "] }), _jsx(Text, { color: "magenta", children: modelLabel(run, config) })] })] }, run.id))), notice ? _jsx(Text, { color: deleteIntent ? "red" : "yellow", children: summarize(notice, width) }) : null, _jsx(Text, { color: "gray", children: "j/k select  Enter focus  m merge  dd delete" })] }));
+    return (_jsxs(Box, { flexDirection: "column", children: [_jsx(Text, { bold: true, children: "rudder" }), _jsx(Text, { color: "gray", children: summarize(`${shortenHome(repoRoot)} ${branch}`, width) }), _jsxs(Text, { children: ["agents ", _jsxs(Text, { color: "gray", children: [runs.length, " runs"] })] }), visibleRuns.length === 0 ? _jsx(Text, { color: "gray", children: "No agents yet." }) : visibleRuns.map((run) => (_jsxs(Box, { flexDirection: "column", children: [_jsxs(Text, { color: run.id === selectedRun?.id ? "cyan" : taskColor(run), children: [run.id === selectedRun?.id ? "> " : "  ", summarize(taskDisplayLabel(run, 80), width - 3)] }), _jsxs(Text, { children: [_jsxs(Text, { color: runStatusColor(run), children: ["  ", statusMark(run)] }), _jsxs(Text, { color: "gray", children: ["  ", run.backend, " "] }), _jsx(Text, { color: "magenta", children: modelLabel(run, config) })] })] }, run.id))), notice ? _jsx(Text, { color: deleteIntent ? "red" : "yellow", children: summarize(notice, width) }) : null, _jsx(Text, { color: "gray", children: "j/k select  Enter focus  u sync  m merge  dd delete" })] }));
 }
 function TaskPane({ defaults }) {
     const [repoRoot, setRepoRoot] = useState(() => findRepoRoot());
@@ -361,6 +378,10 @@ function TaskPane({ defaults }) {
             await startWorker(runTask);
             return;
         }
+        if (task === "/sync" || task.startsWith("/sync ")) {
+            await syncSelectedRun(task.slice("/sync".length).trim());
+            return;
+        }
         if (task.startsWith("/model ")) {
             const nextModel = task.slice("/model ".length).trim() || undefined;
             setModel(nextModel);
@@ -395,7 +416,7 @@ function TaskPane({ defaults }) {
         }
         if (task === "/help") {
             setTaskInput("");
-            setNotice("/plan toggles read-only planning, /run bypasses it, /backend claude|codex, /model");
+            setNotice("/plan toggles read-only planning, /run bypasses it, /sync rebases a worktree, /backend claude|codex, /model");
             return;
         }
         if (task === "/detach") {
@@ -462,6 +483,26 @@ function TaskPane({ defaults }) {
             await updateTmuxDashboardState(repoRoot, defaults.tmuxSessionName, { selectedRunId: run.id, backend, model, effort });
             setTaskInput("");
             setNotice("Read-only planner started");
+        }
+        catch (error) {
+            setNotice(error instanceof Error ? error.message : String(error));
+        }
+        finally {
+            setSubmitting(false);
+        }
+    }
+    async function syncSelectedRun(runId) {
+        const state = await loadTmuxDashboardState(repoRoot, defaults.tmuxSessionName);
+        const targetRunId = runId || state?.selectedRunId;
+        if (!targetRunId) {
+            setNotice("Usage: /sync <run>");
+            return;
+        }
+        setSubmitting(true);
+        try {
+            const synced = await syncRun(targetRunId, { silent: true });
+            setTaskInput("");
+            setNotice(syncNotice(synced));
         }
         catch (error) {
             setNotice(error instanceof Error ? error.message : String(error));
@@ -802,7 +843,7 @@ function isExactRunnableCommand(input) {
     return SLASH_COMMANDS.some((command) => !command.complete && command.value === trimmed);
 }
 function resolveSlashCommand(input) {
-    if (!input.startsWith("/") || input.startsWith("/model ") || input.startsWith("/plan ") || input.startsWith("/run ")) {
+    if (!input.startsWith("/") || input.startsWith("/model ") || input.startsWith("/plan ") || input.startsWith("/run ") || input.startsWith("/sync ")) {
         return undefined;
     }
     if (isExactRunnableCommand(input)) {
@@ -828,6 +869,16 @@ function stripControlInput(value) {
 }
 function shortId(id) {
     return id.slice(0, 14);
+}
+function syncNotice(run) {
+    if (run.sync?.status === "synced") {
+        return `synced ${shortId(run.id)}`;
+    }
+    if (run.sync?.status === "conflict") {
+        const count = run.sync.conflictedFiles?.length || "unknown";
+        return `sync conflict ${shortId(run.id)} (${count} file${count === 1 ? "" : "s"}); resolve in worktree and run git rebase --continue`;
+    }
+    return `sync failed ${shortId(run.id)}`;
 }
 function summarize(value, width) {
     const clean = value.replace(/\s+/g, " ").trim();

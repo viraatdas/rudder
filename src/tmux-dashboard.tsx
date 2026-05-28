@@ -170,9 +170,13 @@ function AgentPane({ defaults }: { defaults: PaneDefaults }): React.ReactElement
     if (chunk === "m" && selectedRun) {
       void mergeRun(selectedRun.id, false, { silent: true })
         .then((merged) => {
-          setNotice(merged.merge?.status === "conflict"
-            ? `merge conflict ${shortId(selectedRun.id)}`
-            : `merged ${shortId(selectedRun.id)}`);
+          if (merged.merge?.status === "conflict") {
+            setNotice(`merge conflict ${shortId(selectedRun.id)}`);
+          } else if (merged.merge?.status === "merged") {
+            setNotice(`merged ${shortId(selectedRun.id)}`);
+          } else {
+            setNotice(`merge failed ${shortId(selectedRun.id)}: ${merged.merge?.error ?? "unknown error"}`);
+          }
           return refresh();
         })
         .catch((error) => setNotice(error instanceof Error ? error.message : String(error)));

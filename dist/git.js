@@ -115,20 +115,68 @@ export async function removeWorktree(repoRoot, targetPath, force = false) {
         allowFailure: force,
     });
 }
-export async function mergeRunIntoCurrentBranch(run, allowDirty = false) {
+export async function mergeRunIntoCurrentBranch(run, allowDirty = false, strategy = "merge") {
     if (!run.worktree.branch) {
         throw new Error("Run has no worktree branch to merge.");
     }
     if (!allowDirty && (await hasChanges(run.repoRoot))) {
         throw new Error("Target branch is dirty. Commit/stash changes or pass --allow-dirty.");
     }
+    const targetBranch = await currentTargetBranch(run);
     run.merge = {
         status: "not-started",
         attemptedAt: new Date().toISOString(),
-        targetBranch: await currentBranch(run.repoRoot),
+        targetBranch,
+        strategy,
     };
     await saveRunRecord(run);
-    await commitWorktreeChanges(run);
+    const commitFailure = await commitWorktreeChangesSafely(run, "merge");
+    if (commitFailure) {
+        return commitFailure;
+    }
+    if (strategy === "rebase") {
+        const rebase = await rebaseWorktreeOntoBase({
+            repoRoot: run.repoRoot,
+            worktreePath: run.worktree.path,
+            baseBranch: targetBranch,
+        });
+        if (!rebase.success) {
+            run.status = "merge-conflict";
+            run.merge = {
+                ...run.merge,
+                status: "conflict",
+                conflictKind: "rebase",
+                conflictedFiles: rebase.conflictedFiles,
+                error: rebase.error,
+            };
+            await saveRunRecord(run);
+            return run;
+        }
+        const fastForward = await runCommand("git", ["merge", "--ff-only", run.worktree.branch], {
+            cwd: run.repoRoot,
+            allowFailure: true,
+        });
+        if (fastForward.code === 0) {
+            run.status = "merged";
+            run.merge = {
+                ...run.merge,
+                status: "merged",
+            };
+            await saveRunRecord(run);
+            return run;
+        }
+        const conflicted = await conflictedFiles(run.repoRoot);
+        run.status = conflicted.length ? "merge-conflict" : "failed";
+        run.merge = {
+            ...run.merge,
+            status: conflicted.length ? "conflict" : "failed",
+            conflictKind: "merge",
+            conflictedFiles: conflicted,
+            error: gitError(fastForward),
+        };
+        await saveRunRecord(run);
+        return run;
+    }
     const merge = await runCommand("git", ["merge", "--no-ff", run.worktree.branch], {
         cwd: run.repoRoot,
         allowFailure: true,
@@ -147,13 +195,132 @@ export async function mergeRunIntoCurrentBranch(run, allowDirty = false) {
     run.merge = {
         ...run.merge,
         status: "conflict",
+        conflictKind: "merge",
         conflictedFiles: conflicted,
-        error: merge.stderr.trim() || merge.stdout.trim(),
+        error: gitError(merge),
     };
     await saveRunRecord(run);
     return run;
 }
+export async function syncRunWorktree(run, baseBranch) {
+    if (!run.worktree.branch) {
+        throw new Error("Run has no worktree branch to sync.");
+    }
+    const targetBranch = baseBranch.trim() === "HEAD" ? run.targetBranch : baseBranch;
+    const previousStatus = run.status;
+    const previousSync = run.sync;
+    run.sync = {
+        status: "not-started",
+        attemptedAt: new Date().toISOString(),
+        baseBranch: targetBranch,
+    };
+    await saveRunRecord(run);
+    const commitFailure = await commitWorktreeChangesSafely(run, "sync");
+    if (commitFailure) {
+        return commitFailure;
+    }
+    const rebase = await rebaseWorktreeOntoBase({
+        repoRoot: run.repoRoot,
+        worktreePath: run.worktree.path,
+        baseBranch: targetBranch,
+    });
+    if (rebase.success) {
+        run.sync = {
+            ...run.sync,
+            status: "synced",
+            conflictedFiles: [],
+        };
+        if (previousStatus === "merge-conflict" &&
+            (run.merge?.conflictKind === "rebase" || previousSync?.status === "conflict")) {
+            run.status = "completed";
+            if (run.merge?.conflictKind === "rebase") {
+                run.merge = {
+                    ...run.merge,
+                    status: "not-started",
+                    conflictedFiles: undefined,
+                    error: undefined,
+                };
+            }
+        }
+        else {
+            run.status = previousStatus;
+        }
+        await saveRunRecord(run);
+        return run;
+    }
+    const conflict = rebase.conflictedFiles.length > 0;
+    run.sync = {
+        ...run.sync,
+        status: conflict ? "conflict" : "failed",
+        conflictedFiles: rebase.conflictedFiles,
+        error: rebase.error,
+    };
+    if (conflict && (previousStatus === "completed" || previousStatus === "merge-conflict")) {
+        run.status = "merge-conflict";
+    }
+    else {
+        run.status = previousStatus;
+    }
+    await saveRunRecord(run);
+    return run;
+}
+export async function rebaseWorktreeOntoBase(params) {
+    const baseRef = await resolveRebaseBaseRef(params.repoRoot, params.baseBranch);
+    const rebase = await runCommand("git", ["rebase", baseRef], {
+        cwd: params.worktreePath,
+        allowFailure: true,
+    });
+    if (rebase.code === 0) {
+        return {
+            success: true,
+            baseRef,
+            conflictedFiles: [],
+        };
+    }
+    return {
+        success: false,
+        baseRef,
+        conflictedFiles: await conflictedFiles(params.worktreePath),
+        error: gitError(rebase) || `Rebase onto ${baseRef} failed.`,
+    };
+}
+export async function resolveRebaseBaseRef(repoRoot, baseBranch) {
+    const branch = baseBranch.trim();
+    if (!branch || branch === "HEAD") {
+        return await currentCommit(repoRoot);
+    }
+    const hasOrigin = (await runCommand("git", ["remote", "get-url", "origin"], {
+        cwd: repoRoot,
+        allowFailure: true,
+    })).code === 0;
+    let fetched = false;
+    if (hasOrigin) {
+        const fetch = await runCommand("git", ["fetch", "origin", branch], {
+            cwd: repoRoot,
+            allowFailure: true,
+        });
+        fetched = fetch.code === 0;
+    }
+    const remoteRef = `refs/remotes/origin/${branch}`;
+    if (await refExists(repoRoot, remoteRef)) {
+        return remoteRef;
+    }
+    if (fetched && await refExists(repoRoot, "FETCH_HEAD")) {
+        return "FETCH_HEAD";
+    }
+    if (await refExists(repoRoot, branch)) {
+        return branch;
+    }
+    return await currentCommit(repoRoot);
+}
 async function commitWorktreeChanges(run) {
+    const unresolved = await conflictedFiles(run.worktree.path);
+    if (unresolved.length > 0) {
+        throw new Error(`Worktree has unresolved conflicts: ${unresolved.join(", ")}`);
+    }
+    if (await rebaseInProgress(run.worktree.path)) {
+        throw new Error(`Worktree has an unfinished rebase. Resolve it in ${run.worktree.path}, run git rebase --continue, then retry.`);
+    }
     if (!(await hasChanges(run.worktree.path))) {
         return;
     }
@@ -171,6 +338,73 @@ async function commitWorktreeChanges(run) {
             throw new Error(commit.stderr.trim() || commit.stdout.trim() || "Failed to commit worktree changes.");
         }
     }
+}
+async function commitWorktreeChangesSafely(run, phase) {
+    try {
+        await commitWorktreeChanges(run);
+        return null;
+    }
+    catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        run.status = "failed";
+        if (phase === "merge") {
+            run.merge = {
+                ...run.merge,
+                status: "failed",
+                error: message,
+            };
+        }
+        else {
+            run.sync = {
+                ...run.sync,
+                status: "failed",
+                error: message,
+            };
+        }
+        await saveRunRecord(run);
+        return run;
+    }
+}
+async function currentTargetBranch(run) {
+    const branch = await currentBranch(run.repoRoot);
+    return branch === "HEAD" ? run.targetBranch : branch;
+}
+async function refExists(repoRoot, ref) {
+    const result = await runCommand("git", ["rev-parse", "--verify", `${ref}^{commit}`], {
+        cwd: repoRoot,
+        allowFailure: true,
+    });
+    return result.code === 0;
+}
+async function rebaseInProgress(worktree) {
+    const gitPaths = await Promise.all([
+        gitPath(worktree, "rebase-merge"),
+        gitPath(worktree, "rebase-apply"),
+    ]);
+    for (const candidate of gitPaths) {
+        if (!candidate) {
+            continue;
+        }
+        try {
+            await fsp.access(candidate);
+            return true;
+        }
+        catch {
+            // Continue checking the other rebase state path.
+        }
+    }
+    return false;
+}
+async function gitPath(worktree, name) {
+    const result = await runCommand("git", ["rev-parse", "--git-path", name], {
+        cwd: worktree,
+        allowFailure: true,
+    });
+    const value = result.stdout.trim();
+    return result.code === 0 && value ? path.resolve(worktree, value) : null;
+}
+function gitError(result) {
+    return result.stderr.trim() || result.stdout.trim();
 }
 export async function conflictedFiles(repoRoot) {
     const result = await runCommand("git", ["diff", "--name-only", "--diff-filter=U"], {

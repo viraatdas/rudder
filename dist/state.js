@@ -51,7 +51,7 @@ function worktreeDirName(runId, task) {
 export async function loadConfig() {
     const existing = await readJson(globalConfigPath());
     if (existing?.version === 1) {
-        return existing;
+        return normalizeConfig(existing);
     }
     return defaultConfig();
 }
@@ -59,6 +59,7 @@ export function defaultConfig() {
     return {
         version: 1,
         defaultBackend: "claude",
+        mergeStrategy: "merge",
         runPolicy: {
             sameCheckout: "single-active",
             concurrentPromptMode: "worktree",
@@ -74,6 +75,29 @@ export function defaultConfig() {
             acpx: { model: "gpt-5.5" },
         },
     };
+}
+function normalizeConfig(existing) {
+    const defaults = defaultConfig();
+    return {
+        ...defaults,
+        ...existing,
+        mergeStrategy: parseMergeStrategy(existing.mergeStrategy),
+        runPolicy: {
+            ...defaults.runPolicy,
+            ...(existing.runPolicy ?? {}),
+        },
+        acpx: {
+            ...defaults.acpx,
+            ...(existing.acpx ?? {}),
+        },
+        backends: {
+            ...defaults.backends,
+            ...(existing.backends ?? {}),
+        },
+    };
+}
+function parseMergeStrategy(value) {
+    return value === "rebase" ? "rebase" : "merge";
 }
 export async function saveConfig(config) {
     await writeJson(globalConfigPath(), config, { mode: 0o600 });

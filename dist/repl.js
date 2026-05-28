@@ -2,7 +2,7 @@ import readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import { runDoctor } from "./auth.js";
 import { currentBranch, findRepoRoot } from "./git.js";
-import { cleanupRuns, listProjectRuns, mergeRun, printLogs, startRun, statusRuns, stopRun, watchRun, } from "./run-manager.js";
+import { cleanupRuns, listProjectRuns, mergeRun, printLogs, startRun, statusRuns, stopRun, syncRun, watchRun, } from "./run-manager.js";
 import { loadConfig, rememberBackendSelection } from "./state.js";
 import { shortenHome } from "./util.js";
 export async function runInteractiveShell(defaults) {
@@ -103,6 +103,9 @@ async function handleSlashCommand(line, state) {
                 return false;
             }
             await mergeRun(args[0], args.includes("--allow-dirty"));
+            return false;
+        case "sync":
+            await syncRun(args[0]);
             return false;
         case "cleanup":
             await cleanupRuns(args.includes("--force"));
@@ -209,6 +212,7 @@ function printShellHelp() {
   /logs [run] [--follow]       Print saved output
   /stop <run>                  Cancel a run
   /merge <run>                 Merge a worktree run
+  /sync [run]                  Rebase a worktree onto its base branch; conflicts stay in that worktree
   /cleanup [--force]           Remove merged worktrees
   /doctor                      Check local tools and auth
   /exit                        Leave the shell

@@ -987,7 +987,9 @@ export async function syncRun(runId?: string, options?: { silent?: boolean }): P
   if (run.status === "merged") {
     throw new Error(`Run ${run.id} is already merged.`);
   }
-  const synced = await syncRunWorktree(run, run.targetBranch || await currentBranch(repoRoot));
+  const current = await currentBranch(repoRoot);
+  const baseBranch = current === "HEAD" ? run.targetBranch : current;
+  const synced = await syncRunWorktree(run, baseBranch);
   await emit(synced, {
     ts: nowIso(),
     runId: synced.id,

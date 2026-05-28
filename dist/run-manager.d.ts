@@ -63,6 +63,9 @@ export declare function stopRun(runId: string, options?: {
 export declare function mergeRun(runId: string, allowDirty?: boolean, options?: {
     silent?: boolean;
 }): Promise<RunRecord>;
+export declare function syncRun(runId?: string, options?: {
+    silent?: boolean;
+}): Promise<RunRecord>;
 export declare function deleteRun(runId: string, options?: {
     mergeFirst?: boolean;
     force?: boolean;

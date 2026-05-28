@@ -8,7 +8,7 @@ import { permissionAttentionFromOutput } from "./agent-attention.js";
 import { currentBranch, findRepoRoot } from "./git.js";
 import { discoverModelOptions, fallbackModelOptions } from "./models.js";
 import { eventsPath, listRuns, loadConfig, outputPath, rememberBackendSelection, } from "./state.js";
-import { continueRun, deleteRun, mergeRun, startRun, stopRun } from "./run-manager.js";
+import { continueRun, deleteRun, mergeRun, startRun, stopRun, syncRun } from "./run-manager.js";
 import { taskDisplayLabel } from "./task-summary.js";
 import { pathExists, shortenHome } from "./util.js";
 const INTERACTIVE_BACKENDS = ["claude", "codex"];
@@ -23,6 +23,7 @@ const COMMANDS = [
     { name: "stop", detail: "stop the selected run", insert: "/stop" },
     { name: "delete", detail: "delete selected run and its worktree", insert: "/delete" },
     { name: "copy", detail: "copy selected worker transcript", insert: "/copy" },
+    { name: "sync", detail: "rebase the selected worktree without merging", insert: "/sync" },
     { name: "merge", detail: "merge the selected completed worktree", insert: "/merge" },
     { name: "merge-all", detail: "merge all completed worktrees", insert: "/merge-all" },
     { name: "clear", detail: "collapse all run cards", insert: "/clear" },
@@ -244,8 +245,11 @@ function RudderTui({ defaults }) {
                     setConflictPrompt({ runId: prompt.runId, files });
                     setNotice(`Merge conflict in ${files.length || "unknown"} file${files.length === 1 ? "" : "s"}; press y for AI help or n for manual`);
                 }
-                else {
+                else if (merged.merge?.status === "merged") {
                     setNotice(`Merged ${shortId(prompt.runId)}`);
+                }
+                else {
+                    setNotice(`Merge failed for ${shortId(prompt.runId)}: ${merged.merge?.error ?? "unknown error"}`);
                 }
                 await refresh();
                 return;
@@ -257,6 +261,11 @@ function RudderTui({ defaults }) {
                     const files = merged.merge.conflictedFiles ?? [];
                     setConflictPrompt({ runId, files });
                     setNotice(`Merge all stopped after ${mergedCount}: conflict in ${shortId(runId)}; press y for AI help or n for manual`);
+                    await refresh();
+                    return;
+                }
+                if (merged.merge?.status !== "merged") {
+                    setNotice(`Merge all stopped after ${mergedCount}: failed in ${shortId(runId)}: ${merged.merge?.error ?? "unknown error"}`);
                     await refresh();
                     return;
                 }
@@ -314,6 +323,22 @@ function RudderTui({ defaults }) {
             setNotice(error instanceof Error ? error.message : String(error));
         }
     }, [selectedRun]);
+    const syncSelectedRun = useCallback(async (runOverride) => {
+        const run = runOverride ?? selectedRun;
+        if (!run) {
+            setNotice("No agent selected");
+            return;
+        }
+        try {
+            const synced = await syncRun(run.id, { silent: true });
+            setNotice(syncNotice(synced));
+            await refresh();
+        }
+        catch (error) {
+            setNotice(error instanceof Error ? error.message : String(error));
+            await refresh();
+        }
+    }, [refresh, selectedRun]);
     const handleCommand = useCallback(async (line) => {
         const [command = "", ...args] = line.slice(1).trim().split(/\s+/).filter(Boolean);
         switch (command) {
@@ -396,6 +421,10 @@ function RudderTui({ defaults }) {
                 await copySelectedTranscript(resolveUiRun(runs, args[0] ?? selectedRun?.id));
                 setInput("");
                 return;
+            case "sync":
+                await syncSelectedRun(resolveUiRun(runs, args[0] ?? selectedRun?.id));
+                setInput("");
+                return;
             case "merge":
                 requestMergeRun(resolveUiRun(runs, args[0] ?? selectedRun?.id), args.includes("--allow-dirty"));
                 setInput("");
@@ -413,7 +442,7 @@ function RudderTui({ defaults }) {
                 setNotice(`Unknown command: /${command}`);
                 setInput("");
         }
-    }, [app, backend, copySelectedTranscript, refresh, requestDeleteSelectedRun, requestMergeAll, requestMergeRun, runs, selectedRun?.id]);
+    }, [app, backend, copySelectedTranscript, refresh, requestDeleteSelectedRun, requestMergeAll, requestMergeRun, runs, selectedRun?.id, syncSelectedRun]);
     const selectModelOption = useCallback((index) => {
         const option = modelOptions[index];
         if (!option) {
@@ -679,6 +708,10 @@ function RudderTui({ defaults }) {
             void runAction(selectedRun.id, async (id) => stopRun(id, { silent: true }), "Stopped", setNotice, refresh);
             return;
         }
+        if (input.length === 0 && value === "u" && selectedRun) {
+            void syncSelectedRun();
+            return;
+        }
         if (input.length === 0 && value === "m" && selectedRun) {
             requestMergeRun(selectedRun);
             return;
@@ -752,7 +785,7 @@ function WorkerComposer(props) {
     return (_jsxs(Box, { flexDirection: "column", marginTop: 1, borderStyle: "single", borderColor: "cyan", paddingX: 1, children: [_jsxs(Box, { justifyContent: "space-between", children: [_jsxs(Text, { children: [_jsx(FocusPill, { label: label }), _jsxs(Text, { color: props.submitting ? "yellow" : "cyan", children: [" ", props.submitting ? "sending" : shortId(props.run.id)] }), _jsxs(Text, { children: ["  ", truncate(value, Math.max(8, props.width - 28))] }), _jsx(Text, { color: "cyan", children: "_" })] }), _jsx(Text, { color: "gray", children: active ? "running" : "resumable" })] }), _jsx(Text, { color: "gray", children: fitLine(`${helper}. Option-1/2/3 changes pane, Esc returns to task.`, props.width) })] }));
 }
 function Help() {
-    return (_jsxs(Box, { borderStyle: "single", borderColor: "yellow", paddingX: 1, flexDirection: "column", children: [_jsx(Text, { bold: true, color: "yellow", children: "keys" }), _jsxs(Text, { children: [_jsx(Text, { color: "cyan", children: "Option-1/2/3" }), " focus agents/worker/task   ", _jsx(Text, { color: "cyan", children: "Enter" }), " submit focused input   ", _jsx(Text, { color: "cyan", children: "j/k" }), " select run"] }), _jsxs(Text, { children: [_jsx(Text, { color: "cyan", children: "worker focus" }), " type to selected agent; running agents are interrupted on Enter   ", _jsx(Text, { color: "cyan", children: "n" }), " new task   ", _jsx(Text, { color: "cyan", children: "x" }), " expand   ", _jsx(Text, { color: "cyan", children: "l" }), " transcript"] }), _jsxs(Text, { children: [_jsx(Text, { color: "cyan", children: "o" }), " model picker   ", _jsx(Text, { color: "cyan", children: "/" }), " command search   ", _jsx(Text, { color: "cyan", children: "dd" }), " delete   ", _jsx(Text, { color: "cyan", children: "y" }), " copy transcript   ", _jsx(Text, { color: "cyan", children: "s" }), " stop   ", _jsx(Text, { color: "cyan", children: "m/M" }), " merge"] }), _jsx(Text, { color: "gray", children: "Slash: /backend claude|codex, /model, /model <name>, /agent, /interrupt, /new, /worktree, /stop, /delete, /copy, /merge, /merge-all, /exit" })] }));
+    return (_jsxs(Box, { borderStyle: "single", borderColor: "yellow", paddingX: 1, flexDirection: "column", children: [_jsx(Text, { bold: true, color: "yellow", children: "keys" }), _jsxs(Text, { children: [_jsx(Text, { color: "cyan", children: "Option-1/2/3" }), " focus agents/worker/task   ", _jsx(Text, { color: "cyan", children: "Enter" }), " submit focused input   ", _jsx(Text, { color: "cyan", children: "j/k" }), " select run"] }), _jsxs(Text, { children: [_jsx(Text, { color: "cyan", children: "worker focus" }), " type to selected agent; running agents are interrupted on Enter   ", _jsx(Text, { color: "cyan", children: "n" }), " new task   ", _jsx(Text, { color: "cyan", children: "x" }), " expand   ", _jsx(Text, { color: "cyan", children: "l" }), " transcript"] }), _jsxs(Text, { children: [_jsx(Text, { color: "cyan", children: "o" }), " model picker   ", _jsx(Text, { color: "cyan", children: "/" }), " command search   ", _jsx(Text, { color: "cyan", children: "dd" }), " delete   ", _jsx(Text, { color: "cyan", children: "y" }), " copy transcript   ", _jsx(Text, { color: "cyan", children: "s" }), " stop   ", _jsx(Text, { color: "cyan", children: "u" }), " sync   ", _jsx(Text, { color: "cyan", children: "m/M" }), " merge"] }), _jsx(Text, { color: "gray", children: "Slash: /backend claude|codex, /model, /model <name>, /agent, /interrupt, /new, /worktree, /stop, /delete, /copy, /sync, /merge, /merge-all, /exit" })] }));
 }
 function FocusPill(props) {
     return (_jsxs(Text, { backgroundColor: "cyan", color: "black", bold: true, children: [" ", props.label.toUpperCase(), " "] }));
@@ -813,7 +846,7 @@ function StatusDock(props) {
     return (_jsxs(Box, { borderStyle: "single", borderColor: "gray", paddingX: 1, justifyContent: "space-between", children: [_jsx(Text, { color: "gray", children: "worker input is active inside the selected agent pane" }), _jsx(Text, { color: "gray", children: props.notice })] }));
 }
 function Footer(props) {
-    return (_jsx(Box, { children: _jsxs(Text, { color: "gray", children: ["focus:", props.focusPane, "  Opt-1/2/3 focus  / commands  o model  n new  c worker  dd delete  y copy  m/M merge  ? help"] }) }));
+    return (_jsx(Box, { children: _jsxs(Text, { color: "gray", children: ["focus:", props.focusPane, "  Opt-1/2/3 focus  / commands  o model  n new  c worker  u sync  dd delete  y copy  m/M merge  ? help"] }) }));
 }
 async function loadUiRuns(repoRoot) {
     const runs = await listRuns(repoRoot);
@@ -907,7 +940,14 @@ function buildWork(events, run) {
             continue;
         }
         if (event.type === "merge.result") {
-            items.push({ label: "merge", detail: event.message, tone: event.message?.includes("conflict") ? "warning" : "success" });
+            const detail = event.message;
+            const tone = detail?.includes("conflict") || detail?.includes("failed") ? "warning" : "success";
+            items.push({ label: "merge", detail, tone });
+        }
+        if (event.type === "sync.result") {
+            const detail = event.message;
+            const tone = detail?.includes("conflict") || detail?.includes("failed") ? "warning" : "success";
+            items.push({ label: "sync", detail, tone });
         }
     }
     return compactWork(items);
@@ -1194,7 +1234,7 @@ function progressBar(percent) {
     return `[${"#".repeat(filled)}${"-".repeat(width - filled)}]`;
 }
 function canMerge(run) {
-    return run.status === "completed" && run.worktree.enabled;
+    return (run.status === "completed" || (run.status === "merge-conflict" && run.merge?.conflictKind === "rebase")) && run.worktree.enabled;
 }
 function runSummary(run) {
     if (runNeedsPermission(run)) {
@@ -1218,7 +1258,7 @@ function workerStateLabel(run) {
         return "needs permission";
     }
     if (run.status === "completed") {
-        return canMerge(run) ? "done  m merge" : "done";
+        return canMerge(run) ? "done  u sync  m merge" : "done";
     }
     if (run.status === "merged") {
         return "merged";
@@ -1233,6 +1273,16 @@ function workerStateLabel(run) {
         return "checking";
     }
     return "running";
+}
+function syncNotice(run) {
+    if (run.sync?.status === "synced") {
+        return `Synced ${shortId(run.id)}`;
+    }
+    if (run.sync?.status === "conflict") {
+        const count = run.sync.conflictedFiles?.length || "unknown";
+        return `Sync conflict in ${count} file${count === 1 ? "" : "s"}; resolve in the worktree and run git rebase --continue`;
+    }
+    return `Sync failed: ${run.sync?.error ?? "unknown error"}`;
 }
 function agentRailSummary(run) {
     if (runNeedsPermission(run)) {

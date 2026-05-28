@@ -9,7 +9,7 @@ import { findRepoRoot } from "./git.js";
 import { backfillLlmTaskSummaries, projectStateDir, runsDir } from "./state.js";
 import { discoverModelOptions } from "./models.js";
 import { resolveNativeBinaryPath } from "./native-binary.js";
-import { cleanupRuns, deleteRun, listProjectRuns, mergeRun, printLogs, startRun, statusRuns, stopRun, watchRun, workerRun, } from "./run-manager.js";
+import { cleanupRuns, deleteRun, listProjectRuns, mergeRun, printLogs, startRun, statusRuns, stopRun, syncRun, watchRun, workerRun, } from "./run-manager.js";
 import { runInteractiveShell } from "./repl.js";
 import { runTmuxAgentPane, runTmuxTaskPane, runTmuxWorkerIdle } from "./tmux-dashboard.js";
 import { runInteractiveTui } from "./tui.js";
@@ -272,6 +272,9 @@ export async function main() {
             await mergeRun(run, Boolean(parsed.flags.allowDirty));
             return;
         }
+        case "sync":
+            await syncRun(parsed.args[0]);
+            return;
         case "cleanup":
             await cleanupRuns(Boolean(parsed.flags.force));
             return;
@@ -672,6 +675,7 @@ Run management:
   rudder stop <run>               Cancel a run
   rudder delete <run>             Delete a run and its worktree
   rudder merge <run>              Merge a worktree run into current branch
+  rudder sync [run]               Rebase a worktree onto its base branch without merging
   rudder cleanup [--force]        Remove merged worktrees
 
 Setup:
@@ -710,6 +714,11 @@ Options:
       --json                      Machine-readable output
   -v, --version                   Print version
       --allow-dirty               Allow merge into dirty target branch
+
+Rebase-first merge:
+  Set {"mergeStrategy":"rebase"} in ~/.rudder/config.json to rebase before
+  merging. If that rebase conflicts, Rudder leaves the worktree mid-rebase so
+  you can resolve it, run git rebase --continue, and retry sync or merge.
 `);
 }
 //# sourceMappingURL=main.js.map

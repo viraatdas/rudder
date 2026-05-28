@@ -154,7 +154,7 @@ export async function mergeRunIntoCurrentBranch(
   if (!allowDirty && (await hasChanges(run.repoRoot))) {
     throw new Error("Target branch is dirty. Commit/stash changes or pass --allow-dirty.");
   }
-  const targetBranch = await currentBranch(run.repoRoot);
+  const targetBranch = await currentTargetBranch(run);
   run.merge = {
     status: "not-started",
     attemptedAt: new Date().toISOString(),
@@ -163,7 +163,10 @@ export async function mergeRunIntoCurrentBranch(
   };
   await saveRunRecord(run);
 
-  await commitWorktreeChanges(run);
+  const commitFailure = await commitWorktreeChangesSafely(run, "merge");
+  if (commitFailure) {
+    return commitFailure;
+  }
 
   if (strategy === "rebase") {
     const rebase = await rebaseWorktreeOntoBase({
@@ -242,21 +245,25 @@ export async function syncRunWorktree(run: RunRecord, baseBranch: string): Promi
   if (!run.worktree.branch) {
     throw new Error("Run has no worktree branch to sync.");
   }
+  const targetBranch = baseBranch.trim() === "HEAD" ? run.targetBranch : baseBranch;
   const previousStatus = run.status;
   const previousSync = run.sync;
   run.sync = {
     status: "not-started",
     attemptedAt: new Date().toISOString(),
-    baseBranch,
+    baseBranch: targetBranch,
   };
   await saveRunRecord(run);
 
-  await commitWorktreeChanges(run);
+  const commitFailure = await commitWorktreeChangesSafely(run, "sync");
+  if (commitFailure) {
+    return commitFailure;
+  }
 
   const rebase = await rebaseWorktreeOntoBase({
     repoRoot: run.repoRoot,
     worktreePath: run.worktree.path,
-    baseBranch,
+    baseBranch: targetBranch,
   });
   if (rebase.success) {
     run.sync = {
@@ -382,6 +389,36 @@ async function commitWorktreeChanges(run: RunRecord): Promise<void> {
       throw new Error(commit.stderr.trim() || commit.stdout.trim() || "Failed to commit worktree changes.");
     }
   }
+}
+
+async function commitWorktreeChangesSafely(run: RunRecord, phase: "merge" | "sync"): Promise<RunRecord | null> {
+  try {
+    await commitWorktreeChanges(run);
+    return null;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    run.status = "failed";
+    if (phase === "merge") {
+      run.merge = {
+        ...run.merge,
+        status: "failed",
+        error: message,
+      };
+    } else {
+      run.sync = {
+        ...run.sync,
+        status: "failed",
+        error: message,
+      };
+    }
+    await saveRunRecord(run);
+    return run;
+  }
+}
+
+async function currentTargetBranch(run: RunRecord): Promise<string> {
+  const branch = await currentBranch(run.repoRoot);
+  return branch === "HEAD" ? run.targetBranch : branch;
 }
 
 async function refExists(repoRoot: string, ref: string): Promise<boolean> {

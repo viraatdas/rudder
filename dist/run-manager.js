@@ -9,7 +9,7 @@ import { nativeAgentCommand } from "./native-agents.js";
 import { buildPlanPrompt, PLAN_MODE_CONTRACT } from "./plan-mode.js";
 import { createRunRecord, agentContextPath, eventsPath, listRuns, loadConfig, loadRunRecord, outputPath, rememberBackendSelection, resolveRun, runDir, saveRunRecord, } from "./state.js";
 import { appendEvent, } from "./state.js";
-import { activeRunsForCheckout, createRunWorktree, currentBranch, currentCommit, findRepoRoot, hasChanges, mergeRunIntoCurrentBranch, processAlive, removeWorktree, worktreeBaseCommit, } from "./git.js";
+import { activeRunsForCheckout, createRunWorktree, currentBranch, currentCommit, findRepoRoot, hasChanges, mergeRunIntoCurrentBranch, processAlive, removeWorktree, syncRunWorktree, worktreeBaseCommit, } from "./git.js";
 import { commandExists, ensureDir, isTty, MissingToolError, newRunId, nowIso, pathExists, runCommand, shortenHome, } from "./util.js";
 import { createAgentPane, killPane, normalizeTmuxDashboardLayout, paneExitStatus, respawnPane, selectPane } from "./tmux.js";
 import { taskDisplayLabel } from "./task-summary.js";
@@ -814,14 +814,13 @@ export async function mergeRun(runId, allowDirty = false, options) {
     if (!run) {
         throw new Error(`Run not found: ${runId}`);
     }
-    const merged = await mergeRunIntoCurrentBranch(run, allowDirty);
+    const config = await loadConfig();
+    const merged = await mergeRunIntoCurrentBranch(run, allowDirty, config.mergeStrategy);
     await emit(merged, {
         ts: nowIso(),
         runId,
         type: "merge.result",
-        message: merged.merge?.status === "merged"
-            ? "Merged successfully"
-            : `Merge conflict: ${(merged.merge?.conflictedFiles ?? []).join(", ")}`,
+        message: mergeResultMessage(merged),
         data: (merged.merge ?? {}),
     });
     if (merged.merge?.status === "merged") {
@@ -833,12 +832,64 @@ export async function mergeRun(runId, allowDirty = false, options) {
     }
     await writeAgentContext(repoRoot);
     if (!options?.silent) {
-        console.log(`Merge conflict for ${runId}`);
-        for (const file of merged.merge?.conflictedFiles ?? []) {
-            console.log(`  ${file}`);
+        if (merged.merge?.status === "conflict") {
+            const kind = merged.merge.conflictKind === "rebase" ? "Rebase conflict" : "Merge conflict";
+            console.log(`${kind} for ${runId}`);
+            for (const file of merged.merge?.conflictedFiles ?? []) {
+                console.log(`  ${file}`);
+            }
+            if (merged.merge.conflictKind === "rebase") {
+                console.log(`Resolve in ${shortenHome(merged.worktree.path)}, run git rebase --continue, then retry rudder merge ${runId}.`);
+            }
+        }
+        else {
+            console.log(`Merge failed for ${runId}: ${merged.merge?.error ?? "unknown error"}`);
         }
     }
     return merged;
+}
+export async function syncRun(runId, options) {
+    const repoRoot = findRepoRoot();
+    const run = await resolveRun(repoRoot, runId);
+    if (!run) {
+        throw new Error("No runs found.");
+    }
+    if (!run.worktree.enabled || !run.worktree.branch) {
+        throw new Error(`Run ${run.id} has no worktree branch to sync.`);
+    }
+    if (isActiveStatus(run.status)) {
+        throw new Error(`Run ${run.id} is still active; wait for it to finish before syncing.`);
+    }
+    if (run.status === "merged") {
+        throw new Error(`Run ${run.id} is already merged.`);
+    }
+    const current = await currentBranch(repoRoot);
+    const baseBranch = current === "HEAD" ? run.targetBranch : current;
+    const synced = await syncRunWorktree(run, baseBranch);
+    await emit(synced, {
+        ts: nowIso(),
+        runId: synced.id,
+        type: "sync.result",
+        message: syncResultMessage(synced),
+        data: (synced.sync ?? {}),
+    });
+    await writeAgentContext(repoRoot);
+    if (!options?.silent) {
+        if (synced.sync?.status === "synced") {
+            console.log(`Synced ${synced.id} with ${synced.sync.baseBranch ?? synced.targetBranch}`);
+        }
+        else if (synced.sync?.status === "conflict") {
+            console.log(`Rebase conflict for ${synced.id}`);
+            for (const file of synced.sync.conflictedFiles ?? []) {
+                console.log(`  ${file}`);
+            }
+            console.log(`Resolve in ${shortenHome(synced.worktree.path)}, run git rebase --continue, then retry rudder sync ${synced.id}.`);
+        }
+        else {
+            console.log(`Sync failed for ${synced.id}: ${synced.sync?.error ?? "unknown error"}`);
+        }
+    }
+    return synced;
 }
 export async function deleteRun(runId, options) {
     const repoRoot = findRepoRoot();
@@ -867,6 +918,37 @@ export async function deleteRun(runId, options) {
     if (!options?.silent) {
         console.log(`Deleted ${runId}`);
     }
+}
+function mergeResultMessage(run) {
+    if (run.merge?.status === "merged") {
+        return run.merge.strategy === "rebase"
+            ? "Rebased and fast-forward merged successfully"
+            : "Merged successfully";
+    }
+    if (run.merge?.status === "conflict") {
+        const files = (run.merge.conflictedFiles ?? []).join(", ") || "unknown files";
+        if (run.merge.conflictKind === "rebase") {
+            return `Rebase conflict before merge: ${files}. Resolve in the worktree, run git rebase --continue, then retry merge.`;
+        }
+        return `Merge conflict: ${files}`;
+    }
+    if (run.merge?.status === "failed") {
+        return `Merge failed: ${run.merge.error ?? "unknown error"}`;
+    }
+    return "Merge did not complete";
+}
+function syncResultMessage(run) {
+    if (run.sync?.status === "synced") {
+        return `Synced with ${run.sync.baseBranch ?? run.targetBranch}`;
+    }
+    if (run.sync?.status === "conflict") {
+        const files = (run.sync.conflictedFiles ?? []).join(", ") || "unknown files";
+        return `Rebase conflict while syncing: ${files}. Resolve in the worktree, run git rebase --continue, then retry sync.`;
+    }
+    if (run.sync?.status === "failed") {
+        return `Sync failed: ${run.sync.error ?? "unknown error"}`;
+    }
+    return "Sync did not complete";
 }
 export async function cleanupRuns(force = false) {
     const repoRoot = findRepoRoot();
@@ -1120,6 +1202,9 @@ function renderShellEvent(event, state) {
         return { text: "cancelled", sawStreamingText, partialOpen };
     }
     if (event.type === "merge.result") {
+        return { text: event.message, sawStreamingText, partialOpen };
+    }
+    if (event.type === "sync.result") {
         return { text: event.message, sawStreamingText, partialOpen };
     }
     return { sawStreamingText, partialOpen };

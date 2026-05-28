@@ -308,8 +308,10 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
           const files = merged.merge.conflictedFiles ?? [];
           setConflictPrompt({ runId: prompt.runId, files });
           setNotice(`Merge conflict in ${files.length || "unknown"} file${files.length === 1 ? "" : "s"}; press y for AI help or n for manual`);
-        } else {
+        } else if (merged.merge?.status === "merged") {
           setNotice(`Merged ${shortId(prompt.runId)}`);
+        } else {
+          setNotice(`Merge failed for ${shortId(prompt.runId)}: ${merged.merge?.error ?? "unknown error"}`);
         }
         await refresh();
         return;
@@ -322,6 +324,11 @@ function RudderTui({ defaults }: { defaults: TuiDefaults }): React.ReactElement 
           const files = merged.merge.conflictedFiles ?? [];
           setConflictPrompt({ runId, files });
           setNotice(`Merge all stopped after ${mergedCount}: conflict in ${shortId(runId)}; press y for AI help or n for manual`);
+          await refresh();
+          return;
+        }
+        if (merged.merge?.status !== "merged") {
+          setNotice(`Merge all stopped after ${mergedCount}: failed in ${shortId(runId)}: ${merged.merge?.error ?? "unknown error"}`);
           await refresh();
           return;
         }
@@ -1216,7 +1223,9 @@ function buildWork(events: RudderEvent[], run: RunRecord): WorkItem[] {
       continue;
     }
     if (event.type === "merge.result") {
-      items.push({ label: "merge", detail: event.message, tone: event.message?.includes("conflict") ? "warning" : "success" });
+      const detail = event.message;
+      const tone = detail?.includes("conflict") || detail?.includes("failed") ? "warning" : "success";
+      items.push({ label: "merge", detail, tone });
     }
     if (event.type === "sync.result") {
       const detail = event.message;

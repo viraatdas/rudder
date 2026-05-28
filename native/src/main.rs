@@ -3750,18 +3750,18 @@ impl App {
     ) {
         let mut operation = ConflictOperation::Merge;
         let mut conflict_root = self.cwd.clone();
-        let mut conflicted_files = conflicted_files(&self.cwd);
-        if conflicted_files.is_empty() {
+        let mut conflicts = conflicted_files(&self.cwd);
+        if conflicts.is_empty() {
             if let Some(path) = worktree_path.as_ref() {
                 let worktree_conflicts = conflicted_files(path);
                 if !worktree_conflicts.is_empty() {
                     operation = ConflictOperation::Rebase;
                     conflict_root = path.clone();
-                    conflicted_files = worktree_conflicts;
+                    conflicts = worktree_conflicts;
                 }
             }
         }
-        if conflicted_files.is_empty() {
+        if conflicts.is_empty() {
             let prefix = merged_before_error
                 .map(|count| format!("merge all stopped after {count}: "))
                 .unwrap_or_else(|| "merge stopped: ".to_string());
@@ -3779,12 +3779,12 @@ impl App {
             return;
         }
 
-        let count = conflicted_files.len();
+        let count = conflicts.len();
         let target_branch = current_branch_at(&self.cwd);
         self.conflict_prompt = Some(MergeConflictPrompt {
             operation,
             task,
-            conflicted_files,
+            conflicted_files: conflicts,
             error: error.to_string(),
             repo_root: conflict_root,
             target_branch,
