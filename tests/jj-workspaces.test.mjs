@@ -70,6 +70,15 @@ test("detectVcsMode respects auto detection and explicit overrides", async (t) =
   assert.throws(() => detectVcsMode(env.repo, "jj"), /not inside a jj repository/);
 });
 
+test("auto detection ignores an enclosing jj repo for a nested git repo", async (t) => {
+  const env = await setupFakeJj(t);
+  const nestedGit = path.join(env.repo, "nested-git");
+  await fsp.mkdir(path.join(nestedGit, ".git"), { recursive: true });
+
+  assert.equal(detectVcsMode(nestedGit), "git");
+  assert.throws(() => detectVcsMode(nestedGit, "jj"), /not inside a jj repository/);
+});
+
 test("createRunJjWorkspace and removeJjWorkspace use jj workspace commands", async (t) => {
   const env = await setupFakeJj(t);
 
@@ -286,7 +295,14 @@ case "\${1:-}" in
     exit 0
     ;;
   log)
-    if [ -n "\${JJ_SOURCE_WORKSPACE:-}" ] && [ "$(pwd)" = "\${JJ_SOURCE_WORKSPACE}" ]; then
+    if [ -n "\${JJ_SOURCE_WORKSPACE:-}" ]; then
+      current_pwd=$(pwd -P)
+      source_pwd=$(cd "\${JJ_SOURCE_WORKSPACE}" && pwd -P)
+    else
+      current_pwd=""
+      source_pwd="__unset__"
+    fi
+    if [ -n "\${JJ_SOURCE_WORKSPACE:-}" ] && [ "\${current_pwd}" = "\${source_pwd}" ]; then
       echo "\${JJ_SOURCE_CHANGE:-sourcechange}"
     else
       echo "\${JJ_TARGET_CHANGE:-targetchange}"

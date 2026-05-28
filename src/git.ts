@@ -41,7 +41,10 @@ export function isJjRepo(cwd: string): boolean {
     cwd,
     allowFailure: true,
   });
-  return result.code === 0 || findJjMarker(cwd) !== null;
+  if (result.code === 0 && result.stdout.trim()) {
+    return samePath(result.stdout.trim(), cwd);
+  }
+  return hasLocalJjMarker(cwd);
 }
 
 export function findJjRoot(cwd: string): string {
@@ -63,7 +66,7 @@ export function detectVcsMode(repoRoot: string, configured?: VcsMode): VcsMode {
     return "git";
   }
   if (configured === "jj") {
-    ensureJjRepo(repoRoot);
+    ensureJjRepoRoot(repoRoot);
     return "jj";
   }
   return isJjRepo(repoRoot) ? "jj" : "git";
@@ -482,8 +485,30 @@ function ensureJjRepo(cwd: string): void {
     cwd,
     allowFailure: true,
   });
-  if (result.code !== 0) {
+  if (result.code !== 0 || !result.stdout.trim()) {
     throw new Error(`Configured vcs is "jj", but ${cwd} is not inside a jj repository.`);
+  }
+}
+
+function ensureJjRepoRoot(cwd: string): void {
+  if (!commandExists("jj")) {
+    throw new MissingToolError("jj");
+  }
+  const result = runCommandSync("jj", ["root"], {
+    cwd,
+    allowFailure: true,
+  });
+  if (result.code !== 0 || !result.stdout.trim() || !samePath(result.stdout.trim(), cwd)) {
+    throw new Error(`Configured vcs is "jj", but ${cwd} is not inside a jj repository.`);
+  }
+}
+
+function hasLocalJjMarker(cwd: string): boolean {
+  const marker = path.join(path.resolve(cwd), ".jj");
+  try {
+    return fs.statSync(marker).isDirectory();
+  } catch {
+    return false;
   }
 }
 
@@ -506,6 +531,18 @@ function findJjMarker(cwd: string): string | null {
     }
     current = parent;
   }
+}
+
+function samePath(left: string, right: string): boolean {
+  const normalize = (value: string) => {
+    const resolved = path.resolve(value);
+    try {
+      return fs.realpathSync(resolved);
+    } catch {
+      return resolved;
+    }
+  };
+  return normalize(left) === normalize(right);
 }
 
 function isJjStatusMetadata(line: string): boolean {

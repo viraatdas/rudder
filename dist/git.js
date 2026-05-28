@@ -27,7 +27,10 @@ export function isJjRepo(cwd) {
         cwd,
         allowFailure: true,
     });
-    return result.code === 0 || findJjMarker(cwd) !== null;
+    if (result.code === 0 && result.stdout.trim()) {
+        return samePath(result.stdout.trim(), cwd);
+    }
+    return hasLocalJjMarker(cwd);
 }
 export function findJjRoot(cwd) {
     if (commandExists("jj")) {
@@ -47,7 +50,7 @@ export function detectVcsMode(repoRoot, configured) {
         return "git";
     }
     if (configured === "jj") {
-        ensureJjRepo(repoRoot);
+        ensureJjRepoRoot(repoRoot);
         return "jj";
     }
     return isJjRepo(repoRoot) ? "jj" : "git";
@@ -417,8 +420,29 @@ function ensureJjRepo(cwd) {
         cwd,
         allowFailure: true,
     });
-    if (result.code !== 0) {
+    if (result.code !== 0 || !result.stdout.trim()) {
         throw new Error(`Configured vcs is "jj", but ${cwd} is not inside a jj repository.`);
+    }
+}
+function ensureJjRepoRoot(cwd) {
+    if (!commandExists("jj")) {
+        throw new MissingToolError("jj");
+    }
+    const result = runCommandSync("jj", ["root"], {
+        cwd,
+        allowFailure: true,
+    });
+    if (result.code !== 0 || !result.stdout.trim() || !samePath(result.stdout.trim(), cwd)) {
+        throw new Error(`Configured vcs is "jj", but ${cwd} is not inside a jj repository.`);
+    }
+}
+function hasLocalJjMarker(cwd) {
+    const marker = path.join(path.resolve(cwd), ".jj");
+    try {
+        return fs.statSync(marker).isDirectory();
+    }
+    catch {
+        return false;
     }
 }
 function findJjMarker(cwd) {
@@ -441,6 +465,18 @@ function findJjMarker(cwd) {
         }
         current = parent;
     }
+}
+function samePath(left, right) {
+    const normalize = (value) => {
+        const resolved = path.resolve(value);
+        try {
+            return fs.realpathSync(resolved);
+        }
+        catch {
+            return resolved;
+        }
+    };
+    return normalize(left) === normalize(right);
 }
 function isJjStatusMetadata(line) {
     return (/^the working copy has no changes\.?$/i.test(line) ||
