@@ -1,7 +1,7 @@
 import fsp from "node:fs/promises";
 import path from "node:path";
 import type { RunRecord, SpecContract, VerificationResult } from "./types.js";
-import { currentBranch, currentCommit, gitDiff, gitStatus, hasChanges } from "./git.js";
+import { currentBranch, currentCommit, runHasChanges, workspaceDiff, workspaceStatus } from "./git.js";
 import { pathExists, readJson, runCommand, writeJson } from "./util.js";
 import { agentContextPath, specPath, verifierPath } from "./state.js";
 
@@ -39,7 +39,7 @@ export async function createSpec(run: RunRecord): Promise<SpecContract> {
       root: workspace,
       branch: await currentBranch(workspace),
       baseCommit: (await currentCommit(workspace)) || run.baseCommit,
-      status: await gitStatus(workspace),
+      status: await workspaceStatus(run),
     },
     instructionsFiles,
     acceptanceCriteria: buildAcceptanceCriteria(task),
@@ -80,8 +80,8 @@ export function renderContract(spec: SpecContract): string {
 }
 
 export async function verifyRun(run: RunRecord): Promise<VerificationResult> {
-  const diff = await gitDiff(run.worktree.path);
-  const changed = await hasChanges(run.worktree.path);
+  const diff = await workspaceDiff(run);
+  const changed = await runHasChanges(run);
   const outputPath = path.join(run.repoRoot, ".rudder", "runs", run.id, "output.txt");
   const transcript = await fsp.readFile(outputPath, "utf8").catch(() => "");
   const spec = await readJson<SpecContract>(specPath(run.repoRoot, run.id));

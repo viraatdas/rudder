@@ -66,6 +66,7 @@ export type AuthProfileStore = {
 
 export type RudderConfig = {
   version: 1;
+  vcs?: VcsMode;
   defaultBackend: BackendId;
   lastUsedBackend?: BackendId;
   runPolicy: {
@@ -84,6 +85,8 @@ export type RudderConfig = {
 };
 
 export type BackendId = "claude" | "codex" | "acpx";
+
+export type VcsMode = "git" | "jj";
 
 export type EffortLevel = "low" | "medium" | "high" | "xhigh" | "max";
 
@@ -110,6 +113,7 @@ export type RunStatus =
 export type RunRecord = {
   id: string;
   status: RunStatus;
+  vcs?: VcsMode;
   mode?: RunMode;
   task: string;
   taskSummary?: string;
@@ -126,6 +130,7 @@ export type RunRecord = {
     enabled: boolean;
     path: string;
     branch?: string;
+    workspaceName?: string;
   };
   process?: {
     pid?: number;

@@ -697,7 +697,7 @@ Cloud:
 
 Options:
   -d, --detach                    Start in background
-      --worktree                  Always isolate in a git worktree
+      --worktree                  Always isolate in a worktree/workspace
       --queue                     Queue mode (reserved)
   -m, --model <model>             Backend model
   -b, --backend <backend>         claude or codex

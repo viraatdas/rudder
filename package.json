@@ -12,6 +12,7 @@
     "build": "tsc -p tsconfig.json && npm run build-native && npm run copy-native",
     "build-native": "cargo build --release --manifest-path native/Cargo.toml",
     "check": "tsc -p tsconfig.json --noEmit",
+    "test": "tsc -p tsconfig.json && node --test tests/*.test.mjs",
     "test:worker-scroll": "cargo test --manifest-path native/Cargo.toml top_origin_scroll_region_history_scrolls_like_terminal_scrollback && cargo test --manifest-path native/Cargo.toml worker_wheel && cargo test --manifest-path native/Cargo.toml wheel_scroll && cargo test --manifest-path native/Cargo.toml worker_page && cargo test --manifest-path native/Cargo.toml codex_alternate_screen_page_key",
     "copy-native": "node -e \"const fs=require('fs');const path=require('path');const sources=[path.join('target','release','rudder-native'),path.join('native','target','release','rudder-native')];const src=sources.find((candidate)=>fs.existsSync(candidate));const dest=path.join('dist','native','rudder-native');if(src){fs.mkdirSync(path.dirname(dest),{recursive:true});fs.copyFileSync(src,dest);fs.chmodSync(dest,0o755);}else if(fs.existsSync(dest)){fs.unlinkSync(dest);}\"",
     "prepack": "npm run build",

@@ -29,7 +29,9 @@ type Detection = {
   claudeCommand: boolean;
   codexCommand: boolean;
   acpxCommand: boolean;
+  jjCommand: boolean;
   acpxVersion?: string;
+  jjVersion?: string;
   npmAcpxLatest?: string;
   anthropicEnv?: boolean;
   openaiEnv?: boolean;
@@ -43,9 +45,17 @@ export async function detectEnvironment(): Promise<Detection> {
   const claudeCommand = commandExists("claude");
   const codexCommand = commandExists("codex");
   const acpxCommand = commandExists("acpx");
+  const jjCommand = commandExists("jj");
   const acpxVersion = acpxCommand
     ? (
         await runCommand("acpx", ["--version"], {
+          allowFailure: true,
+        })
+      ).stdout.trim()
+    : undefined;
+  const jjVersion = jjCommand
+    ? (
+        await runCommand("jj", ["--version"], {
           allowFailure: true,
         })
       ).stdout.trim()
@@ -62,7 +72,9 @@ export async function detectEnvironment(): Promise<Detection> {
     claudeCommand,
     codexCommand,
     acpxCommand,
+    jjCommand,
     acpxVersion,
+    jjVersion,
     npmAcpxLatest,
     anthropicEnv: Boolean(process.env.ANTHROPIC_API_KEY?.trim()),
     openaiEnv: Boolean(process.env.OPENAI_API_KEY?.trim()),
@@ -111,6 +123,8 @@ export async function runDoctor(options?: { json?: boolean }): Promise<void> {
       codex: detection.codexCommand,
       acpx: detection.acpxCommand,
       acpxVersion: detection.acpxVersion || null,
+      jj: detection.jjCommand,
+      jjVersion: detection.jjVersion || null,
       acpxLatest: detection.npmAcpxLatest || null,
     },
     auth: {
@@ -134,12 +148,16 @@ export async function runDoctor(options?: { json?: boolean }): Promise<void> {
       detection.acpxVersion ? ` (${detection.acpxVersion})` : ""
     }${detection.npmAcpxLatest ? ` latest=${detection.npmAcpxLatest}` : ""}`,
   );
+  console.log(`  jj:     ${status(detection.jjCommand)}${detection.jjVersion ? ` (${detection.jjVersion})` : ""}`);
   console.log(`  auth:   ${shortenHome(authStorePath())}`);
   for (const [profileId, credential] of Object.entries(store.profiles).sort()) {
     console.log(`    - ${profileId} (${credential.provider}/${credential.type})`);
   }
   if (!detection.acpxCommand) {
     console.log("  fix:    run `npm install -g acpx@latest` or `rudder onboard`");
+  }
+  if (!detection.jjCommand) {
+    console.log("  note:   jj is optional; git worktree mode still works without it.");
   }
 }
 

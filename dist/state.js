@@ -185,6 +185,7 @@ export async function createRunRecord(params) {
     const record = {
         id,
         status: "created",
+        vcs: params.vcs,
         mode: params.mode ?? "execute",
         task: params.task,
         taskSummary: summarizeTask(params.task),
@@ -200,6 +201,7 @@ export async function createRunRecord(params) {
             enabled: params.useWorktree,
             path: params.worktreePath ?? params.repoRoot,
             branch: params.worktreeBranch,
+            workspaceName: params.worktreeWorkspaceName,
         },
         currentPrompt: params.task,
         turns: [{ ts: createdAt, prompt: params.task, source: "user" }],

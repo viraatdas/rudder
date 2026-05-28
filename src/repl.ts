@@ -228,7 +228,7 @@ function printShellHelp(): void {
   console.log(`Commands:
   /backend claude|codex|acpx   Choose worker backend
   /model <model>               Set model for new tasks
-  /worktree auto|always        Isolate runs in git worktrees
+  /worktree auto|always        Isolate runs in worktrees/workspaces
   /detach on|off               Start tasks without watching output
   /status                      Show active runs
   /runs                        List recent runs

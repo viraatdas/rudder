@@ -1,4 +1,4 @@
-import type { AuthProfileStore, BackendId, EffortLevel, RudderConfig, RunRecord, RudderEvent } from "./types.js";
+import type { AuthProfileStore, BackendId, EffortLevel, RudderConfig, RunRecord, RudderEvent, VcsMode } from "./types.js";
 export declare function globalConfigPath(): string;
 export declare function authStorePath(): string;
 export declare function cloudAuthPath(): string;
@@ -34,8 +34,10 @@ export declare function createRunRecord(params: {
     mode?: RunRecord["mode"];
     targetBranch: string;
     baseCommit: string;
+    vcs?: VcsMode;
     useWorktree: boolean;
     worktreeBranch?: string;
+    worktreeWorkspaceName?: string;
     worktreePath?: string;
 }): Promise<RunRecord>;
 export declare function saveRunRecord(record: RunRecord): Promise<void>;

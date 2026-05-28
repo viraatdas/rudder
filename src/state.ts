@@ -8,6 +8,7 @@ import type {
   RudderConfig,
   RunRecord,
   RudderEvent,
+  VcsMode,
 } from "./types.js";
 import {
   ensureDir,
@@ -247,8 +248,10 @@ export async function createRunRecord(params: {
   mode?: RunRecord["mode"];
   targetBranch: string;
   baseCommit: string;
+  vcs?: VcsMode;
   useWorktree: boolean;
   worktreeBranch?: string;
+  worktreeWorkspaceName?: string;
   worktreePath?: string;
 }): Promise<RunRecord> {
   const id = params.id ?? newRunId(params.task);
@@ -256,6 +259,7 @@ export async function createRunRecord(params: {
   const record: RunRecord = {
     id,
     status: "created",
+    vcs: params.vcs,
     mode: params.mode ?? "execute",
     task: params.task,
     taskSummary: summarizeTask(params.task),
@@ -271,6 +275,7 @@ export async function createRunRecord(params: {
       enabled: params.useWorktree,
       path: params.worktreePath ?? params.repoRoot,
       branch: params.worktreeBranch,
+      workspaceName: params.worktreeWorkspaceName,
     },
     currentPrompt: params.task,
     turns: [{ ts: createdAt, prompt: params.task, source: "user" }],

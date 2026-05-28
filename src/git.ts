@@ -1,7 +1,16 @@
+import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
-import type { RunRecord } from "./types.js";
-import { runCommand, runCommandSync, shortHash, slugPrefix } from "./util.js";
+import type { RunRecord, VcsMode } from "./types.js";
+import {
+  commandExists,
+  MissingToolError,
+  pathExistsSync,
+  runCommand,
+  runCommandSync,
+  shortHash,
+  slugPrefix,
+} from "./util.js";
 import { listRuns, saveRunRecord, worktreePath } from "./state.js";
 
 export function findRepoRoot(cwd = process.cwd()): string {
@@ -9,7 +18,10 @@ export function findRepoRoot(cwd = process.cwd()): string {
     cwd,
     allowFailure: true,
   });
-  return result.code === 0 ? result.stdout.trim() : path.resolve(cwd);
+  if (result.code === 0 && result.stdout.trim()) {
+    return result.stdout.trim();
+  }
+  return findJjRoot(cwd);
 }
 
 export function isGitRepo(cwd: string): boolean {
@@ -19,6 +31,42 @@ export function isGitRepo(cwd: string): boolean {
       allowFailure: true,
     }).stdout.trim() === "true"
   );
+}
+
+export function isJjRepo(cwd: string): boolean {
+  if (!commandExists("jj")) {
+    return false;
+  }
+  const result = runCommandSync("jj", ["root"], {
+    cwd,
+    allowFailure: true,
+  });
+  return result.code === 0 || findJjMarker(cwd) !== null;
+}
+
+export function findJjRoot(cwd: string): string {
+  if (commandExists("jj")) {
+    const result = runCommandSync("jj", ["root"], {
+      cwd,
+      allowFailure: true,
+    });
+    if (result.code === 0 && result.stdout.trim()) {
+      return result.stdout.trim();
+    }
+  }
+  const marker = findJjMarker(cwd);
+  return marker ? path.dirname(marker) : path.resolve(cwd);
+}
+
+export function detectVcsMode(repoRoot: string, configured?: VcsMode): VcsMode {
+  if (configured === "git") {
+    return "git";
+  }
+  if (configured === "jj") {
+    ensureJjRepo(repoRoot);
+    return "jj";
+  }
+  return isJjRepo(repoRoot) ? "jj" : "git";
 }
 
 export async function currentBranch(repoRoot: string): Promise<string> {
@@ -35,6 +83,14 @@ export async function currentCommit(repoRoot: string): Promise<string> {
     allowFailure: true,
   });
   return result.stdout.trim() || "";
+}
+
+export async function currentJjChangeId(workspacePath: string): Promise<string> {
+  const result = await runCommand("jj", ["log", "--no-graph", "-r", "@", "-T", 'change_id ++ "\n"'], {
+    cwd: workspacePath,
+    allowFailure: true,
+  });
+  return result.code === 0 ? result.stdout.trim().split(/\s+/)[0] ?? "" : "";
 }
 
 export async function worktreeBaseCommit(repoRoot: string): Promise<string> {
@@ -83,6 +139,81 @@ export async function hasChanges(repoRoot: string): Promise<boolean> {
   return (await gitStatus(repoRoot)).length > 0;
 }
 
+export async function jjStatus(workspacePath: string): Promise<string[]> {
+  const result = await runCommand("jj", ["status"], {
+    cwd: workspacePath,
+    allowFailure: true,
+  });
+  return result.code === 0 ? parseJjStatus(result.stdout) : [];
+}
+
+export function parseJjStatus(stdout: string): string[] {
+  const lines: string[] = [];
+  let inConflictSection = false;
+  for (const raw of stdout.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line) {
+      continue;
+    }
+    if (/^working copy changes:?$/i.test(line)) {
+      inConflictSection = false;
+      continue;
+    }
+    if (/^(conflicts|unresolved conflicts|there are unresolved conflicts)(:|$)/i.test(line)) {
+      inConflictSection = true;
+      continue;
+    }
+    if (isJjStatusMetadata(line)) {
+      continue;
+    }
+    const statusPath = statusPathFromSummaryLine(line);
+    if (statusPath) {
+      if (!isRudderMetadataPath(statusPath)) {
+        lines.push(line);
+      }
+      continue;
+    }
+    if (inConflictSection) {
+      const conflictPath = line.replace(/^[-*]\s+/, "").replace(/^conflict in\s+/i, "").trim();
+      if (conflictPath && !isRudderMetadataPath(conflictPath)) {
+        lines.push(`C ${conflictPath}`);
+      }
+    }
+  }
+  return lines;
+}
+
+export async function jjDiff(workspacePath: string): Promise<string> {
+  const status = await jjStatus(workspacePath);
+  const stat = await runCommand("jj", ["diff", "--stat"], {
+    cwd: workspacePath,
+    allowFailure: true,
+  });
+  const patch = await runCommand("jj", ["diff", "--git"], {
+    cwd: workspacePath,
+    allowFailure: true,
+  });
+  return [
+    status.length ? `status:\n${status.join("\n")}` : "",
+    stat.stdout.trim(),
+    patch.stdout.trim(),
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+export async function workspaceStatus(run: RunRecord): Promise<string[]> {
+  return (run.vcs ?? "git") === "jj" ? await jjStatus(run.worktree.path) : await gitStatus(run.worktree.path);
+}
+
+export async function workspaceDiff(run: RunRecord): Promise<string> {
+  return (run.vcs ?? "git") === "jj" ? await jjDiff(run.worktree.path) : await gitDiff(run.worktree.path);
+}
+
+export async function runHasChanges(run: RunRecord): Promise<boolean> {
+  return (await workspaceStatus(run)).length > 0;
+}
+
 export function processAlive(pid: number | undefined): boolean {
   if (!pid) {
     return false;
@@ -129,6 +260,22 @@ export async function createRunWorktree(params: {
   return { branch, path: targetPath };
 }
 
+export async function createRunJjWorkspace(params: {
+  repoRoot: string;
+  runId: string;
+  task: string;
+}): Promise<{ workspaceName: string; path: string }> {
+  ensureJjRepo(params.repoRoot);
+  const workspaceName = `rudder-${params.runId.slice(0, 14)}-${shortHash(params.runId).slice(0, 6)}`;
+  const targetPath = worktreePath(params.repoRoot, params.runId, params.task);
+  await fsp.mkdir(path.dirname(targetPath), { recursive: true });
+
+  await runCommand("jj", ["workspace", "add", targetPath, "--name", workspaceName], {
+    cwd: params.repoRoot,
+  });
+  return { workspaceName, path: targetPath };
+}
+
 export async function removeWorktree(repoRoot: string, targetPath: string, force = false): Promise<void> {
   await runCommand("git", ["worktree", "remove", ...(force ? ["--force"] : []), targetPath], {
     cwd: repoRoot,
@@ -136,7 +283,46 @@ export async function removeWorktree(repoRoot: string, targetPath: string, force
   });
 }
 
+export async function removeJjWorkspace(params: {
+  repoRoot: string;
+  workspaceName: string;
+  workspacePath: string;
+}): Promise<void> {
+  if (commandExists("jj")) {
+    await runCommand("jj", ["workspace", "forget", params.workspaceName], {
+      cwd: params.repoRoot,
+      allowFailure: true,
+    }).catch(() => undefined);
+  }
+  await fsp.rm(params.workspacePath, { recursive: true, force: true });
+}
+
+export async function removeRunWorkspace(run: RunRecord, force = false): Promise<void> {
+  if (!run.worktree.enabled) {
+    return;
+  }
+  if ((run.vcs ?? "git") === "jj") {
+    if (!run.worktree.workspaceName) {
+      throw new Error("Run has no jj workspace name to remove.");
+    }
+    await removeJjWorkspace({
+      repoRoot: run.repoRoot,
+      workspaceName: run.worktree.workspaceName,
+      workspacePath: run.worktree.path,
+    });
+    return;
+  }
+  await removeWorktree(run.repoRoot, run.worktree.path, force);
+}
+
 export async function mergeRunIntoCurrentBranch(run: RunRecord, allowDirty = false): Promise<RunRecord> {
+  if ((run.vcs ?? "git") === "jj") {
+    return await mergeJjRunIntoCurrentWorkspace(run, allowDirty);
+  }
+  return await mergeGitRunIntoCurrentBranch(run, allowDirty);
+}
+
+async function mergeGitRunIntoCurrentBranch(run: RunRecord, allowDirty = false): Promise<RunRecord> {
   if (!run.worktree.branch) {
     throw new Error("Run has no worktree branch to merge.");
   }
@@ -178,6 +364,60 @@ export async function mergeRunIntoCurrentBranch(run: RunRecord, allowDirty = fal
   return run;
 }
 
+export async function mergeJjRunIntoCurrentWorkspace(run: RunRecord, allowDirty = false): Promise<RunRecord> {
+  if (!run.worktree.workspaceName) {
+    throw new Error("Run has no jj workspace name to merge.");
+  }
+  ensureJjRepo(run.repoRoot);
+  ensureJjRepo(run.worktree.path);
+  if (!allowDirty && (await jjStatus(run.repoRoot)).length > 0) {
+    throw new Error("Target workspace is dirty. Squash/abandon changes or pass --allow-dirty.");
+  }
+  run.merge = {
+    status: "not-started",
+    attemptedAt: new Date().toISOString(),
+    targetBranch: await currentJjChangeId(run.repoRoot) || "@",
+  };
+  await saveRunRecord(run);
+
+  const sourceChangeId = await currentJjChangeId(run.worktree.path);
+  if (!sourceChangeId) {
+    await markMergeFailed(run, "Could not determine jj change id for run workspace.");
+    throw new Error("Could not determine jj change id for run workspace.");
+  }
+  const message = `rudder: ${run.task.slice(0, 72)}`;
+  const merge = await runCommand("jj", ["new", "@", sourceChangeId, "-m", message], {
+    cwd: run.repoRoot,
+    allowFailure: true,
+  });
+  if (merge.code !== 0) {
+    const error = merge.stderr.trim() || merge.stdout.trim() || "jj merge failed.";
+    await markMergeFailed(run, error);
+    throw new Error(error);
+  }
+
+  const conflicted = await jjConflictedFiles(run.repoRoot);
+  if (conflicted.length === 0) {
+    run.status = "merged";
+    run.merge = {
+      ...run.merge,
+      status: "merged",
+    };
+    await saveRunRecord(run);
+    return run;
+  }
+
+  run.status = "merge-conflict";
+  run.merge = {
+    ...run.merge,
+    status: "conflict",
+    conflictedFiles: conflicted,
+    error: "jj merge created conflicts.",
+  };
+  await saveRunRecord(run);
+  return run;
+}
+
 async function commitWorktreeChanges(run: RunRecord): Promise<void> {
   if (!(await hasChanges(run.worktree.path))) {
     return;
@@ -209,10 +449,92 @@ export async function conflictedFiles(repoRoot: string): Promise<string[]> {
     .filter(Boolean);
 }
 
+export async function jjConflictedFiles(workspacePath: string): Promise<string[]> {
+  const result = await runCommand("jj", ["resolve", "--list"], {
+    cwd: workspacePath,
+    allowFailure: true,
+  });
+  return result.code === 0 ? parseJjConflictedFiles(result.stdout) : [];
+}
+
+export function parseJjConflictedFiles(stdout: string): string[] {
+  return stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => line.replace(/^[-*]\s+/, "").replace(/^conflict in\s+/i, "").trim())
+    .filter((line) => line && !isRudderMetadataPath(line));
+}
+
 export async function worktreeList(repoRoot: string): Promise<string> {
   const result = await runCommand("git", ["worktree", "list"], {
     cwd: repoRoot,
     allowFailure: true,
   });
   return result.stdout.trim();
+}
+
+function ensureJjRepo(cwd: string): void {
+  if (!commandExists("jj")) {
+    throw new MissingToolError("jj");
+  }
+  const result = runCommandSync("jj", ["root"], {
+    cwd,
+    allowFailure: true,
+  });
+  if (result.code !== 0) {
+    throw new Error(`Configured vcs is "jj", but ${cwd} is not inside a jj repository.`);
+  }
+}
+
+function findJjMarker(cwd: string): string | null {
+  let current = path.resolve(cwd);
+  while (true) {
+    const marker = path.join(current, ".jj");
+    if (pathExistsSync(marker)) {
+      try {
+        if (fs.statSync(marker).isDirectory()) {
+          return marker;
+        }
+      } catch {
+        // Keep walking if the marker cannot be inspected.
+      }
+    }
+    const parent = path.dirname(current);
+    if (parent === current) {
+      return null;
+    }
+    current = parent;
+  }
+}
+
+function isJjStatusMetadata(line: string): boolean {
+  return (
+    /^the working copy has no changes\.?$/i.test(line) ||
+    /^the working copy is clean\.?$/i.test(line) ||
+    /^no changes\.?$/i.test(line) ||
+    /^working copy\s*:/i.test(line) ||
+    /^parent commit\s*:/i.test(line) ||
+    /^current operation\s*:/i.test(line) ||
+    /^no conflicts found\.?$/i.test(line)
+  );
+}
+
+function statusPathFromSummaryLine(line: string): string | null {
+  const match = line.match(/^[A-Z?]{1,2}\s+(.+)$/);
+  return match?.[1]?.trim() || null;
+}
+
+function isRudderMetadataPath(filePath: string): boolean {
+  const normalized = filePath.replace(/\\/g, "/").replace(/^["']|["']$/g, "");
+  return normalized === ".rudder" || normalized.startsWith(".rudder/");
+}
+
+async function markMergeFailed(run: RunRecord, error: string): Promise<void> {
+  run.merge = {
+    ...run.merge,
+    status: "failed",
+    error,
+  };
+  await saveRunRecord(run);
 }
