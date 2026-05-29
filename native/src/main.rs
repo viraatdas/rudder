@@ -50,6 +50,8 @@ const CLOUD_COLOR: Color = Color::Cyan;
 const DEFAULT_WHEEL_SCROLL_ROWS: u16 = 1;
 const TASK_HISTORY_LIMIT: usize = 100;
 const MOUSE_DEBUG_ENV: &str = "RUDDER_MOUSE_DEBUG";
+const RUDDER_MOUSE_ENABLE_SEQUENCES: &[u8] = b"\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?1003h";
+const RUDDER_MOUSE_DISABLE_SEQUENCES: &[u8] = b"\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
 const AGENT_LIST_RUN_START_ROW: u16 = 12;
 const REVIEW_ALL_MODEL: &str = "gpt-5.5";
 const REVIEW_ALL_EFFORT: EffortLevel = EffortLevel::XHigh;
@@ -5046,6 +5048,38 @@ branch refs/heads/main\n";
     }
 
     #[test]
+    fn rudder_mouse_capture_explicitly_enables_sgr_wheel_modes() {
+        let mut output = Vec::new();
+
+        enable_rudder_mouse_capture(&mut output).expect("enable mouse capture");
+
+        assert!(
+            output
+                .windows(RUDDER_MOUSE_ENABLE_SEQUENCES.len())
+                .any(|window| window == RUDDER_MOUSE_ENABLE_SEQUENCES),
+            "output was {output:?}"
+        );
+        assert!(
+            output.ends_with(b"\x1b[?1003h"),
+            "mouse tracking must remain in any-event mode; output was {output:?}"
+        );
+    }
+
+    #[test]
+    fn rudder_mouse_capture_explicitly_disables_sgr_wheel_modes() {
+        let mut output = Vec::new();
+
+        disable_rudder_mouse_capture(&mut output).expect("disable mouse capture");
+
+        assert!(
+            output
+                .windows(RUDDER_MOUSE_DISABLE_SEQUENCES.len())
+                .any(|window| window == RUDDER_MOUSE_DISABLE_SEQUENCES),
+            "output was {output:?}"
+        );
+    }
+
+    #[test]
     fn styled_terminal_line_draws_visible_cursor_cell() {
         let line = styled_terminal_line(vec![plain_terminal_cell("a".to_string())], None, Some(3));
 
@@ -7346,7 +7380,16 @@ fn set_terminal_title(stdout: &mut impl Write, title: &str) -> io::Result<()> {
 }
 
 fn enable_rudder_mouse_capture(stdout: &mut impl Write) -> Result<()> {
-    execute!(stdout, EnableMouseCapture)?;
+    execute!(&mut *stdout, EnableMouseCapture)?;
+    stdout.write_all(RUDDER_MOUSE_ENABLE_SEQUENCES)?;
+    stdout.flush()?;
+    Ok(())
+}
+
+fn disable_rudder_mouse_capture(stdout: &mut impl Write) -> Result<()> {
+    stdout.write_all(RUDDER_MOUSE_DISABLE_SEQUENCES)?;
+    execute!(&mut *stdout, DisableMouseCapture)?;
+    stdout.flush()?;
     Ok(())
 }
 
@@ -7402,7 +7445,7 @@ fn run_mouse_test_raw() -> Result<()> {
         Ok(())
     })();
 
-    let _ = execute!(stdout, DisableMouseCapture);
+    let _ = disable_rudder_mouse_capture(&mut stdout);
     let _ = disable_raw_mode();
     result
 }
@@ -7454,18 +7497,18 @@ fn run_mouse_test_parsed() -> Result<()> {
         Ok(())
     })();
 
-    let _ = execute!(stdout, DisableMouseCapture);
+    let _ = disable_rudder_mouse_capture(&mut stdout);
     let _ = disable_raw_mode();
     result
 }
 
 fn restore_terminal(terminal: &mut Tui) -> Result<()> {
     disable_raw_mode()?;
+    disable_rudder_mouse_capture(terminal.backend_mut())?;
     execute!(
         terminal.backend_mut(),
         PopKeyboardEnhancementFlags,
         DisableBracketedPaste,
-        DisableMouseCapture,
         LeaveAlternateScreen
     )?;
     // Clear the tab title we set on startup so the user's shell prompt can

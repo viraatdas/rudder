@@ -169,8 +169,7 @@ impl TerminalPane {
             .openpty(options.size.pty_size())
             .context("failed to open PTY")?;
 
-        let mut builder = command_builder(command)?;
-        builder.env("TERM", &options.term);
+        let mut builder = command_builder(command, &options.term)?;
         if let Some(cwd) = &options.cwd {
             builder.cwd(cwd);
         }
@@ -739,7 +738,7 @@ impl Drop for TerminalPane {
     }
 }
 
-fn command_builder(command: Option<TerminalCommand>) -> Result<CommandBuilder> {
+fn command_builder(command: Option<TerminalCommand>, term: &str) -> Result<CommandBuilder> {
     match command {
         Some(command) => {
             if command.program.is_empty() {
@@ -749,8 +748,12 @@ fn command_builder(command: Option<TerminalCommand>) -> Result<CommandBuilder> {
             let mut builder = CommandBuilder::new(command.program);
             builder.args(command.args);
             for (key, value) in command.env {
+                if is_term_env_key(&key) {
+                    continue;
+                }
                 builder.env(key, value);
             }
+            builder.env("TERM", term);
             Ok(builder)
         }
         None => {
@@ -758,9 +761,21 @@ fn command_builder(command: Option<TerminalCommand>) -> Result<CommandBuilder> {
             if shell.is_empty() {
                 return Err(anyhow!("could not determine default shell"));
             }
-            Ok(CommandBuilder::new(shell))
+            let mut builder = CommandBuilder::new(shell);
+            builder.env("TERM", term);
+            Ok(builder)
         }
     }
+}
+
+#[cfg(windows)]
+fn is_term_env_key(key: &str) -> bool {
+    key.eq_ignore_ascii_case("TERM")
+}
+
+#[cfg(not(windows))]
+fn is_term_env_key(key: &str) -> bool {
+    key == "TERM"
 }
 
 #[cfg(windows)]
@@ -795,6 +810,23 @@ mod tests {
             .collect();
 
         assert_eq!(lines, vec!["red", "plain"]);
+    }
+
+    #[test]
+    fn term_env_key_matching_uses_platform_case_rules() {
+        assert!(is_term_env_key("TERM"));
+
+        #[cfg(windows)]
+        {
+            assert!(is_term_env_key("term"));
+            assert!(is_term_env_key("Term"));
+        }
+
+        #[cfg(not(windows))]
+        {
+            assert!(!is_term_env_key("term"));
+            assert!(!is_term_env_key("Term"));
+        }
     }
 
     #[cfg(not(windows))]
@@ -834,5 +866,56 @@ mod tests {
         let output = pane.visible_lines_snapshot().join("\n");
         assert!(output.contains("history001"), "output was {output:?}");
         assert!(output.contains("history005"), "output was {output:?}");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn pty_child_normalizes_term_without_dropping_case_distinct_env_on_unix() {
+        let command = TerminalCommand::with_args(
+            "/bin/sh",
+            [
+                "-lc",
+                "printf 'term=%s\\r\\nTerm=%s\\r\\nTERM=%s\\r\\n' \"$term\" \"$Term\" \"$TERM\"; sleep 1",
+            ],
+        )
+        .with_env("term", "lowercase")
+        .with_env("Term", "mixedcase")
+        .with_env("TERM", "xterm-kitty");
+        let mut pane = TerminalPane::spawn_shell_or_command(
+            Some(command),
+            TerminalPaneOptions {
+                size: TerminalSize { rows: 5, cols: 40 },
+                scrollback_lines: 100,
+                ..Default::default()
+            },
+        )
+        .expect("spawn test pty");
+
+        for _ in 0..20 {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            pane.drain_output();
+            if pane
+                .visible_lines_snapshot()
+                .join("\n")
+                .contains("TERM=xterm-256color")
+            {
+                break;
+            }
+        }
+
+        let output = pane.visible_lines_snapshot().join("\n");
+        assert!(
+            output.contains("term=lowercase"),
+            "output was {output:?}"
+        );
+        assert!(
+            output.contains("Term=mixedcase"),
+            "output was {output:?}"
+        );
+        assert!(
+            output.contains("TERM=xterm-256color"),
+            "output was {output:?}"
+        );
+        assert!(!output.contains("term=xterm-kitty"), "output was {output:?}");
     }
 }
