@@ -14,10 +14,9 @@ use std::{
 use anyhow::{bail, Context, Result};
 use crossterm::{
     event::{
-        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
-        MouseButton, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
-        PushKeyboardEnhancementFlags,
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent,
+        KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEvent,
+        MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -50,6 +49,8 @@ const CLOUD_COLOR: Color = Color::Cyan;
 const DEFAULT_WHEEL_SCROLL_ROWS: u16 = 1;
 const TASK_HISTORY_LIMIT: usize = 100;
 const MOUSE_DEBUG_ENV: &str = "RUDDER_MOUSE_DEBUG";
+const RUDDER_MOUSE_ENABLE_SEQUENCES: &[u8] = b"\x1b[?1003l\x1b[?1000h\x1b[?1002h\x1b[?1006h";
+const RUDDER_MOUSE_DISABLE_SEQUENCES: &[u8] = b"\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
 const AGENT_LIST_RUN_START_ROW: u16 = 12;
 const REVIEW_ALL_MODEL: &str = "gpt-5.5";
 const REVIEW_ALL_EFFORT: EffortLevel = EffortLevel::XHigh;
@@ -5062,6 +5063,7 @@ branch refs/heads/main\n";
         assert_eq!(count_byte_subsequence(&output, b"\x1b[?1002h"), 1);
         assert_eq!(count_byte_subsequence(&output, b"\x1b[?1006h"), 1);
         assert_eq!(count_byte_subsequence(&output, b"\x1b[?1003h"), 0);
+        assert_eq!(count_byte_subsequence(&output, b"\x1b[?1003l"), 1);
     }
 
     #[test]
@@ -5073,7 +5075,7 @@ branch refs/heads/main\n";
         assert_eq!(count_byte_subsequence(&output, b"\x1b[?1006l"), 1);
         assert_eq!(count_byte_subsequence(&output, b"\x1b[?1002l"), 1);
         assert_eq!(count_byte_subsequence(&output, b"\x1b[?1000l"), 1);
-        assert_eq!(count_byte_subsequence(&output, b"\x1b[?1003l"), 0);
+        assert_eq!(count_byte_subsequence(&output, b"\x1b[?1003l"), 1);
     }
 
     #[test]
@@ -7377,16 +7379,18 @@ fn set_terminal_title(stdout: &mut impl Write, title: &str) -> io::Result<()> {
 }
 
 fn enable_rudder_mouse_capture(stdout: &mut impl Write) -> Result<()> {
-    // crossterm 0.29 enables xterm button, button-motion, and SGR mouse modes
-    // (?1000h, ?1002h, ?1006h). Avoid ?1003h any-event tracking because it
-    // reports every pointer movement and can flood the dashboard event loop.
-    execute!(&mut *stdout, EnableMouseCapture)?;
+    // Avoid crossterm's EnableMouseCapture here: in crossterm 0.29 it also
+    // emits ?1003h any-event tracking, which reports every pointer movement
+    // and can flood terminals like Kitty while scrolling. Enable only xterm
+    // button, button-motion, and SGR modes; first disable ?1003 in case a
+    // previous Rudder process left it on.
+    stdout.write_all(RUDDER_MOUSE_ENABLE_SEQUENCES)?;
     stdout.flush()?;
     Ok(())
 }
 
 fn disable_rudder_mouse_capture(stdout: &mut impl Write) -> Result<()> {
-    execute!(&mut *stdout, DisableMouseCapture)?;
+    stdout.write_all(RUDDER_MOUSE_DISABLE_SEQUENCES)?;
     stdout.flush()?;
     Ok(())
 }
