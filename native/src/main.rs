@@ -50,8 +50,6 @@ const CLOUD_COLOR: Color = Color::Cyan;
 const DEFAULT_WHEEL_SCROLL_ROWS: u16 = 1;
 const TASK_HISTORY_LIMIT: usize = 100;
 const MOUSE_DEBUG_ENV: &str = "RUDDER_MOUSE_DEBUG";
-const RUDDER_MOUSE_ENABLE_SEQUENCES: &[u8] = b"\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?1003h";
-const RUDDER_MOUSE_DISABLE_SEQUENCES: &[u8] = b"\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
 const AGENT_LIST_RUN_START_ROW: u16 = 12;
 const REVIEW_ALL_MODEL: &str = "gpt-5.5";
 const REVIEW_ALL_EFFORT: EffortLevel = EffortLevel::XHigh;
@@ -4730,6 +4728,13 @@ fn contains_word(text: &str, word: &str) -> bool {
 mod app_tests {
     use super::*;
 
+    fn count_byte_subsequence(haystack: &[u8], needle: &[u8]) -> usize {
+        haystack
+            .windows(needle.len())
+            .filter(|window| *window == needle)
+            .count()
+    }
+
     #[test]
     fn worktree_dir_name_leads_with_task_slug() {
         let name = worktree_dir_name(
@@ -5048,35 +5053,27 @@ branch refs/heads/main\n";
     }
 
     #[test]
-    fn rudder_mouse_capture_explicitly_enables_sgr_wheel_modes() {
+    fn rudder_mouse_capture_uses_sgr_wheel_modes_without_any_event_tracking() {
         let mut output = Vec::new();
 
         enable_rudder_mouse_capture(&mut output).expect("enable mouse capture");
 
-        assert!(
-            output
-                .windows(RUDDER_MOUSE_ENABLE_SEQUENCES.len())
-                .any(|window| window == RUDDER_MOUSE_ENABLE_SEQUENCES),
-            "output was {output:?}"
-        );
-        assert!(
-            output.ends_with(b"\x1b[?1003h"),
-            "mouse tracking must remain in any-event mode; output was {output:?}"
-        );
+        assert_eq!(count_byte_subsequence(&output, b"\x1b[?1000h"), 1);
+        assert_eq!(count_byte_subsequence(&output, b"\x1b[?1002h"), 1);
+        assert_eq!(count_byte_subsequence(&output, b"\x1b[?1006h"), 1);
+        assert_eq!(count_byte_subsequence(&output, b"\x1b[?1003h"), 0);
     }
 
     #[test]
-    fn rudder_mouse_capture_explicitly_disables_sgr_wheel_modes() {
+    fn rudder_mouse_capture_disables_sgr_wheel_modes_without_any_event_tracking() {
         let mut output = Vec::new();
 
         disable_rudder_mouse_capture(&mut output).expect("disable mouse capture");
 
-        assert!(
-            output
-                .windows(RUDDER_MOUSE_DISABLE_SEQUENCES.len())
-                .any(|window| window == RUDDER_MOUSE_DISABLE_SEQUENCES),
-            "output was {output:?}"
-        );
+        assert_eq!(count_byte_subsequence(&output, b"\x1b[?1006l"), 1);
+        assert_eq!(count_byte_subsequence(&output, b"\x1b[?1002l"), 1);
+        assert_eq!(count_byte_subsequence(&output, b"\x1b[?1000l"), 1);
+        assert_eq!(count_byte_subsequence(&output, b"\x1b[?1003l"), 0);
     }
 
     #[test]
@@ -7380,14 +7377,15 @@ fn set_terminal_title(stdout: &mut impl Write, title: &str) -> io::Result<()> {
 }
 
 fn enable_rudder_mouse_capture(stdout: &mut impl Write) -> Result<()> {
+    // crossterm 0.29 enables xterm button, button-motion, and SGR mouse modes
+    // (?1000h, ?1002h, ?1006h). Avoid ?1003h any-event tracking because it
+    // reports every pointer movement and can flood the dashboard event loop.
     execute!(&mut *stdout, EnableMouseCapture)?;
-    stdout.write_all(RUDDER_MOUSE_ENABLE_SEQUENCES)?;
     stdout.flush()?;
     Ok(())
 }
 
 fn disable_rudder_mouse_capture(stdout: &mut impl Write) -> Result<()> {
-    stdout.write_all(RUDDER_MOUSE_DISABLE_SEQUENCES)?;
     execute!(&mut *stdout, DisableMouseCapture)?;
     stdout.flush()?;
     Ok(())
