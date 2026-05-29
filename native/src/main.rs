@@ -49,8 +49,8 @@ const CLOUD_COLOR: Color = Color::Cyan;
 const DEFAULT_WHEEL_SCROLL_ROWS: u16 = 1;
 const TASK_HISTORY_LIMIT: usize = 100;
 const MOUSE_DEBUG_ENV: &str = "RUDDER_MOUSE_DEBUG";
-const RUDDER_MOUSE_ENABLE_SEQUENCES: &[u8] = b"\x1b[?1003l\x1b[?1000h\x1b[?1002h\x1b[?1006h";
-const RUDDER_MOUSE_DISABLE_SEQUENCES: &[u8] = b"\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
+const RUDDER_MOUSE_ENABLE_SEQUENCES: &[u8] = b"\x1b[?1000h\x1b[?1002h\x1b[?1006h";
+const RUDDER_MOUSE_DISABLE_SEQUENCES: &[u8] = b"\x1b[?1006l\x1b[?1002l\x1b[?1000l";
 const AGENT_LIST_RUN_START_ROW: u16 = 12;
 const REVIEW_ALL_MODEL: &str = "gpt-5.5";
 const REVIEW_ALL_EFFORT: EffortLevel = EffortLevel::XHigh;
@@ -5059,11 +5059,13 @@ branch refs/heads/main\n";
 
         enable_rudder_mouse_capture(&mut output).expect("enable mouse capture");
 
+        assert_eq!(output.as_slice(), RUDDER_MOUSE_ENABLE_SEQUENCES);
         assert_eq!(count_byte_subsequence(&output, b"\x1b[?1000h"), 1);
         assert_eq!(count_byte_subsequence(&output, b"\x1b[?1002h"), 1);
         assert_eq!(count_byte_subsequence(&output, b"\x1b[?1006h"), 1);
         assert_eq!(count_byte_subsequence(&output, b"\x1b[?1003h"), 0);
-        assert_eq!(count_byte_subsequence(&output, b"\x1b[?1003l"), 1);
+        assert_eq!(count_byte_subsequence(&output, b"\x1b[?1003l"), 0);
+        assert_eq!(count_byte_subsequence(&output, b"\x1b[?1015h"), 0);
     }
 
     #[test]
@@ -5072,10 +5074,12 @@ branch refs/heads/main\n";
 
         disable_rudder_mouse_capture(&mut output).expect("disable mouse capture");
 
+        assert_eq!(output.as_slice(), RUDDER_MOUSE_DISABLE_SEQUENCES);
         assert_eq!(count_byte_subsequence(&output, b"\x1b[?1006l"), 1);
         assert_eq!(count_byte_subsequence(&output, b"\x1b[?1002l"), 1);
         assert_eq!(count_byte_subsequence(&output, b"\x1b[?1000l"), 1);
-        assert_eq!(count_byte_subsequence(&output, b"\x1b[?1003l"), 1);
+        assert_eq!(count_byte_subsequence(&output, b"\x1b[?1003l"), 0);
+        assert_eq!(count_byte_subsequence(&output, b"\x1b[?1015l"), 0);
     }
 
     #[test]
@@ -7379,11 +7383,8 @@ fn set_terminal_title(stdout: &mut impl Write, title: &str) -> io::Result<()> {
 }
 
 fn enable_rudder_mouse_capture(stdout: &mut impl Write) -> Result<()> {
-    // Avoid crossterm's EnableMouseCapture here: in crossterm 0.29 it also
-    // emits ?1003h any-event tracking, which reports every pointer movement
-    // and can flood terminals like Kitty while scrolling. Enable only xterm
-    // button, button-motion, and SGR modes; first disable ?1003 in case a
-    // previous Rudder process left it on.
+    // Do not use crossterm's EnableMouseCapture here: crossterm 0.29 also
+    // enables ?1003 any-event tracking, which reports every pointer movement.
     stdout.write_all(RUDDER_MOUSE_ENABLE_SEQUENCES)?;
     stdout.flush()?;
     Ok(())
