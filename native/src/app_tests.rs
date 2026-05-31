@@ -1167,6 +1167,106 @@ branch refs/heads/main\n";
     }
 
     #[test]
+    fn selection_point_from_mouse_offsets_by_pane_inner_origin() {
+        // Callers pass block_inner(pane) as `area`, so the point must be relative to
+        // that inner origin (pane border + any header already accounted for by the
+        // caller's Rect). Row/col are clamped into the inner height/width.
+        let inner = Rect {
+            x: 2,
+            y: 3,
+            width: 10,
+            height: 5,
+        };
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: 6,
+            modifiers: KeyModifiers::empty(),
+        };
+        assert_eq!(
+            selection_point_from_mouse(mouse, inner),
+            SelectionPoint { row: 3, col: 3 }
+        );
+
+        // A click above/left of the inner origin clamps to (0, 0).
+        let above = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::empty(),
+        };
+        assert_eq!(
+            selection_point_from_mouse(above, inner),
+            SelectionPoint { row: 0, col: 0 }
+        );
+
+        // A click past the inner extent clamps to the last cell.
+        let past = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 99,
+            row: 99,
+            modifiers: KeyModifiers::empty(),
+        };
+        assert_eq!(
+            selection_point_from_mouse(past, inner),
+            SelectionPoint { row: 4, col: 9 }
+        );
+    }
+
+    #[test]
+    fn orchestrator_dag_scroll_offset_moves_and_clamps() {
+        let mut app = App::new();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 10,
+        };
+        let scroll_up = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 5,
+            row: 5,
+            modifiers: KeyModifiers::empty(),
+        };
+        let scroll_down = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 5,
+            row: 5,
+            modifiers: KeyModifiers::empty(),
+        };
+
+        // Start at the bottom (large offset); scrolling up moves toward the top.
+        app.orch_dag_scroll = 5;
+        app.scroll_orchestrator_dag(scroll_up, area);
+        assert!(app.orch_dag_scroll < 5);
+
+        // Scrolling up never goes below zero (cannot scroll above the first line).
+        app.orch_dag_scroll = 0;
+        app.scroll_orchestrator_dag(scroll_up, area);
+        assert_eq!(app.orch_dag_scroll, 0);
+
+        // Scrolling down increases the offset (reveals later lines).
+        app.orch_dag_scroll = 0;
+        app.scroll_orchestrator_dag(scroll_down, area);
+        assert!(app.orch_dag_scroll > 0);
+    }
+
+    #[test]
+    fn orchestrator_dag_scroll_clamp_reaches_bottom_and_no_overflow() {
+        // Content shorter than the viewport pins the offset to 0.
+        assert_eq!(orchestrator_dag_max_scroll(4, 10), 0);
+        assert_eq!(orchestrator_dag_max_scroll(10, 10), 0);
+        // The last content row can scroll to the top of the viewport, no further.
+        assert_eq!(orchestrator_dag_max_scroll(25, 10), 15);
+
+        // Wrapped-row accounting: a wide line consumes multiple viewport rows.
+        assert_eq!(wrapped_row_count(0, 10), 1);
+        assert_eq!(wrapped_row_count(10, 10), 1);
+        assert_eq!(wrapped_row_count(11, 10), 2);
+        assert_eq!(wrapped_row_count(25, 10), 3);
+    }
+
+    #[test]
     fn wraps_worker_paste_as_single_bracketed_paste_payload() {
         assert_eq!(
             bracketed_paste_bytes("hello\nworld"),
@@ -3863,6 +3963,78 @@ branch refs/heads/main\n";
         assert!(text.contains("todo"), "n1 not launched -> todo: {text}");
         // Summary line present.
         assert!(text.contains("running 1"), "summary running count: {text}");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn orchestrator_dag_view_is_scrollable_and_disables_pty_selection() {
+        let mut app = App::new();
+        app.focus = FocusPane::Worker;
+        let block = "RUDDER_PLAN_TASKS_START\n{\"tasks\":[\
+            {\"id\":\"n0\",\"title\":\"api\",\"prompt\":\"build api\",\"goal\":\"api\",\"success\":\"ok\"},\
+            {\"id\":\"n1\",\"title\":\"ui\",\"prompt\":\"build ui\",\"goal\":\"ui\",\"success\":\"ok\"}\
+        ]}\nRUDDER_PLAN_TASKS_END\n";
+        let orch = planner_with_block(&app, block);
+        app.agents = vec![orch];
+        app.selected_agent = 0;
+        // Plan parsed -> the worker pane shows the custom DAG, not the PTY.
+        assert!(
+            app.selected_orchestrator_dag_active(),
+            "PlanReady orchestrator shows the DAG command-center view"
+        );
+
+        let area = Rect::new(0, 0, 60, 20);
+        app.worker_area = Some(area);
+        let inner = block_inner(area);
+
+        // Capture the planner PTY scrollback so we can prove a DAG scroll does NOT
+        // touch it (the old bug: scroll moved the invisible PTY instead).
+        let pty_before = app
+            .selected_terminal_mut()
+            .map(|t| t.scrollback())
+            .unwrap_or(0);
+
+        // ScrollDown over the DAG advances the DAG offset.
+        app.orch_dag_scroll = 0;
+        app.handle_pane_scroll(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: inner.x + 1,
+            row: inner.y + 1,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert!(
+            app.orch_dag_scroll > 0,
+            "scroll over the DAG moves the DAG offset"
+        );
+        let pty_after = app
+            .selected_terminal_mut()
+            .map(|t| t.scrollback())
+            .unwrap_or(0);
+        assert_eq!(
+            pty_before, pty_after,
+            "scrolling the DAG must not move the planner PTY scrollback"
+        );
+
+        // Selection over the DAG is disabled: the handler clears any selection and
+        // refuses to start a PTY-based drag (which would select unseen text).
+        app.worker_selection = Some(WorkerSelection {
+            start: SelectionPoint { row: 0, col: 0 },
+            end: SelectionPoint { row: 0, col: 1 },
+        });
+        let started = app.handle_worker_selection_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: inner.x + 1,
+                row: inner.y + 1,
+                modifiers: KeyModifiers::empty(),
+            },
+            inner,
+        );
+        assert!(!started, "DAG view does not start a PTY selection");
+        assert!(
+            app.worker_selection.is_none(),
+            "DAG view clears any stale PTY selection"
+        );
     }
 
     // --- CHANGE 2: Ctrl+W leader Tab cycle -----------------------------------

@@ -1561,9 +1561,38 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
         }
     }
 
+    let inner = block_inner(area);
+    let inner_width = inner.width.max(1) as usize;
+    let visible_height = inner.height.max(1) as usize;
+    // The paragraph wraps (Wrap { trim: false }), so the on-screen row count can
+    // exceed lines.len(). Sum each line's wrapped row count so the scroll offset
+    // clamps against what is actually drawn and the last line can reach the top.
+    let wrapped_rows: usize = lines
+        .iter()
+        .map(|line| line.width().max(1))
+        .map(|width| wrapped_row_count(width, inner_width))
+        .sum();
+    let max_scroll = orchestrator_dag_max_scroll(wrapped_rows, visible_height);
+    app.orch_dag_scroll = app.orch_dag_scroll.min(max_scroll);
+    let scroll = app.orch_dag_scroll;
+
+    // When the plan overflows the pane, append a one-line scroll hint so the user
+    // knows there is more below (and how to reach it).
+    if max_scroll > 0 {
+        let at_bottom = scroll >= max_scroll;
+        let hint = if at_bottom {
+            "scroll up for more  ·  wheel to scroll".to_string()
+        } else {
+            "scroll for more".to_string()
+        };
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(hint, muted_style(focused))));
+    }
+
     let paragraph = Paragraph::new(lines)
         .style(app_style())
         .block(pane_block("orchestrator", focused, app.nav_mode))
+        .scroll((scroll as u16, 0))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
@@ -2393,6 +2422,18 @@ pub(crate) fn is_scroll_mouse_event(kind: MouseEventKind) -> bool {
             | MouseEventKind::ScrollLeft
             | MouseEventKind::ScrollRight
     )
+}
+
+/// On-screen rows a single logical line occupies once wrapped to `width` columns.
+/// A blank or sub-column line still takes one row.
+pub(crate) fn wrapped_row_count(line_width: usize, width: usize) -> usize {
+    line_width.div_ceil(width.max(1)).max(1)
+}
+
+/// Largest valid scroll offset (lines from the top) for a list of `content_rows`
+/// drawn in a `visible_height`-row viewport. Zero when everything fits.
+pub(crate) fn orchestrator_dag_max_scroll(content_rows: usize, visible_height: usize) -> usize {
+    content_rows.saturating_sub(visible_height)
 }
 
 pub(crate) fn mouse_scrollback_delta(mouse: MouseEvent, viewport_height: u16) -> isize {

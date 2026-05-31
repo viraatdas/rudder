@@ -299,6 +299,11 @@ struct App {
     picker_index: usize,
     worker_selection: Option<WorkerSelection>,
     task_selection: Option<WorkerSelection>,
+    /// Scroll offset (lines from the top) for the orchestrator DAG command-center
+    /// view. The DAG is a static line list (not a PTY), so it needs its own offset
+    /// to read a long plan. Reset to 0 whenever the selected agent changes; clamped
+    /// against the rendered line count in `render_orchestrator`.
+    orch_dag_scroll: usize,
     agents_area: Option<Rect>,
     worker_area: Option<Rect>,
     task_area: Option<Rect>,
@@ -612,6 +617,7 @@ impl App {
             picker_index: 0,
             worker_selection: None,
             task_selection: None,
+            orch_dag_scroll: 0,
             agents_area: None,
             worker_area: None,
             task_area: None,
@@ -737,6 +743,21 @@ impl App {
             .get(self.selected_agent)
             .map(|run| run.is_orchestrator())
             .unwrap_or(false)
+    }
+
+    /// True when the worker pane is currently showing the custom orchestrator DAG
+    /// command-center view (selected orchestrator, Terminal view, plan parsed)
+    /// rather than the raw PTY. In that view scroll/selection target the rendered
+    /// DAG lines, not the underlying planner terminal. Mirrors the dispatch in
+    /// `render_worker`.
+    fn selected_orchestrator_dag_active(&self) -> bool {
+        if self.worker_view != WorkerView::Terminal {
+            return false;
+        }
+        self.agents.get(self.selected_agent).is_some_and(|run| {
+            run.is_orchestrator()
+                && matches!(orchestrator_phase(run), OrchestratorPhase::PlanReady(_))
+        })
     }
 
     fn selected_main_index(&self) -> Option<usize> {
@@ -1152,6 +1173,11 @@ impl App {
     fn copy_focused_selection(&mut self) {
         let text = match self.focus {
             FocusPane::Worker if self.worker_view == WorkerView::Terminal => {
+                // The DAG view shows rendered lines, not the planner PTY; copying the
+                // PTY selection here would yield text the user cannot see.
+                if self.selected_orchestrator_dag_active() {
+                    return;
+                }
                 let Some(selection) = self.worker_selection else {
                     return;
                 };
@@ -1190,6 +1216,7 @@ impl App {
 
     fn select_previous_agent(&mut self) {
         self.delete_pending = None;
+        self.orch_dag_scroll = 0;
         let visible = self.visible_agent_indices();
         if visible.is_empty() {
             self.selected_agent = 0;
@@ -1209,6 +1236,7 @@ impl App {
 
     fn select_next_agent(&mut self) {
         self.delete_pending = None;
+        self.orch_dag_scroll = 0;
         let visible = self.visible_agent_indices();
         if visible.is_empty() {
             self.selected_agent = 0;
@@ -1892,6 +1920,9 @@ impl App {
 
         self.delete_pending = None;
         if let Some(index) = agent_index_from_mouse(self, mouse, area) {
+            if index != self.selected_agent {
+                self.orch_dag_scroll = 0;
+            }
             self.selected_agent = index;
         }
     }
@@ -1912,7 +1943,9 @@ impl App {
                     "mouse {:?} @{},{} focus=worker view={:?}",
                     mouse.kind, mouse.column, mouse.row, self.worker_view
                 ));
-                if self.worker_view == WorkerView::Diff {
+                if self.selected_orchestrator_dag_active() {
+                    self.scroll_orchestrator_dag(mouse, inner);
+                } else if self.worker_view == WorkerView::Diff {
                     let _ = self.scroll_selected_review_or_forward(mouse, inner);
                 } else {
                     let _ = self.scroll_selected_worker_or_forward(mouse, inner);
@@ -1930,7 +1963,9 @@ impl App {
                 "mouse {:?} @{},{} pane=worker view={:?}",
                 mouse.kind, mouse.column, mouse.row, self.worker_view
             ));
-            if self.worker_view == WorkerView::Diff {
+            if self.selected_orchestrator_dag_active() {
+                self.scroll_orchestrator_dag(mouse, inner);
+            } else if self.worker_view == WorkerView::Diff {
                 let _ = self.scroll_selected_review_or_forward(mouse, inner);
             } else {
                 let _ = self.scroll_selected_worker_or_forward(mouse, inner);
@@ -1978,6 +2013,13 @@ impl App {
     }
 
     fn handle_worker_selection_mouse(&mut self, mouse: MouseEvent, area: Rect) -> bool {
+        // The orchestrator DAG command-center view renders its own line list, not
+        // the planner PTY. Dragging there would select PTY content the user cannot
+        // see (a mismatch), so selection is cleanly disabled while the DAG shows.
+        if self.selected_orchestrator_dag_active() {
+            self.worker_selection = None;
+            return false;
+        }
         if self.selected_terminal_mut().is_none() {
             self.worker_selection = None;
             return false;
@@ -2182,6 +2224,29 @@ impl App {
             return true;
         }
         true
+    }
+
+    /// Scroll the orchestrator DAG command-center view. The DAG is a static list of
+    /// rendered lines (not a PTY), so we move an app-level line offset. ScrollUp
+    /// reveals earlier lines (smaller offset); ScrollDown reveals later lines. The
+    /// upper bound is clamped against the rendered content in `render_orchestrator`.
+    fn scroll_orchestrator_dag(&mut self, mouse: MouseEvent, area: Rect) {
+        let delta = mouse_scrollback_delta(mouse, area.height);
+        if delta == 0 {
+            return;
+        }
+        let before = self.orch_dag_scroll;
+        // Positive delta is ScrollUp (toward the top), which lowers the offset.
+        self.orch_dag_scroll = if delta > 0 {
+            self.orch_dag_scroll.saturating_sub(delta as usize)
+        } else {
+            self.orch_dag_scroll
+                .saturating_add(delta.unsigned_abs())
+        };
+        self.set_mouse_debug(format!(
+            "mouse {:?} @{},{} pane=orchestrator-dag delta={} before={} after={}",
+            mouse.kind, mouse.column, mouse.row, delta, before, self.orch_dag_scroll
+        ));
     }
 
     fn write_mouse_to_selected_review(&mut self, mouse: MouseEvent, area: Rect) -> bool {
