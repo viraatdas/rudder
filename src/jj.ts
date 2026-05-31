@@ -83,21 +83,58 @@ export function findJjRoot(cwd: string): string {
 }
 
 /**
- * The change id of `@` (the working-copy commit) in the given workspace.
+ * jj refuses to operate on a STALE workspace — one whose working-copy commit was
+ * moved by a concurrent operation in another workspace (every command in any
+ * workspace advances the shared op log). The command exits non-zero with a
+ * "working copy is stale" message and a hint to run `jj workspace update-stale`.
+ * In a multi-worker run this happens routinely, so any jj read against a worker
+ * workspace must be able to recover instead of falsely reporting "no changes"
+ * (which marks a good run failed) or failing a merge.
  */
-export async function currentJjChangeId(workspacePath: string): Promise<string> {
-  const result = await runCommand("jj", ["log", "--no-graph", "-r", "@", "-T", "change_id"], {
+function isStaleWorkingCopy(text: string): boolean {
+  return /working copy is stale|stale working copy/i.test(text);
+}
+
+/**
+ * Re-point a stale workspace at its recorded working-copy commit. jj snapshots
+ * the on-disk working copy as part of this, so a worker's changes are preserved.
+ * Returns true when the workspace is no longer stale afterwards.
+ */
+async function recoverStaleWorkspace(workspacePath: string): Promise<boolean> {
+  const result = await runCommand("jj", ["workspace", "update-stale"], {
     cwd: workspacePath,
     allowFailure: true,
   });
+  return result.code === 0;
+}
+
+/**
+ * Run a read-only jj command in a workspace, transparently recovering once from a
+ * stale working copy. This keeps the verifier's change-detection and the merge's
+ * change-id reads honest while workers run concurrently in sibling workspaces.
+ */
+async function jjReadInWorkspace(
+  workspacePath: string,
+  args: string[],
+): Promise<{ stdout: string; stderr: string; code: number }> {
+  let result = await runCommand("jj", args, { cwd: workspacePath, allowFailure: true });
+  if (result.code !== 0 && isStaleWorkingCopy(result.stderr)) {
+    await recoverStaleWorkspace(workspacePath);
+    result = await runCommand("jj", args, { cwd: workspacePath, allowFailure: true });
+  }
+  return result;
+}
+
+/**
+ * The change id of `@` (the working-copy commit) in the given workspace.
+ */
+export async function currentJjChangeId(workspacePath: string): Promise<string> {
+  const result = await jjReadInWorkspace(workspacePath, ["log", "--no-graph", "-r", "@", "-T", "change_id"]);
   return result.code === 0 ? result.stdout.trim().split(/\s+/)[0] ?? "" : "";
 }
 
 export async function jjStatus(workspacePath: string): Promise<string[]> {
-  const result = await runCommand("jj", ["status"], {
-    cwd: workspacePath,
-    allowFailure: true,
-  });
+  const result = await jjReadInWorkspace(workspacePath, ["status"]);
   return result.code === 0 ? parseJjStatus(result.stdout) : [];
 }
 

@@ -362,8 +362,20 @@ export function frontier(graph: RudderGraph): TaskNode[] {
  * scheduler decides those. Mirrors plan section 2's projection table.
  */
 export function projectNodeStatus(node: TaskNode, run?: RunRecord): NodeStatus {
+  // Daemon-owned terminal graph statuses are STICKY against re-projection. The
+  // worker only ever writes "completed" to run.json (it never writes "merged" —
+  // merge state lives in graph.json, owned by the daemon). So once the daemon
+  // has merged a node, or blocked it on a merge conflict / handed it to a
+  // resolver, the run.json stays "completed" forever. Without this guard the
+  // next tick re-projects merged -> review, auto-merge fires again on an
+  // already-merged change, and the node thrashes review<->merged, never settling
+  // as done. `blocked` is likewise daemon-owned (failed-parent propagation or a
+  // held merge conflict) and must not be re-projected back to review.
+  if (node.status === "merged" || node.status === "blocked") {
+    return node.status;
+  }
   if (!run) {
-    return node.status === "ready" || node.status === "blocked" ? node.status : "planned";
+    return node.status === "ready" ? "ready" : "planned";
   }
   return nodeStatusFromRunStatus(run.status, node.status);
 }

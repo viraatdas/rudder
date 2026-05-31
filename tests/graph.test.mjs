@@ -9,6 +9,7 @@ import {
   judgeParents,
   mirrorNodeStatus,
   mirrorPlanIntoGraph,
+  projectNodeStatus,
   readyNodes,
   softParents,
 } from "../dist/graph.js";
@@ -545,4 +546,35 @@ test("mirrorPlanIntoGraph on an empty payload clears the whole graph", () => {
   g = mirrorPlanIntoGraph(g, {});
   assert.deepEqual(Object.keys(g.nodes), []);
   assert.deepEqual(Object.keys(g.edges), []);
+});
+
+// ---------------------------------------------------------------------------
+// projectNodeStatus: daemon-owned terminal statuses are sticky against the
+// worker's run.json (which only ever reaches "completed", never "merged").
+// Regression: without stickiness a merged node re-projects to "review" every
+// tick, auto-merge re-fires on an already-merged change, and the node thrashes
+// review<->merged and never settles as done.
+// ---------------------------------------------------------------------------
+
+test("projectNodeStatus keeps a merged node merged even when run.json says completed", () => {
+  const n = node("n0", "merged");
+  assert.equal(projectNodeStatus(n, { status: "completed" }), "merged");
+  assert.equal(projectNodeStatus(n, { status: "merged" }), "merged");
+  // No run at all (post-restart) must still hold merged.
+  assert.equal(projectNodeStatus(n, undefined), "merged");
+});
+
+test("projectNodeStatus keeps a blocked node blocked (failed-parent / held conflict)", () => {
+  const n = node("n0", "blocked");
+  assert.equal(projectNodeStatus(n, { status: "completed" }), "blocked");
+  assert.equal(projectNodeStatus(n, undefined), "blocked");
+});
+
+test("projectNodeStatus still projects a completed run to review for a running node", () => {
+  assert.equal(projectNodeStatus(node("n0", "running"), { status: "completed" }), "review");
+  assert.equal(projectNodeStatus(node("n0", "review"), { status: "completed" }), "review");
+  assert.equal(projectNodeStatus(node("n0", "running"), { status: "running" }), "running");
+  assert.equal(projectNodeStatus(node("n0", "running"), { status: "failed" }), "failed");
+  assert.equal(projectNodeStatus(node("n0", "ready"), undefined), "ready");
+  assert.equal(projectNodeStatus(node("n0", "planned"), undefined), "planned");
 });

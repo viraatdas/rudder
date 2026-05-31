@@ -39,12 +39,25 @@ const GOAL_RULES = [
   "- Always include both. Never omit them and never leave them empty.",
 ].join("\n");
 
+// Each worker runs in its OWN isolated jj workspace at a different path than the
+// repository root you inspect. If a task prompt embeds an absolute path (e.g.
+// "in the repository at /Users/.../repo, edit foo.py"), the worker will write to
+// THAT path instead of its own workspace, the workspace stays empty, and the run
+// fails verification with no changes. So prompts MUST be path-agnostic.
+const WORKER_PATH_RULES = [
+  "Worker workspace rules (REQUIRED):",
+  "- Each task is run by a separate worker in its OWN isolated workspace checkout, at a different filesystem path than the repository root you are inspecting.",
+  "- In every `prompt`, `goal`, and `success`, refer to files by REPOSITORY-RELATIVE paths only (e.g. `mathutils.py`, `src/db/schema.ts`). The worker is already cd'd into its workspace; relative paths resolve correctly there.",
+  "- NEVER write an absolute filesystem path, the repository's location, or phrases like \"in the repository at <path>\" / \"cd into <path>\". An absolute path sends the worker to the wrong directory and the task fails.",
+].join("\n");
+
 const DEP_RULES = [
   "Dependency rules:",
   "- A task with no id and no deps is a 0-dep root.",
-  "- hard = ordering: the child literally CANNOT begin until the parent has merged. Every hard edge MUST carry a non-empty `why` justifying the ordering; an unjustified hard edge is downgraded to soft.",
-  "- soft = context-sharing (the default): the child runs in parallel and is fed the parent's diff once the parent merges.",
-  "- Prefer the MINIMAL hard-edge set. Default to soft. Only make an edge hard when starting the child before the parent merges would be wrong.",
+  "- hard = ordering: the child's success condition CANNOT be met until the parent has merged. Every hard edge MUST carry a non-empty `why` justifying the ordering; an unjustified hard edge is downgraded to soft.",
+  "- A task that CONSUMES another task's produced code is HARD on it. Concretely: tests that import or exercise code another task writes; code that imports a module/function/type another task creates; integration or wiring that calls an API another task defines. The child can technically start, but it cannot SUCCEED (imports resolve, tests pass) until that code exists — so it must wait for the merge. Reading the parent's diff as soft context is NOT enough when the child must execute the parent's code.",
+  "- soft = context-sharing (the default): the child runs in parallel and is fed the parent's diff once the parent merges. Use it when the child can succeed on its own and the parent's work is merely informative (parallel features, doc updates, sibling modules that do not import each other).",
+  "- Prefer the MINIMAL hard-edge set. Default to soft for independent work, but do NOT under-classify: if the child executes or imports the parent's code, it is hard.",
   "- No cycles.",
 ].join("\n");
 
@@ -290,6 +303,8 @@ function planSystemPrompt(): string {
     "",
     GOAL_RULES,
     "",
+    WORKER_PATH_RULES,
+    "",
     "Output rules:",
     "- Print exactly one block and no other JSON block:",
     `${PLAN_START}`,
@@ -307,7 +322,7 @@ export async function planTask(task: string, ctx: PlanContext): Promise<PlanDag>
     ? `\n\nRepository instructions:\n${instructions.map((file) => `### ${file.path}\n${file.content}`).join("\n\n")}`
     : "";
   const user = [
-    `Repository root: ${ctx.root}`,
+    `Repository root (for your read-only inspection ONLY — do NOT put this path in any task prompt; workers run elsewhere): ${ctx.root}`,
     `Branch: ${ctx.branch}`,
     "",
     `User request:\n${task}`,
@@ -331,6 +346,8 @@ function reconcileSystemPrompt(): string {
     DEP_RULES,
     "",
     GOAL_RULES,
+    "",
+    WORKER_PATH_RULES,
     "",
     "Output rules:",
     "- Print exactly one block and no other JSON block. The block holds a single task whose `deps`",
