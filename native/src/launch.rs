@@ -87,7 +87,18 @@ pub(crate) fn agent_command(
                     "--permission-mode".to_string(),
                     "bypassPermissions".to_string(),
                 ],
-                AgentMode::Plan | AgentMode::RudderPlan => vec![
+                // The orchestrator/planner runs in an isolated, never-merged
+                // workspace and is prompted only to emit a plan, so it runs
+                // prompt-free (bypassPermissions) rather than Claude's plan mode,
+                // which still gates and stalls decomposition on a permission ask.
+                AgentMode::RudderPlan => vec![
+                    "--permission-mode".to_string(),
+                    "bypassPermissions".to_string(),
+                    "--name".to_string(),
+                    format!("plan:{}", short_task(task)),
+                ],
+                // Explicit /plan stays read-only (plan mode) by design.
+                AgentMode::Plan => vec![
                     "--permission-mode".to_string(),
                     "plan".to_string(),
                     "--name".to_string(),
