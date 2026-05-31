@@ -174,8 +174,14 @@ function parseRawDeps(value: unknown): PlanEdge[] {
       continue;
     }
     if (entry && typeof entry === "object") {
-      const dep = entry as { on?: unknown; type?: unknown; why?: unknown };
-      const on = typeof dep.on === "string" ? dep.on.trim() : "";
+      const dep = entry as { on?: unknown; from?: unknown; type?: unknown; why?: unknown };
+      // Models phrase the parent id as either "on" or "from"; accept both.
+      const on =
+        typeof dep.on === "string" && dep.on.trim()
+          ? dep.on.trim()
+          : typeof dep.from === "string"
+            ? dep.from.trim()
+            : "";
       if (!on) {
         continue;
       }

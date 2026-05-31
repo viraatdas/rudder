@@ -660,6 +660,7 @@ fn render_planned_section<'a>(
     focused: bool,
     task_width: usize,
     leading_blank: bool,
+    awaiting_approval: bool,
 ) -> bool {
     use std::collections::HashMap;
     if nodes.is_empty() {
@@ -672,6 +673,14 @@ fn render_planned_section<'a>(
         Span::styled(Bucket::Todo.label(), header_style(focused)),
         Span::styled(format!(" {}", nodes.len()), muted_style(focused)),
     ])));
+    // APPROVAL GATE hint: while the plan awaits approval nothing has launched yet;
+    // the user approves (Enter) or fixes/discards (d) from the orchestrator row.
+    if awaiting_approval {
+        lines.push(ListItem::new(Line::from(Span::styled(
+            "  Enter approve  ·  d remove/discard",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ))));
+    }
 
     let id_to_index: HashMap<&str, usize> = nodes
         .iter()
@@ -754,6 +763,10 @@ const ORCH_MARK: &str = "\u{25C6}"; // ◆
 pub(crate) enum OrchTaskStatus {
     Todo,
     Running,
+    /// The worker finished (AgentStatus::Done) but has NOT merged yet: it is
+    /// awaiting review, exactly like the agents-pane Review bucket. Reserve Done
+    /// for Merged so the orchestrator DAG matches the agents-pane buckets.
+    Review,
     Done,
     Failed,
 }
@@ -763,6 +776,7 @@ impl OrchTaskStatus {
         match self {
             OrchTaskStatus::Todo => "todo",
             OrchTaskStatus::Running => "in-progress",
+            OrchTaskStatus::Review => "review",
             OrchTaskStatus::Done => "done",
             OrchTaskStatus::Failed => "failed",
         }
@@ -772,6 +786,7 @@ impl OrchTaskStatus {
         match self {
             OrchTaskStatus::Todo => ST_PLANNED,
             OrchTaskStatus::Running => ST_RUNNING,
+            OrchTaskStatus::Review => ST_REVIEW,
             OrchTaskStatus::Done => ST_MERGED,
             OrchTaskStatus::Failed => ST_FAILED,
         }
@@ -779,8 +794,10 @@ impl OrchTaskStatus {
 }
 
 /// Derive a plan task's live status: a launched agent tagged with this node id
-/// wins (Merged -> done, Failed/Stopped -> failed, otherwise in-progress); else if
-/// it is still a pending planned node it is todo. Falls back to todo.
+/// wins (Merged -> done, Done-not-merged -> review, Failed/Stopped -> failed,
+/// otherwise in-progress); else if it is still a pending planned node it is todo.
+/// Mirrors the agents-pane status buckets: Review is reserved for finished-but-
+/// unmerged, Done for Merged.
 pub(crate) fn orchestrator_task_status(app: &App, node_id: &str) -> OrchTaskStatus {
     if let Some(run) = app
         .agents
@@ -789,6 +806,7 @@ pub(crate) fn orchestrator_task_status(app: &App, node_id: &str) -> OrchTaskStat
     {
         return match run.status {
             AgentStatus::Merged => OrchTaskStatus::Done,
+            AgentStatus::Done => OrchTaskStatus::Review,
             AgentStatus::Failed | AgentStatus::Stopped => OrchTaskStatus::Failed,
             _ => OrchTaskStatus::Running,
         };
@@ -1040,6 +1058,7 @@ pub(crate) fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                     focused,
                     task_width,
                     leading_blank,
+                    app.awaiting_approval,
                 )
             } else {
                 render_status_section(
@@ -1333,17 +1352,23 @@ pub(crate) fn visible_agent_indices(agents: &[AgentRun]) -> Vec<usize> {
     sectioned_agent_order(agents)
 }
 
-/// Last non-empty, ANSI-stripped output line of a planner run. Surfaced under the
-/// spinner in the PLANNING phase so the orchestrator visibly reads as "thinking".
-fn orchestrator_last_output_line(agent: &AgentRun) -> Option<String> {
+/// The last `max` non-empty, ANSI-stripped output lines of a planner run, in
+/// natural (top-to-bottom) order. Surfaced under the spinner in the PLANNING phase
+/// so the orchestrator's clarifying questions (and its thinking) are visible to the
+/// user who is answering them, not just a single trailing line.
+fn orchestrator_recent_output_lines(agent: &AgentRun, max: usize) -> Vec<String> {
     let output = rudder_plan_output_for_run(agent);
     let clean = strip_ansi_for_plan(&output).replace('\r', "");
-    clean
+    let mut recent: Vec<String> = clean
         .lines()
         .rev()
         .map(str::trim)
-        .find(|line| !line.is_empty())
+        .filter(|line| !line.is_empty())
+        .take(max)
         .map(ToString::to_string)
+        .collect();
+    recent.reverse();
+    recent
 }
 
 /// Push one task row of the orchestrator DAG tree: nest glyphs, a live-status
@@ -1449,13 +1474,19 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
                 Span::raw(" "),
                 Span::styled("decomposing the task...", pane_text_style(true)),
             ]));
-            if let Some(last) = orchestrator_last_output_line(agent) {
+            // Render the last several non-empty planner lines so its clarifying
+            // questions are visible to the user who is answering them (input reaches
+            // the planner PTY via handle_worker_key). The spinner stays above.
+            let recent = orchestrator_recent_output_lines(agent, 8);
+            if !recent.is_empty() {
                 lines.push(Line::default());
                 let width = block_inner(area).width.saturating_sub(2).max(8) as usize;
-                lines.push(Line::from(Span::styled(
-                    truncate_chars(&last, width),
-                    muted_style(focused),
-                )));
+                for line in recent {
+                    lines.push(Line::from(Span::styled(
+                        truncate_chars(&line, width),
+                        muted_style(focused),
+                    )));
+                }
             }
         }
         OrchestratorPhase::PlanReady(tasks) => {
@@ -1501,11 +1532,13 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
             }
 
             let mut running = 0usize;
+            let mut review = 0usize;
             let mut done = 0usize;
             let mut todo = 0usize;
             for task in &tasks {
                 match orchestrator_task_status(app, &task.id) {
                     OrchTaskStatus::Running => running += 1,
+                    OrchTaskStatus::Review => review += 1,
                     OrchTaskStatus::Done => done += 1,
                     OrchTaskStatus::Failed => {}
                     OrchTaskStatus::Todo => todo += 1,
@@ -1513,9 +1546,18 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
             }
             lines.push(Line::default());
             lines.push(Line::from(Span::styled(
-                format!("running {running} · done {done} · todo {todo}"),
+                format!("running {running} · review {review} · done {done} · todo {todo}"),
                 muted_style(focused),
             )));
+            // While the plan awaits approval, show the gate hint: nothing has
+            // launched yet and the user can approve or fix the DAG.
+            if app.awaiting_approval {
+                lines.push(Line::default());
+                lines.push(Line::from(Span::styled(
+                    "plan awaiting approval  ·  Enter approve  ·  d remove/discard",
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                )));
+            }
         }
     }
 

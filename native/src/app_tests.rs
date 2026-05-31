@@ -1397,6 +1397,44 @@ branch refs/heads/main\n";
     }
 
     #[test]
+    fn rudder_plan_prompt_is_plan_mode_safe_and_asks_for_typed_deps() {
+        let prompt = rudder_plan_prompt("build the feature");
+        // Plan-mode safety: it must tell the planner NOT to call ExitPlanMode and to
+        // print the block as a normal assistant message (so the block reaches stdout
+        // even if plan mode would otherwise block at an approval prompt).
+        assert!(
+            prompt.contains("Do NOT call ExitPlanMode"),
+            "prompt must forbid ExitPlanMode so the block reaches stdout"
+        );
+        assert!(
+            prompt.contains("plan mode"),
+            "prompt must state it is running in plan mode"
+        );
+        assert!(
+            prompt.contains("separate set of worker agents"),
+            "prompt must say workers implement the tasks, not the planner"
+        );
+        // Typed-dependency DAG: it must ask for an id and typed deps, and define the
+        // hard/soft edge semantics rather than telling the model to make everything
+        // independent / one task.
+        assert!(prompt.contains("`id`") && prompt.contains("`deps`"));
+        assert!(prompt.contains("\"on\"") && prompt.contains("\"type\"") && prompt.contains("\"why\""));
+        assert!(prompt.contains("hard") && prompt.contains("soft"));
+        assert!(
+            prompt.contains("MINIMAL set of hard edges"),
+            "prompt must ask for the minimal hard-edge set"
+        );
+        // Clarifying-questions-first behavior is requested.
+        assert!(prompt.contains("clarifying questions"));
+        assert!(prompt.contains("RUDDER_PLAN_TASKS_START") && prompt.contains("RUDDER_PLAN_TASKS_END"));
+        // It must NOT still tell the model to make everything independent.
+        assert!(
+            !prompt.contains("smallest set of independent implementation tasks"),
+            "old independent-only wording must be gone"
+        );
+    }
+
+    #[test]
     fn extracts_rudder_plan_tasks_from_marked_json_block() {
         let output = "\x1b[32mRUDDER_PLAN_TASKS_START\x1b[0m\n{\"tasks\":[{\"title\":\"API\",\"prompt\":\"Implement API and test it.\",\"goal\":\"Complete the API without stopping until tests pass.\",\"success\":\"cargo test passes\"},{\"title\":\"UI\",\"prompt\":\"Implement UI and test it.\"}]}\nRUDDER_PLAN_TASKS_END";
         let tasks = extract_rudder_plan_tasks(output).expect("parse tasks");
@@ -3219,8 +3257,8 @@ branch refs/heads/main\n";
     fn completed_plan_queues_planned_nodes_and_pins_orchestrator() {
         let mut app = App::new();
         app.cwd = std::env::temp_dir();
-        // A two-node plan with a hard dep: n1 (ui) depends on n0 (api). The scheduler
-        // launches the ready root and leaves the blocked dependent in Todo.
+        // A two-node plan with a hard dep: n1 (ui) depends on n0 (api). Evaluation
+        // queues BOTH nodes and gates for approval: NOTHING launches yet.
         let block = "RUDDER_PLAN_TASKS_START\n{\"tasks\":[\
             {\"id\":\"n0\",\"title\":\"api\",\"prompt\":\"build api\",\"goal\":\"api\",\"success\":\"tests pass\"},\
             {\"id\":\"n1\",\"title\":\"ui\",\"prompt\":\"build ui\",\"goal\":\"ui\",\"success\":\"renders\",\"deps\":[{\"on\":\"n0\",\"type\":\"hard\",\"why\":\"ui needs the api merged\"}]}\
@@ -3232,7 +3270,7 @@ branch refs/heads/main\n";
         app.evaluate_completed_plan(0);
 
         // The planner run is KEPT as the pinned orchestrator (it owns the plan), not
-        // removed; its autosteer flag is cleared so it is only evaluated once.
+        // removed; its autosteer flag is cleared so it is only captured once.
         let orchestrators: Vec<&AgentRun> = app
             .agents
             .iter()
@@ -3240,20 +3278,31 @@ branch refs/heads/main\n";
             .collect();
         assert_eq!(orchestrators.len(), 1, "planner stays as the pinned orchestrator");
         assert!(orchestrators[0].is_orchestrator());
-        assert!(!orchestrators[0].autosteered, "evaluated-once flag cleared");
+        assert!(!orchestrators[0].autosteered, "captured-once flag cleared");
+        // APPROVAL GATE: both nodes queued, nothing launched, awaiting approval.
+        assert!(app.awaiting_approval, "plan gates for approval");
+        assert_eq!(app.planned_nodes.len(), 2, "all nodes queued, none launched");
+        assert!(
+            !app.agents.iter().any(|run| run.node_id.is_some()),
+            "no worker launched before approval"
+        );
+
+        // APPROVE: Enter on the selected orchestrator launches the ready root.
+        app.handle_agents_key(KeyEvent::from(KeyCode::Enter));
+        assert!(!app.awaiting_approval, "approval clears the gate");
         // n0 (root) launched -> an agent tagged with its node id. n1 stays in Todo
         // because its hard dep n0 has not merged.
         assert_eq!(app.planned_nodes.len(), 1, "blocked dependent stays in todo");
         assert_eq!(app.planned_nodes[0].id, "n1");
         assert!(
             app.agents.iter().any(|run| run.node_id.as_deref() == Some("n0")),
-            "ready root n0 launched as a node-tagged agent"
+            "ready root n0 launched as a node-tagged agent after approval"
         );
     }
 
     #[cfg(not(windows))]
     #[test]
-    fn trivial_plan_launches_single_node_on_completion() {
+    fn trivial_plan_gates_for_approval_then_launches_on_enter() {
         let mut app = App::new();
         app.cwd = std::env::temp_dir();
         let block = "RUDDER_PLAN_TASKS_START\n{\"tasks\":[{\"title\":\"only\",\"prompt\":\"do the thing\",\"goal\":\"thing\",\"success\":\"done\"}]}\nRUDDER_PLAN_TASKS_END\n";
@@ -3263,17 +3312,85 @@ branch refs/heads/main\n";
 
         app.evaluate_completed_plan(0);
 
-        // A 1-node plan: no gate, the orchestrator is KEPT pinned, and the single node
-        // (0 deps, slot free) launches on the immediate scheduler drain -> Todo empty.
+        // Even a 1-node plan gates: it is queued, nothing launches, awaiting approval.
+        assert!(app.awaiting_approval, "1-node plan still gates for approval");
+        assert_eq!(app.planned_nodes.len(), 1, "the single node is queued, not launched");
         assert!(
-            app.agents.iter().any(|run| run.mode == AgentMode::RudderPlan),
-            "orchestrator pinned, not removed"
+            !app.agents.iter().any(|run| run.node_id.is_some()),
+            "no worker launched before approval"
         );
-        assert!(app.planned_nodes.is_empty(), "the single node launched");
+
+        // APPROVE launches the single ready node.
+        app.handle_agents_key(KeyEvent::from(KeyCode::Enter));
+        assert!(!app.awaiting_approval, "approval clears the gate");
+        assert!(app.planned_nodes.is_empty(), "the single node launched after approval");
         assert!(
             app.agents.iter().any(|run| run.node_id.is_some()),
             "a node-tagged worker run was launched"
         );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn evaluate_populates_planned_nodes_without_launching() {
+        let mut app = App::new();
+        app.cwd = std::env::temp_dir();
+        let block = "RUDDER_PLAN_TASKS_START\n{\"tasks\":[\
+            {\"id\":\"n0\",\"title\":\"a\",\"prompt\":\"do a\",\"goal\":\"a\",\"success\":\"ok\"},\
+            {\"id\":\"n1\",\"title\":\"b\",\"prompt\":\"do b\",\"goal\":\"b\",\"success\":\"ok\"}\
+        ]}\nRUDDER_PLAN_TASKS_END\n";
+        let planner = planner_with_block(&app, block);
+        app.agents.push(planner);
+        app.selected_agent = 0;
+
+        app.evaluate_completed_plan(0);
+
+        // The gate is set, every node is queued, and NO scheduler launch happened.
+        assert!(app.awaiting_approval);
+        assert_eq!(app.planned_nodes.len(), 2);
+        assert!(
+            app.agents.iter().all(|run| run.node_id.is_none()),
+            "evaluate must not launch any worker"
+        );
+    }
+
+    #[test]
+    fn d_on_orchestrator_discards_pending_plan() {
+        let mut app = App::new();
+        let mut orch = test_agent_run("orch", "build a feature");
+        orch.mode = AgentMode::RudderPlan;
+        orch.status = AgentStatus::Running;
+        app.agents = vec![orch];
+        app.selected_agent = 0;
+        app.planned_nodes = vec![test_planned_node("n0", &[]), test_planned_node("n1", &["n0"])];
+        app.awaiting_approval = true;
+
+        // d on the selected orchestrator discards the whole plan, clearing the gate.
+        app.handle_agents_key(KeyEvent::from(KeyCode::Char('d')));
+        assert!(app.planned_nodes.is_empty(), "d on orchestrator discards the plan");
+        assert!(!app.awaiting_approval, "discard clears the approval gate");
+    }
+
+    #[test]
+    fn remove_planned_node_drops_one_and_keeps_rest() {
+        let mut app = App::new();
+        app.planned_nodes = vec![test_planned_node("n0", &[]), test_planned_node("n1", &["n0"])];
+        app.planned_origin = "build it".to_string();
+        app.awaiting_approval = true;
+
+        assert!(app.remove_planned_node("n1"), "removes the named node");
+        assert_eq!(app.planned_nodes.len(), 1, "one node remains");
+        assert_eq!(app.planned_nodes[0].id, "n0");
+        // The plan is not empty, so the gate stays up for the surviving node.
+        assert!(app.awaiting_approval, "gate stays while nodes remain");
+
+        // Removing the last node clears the gate and the origin.
+        assert!(app.remove_planned_node("n0"));
+        assert!(app.planned_nodes.is_empty());
+        assert!(!app.awaiting_approval, "removing the last node clears the gate");
+        assert!(app.planned_origin.is_empty());
+        // A node id not in the queue is a no-op.
+        assert!(!app.remove_planned_node("ghost"));
     }
 
     // --- Orchestrator view: pinned row + spinner/DAG worker pane -------------
@@ -3358,6 +3475,20 @@ branch refs/heads/main\n";
         failed.id = "n3-run".to_string();
         app.agents.push(failed);
         assert_eq!(orchestrator_task_status(&app, "n3"), OrchTaskStatus::Failed);
+    }
+
+    #[test]
+    fn orchestrator_task_status_done_not_merged_maps_to_review() {
+        let mut app = App::new();
+        // A worker that finished (AgentStatus::Done) but has not merged maps to
+        // Review, not Done. Done is reserved for Merged, matching the agents-pane
+        // buckets (Done -> review, Merged -> done).
+        app.agents = vec![node_agent("n0", AgentStatus::Done)];
+        assert_eq!(orchestrator_task_status(&app, "n0"), OrchTaskStatus::Review);
+
+        // And once merged it becomes Done.
+        app.agents = vec![node_agent("n0", AgentStatus::Merged)];
+        assert_eq!(orchestrator_task_status(&app, "n0"), OrchTaskStatus::Done);
     }
 
     /// Render the worker pane (orchestrator view) into a TestBackend and return its

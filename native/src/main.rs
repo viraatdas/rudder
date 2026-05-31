@@ -271,6 +271,12 @@ struct App {
     /// The original user request that produced `planned_nodes`, used to build each
     /// worker launch prompt so the worker sees the coordinating request.
     planned_origin: String,
+    /// While true, a plan has been parsed into `planned_nodes` but is awaiting the
+    /// user's APPROVAL gate: nothing launches. Enter approves (clears this and runs
+    /// the scheduler); d removes the selected node, or discards the whole plan when
+    /// the orchestrator is selected. Set on streaming plan detection; cleared once
+    /// the user approves (or discards the plan).
+    awaiting_approval: bool,
     /// Tick counter used to run the scheduler on a coarse cadence rather than on
     /// every PTY-byte tick.
     scheduler_tick: u64,
@@ -579,6 +585,7 @@ impl App {
             agents,
             planned_nodes: Vec::new(),
             planned_origin: String::new(),
+            awaiting_approval: false,
             scheduler_tick: 0,
             spinner_frame: 0,
             selected_agent: 0,
@@ -707,6 +714,16 @@ impl App {
         self.agents
             .get(self.selected_agent)
             .map(|run| run.is_main())
+            .unwrap_or(false)
+    }
+
+    /// True when the currently-selected agent is the pinned orchestrator
+    /// (a RudderPlan run). Used by the approval gate: Enter approves and d discards
+    /// the pending plan when the orchestrator row is selected.
+    fn selected_is_orchestrator(&self) -> bool {
+        self.agents
+            .get(self.selected_agent)
+            .map(|run| run.is_orchestrator())
             .unwrap_or(false)
     }
 
@@ -958,7 +975,13 @@ impl App {
             KeyCode::Up | KeyCode::Char('k') => self.select_previous_agent(),
             KeyCode::Down | KeyCode::Char('j') => self.select_next_agent(),
             KeyCode::Enter => {
-                if !self.agents.is_empty() {
+                // APPROVAL GATE: while a plan awaits approval and the pinned
+                // orchestrator is selected, Enter approves the plan and launches the
+                // ready nodes rather than focusing the worker pane.
+                if self.awaiting_approval && self.selected_is_orchestrator() {
+                    self.delete_pending = None;
+                    self.approve_planned_queue();
+                } else if !self.agents.is_empty() {
                     self.delete_pending = None;
                     if self.selected_is_main() {
                         self.focus_or_spawn_main();
@@ -975,10 +998,14 @@ impl App {
             KeyCode::Char('M') => self.request_merge_all_ready(),
             KeyCode::Char('m') => self.request_merge_selected_agent(),
             KeyCode::Char('d') => {
-                // When the only thing in the list is the pending plan queue (no
-                // selectable agents yet), `d` discards the whole plan. Otherwise
-                // it deletes the selected agent as usual.
-                if self.agents.is_empty() && !self.planned_nodes.is_empty() {
+                // FIX/DISCARD the pending plan: while a plan awaits approval and the
+                // pinned orchestrator is selected, `d` discards the whole plan.
+                // Reachable whenever there are planned nodes (no agents.is_empty
+                // guard): an orchestrator agent is present even when no worker has
+                // launched yet. Otherwise `d` deletes the selected agent as usual.
+                if !self.planned_nodes.is_empty()
+                    && (self.selected_is_orchestrator() || self.agents.is_empty())
+                {
                     self.discard_planned_queue();
                 } else {
                     self.delete_selected_agent();
@@ -3608,14 +3635,36 @@ impl App {
         self.workspace_idle_notified = false;
     }
 
-    /// Called from the poll loop when a planner run completes. The plan no longer
-    /// gates for approval or spawns everything at once: each task becomes a
-    /// PLANNED node queued in `planned_nodes`, visible in the Todo section. The
-    /// scheduler then drains the queue into live agents as deps merge and slots
-    /// free. The planner run itself is KEPT as the pinned orchestrator that owns
-    /// the plan (its worker pane renders the orchestrator DAG view); we only clear
-    /// `autosteered` so it is evaluated once. A trivial 1-node plan is just a
-    /// 1-node queue that the immediate scheduler drain launches.
+    /// Streaming plan detection: as soon as a parseable RUDDER_PLAN_TASKS block
+    /// appears in any orchestrator's accumulated output, capture the plan into the
+    /// approval gate WITHOUT waiting for the process to exit or the idle heuristic.
+    /// This makes the orchestrator robust to plan mode blocking at an approval
+    /// prompt (where the process never exits). Fires at most once per plan: the
+    /// `autosteered` flag on the run gates re-entry, and we only act while no plan
+    /// is already pending approval / queued.
+    fn maybe_detect_plan_ready(&mut self) {
+        // A plan is already captured (awaiting approval, or some nodes queued): do
+        // not re-capture from a still-streaming orchestrator.
+        if self.awaiting_approval || !self.planned_nodes.is_empty() {
+            return;
+        }
+        let index = self.agents.iter().position(|run| {
+            run.mode == AgentMode::RudderPlan
+                && run.autosteered
+                && extract_rudder_plan_tasks(&rudder_plan_output_for_run(run)).is_ok()
+        });
+        if let Some(index) = index {
+            self.evaluate_completed_plan(index);
+        }
+    }
+
+    /// Capture a completed (or streaming-detected) orchestrator plan into the
+    /// APPROVAL gate. Each task becomes a PLANNED node queued in `planned_nodes`,
+    /// visible in the Todo section, and `awaiting_approval` is set so NOTHING
+    /// launches yet: the user reviews the DAG, removes a node (d), discards the
+    /// plan (d on the orchestrator), or approves (Enter) to launch. The planner run
+    /// is KEPT as the pinned orchestrator that owns the plan (its worker pane
+    /// renders the DAG view); we clear `autosteered` so it is captured once.
     fn evaluate_completed_plan(&mut self, index: usize) {
         let Some(run) = self.agents.get_mut(index) else {
             return;
@@ -3649,16 +3698,59 @@ impl App {
         self.planned_nodes = nodes;
         self.planned_origin = planner_task;
 
-        // Clear the planner's autosteer flag so it is evaluated once, but KEEP the
+        // Clear the planner's autosteer flag so it is captured once, but KEEP the
         // run: it stays pinned at the top of the list as the orchestrator that owns
         // the plan. Its worker pane renders the DAG tree of the parsed tasks.
         run.autosteered = false;
         let _ = save_native_run_record(&self.cwd, run);
 
-        self.notice = Some(format!("plan queued {count} node(s) in todo"));
+        // APPROVAL GATE: do NOT launch. Hold the plan until the user approves so
+        // they can review and fix the DAG first.
+        self.awaiting_approval = true;
+        self.notice = Some(format!(
+            "plan ready: {count} node(s). Enter approve · d remove/discard"
+        ));
+        self.dirty = true;
+    }
+
+    /// APPROVE the pending plan: clear the approval gate and drain the queue into
+    /// live workers. Ready nodes (hard deps satisfied, slot free) launch on this
+    /// immediate scheduler pass; the rest stay in Todo until their deps merge.
+    fn approve_planned_queue(&mut self) {
+        if !self.awaiting_approval {
+            return;
+        }
+        if self.planned_nodes.is_empty() {
+            self.awaiting_approval = false;
+            return;
+        }
+        self.awaiting_approval = false;
+        self.notice = Some("plan approved".to_string());
         // Drain immediately so a ready node moves todo->in progress without waiting
         // a full scheduler interval (covers the trivial 1-node case visibly).
         self.run_scheduler();
+        self.dirty = true;
+    }
+
+    /// Remove a single planned node from the queue (FIX the plan before approval).
+    /// Returns true when a node was removed. Dropping a parent leaves its children
+    /// as roots (their dep id is simply absent from the plan, treated as satisfied).
+    fn remove_planned_node(&mut self, node_id: &str) -> bool {
+        let Some(position) = self
+            .planned_nodes
+            .iter()
+            .position(|node| node.id == node_id)
+        else {
+            return false;
+        };
+        let node = self.planned_nodes.remove(position);
+        self.notice = Some(format!("removed planned node {}", node.title));
+        if self.planned_nodes.is_empty() {
+            self.awaiting_approval = false;
+            self.planned_origin.clear();
+        }
+        self.dirty = true;
+        true
     }
 
     /// Node ids of agents that have reached Merged. These satisfy hard deps and
@@ -3750,6 +3842,7 @@ impl App {
         let count = self.planned_nodes.len();
         self.planned_nodes.clear();
         self.planned_origin.clear();
+        self.awaiting_approval = false;
         self.notice = Some(format!("discarded {count} planned node(s)"));
         self.dirty = true;
     }
@@ -4775,18 +4868,30 @@ What to do\n\
 
         // The planner run is now KEPT as the pinned orchestrator (no removal), so
         // indices stay stable. Process once each; `autosteered` is cleared inside
-        // so a re-poll of the same Done planner is a no-op.
+        // so a re-poll of the same Done planner is a no-op. This handles the case
+        // where the planner process actually exits after printing the block.
         completed_rudder_plans.sort_unstable();
         completed_rudder_plans.dedup();
         for index in completed_rudder_plans.into_iter().rev() {
             self.evaluate_completed_plan(index);
         }
 
+        // STREAMING DETECTION: a plan-mode planner may print the RUDDER_PLAN_TASKS
+        // block and then BLOCK at an ExitPlanMode approval prompt without ever
+        // exiting, so the Done-keyed path above never fires. Capture the plan into
+        // the approval gate as soon as a parseable block appears in the live output.
+        self.maybe_detect_plan_ready();
+
         // Drain the planned-node queue on a coarse cadence: as plan-launched
         // agents reach Merged their node ids satisfy dependents' hard deps, so a
         // periodic pass moves newly-ready nodes todo->in progress as slots free.
+        // Suppressed while a plan awaits approval: nothing launches until the user
+        // approves the DAG at the gate.
         self.scheduler_tick = self.scheduler_tick.wrapping_add(1);
-        if !self.planned_nodes.is_empty() && self.scheduler_tick % SCHEDULER_TICK_INTERVAL == 0 {
+        if !self.awaiting_approval
+            && !self.planned_nodes.is_empty()
+            && self.scheduler_tick % SCHEDULER_TICK_INTERVAL == 0
+        {
             self.run_scheduler();
         }
 
