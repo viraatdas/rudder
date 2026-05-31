@@ -663,13 +663,21 @@ function projectTaskNodeToBoardNode(
 // Build {from-node-id -> {hard,soft}} maps so each BoardNode carries the ids of
 // its incoming parents, and the flat BoardEdge list for the Nest/DAG view.
 function projectGraphEdges(graph: RudderGraph): { edges: BoardEdge[]; depsByNode: Map<string, { hard: string[]; soft: string[] }> } {
+  // A launched node is shown on the board under its runId, but graph edges
+  // reference node ids. Map every edge/dep endpoint to the id the board actually
+  // displays the node under (runId once scheduled, else the node id) so Nest-view
+  // arrows resolve to a real node instead of dangling.
+  const displayId = (id: string): string => graph.nodes[id]?.runId ?? id;
   const edges: BoardEdge[] = [];
   const depsByNode = new Map<string, { hard: string[]; soft: string[] }>();
   for (const id of Object.keys(graph.nodes)) {
-    depsByNode.set(id, { hard: hardParents(graph, id), soft: softParents(graph, id) });
+    depsByNode.set(id, {
+      hard: hardParents(graph, id).map(displayId),
+      soft: softParents(graph, id).map(displayId),
+    });
   }
   for (const edge of Object.values(graph.edges)) {
-    edges.push({ from: edge.from, to: edge.to, kind: edge.type });
+    edges.push({ from: displayId(edge.from), to: displayId(edge.to), kind: edge.type });
   }
   return { edges, depsByNode };
 }
