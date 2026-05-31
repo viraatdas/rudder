@@ -60,6 +60,26 @@ pub(crate) fn merge_strategy() -> MergeStrategy {
         .unwrap_or(MergeStrategy::Merge)
 }
 
+/// Read `orchestrator.maxParallel` from the config, clamped to a sane range.
+/// Falls back to `DEFAULT_MAX_PARALLEL` when unset or out of range.
+pub(crate) fn config_max_parallel(config: &serde_json::Value) -> usize {
+    config
+        .get("orchestrator")
+        .and_then(|orchestrator| orchestrator.get("maxParallel"))
+        .and_then(serde_json::Value::as_u64)
+        .map(|value| value as usize)
+        .filter(|value| (1..=100_000).contains(value))
+        .unwrap_or(DEFAULT_MAX_PARALLEL)
+}
+
+/// The plan-orchestration parallelism cap for this session.
+pub(crate) fn max_parallel() -> usize {
+    load_rudder_config()
+        .as_ref()
+        .map(config_max_parallel)
+        .unwrap_or(DEFAULT_MAX_PARALLEL)
+}
+
 pub(crate) fn save_model_defaults(backend: Backend, model: &str, effort: Option<EffortLevel>) -> Result<()> {
     let path = rudder_config_path().context("could not determine Rudder config path")?;
     let mut config = load_rudder_config().unwrap_or_else(default_config_value);

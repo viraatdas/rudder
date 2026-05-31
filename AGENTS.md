@@ -14,11 +14,11 @@ first.
 ## 1. What Rudder is
 
 Rudder is a terminal app for running coding agents (Claude Code and Codex) in
-parallel. Each task gets an isolated git worktree and runs a real agent CLI
-inside a native terminal pane. Rudder owns the outer workflow around those
-agents: a three-pane dashboard, pane focus, scrollback, task summaries, live
-review, and merge back to the base branch. Rudder Cloud is an optional hosted
-worker mode that keeps the same local control surface.
+parallel. Each task gets an isolated jj (Jujutsu) workspace, colocated with git,
+and runs a real agent CLI inside a native terminal pane. Rudder owns the outer
+workflow around those agents: a three-pane dashboard, pane focus, scrollback,
+task summaries, live review, and merge back to the base branch. Rudder Cloud is
+an optional hosted worker mode that keeps the same local control surface.
 
 It ships as the npm package `@viraatdas/rudder`, binary `rudder`
 (`dist/index.js`).
@@ -26,7 +26,8 @@ It ships as the npm package `@viraatdas/rudder`, binary `rudder`
 Two big pieces, one product:
 
 - A **TypeScript orchestrator** (the `rudder` CLI): argument parsing, run
-  lifecycle, git worktrees, backend adapters, state persistence, auth, cloud.
+  lifecycle, jj workspaces (colocated with git), backend adapters, state
+  persistence, auth, cloud.
 - A **Rust native dashboard** (`rudder-native`): the interactive three-pane TUI
   that hosts the agent PTYs, drawn with ratatui over crossterm, with real
   pseudo-terminals via portable-pty.
@@ -90,7 +91,7 @@ publishing; there is nothing to commit under `dist/`.
   │  no args + TTY      │ subcommands (run, doctor, login, cloud, ...)
   ▼                     ▼
  native dashboard   startRun / startNativeRun / startNativePlan (run-manager.ts)
- (rudder-native)         │  creates git worktree (git.ts), writes run.json (state.ts)
+ (rudder-native)         │  creates jj workspace (jj.ts), writes run.json (state.ts)
   │  hosts PTYs          │  spawns a detached `rudder __worker --repo --run <id>`
   │  reads run.json      ▼
   │  directly        __worker -> backend adapter (backends.ts)
@@ -171,14 +172,18 @@ Implemented in `src/run-manager.ts`.
    - Resolve repo root (`git.ts::findRepoRoot`, git `rev-parse --show-toplevel`,
      falling back to `path.resolve(cwd)`).
    - Load config, pick backend + model + effort.
-   - Decide worktree vs current checkout. Policy: a second concurrent run on the
-     same checkout forces a worktree (`activeRunsForCheckout`). `--worktree`
+   - `ensureJj()` + `ensureColocated(repoRoot)` (`jj.ts`): jj is hard-required and
+     auto-colocated (`jj git init --colocate`) so the repo still externally looks
+     like git.
+   - Decide jj workspace vs current checkout. Policy: a second concurrent run on
+     the same checkout forces a workspace (`activeRunsForCheckout`). `--worktree`
      forces one explicitly.
-   - `baseCommit = worktreeBaseCommit(repoRoot)` (the `main` ref, else HEAD) for
-     worktree runs, else current HEAD. `targetBranch = currentBranch(repoRoot)`.
-   - `createRunWorkspace` -> `git.ts::createRunWorktree`: creates branch
-     `rudder/<task-slug>-<hash>` and `git worktree add` at
-     `../.rudder-worktrees/<repo>-<hash>/<task-slug>-<hash>`.
+   - `baseCommit = currentJjChangeId(repoRoot)`. `targetBranch =
+     currentJjChangeId(repoRoot)` (else `currentBranch`).
+   - `createRunWorkspace` -> `jj.ts::createRunJjWorkspace`: `jj workspace add` at
+     `../.rudder-worktrees/<repo>-<hash>/<task-slug>-<hash>` with name
+     `rudder-<id..>-<hash>`. The run records `vcs:"jj"` and
+     `worktree.jjChangeId`.
    - `createRunRecord` (`state.ts`) writes `.rudder/runs/<id>/run.json`.
    - `writeAgentContext` regenerates `RUDDER.md` and excludes it via
      `.git/info/exclude`.
@@ -211,21 +216,24 @@ Implemented in `src/run-manager.ts`.
 4. **Verify** (`brain.ts::verifyRun`): produces a `VerificationResult`
    (`satisfied`, `missing`, `notes`, `shouldContinue`) written to `verifier.json`.
 
-5. **Merge / sync** (`src/git.ts`):
-   - `mergeRunIntoCurrentBranch(run, allowDirty, strategy)`:
-     - commits the worktree (`commitWorktreeChanges`, refuses on unresolved
-       conflicts or an in-progress rebase),
-     - `strategy === "merge"`: `git merge --no-ff <branch>` into the checkout,
-     - `strategy === "rebase"`: rebase the worktree onto the target, then
-       `git merge --ff-only`,
-     - records `MergeState` (status / conflictKind / conflictedFiles / error) on
-       the run and sets `run.status` to `merged` or `merge-conflict`.
-   - `syncRunWorktree(run, baseBranch)`: rebases the worktree onto the latest base
-     (`resolveRebaseBaseRef` prefers a local branch, then `origin/<branch>` after a
-     fetch, then HEAD). Recovers a `merge-conflict` run to `completed` when a
-     rebase conflict is resolved.
-   - `removeRunWorkspace` / `removeWorktree`: `git worktree remove [--force]`.
-   - `git.ts` is git-only. jj/Jujutsu support was removed; see section 12.
+5. **Merge / sync** (jj-first; routed by `run.vcs` in `run-manager.ts`):
+   - New runs are jj. `mergeJjRunIntoCurrentWorkspace(run, allowDirty)` (`jj.ts`):
+     captures `currentOpId` first (records it on `MergeState.operationId`), then
+     `jj new <into> <node>` to merge the run's change into the current change `@`.
+     jj records any conflict in the merge change (`jj resolve --list`) rather than
+     blocking; sets `MergeState.mergeChangeId` and `run.status` to `merged` or
+     `merge-conflict`. After a clean merge, `run-manager` calls
+     `exportToGit` (`jj git export`) so the colocated git refs stay current.
+   - `syncRunWorkspace(run, baseBranch)` (`jj.ts`): `jj rebase -s <node> -o <trunk>`
+     (jj records conflicts in place, never blocks; no rebase-in-progress dance).
+   - `removeRunWorkspace(run)` (`jj.ts`): `jj workspace forget <name>` + rm dir.
+   - **Global undo:** `currentOpId`/`undoToOp`/`undoLast` back `rudder undo [opId]`;
+     `.rudder/undo-stack.json` records `UndoEntry`s. `jj op restore` is global - it
+     rewinds all workspaces and refs at once.
+   - **Legacy git runs** (`run.vcs === "git"`, created before the jj switch) stay
+     mergeable via the git helpers kept in `git.ts`
+     (`mergeGitRunIntoCurrentBranch`, `syncGitRunWorktree`, `rebaseWorktreeOntoBase`,
+     `resolveRebaseBaseRef`, `removeGitWorktree`), reached only behind the vcs guard.
 
 ---
 
@@ -235,10 +243,12 @@ Implemented in `src/run-manager.ts`.
 The important shapes:
 - `RunRecord`: the full per-run document. Status union is
   `created | running | steering | verifying | completed | failed | cancelled |
-  merge-conflict | merged`. Holds `worktree{enabled,path,branch,workspaceName?}`,
-  `process{pid,...}`, `turns[]`, `autoSteer`, `session{nativeSessionId,...}`,
-  `terminal{kind:"tmux",...}`, `verification`, `merge`, `sync`,
-  `taskSummary`/`taskSummaryLlm`.
+  merge-conflict | merged`. Holds
+  `worktree{enabled,path,branch?,workspaceName?,jjChangeId?}`,
+  `vcs:"jj"|"git"`, `process{pid,...}`, `turns[]`, `autoSteer`,
+  `session{nativeSessionId,...}`, `terminal{kind:"tmux",...}`, `verification`,
+  `merge` (with `operationId`/`mergeChangeId`), `sync`,
+  `resolverFor?`/`resolverRunId?`, `taskSummary`/`taskSummaryLlm`.
 - `RudderConfig`: `defaultBackend`, `lastUsedBackend`, `mergeStrategy`,
   `runPolicy`, `backends{claude,codex,acpx}` (each `BackendConfig` with
   `model`/`effort`/`reasoningEffort`/`profileId`).
@@ -247,8 +257,10 @@ The important shapes:
 - `RudderEvent`: the event-stream union appended to `events.ndjson`.
 - `SpecContract` / `VerificationResult` / `RunRequest` / `BackendAdapter`.
 - `CloudAuthState` / `CloudSail` for cloud.
-- `VcsMode = "git" | "jj"`: retained only for backward-compatible deserialization
-  of old records; runtime is always git (section 12).
+- `VcsMode = "git" | "jj"`: new runs are always `"jj"`; `"git"` only appears on
+  legacy records merged behind the vcs guard (section 12).
+- `UndoEntry = {opId,label,ts,runIds[]}`: entries on `.rudder/undo-stack.json`
+  backing `rudder undo`.
 
 ### File layout
 Global (`~/.rudder/`, overridable via `RUDDER_HOME`):
@@ -261,11 +273,12 @@ Per repo (`<repo>/.rudder/`):
 - `runs/<id>/events.ndjson` (append-only event log)
 - `runs/<id>/output.txt` (raw backend stdout/stderr)
 - `runs/<id>/spec.json`, `runs/<id>/verifier.json`
+- `undo-stack.json` (`UndoEntry[]`, atomic via `updateJson`)
 
-Worktrees live outside the repo at
+jj workspaces live outside the repo at
 `../.rudder-worktrees/<repoSlug>-<repoHash>/<taskSlug>-<runHash>` so they never
 nest inside the checkout. `RUDDER.md` is generated at the repo root and inside
-each active worktree, and excluded via each checkout's `.git/info/exclude`.
+each active workspace, and excluded via each checkout's `.git/info/exclude`.
 
 ### Persistence helpers: `src/util.ts`
 - `writeJson(path, value, {mode})`: atomic write (temp file + `rename`) under a
@@ -494,11 +507,18 @@ is a separate piece of work.
 
 ## 12. Conventions and gotchas
 
-- **No jj.** jj/Jujutsu workspace support was removed; Rudder is git-worktree
-  only. The `VcsMode = "git" | "jj"` type and the optional `RunRecord.vcs` /
-  `worktree.workspaceName` / `RudderConfig.vcs` fields are kept ONLY so old
-  persisted JSON still deserializes. Never write `"jj"`, never branch on vcs, do
-  not reintroduce a jj backend.
+- **jj is the required internal substrate.** Run isolation and merge run on jj
+  (Jujutsu), colocated with git (`jj git init --colocate`) so the repo still
+  externally looks like git and final output is normal git commits / a PR. jj is
+  hard-required (`ensureJj` throws `MissingToolError("jj")`; `doctor`/`onboard`
+  fail loudly if absent). The jj driver is `src/jj.ts` (all commands via
+  `runCommand("jj", ...)`); `git.ts` keeps only the externally-git contract
+  (root/branch/commit, status+diff for Hunk) plus the legacy git merge/sync
+  helpers behind a `run.vcs === "git"` guard. New runs always record
+  `vcs:"jj"` + `worktree.jjChangeId`. Use `exportToGit` after each merge. Global
+  undo is free via `jj op restore` (`rudder undo`). jj 0.40 note: `jj rebase`
+  uses `-o`/`--onto` (not `-d`); `jj git push --allow-new` is gone (plain
+  `--bookmark` push handles new bookmarks) - both have fallbacks in `jj.ts`.
 - **Atomic, serialized writes.** Anything that persists JSON should go through
   `writeJson`/`updateJson` so the per-path lock and unique temp names hold. Do not
   hand-roll temp-file writes for `run.json`/`config.json`.
@@ -526,7 +546,8 @@ is a separate piece of work.
   matching module (`run-manager.ts` / `cloud.ts` / `auth.ts`).
 - New backend behavior: `src/backends.ts` (`BackendAdapter`) + `src/codex-binary.ts`
   for Codex specifics.
-- Run/merge/worktree behavior: `src/git.ts` + `src/run-manager.ts`.
+- Run isolation/merge/sync behavior: `src/jj.ts` (jj substrate) + `src/run-manager.ts`
+  (routing); `src/git.ts` for the externally-git surface + legacy git runs.
 - Dashboard input/state/keys: `native/src/main.rs` (`App` + `impl App`).
   Rendering: `render.rs`. Terminal emulation/scroll: `pty_terminal.rs`. Output
   heuristics: `detect.rs`. Add coverage in `app_tests.rs`.

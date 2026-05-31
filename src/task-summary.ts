@@ -267,6 +267,162 @@ async function summarizeViaClaudeCli(task: string): Promise<string | null> {
   });
 }
 
+/**
+ * Resolve an Anthropic API key from the environment or the saved anthropic auth
+ * profile. Returns "" when none is available.
+ */
+export async function resolveAnthropicApiKey(): Promise<string> {
+  let apiKey = process.env.ANTHROPIC_API_KEY ?? "";
+  if (!apiKey) {
+    try {
+      const { backendEnv } = await import("./backends.js");
+      const env = await backendEnv("anthropic");
+      apiKey = env.ANTHROPIC_API_KEY ?? "";
+    } catch {
+      // ignore — caller falls through to the claude CLI path
+    }
+  }
+  return apiKey;
+}
+
+async function callModelViaApiKey(params: {
+  apiKey: string;
+  model: string;
+  system: string;
+  user: string;
+  maxTokens: number;
+}): Promise<string | null> {
+  try {
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": params.apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: params.model,
+        max_tokens: params.maxTokens,
+        system: params.system,
+        messages: [{ role: "user", content: params.user }],
+      }),
+    });
+    if (!response.ok) {
+      return null;
+    }
+    const data = (await response.json()) as {
+      content?: Array<{ type?: string; text?: string }>;
+    };
+    return (data.content ?? [])
+      .filter((block) => typeof block?.text === "string")
+      .map((block) => block.text)
+      .join("")
+      .trim();
+  } catch {
+    return null;
+  }
+}
+
+async function callModelViaClaudeCli(params: {
+  model: string;
+  system: string;
+  user: string;
+  timeoutMs: number;
+}): Promise<string | null> {
+  const { spawn } = await import("node:child_process");
+  return await new Promise<string | null>((resolve) => {
+    let settled = false;
+    const finish = (val: string | null) => {
+      if (!settled) {
+        settled = true;
+        resolve(val);
+      }
+    };
+    let child;
+    try {
+      child = spawn(
+        "claude",
+        ["-p", "--model", params.model, "--append-system-prompt", params.system],
+        { stdio: ["pipe", "pipe", "ignore"] },
+      );
+    } catch {
+      finish(null);
+      return;
+    }
+    let out = "";
+    const timer = setTimeout(() => {
+      try {
+        child.kill("SIGTERM");
+      } catch {
+        // ignore
+      }
+      finish(null);
+    }, params.timeoutMs);
+    child.stdout?.on("data", (d: Buffer) => {
+      out += d.toString("utf8");
+    });
+    child.on("exit", () => {
+      clearTimeout(timer);
+      finish(out.trim() || null);
+    });
+    child.on("error", () => {
+      clearTimeout(timer);
+      finish(null);
+    });
+    try {
+      child.stdin?.write(params.user);
+      child.stdin?.end();
+    } catch {
+      // ignore — child error handler will fire
+    }
+  });
+}
+
+/**
+ * Generic single-shot LLM text call reused by the planner. Tries the Anthropic
+ * API (when a key is available) then falls back to the `claude` CLI, mirroring
+ * llmSummarizeTask's degradation path. Throws only when neither path is usable
+ * AND no output was produced, so callers can surface a clear error.
+ */
+export async function callTextModel(params: {
+  model: string;
+  system: string;
+  user: string;
+  maxTokens?: number;
+  timeoutMs?: number;
+}): Promise<string> {
+  const maxTokens = params.maxTokens ?? 2048;
+  const timeoutMs = params.timeoutMs ?? 60000;
+  const apiKey = await resolveAnthropicApiKey();
+  if (apiKey) {
+    const text = await callModelViaApiKey({
+      apiKey,
+      model: params.model,
+      system: params.system,
+      user: params.user,
+      maxTokens,
+    });
+    if (text) {
+      return text;
+    }
+  }
+  const { commandExists } = await import("./util.js");
+  if (commandExists("claude")) {
+    const text = await callModelViaClaudeCli({
+      model: params.model,
+      system: params.system,
+      user: params.user,
+      timeoutMs,
+    });
+    if (text) {
+      return text;
+    }
+  }
+  throw new Error(
+    "No planning model available: set ANTHROPIC_API_KEY (or sign in so a key is in your auth profile), or install the `claude` CLI.",
+  );
+}
+
 export async function llmSummarizeTask(task: string): Promise<string | null> {
   const trimmed = normalizeTaskText(task);
   if (!trimmed) {

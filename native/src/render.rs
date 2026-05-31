@@ -89,6 +89,792 @@ pub(crate) fn render_mouse_debug(frame: &mut Frame<'_>, area: Rect, app: &App) {
     );
 }
 
+/// Render one agent into the list: a task-label line, a status badge line, and an
+/// optional diff line. `prefix` is prepended to the task-label line and
+/// `cont_prefix` to the status/diff continuation lines. Both are empty in flat
+/// mode (byte-for-byte unchanged output); nest mode passes jj-log connector glyphs.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn push_agent_row<'a>(
+    lines: &mut Vec<ListItem<'a>>,
+    app: &App,
+    index: usize,
+    agent: &AgentRun,
+    diff: Option<String>,
+    focused: bool,
+    task_width: usize,
+    prefix: &[Span<'a>],
+    cont_prefix: &[Span<'a>],
+) {
+    push_agent_row_with_trailing(
+        lines, app, index, agent, diff, focused, task_width, prefix, cont_prefix, &[],
+    );
+}
+
+/// Like `push_agent_row` but appends `trailing` spans to the task-label line (used
+/// for the faint "^dep" cross-section dependency hint).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn push_agent_row_with_trailing<'a>(
+    lines: &mut Vec<ListItem<'a>>,
+    app: &App,
+    index: usize,
+    agent: &AgentRun,
+    diff: Option<String>,
+    focused: bool,
+    task_width: usize,
+    prefix: &[Span<'a>],
+    cont_prefix: &[Span<'a>],
+    trailing: &[Span<'a>],
+) {
+    let selected = index == app.selected_agent;
+    let marker = if selected { "> " } else { "  " };
+    let task_style = if selected {
+        pane_text_style(focused).add_modifier(Modifier::BOLD)
+    } else {
+        pane_text_style(focused)
+    };
+    let task_label = if agent.is_main() {
+        agent.task_summary.clone()
+    } else if selected && app.rename_input.is_some() {
+        let buf = app.rename_input.clone().unwrap_or_default();
+        format!("✎ {buf}")
+    } else if agent.task_summary.trim().is_empty() {
+        summarize_task(&agent.task)
+    } else {
+        agent.task_summary.clone()
+    };
+
+    let mut first = prefix.to_vec();
+    first.extend([
+        Span::styled(marker, accent_style(focused)),
+        if is_cloud_agent(agent) {
+            Span::styled(
+                "☁ ",
+                cloud_style(true, focused).add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::raw("")
+        },
+        Span::styled(truncate_chars(&task_label, task_width), task_style),
+    ]);
+    first.extend(trailing.iter().cloned());
+    lines.push(ListItem::new(Line::from(first)));
+
+    let (status_label, status_style): (&'static str, Style) =
+        if agent.is_main() && agent.terminal.is_none() {
+            ("idle", muted_style(focused))
+        } else {
+            (agent_status_label(agent), agent_status_style(agent))
+        };
+    let badge_style = Style::default().fg(status_style.fg.unwrap_or(MUTED));
+
+    let mut status_line = cont_prefix.to_vec();
+    status_line.extend([
+        Span::raw("  "),
+        Span::styled(BADGE, badge_style),
+        Span::raw(" "),
+        Span::styled(status_label, status_style),
+        Span::raw("  "),
+        if agent.is_main() {
+            Span::styled("main", accent_style(focused).add_modifier(Modifier::BOLD))
+        } else if is_cloud_agent(agent) {
+            Span::styled("cloud", accent_style(focused).add_modifier(Modifier::BOLD))
+        } else if agent.mode == AgentMode::RudderPlan {
+            Span::styled("rudder-plan", accent_style(focused))
+        } else if agent.mode == AgentMode::ReviewAll {
+            Span::styled("review-all", accent_style(focused))
+        } else if agent.mode == AgentMode::Plan {
+            Span::styled("plan", accent_style(focused))
+        } else {
+            Span::styled("run", muted_style(focused))
+        },
+        Span::raw("  "),
+        Span::styled(agent.backend.as_str().to_string(), muted_style(focused)),
+        Span::raw("  "),
+        Span::styled(agent.model.clone(), model_style(focused)),
+        Span::styled(
+            format!("({})", effort_label(agent.effort)),
+            model_style(focused),
+        ),
+    ]);
+    lines.push(ListItem::new(Line::from(status_line)));
+    if let Some(summary) = diff {
+        let mut diff_line = cont_prefix.to_vec();
+        diff_line.extend([
+            Span::raw("  "),
+            Span::styled(summary, muted_style(focused)),
+        ]);
+        lines.push(ListItem::new(Line::from(diff_line)));
+    }
+}
+
+/// Status section for the agents pane. Order here is the rendered/navigated order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Bucket {
+    Todo,
+    InProgress,
+    Review,
+    Done,
+    Closed,
+}
+
+impl Bucket {
+    /// Sections in display order; main agents render above all of these.
+    const ORDER: [Bucket; 5] = [
+        Bucket::Todo,
+        Bucket::InProgress,
+        Bucket::Review,
+        Bucket::Done,
+        Bucket::Closed,
+    ];
+
+    /// Short header label (the left pane is only 34 cols wide).
+    fn label(self) -> &'static str {
+        match self {
+            Bucket::Todo => "todo",
+            Bucket::InProgress => "in progress",
+            Bucket::Review => "review",
+            Bucket::Done => "done",
+            Bucket::Closed => "closed",
+        }
+    }
+}
+
+/// Map an agent to its status section.
+///
+/// - todo:        planned (not-yet-launched) DAG nodes (rendered from the
+///                `planned_nodes` queue, not from agents).
+/// - in progress: Running (incl. steering/verifying via AgentStatus::Running).
+/// - review:      completed-but-not-merged (Done), plus needs-permission/-input.
+/// - done:        Merged.
+/// - closed:      Failed / Stopped (cancelled).
+///
+/// Main agents are rendered in their own leading section and are not bucketed.
+/// Agents never land in Todo: that section now holds planned nodes only.
+pub(crate) fn status_bucket(agent: &AgentRun) -> Bucket {
+    if agent.needs_permission || agent.needs_user_input {
+        return Bucket::Review;
+    }
+    match agent.status {
+        AgentStatus::Running => Bucket::InProgress,
+        AgentStatus::Done => Bucket::Review,
+        AgentStatus::Merged => Bucket::Done,
+        AgentStatus::Failed | AgentStatus::Stopped => Bucket::Closed,
+    }
+}
+
+/// Build the per-section nest: parent->children adjacency restricted to edges where
+/// BOTH endpoints fall in `members` (the indices in one section). Also returns,
+/// for each member, whether it has a parent that lives OUTSIDE this section (so we
+/// render it as a section root with a dep hint rather than a connector).
+fn section_nest(
+    agents: &[AgentRun],
+    members: &[usize],
+) -> (
+    std::collections::HashMap<usize, Vec<(usize, EdgeType)>>,
+    std::collections::HashSet<usize>,
+    std::collections::HashSet<usize>,
+) {
+    use std::collections::{HashMap, HashSet};
+    let member_set: HashSet<usize> = members.iter().copied().collect();
+    let id_to_index: HashMap<&str, usize> = agents
+        .iter()
+        .enumerate()
+        .map(|(index, agent)| (agent.id.as_str(), index))
+        .collect();
+
+    let mut children: HashMap<usize, Vec<(usize, EdgeType)>> = HashMap::new();
+    let mut has_in_section_parent: HashSet<usize> = HashSet::new();
+    let mut has_out_of_section_parent: HashSet<usize> = HashSet::new();
+
+    for &child_index in members {
+        let agent = &agents[child_index];
+        // Hard parents bind before soft so the most-binding edge wins.
+        let mut seen_parent = false;
+        for parent_id in &agent.deps {
+            if let Some(&parent_index) = id_to_index.get(parent_id.as_str()) {
+                if parent_index == child_index {
+                    continue;
+                }
+                if member_set.contains(&parent_index) {
+                    children
+                        .entry(parent_index)
+                        .or_default()
+                        .push((child_index, EdgeType::Hard));
+                    has_in_section_parent.insert(child_index);
+                } else {
+                    has_out_of_section_parent.insert(child_index);
+                }
+                seen_parent = true;
+            }
+        }
+        for parent_id in &agent.soft_deps {
+            if agent.deps.iter().any(|hard| hard == parent_id) {
+                continue;
+            }
+            if let Some(&parent_index) = id_to_index.get(parent_id.as_str()) {
+                if parent_index == child_index {
+                    continue;
+                }
+                if member_set.contains(&parent_index) {
+                    children
+                        .entry(parent_index)
+                        .or_default()
+                        .push((child_index, EdgeType::Soft));
+                    has_in_section_parent.insert(child_index);
+                } else {
+                    has_out_of_section_parent.insert(child_index);
+                }
+                seen_parent = true;
+            }
+        }
+        let _ = seen_parent;
+    }
+
+    (children, has_in_section_parent, has_out_of_section_parent)
+}
+
+/// Depth-first walk of one section's nest, appending visited indices in render
+/// order (parents before children). Cycle-guarded by `visited`.
+#[allow(clippy::too_many_arguments)]
+fn section_walk(
+    out: &mut Vec<usize>,
+    children: &std::collections::HashMap<usize, Vec<(usize, EdgeType)>>,
+    index: usize,
+    visited: &mut std::collections::HashSet<usize>,
+) {
+    if !visited.insert(index) {
+        return;
+    }
+    out.push(index);
+    if let Some(kids) = children.get(&index) {
+        for (child_index, _) in kids {
+            section_walk(out, children, *child_index, visited);
+        }
+    }
+}
+
+/// The members of one section in nested render order: section roots (no in-section
+/// parent) in display order, each followed by its in-section subtree.
+fn section_order(agents: &[AgentRun], members: &[usize]) -> Vec<usize> {
+    use std::collections::HashSet;
+    let (children, has_in_section_parent, _out) = section_nest(agents, members);
+    let mut visited: HashSet<usize> = HashSet::new();
+    let mut out: Vec<usize> = Vec::new();
+    for &index in members {
+        if !has_in_section_parent.contains(&index) {
+            section_walk(&mut out, &children, index, &mut visited);
+        }
+    }
+    // Any member left unvisited (e.g. inside an in-section cycle) renders at root.
+    for &index in members {
+        section_walk(&mut out, &children, index, &mut visited);
+    }
+    out
+}
+
+/// Indices that belong to `bucket`, in display (insertion) order, excluding main
+/// and pinned orchestrators (which render above all sections).
+fn bucket_members(agents: &[AgentRun], bucket: Bucket) -> Vec<usize> {
+    agents
+        .iter()
+        .enumerate()
+        .filter(|(_, agent)| {
+            !agent.is_main() && !agent.is_orchestrator() && status_bucket(agent) == bucket
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// Canonical agents-pane order used by BOTH the renderer and navigation so the
+/// selection marker always lands on the row j/k move to: main agents first, then
+/// each status section in `Bucket::ORDER`, nested within the section.
+pub(crate) fn sectioned_agent_order(agents: &[AgentRun]) -> Vec<usize> {
+    // Pinned orchestrators (RudderPlan) render and navigate first, above main and
+    // every status section, so j/k land on them where they are drawn.
+    let mut order: Vec<usize> = agents
+        .iter()
+        .enumerate()
+        .filter(|(_, agent)| agent.is_orchestrator())
+        .map(|(index, _)| index)
+        .collect();
+    order.extend(
+        agents
+            .iter()
+            .enumerate()
+            .filter(|(_, agent)| agent.is_main() && !agent.is_orchestrator())
+            .map(|(index, _)| index),
+    );
+    for bucket in Bucket::ORDER {
+        let members = bucket_members(agents, bucket);
+        order.extend(section_order(agents, &members));
+    }
+    order
+}
+
+/// Faint "^dep" badge appended to a section root whose parent lives in another
+/// section (so it has no connector to draw here). Short to fit the 34-col pane.
+fn dep_hint_span(focused: bool) -> Span<'static> {
+    Span::styled(
+        "  ^dep",
+        Style::default()
+            .fg(if focused { FAINT } else { FAINT })
+            .add_modifier(Modifier::DIM),
+    )
+}
+
+/// Recursive section nest walk that pushes rendered rows (mirrors `nest_walk` but
+/// scoped to one section's adjacency, and tags out-of-section roots with a dep hint).
+#[allow(clippy::too_many_arguments)]
+fn section_walk_rows<'a>(
+    lines: &mut Vec<ListItem<'a>>,
+    app: &App,
+    focused: bool,
+    task_width: usize,
+    diff_summaries: &[Option<String>],
+    children: &std::collections::HashMap<usize, Vec<(usize, EdgeType)>>,
+    out_of_section: &std::collections::HashSet<usize>,
+    index: usize,
+    edge: Option<EdgeType>,
+    is_last: bool,
+    lanes: &mut Vec<bool>,
+    visited: &mut std::collections::HashSet<usize>,
+) {
+    if !visited.insert(index) {
+        return;
+    }
+    let agent = &app.agents[index];
+    let is_root = lanes.is_empty();
+    let mut prefix = nest_prefix(lanes, is_last, edge);
+    // A section root whose parent is in another section gets a faint dep hint after
+    // its label rather than a connector glyph (the parent isn't drawn here).
+    let trailing = if is_root && out_of_section.contains(&index) {
+        vec![dep_hint_span(focused)]
+    } else {
+        Vec::new()
+    };
+
+    let own_children = children.get(&index).map(Vec::as_slice).unwrap_or(&[]);
+    let has_unvisited_children = own_children.iter().any(|(child, _)| !visited.contains(child));
+    let cont_prefix = nest_cont_prefix(lanes, has_unvisited_children, is_root);
+
+    let summary = if agent.is_main() {
+        None
+    } else {
+        diff_summaries.get(index).and_then(|opt| opt.clone())
+    };
+    push_agent_row_with_trailing(
+        lines, app, index, agent, summary, focused, task_width, &prefix, &cont_prefix, &trailing,
+    );
+    prefix.clear();
+
+    let pending: Vec<(usize, EdgeType)> = own_children
+        .iter()
+        .copied()
+        .filter(|(child, _)| !visited.contains(child))
+        .collect();
+    for (position, (child_index, child_edge)) in pending.iter().enumerate() {
+        let child_is_last = position + 1 == pending.len();
+        lanes.push(!child_is_last);
+        section_walk_rows(
+            lines,
+            app,
+            focused,
+            task_width,
+            diff_summaries,
+            children,
+            out_of_section,
+            *child_index,
+            Some(*child_edge),
+            child_is_last,
+            lanes,
+            visited,
+        );
+        lanes.pop();
+    }
+}
+
+/// Render one status section: a header line with a count, then its members nested
+/// by dependency. Returns true if anything was emitted (the section was non-empty).
+#[allow(clippy::too_many_arguments)]
+fn render_status_section<'a>(
+    lines: &mut Vec<ListItem<'a>>,
+    app: &App,
+    focused: bool,
+    task_width: usize,
+    diff_summaries: &[Option<String>],
+    bucket: Bucket,
+    leading_blank: bool,
+) -> bool {
+    use std::collections::HashSet;
+    let members = bucket_members(&app.agents, bucket);
+    if members.is_empty() {
+        return false;
+    }
+    if leading_blank {
+        lines.push(ListItem::new(Line::default()));
+    }
+    lines.push(ListItem::new(Line::from(vec![
+        Span::styled(bucket.label(), header_style(focused)),
+        Span::styled(format!(" {}", members.len()), muted_style(focused)),
+    ])));
+
+    let (children, has_in_section_parent, out_of_section) = section_nest(&app.agents, &members);
+    let mut visited: HashSet<usize> = HashSet::new();
+    let mut lanes: Vec<bool> = Vec::new();
+    // Roots: members with no in-section parent, in display order.
+    for &index in &members {
+        if !has_in_section_parent.contains(&index) {
+            section_walk_rows(
+                lines,
+                app,
+                focused,
+                task_width,
+                diff_summaries,
+                &children,
+                &out_of_section,
+                index,
+                None,
+                true,
+                &mut lanes,
+                &mut visited,
+            );
+        }
+    }
+    // Any member trapped in an in-section cycle renders at root so nothing hides.
+    for &index in &members {
+        if !visited.contains(&index) {
+            section_walk_rows(
+                lines,
+                app,
+                focused,
+                task_width,
+                diff_summaries,
+                &children,
+                &out_of_section,
+                index,
+                None,
+                true,
+                &mut lanes,
+                &mut visited,
+            );
+        }
+    }
+    true
+}
+
+/// Push one planned (not-yet-launched) node row into the Todo section: a label
+/// line with the node title and a status line with a Todo-colored badge reading
+/// "todo". `prefix`/`cont_prefix` carry the nest glyphs (empty for a root).
+fn push_planned_row<'a>(
+    lines: &mut Vec<ListItem<'a>>,
+    node: &PlannedNode,
+    focused: bool,
+    task_width: usize,
+    prefix: &[Span<'a>],
+    cont_prefix: &[Span<'a>],
+) {
+    let label = if node.title.trim().is_empty() {
+        summarize_task(&node.prompt)
+    } else {
+        node.title.clone()
+    };
+    let mut first = prefix.to_vec();
+    first.extend([
+        Span::raw("  "),
+        Span::styled(truncate_chars(&label, task_width), pane_text_style(focused)),
+    ]);
+    lines.push(ListItem::new(Line::from(first)));
+
+    let mut status_line = cont_prefix.to_vec();
+    status_line.extend([
+        Span::raw("  "),
+        Span::styled(BADGE, Style::default().fg(ST_PLANNED)),
+        Span::raw(" "),
+        Span::styled("todo", Style::default().fg(ST_PLANNED)),
+        Span::raw("  "),
+        Span::styled("planned", muted_style(focused)),
+    ]);
+    lines.push(ListItem::new(Line::from(status_line)));
+}
+
+/// Walk the planned-node forest depth-first, nesting a node under a parent that is
+/// also still planned. Roots are nodes whose every dep id is not itself a pending
+/// planned node (so its parent has already launched or never existed).
+#[allow(clippy::too_many_arguments)]
+fn planned_walk<'a>(
+    lines: &mut Vec<ListItem<'a>>,
+    nodes: &[PlannedNode],
+    children: &std::collections::HashMap<usize, Vec<(usize, EdgeType)>>,
+    index: usize,
+    edge: Option<EdgeType>,
+    is_last: bool,
+    focused: bool,
+    task_width: usize,
+    lanes: &mut Vec<bool>,
+    visited: &mut Vec<bool>,
+) {
+    if visited[index] {
+        return;
+    }
+    visited[index] = true;
+
+    let is_root = lanes.is_empty();
+    let prefix = nest_prefix(lanes, is_last, edge);
+    let own_children = children.get(&index).map(Vec::as_slice).unwrap_or(&[]);
+    let has_unvisited_children = own_children.iter().any(|(child, _)| !visited[*child]);
+    let cont_prefix = nest_cont_prefix(lanes, has_unvisited_children, is_root);
+
+    push_planned_row(lines, &nodes[index], focused, task_width, &prefix, &cont_prefix);
+
+    let pending: Vec<(usize, EdgeType)> = own_children
+        .iter()
+        .copied()
+        .filter(|(child, _)| !visited[*child])
+        .collect();
+    for (position, (child_index, child_edge)) in pending.iter().enumerate() {
+        let child_is_last = position + 1 == pending.len();
+        lanes.push(!child_is_last);
+        planned_walk(
+            lines,
+            nodes,
+            children,
+            *child_index,
+            Some(*child_edge),
+            child_is_last,
+            focused,
+            task_width,
+            lanes,
+            visited,
+        );
+        lanes.pop();
+    }
+}
+
+/// Render the Todo section from the planned-node queue. A node nests under its
+/// parent when that parent is also still a pending planned node; once the parent
+/// launches it leaves the queue and the child becomes a section root. Returns
+/// true when anything was emitted.
+fn render_planned_section<'a>(
+    lines: &mut Vec<ListItem<'a>>,
+    nodes: &[PlannedNode],
+    focused: bool,
+    task_width: usize,
+    leading_blank: bool,
+) -> bool {
+    use std::collections::HashMap;
+    if nodes.is_empty() {
+        return false;
+    }
+    if leading_blank {
+        lines.push(ListItem::new(Line::default()));
+    }
+    lines.push(ListItem::new(Line::from(vec![
+        Span::styled(Bucket::Todo.label(), header_style(focused)),
+        Span::styled(format!(" {}", nodes.len()), muted_style(focused)),
+    ])));
+
+    let id_to_index: HashMap<&str, usize> = nodes
+        .iter()
+        .enumerate()
+        .map(|(index, node)| (node.id.as_str(), index))
+        .collect();
+
+    // Parent (still-planned node) -> children among the planned set. Hard edges
+    // bind before soft. A dep whose parent already launched is not in the map, so
+    // such a node renders at root.
+    let mut children: HashMap<usize, Vec<(usize, EdgeType)>> = HashMap::new();
+    let mut has_planned_parent = vec![false; nodes.len()];
+    for (child_index, node) in nodes.iter().enumerate() {
+        for parent_id in &node.deps {
+            if let Some(&parent_index) = id_to_index.get(parent_id.as_str()) {
+                if parent_index == child_index {
+                    continue;
+                }
+                children
+                    .entry(parent_index)
+                    .or_default()
+                    .push((child_index, EdgeType::Hard));
+                has_planned_parent[child_index] = true;
+            }
+        }
+        for parent_id in &node.soft_deps {
+            if node.deps.iter().any(|hard| hard == parent_id) {
+                continue;
+            }
+            if let Some(&parent_index) = id_to_index.get(parent_id.as_str()) {
+                if parent_index == child_index {
+                    continue;
+                }
+                children
+                    .entry(parent_index)
+                    .or_default()
+                    .push((child_index, EdgeType::Soft));
+                has_planned_parent[child_index] = true;
+            }
+        }
+    }
+
+    let mut visited = vec![false; nodes.len()];
+    let mut lanes: Vec<bool> = Vec::new();
+    for index in 0..nodes.len() {
+        if !has_planned_parent[index] {
+            planned_walk(
+                lines, nodes, &children, index, None, true, focused, task_width, &mut lanes,
+                &mut visited,
+            );
+        }
+    }
+    // Anything trapped in a planned-node cycle renders at root so nothing hides.
+    for index in 0..nodes.len() {
+        if !visited[index] {
+            planned_walk(
+                lines, nodes, &children, index, None, true, focused, task_width, &mut lanes,
+                &mut visited,
+            );
+        }
+    }
+    true
+}
+
+// --- Orchestrator view -----------------------------------------------------
+//
+// A RudderPlan agent is the pinned orchestrator: it owns the active plan. While it
+// is still decomposing the task (Running and no parseable RUDDER_PLAN_TASKS block
+// yet) the orchestrator is in the PLANNING phase and shows an animated spinner.
+// Once a plan block parses it flips to PLAN-READY and renders a DAG tree of the
+// parsed tasks, each row badged with that task's LIVE status (todo / in-progress /
+// done / failed) derived from the planned-node queue and launched agents.
+
+/// Diamond marker used to identify the orchestrator row and header.
+const ORCH_MARK: &str = "\u{25C6}"; // ◆
+
+/// Live status of a single plan task, derived from the planned-node queue (todo)
+/// and any agent launched from that node id (running/done/failed).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OrchTaskStatus {
+    Todo,
+    Running,
+    Done,
+    Failed,
+}
+
+impl OrchTaskStatus {
+    fn label(self) -> &'static str {
+        match self {
+            OrchTaskStatus::Todo => "todo",
+            OrchTaskStatus::Running => "in-progress",
+            OrchTaskStatus::Done => "done",
+            OrchTaskStatus::Failed => "failed",
+        }
+    }
+
+    fn color(self) -> Color {
+        match self {
+            OrchTaskStatus::Todo => ST_PLANNED,
+            OrchTaskStatus::Running => ST_RUNNING,
+            OrchTaskStatus::Done => ST_MERGED,
+            OrchTaskStatus::Failed => ST_FAILED,
+        }
+    }
+}
+
+/// Derive a plan task's live status: a launched agent tagged with this node id
+/// wins (Merged -> done, Failed/Stopped -> failed, otherwise in-progress); else if
+/// it is still a pending planned node it is todo. Falls back to todo.
+pub(crate) fn orchestrator_task_status(app: &App, node_id: &str) -> OrchTaskStatus {
+    if let Some(run) = app
+        .agents
+        .iter()
+        .find(|run| run.node_id.as_deref() == Some(node_id))
+    {
+        return match run.status {
+            AgentStatus::Merged => OrchTaskStatus::Done,
+            AgentStatus::Failed | AgentStatus::Stopped => OrchTaskStatus::Failed,
+            _ => OrchTaskStatus::Running,
+        };
+    }
+    OrchTaskStatus::Todo
+}
+
+/// The orchestrator's current phase. `Planning` shows the spinner; `PlanReady`
+/// carries the parsed tasks for the DAG tree.
+pub(crate) enum OrchestratorPhase {
+    Planning,
+    PlanReady(Vec<RudderPlanTask>),
+}
+
+/// Compute the orchestrator phase from the agent's live output. A parseable
+/// RUDDER_PLAN_TASKS block means the plan is ready (even while the planner process
+/// is still winding down); otherwise it is still decomposing the task.
+pub(crate) fn orchestrator_phase(agent: &AgentRun) -> OrchestratorPhase {
+    match extract_rudder_plan_tasks(&rudder_plan_output_for_run(agent)) {
+        Ok(tasks) if !tasks.is_empty() => OrchestratorPhase::PlanReady(tasks),
+        _ => OrchestratorPhase::Planning,
+    }
+}
+
+/// Short phase label for the pinned orchestrator row: "planning" while
+/// decomposing, then "plan N · running X" once tasks are parsed and launching.
+fn orchestrator_phase_label(app: &App, agent: &AgentRun) -> String {
+    match orchestrator_phase(agent) {
+        OrchestratorPhase::Planning => "planning".to_string(),
+        OrchestratorPhase::PlanReady(tasks) => {
+            let running = tasks
+                .iter()
+                .filter(|t| orchestrator_task_status(app, &t.id) == OrchTaskStatus::Running)
+                .count();
+            format!("plan {} · running {}", tasks.len(), running)
+        }
+    }
+}
+
+/// Push the pinned orchestrator row: a diamond + selection marker, the task label,
+/// then a phase line (spinner + "planning" while decomposing, or the plan summary).
+fn push_orchestrator_row<'a>(
+    lines: &mut Vec<ListItem<'a>>,
+    app: &App,
+    index: usize,
+    agent: &AgentRun,
+    focused: bool,
+    task_width: usize,
+) {
+    let selected = index == app.selected_agent;
+    let marker = if selected { "> " } else { "  " };
+    let label = if selected && app.rename_input.is_some() {
+        format!("✎ {}", app.rename_input.clone().unwrap_or_default())
+    } else if agent.task_summary.trim().is_empty() {
+        summarize_task(&agent.task)
+    } else {
+        agent.task_summary.clone()
+    };
+    let label_style = if selected {
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(ACCENT)
+    };
+    lines.push(ListItem::new(Line::from(vec![
+        Span::styled(marker, accent_style(focused)),
+        Span::styled(format!("{ORCH_MARK} "), label_style),
+        Span::styled(truncate_chars(&label, task_width.saturating_sub(2)), label_style),
+    ])));
+
+    let planning = matches!(orchestrator_phase(agent), OrchestratorPhase::Planning)
+        && agent.status == AgentStatus::Running;
+    let badge = if planning {
+        app.spinner_glyph()
+    } else {
+        BADGE
+    };
+    lines.push(ListItem::new(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(badge, Style::default().fg(ACCENT)),
+        Span::raw(" "),
+        Span::styled("orchestrator", Style::default().fg(ACCENT)),
+        Span::raw("  "),
+        Span::styled(orchestrator_phase_label(app, agent), muted_style(focused)),
+    ])));
+}
+
 pub(crate) fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let focused = app.focus == FocusPane::Agents;
     let diff_summaries: Vec<Option<String>> = {
@@ -193,181 +979,570 @@ pub(crate) fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 
     let task_width = area.width.saturating_sub(4).max(12) as usize;
 
-    let push_agent_row = |lines: &mut Vec<ListItem>,
-                          app: &App,
-                          index: usize,
-                          agent: &AgentRun,
-                          diff: Option<String>| {
-        let selected = index == app.selected_agent;
-        let marker = if selected { "> " } else { "  " };
-        let task_style = if selected {
-            pane_text_style(focused).add_modifier(Modifier::BOLD)
-        } else {
-            pane_text_style(focused)
-        };
-        let task_label = if agent.is_main() {
-            agent.task_summary.clone()
-        } else if selected && app.rename_input.is_some() {
-            let buf = app.rename_input.clone().unwrap_or_default();
-            format!("✎ {buf}")
-        } else if agent.task_summary.trim().is_empty() {
-            summarize_task(&agent.task)
-        } else {
-            agent.task_summary.clone()
-        };
+    let main_count = app.agents.iter().filter(|a| a.is_main()).count();
+    let run_total = app.agents.iter().filter(|a| !a.is_main()).count();
+    let orchestrator_count = app.agents.iter().filter(|a| a.is_orchestrator()).count();
 
-        lines.push(ListItem::new(Line::from(vec![
-            Span::styled(marker, accent_style(focused)),
-            if is_cloud_agent(agent) {
-                Span::styled(
-                    "☁ ",
-                    cloud_style(true, focused).add_modifier(Modifier::BOLD),
+    // Pinned orchestrators render at the very top of BOTH views: one distinct
+    // accent + diamond row per RudderPlan agent showing its phase, above main and
+    // every status section. There is normally one at a time.
+    if orchestrator_count > 0 {
+        lines.push(ListItem::new(Line::from(Span::styled(
+            "orchestrator",
+            header_style(focused),
+        ))));
+        for (index, agent) in app.agents.iter().enumerate() {
+            if agent.is_orchestrator() {
+                push_orchestrator_row(&mut lines, app, index, agent, focused, task_width);
+            }
+        }
+        lines.push(ListItem::new(Line::default()));
+    }
+
+    if app.nest_view {
+        // Alternate full-DAG view (toggled with `g`): one topological tree across
+        // every agent, ignoring status sections.
+        lines.extend(render_agents_nest(app, focused, task_width, &diff_summaries));
+        if main_count == 0 && run_total == 0 {
+            lines.push(ListItem::new(Line::from(Span::styled(
+                "no agents yet  ·  type a task or /main",
+                muted_style(focused),
+            ))));
+        }
+    } else {
+        // Default view: main agents first, then status sections (todo / in progress
+        // / review / done / closed), each header carrying a count and omitted when
+        // empty. Dependents nest under their parents within a section.
+        if main_count > 0 {
+            lines.push(ListItem::new(Line::from(Span::styled(
+                "main",
+                header_style(focused),
+            ))));
+            for (index, agent) in app.agents.iter().enumerate() {
+                if !agent.is_main() {
+                    continue;
+                }
+                push_agent_row(&mut lines, app, index, agent, None, focused, task_width, &[], &[]);
+            }
+        }
+
+        let mut emitted_any_section = false;
+        for bucket in Bucket::ORDER {
+            // Leave a blank line before any non-first block (after main or a prior
+            // section) for visual separation.
+            let leading_blank = main_count > 0 || emitted_any_section;
+            // The Todo section is the planned-node queue (no agent ever buckets
+            // there); every other section renders agents by status.
+            let emitted = if bucket == Bucket::Todo {
+                render_planned_section(
+                    &mut lines,
+                    &app.planned_nodes,
+                    focused,
+                    task_width,
+                    leading_blank,
                 )
             } else {
-                Span::raw("")
-            },
-            Span::styled(truncate_chars(&task_label, task_width), task_style),
-        ])));
-
-        let (status_label, status_style): (&'static str, Style) =
-            if agent.is_main() && agent.terminal.is_none() {
-                ("idle", muted_style(focused))
-            } else {
-                (agent_status_label(agent), agent_status_style(agent))
+                render_status_section(
+                    &mut lines,
+                    app,
+                    focused,
+                    task_width,
+                    &diff_summaries,
+                    bucket,
+                    leading_blank,
+                )
             };
-
-        lines.push(ListItem::new(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(status_label, status_style),
-            Span::raw("  "),
-            if agent.is_main() {
-                Span::styled("main", accent_style(focused).add_modifier(Modifier::BOLD))
-            } else if is_cloud_agent(agent) {
-                Span::styled("cloud", accent_style(focused).add_modifier(Modifier::BOLD))
-            } else if agent.mode == AgentMode::RudderPlan {
-                Span::styled("rudder-plan", accent_style(focused))
-            } else if agent.mode == AgentMode::ReviewAll {
-                Span::styled("review-all", accent_style(focused))
-            } else if agent.mode == AgentMode::Plan {
-                Span::styled("plan", accent_style(focused))
-            } else {
-                Span::styled("run", muted_style(focused))
-            },
-            Span::raw("  "),
-            Span::styled(agent.backend.as_str().to_string(), muted_style(focused)),
-            Span::raw("  "),
-            Span::styled(agent.model.clone(), model_style(focused)),
-            Span::styled(
-                format!("({})", effort_label(agent.effort)),
-                model_style(focused),
-            ),
-        ])));
-        if let Some(summary) = diff {
-            lines.push(ListItem::new(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(summary, muted_style(focused)),
-            ])));
-        }
-    };
-
-    let main_count = app.agents.iter().filter(|a| a.is_main()).count();
-    let active_count = app
-        .agents
-        .iter()
-        .filter(|a| a.status != AgentStatus::Merged && !a.is_main())
-        .count();
-    let merged_count = app
-        .agents
-        .iter()
-        .filter(|a| a.status == AgentStatus::Merged && !a.is_main())
-        .count();
-
-    if main_count > 0 {
-        lines.push(ListItem::new(Line::from(Span::styled(
-            "main",
-            muted_style(focused),
-        ))));
-        for (index, agent) in app.agents.iter().enumerate() {
-            if !agent.is_main() {
-                continue;
+            if emitted {
+                emitted_any_section = true;
             }
-            push_agent_row(&mut lines, app, index, agent, None);
         }
-    }
 
-    if active_count > 0 {
-        if main_count > 0 {
-            lines.push(ListItem::new(Line::default()));
-        }
-        lines.push(ListItem::new(Line::from(Span::styled(
-            "worktrees",
-            muted_style(focused),
-        ))));
-    }
-
-    for (index, agent) in app.agents.iter().enumerate() {
-        if agent.is_main() || agent.status == AgentStatus::Merged {
-            continue;
-        }
-        let summary = diff_summaries.get(index).and_then(|opt| opt.clone());
-        push_agent_row(&mut lines, app, index, agent, summary);
-    }
-    if main_count == 0 && active_count == 0 && merged_count == 0 {
-        lines.push(ListItem::new(Line::from(Span::styled(
-            "no agents yet  ·  type a task or /main",
-            muted_style(focused),
-        ))));
-    }
-
-    if merged_count > 0 {
-        lines.push(ListItem::new(Line::default()));
-        lines.push(ListItem::new(Line::from(Span::styled(
-            "merged",
-            muted_style(focused),
-        ))));
-        for (index, agent) in app.agents.iter().enumerate() {
-            if agent.status != AgentStatus::Merged || agent.is_main() {
-                continue;
-            }
-            push_agent_row(&mut lines, app, index, agent, None);
+        if main_count == 0 && run_total == 0 && app.planned_nodes.is_empty() {
+            lines.push(ListItem::new(Line::from(Span::styled(
+                "no agents yet  ·  type a task or /main",
+                muted_style(focused),
+            ))));
         }
     }
 
     frame.render_widget(
         List::new(lines)
             .style(app_style())
-            .block(pane_block("agents", focused, app.nav_mode)),
+            .block(pane_block(
+                if app.nest_view { "agents · nest" } else { "agents" },
+                focused,
+                app.nav_mode,
+            )),
         area,
     );
 }
 
-pub(crate) fn visible_agent_indices(agents: &[AgentRun]) -> Vec<usize> {
-    let mut indices = agents
+// --- Nest / DAG view -------------------------------------------------------
+//
+// ratatui has no tree widget, so the dependency tree is drawn with manual jj-log
+// glyphs: a colored status BADGE node marker plus connector glyphs for ancestry.
+// HARD-edge connectors render solid in MUTED; SOFT-edge connectors render with a
+// dashed glyph in FAINT + DIM. The walk is a depth-first topological pass from
+// roots (nodes with no present parent), guarding cycles with a visited set so an
+// orphaned cycle still renders (at depth 0) rather than looping forever.
+
+const NEST_LANE_BAR: &str = "\u{2502} "; // "│ " ancestor lane continues
+const NEST_LANE_BLANK: &str = "  "; // ancestor lane ended
+const NEST_TEE_HARD: &str = "\u{251c}\u{2500}"; // "├─" child with a following sibling
+const NEST_CORNER_HARD: &str = "\u{2570}\u{2500}"; // "╰─" last child
+const NEST_TEE_SOFT: &str = "\u{251c}\u{2504}"; // "├┄" soft, dashed feel
+const NEST_CORNER_SOFT: &str = "\u{2570}\u{2504}"; // "╰┄" soft, dashed feel
+
+/// Build the parent->children adjacency for the displayed agents, plus the edge
+/// type for each (child, parent) relation. Children are kept in display (index)
+/// order so the tree renders deterministically.
+pub(crate) fn nest_children_by_index(
+    agents: &[AgentRun],
+) -> (std::collections::HashMap<usize, Vec<(usize, EdgeType)>>, Vec<bool>) {
+    use std::collections::HashMap;
+    let id_to_index: HashMap<&str, usize> = agents
         .iter()
         .enumerate()
-        .filter(|(_, agent)| agent.is_main())
-        .map(|(index, _)| index)
-        .collect::<Vec<_>>();
-    indices.extend(
-        agents
-            .iter()
-            .enumerate()
-            .filter(|(_, agent)| agent.status != AgentStatus::Merged && !agent.is_main())
-            .map(|(index, _)| index),
-    );
-    indices.extend(
-        agents
-            .iter()
-            .enumerate()
-            .filter(|(_, agent)| agent.status == AgentStatus::Merged && !agent.is_main())
-            .map(|(index, _)| index),
-    );
-    indices
+        .map(|(index, agent)| (agent.id.as_str(), index))
+        .collect();
+
+    let mut children: HashMap<usize, Vec<(usize, EdgeType)>> = HashMap::new();
+    let mut has_parent = vec![false; agents.len()];
+
+    for (child_index, agent) in agents.iter().enumerate() {
+        // Hard parents first so the most-binding edge wins if a parent appears in
+        // both lists; soft parents only contribute a soft edge when not already hard.
+        for parent_id in &agent.deps {
+            if let Some(&parent_index) = id_to_index.get(parent_id.as_str()) {
+                if parent_index == child_index {
+                    continue;
+                }
+                children
+                    .entry(parent_index)
+                    .or_default()
+                    .push((child_index, EdgeType::Hard));
+                has_parent[child_index] = true;
+            }
+        }
+        for parent_id in &agent.soft_deps {
+            if agent.deps.iter().any(|hard| hard == parent_id) {
+                continue;
+            }
+            if let Some(&parent_index) = id_to_index.get(parent_id.as_str()) {
+                if parent_index == child_index {
+                    continue;
+                }
+                children
+                    .entry(parent_index)
+                    .or_default()
+                    .push((child_index, EdgeType::Soft));
+                has_parent[child_index] = true;
+            }
+        }
+    }
+
+    (children, has_parent)
 }
+
+/// Connector glyph + style for the first (task-label) line of a node, given the
+/// ancestor lane state, whether this node is the last among its siblings, and the
+/// edge type from its parent. `lanes[i]` is true when ancestor level `i` still has
+/// a following sibling (draw a vertical bar) and false when its subtree ended.
+fn nest_prefix(lanes: &[bool], is_last: bool, edge: Option<EdgeType>) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for continues in lanes {
+        spans.push(Span::styled(
+            if *continues { NEST_LANE_BAR } else { NEST_LANE_BLANK },
+            Style::default().fg(MUTED),
+        ));
+    }
+    if let Some(edge) = edge {
+        let (glyph, style) = match edge {
+            EdgeType::Hard => (
+                if is_last { NEST_CORNER_HARD } else { NEST_TEE_HARD },
+                Style::default().fg(MUTED),
+            ),
+            EdgeType::Soft => (
+                if is_last { NEST_CORNER_SOFT } else { NEST_TEE_SOFT },
+                Style::default().fg(FAINT).add_modifier(Modifier::DIM),
+            ),
+        };
+        spans.push(Span::styled(glyph, style));
+    }
+    spans
+}
+
+/// Continuation-line prefix (for the status/diff rows under a node): the ancestor
+/// lanes plus this node's own lane, so child rows align beneath the task label.
+fn nest_cont_prefix(lanes: &[bool], self_continues: bool, is_root: bool) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for continues in lanes {
+        spans.push(Span::styled(
+            if *continues { NEST_LANE_BAR } else { NEST_LANE_BLANK },
+            Style::default().fg(MUTED),
+        ));
+    }
+    // The node's own subtree lane: a bar while it (or its later siblings) continue.
+    if !is_root {
+        spans.push(Span::styled(
+            if self_continues { NEST_LANE_BAR } else { NEST_LANE_BLANK },
+            Style::default().fg(MUTED),
+        ));
+    } else if self_continues {
+        spans.push(Span::styled(NEST_LANE_BAR, Style::default().fg(MUTED)));
+    }
+    spans
+}
+
+#[allow(clippy::too_many_arguments)]
+fn nest_walk<'a>(
+    lines: &mut Vec<ListItem<'a>>,
+    app: &App,
+    focused: bool,
+    task_width: usize,
+    diff_summaries: &[Option<String>],
+    children: &std::collections::HashMap<usize, Vec<(usize, EdgeType)>>,
+    index: usize,
+    edge: Option<EdgeType>,
+    is_last: bool,
+    lanes: &mut Vec<bool>,
+    visited: &mut Vec<bool>,
+) {
+    if visited[index] {
+        return;
+    }
+    visited[index] = true;
+
+    let agent = &app.agents[index];
+    let is_root = lanes.is_empty();
+    let prefix = nest_prefix(lanes, is_last, edge);
+    let own_children = children.get(&index).map(Vec::as_slice).unwrap_or(&[]);
+    let has_unvisited_children = own_children.iter().any(|(child, _)| !visited[*child]);
+    let cont_prefix = nest_cont_prefix(lanes, has_unvisited_children, is_root);
+
+    let summary = if agent.is_main() {
+        None
+    } else {
+        diff_summaries.get(index).and_then(|opt| opt.clone())
+    };
+    push_agent_row(
+        lines, app, index, agent, summary, focused, task_width, &prefix, &cont_prefix,
+    );
+
+    // Recurse into children that have not yet been placed in the tree.
+    let pending: Vec<(usize, EdgeType)> = own_children
+        .iter()
+        .copied()
+        .filter(|(child, _)| !visited[*child])
+        .collect();
+    for (position, (child_index, child_edge)) in pending.iter().enumerate() {
+        let child_is_last = position + 1 == pending.len();
+        lanes.push(!child_is_last);
+        nest_walk(
+            lines,
+            app,
+            focused,
+            task_width,
+            diff_summaries,
+            children,
+            *child_index,
+            Some(*child_edge),
+            child_is_last,
+            lanes,
+            visited,
+        );
+        lanes.pop();
+    }
+}
+
+pub(crate) fn render_agents_nest(
+    app: &App,
+    focused: bool,
+    task_width: usize,
+    diff_summaries: &[Option<String>],
+) -> Vec<ListItem<'static>> {
+    let mut lines: Vec<ListItem<'static>> = Vec::new();
+    let (children, has_parent) = nest_children_by_index(&app.agents);
+    let mut visited = vec![false; app.agents.len()];
+
+    // Pinned orchestrators are drawn as a dedicated row above this tree, so mark
+    // them visited to keep the nest walk (and its orphan sweep) from re-drawing them.
+    for index in 0..app.agents.len() {
+        if app.agents[index].is_orchestrator() {
+            visited[index] = true;
+        }
+    }
+
+    // Roots: any node with no present parent, in display order. Main agents have no
+    // deps and so are always roots, rendered first.
+    let mut roots: Vec<usize> = (0..app.agents.len())
+        .filter(|index| app.agents[*index].is_main() && !app.agents[*index].is_orchestrator())
+        .collect();
+    roots.extend(
+        (0..app.agents.len()).filter(|index| {
+            !app.agents[*index].is_main()
+                && !app.agents[*index].is_orchestrator()
+                && !has_parent[*index]
+        }),
+    );
+
+    let mut lanes: Vec<bool> = Vec::new();
+    for &root in &roots {
+        nest_walk(
+            &mut lines,
+            app,
+            focused,
+            task_width,
+            diff_summaries,
+            &children,
+            root,
+            None,
+            true,
+            &mut lanes,
+            &mut visited,
+        );
+    }
+
+    // Any node not reached from a root (e.g. part of a dependency cycle) is an
+    // orphan; render it at depth 0 so a cycle never hides work or loops.
+    for index in 0..app.agents.len() {
+        if !visited[index] {
+            nest_walk(
+                &mut lines,
+                app,
+                focused,
+                task_width,
+                diff_summaries,
+                &children,
+                index,
+                None,
+                true,
+                &mut lanes,
+                &mut visited,
+            );
+        }
+    }
+
+    lines
+}
+
+pub(crate) fn visible_agent_indices(agents: &[AgentRun]) -> Vec<usize> {
+    // Navigation follows the rendered order: main agents first, then each status
+    // section nested by dependency. Sharing `sectioned_agent_order` guarantees the
+    // selection marker lands exactly where j/k move.
+    sectioned_agent_order(agents)
+}
+
+/// Last non-empty, ANSI-stripped output line of a planner run. Surfaced under the
+/// spinner in the PLANNING phase so the orchestrator visibly reads as "thinking".
+fn orchestrator_last_output_line(agent: &AgentRun) -> Option<String> {
+    let output = rudder_plan_output_for_run(agent);
+    let clean = strip_ansi_for_plan(&output).replace('\r', "");
+    clean
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(ToString::to_string)
+}
+
+/// Push one task row of the orchestrator DAG tree: nest glyphs, a live-status
+/// BADGE, the task title, and the status label. Mirrors `push_planned_row` styling
+/// but the badge color reflects the task's LIVE status.
+fn push_orchestrator_task_row<'a>(
+    lines: &mut Vec<Line<'a>>,
+    task: &RudderPlanTask,
+    status: OrchTaskStatus,
+    prefix: &[Span<'a>],
+) {
+    let label = if task.title.trim().is_empty() {
+        summarize_task(&task.prompt)
+    } else {
+        task.title.clone()
+    };
+    let mut spans = prefix.to_vec();
+    spans.extend([
+        Span::styled(BADGE, Style::default().fg(status.color())),
+        Span::raw(" "),
+        Span::styled(label, pane_text_style(true)),
+        Span::raw("  "),
+        Span::styled(status.label(), Style::default().fg(status.color())),
+    ]);
+    lines.push(Line::from(spans));
+}
+
+/// Depth-first walk of the parsed plan task forest for the orchestrator DAG tree.
+/// Nests a task under a parent that is also in the plan (hard edges solid MUTED,
+/// soft edges dashed/dimmed), reusing the same nest glyphs as the agents pane.
+#[allow(clippy::too_many_arguments)]
+fn orchestrator_tree_walk<'a>(
+    lines: &mut Vec<Line<'a>>,
+    app: &App,
+    tasks: &[RudderPlanTask],
+    children: &std::collections::HashMap<usize, Vec<(usize, EdgeType)>>,
+    index: usize,
+    edge: Option<EdgeType>,
+    is_last: bool,
+    lanes: &mut Vec<bool>,
+    visited: &mut Vec<bool>,
+) {
+    if visited[index] {
+        return;
+    }
+    visited[index] = true;
+    let prefix = nest_prefix(lanes, is_last, edge);
+    let status = orchestrator_task_status(app, &tasks[index].id);
+    push_orchestrator_task_row(lines, &tasks[index], status, &prefix);
+
+    let own_children = children.get(&index).map(Vec::as_slice).unwrap_or(&[]);
+    let pending: Vec<(usize, EdgeType)> = own_children
+        .iter()
+        .copied()
+        .filter(|(child, _)| !visited[*child])
+        .collect();
+    for (position, (child_index, child_edge)) in pending.iter().enumerate() {
+        let child_is_last = position + 1 == pending.len();
+        lanes.push(!child_is_last);
+        orchestrator_tree_walk(
+            lines, app, tasks, children, *child_index, Some(*child_edge), child_is_last, lanes,
+            visited,
+        );
+        lanes.pop();
+    }
+}
+
+/// Custom command-center view for a selected orchestrator (RudderPlan) agent,
+/// rendered in place of the raw planner PTY. PLANNING shows an animated spinner;
+/// PLAN-READY renders a DAG tree of the parsed tasks with live status badges.
+pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    use std::collections::HashMap;
+    let focused = app.focus == FocusPane::Worker;
+    let Some(agent) = app.agents.get(app.selected_agent) else {
+        return;
+    };
+
+    let phase = orchestrator_phase(agent);
+    let phase_label = match &phase {
+        OrchestratorPhase::Planning => "planning".to_string(),
+        OrchestratorPhase::PlanReady(tasks) => format!("plan · {} tasks", tasks.len()),
+    };
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    // Header: ◆ ORCHESTRATOR (accent bold) · phase.
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("{ORCH_MARK} ORCHESTRATOR"),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  ·  ", muted_style(focused)),
+        Span::styled(phase_label, muted_style(focused)),
+    ]));
+    lines.push(Line::default());
+
+    match phase {
+        OrchestratorPhase::Planning => {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    app.spinner_glyph(),
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" "),
+                Span::styled("decomposing the task...", pane_text_style(true)),
+            ]));
+            if let Some(last) = orchestrator_last_output_line(agent) {
+                lines.push(Line::default());
+                let width = block_inner(area).width.saturating_sub(2).max(8) as usize;
+                lines.push(Line::from(Span::styled(
+                    truncate_chars(&last, width),
+                    muted_style(focused),
+                )));
+            }
+        }
+        OrchestratorPhase::PlanReady(tasks) => {
+            // Build hard+soft adjacency over the parsed tasks. Hard edges bind first.
+            let id_to_index: HashMap<&str, usize> = tasks
+                .iter()
+                .enumerate()
+                .map(|(index, task)| (task.id.as_str(), index))
+                .collect();
+            let mut children: HashMap<usize, Vec<(usize, EdgeType)>> = HashMap::new();
+            let mut has_parent = vec![false; tasks.len()];
+            for (child_index, task) in tasks.iter().enumerate() {
+                for edge in &task.deps {
+                    if let Some(&parent_index) = id_to_index.get(edge.on.as_str()) {
+                        if parent_index == child_index {
+                            continue;
+                        }
+                        children
+                            .entry(parent_index)
+                            .or_default()
+                            .push((child_index, edge.edge));
+                        has_parent[child_index] = true;
+                    }
+                }
+            }
+
+            let mut visited = vec![false; tasks.len()];
+            let mut lanes: Vec<bool> = Vec::new();
+            for index in 0..tasks.len() {
+                if !has_parent[index] {
+                    orchestrator_tree_walk(
+                        &mut lines, app, &tasks, &children, index, None, true, &mut lanes,
+                        &mut visited,
+                    );
+                }
+            }
+            // Anything trapped in a cycle renders at root so nothing hides.
+            for index in 0..tasks.len() {
+                orchestrator_tree_walk(
+                    &mut lines, app, &tasks, &children, index, None, true, &mut lanes,
+                    &mut visited,
+                );
+            }
+
+            let mut running = 0usize;
+            let mut done = 0usize;
+            let mut todo = 0usize;
+            for task in &tasks {
+                match orchestrator_task_status(app, &task.id) {
+                    OrchTaskStatus::Running => running += 1,
+                    OrchTaskStatus::Done => done += 1,
+                    OrchTaskStatus::Failed => {}
+                    OrchTaskStatus::Todo => todo += 1,
+                }
+            }
+            lines.push(Line::default());
+            lines.push(Line::from(Span::styled(
+                format!("running {running} · done {done} · todo {todo}"),
+                muted_style(focused),
+            )));
+        }
+    }
+
+    let paragraph = Paragraph::new(lines)
+        .style(app_style())
+        .block(pane_block("orchestrator", focused, app.nav_mode))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, area);
+}
+
 pub(crate) fn render_worker(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let inner = block_inner(area);
     let terminal_size = TerminalSize::new(inner.height.max(1), inner.width.max(1)).ok();
     let focused = app.focus == FocusPane::Worker;
+
+    // The selected orchestrator (RudderPlan) gets the custom command-center view
+    // instead of its raw planner PTY: a spinner while decomposing, then a DAG tree.
+    // The diff/review view still falls through to the normal terminal path.
+    if app.worker_view == WorkerView::Terminal
+        && app
+            .agents
+            .get(app.selected_agent)
+            .is_some_and(|run| run.is_orchestrator())
+    {
+        render_orchestrator(frame, area, app);
+        return;
+    }
 
     if let Some(size) = terminal_size {
         if let Some(run) = app.agents.get_mut(app.selected_agent) {
@@ -600,7 +1775,7 @@ pub(crate) fn render_task(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let default_hint = if app.plan_mode {
         "Enter plan  Up/Down history  Option-1/2/3 or ^W pane  /plan off"
     } else {
-        "Enter start  Up/Down history  Option-1/2/3 or ^W pane  /plan  /rudder-plan  /sync"
+        "Enter plan + run  Up/Down history  Option-1/2/3 or ^W pane  /plan  /sync"
     };
     let hint = app.notice.as_deref().unwrap_or(default_hint);
     let inner_width = area.width.saturating_sub(2).max(1);
@@ -634,7 +1809,7 @@ pub(crate) fn render_task(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 if app.plan_mode {
                     "Type a task to plan"
                 } else {
-                    "Type a task, /plan, /rudder-plan, or /sync"
+                    "Type a task, /plan, or /sync"
                 }
             } else {
                 line.as_str()
@@ -701,7 +1876,7 @@ pub(crate) fn task_pane_height(app: &App, width: u16) -> u16 {
     let default_hint = if app.plan_mode {
         "Enter plan  Up/Down history  Option-1/2/3 or ^W pane  /plan off"
     } else {
-        "Enter start  Up/Down history  Option-1/2/3 or ^W pane  /plan  /rudder-plan  /sync"
+        "Enter plan + run  Up/Down history  Option-1/2/3 or ^W pane  /plan  /sync"
     };
     let hint = app.notice.as_deref().unwrap_or(default_hint);
     let inner_width = width.saturating_sub(2).max(1);
@@ -1095,22 +2270,16 @@ pub(crate) fn push_wrapped_word(lines: &mut Vec<String>, current: &mut String, w
 
 pub(crate) fn pane_text_style(focused: bool) -> Style {
     if focused {
+        // Terminal default fg so primary text adapts to the user's theme.
         Style::default()
     } else {
-        Style::default()
-            .fg(INACTIVE_COLOR)
-            .add_modifier(Modifier::DIM)
+        // Warm, readable muted instead of DarkGray+DIM (the old gray wash).
+        Style::default().fg(MUTED)
     }
 }
 
 pub(crate) fn muted_style(focused: bool) -> Style {
-    if focused {
-        Style::default().fg(Color::Gray)
-    } else {
-        Style::default()
-            .fg(INACTIVE_COLOR)
-            .add_modifier(Modifier::DIM)
-    }
+    Style::default().fg(if focused { MUTED } else { FAINT })
 }
 
 pub(crate) fn accent_style(focused: bool) -> Style {
@@ -1119,32 +2288,21 @@ pub(crate) fn accent_style(focused: bool) -> Style {
             .fg(FOCUS_COLOR)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default()
-            .fg(INACTIVE_COLOR)
-            .add_modifier(Modifier::DIM)
+        Style::default().fg(FAINT).add_modifier(Modifier::BOLD)
     }
 }
 
 pub(crate) fn model_style(focused: bool) -> Style {
-    if focused {
-        Style::default().fg(MODEL_COLOR)
-    } else {
-        Style::default()
-            .fg(INACTIVE_COLOR)
-            .add_modifier(Modifier::DIM)
-    }
+    Style::default().fg(if focused { MODEL_COLOR } else { FAINT })
 }
 
 pub(crate) fn cloud_style(connected: bool, focused: bool) -> Style {
-    let color = if connected {
-        CLOUD_COLOR
-    } else {
-        INACTIVE_COLOR
-    };
+    let color = if connected { CLOUD_COLOR } else { FAINT };
+    let style = Style::default().fg(color);
     if focused {
-        Style::default().fg(color).add_modifier(Modifier::BOLD)
+        style.add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(color).add_modifier(Modifier::DIM)
+        style
     }
 }
 
@@ -1252,12 +2410,5 @@ pub(crate) fn is_cloud_agent(agent: &AgentRun) -> bool {
         || agent.current_prompt.starts_with("cloud ")
 }
 
-pub(crate) fn status_color(status: AgentStatus) -> Color {
-    match status {
-        AgentStatus::Running => RUNNING_COLOR,
-        AgentStatus::Done | AgentStatus::Merged => DONE_COLOR,
-        AgentStatus::Failed => FAILED_COLOR,
-        AgentStatus::Stopped => INACTIVE_COLOR,
-    }
-}
+// status_color now lives in theme.rs (re-exported via the crate root).
 

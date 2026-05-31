@@ -83,7 +83,7 @@ pub(crate) fn task_visible_input_count(app: &App, area: Rect, input_line_count: 
     let default_hint = if app.plan_mode {
         "Enter plan  Up/Down history  Option-1/2/3 or ^W pane  /plan off"
     } else {
-        "Enter start  Up/Down history  Option-1/2/3 or ^W pane  /plan  /rudder-plan  /sync"
+        "Enter plan + run  Up/Down history  Option-1/2/3 or ^W pane  /plan  /sync"
     };
     let hint = app.notice.as_deref().unwrap_or(default_hint);
     let hint_line_count = wrap_text(hint, task_inner_width(area)).len().max(1);

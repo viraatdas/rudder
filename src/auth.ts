@@ -12,6 +12,8 @@ import type {
 import {
   commandExists,
   expandHome,
+  formatMissingToolMessage,
+  MissingToolError,
   pathExists,
   promptSelect,
   promptText,
@@ -31,6 +33,8 @@ type Detection = {
   acpxCommand: boolean;
   acpxVersion?: string;
   npmAcpxLatest?: string;
+  jjCommand: boolean;
+  jjVersion?: string;
   anthropicEnv?: boolean;
   openaiEnv?: boolean;
   claudeCredential?: AuthProfileCredential;
@@ -55,6 +59,11 @@ export async function detectEnvironment(): Promise<Detection> {
       allowFailure: true,
     })
   ).stdout.trim();
+  const jjCommand = commandExists("jj");
+  const jjVersionRaw = jjCommand
+    ? (await runCommand("jj", ["--version"], { allowFailure: true })).stdout.trim()
+    : undefined;
+  const jjVersion = jjVersionRaw?.match(/(\d+)\.(\d+)\.(\d+)/)?.[0] ?? jjVersionRaw;
 
   const claude = await readClaudeCliCredential();
   const codex = await readCodexCliCredential();
@@ -64,6 +73,8 @@ export async function detectEnvironment(): Promise<Detection> {
     acpxCommand,
     acpxVersion,
     npmAcpxLatest,
+    jjCommand,
+    jjVersion,
     anthropicEnv: Boolean(process.env.ANTHROPIC_API_KEY?.trim()),
     openaiEnv: Boolean(process.env.OPENAI_API_KEY?.trim()),
     claudeCredential: claude?.credential,
@@ -112,6 +123,8 @@ export async function runDoctor(options?: { json?: boolean }): Promise<void> {
       acpx: detection.acpxCommand,
       acpxVersion: detection.acpxVersion || null,
       acpxLatest: detection.npmAcpxLatest || null,
+      jj: detection.jjCommand,
+      jjVersion: detection.jjVersion || null,
     },
     auth: {
       storePath: authStorePath(),
@@ -134,12 +147,19 @@ export async function runDoctor(options?: { json?: boolean }): Promise<void> {
       detection.acpxVersion ? ` (${detection.acpxVersion})` : ""
     }${detection.npmAcpxLatest ? ` latest=${detection.npmAcpxLatest}` : ""}`,
   );
+  console.log(
+    `  jj:     ${status(detection.jjCommand)}${detection.jjVersion ? ` (${detection.jjVersion})` : ""} (required internal substrate)`,
+  );
   console.log(`  auth:   ${shortenHome(authStorePath())}`);
   for (const [profileId, credential] of Object.entries(store.profiles).sort()) {
     console.log(`    - ${profileId} (${credential.provider}/${credential.type})`);
   }
   if (!detection.acpxCommand) {
     console.log("  fix:    run `npm install -g acpx@latest` or `rudder onboard`");
+  }
+  if (!detection.jjCommand) {
+    console.log(`  fix:    ${formatMissingToolMessage("jj")}`);
+    throw new MissingToolError("jj", "jj is required but not installed. Rudder uses jj for run isolation and merge.");
   }
 }
 
@@ -160,6 +180,13 @@ export async function runOnboard(options?: { nonInteractive?: boolean; json?: bo
         : "Installing acpx@latest...",
     );
     await runCommand("npm", ["install", "-g", "acpx@latest"]);
+  }
+
+  if (detection.jjCommand) {
+    console.log(`jj detected${detection.jjVersion ? ` (${detection.jjVersion})` : ""} - required internal substrate`);
+  } else {
+    console.log("jj is required but not installed. Rudder uses jj for run isolation and merge.");
+    console.log(`  ${formatMissingToolMessage("jj")}`);
   }
 
   if (!options?.nonInteractive && process.stdin.isTTY) {

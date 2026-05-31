@@ -218,6 +218,9 @@ pub(crate) fn review_all_run(
         worker_input_is_prompt: false,
         last_drain_at: None,
         review_source_ids: source_ids,
+        deps: Vec::new(),
+        soft_deps: Vec::new(),
+        node_id: None,
     }
 }
 

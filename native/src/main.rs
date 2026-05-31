@@ -60,17 +60,14 @@ mod render;
 use crate::render::*;
 mod detect;
 use crate::detect::*;
+mod theme;
+use crate::theme::*;
 
 const TICK_RATE: Duration = Duration::from_millis(33);
 const MAX_EVENTS_PER_FRAME: usize = 64;
 const INTERACTIVE_COMPLETION_IDLE: Duration = Duration::from_secs(4);
-const FOCUS_COLOR: Color = Color::Rgb(57, 255, 20);
-const INACTIVE_COLOR: Color = Color::DarkGray;
-const MODEL_COLOR: Color = Color::Magenta;
-const RUNNING_COLOR: Color = Color::Yellow;
-const DONE_COLOR: Color = Color::Gray;
-const FAILED_COLOR: Color = Color::Red;
-const CLOUD_COLOR: Color = Color::Cyan;
+// Dashboard colors now live in `theme.rs` (FOCUS_COLOR, INACTIVE_COLOR, ...),
+// re-exported above so call sites are unchanged.
 const DEFAULT_WHEEL_SCROLL_ROWS: u16 = 1;
 const TASK_HISTORY_LIMIT: usize = 100;
 const MOUSE_DEBUG_ENV: &str = "RUDDER_MOUSE_DEBUG";
@@ -80,11 +77,25 @@ const AGENT_LIST_RUN_START_ROW: u16 = 12;
 const REVIEW_ALL_MODEL: &str = "gpt-5.5";
 const REVIEW_ALL_EFFORT: EffortLevel = EffortLevel::XHigh;
 const TASK_SUMMARY_MODEL: &str = "claude-haiku-4-5-20251001";
+/// Default cap on how many plan-launched agents may run at once. Overridable via
+/// `orchestrator.maxParallel` in ~/.rudder/config.json. This is what makes nodes
+/// visibly wait in Todo and move to In Progress as slots free.
+const DEFAULT_MAX_PARALLEL: usize = 1000;
+/// Run the scheduler every N poll ticks (a coarse cadence; the tick rate is 33ms).
+const SCHEDULER_TICK_INTERVAL: u64 = 8;
+/// Braille spinner frames for the orchestrator "planning" phase (and, as a nice
+/// touch, running agents' status badge). Advances one frame per poll tick so it
+/// animates while the planner decomposes the task.
+pub(crate) const SPINNER_FRAMES: [&str; 10] = [
+    "\u{280B}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283C}", "\u{2834}", "\u{2826}", "\u{2827}",
+    "\u{2807}", "\u{280F}",
+];
 const AGENT_PANE_HINTS: &[&str] = &[
     "j/k move",
     "Enter focus",
     "r rename",
     "v review",
+    "g nest",
     "u sync",
     "R review all",
     "m merge",
@@ -241,6 +252,9 @@ struct App {
     /// command (focus a pane, review, merge, ...) instead of reaching the pane.
     leader_pending: bool,
     worker_view: WorkerView,
+    /// When true, the agents pane renders a topological dependency tree (nest view)
+    /// instead of the flat main/worktrees/merged sections. Toggled with `g`.
+    nest_view: bool,
     cwd: PathBuf,
     branch: Option<String>,
     task_input: String,
@@ -250,6 +264,19 @@ struct App {
     task_history_draft: String,
     plan_mode: bool,
     agents: Vec<AgentRun>,
+    /// Queue of planned (not-yet-launched) DAG nodes. The scheduler drains these
+    /// into live agents as their hard deps merge and parallelism slots free.
+    /// Rendered in the Todo section. A new completed plan replaces the queue.
+    planned_nodes: Vec<PlannedNode>,
+    /// The original user request that produced `planned_nodes`, used to build each
+    /// worker launch prompt so the worker sees the coordinating request.
+    planned_origin: String,
+    /// Tick counter used to run the scheduler on a coarse cadence rather than on
+    /// every PTY-byte tick.
+    scheduler_tick: u64,
+    /// Animation frame for the orchestrator spinner. Advances every poll tick so
+    /// the "decomposing the task..." spinner feels alive while the planner runs.
+    spinner_frame: usize,
     selected_agent: usize,
     backend: Backend,
     model: String,
@@ -428,6 +455,15 @@ struct AgentRun {
     worker_input_is_prompt: bool,
     last_drain_at: Option<Instant>,
     review_source_ids: Vec<String>,
+    /// Hard-dependency parent node ids (from `.rudder/graph.json`). Empty in flat
+    /// mode (no graph.json or node not found).
+    deps: Vec<String>,
+    /// Soft-dependency parent node ids. Never block; rendered dimmed in nest view.
+    soft_deps: Vec<String>,
+    /// Plan node id when this run was launched from a planned node by the
+    /// scheduler. `None` for manually started agents and planner runs. When the
+    /// run reaches Merged, this id enters the merged set and unblocks dependents.
+    node_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -439,6 +475,13 @@ struct TaskSummaryResult {
 impl AgentRun {
     fn is_main(&self) -> bool {
         self.mode == AgentMode::Main || self.id == MAIN_AGENT_ID
+    }
+
+    /// A RudderPlan agent is the pinned orchestrator that owns the active plan. It
+    /// renders as a distinct row at the very top of the list (not in a status
+    /// bucket) and its worker pane shows the orchestrator DAG view.
+    pub(crate) fn is_orchestrator(&self) -> bool {
+        self.mode == AgentMode::RudderPlan
     }
 }
 
@@ -514,6 +557,7 @@ impl App {
             nav_mode: false,
             leader_pending: false,
             worker_view: WorkerView::Terminal,
+            nest_view: false,
             cwd,
             branch,
             task_input,
@@ -523,6 +567,10 @@ impl App {
             task_history_draft: String::new(),
             plan_mode: false,
             agents,
+            planned_nodes: Vec::new(),
+            planned_origin: String::new(),
+            scheduler_tick: 0,
+            spinner_frame: 0,
             selected_agent: 0,
             backend: selection.backend,
             model: selection.model,
@@ -612,6 +660,22 @@ impl App {
         let was = self.dirty;
         self.dirty = false;
         was
+    }
+
+    /// Current spinner glyph for the active animation frame.
+    pub(crate) fn spinner_glyph(&self) -> &'static str {
+        SPINNER_FRAMES[self.spinner_frame % SPINNER_FRAMES.len()]
+    }
+
+    /// True when at least one pinned orchestrator (a RudderPlan agent) is still
+    /// running AND has not yet produced a parseable plan block. While this holds,
+    /// the spinner must keep animating, so the render loop redraws on every tick.
+    pub(crate) fn has_planning_orchestrator(&self) -> bool {
+        self.agents.iter().any(|run| {
+            run.mode == AgentMode::RudderPlan
+                && run.status == AgentStatus::Running
+                && extract_rudder_plan_tasks(&rudder_plan_output_for_run(run)).is_err()
+        })
     }
 
     fn cached_diff_summary(&mut self, id: &str, cwd: &Path) -> Option<String> {
@@ -727,7 +791,7 @@ impl App {
             self.leader_pending = true;
             self.nav_mode = false;
             self.notice = Some(
-                "Ctrl+W: 1 agents  2 worker  3 task  v review  m merge  R review-all  M merge-all  Esc cancels"
+                "Ctrl+W: Tab cycle  1/2/3 panes  v review  m merge  R review-all  M merge-all  Esc cancels"
                     .to_string(),
             );
             return false;
@@ -831,19 +895,32 @@ impl App {
                 self.delete_pending = None;
                 self.notice = Some("leader cancelled".to_string());
             }
-            KeyCode::Char('1') => {
+            // Tab cycles focus forward and RE-ARMS the leader so repeated Tab keeps
+            // cycling (BackTab cycles backward, also re-arming). This only happens
+            // under the Ctrl+W leader; a bare Tab still forwards to the worker.
+            KeyCode::Tab => {
+                self.delete_pending = None;
+                self.cycle_focus(true);
+                self.leader_pending = true;
+            }
+            KeyCode::BackTab => {
+                self.delete_pending = None;
+                self.cycle_focus(false);
+                self.leader_pending = true;
+            }
+            KeyCode::Char('1') | KeyCode::Char('\u{00a1}') => {
                 self.delete_pending = None;
                 self.focus = FocusPane::Agents;
             }
-            KeyCode::Char('2') => {
+            KeyCode::Char('2') | KeyCode::Char('\u{2122}') => {
                 self.delete_pending = None;
                 self.focus = FocusPane::Worker;
             }
-            KeyCode::Char('3') => {
+            KeyCode::Char('3') | KeyCode::Char('\u{00a3}') => {
                 self.delete_pending = None;
                 self.focus = FocusPane::Task;
             }
-            KeyCode::Char('v') => self.toggle_worker_view(),
+            KeyCode::Char('v') | KeyCode::Char('\u{221a}') => self.toggle_worker_view(),
             KeyCode::Char('r') => self.start_rename_selected_agent(),
             KeyCode::Char('u') => self.request_sync_selected_agent(),
             KeyCode::Up | KeyCode::Char('k') => self.select_previous_agent(),
@@ -880,16 +957,49 @@ impl App {
                 }
             }
             KeyCode::Char('v') => self.toggle_worker_view(),
+            KeyCode::Char('g') => self.toggle_nest_view(),
             KeyCode::Char('r') => self.start_rename_selected_agent(),
             KeyCode::Char('u') => self.request_sync_selected_agent(),
             KeyCode::Char('R') => self.review_all_ready(),
             KeyCode::Char('M') => self.request_merge_all_ready(),
             KeyCode::Char('m') => self.request_merge_selected_agent(),
-            KeyCode::Char('d') => self.delete_selected_agent(),
+            KeyCode::Char('d') => {
+                // When the only thing in the list is the pending plan queue (no
+                // selectable agents yet), `d` discards the whole plan. Otherwise
+                // it deletes the selected agent as usual.
+                if self.agents.is_empty() && !self.planned_nodes.is_empty() {
+                    self.discard_planned_queue();
+                } else {
+                    self.delete_selected_agent();
+                }
+            }
             KeyCode::Char('P') => self.open_main_model_switcher(),
             _ => {}
         }
         false
+    }
+
+    fn toggle_nest_view(&mut self) {
+        self.nest_view = !self.nest_view;
+        self.dirty = true;
+    }
+
+    /// Rotate pane focus: Agents -> Worker -> Task -> Agents (forward) or the
+    /// reverse. Used by the Ctrl+W leader Tab/BackTab cycle.
+    fn cycle_focus(&mut self, forward: bool) {
+        self.focus = if forward {
+            match self.focus {
+                FocusPane::Agents => FocusPane::Worker,
+                FocusPane::Worker => FocusPane::Task,
+                FocusPane::Task => FocusPane::Agents,
+            }
+        } else {
+            match self.focus {
+                FocusPane::Agents => FocusPane::Task,
+                FocusPane::Worker => FocusPane::Agents,
+                FocusPane::Task => FocusPane::Worker,
+            }
+        };
     }
 
     fn handle_worker_key(&mut self, key: KeyEvent) -> bool {
@@ -1372,8 +1482,7 @@ impl App {
                 self.task_cursor = 1;
                 self.picker_index = 0;
                 self.notice = Some(
-                    "type /plan, /rudder-plan, /model, /main|/m, /sync, /goal, /usage, or /cloud"
-                        .to_string(),
+                    "type /plan, /model, /main|/m, /sync, /goal, /usage, or /cloud".to_string(),
                 );
             }
             KeyCode::Char(ch) => {
@@ -2136,17 +2245,26 @@ impl App {
         self.notice = None;
 
         if self.plan_mode {
+            // Explicit /plan mode: a read-only planner that never spawns workers.
             self.start_plan_task(&input);
         } else {
-            self.start_execute_task(&input);
+            // Default: run the adaptive planner. It inspects the repo read-only and
+            // emits a task list; the poll loop then either auto-runs a single task
+            // or gates a multi-task plan for the user to approve (Enter) or discard.
+            self.start_rudder_plan_task(&input);
         }
     }
 
-    fn start_execute_task(&mut self, input: &str) {
-        self.start_execute_task_with_summary(input, None);
-    }
-
-    fn start_execute_task_with_summary(&mut self, input: &str, explicit_summary: Option<&str>) {
+    /// Launch a live execute agent. When `node` is `Some`, the run is tagged with
+    /// its plan node id and hard deps (so the scheduler can track its merge and
+    /// unblock dependents), and the node's backend/model/effort overrides apply.
+    /// When `None`, this is an ordinary manual launch using the dashboard defaults.
+    fn start_execute_task_node(
+        &mut self,
+        input: &str,
+        explicit_summary: Option<&str>,
+        node: Option<PlannedNode>,
+    ) {
         let planner_title = explicit_summary
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -2172,15 +2290,35 @@ impl App {
             self.notice = Some(format!("hunk config warning: {error}"));
         }
 
-        let model = self.model.clone();
-        let backend = self.backend;
-        let effort = self.effort;
+        // Plan node overrides win over the dashboard defaults when supplied.
+        let backend = node
+            .as_ref()
+            .and_then(|n| n.backend.as_deref())
+            .and_then(provider_backend)
+            .unwrap_or(self.backend);
+        let model = node
+            .as_ref()
+            .and_then(|n| n.model.clone())
+            .filter(|model| !model.trim().is_empty())
+            .unwrap_or_else(|| self.model.clone());
+        let effort = node
+            .as_ref()
+            .and_then(|n| n.effort.as_deref())
+            .and_then(EffortLevel::parse)
+            .or(self.effort);
+        let node_id = node.as_ref().map(|n| n.id.clone());
+        let node_deps = node.as_ref().map(|n| n.deps.clone()).unwrap_or_default();
         let session_id = mint_session_id_for(backend);
+        // Lead the launch prompt with the canonical /goal + Done-when block so
+        // every spawned agent has a clear objective and verifiable stopping
+        // condition. Idempotent: a /rudder-plan worker prompt that already leads
+        // with /goal is left unchanged.
+        let goal_prompt = manual_goal_prompt(input);
         let command = agent_command(
             backend,
             &model,
             effort,
-            input,
+            &goal_prompt,
             AgentMode::Execute,
             session_id.as_deref(),
         );
@@ -2195,12 +2333,12 @@ impl App {
             id: worktree.id.clone(),
             created_at: created_at.clone(),
             mode: AgentMode::Execute,
-            task: input.to_string(),
+            task: goal_prompt.clone(),
             task_summary,
-            current_prompt: input.to_string(),
+            current_prompt: goal_prompt.clone(),
             turns: vec![AgentTurn {
                 ts: created_at.clone(),
-                prompt: input.to_string(),
+                prompt: goal_prompt.clone(),
                 source: "user".to_string(),
             }],
             last_user_input_at: created_at,
@@ -2230,6 +2368,9 @@ impl App {
             worker_input_is_prompt: false,
             last_drain_at: None,
             review_source_ids: Vec::new(),
+            deps: node_deps,
+            soft_deps: Vec::new(),
+            node_id,
         };
 
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
@@ -2317,6 +2458,9 @@ impl App {
             worker_input_is_prompt: false,
             last_drain_at: None,
             review_source_ids: Vec::new(),
+            deps: Vec::new(),
+            soft_deps: Vec::new(),
+            node_id: None,
         };
 
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
@@ -2403,19 +2547,22 @@ impl App {
             worker_input_is_prompt: false,
             last_drain_at: None,
             review_source_ids: Vec::new(),
+            deps: Vec::new(),
+            soft_deps: Vec::new(),
+            node_id: None,
         };
 
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
             Ok(mut terminal) => {
                 let _ = terminal.drain_output();
                 run.terminal = Some(terminal);
-                self.notice = Some("rudder planner started".to_string());
+                self.notice = Some("planner started".to_string());
             }
             Err(error) => {
                 run.status = AgentStatus::Failed;
                 run.last_error = Some(error.to_string());
                 self.notice = Some(format!(
-                    "failed to start {} rudder planner: {error}",
+                    "failed to start {} planner: {error}",
                     backend.as_str()
                 ));
             }
@@ -2924,18 +3071,9 @@ impl App {
                 }
                 true
             }
-            Some("/rudder-plan") => {
-                let task = parts.collect::<Vec<_>>().join(" ");
-                if task.trim().is_empty() {
-                    self.notice = Some("usage: /rudder-plan <task>".to_string());
-                } else {
-                    self.start_rudder_plan_task(task.trim());
-                }
-                true
-            }
             Some("/help") => {
                 self.notice = Some(
-                    "Option-1/2/3 or ^W pane  Enter start/focus  /plan  /rudder-plan  /model  /main|/m  /sync  /goal"
+                    "Option-1/2/3 or ^W pane  Enter start/focus  /plan  /model  /main|/m  /sync  /goal"
                         .to_string(),
                 );
                 true
@@ -3333,6 +3471,9 @@ impl App {
             worker_input_is_prompt: false,
             last_drain_at: None,
             review_source_ids: Vec::new(),
+            deps: Vec::new(),
+            soft_deps: Vec::new(),
+            node_id: None,
         };
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
             Ok(mut terminal) => {
@@ -3435,7 +3576,15 @@ impl App {
         self.workspace_idle_notified = false;
     }
 
-    fn spawn_agents_from_rudder_plan(&mut self, index: usize) {
+    /// Called from the poll loop when a planner run completes. The plan no longer
+    /// gates for approval or spawns everything at once: each task becomes a
+    /// PLANNED node queued in `planned_nodes`, visible in the Todo section. The
+    /// scheduler then drains the queue into live agents as deps merge and slots
+    /// free. The planner run itself is KEPT as the pinned orchestrator that owns
+    /// the plan (its worker pane renders the orchestrator DAG view); we only clear
+    /// `autosteered` so it is evaluated once. A trivial 1-node plan is just a
+    /// 1-node queue that the immediate scheduler drain launches.
+    fn evaluate_completed_plan(&mut self, index: usize) {
         let Some(run) = self.agents.get_mut(index) else {
             return;
         };
@@ -3448,28 +3597,129 @@ impl App {
         let tasks = match extract_rudder_plan_tasks(&output) {
             Ok(tasks) => tasks,
             Err(error) => {
-                self.notice = Some(format!(
-                    "rudder-plan did not produce runnable tasks: {error}"
-                ));
+                run.autosteered = false;
+                let _ = save_native_run_record(&self.cwd, run);
+                self.notice = Some(format!("plan did not produce runnable tasks: {error}"));
                 return;
             }
         };
         if tasks.is_empty() {
             run.autosteered = false;
             let _ = save_native_run_record(&self.cwd, run);
-            self.notice = Some("rudder-plan produced no runnable tasks".to_string());
+            self.notice = Some("plan produced no runnable tasks".to_string());
             return;
         }
 
+        // Queue every task as a PLANNED node. A new plan replaces any pending queue
+        // (the planner is the single source of truth for the active plan).
+        let nodes: Vec<PlannedNode> = tasks.iter().map(PlannedNode::from_task).collect();
+        let count = nodes.len();
+        self.planned_nodes = nodes;
+        self.planned_origin = planner_task;
+
+        // Clear the planner's autosteer flag so it is evaluated once, but KEEP the
+        // run: it stays pinned at the top of the list as the orchestrator that owns
+        // the plan. Its worker pane renders the DAG tree of the parsed tasks.
         run.autosteered = false;
         let _ = save_native_run_record(&self.cwd, run);
-        let count = tasks.len();
-        let worker_backend = self.backend;
-        for task in tasks {
-            let prompt = rudder_plan_worker_prompt(&planner_task, &task, worker_backend);
-            self.start_execute_task_with_summary(&prompt, Some(&task.title));
+
+        self.notice = Some(format!("plan queued {count} node(s) in todo"));
+        // Drain immediately so a ready node moves todo->in progress without waiting
+        // a full scheduler interval (covers the trivial 1-node case visibly).
+        self.run_scheduler();
+    }
+
+    /// Node ids of agents that have reached Merged. These satisfy hard deps and
+    /// unblock dependents on the next scheduler pass.
+    fn merged_node_ids(&self) -> Vec<String> {
+        self.agents
+            .iter()
+            .filter(|run| run.status == AgentStatus::Merged)
+            .filter_map(|run| run.node_id.clone())
+            .collect()
+    }
+
+    /// Count of currently-running agents that were launched from a planned node.
+    /// This is the figure the parallelism cap (MAX_PARALLEL) limits.
+    fn running_plan_agents(&self) -> usize {
+        self.agents
+            .iter()
+            .filter(|run| run.node_id.is_some() && run.status == AgentStatus::Running)
+            .count()
+    }
+
+    /// Scheduler step: drain ready planned nodes into live agents while a slot is
+    /// free. A node is ready when all its hard deps are merged (or reference ids
+    /// absent from the plan, treated as satisfied so the DAG never deadlocks).
+    /// Soft deps never gate. Runs on a coarse tick and after a plan is queued.
+    fn run_scheduler(&mut self) {
+        if self.planned_nodes.is_empty() {
+            return;
         }
-        self.notice = Some(format!("rudder-plan spawned {count} agent(s)"));
+        let cap = max_parallel();
+        let planner_task = self.planned_origin.clone();
+        let mut launched = 0usize;
+
+        // Recompute the launch decision each iteration so a node launched this pass
+        // (now Running) updates the cap accounting before the next pick.
+        while let Some(position) = self.next_node_to_launch(cap) {
+            let node = self.planned_nodes.remove(position);
+            let title = node.title.clone();
+            let prompt = planned_node_worker_prompt(&planner_task, &node);
+            self.start_execute_task_node(&prompt, Some(&title), Some(node));
+            launched += 1;
+        }
+
+        if launched > 0 {
+            let remaining = self.planned_nodes.len();
+            self.notice = Some(if remaining > 0 {
+                format!("launched {launched} node(s), {remaining} waiting in todo")
+            } else {
+                format!("launched {launched} node(s)")
+            });
+            self.dirty = true;
+        }
+    }
+
+    /// Position in `planned_nodes` of the next node to launch, or `None` when the
+    /// cap is reached or no queued node is ready. Pure decision (no side effects)
+    /// so the scheduler's dep-gating + cap can be tested without spawning PTYs.
+    fn next_node_to_launch(&self, cap: usize) -> Option<usize> {
+        if self.running_plan_agents() >= cap {
+            return None;
+        }
+        let merged = self.merged_node_ids();
+        let plan_ids = self.known_plan_node_ids();
+        self.planned_nodes
+            .iter()
+            .position(|node| node.is_ready(&merged, &plan_ids))
+    }
+
+    /// Every node id that belongs to the active plan: ids still queued in
+    /// `planned_nodes` PLUS ids of agents already launched from a node. A dep id
+    /// outside this set was never part of the plan and is treated as satisfied so
+    /// the DAG cannot deadlock; a dep still inside it must merge before unblocking.
+    fn known_plan_node_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .planned_nodes
+            .iter()
+            .map(|node| node.id.clone())
+            .collect();
+        ids.extend(self.agents.iter().filter_map(|run| run.node_id.clone()));
+        ids
+    }
+
+    /// Discard the entire pending plan queue (the `d` key on a planned node when no
+    /// agent is selected for deletion). Clears Todo of planned nodes.
+    fn discard_planned_queue(&mut self) {
+        if self.planned_nodes.is_empty() {
+            return;
+        }
+        let count = self.planned_nodes.len();
+        self.planned_nodes.clear();
+        self.planned_origin.clear();
+        self.notice = Some(format!("discarded {count} planned node(s)"));
+        self.dirty = true;
     }
 
     fn selected_terminal_mut(&mut self) -> Option<&mut TerminalPane> {
@@ -3606,6 +3856,34 @@ impl App {
                 "deleted agent from dashboard".to_string()
             }
         }));
+        let _ = write_rudder_context(&self.cwd, &self.agents, None);
+    }
+
+    /// Remove the agent at `index` from the dashboard and its on-disk run record,
+    /// then re-anchor `selected_agent` onto the nearest visible row. Used to abandon
+    /// a gated plan's planner run (which has no worktree to clean up).
+    // Retained as a general utility (the orchestrator is no longer removed on plan
+    // completion, which was its only caller). Kept for future deletion paths.
+    #[allow(dead_code)]
+    fn remove_agent_at(&mut self, index: usize) {
+        if index >= self.agents.len() {
+            return;
+        }
+        let run = self.agents.remove(index);
+        let _ = remove_native_run_record(&self.cwd, &run.id);
+        let last = self.agents.len().saturating_sub(1);
+        self.selected_agent = self.selected_agent.min(last);
+        if !self.agents.is_empty() {
+            let visible = self.visible_agent_indices();
+            if let Some(target) = visible
+                .iter()
+                .copied()
+                .find(|&visible_index| visible_index >= self.selected_agent)
+                .or_else(|| visible.last().copied())
+            {
+                self.selected_agent = target;
+            }
+        }
         let _ = write_rudder_context(&self.cwd, &self.agents, None);
     }
 
@@ -4413,8 +4691,29 @@ What to do\n\
             }
         }
 
-        for index in completed_rudder_plans {
-            self.spawn_agents_from_rudder_plan(index);
+        // The planner run is now KEPT as the pinned orchestrator (no removal), so
+        // indices stay stable. Process once each; `autosteered` is cleared inside
+        // so a re-poll of the same Done planner is a no-op.
+        completed_rudder_plans.sort_unstable();
+        completed_rudder_plans.dedup();
+        for index in completed_rudder_plans.into_iter().rev() {
+            self.evaluate_completed_plan(index);
+        }
+
+        // Drain the planned-node queue on a coarse cadence: as plan-launched
+        // agents reach Merged their node ids satisfy dependents' hard deps, so a
+        // periodic pass moves newly-ready nodes todo->in progress as slots free.
+        self.scheduler_tick = self.scheduler_tick.wrapping_add(1);
+        if !self.planned_nodes.is_empty() && self.scheduler_tick % SCHEDULER_TICK_INTERVAL == 0 {
+            self.run_scheduler();
+        }
+
+        // Advance the spinner each tick and force a redraw while an orchestrator is
+        // still planning, so "decomposing the task..." animates even when the
+        // planner is not emitting bytes this tick.
+        self.spinner_frame = self.spinner_frame.wrapping_add(1);
+        if self.has_planning_orchestrator() {
+            self.dirty = true;
         }
 
         if any_dirty {

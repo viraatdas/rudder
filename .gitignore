@@ -8,3 +8,4 @@ target/
 npm-debug.log*
 .DS_Store
 RUDDER.md
+*.tgz

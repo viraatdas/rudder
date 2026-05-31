@@ -233,6 +233,31 @@ branch refs/heads/main\n";
     }
 
     #[test]
+    fn manual_goal_prompt_leads_with_goal_and_done_when() {
+        let prompt = manual_goal_prompt("fix the flaky login test");
+        assert!(prompt.starts_with("/goal fix the flaky login test\n"));
+        assert!(prompt.contains("Done when: the task is implemented and its own verification passes"));
+        // The full task body follows the header.
+        assert!(prompt.contains("fix the flaky login test"));
+    }
+
+    #[test]
+    fn manual_goal_prompt_is_idempotent_for_existing_goal_prompts() {
+        let already = "/goal do the thing\nDone when: tests pass\n\nbody text";
+        assert_eq!(manual_goal_prompt(already), already);
+    }
+
+    #[test]
+    fn execution_prompt_hoists_goal_block_above_context() {
+        let prompt =
+            execution_prompt("/goal ship the parser\nDone when: cargo test passes\n\nWrite the parser.");
+        // The /goal line must be the very first line so the backend picks it up.
+        assert!(prompt.starts_with("/goal ship the parser\nDone when: cargo test passes\n"));
+        assert!(prompt.contains("Rudder-specific context injected by Rudder"));
+        assert!(prompt.contains("Write the parser."));
+    }
+
+    #[test]
     fn auto_steer_prompt_is_plain_task_text() {
         let task = "add bring your own vm";
         let prompt = format!(
@@ -1337,7 +1362,7 @@ branch refs/heads/main\n";
         assert!(rudder_plan.args.iter().any(|arg| {
             arg.contains("RUDDER_PLAN_TASKS_START")
                 && arg.contains("build the feature")
-                && arg.contains("Codex `/goal`")
+                && arg.contains("Every task MUST carry both a `goal` and a `success`")
         }));
         assert!(rudder_plan
             .args
@@ -1355,7 +1380,7 @@ branch refs/heads/main\n";
 
     #[test]
     fn extracts_rudder_plan_tasks_from_marked_json_block() {
-        let output = "\x1b[32mRUDDER_PLAN_TASKS_START\x1b[0m\n{\"tasks\":[{\"title\":\"API\",\"prompt\":\"Implement API and test it.\",\"goal\":\"Complete the API without stopping until tests pass.\"},{\"title\":\"UI\",\"prompt\":\"Implement UI and test it.\"}]}\nRUDDER_PLAN_TASKS_END";
+        let output = "\x1b[32mRUDDER_PLAN_TASKS_START\x1b[0m\n{\"tasks\":[{\"title\":\"API\",\"prompt\":\"Implement API and test it.\",\"goal\":\"Complete the API without stopping until tests pass.\",\"success\":\"cargo test passes\"},{\"title\":\"UI\",\"prompt\":\"Implement UI and test it.\"}]}\nRUDDER_PLAN_TASKS_END";
         let tasks = extract_rudder_plan_tasks(output).expect("parse tasks");
         assert_eq!(tasks.len(), 2);
         assert_eq!(tasks[0].title, "API");
@@ -1363,8 +1388,12 @@ branch refs/heads/main\n";
             tasks[0].goal.as_deref(),
             Some("Complete the API without stopping until tests pass.")
         );
+        assert_eq!(tasks[0].success.as_deref(), Some("cargo test passes"));
         assert_eq!(tasks[1].prompt, "Implement UI and test it.");
+        // goal + success stay backward-compatible: a plan block that omits them
+        // still parses (with None), and the worker prompt derives defaults.
         assert_eq!(tasks[1].goal, None);
+        assert_eq!(tasks[1].success, None);
     }
 
     #[test]
@@ -1395,17 +1424,163 @@ branch refs/heads/main\n";
     }
 
     #[test]
-    fn rudder_plan_worker_prompt_includes_codex_goal_when_available() {
+    fn flat_plan_tasks_synthesize_ids_and_have_no_deps() {
+        let output = "RUDDER_PLAN_TASKS_START\n{\"tasks\":[{\"title\":\"A\",\"prompt\":\"Do A.\"},{\"title\":\"B\",\"prompt\":\"Do B.\"}]}\nRUDDER_PLAN_TASKS_END";
+        let tasks = extract_rudder_plan_tasks(output).expect("parse tasks");
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].id, "n0");
+        assert_eq!(tasks[1].id, "n1");
+        assert!(tasks[0].deps.is_empty());
+        assert!(tasks[1].deps.is_empty());
+        assert_eq!(tasks[0].backend, None);
+    }
+
+    #[test]
+    fn parses_typed_deps_and_optional_fields() {
+        let output = "RUDDER_PLAN_TASKS_START\n{\"tasks\":[\
+            {\"id\":\"n0\",\"title\":\"schema\",\"prompt\":\"Write schema.\"},\
+            {\"id\":\"n1\",\"title\":\"api\",\"prompt\":\"Write API.\",\"backend\":\"codex\",\"model\":\"gpt-5\",\"effort\":\"high\",\"deps\":[{\"on\":\"n0\",\"type\":\"hard\",\"why\":\"needs the schema n0 migrates\"}]}\
+        ]}\nRUDDER_PLAN_TASKS_END";
+        let tasks = extract_rudder_plan_tasks(output).expect("parse tasks");
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[1].deps.len(), 1);
+        let edge = &tasks[1].deps[0];
+        assert_eq!(edge.on, "n0");
+        assert_eq!(edge.edge, EdgeType::Hard);
+        assert_eq!(edge.why.as_deref(), Some("needs the schema n0 migrates"));
+        assert_eq!(tasks[1].backend.as_deref(), Some("codex"));
+        assert_eq!(tasks[1].model.as_deref(), Some("gpt-5"));
+        assert_eq!(tasks[1].effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn drops_dep_edges_to_unknown_ids() {
+        let output = "RUDDER_PLAN_TASKS_START\n{\"tasks\":[\
+            {\"id\":\"n0\",\"title\":\"a\",\"prompt\":\"Do a.\",\"deps\":[{\"on\":\"ghost\",\"type\":\"hard\",\"why\":\"x\"}]}\
+        ]}\nRUDDER_PLAN_TASKS_END";
+        let tasks = extract_rudder_plan_tasks(output).expect("parse tasks");
+        assert_eq!(tasks.len(), 1);
+        assert!(
+            tasks[0].deps.is_empty(),
+            "edge to unknown id should be dropped"
+        );
+    }
+
+    #[test]
+    fn downgrades_unjustified_hard_edge_to_soft() {
+        let output = "RUDDER_PLAN_TASKS_START\n{\"tasks\":[\
+            {\"id\":\"n0\",\"title\":\"a\",\"prompt\":\"Do a.\"},\
+            {\"id\":\"n1\",\"title\":\"b\",\"prompt\":\"Do b.\",\"deps\":[{\"on\":\"n0\",\"type\":\"hard\"}]}\
+        ]}\nRUDDER_PLAN_TASKS_END";
+        let tasks = extract_rudder_plan_tasks(output).expect("parse tasks");
+        assert_eq!(tasks[1].deps.len(), 1);
+        assert_eq!(
+            tasks[1].deps[0].edge,
+            EdgeType::Soft,
+            "a hard edge without a why must downgrade to soft"
+        );
+    }
+
+    #[test]
+    fn rejects_hard_dependency_cycle() {
+        let output = "RUDDER_PLAN_TASKS_START\n{\"tasks\":[\
+            {\"id\":\"n0\",\"title\":\"a\",\"prompt\":\"Do a.\",\"deps\":[{\"on\":\"n1\",\"type\":\"hard\",\"why\":\"loop\"}]},\
+            {\"id\":\"n1\",\"title\":\"b\",\"prompt\":\"Do b.\",\"deps\":[{\"on\":\"n0\",\"type\":\"hard\",\"why\":\"loop\"}]}\
+        ]}\nRUDDER_PLAN_TASKS_END";
+        let result = extract_rudder_plan_tasks(output);
+        assert!(result.is_err(), "a hard-edge cycle must be rejected");
+    }
+
+    #[test]
+    fn soft_cycle_does_not_deadlock_parsing() {
+        // soft edges never block, so a soft cycle is allowed (it cannot deadlock).
+        let output = "RUDDER_PLAN_TASKS_START\n{\"tasks\":[\
+            {\"id\":\"n0\",\"title\":\"a\",\"prompt\":\"Do a.\",\"deps\":[{\"on\":\"n1\"}]},\
+            {\"id\":\"n1\",\"title\":\"b\",\"prompt\":\"Do b.\",\"deps\":[{\"on\":\"n0\"}]}\
+        ]}\nRUDDER_PLAN_TASKS_END";
+        let tasks = extract_rudder_plan_tasks(output).expect("soft cycle parses");
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].deps[0].edge, EdgeType::Soft);
+        assert_eq!(tasks[1].deps[0].edge, EdgeType::Soft);
+    }
+
+    #[test]
+    fn ready_nodes_only_blocks_on_hard_deps() {
+        let output = "RUDDER_PLAN_TASKS_START\n{\"tasks\":[\
+            {\"id\":\"n0\",\"title\":\"a\",\"prompt\":\"Do a.\"},\
+            {\"id\":\"n1\",\"title\":\"b\",\"prompt\":\"Do b.\",\"deps\":[{\"on\":\"n0\",\"type\":\"hard\",\"why\":\"needs a merged\"}]},\
+            {\"id\":\"n2\",\"title\":\"c\",\"prompt\":\"Do c.\",\"deps\":[{\"on\":\"n0\",\"type\":\"soft\"}]}\
+        ]}\nRUDDER_PLAN_TASKS_END";
+        let tasks = extract_rudder_plan_tasks(output).expect("parse tasks");
+
+        // Nothing merged: roots n0 and the soft-only child n2 are ready, n1 is not.
+        let ready: Vec<&str> = ready_nodes(&tasks, &[])
+            .iter()
+            .map(|task| task.id.as_str())
+            .collect();
+        assert!(ready.contains(&"n0"));
+        assert!(ready.contains(&"n2"), "soft deps never block readiness");
+        assert!(!ready.contains(&"n1"), "hard dep not yet merged blocks n1");
+
+        // Once n0 is merged, n1 becomes ready too.
+        let ready: Vec<&str> = ready_nodes(&tasks, &["n0".to_string()])
+            .iter()
+            .map(|task| task.id.as_str())
+            .collect();
+        assert!(ready.contains(&"n1"));
+    }
+
+    #[test]
+    fn rudder_plan_worker_prompt_always_leads_with_goal_and_done_when() {
         let task = RudderPlanTask {
+            id: "n0".to_string(),
             title: "API".to_string(),
             prompt: "Implement API and run cargo test.".to_string(),
             goal: Some("Complete the API without stopping until cargo test passes.".to_string()),
+            success: Some("cargo test passes with no failures".to_string()),
+            deps: Vec::new(),
+            backend: None,
+            model: None,
+            effort: None,
         };
-        let prompt = rudder_plan_worker_prompt("build the feature", &task, Backend::Codex);
 
-        assert!(prompt.contains("Original request:\nbuild the feature"));
-        assert!(prompt.contains("Worker task: API"));
-        assert!(prompt.contains("/goal Complete the API without stopping until cargo test passes."));
+        // The /goal block leads the prompt unconditionally for BOTH backends.
+        for backend in [Backend::Codex, Backend::Claude] {
+            let prompt = rudder_plan_worker_prompt("build the feature", &task, backend);
+            assert!(
+                prompt.starts_with("/goal Complete the API without stopping until cargo test passes."),
+                "prompt must lead with /goal: {prompt}"
+            );
+            assert!(prompt.contains("\nDone when: cargo test passes with no failures"));
+            assert!(prompt.contains("Original request:\nbuild the feature"));
+            assert!(prompt.contains("Worker task: API"));
+        }
+    }
+
+    #[test]
+    fn rudder_plan_worker_prompt_derives_goal_and_success_when_absent() {
+        // No explicit goal/success: the worker prompt still emits a /goal line
+        // (derived from the title) and a Done-when line (the canonical default).
+        let task = RudderPlanTask {
+            id: "n0".to_string(),
+            title: "Implement the parser".to_string(),
+            prompt: "Write the parser and add tests.".to_string(),
+            goal: None,
+            success: None,
+            deps: Vec::new(),
+            backend: None,
+            model: None,
+            effort: None,
+        };
+        let prompt = rudder_plan_worker_prompt("build it", &task, Backend::Claude);
+        assert!(
+            prompt.starts_with("/goal Implement the parser\n"),
+            "derived /goal from title: {prompt}"
+        );
+        assert!(
+            prompt.contains("Done when: the task is implemented and its own verification passes"),
+            "derived Done-when default: {prompt}"
+        );
     }
 
     #[test]
@@ -2022,6 +2197,108 @@ branch refs/heads/main\n";
         assert!(AGENT_PANE_HINTS.contains(&"M merge all"));
     }
 
+    #[test]
+    fn g_key_toggles_nest_view_in_agents_pane() {
+        let mut app = App::new();
+        app.focus = FocusPane::Agents;
+        assert!(!app.nest_view, "nest view is off (flat) by default");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::empty()));
+        assert!(app.nest_view, "g toggles nest view on");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::empty()));
+        assert!(!app.nest_view, "g toggles nest view back off");
+    }
+
+    #[test]
+    fn nest_hint_is_listed_in_agent_pane() {
+        assert!(AGENT_PANE_HINTS.contains(&"g nest"));
+    }
+
+    fn nest_line_text(item: &ListItem) -> String {
+        // ListItem wraps a Text (one Line per row); join its first line's spans.
+        format!("{item:?}")
+    }
+
+    #[test]
+    fn nest_view_renders_parents_before_children_with_glyphs() {
+        let mut app = App::new();
+        // n0 (root) -> n1 hard child -> n2 hard grandchild, plus n3 a soft child of n0.
+        let n0 = test_agent_run("n0", "schema");
+        let mut n1 = test_agent_run("n1", "api");
+        n1.deps = vec!["n0".to_string()];
+        let mut n2 = test_agent_run("n2", "tests");
+        n2.deps = vec!["n1".to_string()];
+        let mut n3 = test_agent_run("n3", "docs");
+        n3.soft_deps = vec!["n0".to_string()];
+        app.agents = vec![n0, n1, n2, n3];
+
+        let diff: Vec<Option<String>> = vec![None, None, None, None];
+        let lines = render_agents_nest(&app, true, 40, &diff);
+
+        // Collect the task-label lines (the first span line for each node) in order.
+        // Each node contributes a task line then a status line (no diffs here), so
+        // task-label lines are at even offsets.
+        let label_text = |item: &ListItem| -> String {
+            let dbg = nest_line_text(item);
+            dbg
+        };
+        // Find the order of node summaries by scanning the rendered debug text.
+        let blob: String = lines.iter().map(label_text).collect::<Vec<_>>().join("\n");
+        let pos = |needle: &str| blob.find(needle).unwrap_or(usize::MAX);
+        let p0 = pos("schema");
+        let p1 = pos("api");
+        let p2 = pos("tests");
+        let p3 = pos("docs");
+        assert!(p0 < p1, "parent schema renders before child api");
+        assert!(p1 < p2, "child api renders before grandchild tests");
+        assert!(p0 < p3, "parent schema renders before soft child docs");
+
+        // Assert glyphs: a hard connector glyph (├─ or ╰─) and a soft dashed
+        // connector (├┄ or ╰┄) both appear in the rendered tree.
+        assert!(
+            blob.contains('\u{2570}') || blob.contains('\u{251c}'),
+            "hard connector glyph (corner/tee) present"
+        );
+        assert!(
+            blob.contains('\u{2504}'),
+            "soft dashed connector glyph present"
+        );
+    }
+
+    #[test]
+    fn nest_view_first_child_line_carries_connector_prefix_span() {
+        let mut app = App::new();
+        let n0 = test_agent_run("n0", "root task");
+        let mut n1 = test_agent_run("n1", "child task");
+        n1.deps = vec!["n0".to_string()];
+        app.agents = vec![n0, n1];
+
+        let diff: Vec<Option<String>> = vec![None, None];
+        let lines = render_agents_nest(&app, true, 40, &diff);
+
+        // The first rendered line is the root's task label: no connector glyph at
+        // depth 0 (just the selection marker). ListItem content is private in
+        // ratatui, so inspect via the Debug representation like the sibling test.
+        let root_dbg = nest_line_text(&lines[0]);
+        assert!(
+            !root_dbg.contains('\u{2570}') && !root_dbg.contains('\u{251c}'),
+            "root task line has no connector glyph"
+        );
+
+        // The child task-label line (third entry: root label, root status, child
+        // label) carries a hard corner connector styled MUTED (Rgb 154,147,132).
+        let child_dbg = nest_line_text(&lines[2]);
+        assert!(
+            child_dbg.contains('\u{2570}'),
+            "single hard child uses the corner connector"
+        );
+        assert!(
+            child_dbg.contains("154, 147, 132"),
+            "hard connector is MUTED"
+        );
+    }
+
     fn test_agent_run(id: &str, task: &str) -> AgentRun {
         AgentRun {
             id: id.to_string(),
@@ -2062,6 +2339,9 @@ branch refs/heads/main\n";
             worker_input_is_prompt: false,
             last_drain_at: None,
             review_source_ids: Vec::new(),
+            deps: Vec::new(),
+            soft_deps: Vec::new(),
+            node_id: None,
         }
     }
 
@@ -2472,6 +2752,9 @@ branch refs/heads/main\n";
             worker_input_is_prompt: false,
             last_drain_at: None,
             review_source_ids: Vec::new(),
+            deps: Vec::new(),
+            soft_deps: Vec::new(),
+            node_id: None,
         });
 
         app.delete_selected_agent();
@@ -2641,4 +2924,578 @@ branch refs/heads/main\n";
         app.worker_view = WorkerView::Diff;
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty())));
         assert_eq!(app.worker_view, WorkerView::Terminal);
+    }
+
+    // --- CHANGE 1: plan -> planned-node queue (DAG orchestration) ------------
+
+    fn test_planned_node(id: &str, deps: &[&str]) -> PlannedNode {
+        PlannedNode {
+            id: id.to_string(),
+            title: id.to_string(),
+            prompt: format!("do {id}"),
+            goal: None,
+            success: None,
+            deps: deps.iter().map(ToString::to_string).collect(),
+            soft_deps: Vec::new(),
+            backend: None,
+            model: None,
+            effort: None,
+        }
+    }
+
+    #[test]
+    fn planned_node_ready_when_hard_deps_merged_or_missing() {
+        let plan_ids = vec!["n0".to_string(), "n1".to_string()];
+
+        let root = test_planned_node("n0", &[]);
+        assert!(root.is_ready(&[], &plan_ids), "a 0-dep root is always ready");
+
+        let child = test_planned_node("n1", &["n0"]);
+        assert!(
+            !child.is_ready(&[], &plan_ids),
+            "child blocked while parent unmerged"
+        );
+        assert!(
+            child.is_ready(&["n0".to_string()], &plan_ids),
+            "child ready once parent merged"
+        );
+
+        // A dep id not present anywhere in the plan is treated as satisfied so the
+        // DAG never deadlocks on a dangling reference.
+        let dangling = test_planned_node("n1", &["ghost"]);
+        assert!(
+            dangling.is_ready(&[], &plan_ids),
+            "dep absent from plan is treated as satisfied"
+        );
+    }
+
+    /// A fake plan-launched agent (no PTY) with a node id and status, used to drive
+    /// the scheduler's merged-set / cap accounting in tests.
+    fn node_agent(node_id: &str, status: AgentStatus) -> AgentRun {
+        let mut run = test_agent_run(node_id, &format!("work {node_id}"));
+        run.node_id = Some(node_id.to_string());
+        run.status = status;
+        run
+    }
+
+    #[test]
+    fn scheduler_launches_ready_root_but_holds_blocked_dependent() {
+        let mut app = App::new();
+        app.cwd = std::env::temp_dir();
+        // n0 root + n1 hard-depends on n0. Nothing merged yet.
+        app.planned_nodes = vec![test_planned_node("n0", &[]), test_planned_node("n1", &["n0"])];
+
+        // With no merged ids, only the root n0 is ready.
+        let position = app.next_node_to_launch(4).expect("a ready node");
+        assert_eq!(app.planned_nodes[position].id, "n0", "root launches first");
+
+        // Pretend n0 launched and is running: n1 is still blocked (n0 not merged).
+        app.planned_nodes.remove(position);
+        app.agents.push(node_agent("n0", AgentStatus::Running));
+        assert!(
+            app.next_node_to_launch(4).is_none(),
+            "dependent stays in todo until its parent merges"
+        );
+
+        // n0 merges: n1's hard dep is satisfied, so it becomes launchable.
+        app.agents[0].status = AgentStatus::Merged;
+        let position = app.next_node_to_launch(4).expect("dependent now ready");
+        assert_eq!(app.planned_nodes[position].id, "n1", "merged parent unblocks n1");
+    }
+
+    #[test]
+    fn scheduler_respects_parallelism_cap() {
+        let mut app = App::new();
+        app.cwd = std::env::temp_dir();
+        // Three independent ready roots, but only 2 slots.
+        app.planned_nodes = vec![
+            test_planned_node("n0", &[]),
+            test_planned_node("n1", &[]),
+            test_planned_node("n2", &[]),
+        ];
+        app.agents.push(node_agent("n0", AgentStatus::Running));
+        app.agents.push(node_agent("n1", AgentStatus::Running));
+
+        assert_eq!(
+            app.running_plan_agents(),
+            2,
+            "two plan-launched agents are running"
+        );
+        assert!(
+            app.next_node_to_launch(2).is_none(),
+            "cap reached: no further node launches while 2 run"
+        );
+        // A slot frees (one finishes): the next ready node may launch.
+        app.agents[0].status = AgentStatus::Done;
+        assert!(
+            app.next_node_to_launch(2).is_some(),
+            "a freed slot lets a waiting node launch"
+        );
+    }
+
+    #[test]
+    fn scheduler_treats_unknown_dep_as_satisfied() {
+        let mut app = App::new();
+        app.cwd = std::env::temp_dir();
+        // n0 hard-depends on an id absent from the plan -> not a deadlock.
+        app.planned_nodes = vec![test_planned_node("n0", &["ghost"])];
+        assert!(
+            app.next_node_to_launch(4).is_some(),
+            "a node whose dep is absent from the plan is launchable"
+        );
+    }
+
+    #[test]
+    fn discard_planned_queue_clears_todo() {
+        let mut app = App::new();
+        app.cwd = std::env::temp_dir();
+        app.planned_nodes = vec![test_planned_node("n0", &[]), test_planned_node("n1", &["n0"])];
+
+        app.discard_planned_queue();
+
+        assert!(app.planned_nodes.is_empty(), "queue is cleared");
+        assert_eq!(app.notice.as_deref(), Some("discarded 2 planned node(s)"));
+    }
+
+    #[test]
+    fn d_key_discards_plan_queue_when_no_agents() {
+        let mut app = App::new();
+        app.cwd = std::env::temp_dir();
+        app.planned_nodes = vec![test_planned_node("n0", &[])];
+        app.focus = FocusPane::Agents;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::empty()));
+        assert!(app.planned_nodes.is_empty(), "d discards the plan queue");
+    }
+
+    #[test]
+    fn enter_on_agent_focuses_worker() {
+        let mut app = App::new();
+        let run = test_agent_run("run-1", "ordinary task");
+        app.agents.push(run);
+        app.selected_agent = 0;
+        app.focus = FocusPane::Agents;
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        assert_eq!(app.focus, FocusPane::Worker, "Enter focuses worker as before");
+        assert_eq!(app.agents.len(), 1);
+    }
+
+    #[cfg(not(windows))]
+    fn planner_with_block(app: &App, block: &str) -> AgentRun {
+        // Spawn a real pty that prints the RUDDER_PLAN_TASKS block so
+        // rudder_plan_output_for_run can read it back from the output log.
+        let script = format!("printf '%s' {}; sleep 1", shell_single_quote(block));
+        let command = TerminalCommand::with_args("/bin/sh", ["-lc", script.as_str()]);
+        let mut pane = TerminalPane::spawn_shell_or_command(
+            Some(command),
+            TerminalPaneOptions {
+                size: TerminalSize { rows: 40, cols: 80 },
+                scrollback_lines: 400,
+                ..Default::default()
+            },
+        )
+        .expect("spawn planner pty");
+        for _ in 0..40 {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            pane.drain_output();
+            if pane.output_log_snapshot().contains("RUDDER_PLAN_TASKS_END") {
+                break;
+            }
+        }
+        let mut run = test_agent_run("planner-1", "plan it");
+        run.cwd = app.cwd.clone();
+        run.mode = AgentMode::RudderPlan;
+        run.status = AgentStatus::Done;
+        run.autosteered = true;
+        run.terminal = Some(pane);
+        run
+    }
+
+    #[cfg(not(windows))]
+    fn shell_single_quote(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn completed_plan_queues_planned_nodes_and_pins_orchestrator() {
+        let mut app = App::new();
+        app.cwd = std::env::temp_dir();
+        // A two-node plan with a hard dep: n1 (ui) depends on n0 (api). The scheduler
+        // launches the ready root and leaves the blocked dependent in Todo.
+        let block = "RUDDER_PLAN_TASKS_START\n{\"tasks\":[\
+            {\"id\":\"n0\",\"title\":\"api\",\"prompt\":\"build api\",\"goal\":\"api\",\"success\":\"tests pass\"},\
+            {\"id\":\"n1\",\"title\":\"ui\",\"prompt\":\"build ui\",\"goal\":\"ui\",\"success\":\"renders\",\"deps\":[{\"on\":\"n0\",\"type\":\"hard\",\"why\":\"ui needs the api merged\"}]}\
+        ]}\nRUDDER_PLAN_TASKS_END\n";
+        let planner = planner_with_block(&app, block);
+        app.agents.push(planner);
+        app.selected_agent = 0;
+
+        app.evaluate_completed_plan(0);
+
+        // The planner run is KEPT as the pinned orchestrator (it owns the plan), not
+        // removed; its autosteer flag is cleared so it is only evaluated once.
+        let orchestrators: Vec<&AgentRun> = app
+            .agents
+            .iter()
+            .filter(|run| run.mode == AgentMode::RudderPlan)
+            .collect();
+        assert_eq!(orchestrators.len(), 1, "planner stays as the pinned orchestrator");
+        assert!(orchestrators[0].is_orchestrator());
+        assert!(!orchestrators[0].autosteered, "evaluated-once flag cleared");
+        // n0 (root) launched -> an agent tagged with its node id. n1 stays in Todo
+        // because its hard dep n0 has not merged.
+        assert_eq!(app.planned_nodes.len(), 1, "blocked dependent stays in todo");
+        assert_eq!(app.planned_nodes[0].id, "n1");
+        assert!(
+            app.agents.iter().any(|run| run.node_id.as_deref() == Some("n0")),
+            "ready root n0 launched as a node-tagged agent"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn trivial_plan_launches_single_node_on_completion() {
+        let mut app = App::new();
+        app.cwd = std::env::temp_dir();
+        let block = "RUDDER_PLAN_TASKS_START\n{\"tasks\":[{\"title\":\"only\",\"prompt\":\"do the thing\",\"goal\":\"thing\",\"success\":\"done\"}]}\nRUDDER_PLAN_TASKS_END\n";
+        let planner = planner_with_block(&app, block);
+        app.agents.push(planner);
+        app.selected_agent = 0;
+
+        app.evaluate_completed_plan(0);
+
+        // A 1-node plan: no gate, the orchestrator is KEPT pinned, and the single node
+        // (0 deps, slot free) launches on the immediate scheduler drain -> Todo empty.
+        assert!(
+            app.agents.iter().any(|run| run.mode == AgentMode::RudderPlan),
+            "orchestrator pinned, not removed"
+        );
+        assert!(app.planned_nodes.is_empty(), "the single node launched");
+        assert!(
+            app.agents.iter().any(|run| run.node_id.is_some()),
+            "a node-tagged worker run was launched"
+        );
+    }
+
+    // --- Orchestrator view: pinned row + spinner/DAG worker pane -------------
+
+    #[test]
+    fn spinner_glyph_advances_with_frame() {
+        let mut app = App::new();
+        let first = app.spinner_glyph();
+        app.spinner_frame = app.spinner_frame.wrapping_add(1);
+        let second = app.spinner_glyph();
+        assert_ne!(first, second, "advancing the frame changes the spinner glyph");
+        // Wrapping back to the same frame yields the same glyph.
+        app.spinner_frame = SPINNER_FRAMES.len();
+        assert_eq!(app.spinner_glyph(), SPINNER_FRAMES[0]);
+    }
+
+    #[test]
+    fn orchestrator_is_pinned_above_status_sections_and_excluded_from_buckets() {
+        let mut app = App::new();
+        let mut orch = test_agent_run("orch", "build a feature");
+        orch.mode = AgentMode::RudderPlan;
+        orch.status = AgentStatus::Running;
+        let running = test_agent_run("worker", "do work"); // in progress bucket
+        app.agents = vec![running, orch];
+
+        // The orchestrator (index 1) navigates first even though it is pushed last.
+        let order = app.visible_agent_indices();
+        assert_eq!(order.first().copied(), Some(1), "orchestrator pinned first");
+        assert!(order.contains(&0), "the worker still appears in a status section");
+        // It is not in any status bucket (RudderPlan is excluded).
+        assert!(
+            !sectioned_agent_order(&app.agents)
+                .iter()
+                .skip(1)
+                .any(|&i| app.agents[i].is_orchestrator()),
+            "orchestrator does not also appear in a status section"
+        );
+    }
+
+    #[test]
+    fn render_agents_shows_pinned_orchestrator_header_and_phase() {
+        let mut app = App::new();
+        app.focus = FocusPane::Agents;
+        let mut orch = test_agent_run("orch", "ship the thing");
+        orch.mode = AgentMode::RudderPlan;
+        orch.status = AgentStatus::Running;
+        app.agents = vec![orch];
+        app.selected_agent = 0;
+
+        let area = Rect::new(0, 0, 34, 40);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(34, 40))
+            .expect("test backend");
+        terminal
+            .draw(|frame| render_agents(frame, area, &mut app))
+            .expect("draw agents pane");
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("orchestrator"), "pinned orchestrator header/label present: {text}");
+        // While Running with no plan block, the phase reads "planning".
+        assert!(text.contains("planning"), "phase reads planning: {text}");
+    }
+
+    #[test]
+    fn orchestrator_task_status_reflects_launched_agent() {
+        let mut app = App::new();
+        // n0 launched and merged -> done; n1 launched and running -> in-progress;
+        // n2 still queued (no agent) -> todo.
+        app.agents = vec![
+            node_agent("n0", AgentStatus::Merged),
+            node_agent("n1", AgentStatus::Running),
+        ];
+        assert_eq!(orchestrator_task_status(&app, "n0"), OrchTaskStatus::Done);
+        assert_eq!(orchestrator_task_status(&app, "n1"), OrchTaskStatus::Running);
+        assert_eq!(orchestrator_task_status(&app, "n2"), OrchTaskStatus::Todo);
+
+        let mut failed = node_agent("n3", AgentStatus::Failed);
+        failed.id = "n3-run".to_string();
+        app.agents.push(failed);
+        assert_eq!(orchestrator_task_status(&app, "n3"), OrchTaskStatus::Failed);
+    }
+
+    /// Render the worker pane (orchestrator view) into a TestBackend and return its
+    /// flattened text.
+    fn render_worker_text(app: &mut App, width: u16, height: u16) -> String {
+        let area = Rect::new(0, 0, width, height);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+                .expect("test backend");
+        terminal
+            .draw(|frame| render_worker(frame, area, app))
+            .expect("draw worker pane");
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn render_orchestrator_shows_spinner_while_planning() {
+        let mut app = App::new();
+        app.focus = FocusPane::Worker;
+        let mut orch = test_agent_run("orch", "build a feature");
+        orch.mode = AgentMode::RudderPlan;
+        orch.status = AgentStatus::Running; // no PTY, no plan block -> planning phase
+        app.agents = vec![orch];
+        app.selected_agent = 0;
+
+        let text = render_worker_text(&mut app, 60, 20);
+        assert!(text.contains("ORCHESTRATOR"), "header present: {text}");
+        assert!(text.contains("decomposing the task"), "spinner caption present: {text}");
+        // The pane title is "orchestrator", not "worker".
+        assert!(text.contains("orchestrator"), "pane title is orchestrator: {text}");
+        assert!(!text.contains("decomposing the task...running"), "no DAG summary while planning");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn render_orchestrator_shows_task_tree_with_live_badges_once_plan_parsed() {
+        let mut app = App::new();
+        app.focus = FocusPane::Worker;
+        let block = "RUDDER_PLAN_TASKS_START\n{\"tasks\":[\
+            {\"id\":\"n0\",\"title\":\"api\",\"prompt\":\"build api\",\"goal\":\"api\",\"success\":\"tests pass\"},\
+            {\"id\":\"n1\",\"title\":\"ui\",\"prompt\":\"build ui\",\"goal\":\"ui\",\"success\":\"renders\",\"deps\":[{\"on\":\"n0\",\"type\":\"hard\",\"why\":\"needs api\"}]}\
+        ]}\nRUDDER_PLAN_TASKS_END\n";
+        let mut orch = planner_with_block(&app, block);
+        // The orchestrator is still selected after a plan parses; mark it as the
+        // post-plan pinned run (autosteer cleared) and the source of the plan.
+        orch.autosteered = false;
+        orch.id = "orch".to_string();
+        // n0 launched and is running; n1 not yet launched -> todo.
+        let mut n0 = node_agent("n0", AgentStatus::Running);
+        n0.id = "n0-run".to_string();
+        app.agents = vec![orch, n0];
+        app.selected_agent = 0;
+
+        let text = render_worker_text(&mut app, 60, 20);
+        assert!(text.contains("ORCHESTRATOR"), "header present: {text}");
+        // The parsed task titles render in the tree.
+        assert!(text.contains("api"), "task n0 title in tree: {text}");
+        assert!(text.contains("ui"), "task n1 title in tree: {text}");
+        // n0's badge reflects its launched agent (running == in-progress); n1 is todo.
+        assert!(text.contains("in-progress"), "n0 badge reflects launched agent: {text}");
+        assert!(text.contains("todo"), "n1 not launched -> todo: {text}");
+        // Summary line present.
+        assert!(text.contains("running 1"), "summary running count: {text}");
+    }
+
+    // --- CHANGE 2: Ctrl+W leader Tab cycle -----------------------------------
+
+    #[test]
+    fn cycle_focus_rotates_panes_both_directions() {
+        let mut app = App::new();
+        app.focus = FocusPane::Agents;
+        app.cycle_focus(true);
+        assert_eq!(app.focus, FocusPane::Worker);
+        app.cycle_focus(true);
+        assert_eq!(app.focus, FocusPane::Task);
+        app.cycle_focus(true);
+        assert_eq!(app.focus, FocusPane::Agents);
+
+        app.cycle_focus(false);
+        assert_eq!(app.focus, FocusPane::Task);
+        app.cycle_focus(false);
+        assert_eq!(app.focus, FocusPane::Worker);
+    }
+
+    #[test]
+    fn ctrl_w_then_tab_cycles_and_rearms() {
+        let mut app = App::new();
+        app.focus = FocusPane::Agents;
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert!(app.leader_pending);
+
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()));
+        assert_eq!(app.focus, FocusPane::Worker, "Ctrl+W Tab cycles one pane");
+        assert!(app.leader_pending, "leader re-arms after Tab");
+
+        // A second Tab (no fresh Ctrl+W) keeps cycling because the leader re-armed.
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()));
+        assert_eq!(app.focus, FocusPane::Task, "Ctrl+W Tab Tab cycles twice");
+        assert!(app.leader_pending, "leader still armed after second Tab");
+    }
+
+    #[test]
+    fn ctrl_w_then_backtab_cycles_backward_and_rearms() {
+        let mut app = App::new();
+        app.focus = FocusPane::Agents;
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert_eq!(app.focus, FocusPane::Task, "Ctrl+W BackTab cycles backward");
+        assert!(app.leader_pending, "leader re-arms after BackTab");
+    }
+
+    #[test]
+    fn ctrl_w_then_option_typographic_chars_focus_panes() {
+        let mut app = App::new();
+        app.focus = FocusPane::Task;
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        app.handle_key(KeyEvent::new(KeyCode::Char('\u{2122}'), KeyModifiers::empty()));
+        assert_eq!(app.focus, FocusPane::Worker, "Option+2 (™) focuses worker");
+        assert!(!app.leader_pending, "pane focus is one-shot");
+    }
+
+    // --- CHANGE 3: status sections + nested deps -----------------------------
+
+    #[test]
+    fn status_bucket_maps_each_state() {
+        let mut run = test_agent_run("a", "t");
+        run.status = AgentStatus::Running;
+        assert_eq!(status_bucket(&run), Bucket::InProgress);
+
+        run.status = AgentStatus::Done;
+        assert_eq!(status_bucket(&run), Bucket::Review);
+
+        run.needs_permission = true;
+        assert_eq!(status_bucket(&run), Bucket::Review, "needs-permission is review");
+        run.needs_permission = false;
+
+        run.status = AgentStatus::Merged;
+        assert_eq!(status_bucket(&run), Bucket::Done);
+
+        run.status = AgentStatus::Failed;
+        assert_eq!(status_bucket(&run), Bucket::Closed);
+        run.status = AgentStatus::Stopped;
+        assert_eq!(status_bucket(&run), Bucket::Closed);
+
+        // Agents never land in Todo: that section now holds planned nodes only. The
+        // orchestrator's raw status still maps to Review at the status_bucket level,
+        // but it is excluded from buckets and pinned at the top of the list instead.
+        let mut planner = test_agent_run("p", "plan");
+        planner.mode = AgentMode::RudderPlan;
+        planner.status = AgentStatus::Done;
+        planner.autosteered = true;
+        assert_eq!(status_bucket(&planner), Bucket::Review);
+        assert!(planner.is_orchestrator(), "RudderPlan agent is the orchestrator");
+    }
+
+    #[test]
+    fn sectioned_order_groups_by_status_then_nests_children() {
+        let mut app = App::new();
+        // parent (Running -> in progress), child hard-depends on parent (also Running),
+        // plus a merged agent (done) and a failed agent (closed).
+        let parent = test_agent_run("parent", "parent task"); // Running
+        let mut child = test_agent_run("child", "child task");
+        child.deps = vec!["parent".to_string()];
+        let mut merged = test_agent_run("m", "merged task");
+        merged.status = AgentStatus::Merged;
+        let mut failed = test_agent_run("f", "failed task");
+        failed.status = AgentStatus::Failed;
+        app.agents = vec![parent, child, merged, failed];
+
+        // in progress: parent(0) then nested child(1); done: merged(2); closed: failed(3).
+        assert_eq!(app.visible_agent_indices(), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn sectioned_render_emits_status_headers_with_counts() {
+        let mut app = App::new();
+        app.focus = FocusPane::Agents;
+        let running = test_agent_run("r", "alpha work"); // in progress
+        let mut done = test_agent_run("m", "beta work");
+        done.status = AgentStatus::Merged; // done section
+        app.agents = vec![running, done];
+
+        let area = Rect::new(0, 0, 34, 40);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(34, 40))
+            .expect("test backend");
+        terminal
+            .draw(|frame| render_agents(frame, area, &mut app))
+            .expect("draw agents pane");
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("in progress"), "in progress header present");
+        // "done" header (note: the row-2 "agents N runs" line never says "done").
+        assert!(text.contains("done"), "done header present: {text}");
+        // The old grouping headers must be gone; neither agent label uses these words.
+        assert!(!text.contains("worktrees"), "no worktrees header");
+    }
+
+    #[test]
+    fn cross_section_dependent_renders_dep_hint() {
+        let mut app = App::new();
+        app.focus = FocusPane::Agents;
+        // parent is merged (done section); child is running (in progress section) and
+        // hard-depends on the parent which is NOT in the child's section.
+        let mut parent = test_agent_run("parent", "parent task");
+        parent.status = AgentStatus::Merged;
+        let mut child = test_agent_run("child", "child task");
+        child.deps = vec!["parent".to_string()];
+        app.agents = vec![parent, child];
+
+        let area = Rect::new(0, 0, 34, 40);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(34, 40))
+            .expect("test backend");
+        terminal
+            .draw(|frame| render_agents(frame, area, &mut app))
+            .expect("draw agents pane");
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(
+            text.contains("^dep"),
+            "cross-section dependent shows a dep hint: {text}"
+        );
     }

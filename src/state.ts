@@ -5,12 +5,17 @@ import type {
   BackendConfig,
   BackendId,
   EffortLevel,
+  JsonValue,
   MergeStrategy,
+  ProjectEntry,
+  ProjectsRegistry,
   RudderConfig,
   RunRecord,
   RudderEvent,
+  UndoEntry,
   VcsMode,
 } from "./types.js";
+import { DEFAULT_BOARD_PORT } from "./types.js";
 import {
   ensureDir,
   newRunId,
@@ -29,6 +34,10 @@ export function globalConfigPath(): string {
   return path.join(rudderHome(), "config.json");
 }
 
+export function projectsRegistryPath(): string {
+  return path.join(rudderHome(), "projects.json");
+}
+
 export function authStorePath(): string {
   return path.join(rudderHome(), "auth-profiles.json");
 }
@@ -43,6 +52,10 @@ export function projectStateDir(repoRoot: string): string {
 
 export function runsDir(repoRoot: string): string {
   return path.join(projectStateDir(repoRoot), "runs");
+}
+
+export function undoStackPath(repoRoot: string): string {
+  return path.join(projectStateDir(repoRoot), "undo-stack.json");
 }
 
 export function runDir(repoRoot: string, runId: string): string {
@@ -112,6 +125,8 @@ export function defaultConfig(): RudderConfig {
       },
       acpx: { model: "gpt-5.5" },
     },
+    board: { port: DEFAULT_BOARD_PORT },
+    orchestrator: { maxParallel: 1000, reviewGate: "manual" },
   };
 }
 
@@ -132,6 +147,15 @@ function normalizeConfig(existing: RudderConfig): RudderConfig {
     backends: {
       ...defaults.backends,
       ...(existing.backends ?? {}),
+    },
+    board: {
+      ...defaults.board,
+      ...(existing.board ?? {}),
+    },
+    orchestrator: {
+      maxParallel: existing.orchestrator?.maxParallel ?? defaults.orchestrator?.maxParallel ?? 1000,
+      reviewGate: existing.orchestrator?.reviewGate ?? defaults.orchestrator?.reviewGate ?? "manual",
+      ...(existing.orchestrator?.budget ? { budget: existing.orchestrator.budget } : {}),
     },
   };
 }
@@ -277,9 +301,11 @@ export async function createRunRecord(params: {
   targetBranch: string;
   baseCommit: string;
   vcs?: VcsMode;
+  resolverFor?: string;
   useWorktree: boolean;
   worktreeBranch?: string;
   worktreeWorkspaceName?: string;
+  worktreeJjChangeId?: string;
   worktreePath?: string;
 }): Promise<RunRecord> {
   const id = params.id ?? newRunId(params.task);
@@ -288,6 +314,7 @@ export async function createRunRecord(params: {
     id,
     status: "created",
     vcs: params.vcs,
+    ...(params.resolverFor ? { resolverFor: params.resolverFor } : {}),
     mode: params.mode ?? "execute",
     task: params.task,
     taskSummary: summarizeTask(params.task),
@@ -304,6 +331,7 @@ export async function createRunRecord(params: {
       path: params.worktreePath ?? params.repoRoot,
       branch: params.worktreeBranch,
       workspaceName: params.worktreeWorkspaceName,
+      ...(params.worktreeJjChangeId ? { jjChangeId: params.worktreeJjChangeId } : {}),
     },
     currentPrompt: params.task,
     turns: [{ ts: createdAt, prompt: params.task, source: "user" }],
@@ -442,4 +470,102 @@ export async function resolveRun(repoRoot: string, runId?: string): Promise<RunR
   }
   const runs = await listRuns(repoRoot);
   return runs[0] ?? null;
+}
+
+export async function loadUndoStack(repoRoot: string): Promise<UndoEntry[]> {
+  const stack = await readJson<UndoEntry[]>(undoStackPath(repoRoot));
+  return Array.isArray(stack) ? stack : [];
+}
+
+export async function pushUndoEntry(repoRoot: string, entry: UndoEntry): Promise<void> {
+  await updateJson<UndoEntry[]>(undoStackPath(repoRoot), (current) => {
+    const stack = Array.isArray(current) ? current : [];
+    return [...stack, entry] as unknown as JsonValue;
+  });
+}
+
+export async function popUndoEntry(repoRoot: string): Promise<UndoEntry | null> {
+  let popped: UndoEntry | null = null;
+  await updateJson<UndoEntry[]>(undoStackPath(repoRoot), (current) => {
+    const stack = Array.isArray(current) ? [...current] : [];
+    popped = stack.pop() ?? null;
+    return stack as unknown as JsonValue;
+  });
+  return popped;
+}
+
+// ---------------------------------------------------------------------------
+// Multi-project registry (~/.rudder/projects.json). The localhost board serves
+// every registered repo; runs auto-register their repo so projects appear.
+// ---------------------------------------------------------------------------
+
+export async function loadProjects(): Promise<ProjectEntry[]> {
+  const registry = await readJson<ProjectsRegistry>(projectsRegistryPath());
+  if (registry?.version === 1 && Array.isArray(registry.projects)) {
+    return registry.projects.filter(
+      (entry): entry is ProjectEntry =>
+        Boolean(entry) && typeof entry.slug === "string" && typeof entry.repoRoot === "string",
+    );
+  }
+  return [];
+}
+
+/**
+ * Compute a stable slug for a repo: slugify(basename) with a -<shortHash> suffix
+ * appended only when another already-registered repo claimed the bare slug.
+ */
+function computeProjectSlug(repoRoot: string, existing: ProjectEntry[]): string {
+  const resolved = path.resolve(repoRoot);
+  const base = slugify(path.basename(resolved), "project");
+  const collision = existing.some(
+    (entry) => entry.slug === base && path.resolve(entry.repoRoot) !== resolved,
+  );
+  return collision ? `${base}-${shortHash(resolved)}` : base;
+}
+
+/**
+ * Register the given repo in the global registry. Idempotent: an existing entry
+ * for the same repoRoot is returned unchanged (its slug is stable). Never throws
+ * on a malformed registry (it is rebuilt from the known-good entries).
+ */
+export async function registerProject(repoRoot: string): Promise<ProjectEntry> {
+  const resolved = path.resolve(repoRoot);
+  let result: ProjectEntry | null = null;
+  await updateJson<ProjectsRegistry>(projectsRegistryPath(), (current) => {
+    const projects =
+      current?.version === 1 && Array.isArray(current.projects)
+        ? current.projects.filter(
+            (entry): entry is ProjectEntry =>
+              Boolean(entry) && typeof entry.slug === "string" && typeof entry.repoRoot === "string",
+          )
+        : [];
+    const found = projects.find((entry) => path.resolve(entry.repoRoot) === resolved);
+    if (found) {
+      result = found;
+      return { version: 1, projects } as unknown as JsonValue;
+    }
+    const entry: ProjectEntry = {
+      slug: computeProjectSlug(resolved, projects),
+      repoRoot: resolved,
+      name: path.basename(resolved),
+      addedAt: nowIso(),
+    };
+    result = entry;
+    return { version: 1, projects: [...projects, entry] } as unknown as JsonValue;
+  });
+  if (!result) {
+    // Should be unreachable; the transform always assigns result.
+    result = {
+      slug: computeProjectSlug(resolved, []),
+      repoRoot: resolved,
+      name: path.basename(resolved),
+      addedAt: nowIso(),
+    };
+  }
+  return result;
+}
+
+export async function findProjectBySlug(slug: string): Promise<ProjectEntry | null> {
+  const projects = await loadProjects();
+  return projects.find((entry) => entry.slug === slug) ?? null;
 }

@@ -1,8 +1,9 @@
 import fsp from "node:fs/promises";
 import path from "node:path";
 import type { MergeStrategy, RunRecord } from "./types.js";
-import { runCommand, runCommandSync, shortHash, slugPrefix } from "./util.js";
-import { listRuns, saveRunRecord, worktreePath } from "./state.js";
+import { runCommand, runCommandSync } from "./util.js";
+import { listRuns, saveRunRecord } from "./state.js";
+import { jjDiff, jjStatus } from "./jj.js";
 
 export type RebaseResult = {
   success: boolean;
@@ -10,6 +11,16 @@ export type RebaseResult = {
   conflictedFiles: string[];
   error?: string;
 };
+
+// ---------------------------------------------------------------------------
+// Externally-git contract + plumbing.
+//
+// Rudder's internal run isolation/merge runs on jj (see src/jj.ts). git.ts now
+// only owns the surface where Rudder still talks plain git: discovering the repo
+// root, reporting branch/commit, and producing status/diff for the Hunk review
+// surface. Legacy runs created before the jj switch (run.vcs === "git") still
+// merge/sync through the git helpers below, guarded by the vcs mode.
+// ---------------------------------------------------------------------------
 
 export function findRepoRoot(cwd = process.cwd()): string {
   const result = runCommandSync("git", ["rev-parse", "--show-toplevel"], {
@@ -45,14 +56,6 @@ export async function currentCommit(repoRoot: string): Promise<string> {
     allowFailure: true,
   });
   return result.stdout.trim() || "";
-}
-
-export async function worktreeBaseCommit(repoRoot: string): Promise<string> {
-  const result = await runCommand("git", ["rev-parse", "main"], {
-    cwd: repoRoot,
-    allowFailure: true,
-  });
-  return result.stdout.trim() || await currentCommit(repoRoot);
 }
 
 export async function gitStatus(repoRoot: string): Promise<string[]> {
@@ -93,12 +96,18 @@ export async function hasChanges(repoRoot: string): Promise<boolean> {
   return (await gitStatus(repoRoot)).length > 0;
 }
 
+// VCS-aware projections used by brain.ts and the worker. jj runs read jj
+// status/diff; legacy git runs read git status/diff.
 export async function workspaceStatus(run: RunRecord): Promise<string[]> {
-  return await gitStatus(run.worktree.path);
+  return (run.vcs ?? "git") === "jj"
+    ? await jjStatus(run.worktree.path)
+    : await gitStatus(run.worktree.path);
 }
 
 export async function workspaceDiff(run: RunRecord): Promise<string> {
-  return await gitDiff(run.worktree.path);
+  return (run.vcs ?? "git") === "jj"
+    ? await jjDiff(run.worktree.path)
+    : await gitDiff(run.worktree.path);
 }
 
 export async function runHasChanges(run: RunRecord): Promise<boolean> {
@@ -130,50 +139,41 @@ export async function activeRunsForCheckout(repoRoot: string, checkoutPath: stri
   });
 }
 
-export async function createRunWorktree(params: {
-  repoRoot: string;
-  runId: string;
-  task: string;
-  baseCommit: string;
-}): Promise<{ branch: string; path: string }> {
-  const taskSlug = slugPrefix(params.task, "task");
-  const branch = `rudder/${taskSlug}-${shortHash(params.runId).slice(0, 8)}`;
-  const targetPath = worktreePath(params.repoRoot, params.runId, params.task);
-  await fsp.mkdir(path.dirname(targetPath), { recursive: true });
-
-  await runCommand("git", ["branch", branch, params.baseCommit], {
-    cwd: params.repoRoot,
+export async function conflictedFiles(repoRoot: string): Promise<string[]> {
+  const result = await runCommand("git", ["diff", "--name-only", "--diff-filter=U"], {
+    cwd: repoRoot,
     allowFailure: true,
   });
-  await runCommand("git", ["worktree", "add", targetPath, branch], {
-    cwd: params.repoRoot,
-  });
-  return { branch, path: targetPath };
+  return result.stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
 }
 
-export async function removeWorktree(repoRoot: string, targetPath: string, force = false): Promise<void> {
+export async function worktreeList(repoRoot: string): Promise<string> {
+  const result = await runCommand("git", ["worktree", "list"], {
+    cwd: repoRoot,
+    allowFailure: true,
+  });
+  return result.stdout.trim();
+}
+
+export async function removeGitWorktree(repoRoot: string, targetPath: string, force = false): Promise<void> {
   await runCommand("git", ["worktree", "remove", ...(force ? ["--force"] : []), targetPath], {
     cwd: repoRoot,
     allowFailure: force,
   });
 }
 
-export async function removeRunWorkspace(run: RunRecord, force = false): Promise<void> {
-  if (!run.worktree.enabled) {
-    return;
-  }
-  await removeWorktree(run.repoRoot, run.worktree.path, force);
-}
+// ---------------------------------------------------------------------------
+// Legacy git run isolation/merge/sync.
+//
+// These remain only to keep runs created before the jj switch
+// (run.vcs === "git") mergeable. No NEW runs reach this path; run-manager routes
+// jj runs to src/jj.ts and only falls back here when run.vcs === "git".
+// ---------------------------------------------------------------------------
 
-export async function mergeRunIntoCurrentBranch(
-  run: RunRecord,
-  allowDirty = false,
-  strategy: MergeStrategy = "merge",
-): Promise<RunRecord> {
-  return await mergeGitRunIntoCurrentBranch(run, allowDirty, strategy);
-}
-
-async function mergeGitRunIntoCurrentBranch(
+export async function mergeGitRunIntoCurrentBranch(
   run: RunRecord,
   allowDirty = false,
   strategy: MergeStrategy = "merge",
@@ -271,7 +271,7 @@ async function mergeGitRunIntoCurrentBranch(
   return run;
 }
 
-export async function syncRunWorktree(run: RunRecord, baseBranch: string): Promise<RunRecord> {
+export async function syncGitRunWorktree(run: RunRecord, baseBranch: string): Promise<RunRecord> {
   if (!run.worktree.branch) {
     throw new Error("Run has no worktree branch to sync.");
   }
@@ -490,23 +490,4 @@ async function gitPath(worktree: string, name: string): Promise<string | null> {
 
 function gitError(result: { stdout: string; stderr: string }): string {
   return result.stderr.trim() || result.stdout.trim();
-}
-
-export async function conflictedFiles(repoRoot: string): Promise<string[]> {
-  const result = await runCommand("git", ["diff", "--name-only", "--diff-filter=U"], {
-    cwd: repoRoot,
-    allowFailure: true,
-  });
-  return result.stdout
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
-}
-
-export async function worktreeList(repoRoot: string): Promise<string> {
-  const result = await runCommand("git", ["worktree", "list"], {
-    cwd: repoRoot,
-    allowFailure: true,
-  });
-  return result.stdout.trim();
 }

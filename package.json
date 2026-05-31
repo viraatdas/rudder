@@ -1,6 +1,6 @@
 {
   "name": "@viraatdas/rudder",
-  "version": "1.0.74",
+  "version": "1.1.5",
   "description": "A Claude Code-style terminal app for running coding agents with worktree-isolated runs.",
   "license": "MIT",
   "homepage": "https://rudder.viraat.dev",
@@ -13,18 +13,21 @@
     "rudder": "dist/index.js"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json && npm run build-native && npm run copy-native",
+    "build": "tsc -p tsconfig.json && npm run build-board && npm run build-native && npm run copy-native",
+    "build-board": "esbuild src/board/ui/index.tsx --bundle --minify --format=esm --jsx=automatic --jsx-import-source=preact --outfile=dist/board/board.js && esbuild src/board/ui/board.css --bundle --minify --outfile=dist/board/board.css",
     "build-native": "cargo build --release --manifest-path native/Cargo.toml",
     "check": "tsc -p tsconfig.json --noEmit",
     "test": "tsc -p tsconfig.json && node --test tests/*.test.mjs",
     "test:worker-scroll": "cargo test --manifest-path native/Cargo.toml top_origin_scroll_region_history_scrolls_like_terminal_scrollback && cargo test --manifest-path native/Cargo.toml worker_wheel && cargo test --manifest-path native/Cargo.toml wheel_scroll && cargo test --manifest-path native/Cargo.toml worker_page && cargo test --manifest-path native/Cargo.toml codex_alternate_screen_page_key",
     "copy-native": "node -e \"const fs=require('fs');const path=require('path');const sources=[path.join('target','release','rudder-native'),path.join('native','target','release','rudder-native')];const src=sources.find((candidate)=>fs.existsSync(candidate));const dest=path.join('dist','native','rudder-native');if(src){fs.mkdirSync(path.dirname(dest),{recursive:true});fs.copyFileSync(src,dest);fs.chmodSync(dest,0o755);}else if(fs.existsSync(dest)){fs.unlinkSync(dest);}\"",
     "prepack": "npm run build",
+    "postinstall": "node scripts/postinstall.mjs",
     "start": "node dist/index.js"
   },
   "files": [
     "dist/",
     "assets/",
+    "scripts/postinstall.mjs",
     "README.md",
     "package.json"
   ],
@@ -38,6 +41,8 @@
     "@types/node": "^22.15.3",
     "@types/react": "^19.2.14",
     "@types/ws": "^8.5.13",
+    "esbuild": "^0.24.0",
+    "preact": "^10.25.0",
     "typescript": "^5.8.3"
   },
   "dependencies": {

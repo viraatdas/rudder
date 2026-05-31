@@ -6,9 +6,9 @@ import path from "node:path";
 import test from "node:test";
 
 import {
-  mergeRunIntoCurrentBranch,
+  mergeGitRunIntoCurrentBranch,
   resolveRebaseBaseRef,
-  syncRunWorktree,
+  syncGitRunWorktree,
 } from "../dist/git.js";
 import {
   createRunRecord,
@@ -31,7 +31,7 @@ test("sync persists commit preparation failures before returning", async (t) => 
   run.status = "completed";
   await makeRebaseInProgress(repo);
 
-  const synced = await syncRunWorktree(run, "main");
+  const synced = await syncGitRunWorktree(run, "main");
   const saved = await loadRunRecord(repo, run.id);
 
   assert.equal(synced.status, "failed");
@@ -57,7 +57,7 @@ test("merge persists commit preparation failures before returning", async (t) =>
   run.status = "completed";
   await makeRebaseInProgress(repo);
 
-  const merged = await mergeRunIntoCurrentBranch(run, false, "rebase");
+  const merged = await mergeGitRunIntoCurrentBranch(run, false, "rebase");
   const saved = await loadRunRecord(repo, run.id);
 
   assert.equal(merged.status, "failed");

@@ -1,6 +1,7 @@
 #![allow(unused_imports)]
 //! Git, worktree, run-record persistence, and filesystem helpers.
 use super::*;
+use std::cell::RefCell;
 
 pub(crate) fn current_branch_at(cwd: &Path) -> Option<String> {
     let output = Command::new("git")
@@ -25,6 +26,127 @@ pub(crate) fn native_runs_dir(repo_root: &Path) -> PathBuf {
 
 pub(crate) fn native_run_dir(repo_root: &Path, run_id: &str) -> PathBuf {
     native_runs_dir(repo_root).join(run_id)
+}
+
+pub(crate) fn graph_json_path(repo_root: &Path) -> PathBuf {
+    repo_root.join(".rudder").join("graph.json")
+}
+
+/// A parsed, query-friendly view of `.rudder/graph.json`. The daemon (TS side)
+/// owns writing this file; the TUI only reads it. The index lets us answer "what
+/// are this run's hard/soft parent node ids" without re-walking JSON per agent.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct GraphIndex {
+    /// node id -> (hard parent node ids, soft parent node ids).
+    parents_by_node: HashMap<String, (Vec<String>, Vec<String>)>,
+    /// runId -> node id (so a run with a known runId resolves to its node).
+    node_by_run: HashMap<String, String>,
+}
+
+impl GraphIndex {
+    /// Build the index from a parsed graph.json value. Resolves each node's
+    /// incoming edge ids (`deps`) through `edges` into parent node ids, split by
+    /// edge `type`. Unknown edge ids are skipped.
+    pub(crate) fn from_value(value: &serde_json::Value) -> Self {
+        let mut index = GraphIndex::default();
+        let Some(nodes) = value.get("nodes").and_then(serde_json::Value::as_object) else {
+            return index;
+        };
+        let edges = value.get("edges").and_then(serde_json::Value::as_object);
+
+        // edge id -> from node id (the parent), with type.
+        let resolve_edge = |edge_id: &str| -> Option<(String, bool)> {
+            let edge = edges?.get(edge_id)?;
+            let from = edge.get("from").and_then(serde_json::Value::as_str)?;
+            if from.trim().is_empty() {
+                return None;
+            }
+            let is_hard = edge
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .map(|kind| kind.trim().eq_ignore_ascii_case("hard"))
+                .unwrap_or(false);
+            Some((from.to_string(), is_hard))
+        };
+
+        for (node_id, node) in nodes {
+            let mut hard = Vec::new();
+            let mut soft = Vec::new();
+            if let Some(deps) = node.get("deps").and_then(serde_json::Value::as_array) {
+                for dep in deps {
+                    let Some(edge_id) = dep.as_str() else { continue };
+                    if let Some((parent, is_hard)) = resolve_edge(edge_id) {
+                        if is_hard {
+                            hard.push(parent);
+                        } else {
+                            soft.push(parent);
+                        }
+                    }
+                }
+            }
+            index
+                .parents_by_node
+                .insert(node_id.clone(), (hard, soft));
+
+            if let Some(run_id) = node.get("runId").and_then(serde_json::Value::as_str) {
+                if !run_id.trim().is_empty() {
+                    index.node_by_run.insert(run_id.to_string(), node_id.clone());
+                }
+            }
+        }
+
+        index
+    }
+
+    /// Hard and soft parent node ids for a run, looked up first by its runId then
+    /// by treating the run id itself as a node id. Returns empty vectors when the
+    /// run has no node in the graph (flat behavior).
+    pub(crate) fn deps_for_run(&self, run_id: &str) -> (Vec<String>, Vec<String>) {
+        let node_id = self
+            .node_by_run
+            .get(run_id)
+            .map(String::as_str)
+            .unwrap_or(run_id);
+        self.parents_by_node
+            .get(node_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+thread_local! {
+    /// Per-repo cache of the parsed graph index, refreshed at most once per short
+    /// window so a single `load_persisted_agents` pass reads graph.json once.
+    static GRAPH_INDEX_CACHE: RefCell<Option<(PathBuf, Instant, GraphIndex)>> =
+        const { RefCell::new(None) };
+}
+
+const GRAPH_INDEX_TTL: Duration = Duration::from_millis(500);
+
+/// Load `.rudder/graph.json` for a repo as a [`GraphIndex`], reading from disk at
+/// most once per [`GRAPH_INDEX_TTL`] window per repo. Absent or invalid graph.json
+/// yields an empty index (flat behavior).
+pub(crate) fn cached_graph_index(repo_root: &Path) -> GraphIndex {
+    GRAPH_INDEX_CACHE.with(|cell| {
+        if let Some((cached_root, loaded_at, index)) = cell.borrow().as_ref() {
+            if cached_root == repo_root && loaded_at.elapsed() < GRAPH_INDEX_TTL {
+                return index.clone();
+            }
+        }
+        let index = load_graph_index(repo_root);
+        *cell.borrow_mut() = Some((repo_root.to_path_buf(), Instant::now(), index.clone()));
+        index
+    })
+}
+
+fn load_graph_index(repo_root: &Path) -> GraphIndex {
+    let Ok(raw) = fs::read_to_string(graph_json_path(repo_root)) else {
+        return GraphIndex::default();
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return GraphIndex::default();
+    };
+    GraphIndex::from_value(&value)
 }
 
 pub(crate) fn read_migration_manifest(repo_root: &Path) -> Vec<MigratedAgent> {
@@ -128,6 +250,9 @@ pub(crate) fn create_main_agent(
         worker_input_is_prompt: false,
         last_drain_at: None,
         review_source_ids: Vec::new(),
+        deps: Vec::new(),
+        soft_deps: Vec::new(),
+        node_id: None,
     }
 }
 
@@ -244,6 +369,28 @@ pub(crate) fn agent_from_run_record(repo_root: &Path, record: serde_json::Value)
         })
         .unwrap_or_default();
 
+    // Typed dependencies from the daemon-owned graph.json (read-only here). When
+    // absent or the node is not found, both vectors stay empty (flat behavior).
+    let (mut deps, soft_deps) = cached_graph_index(repo_root).deps_for_run(&id);
+
+    // Plan node identity persisted by the scheduler-launch path. When present it
+    // takes precedence so a restored plan-launched run keeps its gating + the id
+    // that unblocks dependents on merge.
+    let node_id = record
+        .get("nodeId")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned);
+    if deps.is_empty() {
+        if let Some(plan_deps) = record.get("planDeps").and_then(|value| value.as_array()) {
+            deps = plan_deps
+                .iter()
+                .filter_map(|value| value.as_str())
+                .map(ToOwned::to_owned)
+                .collect();
+        }
+    }
+
     Some(AgentRun {
         id,
         created_at,
@@ -279,6 +426,9 @@ pub(crate) fn agent_from_run_record(repo_root: &Path, record: serde_json::Value)
         worker_input_is_prompt: false,
         last_drain_at: None,
         review_source_ids,
+        deps,
+        soft_deps,
+        node_id,
     })
 }
 
@@ -392,6 +542,11 @@ pub(crate) fn save_native_run_record(repo_root: &Path, run: &AgentRun) -> Result
         "lastUserInputAt": run.last_user_input_at,
         "autoSteer": { "count": if run.autosteered { 1 } else { 0 }, "max": 2 },
         "reviewSourceIds": run.review_source_ids,
+        // Plan node identity for scheduler-launched runs. `nodeId` enters the
+        // merged set when this run merges; `planDeps` are the hard-dep node ids
+        // this run was launched against (so a restored run keeps its gating).
+        "nodeId": run.node_id,
+        "planDeps": run.deps,
         "session": run.session_id.as_ref().map(|sid| serde_json::json!({ "nativeSessionId": sid })),
     });
     let temp = record_path.with_extension(format!(

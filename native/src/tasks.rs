@@ -5,9 +5,46 @@ use super::*;
 
 pub(crate) fn execution_prompt(task: &str) -> String {
     let task = strip_rudder_prompt_wrappers(task);
-    format!(
-        "Rudder-specific context injected by Rudder:\n- Read RUDDER.md first if it exists. Rudder generated that file to show active Rudder agents and worktrees in this repo.\n- If a Hunk review is open for this worktree, run `hunk skill path`, load that skill, and use `hunk session review --repo . --json` plus `hunk session comment ...` commands to inspect and annotate the live review.\n\n{task}"
-    )
+    const CONTEXT: &str = "Rudder-specific context injected by Rudder:\n- Read RUDDER.md first if it exists. Rudder generated that file to show active Rudder agents and worktrees in this repo.\n- If a Hunk review is open for this worktree, run `hunk skill path`, load that skill, and use `hunk session review --repo . --json` plus `hunk session comment ...` commands to inspect and annotate the live review.";
+    // Keep the /goal block as the very first line so the backend (Claude or
+    // Codex) picks it up as a slash command: hoist a leading `/goal ...` (and its
+    // `Done when:` line) above the injected Rudder context.
+    if task.trim_start().starts_with("/goal") {
+        let (goal_block, rest) = split_leading_goal_block(&task);
+        return format!("{goal_block}\n\n{CONTEXT}\n\n{rest}");
+    }
+    format!("{CONTEXT}\n\n{task}")
+}
+
+/// Split a /goal-formatted prompt into its leading `/goal ...` + `Done when: ...`
+/// block and the remaining body. Assumes the input leads with `/goal`.
+fn split_leading_goal_block(task: &str) -> (String, String) {
+    let task = task.trim_start();
+    let mut lines = task.lines();
+    let mut block = Vec::new();
+    if let Some(goal_line) = lines.next() {
+        block.push(goal_line);
+    }
+    // The optional Done-when line immediately follows the /goal line.
+    let mut rest_lines: Vec<&str> = Vec::new();
+    let mut consumed_done = false;
+    for line in lines {
+        if !consumed_done {
+            consumed_done = true;
+            if line.trim_start().to_ascii_lowercase().starts_with("done when:") {
+                block.push(line);
+                continue;
+            }
+        }
+        rest_lines.push(line);
+    }
+    let body = rest_lines
+        .iter()
+        .skip_while(|line| line.trim().is_empty())
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n");
+    (block.join("\n"), body)
 }
 
 pub(crate) fn plan_prompt(task: &str) -> String {
@@ -20,15 +57,200 @@ pub(crate) fn plan_prompt(task: &str) -> String {
 pub(crate) fn rudder_plan_prompt(task: &str) -> String {
     let task = strip_rudder_prompt_wrappers(task);
     format!(
-        "You are Rudder's planning coordinator. Inspect the repository in read-only mode and decide whether this user request should be split across multiple independent implementation agents.\n\nUser request:\n{task}\n\nProcess:\n1. Identify missing requirements. If the work is ambiguous enough that implementation would likely go wrong, ask concise follow-up questions and do not emit tasks yet.\n2. Otherwise create the smallest set of independent implementation tasks that can run in separate git worktrees with minimal conflicts.\n3. Each task must be self-contained, include concrete files or modules to inspect when known, and include its own verification instructions.\n4. Do not include a task that depends on another task's unmerged changes. If work is sequential, make one task.\n5. Prefer 1-4 tasks. Use more only when the split is clearly independent.\n6. For each worker task that is bigger than one normal turn and has a clear validation loop, include a `goal` value suitable for Codex `/goal`. The goal must name one durable objective, important constraints, validation commands or artifacts, and a verifiable stopping condition. Omit `goal` or set it to an empty string for small tasks, vague tasks, or loose backlogs.\n\nWhen the task list is ready, print exactly this block and no other JSON block:\nRUDDER_PLAN_TASKS_START\n{{\"tasks\":[{{\"title\":\"short task title\",\"prompt\":\"full implementation prompt for one worker agent\",\"goal\":\"optional durable objective for /goal, without the leading slash command\"}}]}}\nRUDDER_PLAN_TASKS_END\n\nAfter the block, add a short human summary of why this split is safe."
+        "You are Rudder's planning coordinator. Inspect the repository in read-only mode and decide whether this user request should be split across multiple independent implementation agents.\n\nUser request:\n{task}\n\nProcess:\n1. Identify missing requirements. If the work is ambiguous enough that implementation would likely go wrong, ask concise follow-up questions and do not emit tasks yet.\n2. Otherwise create the smallest set of independent implementation tasks that can run in separate git worktrees with minimal conflicts.\n3. Each task must be self-contained, include concrete files or modules to inspect when known, and include its own verification instructions.\n4. Do not include a task that depends on another task's unmerged changes. If work is sequential, make one task.\n5. Prefer 1-4 tasks. Use more only when the split is clearly independent.\n6. Every task MUST carry both a `goal` and a `success`. `goal` is one line naming the single objective the worker should accomplish (suitable for the `/goal` slash command, without the leading slash). `success` is the verifiable DONE-WHEN condition: the commands, artifacts, or criteria that mean the task is complete. Never omit either or leave them empty.\n\nWhen the task list is ready, print exactly this block and no other JSON block:\nRUDDER_PLAN_TASKS_START\n{{\"tasks\":[{{\"title\":\"short task title\",\"prompt\":\"full implementation prompt for one worker agent\",\"goal\":\"one-line objective for /goal, without the leading slash command\",\"success\":\"verifiable done-when condition\"}}]}}\nRUDDER_PLAN_TASKS_END\n\nAfter the block, add a short human summary of why this split is safe."
     )
+}
+
+/// Dependency edge type. `hard` blocks the child from starting until the parent
+/// has merged; `soft` never blocks (the parent's diff is delivered as context once
+/// it lands). `soft` is the safe default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EdgeType {
+    Hard,
+    Soft,
+}
+
+impl EdgeType {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Hard => "hard",
+            Self::Soft => "soft",
+        }
+    }
+}
+
+/// A typed dependency declared by a plan task: this task depends `on` another
+/// task id, with the given `edge` type and an optional justification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlanEdge {
+    pub(crate) on: String,
+    pub(crate) edge: EdgeType,
+    pub(crate) why: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RudderPlanTask {
+    /// Stable node id. Synthesized as `n{i}` when the plan omits it so older flat
+    /// plans (no id, no deps) keep working as 0-dep roots.
+    pub(crate) id: String,
+    pub(crate) title: String,
+    pub(crate) prompt: String,
+    /// One-line OBJECTIVE for the `/goal` launch line. Optional in the parse for
+    /// backward compatibility; the worker prompt derives a default when absent.
+    pub(crate) goal: Option<String>,
+    /// Verifiable SUCCESS / DONE-WHEN condition for the launch prompt. Optional
+    /// in the parse for backward compatibility; defaulted in the worker prompt.
+    pub(crate) success: Option<String>,
+    /// Typed dependencies. Empty for a 0-dep root.
+    pub(crate) deps: Vec<PlanEdge>,
+    pub(crate) backend: Option<String>,
+    pub(crate) model: Option<String>,
+    pub(crate) effort: Option<String>,
+}
+
+impl RudderPlanTask {
+    /// Ids this task hard-depends on (cannot start until these are merged).
+    pub(crate) fn hard_deps(&self) -> impl Iterator<Item = &str> {
+        self.deps
+            .iter()
+            .filter(|edge| edge.edge == EdgeType::Hard)
+            .map(|edge| edge.on.as_str())
+    }
+}
+
+/// Ready-work detection (beads-style): a task is ready when every one of its
+/// hard-dep ids appears in `merged_ids`. Soft deps never block readiness.
+pub(crate) fn ready_nodes<'a>(
+    tasks: &'a [RudderPlanTask],
+    merged_ids: &[String],
+) -> Vec<&'a RudderPlanTask> {
+    tasks
+        .iter()
+        .filter(|task| {
+            task.hard_deps()
+                .all(|dep| merged_ids.iter().any(|id| id == dep))
+        })
+        .collect()
+}
+
+/// A queued unit of plannable work that has not launched yet. The scheduler
+/// drains these into live `AgentRun`s as their hard deps merge and parallelism
+/// slots free. Created one-per-task when a planner agent completes; rendered in
+/// the Todo section until launched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlannedNode {
+    /// Stable node id (the plan task id). Becomes the launched `AgentRun.node_id`.
+    pub(crate) id: String,
     pub(crate) title: String,
     pub(crate) prompt: String,
     pub(crate) goal: Option<String>,
+    /// Verifiable DONE-WHEN condition carried through to the worker launch prompt.
+    pub(crate) success: Option<String>,
+    /// Hard-dependency parent node ids: launch is gated until ALL are merged.
+    pub(crate) deps: Vec<String>,
+    /// Soft-dependency parent node ids: never gate launch (kept for nesting).
+    pub(crate) soft_deps: Vec<String>,
+    pub(crate) backend: Option<String>,
+    pub(crate) model: Option<String>,
+    pub(crate) effort: Option<String>,
+}
+
+impl PlannedNode {
+    /// Build a queued node from a parsed plan task: hard-dep ids gate the launch;
+    /// soft-dep ids are retained only for nesting.
+    pub(crate) fn from_task(task: &RudderPlanTask) -> Self {
+        let deps: Vec<String> = task.hard_deps().map(ToString::to_string).collect();
+        let soft_deps: Vec<String> = task
+            .deps
+            .iter()
+            .filter(|edge| edge.edge == EdgeType::Soft)
+            .map(|edge| edge.on.clone())
+            .collect();
+        Self {
+            id: task.id.clone(),
+            title: task.title.clone(),
+            prompt: task.prompt.clone(),
+            goal: task.goal.clone(),
+            success: task.success.clone(),
+            deps,
+            soft_deps,
+            backend: task.backend.clone(),
+            model: task.model.clone(),
+            effort: task.effort.clone(),
+        }
+    }
+
+    /// A planned node is launchable when every hard dep is satisfied: either the
+    /// dep id is in `merged_ids`, or it is not present in `plan_ids` (the set of
+    /// node ids known to this plan: still-queued nodes plus already-launched ones).
+    /// A dep outside `plan_ids` was never part of the plan and is treated as
+    /// satisfied so the DAG never deadlocks on a dangling reference.
+    pub(crate) fn is_ready(&self, merged_ids: &[String], plan_ids: &[String]) -> bool {
+        self.deps.iter().all(|dep| {
+            merged_ids.iter().any(|id| id == dep) || !plan_ids.iter().any(|id| id == dep)
+        })
+    }
+}
+
+/// Build the worker launch prompt for a planned node. Mirrors
+/// `rudder_plan_worker_prompt` but sources fields off the queued node rather than
+/// a freshly parsed `RudderPlanTask`.
+pub(crate) fn planned_node_worker_prompt(planner_task: &str, node: &PlannedNode) -> String {
+    let task = RudderPlanTask {
+        id: node.id.clone(),
+        title: node.title.clone(),
+        prompt: node.prompt.clone(),
+        goal: node.goal.clone(),
+        success: node.success.clone(),
+        deps: Vec::new(),
+        backend: node.backend.clone(),
+        model: node.model.clone(),
+        effort: node.effort.clone(),
+    };
+    // Backend is unused by the prompt builder; pass a placeholder.
+    rudder_plan_worker_prompt(planner_task, &task, Backend::Claude)
+}
+
+/// Kahn topological sort over the hard edges only. Returns `Err` when a cycle is
+/// present so the TUI can surface it instead of deadlocking. Unknown ids are
+/// assumed already dropped by the caller.
+fn assert_no_hard_cycle(tasks: &[RudderPlanTask]) -> Result<()> {
+    use std::collections::{HashMap, VecDeque};
+
+    let ids: Vec<&str> = tasks.iter().map(|task| task.id.as_str()).collect();
+    let mut indegree: HashMap<&str, usize> = ids.iter().map(|id| (*id, 0usize)).collect();
+    // child -> list of parents it hard-depends on; edge parent -> child.
+    let mut children: HashMap<&str, Vec<&str>> = HashMap::new();
+    for task in tasks {
+        for parent in task.hard_deps() {
+            children.entry(parent).or_default().push(task.id.as_str());
+            *indegree.entry(task.id.as_str()).or_insert(0) += 1;
+        }
+    }
+
+    let mut queue: VecDeque<&str> = indegree
+        .iter()
+        .filter(|(_, deg)| **deg == 0)
+        .map(|(id, _)| *id)
+        .collect();
+    let mut visited = 0usize;
+    while let Some(node) = queue.pop_front() {
+        visited += 1;
+        if let Some(kids) = children.get(node) {
+            for kid in kids {
+                let entry = indegree.entry(kid).or_insert(0);
+                *entry = entry.saturating_sub(1);
+                if *entry == 0 {
+                    queue.push_back(kid);
+                }
+            }
+        }
+    }
+
+    if visited != tasks.len() {
+        bail!("rudder-plan tasks form a hard-dependency cycle");
+    }
+    Ok(())
 }
 
 pub(crate) fn rudder_plan_output_for_run(run: &AgentRun) -> String {
@@ -75,8 +297,20 @@ pub(crate) fn extract_rudder_plan_tasks(output: &str) -> Result<Vec<RudderPlanTa
         .and_then(serde_json::Value::as_array)
         .context("task block must contain a tasks array")?;
 
+    // Cap first, then synthesize ids by position so `deps` referencing dropped
+    // (beyond-cap) tasks are treated as unknown and dropped below.
+    let capped: Vec<&serde_json::Value> = tasks.iter().take(6).collect();
+
+    // Known ids across the capped block. An explicit id wins; otherwise the
+    // positional fallback `n{i}` is used (matching the synthesized id below).
+    let known_ids: std::collections::HashSet<String> = capped
+        .iter()
+        .enumerate()
+        .map(|(index, task)| plan_task_id(task, index))
+        .collect();
+
     let mut out = Vec::new();
-    for task in tasks.iter().take(6) {
+    for (index, task) in capped.iter().enumerate() {
         let title = task
             .get("title")
             .and_then(serde_json::Value::as_str)
@@ -90,52 +324,177 @@ pub(crate) fn extract_rudder_plan_tasks(output: &str) -> Result<Vec<RudderPlanTa
         if prompt.is_empty() {
             continue;
         }
+
+        let id = plan_task_id(task, index);
+        let deps = parse_plan_deps(task, &id, &known_ids);
+
         out.push(RudderPlanTask {
+            id,
             title: if title.is_empty() {
                 "worker task".to_string()
             } else {
                 title.to_string()
             },
             prompt: prompt.to_string(),
-            goal: task
-                .get("goal")
-                .and_then(serde_json::Value::as_str)
-                .map(str::trim)
-                .filter(|goal| !goal.is_empty())
-                .map(ToString::to_string),
+            goal: plan_optional_str(task, "goal"),
+            success: plan_optional_str(task, "success"),
+            deps,
+            backend: plan_optional_str(task, "backend"),
+            model: plan_optional_str(task, "model"),
+            effort: plan_optional_str(task, "effort"),
         });
     }
+
+    assert_no_hard_cycle(&out)?;
 
     Ok(out)
 }
 
+/// Read a non-empty trimmed string field, or `None`.
+fn plan_optional_str(task: &serde_json::Value, key: &str) -> Option<String> {
+    task.get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+/// The node id for a task: explicit `id` if non-empty, else synthesized `n{index}`.
+fn plan_task_id(task: &serde_json::Value, index: usize) -> String {
+    plan_optional_str(task, "id").unwrap_or_else(|| format!("n{index}"))
+}
+
+/// Parse `deps` into typed edges. Drops edges whose `on` is not a known id (and
+/// self-edges). Downgrades a `hard` edge with empty/missing `why` to `soft` so
+/// every hard dependency is justified.
+fn parse_plan_deps(
+    task: &serde_json::Value,
+    self_id: &str,
+    known_ids: &std::collections::HashSet<String>,
+) -> Vec<PlanEdge> {
+    let Some(deps) = task.get("deps").and_then(serde_json::Value::as_array) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for dep in deps {
+        let on = dep
+            .get("on")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let Some(on) = on else { continue };
+        // Drop edges to unknown ids and self-edges.
+        if on == self_id || !known_ids.contains(on) {
+            continue;
+        }
+        let why = dep
+            .get("why")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string);
+        let declared_hard = dep
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .map(|value| value.trim().eq_ignore_ascii_case("hard"))
+            .unwrap_or(false);
+        // hard requires a justification; downgrade to soft otherwise. soft is default.
+        let edge = if declared_hard && why.is_some() {
+            EdgeType::Hard
+        } else {
+            EdgeType::Soft
+        };
+        out.push(PlanEdge {
+            on: on.to_string(),
+            edge,
+            why,
+        });
+    }
+    out
+}
+
+/// The canonical default DONE-WHEN condition when the planner did not supply a
+/// `success`. Mirrors the TS `DEFAULT_SUCCESS` constant in src/goal.ts.
+pub(crate) const DEFAULT_GOAL_SUCCESS: &str =
+    "the task is implemented and its own verification passes";
+
+/// Collapse a value to a single line so the leading `/goal` slash command stays
+/// intact, trimmed for prompt budget.
+fn one_line(value: &str) -> String {
+    let joined = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed = joined.trim();
+    truncate_chars(trimmed, 200)
+}
+
+/// The OBJECTIVE for a task's `/goal` line: the planner-supplied `goal`, else a
+/// default derived from the title (or the first line of the prompt).
+fn goal_objective(task: &RudderPlanTask) -> String {
+    if let Some(goal) = task.goal.as_deref().map(str::trim).filter(|g| !g.is_empty()) {
+        return one_line(goal);
+    }
+    let title = task.title.trim();
+    if !title.is_empty() {
+        return one_line(title);
+    }
+    let first_line = task
+        .prompt
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("complete the task");
+    one_line(first_line)
+}
+
+/// The verifiable DONE-WHEN condition for a task: the planner-supplied
+/// `success`, else the canonical default stopping condition.
+fn goal_success(task: &RudderPlanTask) -> String {
+    task.success
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(one_line)
+        .unwrap_or_else(|| DEFAULT_GOAL_SUCCESS.to_string())
+}
+
+/// Build a worker launch prompt in the canonical /goal format. EVERY spawned
+/// agent (Claude or Codex) leads with `/goal <objective>` then a `Done when:`
+/// line so the backend picks up the slash command and the worker always knows
+/// what done means. The full task body follows. Both backends support /goal, so
+/// the block is emitted unconditionally (not gated on the goals feature flag).
 pub(crate) fn rudder_plan_worker_prompt(
     planner_task: &str,
     task: &RudderPlanTask,
-    backend: Backend,
+    _backend: Backend,
 ) -> String {
-    let mut prompt = format!(
+    let body = format!(
         "This task was spawned by Rudder from a /rudder-plan coordinator.\n\nOriginal request:\n{planner_task}\n\nWorker task: {}\n\n{}",
         task.title, task.prompt
     );
-    if let Some(goal) = task.goal.as_deref() {
-        match backend {
-            Backend::Codex => {
-                prompt.push_str(
-                    "\n\nDurable Codex goal:\nIf goals are available, start by setting this goal before implementation:\n",
-                );
-                prompt.push_str("/goal ");
-                prompt.push_str(goal);
-            }
-            Backend::Claude => {
-                prompt.push_str(
-                    "\n\nDurable objective:\nUse this as the stopping condition for the worker task:\n",
-                );
-                prompt.push_str(goal);
-            }
-        }
+    format!(
+        "/goal {}\nDone when: {}\n\n{}",
+        goal_objective(task),
+        goal_success(task),
+        body
+    )
+}
+
+/// Wrap a manual single-task spawn (no planner) in the canonical /goal format.
+/// The objective is the task statement's first line; the success condition is
+/// the canonical default stopping condition. Idempotent: a prompt that already
+/// leads with `/goal` (e.g. a /rudder-plan worker prompt) is returned unchanged.
+pub(crate) fn manual_goal_prompt(task: &str) -> String {
+    let trimmed = task.trim_start();
+    if trimmed.starts_with("/goal") {
+        return task.to_string();
     }
-    prompt
+    let objective = task
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(one_line)
+        .filter(|line| !line.is_empty())
+        .unwrap_or_else(|| "complete the task".to_string());
+    format!("/goal {objective}\nDone when: {DEFAULT_GOAL_SUCCESS}\n\n{task}")
 }
 
 pub(crate) fn rudder_plan_worker_title_from_prompt(task: &str) -> Option<String> {

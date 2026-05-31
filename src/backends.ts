@@ -264,10 +264,16 @@ async function spawnAndStream(params: {
   let outRest = "";
   let errRest = "";
   const streamState = { sawStreamingText: false };
+  // Best-effort token accounting: accumulate the largest usage the backend
+  // reports on its own stream (claude usage / codex token_count). Backends
+  // report cumulative totals, so we keep the max seen and write it onto the
+  // run record so the scheduler's budget cap operates on real numbers.
+  const usageState = { input: 0, output: 0 };
   let emitQueue = Promise.resolve();
   const enqueueBackendLine = (line: string, stderr: boolean) => {
     emitQueue = emitQueue
       .then(async () => {
+        accumulateUsage(usageState, line);
         await emitBackendLine(params.request.run, line, params.emit, stderr, streamState);
       })
       .catch(async (error: unknown) => {
@@ -319,12 +325,22 @@ async function spawnAndStream(params: {
       }
       void (async () => {
         await emitQueue;
+        // Persist the best-effort token usage captured from the stream so the
+        // scheduler can sum it against the budget cap. Only write when we saw a
+        // real number; backends that emit no usage leave run.tokens untouched.
+        if (usageState.input + usageState.output > 0) {
+          const previous = params.request.run.tokens;
+          if (!previous || usageState.input + usageState.output >= previous.input + previous.output) {
+            params.request.run.tokens = { input: usageState.input, output: usageState.output };
+            await saveRunRecord(params.request.run);
+          }
+        }
         await params.emit({
           ts: nowIso(),
           runId: params.request.run.id,
           type: "backend.exit",
           message: `${params.command} exited with ${code ?? signal ?? "unknown"}`,
-          data: { code: code ?? null, signal: signal ?? null },
+          data: { code: code ?? null, signal: signal ?? null, tokens: { ...usageState } },
         });
         resolve(code ?? (signal ? 130 : 1));
       })();
@@ -370,6 +386,83 @@ async function emitBackendLine(
 
 function sessionIdFromBackendData(data: unknown): string | undefined {
   return isRecord(data) && typeof data.session_id === "string" ? data.session_id : undefined;
+}
+
+/**
+ * Best-effort token accounting. Parses a single backend stream line and raises
+ * the running usage totals to the largest cumulative numbers seen. Recognizes:
+ *  - claude (--output-format stream-json): `result` events carry a cumulative
+ *    `usage`; `assistant` events carry per-message `message.usage`. We take the
+ *    cumulative `result` usage when present and otherwise accumulate assistant
+ *    deltas, keeping whichever total is larger.
+ *  - codex (exec --json): `token_count` event with
+ *    `payload.info.total_token_usage` (cumulative). We take the max.
+ * Anything else is a no-op. Mirrors native/src/usage.rs field names.
+ */
+function accumulateUsage(state: { input: number; output: number }, line: string): void {
+  const parsed = parseJsonLine(line.trimEnd());
+  if (!isRecord(parsed)) {
+    return;
+  }
+
+  // Claude: final `result` event with a cumulative usage block.
+  if (parsed.type === "result") {
+    const usage = readClaudeUsage(parsed.usage);
+    if (usage) {
+      raiseUsage(state, usage.input, usage.output);
+    }
+    return;
+  }
+  // Claude: per-message assistant usage. Sum across messages; compare to state.
+  if (parsed.type === "assistant" && isRecord(parsed.message)) {
+    const usage = readClaudeUsage(parsed.message.usage);
+    if (usage) {
+      // assistant usage is per-turn; add it to the running totals.
+      state.input += usage.input;
+      state.output += usage.output;
+    }
+    return;
+  }
+  // Codex: token_count event carrying a cumulative total_token_usage.
+  const payload = isRecord(parsed.payload) ? parsed.payload : undefined;
+  if (payload && payload.type === "token_count" && isRecord(payload.info)) {
+    const total = isRecord(payload.info.total_token_usage) ? payload.info.total_token_usage : undefined;
+    if (total) {
+      const inp = numberField(total.input_tokens);
+      const cached = numberField(total.cached_input_tokens);
+      const out = numberField(total.output_tokens);
+      const reasoning = numberField(total.reasoning_output_tokens);
+      // Mirror usage.rs: codex cached_input_tokens are a subset already in
+      // input_tokens; reasoning tokens are billed as output.
+      raiseUsage(state, Math.max(0, inp - cached), out + reasoning);
+    }
+  }
+}
+
+function readClaudeUsage(value: unknown): { input: number; output: number } | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  const input =
+    numberField(value.input_tokens) +
+    numberField(value.cache_creation_input_tokens) +
+    numberField(value.cache_read_input_tokens);
+  const output = numberField(value.output_tokens);
+  if (input + output === 0) {
+    return undefined;
+  }
+  return { input, output };
+}
+
+function raiseUsage(state: { input: number; output: number }, input: number, output: number): void {
+  if (input + output > state.input + state.output) {
+    state.input = input;
+    state.output = output;
+  }
+}
+
+function numberField(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
 
 function textFromBackendData(data: unknown, sawStreamingText: boolean): string {

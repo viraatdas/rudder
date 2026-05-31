@@ -155,6 +155,7 @@ const TOOL_INSTALL_HINTS: Record<string, string> = {
   claude: "Install with `npm install -g @anthropic-ai/claude-code` (see https://github.com/anthropics/claude-code).",
   codex: "Install with `npm install -g @openai/codex` (see https://github.com/openai/codex).",
   acpx: "Install with `npm install -g acpx@latest` or run `rudder onboard`.",
+  jj: "Install jj: brew install jj (or cargo install jj-cli) - https://jj-vcs.github.io",
 };
 
 export class MissingToolError extends Error {

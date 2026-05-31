@@ -5,8 +5,12 @@ import { fileURLToPath } from "node:url";
 import { authStoreExists, runDoctor, runOnboard } from "./auth.js";
 import { codexEnvVars, codexLaunchEnv } from "./codex-binary.js";
 import { runCloudCommand } from "./cloud.js";
-import { findRepoRoot } from "./git.js";
-import { backfillLlmTaskSummaries, projectStateDir, runsDir } from "./state.js";
+import { currentBranch, findRepoRoot } from "./git.js";
+import { ensureBoardRunning } from "./daemon.js";
+import { currentOpId, ensureColocated, ensureJj, undoLast, undoToOp } from "./jj.js";
+import { graphPath } from "./graph.js";
+import { buildFanoutDag, gateDecision, planTask, scaffoldPlan } from "./planner.js";
+import { backfillLlmTaskSummaries, popUndoEntry, projectStateDir, registerProject, runsDir } from "./state.js";
 import { discoverModelOptions } from "./models.js";
 import { resolveNativeBinaryPath } from "./native-binary.js";
 import {
@@ -23,6 +27,7 @@ import {
   workerRun,
 } from "./run-manager.js";
 import { runInteractiveShell } from "./repl.js";
+import { appendDecision } from "./surfaces.js";
 import { runTmuxAgentPane, runTmuxTaskPane, runTmuxWorkerIdle } from "./tmux-dashboard.js";
 import { runInteractiveTui } from "./tui.js";
 import type { BackendId } from "./types.js";
@@ -57,6 +62,9 @@ type Parsed = {
     tmuxSession?: string;
     homePaths?: string[];
     sshHost?: string;
+    port?: number;
+    open?: boolean;
+    n?: number;
   };
 };
 
@@ -325,6 +333,41 @@ export async function main(): Promise<void> {
     case "cleanup":
       await cleanupRuns(Boolean(parsed.flags.force));
       return;
+    case "board":
+    case "serve": {
+      await runBoard(parsed);
+      return;
+    }
+    case "undo": {
+      await runUndo(parsed.args[0]);
+      return;
+    }
+    case "remember": {
+      const insight = parsed.args.join(" ").trim();
+      if (!insight) {
+        throw new Error('Missing insight. Usage: rudder remember "the parser owns token budget"');
+      }
+      await runRemember(insight);
+      return;
+    }
+    case "plan": {
+      await maybeOnboard();
+      const task = parsed.args.join(" ").trim();
+      if (!task) {
+        throw new Error('Missing task. Usage: rudder plan "split the parser work"');
+      }
+      await runPlan(task);
+      return;
+    }
+    case "fanout": {
+      await maybeOnboard();
+      const task = parsed.args.join(" ").trim();
+      if (!task) {
+        throw new Error('Missing task. Usage: rudder fanout "implement the cache" [--n 3]');
+      }
+      await runFanout(task, parsed.flags.n, parsed.flags.backend);
+      return;
+    }
     default: {
       await maybeOnboard();
       await startRun({
@@ -407,6 +450,30 @@ function parseArgs(argv: string[]): Parsed {
     }
     if (arg === "--headless") {
       parsed.flags.headless = true;
+      continue;
+    }
+    if (arg === "--open") {
+      parsed.flags.open = true;
+      continue;
+    }
+    if (arg === "--no-open") {
+      parsed.flags.open = false;
+      continue;
+    }
+    if (takesValue(arg, "--port", "-p")) {
+      parsed.flags.port = Number.parseInt(readValue(argv, ++i, arg), 10);
+      continue;
+    }
+    if (arg.startsWith("--port=")) {
+      parsed.flags.port = Number.parseInt(arg.slice("--port=".length), 10);
+      continue;
+    }
+    if (takesValue(arg, "--n")) {
+      parsed.flags.n = Number.parseInt(readValue(argv, ++i, arg), 10);
+      continue;
+    }
+    if (arg.startsWith("--n=")) {
+      parsed.flags.n = Number.parseInt(arg.slice("--n=".length), 10);
       continue;
     }
     if (takesValue(arg, "--model", "-m")) {
@@ -709,6 +776,105 @@ async function packageVersion(): Promise<string> {
   }
 }
 
+async function runBoard(parsed: Parsed): Promise<void> {
+  const repoRoot = findRepoRoot();
+  await registerProject(repoRoot).catch(() => undefined);
+  // `rudder board` defaults to opening the browser; `--no-open` suppresses it.
+  // `rudder serve` defaults to not opening unless `--open` is passed.
+  const open = parsed.flags.open ?? parsed.command === "board";
+  const result = await ensureBoardRunning(repoRoot, { port: parsed.flags.port, open });
+  if (!result.started) {
+    console.log(`rudder board already running on ${result.url}`);
+    return;
+  }
+  // Keep the process alive while the in-process daemon serves the board.
+  await new Promise<void>(() => {});
+}
+
+async function runUndo(opId?: string): Promise<void> {
+  const repoRoot = findRepoRoot();
+  ensureJj();
+  await ensureColocated(repoRoot);
+
+  if (opId) {
+    await undoToOp(repoRoot, opId);
+    console.log(`Restored jj to operation ${opId}.`);
+    console.log("Note: jj op restore is global - it rewinds all workspaces and refs to that point.");
+    return;
+  }
+
+  const entry = await popUndoEntry(repoRoot);
+  if (entry) {
+    if (entry.runIds.length) {
+      console.log(`This undo reverts runs: ${entry.runIds.join(", ")}`);
+    }
+    await undoToOp(repoRoot, entry.opId);
+    console.log(`Restored jj to operation ${entry.opId} (${entry.label}).`);
+    console.log("Note: jj op restore is global - it rewinds all workspaces and refs to that point.");
+    return;
+  }
+
+  const before = await currentOpId(repoRoot);
+  await undoLast(repoRoot);
+  console.log(`Undid the last jj operation${before ? ` (was at ${before})` : ""}.`);
+  console.log("Note: jj undo is global - it rewinds all workspaces and refs.");
+}
+
+async function runRemember(insight: string): Promise<void> {
+  // The bd-remember equivalent: append a durable insight to DECISIONS.md, the
+  // tracked agent-authored knowledge surface the board's Memory view renders.
+  const repoRoot = findRepoRoot();
+  await appendDecision(repoRoot, insight, "cli");
+  console.log("Remembered. Appended to DECISIONS.md (shared, jj-tracked).");
+}
+
+async function runPlan(task: string): Promise<void> {
+  const repoRoot = findRepoRoot();
+  ensureJj();
+  await ensureColocated(repoRoot);
+  const branch = await currentBranch(repoRoot).catch(() => "");
+
+  const dag = await planTask(task, { root: repoRoot, branch });
+  const gate = gateDecision(dag);
+
+  if (gate.autoRun) {
+    console.log(`auto: ${gate.reason}`);
+  } else {
+    console.log(`gate: ${gate.reason}`);
+    console.log(`Plan: ${dag.nodes.length} node(s), ${dag.edges.length} edge(s)`);
+    for (const node of dag.nodes) {
+      const deps = node.deps.length
+        ? ` deps=[${node.deps.map((dep) => `${dep.on}:${dep.type}`).join(", ")}]`
+        : "";
+      console.log(`  - ${node.id} ${node.title}${deps}`);
+    }
+  }
+
+  await scaffoldPlan(repoRoot, dag);
+  console.log(`graph: ${graphPath(repoRoot)}`);
+}
+
+async function runFanout(task: string, n: number | undefined, backend?: BackendId): Promise<void> {
+  const repoRoot = findRepoRoot();
+  ensureJj();
+  await ensureColocated(repoRoot);
+
+  const requested = typeof n === "number" && Number.isFinite(n) ? n : 3;
+  const dag = buildFanoutDag(task, requested, backend ? { backend } : {});
+  const variants = dag.nodes.filter((node) => node.id !== "judge");
+
+  console.log(`fanout: ${variants.length} variant(s) + 1 judge`);
+  for (const node of dag.nodes) {
+    const judgeOf = node.deps.filter((dep) => dep.type === "judge").map((dep) => dep.on);
+    const suffix = judgeOf.length ? ` judges=[${judgeOf.join(", ")}]` : "";
+    console.log(`  - ${node.id} ${node.title}${suffix}`);
+  }
+
+  await scaffoldPlan(repoRoot, dag);
+  console.log(`graph: ${graphPath(repoRoot)}`);
+  console.log("The judge launches once every variant reaches review; variants are not merged.");
+}
+
 function printHelp(): void {
   console.log(`rudder
 
@@ -738,10 +904,22 @@ Run management:
   rudder status [--json]          Show active runs for this repo
   rudder runs [--json]            List runs for this repo
   rudder stop <run>               Cancel a run
-  rudder delete <run>             Delete a run and its worktree
-  rudder merge <run>              Merge a worktree run into current branch
-  rudder sync [run]               Rebase a worktree onto its base branch without merging
-  rudder cleanup [--force]        Remove merged worktrees
+  rudder delete <run>             Delete a run and its workspace
+  rudder merge <run>              Merge a run into the current change
+  rudder sync [run]               Rebase a run's jj change onto its base without merging
+  rudder cleanup [--force]        Remove merged run workspaces
+  rudder undo [opId]              Rewind jj to an op id, or the last undo-stack entry (global)
+
+Planner:
+  rudder plan "task"             Decompose a task into a DAG, scaffold empty jj changes, write graph.json
+  rudder fanout "task" [--n N]   Fan out N variant agents on one task, then a judge picks/merges the best (default N=3)
+
+Memory:
+  rudder remember "<insight>"    Append a durable cross-cutting decision to DECISIONS.md (shared, jj-tracked)
+
+Board:
+  rudder board [--port N] [--open|--no-open]   Serve the localhost board (opens browser by default)
+  rudder serve [--port N] [--open]             Ensure the board server is up
 
 Setup:
   rudder onboard
@@ -771,6 +949,9 @@ Options:
   -m, --model <model>             Backend model
   -b, --backend <backend>         claude or codex
   -C, --cwd <dir>                 Run from another directory
+  -p, --port <port>               Board server port (default 4774)
+      --n <count>                 Number of fan-out variants for rudder fanout (default 3)
+      --open / --no-open          Open (or do not open) the browser for the board
       --no-tmux                   Use the legacy TUI for bare rudder
       --no-native                 Use the tmux dashboard instead of native
       --headless                  Alias for --no-tmux on bare rudder

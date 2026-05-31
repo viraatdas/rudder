@@ -258,11 +258,6 @@ pub(crate) fn command_suggestions() -> Vec<Suggestion> {
             action: SuggestionAction::Insert("/plan ".to_string()),
         },
         Suggestion {
-            label: "/rudder-plan <task>".to_string(),
-            detail: "decompose a task and spawn worker agents".to_string(),
-            action: SuggestionAction::Insert("/rudder-plan ".to_string()),
-        },
-        Suggestion {
             label: "/model".to_string(),
             detail: "pick Claude or Codex model".to_string(),
             action: SuggestionAction::Insert("/model ".to_string()),
