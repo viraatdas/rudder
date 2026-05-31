@@ -16,7 +16,8 @@ import {
   undoLast,
   undoToOp,
 } from "./jj.js";
-import { graphPath } from "./graph.js";
+import { graphPath, mirrorPlanIntoGraph, updateGraph } from "./graph.js";
+import type { MirrorPayload } from "./graph.js";
 import { buildFanoutDag, gateDecision, planTask, scaffoldPlan } from "./planner.js";
 import { backfillLlmTaskSummaries, popUndoEntry, projectStateDir, registerProject, runsDir } from "./state.js";
 import { discoverModelOptions } from "./models.js";
@@ -218,6 +219,10 @@ export async function main(): Promise<void> {
     }
     case "__launch-node": {
       await runLaunchNode(parsed);
+      return;
+    }
+    case "__graph-mirror": {
+      await runGraphMirror(parsed);
       return;
     }
     case "onboard":
@@ -707,14 +712,22 @@ async function runNativeDashboard(): Promise<boolean> {
   }
   // Start the board daemon in-process so the web board is live and reflects this
   // TUI session (this also registers the project so /api/projects is populated).
-  // ensureBoardRunning sets up the server + scheduler and returns promptly; the
-  // listeners keep running on the Node event loop while the native TUI is in the
-  // foreground. Strictly non-fatal: if it throws, log a notice and keep launching
-  // the TUI - the daemon must never block or break the session.
+  // PROJECTOR-ONLY: the TUI is the sole scheduler. It schedules from its own
+  // in-memory planned_nodes and MIRRORS its plan + node statuses into graph.json.
+  // The daemon here must NOT run the launching scheduler, or both would launch
+  // the same graph.json node (double-launch). So we pass scheduler:false: the
+  // board still serves HTTP + SSE + fs.watch and reflects the mirrored graph,
+  // but never launches. (Limitation: in projector-only mode a board-composer POST
+  // only writes a planned node to graph.json; the TUI will not auto-pick it up
+  // for scheduling. That is acceptable for now.)
+  // ensureBoardRunning returns promptly; the listeners keep running on the Node
+  // event loop while the native TUI is in the foreground. Strictly non-fatal: if
+  // it throws, log a notice and keep launching the TUI - the daemon must never
+  // block or break the session.
   try {
     const repoRoot = findRepoRoot();
     if (repoRoot) {
-      await ensureBoardRunning(repoRoot, { open: false });
+      await ensureBoardRunning(repoRoot, { open: false, scheduler: false });
     }
   } catch (err) {
     if (isTty()) {
@@ -879,6 +892,39 @@ async function runLaunchNode(parsed: Parsed): Promise<void> {
       jjChangeId,
     })}\n`,
   );
+}
+
+async function readStdin(): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of process.stdin) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+/**
+ * `rudder __graph-mirror --repo <root>`: read a JSON plan payload from stdin and
+ * MIRROR it into graph.json. The TUI is the sole scheduler; graph.json is a
+ * write-only projection the board reads (it is NEVER read back for scheduling).
+ * The schema lives in graph.ts: this shim just reads stdin and hands the payload
+ * to mirrorPlanIntoGraph under the graph lock. Prints `ok`/exit 0; the native
+ * caller treats it as best-effort and never blocks on it.
+ */
+async function runGraphMirror(parsed: Parsed): Promise<void> {
+  const repoRoot = parsed.flags.repo ?? findRepoRoot();
+  if (!repoRoot) {
+    throw new Error("__graph-mirror requires --repo");
+  }
+
+  const raw = await readStdin();
+  let payload: MirrorPayload = {};
+  if (raw.trim()) {
+    payload = JSON.parse(raw) as MirrorPayload;
+  }
+
+  await updateGraph(repoRoot, (graph) => mirrorPlanIntoGraph(graph, payload));
+
+  process.stdout.write("ok\n");
 }
 
 async function runUndo(opId?: string): Promise<void> {

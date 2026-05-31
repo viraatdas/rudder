@@ -7,6 +7,8 @@ import {
   hardParents,
   isReady,
   judgeParents,
+  mirrorNodeStatus,
+  mirrorPlanIntoGraph,
   readyNodes,
   softParents,
 } from "../dist/graph.js";
@@ -422,4 +424,125 @@ test("buildFanoutDag clamps N to [2,6] and applies the backend option", () => {
   assert.ok(tooFew.nodes.every((n) => n.backend === "codex"));
   const tooMany = buildFanoutDag("x", 99);
   assert.equal(tooMany.nodes.filter((n) => n.id !== "judge").length, 6);
+});
+
+// ---------------------------------------------------------------------------
+// mirrorPlanIntoGraph: the write-only projection of the TUI's in-memory plan.
+// Maps TUI statuses, rebuilds edges from deps, and PRUNES nodes/edges absent
+// from the payload so graph.json exactly reflects the live plan.
+// ---------------------------------------------------------------------------
+
+function emptyGraph() {
+  return { version: 1, repoRoot: "/tmp/repo", nodes: {}, edges: {}, updatedAt: "t" };
+}
+
+test("mirrorNodeStatus maps the TUI vocabulary and defaults unknown to planned", () => {
+  assert.equal(mirrorNodeStatus("running"), "running");
+  assert.equal(mirrorNodeStatus("review"), "review");
+  assert.equal(mirrorNodeStatus("merged"), "merged");
+  assert.equal(mirrorNodeStatus("failed"), "failed");
+  assert.equal(mirrorNodeStatus("blocked"), "blocked");
+  assert.equal(mirrorNodeStatus("ready"), "ready");
+  assert.equal(mirrorNodeStatus("planned"), "planned");
+  assert.equal(mirrorNodeStatus("done"), "planned");
+  assert.equal(mirrorNodeStatus(undefined), "planned");
+});
+
+test("mirrorPlanIntoGraph upserts nodes with mapped status and metadata", () => {
+  const g = mirrorPlanIntoGraph(emptyGraph(), {
+    nodes: [
+      { id: "n0", title: "build api", status: "merged", backend: "codex", model: "o3", effort: "high" },
+      { id: "n1", title: "build ui", status: "running", runId: "run-1", jjChangeId: "z123", worktreePath: "/w/n1" },
+    ],
+  });
+  assert.deepEqual(Object.keys(g.nodes).sort(), ["n0", "n1"]);
+  assert.equal(g.nodes.n0.status, "merged");
+  assert.equal(g.nodes.n0.backend, "codex");
+  assert.equal(g.nodes.n0.model, "o3");
+  assert.equal(g.nodes.n0.effort, "high");
+  assert.equal(g.nodes.n1.status, "running");
+  assert.equal(g.nodes.n1.runId, "run-1");
+  assert.equal(g.nodes.n1.jjChangeId, "z123");
+  assert.deepEqual(g.nodes.n1.worktree, { path: "/w/n1" });
+});
+
+test("mirrorPlanIntoGraph rebuilds edges from deps and stores edge ids on the node", () => {
+  const g = mirrorPlanIntoGraph(emptyGraph(), {
+    nodes: [
+      { id: "n0", title: "a", status: "merged" },
+      { id: "n1", title: "b", status: "running", deps: [{ on: "n0", type: "hard" }] },
+      { id: "n2", title: "c", status: "planned", deps: [{ on: "n0", type: "soft" }] },
+    ],
+  });
+  const edges = Object.values(g.edges);
+  assert.equal(edges.length, 2);
+  const hard = edges.find((e) => e.type === "hard");
+  const soft = edges.find((e) => e.type === "soft");
+  assert.deepEqual({ from: hard.from, to: hard.to }, { from: "n0", to: "n1" });
+  assert.deepEqual({ from: soft.from, to: soft.to }, { from: "n0", to: "n2" });
+  // The node's deps array holds its incoming edge ids (matching the keyed edges).
+  assert.deepEqual(g.nodes.n1.deps, [hard.id]);
+  assert.deepEqual(g.nodes.n2.deps, [soft.id]);
+});
+
+test("mirrorPlanIntoGraph PRUNES nodes and edges absent from a later payload", () => {
+  let g = mirrorPlanIntoGraph(emptyGraph(), {
+    nodes: [
+      { id: "n0", title: "a", status: "merged" },
+      { id: "n1", title: "b", status: "running", deps: [{ on: "n0", type: "hard" }] },
+    ],
+  });
+  assert.equal(Object.keys(g.nodes).length, 2);
+  assert.equal(Object.keys(g.edges).length, 1);
+
+  // A later mirror that drops n0 (and thus its edge) must prune both.
+  g = mirrorPlanIntoGraph(g, {
+    nodes: [{ id: "n1", title: "b", status: "review" }],
+  });
+  assert.deepEqual(Object.keys(g.nodes), ["n1"]);
+  assert.equal(Object.keys(g.edges).length, 0, "stale n0->n1 edge pruned");
+  assert.equal(g.nodes.n1.status, "review");
+  assert.deepEqual(g.nodes.n1.deps, []);
+});
+
+test("mirrorPlanIntoGraph is idempotent for edge ids (stable keys, no churn)", () => {
+  const payload = {
+    nodes: [
+      { id: "n0", title: "a", status: "merged" },
+      { id: "n1", title: "b", status: "running", deps: [{ on: "n0", type: "hard" }] },
+    ],
+  };
+  const first = mirrorPlanIntoGraph(emptyGraph(), payload);
+  const firstEdgeIds = Object.keys(first.edges).sort();
+  // Re-mirror the same plan onto the same graph: same edge keys (no duplicates).
+  const second = mirrorPlanIntoGraph(first, payload);
+  assert.deepEqual(Object.keys(second.edges).sort(), firstEdgeIds);
+});
+
+test("mirrorPlanIntoGraph preserves prompt/source/createdAt across re-mirror", () => {
+  let g = emptyGraph();
+  g.nodes.n0 = {
+    id: "n0",
+    title: "a",
+    prompt: "the original detailed prompt",
+    backend: "claude",
+    status: "running",
+    deps: [],
+    source: "injection",
+    createdAt: "2020-01-01T00:00:00.000Z",
+    updatedAt: "2020-01-01T00:00:00.000Z",
+  };
+  g = mirrorPlanIntoGraph(g, { nodes: [{ id: "n0", title: "a", status: "review" }] });
+  assert.equal(g.nodes.n0.prompt, "the original detailed prompt");
+  assert.equal(g.nodes.n0.source, "injection");
+  assert.equal(g.nodes.n0.createdAt, "2020-01-01T00:00:00.000Z");
+  assert.equal(g.nodes.n0.status, "review");
+});
+
+test("mirrorPlanIntoGraph on an empty payload clears the whole graph", () => {
+  let g = mirrorPlanIntoGraph(emptyGraph(), { nodes: [{ id: "n0", title: "a", status: "running" }] });
+  assert.equal(Object.keys(g.nodes).length, 1);
+  g = mirrorPlanIntoGraph(g, {});
+  assert.deepEqual(Object.keys(g.nodes), []);
+  assert.deepEqual(Object.keys(g.edges), []);
 });

@@ -40,7 +40,7 @@ async function readPidFile(repoRoot: string): Promise<DaemonPidFile | null> {
  */
 export async function ensureBoardRunning(
   repoRoot: string,
-  opts?: { port?: number; open?: boolean },
+  opts?: { port?: number; open?: boolean; scheduler?: boolean },
 ): Promise<{ port: number; url: string; started: boolean; handle?: BoardDaemonHandle }> {
   await registerProject(repoRoot).catch(() => undefined);
 
@@ -58,7 +58,14 @@ export async function ensureBoardRunning(
   const bus = new RudderBus();
   const handle = await startBoardDaemon({ port, repoRoot, open: opts?.open, bus });
 
-  const scheduler = startScheduler(repoRoot, bus);
+  // Projector-only mode: when scheduler === false the board still serves
+  // HTTP + SSE + fs.watch (so it reflects whatever is written to graph.json),
+  // but the LAUNCHING scheduler tick is NOT started. The TUI starts the daemon
+  // this way so the TUI remains the sole scheduler and there is no double-launch
+  // (the TUI mirrors its plan into graph.json; the daemon only projects it). The
+  // standalone `rudder board`/`serve` paths keep the full scheduler (default).
+  const runScheduler = opts?.scheduler ?? true;
+  const scheduler = runScheduler ? startScheduler(repoRoot, bus) : { stop: (): void => {} };
 
   await ensureDir(projectStateDir(repoRoot));
   await writeJson(daemonPidPath(repoRoot), {

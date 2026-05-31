@@ -3995,3 +3995,136 @@ branch refs/heads/main\n";
             "cross-section dependent shows a dep hint: {text}"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // graph.json mirror: build_mirror_payload projects the in-memory plan into
+    // the JSON payload the `rudder __graph-mirror` shim consumes. Statuses are
+    // mapped from AgentStatus; planned nodes and plan-launched agents both
+    // appear; deps/soft_deps become typed edges in the payload.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mirror_payload_includes_planned_nodes_with_typed_deps() {
+        let mut app = App::new();
+        app.cwd = std::env::temp_dir();
+        let mut root = test_planned_node("n0", &[]);
+        root.title = "build the parser".to_string();
+        let mut child = test_planned_node("n1", &["n0"]);
+        child.soft_deps = vec!["n0".to_string()];
+        app.planned_nodes = vec![root, child];
+
+        let payload = app.build_mirror_payload();
+        let nodes = payload["nodes"].as_array().expect("nodes array");
+        assert_eq!(nodes.len(), 2);
+
+        let n0 = nodes.iter().find(|n| n["id"] == "n0").expect("n0");
+        assert_eq!(n0["status"], "planned");
+        assert_eq!(n0["title"], "build the parser");
+        assert!(n0["deps"].as_array().unwrap().is_empty());
+
+        let n1 = nodes.iter().find(|n| n["id"] == "n1").expect("n1");
+        assert_eq!(n1["status"], "planned");
+        let deps = n1["deps"].as_array().expect("n1 deps");
+        // One hard edge on n0 and one soft edge on n0.
+        assert!(deps
+            .iter()
+            .any(|d| d["on"] == "n0" && d["type"] == "hard"));
+        assert!(deps
+            .iter()
+            .any(|d| d["on"] == "n0" && d["type"] == "soft"));
+    }
+
+    #[test]
+    fn mirror_payload_maps_agent_status_and_carries_run_metadata() {
+        let mut app = App::new();
+        app.cwd = std::env::temp_dir();
+
+        let mut running = node_agent("n0", AgentStatus::Running);
+        running.id = "run-a".to_string();
+        running.jj_change_id = Some("zchange".to_string());
+        running.worktree_path = Some(PathBuf::from("/tmp/w/n0"));
+        running.deps = vec![];
+
+        let mut done = node_agent("n1", AgentStatus::Done);
+        done.id = "run-b".to_string();
+        done.deps = vec!["n0".to_string()];
+
+        let mut merged = node_agent("n2", AgentStatus::Merged);
+        merged.id = "run-c".to_string();
+
+        let mut failed = node_agent("n3", AgentStatus::Failed);
+        failed.id = "run-d".to_string();
+
+        let mut stopped = node_agent("n4", AgentStatus::Stopped);
+        stopped.id = "run-e".to_string();
+
+        app.agents = vec![running, done, merged, failed, stopped];
+
+        let payload = app.build_mirror_payload();
+        let nodes = payload["nodes"].as_array().expect("nodes array");
+        let by_id = |id: &str| nodes.iter().find(|n| n["id"] == id).cloned().unwrap();
+
+        // AgentStatus -> board NodeStatus mapping.
+        assert_eq!(by_id("n0")["status"], "running");
+        assert_eq!(by_id("n1")["status"], "review");
+        assert_eq!(by_id("n2")["status"], "merged");
+        assert_eq!(by_id("n3")["status"], "failed");
+        assert_eq!(by_id("n4")["status"], "failed");
+
+        // The running node carries its run id, jj change, and worktree path.
+        let n0 = by_id("n0");
+        assert_eq!(n0["runId"], "run-a");
+        assert_eq!(n0["jjChangeId"], "zchange");
+        assert_eq!(n0["worktreePath"], "/tmp/w/n0");
+
+        // The Done agent's hard dep on n0 becomes a typed edge in the payload.
+        let n1_deps = by_id("n1")["deps"].as_array().unwrap().clone();
+        assert!(n1_deps
+            .iter()
+            .any(|d| d["on"] == "n0" && d["type"] == "hard"));
+    }
+
+    #[test]
+    fn mirror_payload_combines_queued_nodes_and_launched_agents() {
+        let mut app = App::new();
+        app.cwd = std::env::temp_dir();
+        // n0 launched (running), n1 still queued in Todo.
+        app.agents = vec![node_agent("n0", AgentStatus::Running)];
+        app.planned_nodes = vec![test_planned_node("n1", &["n0"])];
+
+        let payload = app.build_mirror_payload();
+        let nodes = payload["nodes"].as_array().expect("nodes array");
+        let ids: Vec<&str> = nodes.iter().map(|n| n["id"].as_str().unwrap()).collect();
+        assert!(ids.contains(&"n0"), "launched agent projected");
+        assert!(ids.contains(&"n1"), "queued node projected");
+    }
+
+    #[test]
+    fn mirror_graph_coalesce_guard_skips_when_signature_unchanged() {
+        // In a #[cfg(test)] build mirror_graph never shells out, so we assert the
+        // coalesce bookkeeping directly: the first call records a signature; a
+        // second call with an identical plan keeps the same signature (no churn);
+        // a plan change moves the signature.
+        let mut app = App::new();
+        app.cwd = std::env::temp_dir();
+        app.planned_nodes = vec![test_planned_node("n0", &[])];
+        assert_eq!(app.last_mirror_signature, None);
+
+        app.mirror_graph();
+        let first = app.last_mirror_signature;
+        assert!(first.is_some(), "first mirror records a signature");
+
+        app.mirror_graph();
+        assert_eq!(
+            app.last_mirror_signature, first,
+            "an unchanged plan keeps the same signature (coalesced)"
+        );
+
+        // Mutate the plan: the signature must change.
+        app.planned_nodes.push(test_planned_node("n1", &["n0"]));
+        app.mirror_graph();
+        assert_ne!(
+            app.last_mirror_signature, first,
+            "a changed plan moves the signature"
+        );
+    }

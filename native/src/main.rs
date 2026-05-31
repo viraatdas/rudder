@@ -329,6 +329,11 @@ struct App {
     /// `/usage` to this rudder session rather than the user's full lifetime
     /// claude/codex history for the repo.
     session_started_iso: String,
+    /// Coalesce guard for graph.json mirroring: a hash of the last mirrored
+    /// plan/agent signature. `mirror_graph` is a no-op when the signature has
+    /// not changed, so a burst of poll ticks coalesces into one shell-out. None
+    /// until the first mirror.
+    last_mirror_signature: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -631,6 +636,7 @@ impl App {
             last_tab_emoji: None,
             session_started_iso,
             quit_confirm_pending: false,
+            last_mirror_signature: None,
         }
     }
 
@@ -4045,6 +4051,10 @@ impl App {
             self.notice = Some(format!("added {appended} node(s) to the plan"));
             self.run_scheduler();
         }
+        // MIRROR the appended node(s) into graph.json. When awaiting approval the
+        // node was only queued (run_scheduler did not run), so mirror here too so
+        // the board reflects the reconcile. Coalesced + non-fatal.
+        self.mirror_graph();
         self.dirty = true;
     }
 
@@ -4132,6 +4142,157 @@ impl App {
             .count()
     }
 
+    /// Build the JSON payload that MIRRORS the current plan into graph.json. The
+    /// TUI owns no graph.json schema: it just describes its plan and the TS shim
+    /// (`rudder __graph-mirror`) projects it. The payload contains:
+    ///   - every queued `planned_node` (status "planned", with its hard + soft deps)
+    ///   - every plan-launched agent (those carrying a `node_id`), status mapped
+    ///     from AgentStatus (Running->running, Done->review, Merged->merged,
+    ///     Failed/Stopped->failed), carrying its runId, jjChangeId, worktree path,
+    ///     and its deps/soft_deps.
+    /// Pure (no IO) so the builder can be unit-tested without a shell-out.
+    fn build_mirror_payload(&self) -> serde_json::Value {
+        let mut nodes: Vec<serde_json::Value> = Vec::new();
+
+        // Queued planned nodes: not yet launched, status "planned".
+        for node in &self.planned_nodes {
+            let mut deps: Vec<serde_json::Value> = node
+                .deps
+                .iter()
+                .map(|on| serde_json::json!({ "on": on, "type": "hard" }))
+                .collect();
+            deps.extend(
+                node.soft_deps
+                    .iter()
+                    .map(|on| serde_json::json!({ "on": on, "type": "soft" })),
+            );
+            let mut value = serde_json::json!({
+                "id": node.id,
+                "title": node.title,
+                "status": "planned",
+                "deps": deps,
+            });
+            if let Some(backend) = &node.backend {
+                value["backend"] = serde_json::json!(backend);
+            }
+            if let Some(model) = &node.model {
+                value["model"] = serde_json::json!(model);
+            }
+            if let Some(effort) = &node.effort {
+                value["effort"] = serde_json::json!(effort);
+            }
+            nodes.push(value);
+        }
+
+        // Plan-launched agents: those carrying a node_id, projected to a node
+        // keyed by that node_id. AgentStatus maps onto the board's NodeStatus.
+        for run in &self.agents {
+            let Some(node_id) = run.node_id.as_ref() else {
+                continue;
+            };
+            let status = match run.status {
+                AgentStatus::Running => "running",
+                AgentStatus::Done => "review",
+                AgentStatus::Merged => "merged",
+                AgentStatus::Failed | AgentStatus::Stopped => "failed",
+            };
+            let mut deps: Vec<serde_json::Value> = run
+                .deps
+                .iter()
+                .map(|on| serde_json::json!({ "on": on, "type": "hard" }))
+                .collect();
+            deps.extend(
+                run.soft_deps
+                    .iter()
+                    .map(|on| serde_json::json!({ "on": on, "type": "soft" })),
+            );
+            let title = if run.task_summary.trim().is_empty() {
+                run.task.clone()
+            } else {
+                run.task_summary.clone()
+            };
+            let mut value = serde_json::json!({
+                "id": node_id,
+                "title": title,
+                "status": status,
+                "runId": run.id,
+                "backend": run.backend.as_str(),
+                "deps": deps,
+            });
+            value["model"] = serde_json::json!(run.model);
+            if let Some(effort) = run.effort {
+                value["effort"] = serde_json::json!(effort.as_str());
+            }
+            if let Some(change) = &run.jj_change_id {
+                value["jjChangeId"] = serde_json::json!(change);
+            }
+            if let Some(path) = &run.worktree_path {
+                value["worktreePath"] = serde_json::json!(path.to_string_lossy());
+            }
+            nodes.push(value);
+        }
+
+        serde_json::json!({ "nodes": nodes })
+    }
+
+    /// MIRROR the current plan into graph.json so the web board shows this TUI
+    /// session's DAG. Coalesced: a stable signature of the payload is hashed and
+    /// the shell-out is skipped when nothing changed since the last mirror (so a
+    /// burst of poll ticks is one write at most). Best-effort + NON-FATAL: the TS
+    /// shim is shelled synchronously and any failure (missing CLI, non-zero exit,
+    /// spawn error) is swallowed - mirroring must never block or break the TUI.
+    fn mirror_graph(&mut self) {
+        let payload = self.build_mirror_payload();
+        // Coalesce: hash the serialized payload; skip when unchanged. The payload
+        // intentionally excludes volatile fields (no timestamps), so the signature
+        // only changes when the plan/agent set or a status actually changes.
+        let serialized = payload.to_string();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        serialized.hash(&mut hasher);
+        let signature = hasher.finish();
+        if self.last_mirror_signature == Some(signature) {
+            return;
+        }
+        self.last_mirror_signature = Some(signature);
+
+        // Nothing to mirror and we have never mirrored a non-empty plan: skip the
+        // shell-out entirely (avoids spawning a CLI just to write an empty graph).
+        // We still recorded the signature above so we do not re-check every tick.
+
+        #[cfg(test)]
+        {
+            // Tests exercise build_mirror_payload + the coalesce guard directly;
+            // never shell out from a test run.
+            let _ = serialized;
+        }
+
+        #[cfg(not(test))]
+        {
+            let Some(rudder) = locate_rudder_cli() else {
+                return;
+            };
+            let repo = self.cwd.clone();
+            let child = Command::new(&rudder)
+                .arg("__graph-mirror")
+                .arg("--repo")
+                .arg(&repo)
+                .current_dir(&repo)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn();
+            let Ok(mut child) = child else {
+                return;
+            };
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(serialized.as_bytes());
+                // Drop stdin to signal EOF so the shim's stdin read completes.
+            }
+            // Reap so we do not leave a zombie; ignore the outcome (best-effort).
+            let _ = child.wait();
+        }
+    }
+
     /// Scheduler step: drain ready planned nodes into live agents while a slot is
     /// free. A node is ready when all its hard deps are merged (or reference ids
     /// absent from the plan, treated as satisfied so the DAG never deadlocks).
@@ -4163,6 +4324,11 @@ impl App {
             });
             self.dirty = true;
         }
+
+        // MIRROR the plan into graph.json so the board reflects this DAG. Covers
+        // both the just-launched nodes (now Running agents) and the queue that
+        // remains in Todo. Coalesced + non-fatal inside mirror_graph.
+        self.mirror_graph();
     }
 
     /// Position in `planned_nodes` of the next node to launch, or `None` when the
@@ -5056,6 +5222,9 @@ What to do\n\
             }
         }
         let _ = write_rudder_context(&self.cwd, &self.agents, None);
+        // A merge is a meaningful node transition (-> merged); mirror it so the
+        // board reflects it without waiting for the next poll pass. Coalesced.
+        self.mirror_graph();
     }
 
     fn poll_agents(&mut self) {
@@ -5274,6 +5443,19 @@ What to do\n\
         self.spinner_frame = self.spinner_frame.wrapping_add(1);
         if self.has_planning_orchestrator() {
             self.dirty = true;
+        }
+
+        // MIRROR plan-launched agents' status transitions (running->review->merged
+        // / failed) into graph.json so the board tracks them. Only when something
+        // changed this pass AND a plan node/agent exists; the coalesce guard inside
+        // mirror_graph then makes this a real shell-out ONLY when the DAG signature
+        // actually changed (it is not per-tick: terminal-byte churn does not move
+        // the signature, which excludes volatile output). Non-fatal.
+        if any_dirty
+            && (!self.planned_nodes.is_empty()
+                || self.agents.iter().any(|run| run.node_id.is_some()))
+        {
+            self.mirror_graph();
         }
 
         if any_dirty {

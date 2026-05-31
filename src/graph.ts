@@ -1,5 +1,17 @@
 import path from "node:path";
-import type { GraphEdge, JsonValue, NodeStatus, RudderGraph, RunRecord, RunStatus, TaskNode } from "./types.js";
+import type {
+  BackendId,
+  DepType,
+  EdgeType,
+  EffortLevel,
+  GraphEdge,
+  JsonValue,
+  NodeStatus,
+  RudderGraph,
+  RunRecord,
+  RunStatus,
+  TaskNode,
+} from "./types.js";
 import { projectStateDir } from "./state.js";
 import { nowIso, readJson, shortHash, updateJson } from "./util.js";
 
@@ -78,6 +90,147 @@ export async function updateGraph(
     return sorted as unknown as JsonValue;
   });
   return result;
+}
+
+// ---------------------------------------------------------------------------
+// Plan mirror (write-only projection of the TUI's in-memory plan). The native
+// TUI owns NO graph.json schema: it pipes a simple payload describing its plan
+// to `rudder __graph-mirror`, which calls mirrorPlanIntoGraph below. graph.json
+// is a write-only mirror the board reads; it is NEVER read back for scheduling.
+// ---------------------------------------------------------------------------
+
+/** A dependency edge in the mirror payload: this node depends `on` another. */
+export type MirrorDep = { on: string; type: DepType };
+
+/** One node in the mirror payload. Only `id`, `title`, `status`, and `deps` are
+ * load-bearing; the rest enrich the board projection when the TUI knows them. */
+export type MirrorNode = {
+  id: string;
+  title: string;
+  status: string;
+  runId?: string;
+  jjChangeId?: string;
+  backend?: string;
+  model?: string;
+  effort?: string;
+  worktreePath?: string;
+  deps?: MirrorDep[];
+};
+
+export type MirrorPayload = { nodes?: MirrorNode[] };
+
+/** Map a TUI status string onto the DAG-level NodeStatus vocabulary. Unknown
+ * values fall back to "planned" so a malformed payload never crashes the mirror. */
+export function mirrorNodeStatus(status: string | undefined): NodeStatus {
+  switch (status) {
+    case "ready":
+      return "ready";
+    case "running":
+      return "running";
+    case "review":
+      return "review";
+    case "merged":
+      return "merged";
+    case "failed":
+      return "failed";
+    case "blocked":
+      return "blocked";
+    default:
+      return "planned";
+  }
+}
+
+function mirrorBackend(backend: string | undefined): BackendId {
+  return backend === "codex" || backend === "acpx" ? backend : "claude";
+}
+
+function mirrorEffort(effort: string | undefined): EffortLevel | undefined {
+  switch (effort) {
+    case "low":
+    case "medium":
+    case "high":
+    case "xhigh":
+    case "max":
+      return effort;
+    default:
+      return undefined;
+  }
+}
+
+/** Stable, mergeable edge id keyed only by endpoints + type (no timestamp/nonce)
+ * so re-mirroring an unchanged plan reuses the same key and the prune is a no-op. */
+function mirrorEdgeId(from: string, to: string, type: EdgeType): string {
+  return `e_${from}__${type}__${to}`;
+}
+
+/**
+ * Project a TUI plan payload into the graph, IN PLACE. Upserts every node in the
+ * payload (mapping TUI status -> NodeStatus), rebuilds each node's incoming edges
+ * from its deps, and PRUNES any graph node/edge no longer present in the payload
+ * so the mirror exactly reflects the current TUI plan (not an append-only log).
+ * Pure (no IO): callers wrap it in updateGraph. Existing prompt/source/createdAt
+ * are preserved on upsert; everything else is overwritten from the payload.
+ */
+export function mirrorPlanIntoGraph(graph: RudderGraph, payload: MirrorPayload): RudderGraph {
+  const inNodes = Array.isArray(payload.nodes) ? payload.nodes : [];
+  const createdAt = nowIso();
+  const keepNodeIds = new Set<string>();
+  const keepEdgeIds = new Set<string>();
+
+  for (const incoming of inNodes) {
+    if (!incoming || typeof incoming.id !== "string" || !incoming.id) {
+      continue;
+    }
+    keepNodeIds.add(incoming.id);
+    const title = (incoming.title || incoming.id).slice(0, 200);
+    const status = mirrorNodeStatus(incoming.status);
+
+    const incomingEdgeIds: string[] = [];
+    const deps = Array.isArray(incoming.deps) ? incoming.deps : [];
+    for (const dep of deps) {
+      if (!dep || typeof dep.on !== "string" || !dep.on) {
+        continue;
+      }
+      const type: EdgeType = dep.type === "soft" ? "soft" : "hard";
+      const edgeId = mirrorEdgeId(dep.on, incoming.id, type);
+      keepEdgeIds.add(edgeId);
+      graph.edges[edgeId] = { id: edgeId, from: dep.on, to: incoming.id, type };
+      incomingEdgeIds.push(edgeId);
+    }
+
+    const existing = graph.nodes[incoming.id];
+    const effort = mirrorEffort(incoming.effort);
+    graph.nodes[incoming.id] = {
+      id: incoming.id,
+      title,
+      prompt: existing?.prompt ?? title,
+      backend: mirrorBackend(incoming.backend),
+      ...(incoming.model ? { model: incoming.model } : {}),
+      ...(effort ? { effort } : {}),
+      status,
+      ...(incoming.runId ? { runId: incoming.runId } : {}),
+      ...(incoming.worktreePath ? { worktree: { path: incoming.worktreePath } } : {}),
+      ...(incoming.jjChangeId ? { jjChangeId: incoming.jjChangeId } : {}),
+      deps: incomingEdgeIds,
+      source: existing?.source ?? "planner",
+      createdAt: existing?.createdAt ?? createdAt,
+      updatedAt: createdAt,
+    };
+  }
+
+  // PRUNE: drop graph nodes/edges absent from the payload so the mirror is an
+  // exact reflection of the live TUI plan.
+  for (const id of Object.keys(graph.nodes)) {
+    if (!keepNodeIds.has(id)) {
+      delete graph.nodes[id];
+    }
+  }
+  for (const id of Object.keys(graph.edges)) {
+    if (!keepEdgeIds.has(id)) {
+      delete graph.edges[id];
+    }
+  }
+  return graph;
 }
 
 function sortGraph(graph: RudderGraph): RudderGraph {
