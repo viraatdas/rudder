@@ -6,6 +6,67 @@ The CLI package stays light. This service is a separate deployable app that uses
 Better Auth for Google and GitHub login, then issues a Rudder CLI token for the
 local dashboard.
 
+## Quickstart (copy/paste)
+
+```bash
+npm install -g @viraatdas/rudder@latest
+rudder login                                  # opens the cloud login
+rudder cloud "fix the failing tests"          # launches a fresh cloud instance
+rudder cloud list                             # see every instance on your account
+rudder cloud talk <id> "what are you doing?"  # message any instance, see its reply
+rudder cloud output <id>                      # latest output from an instance
+rudder cloud attach <id>                      # full interactive terminal
+```
+
+`rudder cloud quickstart` prints this list at any time.
+
+## Talk to instances (HTTP relay)
+
+Every running instance keeps a worker WebSocket open to the control plane. Two
+endpoints let you converse with it without a full interactive attach — this is
+what `rudder cloud talk` and the Slack bot use:
+
+```text
+POST /api/rudder/sail/:id/input    { "text": "...", "submit": true }
+GET  /api/rudder/sail/:id/output   -> { id, connected, output }
+```
+
+Both require the account's CLI bearer token and instance ownership. `input`
+injects the text into the agent's PTY exactly as a keystroke (with a trailing
+carriage return when `submit` is not `false`); `output` returns the recent
+replay buffer.
+
+## Slack — the shared "main panel"
+
+A single Slack channel becomes the control surface for every cloud instance on
+the account. Each instance opens its own **thread** in the channel: launching
+announces it, the agent's final result posts into the thread, and **replying in
+a thread sends your message straight to that instance**. You can also drive it
+with `list`, `talk <id> <message>`, `output <id>`, and `stop <id>`.
+
+Default channel: `C0B78TDLM5G` (override with `RUDDER_SLACK_CHANNEL`).
+
+Set up in three steps (or run `rudder cloud slack` for the guided version):
+
+```bash
+# 1. Create a Slack app from the manifest:
+rudder cloud slack manifest          # prints a JSON manifest to paste at api.slack.com/apps
+
+# 2. Install it, then invite the bot to the channel:
+#    /invite @rudder   (in C0B78TDLM5G)
+
+# 3. Give the control plane the credentials and redeploy:
+flyctl secrets set \
+  SLACK_BOT_TOKEN=xoxb-... \
+  SLACK_SIGNING_SECRET=... \
+  RUDDER_SLACK_CHANNEL=C0B78TDLM5G \
+  -a rudder-cloud-control
+```
+
+The events request URL is `https://<control-plane>/api/slack/events`. Inbound
+requests are verified with `SLACK_SIGNING_SECRET` (v0 signature, 5-minute replay
+window) and deduped by Slack `event_id`.
+
 ## Environment
 
 ```bash
@@ -24,7 +85,13 @@ FLY_API_TOKEN=<fly token>
 FLY_APP_NAME=<existing fly machines app>
 FLY_REGION=iad
 RUDDER_WORKER_IMAGE=<registry image for cloud/worker/Dockerfile>
+SLACK_BOT_TOKEN=<xoxb- bot token, enables the Slack control surface>
+SLACK_SIGNING_SECRET=<verifies inbound Slack events>
+RUDDER_SLACK_CHANNEL=C0B78TDLM5G
 ```
+
+`SLACK_*` are optional; when `SLACK_BOT_TOKEN` is unset the Slack surface is
+simply disabled. See "Slack — the shared main panel" below.
 
 `FLY_API_TOKEN` and `FLY_APP_NAME` are only required for the managed Fly
 Machines runtime. BYOC runs still require `RUDDER_S3_BUCKET` and

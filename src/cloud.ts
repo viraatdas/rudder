@@ -237,6 +237,21 @@ export async function runCloudCommand(command: string, args: string[], options: 
     case "attach":
       await attach(rest, options);
       return;
+    case "talk":
+    case "say":
+    case "msg":
+      await talk(rest, options);
+      return;
+    case "output":
+    case "tail":
+      await tailOutput(rest, options);
+      return;
+    case "quickstart":
+      await quickstart(options);
+      return;
+    case "slack":
+      await slackSetup(rest, options);
+      return;
     case "workspace":
       await workspaceCommand(rest, options);
       return;
@@ -672,6 +687,150 @@ async function mutateSail(action: "onload" | "pause" | "resume" | "stop", args: 
     body: args.length > 1 ? { args: args.slice(1) } : {},
   });
   await printResult(result, options);
+}
+
+async function talk(args: string[], options: CloudCommandOptions): Promise<void> {
+  const sailId = args[0];
+  const message = args.slice(1).join(" ").trim();
+  if (!sailId || !message) {
+    throw new Error('Usage: rudder cloud talk <id> "<message>"');
+  }
+  const client = await cloudClient({ requireToken: true });
+  const result = await client.request<JsonValue>(
+    `/api/rudder/sail/${encodeURIComponent(sailId)}/input`,
+    { method: "POST", body: { text: message } },
+  );
+  if (options.json) {
+    printJson(result);
+    return;
+  }
+  const delivered = result && typeof result === "object" && !Array.isArray(result)
+    ? (result as Record<string, JsonValue>).delivered === true
+    : false;
+  if (!delivered) {
+    console.log(`Could not reach ${sailId}: it is not connected right now.`);
+    return;
+  }
+  console.log(`→ ${sailId}: ${message}`);
+  // Give the agent a moment, then show what it said back.
+  await sleep(3500);
+  await tailOutput([sailId], options);
+}
+
+async function tailOutput(args: string[], options: CloudCommandOptions): Promise<void> {
+  const sailId = args[0];
+  if (!sailId) {
+    throw new Error("Usage: rudder cloud output <id>");
+  }
+  const client = await cloudClient({ requireToken: true });
+  const result = await client.request<Record<string, JsonValue>>(
+    `/api/rudder/sail/${encodeURIComponent(sailId)}/output`,
+    { method: "GET" },
+  );
+  if (options.json) {
+    printJson(result);
+    return;
+  }
+  const output = typeof result.output === "string" ? result.output : "";
+  const cleaned = stripAnsiForCli(output).trimEnd();
+  const lines = cleaned ? cleaned.split("\n").slice(-30).join("\n") : "(no output yet)";
+  console.log(lines);
+}
+
+function stripAnsiForCli(text: string): string {
+  // eslint-disable-next-line no-control-regex
+  return text
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "")
+    .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "")
+    .replace(/\x1b[@-Z\\-_=>()#][0-9;]*/g, "")
+    .replace(/[\x00-\x08\x0b-\x1f\x7f]/g, "");
+}
+
+async function quickstart(options: CloudCommandOptions): Promise<void> {
+  const url = normalizeCloudUrl(process.env.RUDDER_CLOUD_URL) || DEFAULT_CLOUD_URL;
+  if (options.json) {
+    printJson({ cloudUrl: url, steps: ["install", "login", "launch", "talk", "slack"] });
+    return;
+  }
+  const lines = [
+    "Rudder Cloud — copy/paste quickstart",
+    "",
+    "1. Install Rudder:",
+    "   npm install -g @viraatdas/rudder@latest",
+    "",
+    "2. Log in to the cloud control plane:",
+    "   rudder login",
+    "",
+    "3. Launch a fresh cloud instance on any task (run inside a repo):",
+    '   rudder cloud "fix the failing tests"',
+    "",
+    "4. See your instances and talk to any of them:",
+    "   rudder cloud list",
+    '   rudder cloud talk <id> "what are you working on?"',
+    "   rudder cloud output <id>",
+    "   rudder cloud attach <id>      # full interactive terminal",
+    "",
+    "5. Talk to every instance from Slack (one thread per instance):",
+    "   rudder cloud slack            # prints the Slack setup",
+    "",
+    `Control plane: ${url}`,
+  ];
+  console.log(lines.join("\n"));
+}
+
+async function slackSetup(args: string[], options: CloudCommandOptions): Promise<void> {
+  const url = normalizeCloudUrl(process.env.RUDDER_CLOUD_URL) || DEFAULT_CLOUD_URL;
+  const eventsUrl = `${url.replace(/\/$/, "")}/api/slack/events`;
+  const channel = process.env.RUDDER_SLACK_CHANNEL || "C0B78TDLM5G";
+  const manifest = {
+    display_information: { name: "Rudder Cloud" },
+    features: {
+      bot_user: { display_name: "rudder", always_online: true },
+    },
+    oauth_config: {
+      scopes: { bot: ["app_mentions:read", "channels:history", "groups:history", "chat:write"] },
+    },
+    settings: {
+      event_subscriptions: {
+        request_url: eventsUrl,
+        bot_events: ["app_mention", "message.channels", "message.groups"],
+      },
+      org_deploy_enabled: false,
+      socket_mode_enabled: false,
+    },
+  };
+  if (args[0] === "manifest") {
+    console.log(JSON.stringify(manifest, null, 2));
+    return;
+  }
+  if (options.json) {
+    printJson({ eventsUrl, channel, manifest });
+    return;
+  }
+  const lines = [
+    "Rudder Cloud → Slack setup",
+    "",
+    `Channel: ${channel}`,
+    `Events request URL: ${eventsUrl}`,
+    "",
+    "1. Create a Slack app from the manifest (api.slack.com/apps → Create New App → From a manifest):",
+    "   rudder cloud slack manifest    # prints the JSON manifest to paste",
+    "",
+    "2. Install the app to your workspace and invite it to the channel:",
+    `   /invite @rudder   (in ${channel})`,
+    "",
+    "3. Set these on the control plane (Fly secrets), then redeploy:",
+    "   SLACK_BOT_TOKEN=xoxb-...        # Bot User OAuth Token",
+    "   SLACK_SIGNING_SECRET=...        # Basic Information → Signing Secret",
+    `   RUDDER_SLACK_CHANNEL=${channel}`,
+    "",
+    "   flyctl secrets set SLACK_BOT_TOKEN=xoxb-... SLACK_SIGNING_SECRET=... \\",
+    `     RUDDER_SLACK_CHANNEL=${channel} -a rudder-cloud-control`,
+    "",
+    "That's it. Every `rudder cloud \"<task>\"` now opens a thread in the channel;",
+    "reply in a thread to talk to that instance, or use `list` / `talk <id> <msg>`.",
+  ];
+  console.log(lines.join("\n"));
 }
 
 async function setupOAuthProvider(
@@ -2478,6 +2637,14 @@ Usage:
   rudder cloud logs <id>
   rudder cloud attach <id>
       stream the live cloud worker terminal into this pane
+  rudder cloud talk <id> "<message>"
+      send a message to a running instance and show its reply
+  rudder cloud output <id>
+      show an instance's latest output
+  rudder cloud quickstart
+      print the copy/paste setup for the whole flow
+  rudder cloud slack [manifest]
+      print Slack setup (one thread per instance in the shared channel)
   rudder cloud workspace [attach [id]|share|status [--json]|stop <id>|list]
       shared cloud workspace for this repo
   rudder cloud bootstrap <id>
