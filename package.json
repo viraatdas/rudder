@@ -1,6 +1,6 @@
 {
   "name": "@viraatdas/rudder",
-  "version": "1.0.69",
+  "version": "1.0.74",
   "description": "A Claude Code-style terminal app for running coding agents with worktree-isolated runs.",
   "license": "MIT",
   "homepage": "https://rudder.viraat.dev",
