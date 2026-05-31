@@ -1488,6 +1488,17 @@ branch refs/heads/main\n";
             orchestrator_claude.args.iter().any(|arg| arg == "-p"),
             "orchestrator runs non-interactively (claude -p), not the interactive TUI"
         );
+        assert!(
+            orchestrator_claude
+                .args
+                .windows(2)
+                .any(|w| w[0] == "--output-format" && w[1] == "stream-json"),
+            "orchestrator streams JSON events for the live transcript"
+        );
+        assert!(
+            orchestrator_claude.args.iter().any(|arg| arg == "--include-partial-messages"),
+            "orchestrator streams partial messages so text/thinking arrive incrementally"
+        );
 
         let rudder_plan = agent_command(
             Backend::Codex,
@@ -2621,6 +2632,7 @@ branch refs/heads/main\n";
             soft_deps: Vec::new(),
             node_id: None,
             reconcile_planner: false,
+            plan_stream: None,
         }
     }
 
@@ -3037,6 +3049,7 @@ branch refs/heads/main\n";
             soft_deps: Vec::new(),
             node_id: None,
             reconcile_planner: false,
+            plan_stream: None,
         });
 
         app.delete_selected_agent();
@@ -3855,6 +3868,104 @@ branch refs/heads/main\n";
         assert!(outline.contains("n0:hard"), "hard dep is shown: {outline}");
     }
 
+    // --- Live planner stream (plan_stream.rs) --------------------------------
+    // ingest() takes the FULL cumulative output_log snapshot each call (the PTY log
+    // grows), so the tests append to a buffer and feed the whole buffer each time.
+
+    fn text_delta_line(text: &str) -> String {
+        let escaped = text.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n");
+        format!(
+            "{{\"type\":\"stream_event\",\"event\":{{\"type\":\"content_block_delta\",\"delta\":{{\"type\":\"text_delta\",\"text\":\"{escaped}\"}}}}}}\n"
+        )
+    }
+
+    #[test]
+    fn plan_stream_accumulates_text_not_thinking() {
+        let mut s = PlanStreamState::new();
+        let mut buf = String::new();
+        buf.push_str("{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"hmm\"}}}\n");
+        s.ingest(&buf);
+        buf.push_str(&text_delta_line("the plan"));
+        s.ingest(&buf);
+        // Thinking never feeds the DAG parser; only assistant text does.
+        assert_eq!(s.assistant_text(), "the plan");
+        assert!(s.transcript().iter().any(|e| e.kind == PlanEntryKind::Thinking));
+        assert!(s.transcript().iter().any(|e| e.kind == PlanEntryKind::Text));
+    }
+
+    #[test]
+    fn plan_stream_reconstructs_block_across_text_deltas() {
+        let mut s = PlanStreamState::new();
+        let mut buf = String::new();
+        for chunk in [
+            "RUDDER_PLAN_TASKS_START\n{\"tasks\":[{\"id\":\"n0\",",
+            "\"title\":\"scaffold\",\"prompt\":\"do it\",\"goal\":\"g\",\"success\":\"s\",\"deps\":[]}]}\n",
+            "RUDDER_PLAN_TASKS_END\nThat's the plan.",
+        ] {
+            buf.push_str(&text_delta_line(chunk));
+            s.ingest(&buf);
+        }
+        let tasks = extract_rudder_plan_tasks(s.parse_text()).expect("block parses from reconstructed text");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, "n0");
+    }
+
+    #[test]
+    fn plan_stream_codex_agent_message_and_session() {
+        let mut s = PlanStreamState::new();
+        let mut buf = String::new();
+        buf.push_str("{\"type\":\"thread.started\",\"thread_id\":\"abc-123\"}\n");
+        s.ingest(&buf);
+        buf.push_str("{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"RUDDER_PLAN_TASKS_START\\n{\\\"tasks\\\":[{\\\"id\\\":\\\"n0\\\",\\\"title\\\":\\\"t\\\",\\\"prompt\\\":\\\"p\\\",\\\"goal\\\":\\\"g\\\",\\\"success\\\":\\\"s\\\",\\\"deps\\\":[]}]}\\nRUDDER_PLAN_TASKS_END\"}}\n");
+        s.ingest(&buf);
+        assert_eq!(s.session_id(), Some("abc-123"));
+        let tasks = extract_rudder_plan_tasks(s.parse_text()).expect("codex block parses");
+        assert_eq!(tasks.len(), 1);
+    }
+
+    #[test]
+    fn plan_stream_is_incremental_without_duplicates() {
+        let mut s = PlanStreamState::new();
+        let mut buf = String::new();
+        buf.push_str(&text_delta_line("ab"));
+        s.ingest(&buf);
+        buf.push_str(&text_delta_line("cd"));
+        s.ingest(&buf);
+        assert_eq!(s.assistant_text(), "abcd", "no duplicate of the first delta");
+    }
+
+    #[test]
+    fn plan_stream_per_turn_baseline_isolates_refine() {
+        let mut s = PlanStreamState::new();
+        let mut buf = String::new();
+        let block = |id: &str| format!(
+            "RUDDER_PLAN_TASKS_START {{\"tasks\":[{{\"id\":\"{id}\",\"title\":\"t\",\"prompt\":\"p\",\"goal\":\"g\",\"success\":\"s\",\"deps\":[]}}]}} RUDDER_PLAN_TASKS_END"
+        );
+        buf.push_str(&text_delta_line(&block("old")));
+        s.ingest(&buf);
+        assert_eq!(extract_rudder_plan_tasks(s.parse_text()).unwrap()[0].id, "old");
+        // A refine begins a new turn (baseline moves) then the revised block streams.
+        s.begin_user_turn("change it");
+        buf.push_str(&text_delta_line(&block("new")));
+        s.ingest(&buf);
+        assert_eq!(
+            extract_rudder_plan_tasks(s.parse_text()).unwrap()[0].id,
+            "new",
+            "parse_text returns only the current turn's block"
+        );
+    }
+
+    #[test]
+    fn plan_stream_skips_non_json_noise() {
+        let mut s = PlanStreamState::new();
+        let mut buf = String::new();
+        buf.push_str("ERROR rmcp transport closed\n");
+        s.ingest(&buf);
+        buf.push_str(&text_delta_line("plan text"));
+        s.ingest(&buf);
+        assert_eq!(s.assistant_text(), "plan text");
+    }
+
     // --- Orchestrator view: pinned row + spinner/DAG worker pane -------------
 
     #[test]
@@ -3973,24 +4084,31 @@ branch refs/heads/main\n";
     }
 
     #[test]
-    fn render_worker_shows_planner_terminal_while_planning() {
+    fn render_worker_shows_live_transcript_while_planning() {
         let mut app = App::new();
         app.focus = FocusPane::Worker;
         let mut orch = test_agent_run("orch", "build a feature");
         orch.mode = AgentMode::RudderPlan;
         orch.status = AgentStatus::Running; // no plan block yet -> planning phase
+        // The planner streams JSON events; the live transcript renders the model's
+        // text and tool steps as it works.
+        let mut stream = PlanStreamState::new();
+        stream.ingest("{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"Scoping the CLI now.\"}}}\n");
+        orch.plan_stream = Some(stream);
         app.agents = vec![orch];
         app.selected_agent = 0;
 
-        let text = render_worker_text(&mut app, 60, 20);
-        // While planning, the pane shows the raw planner terminal (titled
-        // "orchestrator") so the live plan-mode session - questions, menus,
-        // approval - renders through the terminal emulator and fills the pane.
-        // It must NOT use the custom DAG command-center view yet.
+        let text = render_worker_text(&mut app, 70, 20);
+        // While planning, the orchestrator pane shows the custom transcript view
+        // (titled "orchestrator"), NOT the raw JSON PTY and NOT the DAG summary.
         assert!(text.contains("orchestrator"), "pane title is orchestrator: {text}");
         assert!(
-            !text.contains("decomposing the task"),
-            "planning shows the planner terminal, not the custom spinner caption: {text}"
+            text.contains("decomposing the task") || text.contains("Scoping the CLI"),
+            "planning shows the live transcript: {text}"
+        );
+        assert!(
+            !text.contains("stream_event"),
+            "raw JSON events are not shown: {text}"
         );
         assert!(!text.contains("running 1"), "no DAG summary while planning: {text}");
     }

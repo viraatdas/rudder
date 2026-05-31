@@ -1,6 +1,7 @@
 #![allow(unused_imports)]
 //! ratatui rendering: panes, prompts, layout, styles, and scroll math.
 use super::*;
+use crate::plan_stream::{PlanEntry, PlanEntryKind};
 
 pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
@@ -1356,6 +1357,7 @@ pub(crate) fn visible_agent_indices(agents: &[AgentRun]) -> Vec<usize> {
 /// natural (top-to-bottom) order. Surfaced under the spinner in the PLANNING phase
 /// so the orchestrator's clarifying questions (and its thinking) are visible to the
 /// user who is answering them, not just a single trailing line.
+#[allow(dead_code)]
 fn orchestrator_recent_output_lines(agent: &AgentRun, max: usize) -> Vec<String> {
     let output = rudder_plan_output_for_run(agent);
     let clean = strip_ansi_for_plan(&output).replace('\r', "");
@@ -1466,26 +1468,63 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
 
     match phase {
         OrchestratorPhase::Planning => {
+            let header = if app.refining {
+                "refining the plan…"
+            } else {
+                "decomposing the task…"
+            };
             lines.push(Line::from(vec![
                 Span::styled(
                     app.spinner_glyph(),
                     Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(" "),
-                Span::styled("decomposing the task...", pane_text_style(true)),
+                Span::styled(header, pane_text_style(true)),
             ]));
-            // Render the last several non-empty planner lines so its clarifying
-            // questions are visible to the user who is answering them (input reaches
-            // the planner PTY via handle_worker_key). The spinner stays above.
-            let recent = orchestrator_recent_output_lines(agent, 8);
-            if !recent.is_empty() {
-                lines.push(Line::default());
-                let width = block_inner(area).width.saturating_sub(2).max(8) as usize;
-                for line in recent {
-                    lines.push(Line::from(Span::styled(
-                        truncate_chars(&line, width),
-                        muted_style(focused),
-                    )));
+            lines.push(Line::default());
+            // Live conversation transcript: the model's reasoning, the files it is
+            // inspecting, and the plan as it streams (parsed from the backend's JSON
+            // event stream by plan_stream.rs). Empty until the first events arrive.
+            let empty: &[PlanEntry] = &[];
+            let transcript = agent
+                .plan_stream
+                .as_ref()
+                .map(|stream| stream.transcript())
+                .unwrap_or(empty);
+            if transcript.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "starting the planner…",
+                    muted_style(focused),
+                )));
+            } else {
+                for entry in transcript {
+                    let (prefix, style) = match entry.kind {
+                        PlanEntryKind::Thinking => {
+                            ("· ", muted_style(focused).add_modifier(Modifier::ITALIC))
+                        }
+                        PlanEntryKind::Tool => ("  ", muted_style(focused)),
+                        PlanEntryKind::Result | PlanEntryKind::System => {
+                            ("", muted_style(focused))
+                        }
+                        PlanEntryKind::UserTurn => (
+                            "you: ",
+                            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                        ),
+                        PlanEntryKind::Text => ("", pane_text_style(focused)),
+                    };
+                    let mut first = true;
+                    for sub in entry.text.split('\n') {
+                        let content = if first {
+                            format!("{prefix}{}", sub.trim_end())
+                        } else {
+                            sub.trim_end().to_string()
+                        };
+                        first = false;
+                        if content.is_empty() {
+                            continue;
+                        }
+                        lines.push(Line::from(Span::styled(content, style)));
+                    }
                 }
             }
         }
@@ -1579,6 +1618,27 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
         }
     }
 
+    // Chat input: when the orchestrator pane is focused it is a conversation with the
+    // planner. Show the follow-up line being composed; keys route through
+    // handle_orchestrator_chat_key (Enter refines, empty Enter approves).
+    let draft = agent.worker_input_draft.clone();
+    if focused {
+        lines.push(Line::default());
+        let mut spans = vec![Span::styled(
+            "› ",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )];
+        if draft.is_empty() {
+            spans.push(Span::styled(
+                "chat to refine the plan, or press Enter to approve & launch",
+                muted_style(focused),
+            ));
+        } else {
+            spans.push(Span::styled(draft.clone(), pane_text_style(focused)));
+        }
+        lines.push(Line::from(spans));
+    }
+
     let inner = block_inner(area);
     let inner_width = inner.width.max(1) as usize;
     let visible_height = inner.height.max(1) as usize;
@@ -1592,7 +1652,13 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
         .sum();
     let max_scroll = orchestrator_dag_max_scroll(wrapped_rows, visible_height);
     app.orch_dag_scroll = app.orch_dag_scroll.min(max_scroll);
-    let scroll = app.orch_dag_scroll;
+    // When focused, stick to the bottom so the live transcript + the chat input line
+    // stay in view; when unfocused, honor the user's scroll so they can read the DAG.
+    let scroll = if focused {
+        max_scroll
+    } else {
+        app.orch_dag_scroll
+    };
 
     // When the plan overflows the pane, append a one-line scroll hint so the user
     // knows there is more below (and how to reach it).
@@ -1630,15 +1696,12 @@ pub(crate) fn render_worker(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         .agents
         .get(app.selected_agent)
         .is_some_and(|run| run.is_orchestrator());
+    // The orchestrator ALWAYS gets the custom command-center view: a live streaming
+    // transcript while planning (its raw PTY is now JSON events, not human text), and
+    // the DAG tree once a plan is ready. Both phases are rendered by render_orchestrator.
     if app.worker_view == WorkerView::Terminal && selected_is_orchestrator {
-        let plan_ready = app
-            .agents
-            .get(app.selected_agent)
-            .is_some_and(|run| matches!(orchestrator_phase(run), OrchestratorPhase::PlanReady(_)));
-        if plan_ready {
-            render_orchestrator(frame, area, app);
-            return;
-        }
+        render_orchestrator(frame, area, app);
+        return;
     }
 
     if let Some(size) = terminal_size {

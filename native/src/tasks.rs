@@ -280,6 +280,15 @@ fn assert_no_hard_cycle(tasks: &[RudderPlanTask]) -> Result<()> {
 }
 
 pub(crate) fn rudder_plan_output_for_run(run: &AgentRun) -> String {
+    // The orchestrator streams JSON events now, so its raw PTY output_log is NDJSON,
+    // not plan text. `plan_stream` reconstructs the assistant text (and, for a refine,
+    // exposes only the CURRENT turn so a stale prior block is not re-captured). Prefer
+    // it whenever present; the raw/codex-session path is a pre-ingest fallback only.
+    if let Some(stream) = run.plan_stream.as_ref() {
+        if stream.has_text() {
+            return stream.parse_text().to_string();
+        }
+    }
     let mut output = run
         .terminal
         .as_ref()
@@ -412,6 +421,16 @@ pub(crate) fn extract_rudder_plan_summary(output: &str) -> Option<String> {
 /// feedback, framed so the planner revises the whole DAG (reusing stable ids)
 /// rather than starting over. This string is the orchestrator's task; the
 /// decomposer system prompt (`rudder_plan_prompt`) still wraps it.
+/// The SLIM follow-up prompt sent on a session-RESUMED refine. The resumed session
+/// already holds the prior plan + reasoning + the files it inspected, so we send
+/// only the feedback plus the one rule that is not re-applied on resume: re-emit the
+/// full RUDDER_PLAN_TASKS block. Used when there is a session to `--resume`.
+pub(crate) fn build_refine_followup(feedback: &str) -> String {
+    format!(
+        "The user reviewed the plan you just produced and wants changes. Apply this feedback directly — do not ask questions and do not re-explain the whole plan. Keep the parts that still make sense (reuse their ids), add, remove, or edit tasks and dependencies as needed, then RE-EMIT THE FULL UPDATED PLAN as one block exactly as before:\nRUDDER_PLAN_TASKS_START\n{{\"tasks\":[...]}}\nRUDDER_PLAN_TASKS_END\nAfter the block, add a short note on what changed.\n\nUser feedback:\n{feedback}"
+    )
+}
+
 pub(crate) fn build_refine_request(original: &str, current_plan: &str, feedback: &str) -> String {
     format!(
         "You previously produced the task DAG below for the original request. The user has reviewed it and wants changes. Produce the REVISED, COMPLETE task DAG with the changes applied: keep the parts that still make sense (reuse their ids), add, remove, or edit tasks and dependencies as needed, and re-emit the full plan. Apply the user's feedback directly and do not ask questions.\n\nOriginal request:\n{original}\n\nCurrent plan:\n{current_plan}\n\nUser feedback / requested changes:\n{feedback}"

@@ -62,6 +62,8 @@ mod detect;
 use crate::detect::*;
 mod theme;
 use crate::theme::*;
+mod plan_stream;
+use crate::plan_stream::*;
 
 const TICK_RATE: Duration = Duration::from_millis(33);
 const MAX_EVENTS_PER_FRAME: usize = 64;
@@ -513,6 +515,11 @@ struct AgentRun {
     /// the REPLACE path (`evaluate_completed_plan`), so the existing plan's
     /// not-yet-launched nodes are preserved. Ordinary planners have this `false`.
     reconcile_planner: bool,
+    /// Live planner stream parser for a RudderPlan run: turns the backend's JSON
+    /// event stream into a conversation transcript + the reconstructed assistant
+    /// text the RUDDER_PLAN_TASKS parser reads, and captures the session id for
+    /// refine-via-resume. `None` for non-planner agents and until first ingest.
+    plan_stream: Option<PlanStreamState>,
 }
 
 #[derive(Debug)]
@@ -1113,6 +1120,14 @@ impl App {
             return false;
         }
 
+        // Orchestrator pane = a CHAT with the planner. Typing composes a follow-up;
+        // Enter with text refines the plan (resumes the planner conversation), Enter
+        // on an empty line approves & launches. We intercept before the PTY-forward
+        // path because the planner runs non-interactively (writing to it is useless).
+        if self.selected_is_orchestrator() {
+            return self.handle_orchestrator_chat_key(key);
+        }
+
         self.worker_selection = None;
         if self.selected_terminal_mut().is_none() {
             match key.code {
@@ -1166,6 +1181,76 @@ impl App {
         if let Some(prompt) = self.capture_selected_worker_key(key, capture_as_prompt) {
             self.record_selected_worker_prompt(prompt);
         }
+        false
+    }
+
+    /// Key handling for the orchestrator chat (worker pane on a RudderPlan run). The
+    /// draft lives on `worker_input_draft`. Enter with text refines (a follow-up turn
+    /// to the planner); Enter on an empty line approves & launches; Esc clears the
+    /// draft; PageUp/Down scroll the transcript; other printable keys type.
+    fn handle_orchestrator_chat_key(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Enter => {
+                let draft = self
+                    .agents
+                    .get(self.selected_agent)
+                    .map(|run| run.worker_input_draft.trim().to_string())
+                    .unwrap_or_default();
+                if draft.is_empty() {
+                    if self.refining {
+                        self.notice =
+                            Some("still refining — the updated plan is on its way".to_string());
+                    } else if self.awaiting_approval {
+                        self.approve_planned_queue();
+                    } else {
+                        self.notice =
+                            Some("type a message to refine the plan, or wait for it to finish".to_string());
+                    }
+                } else {
+                    if let Some(run) = self.agents.get_mut(self.selected_agent) {
+                        run.worker_input_draft.clear();
+                        run.worker_input_cursor = 0;
+                    }
+                    self.remember_task_history(&draft);
+                    self.refine_plan(&draft);
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(run) = self.agents.get_mut(self.selected_agent) {
+                    delete_char_before_cursor(
+                        &mut run.worker_input_draft,
+                        &mut run.worker_input_cursor,
+                    );
+                }
+            }
+            KeyCode::Esc => {
+                if let Some(run) = self.agents.get_mut(self.selected_agent) {
+                    run.worker_input_draft.clear();
+                    run.worker_input_cursor = 0;
+                }
+            }
+            KeyCode::PageUp => {
+                self.handle_worker_page_key(key, page_scroll_rows(self.worker_area));
+            }
+            KeyCode::PageDown => {
+                self.handle_worker_page_key(key, -page_scroll_rows(self.worker_area));
+            }
+            KeyCode::Char(ch)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                if let Some(run) = self.agents.get_mut(self.selected_agent) {
+                    insert_char_at_cursor(
+                        &mut run.worker_input_draft,
+                        &mut run.worker_input_cursor,
+                        ch,
+                    );
+                }
+            }
+            _ => {}
+        }
+        self.dirty = true;
         false
     }
 
@@ -2578,6 +2663,7 @@ impl App {
             node_id: None,
             // Discriminator: route completion to the APPEND path, not REPLACE.
             reconcile_planner: true,
+            plan_stream: None,
         };
 
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
@@ -2727,6 +2813,7 @@ impl App {
             soft_deps: Vec::new(),
             node_id,
             reconcile_planner: false,
+            plan_stream: None,
         };
 
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
@@ -2820,6 +2907,7 @@ impl App {
             soft_deps: Vec::new(),
             node_id: None,
             reconcile_planner: false,
+            plan_stream: None,
         };
 
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
@@ -2924,6 +3012,7 @@ impl App {
             soft_deps: Vec::new(),
             node_id: None,
             reconcile_planner: false,
+            plan_stream: None,
         };
 
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
@@ -2962,19 +3051,66 @@ impl App {
             self.start_rudder_plan_task(feedback);
             return;
         };
-        let original = if self.plan_request.trim().is_empty() {
-            self.planned_origin.clone()
-        } else {
-            self.plan_request.clone()
+        let (backend, model, effort, session) = {
+            let run = &self.agents[index];
+            (
+                run.backend,
+                run.model.clone(),
+                run.effort,
+                run.session_id.clone().filter(|s| !s.trim().is_empty()),
+            )
         };
-        let outline = self.current_plan_outline();
-        let composite = build_refine_request(&original, &outline, feedback);
-        // Mark the refine in flight: this keeps awaiting_approval = true (so the
-        // scheduler never launches the stale plan and Enter cannot approve it mid
-        // -refine) while still letting maybe_detect_plan_ready capture the revised
-        // DAG. evaluate_completed_plan clears `refining` once the new plan lands.
+        // FOLLOW-UP when we have a session to resume: the model already remembers the
+        // prior plan + reasoning, so send only the slim feedback and RESUME the
+        // conversation (claude --resume / codex exec resume). Otherwise fall back to a
+        // fresh decompose with the full context crammed into the prompt.
+        let resume = session.is_some();
+        let command = match &session {
+            Some(sid) => rudder_plan_refine_command(
+                backend,
+                &model,
+                effort,
+                &build_refine_followup(feedback),
+                sid,
+            ),
+            None => {
+                let original = if self.plan_request.trim().is_empty() {
+                    self.planned_origin.clone()
+                } else {
+                    self.plan_request.clone()
+                };
+                let outline = self.current_plan_outline();
+                let composite = build_refine_request(&original, &outline, feedback);
+                agent_command(
+                    backend,
+                    &model,
+                    effort,
+                    &composite,
+                    AgentMode::RudderPlan,
+                    mint_session_id_for(backend).as_deref(),
+                )
+            }
+        };
+        // Mark the refine in flight: keeps awaiting_approval = true (the scheduler
+        // never launches the stale plan and Enter cannot approve it mid-refine) while
+        // maybe_detect_plan_ready still captures the revised DAG. evaluate_completed_plan
+        // clears `refining` once the new plan lands.
         self.refining = true;
-        if self.relaunch_orchestrator_with(index, composite, feedback) {
+        if let Some(run) = self.agents.get_mut(index) {
+            if resume {
+                // Keep the conversation transcript; append "you: <feedback>" and move
+                // the parse baseline so the prior block is not re-captured. Re-point
+                // ingest at the new PTY without wiping the pane.
+                if let Some(stream) = run.plan_stream.as_mut() {
+                    stream.begin_user_turn(feedback);
+                    stream.rebind_stream();
+                }
+            } else {
+                // Fresh re-plan (no session): start a clean transcript.
+                run.plan_stream = Some(PlanStreamState::new());
+            }
+        }
+        if self.relaunch_orchestrator_with(index, command, feedback) {
             self.notice = Some("refining the plan with your feedback…".to_string());
         } else {
             // The planner could not be relaunched: drop back to the existing plan so
@@ -3019,20 +3155,16 @@ impl App {
     /// Re-launch an existing orchestrator run (by index) with a NEW composite task
     /// and re-arm autosteer so its revised plan is captured. Mirrors the spawn in
     /// start_rudder_plan_task but reuses the pinned orchestrator row in place.
-    fn relaunch_orchestrator_with(&mut self, index: usize, new_task: String, feedback: &str) -> bool {
+    fn relaunch_orchestrator_with(
+        &mut self,
+        index: usize,
+        command: TerminalCommand,
+        feedback: &str,
+    ) -> bool {
         let cwd = self.cwd.clone();
         let Some(run) = self.agents.get_mut(index) else {
             return false;
         };
-        let session_id = mint_session_id_for(run.backend);
-        let command = agent_command(
-            run.backend,
-            &run.model,
-            run.effort,
-            &new_task,
-            AgentMode::RudderPlan,
-            session_id.as_deref(),
-        );
         let options = TerminalPaneOptions {
             size: run.terminal_size.unwrap_or_default(),
             cwd: Some(run.cwd.clone()),
@@ -3042,8 +3174,10 @@ impl App {
             Ok(mut terminal) => {
                 let _ = terminal.drain_output();
                 run.terminal = Some(terminal);
-                run.task = new_task.clone();
-                run.current_prompt = new_task;
+                // Record the follow-up as a turn; KEEP run.task (the original label)
+                // and run.session_id (so the next refine can resume the same session;
+                // a fresh-fallback's new id is captured from the stream on ingest).
+                run.current_prompt = feedback.to_string();
                 let now = now_stamp();
                 run.turns.push(AgentTurn {
                     ts: now.clone(),
@@ -3052,7 +3186,6 @@ impl App {
                 });
                 run.last_user_input_at = now;
                 run.status = AgentStatus::Running;
-                run.session_id = session_id;
                 run.completed_at = None;
                 run.last_output_at = Instant::now();
                 run.autosteered = true;
@@ -3975,6 +4108,7 @@ impl App {
             soft_deps: Vec::new(),
             node_id: None,
             reconcile_planner: false,
+            plan_stream: None,
         };
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
             Ok(mut terminal) => {
@@ -5572,6 +5706,22 @@ What to do\n\
             let had_output = !terminal.drain_output().is_empty();
             if had_output {
                 any_dirty = true;
+            }
+            // Feed the orchestrator's JSON event stream into its live transcript +
+            // reconstructed plan text, and capture the backend session id so a refine
+            // can resume the same conversation. Incremental: a no-op when no new bytes.
+            if run.mode == AgentMode::RudderPlan {
+                let snapshot = terminal.output_log_snapshot().to_string();
+                let stream = run.plan_stream.get_or_insert_with(PlanStreamState::new);
+                if stream.ingest(&snapshot) {
+                    changed = true;
+                }
+                let captured = stream.session_id().map(str::to_string);
+                if run.session_id.is_none() {
+                    if let Some(sid) = captured {
+                        run.session_id = Some(sid);
+                    }
+                }
             }
             if had_output {
                 run.last_output_at = Instant::now();

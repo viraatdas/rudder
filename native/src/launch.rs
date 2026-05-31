@@ -66,6 +66,66 @@ pub(crate) fn codex_resume_command(run: &AgentRun, session_id: &str) -> Terminal
     TerminalCommand::with_args(codex_program(), args).with_env("CODEX_RUDDER_SCROLLBACK_SAFE", "1")
 }
 
+/// Build the REFINE follow-up command for the orchestrator: RESUME the planner's
+/// existing session so it remembers the prior plan + reasoning, and send only the
+/// slim feedback prompt (the system prompt is already in the session). Claude:
+/// `--resume <sid>`; Codex: `exec resume <sid>`. Same JSON streaming + read-only
+/// tool allowlist as the first turn, so plan_stream.rs keeps rendering the live
+/// transcript and the revised RUDDER_PLAN_TASKS block parses the same way.
+pub(crate) fn rudder_plan_refine_command(
+    backend: Backend,
+    model: &str,
+    effort: Option<EffortLevel>,
+    feedback_prompt: &str,
+    session_id: &str,
+) -> TerminalCommand {
+    match backend {
+        Backend::Claude => {
+            let mut args = vec![
+                "-p".to_string(),
+                "--output-format".to_string(),
+                "stream-json".to_string(),
+                "--include-partial-messages".to_string(),
+                "--verbose".to_string(),
+                "--permission-mode".to_string(),
+                "default".to_string(),
+                "--tools".to_string(),
+                CLAUDE_DECOMPOSER_TOOLS.to_string(),
+                "--allowedTools".to_string(),
+                CLAUDE_DECOMPOSER_TOOLS.to_string(),
+                "--disallowedTools".to_string(),
+                CLAUDE_DECOMPOSER_DISALLOWED.to_string(),
+            ];
+            if !model.trim().is_empty() {
+                args.push("--model".to_string());
+                args.push(model.to_string());
+            }
+            if let Some(effort) = effort {
+                args.push("--effort".to_string());
+                args.push(effort.as_str().to_string());
+            }
+            args.push("--resume".to_string());
+            args.push(session_id.to_string());
+            args.push(feedback_prompt.to_string());
+            TerminalCommand::with_args("claude", args).with_env("CLAUDE_CODE_NO_FLICKER", "0")
+        }
+        Backend::Codex => {
+            // `codex exec resume [OPTIONS] <SESSION_ID> [PROMPT]`. No --sandbox here:
+            // it inherits the read-only sandbox from the resumed session.
+            let mut args = vec!["exec".to_string(), "resume".to_string(), "--json".to_string()];
+            push_codex_rudder_config_overrides(&mut args, effort);
+            if !model.trim().is_empty() {
+                args.push("-m".to_string());
+                args.push(model.to_string());
+            }
+            args.push(session_id.to_string());
+            args.push(feedback_prompt.to_string());
+            TerminalCommand::with_args(codex_program(), args)
+                .with_env("CODEX_RUDDER_SCROLLBACK_SAFE", "1")
+        }
+    }
+}
+
 pub(crate) fn agent_command(
     backend: Backend,
     model: &str,
@@ -103,15 +163,17 @@ pub(crate) fn agent_command(
                 // implement; it only inspects and emits the task DAG, and Rudder
                 // spawns the separate worker agents.
                 AgentMode::RudderPlan => vec![
-                    // Print mode: run non-interactively so the decomposition streams
-                    // as clean stdout that Rudder parses, then the process exits.
-                    // NOT the interactive Claude Code TUI (which buried the plan
-                    // block and sat waiting for input).
+                    // Print mode: run non-interactively so Rudder parses the plan and
+                    // the process exits. NOT the interactive Claude Code TUI.
                     "-p".to_string(),
-                    // Verbose so the planner streams its repo-inspection steps (the
-                    // files it reads/greps) into the pane as it works, instead of the
-                    // pane sitting silent during the model's thinking phase. The
-                    // RUDDER_PLAN_TASKS block still appears at the end and parses.
+                    // Stream the event log as JSONL so the orchestrator pane can show
+                    // the model thinking + inspecting files + writing the plan live
+                    // (plain -p hides thinking, leaving a silent gap). plan_stream.rs
+                    // parses these events into a transcript and reconstructs the
+                    // assistant text the RUDDER_PLAN_TASKS parser reads.
+                    "--output-format".to_string(),
+                    "stream-json".to_string(),
+                    "--include-partial-messages".to_string(),
                     "--verbose".to_string(),
                     "--permission-mode".to_string(),
                     "default".to_string(),
@@ -138,13 +200,13 @@ pub(crate) fn agent_command(
                 args.push("--effort".to_string());
                 args.push(effort.as_str().to_string());
             }
-            // The orchestrator runs one-shot in print mode, so it needs no resumable
-            // session id (passing one is meaningless for a non-interactive print run).
+            // Pass the session id for every mode including RudderPlan: the planner
+            // now persists a resumable session so a refinement can `--resume` it as
+            // a follow-up turn (the model remembers the prior plan) instead of
+            // re-planning from scratch. See rudder_plan_refine_command.
             if let Some(sid) = session_id {
-                if mode != AgentMode::RudderPlan {
-                    args.push("--session-id".to_string());
-                    args.push(sid.to_string());
-                }
+                args.push("--session-id".to_string());
+                args.push(sid.to_string());
             }
             if let Some(prompt) = prompt {
                 args.push(prompt);
@@ -158,6 +220,9 @@ pub(crate) fn agent_command(
             if mode == AgentMode::RudderPlan {
                 let mut args = vec![
                     "exec".to_string(),
+                    // Emit events as JSONL so plan_stream.rs can render a live
+                    // transcript and capture the thread id (for `exec resume`).
+                    "--json".to_string(),
                     "--sandbox".to_string(),
                     "read-only".to_string(),
                 ];
@@ -284,6 +349,7 @@ pub(crate) fn review_all_run(
         soft_deps: Vec::new(),
         node_id: None,
         reconcile_planner: false,
+        plan_stream: None,
     }
 }
 
