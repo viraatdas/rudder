@@ -2475,6 +2475,7 @@ branch refs/heads/main\n";
             deps: Vec::new(),
             soft_deps: Vec::new(),
             node_id: None,
+            reconcile_planner: false,
         }
     }
 
@@ -2890,6 +2891,7 @@ branch refs/heads/main\n";
             deps: Vec::new(),
             soft_deps: Vec::new(),
             node_id: None,
+            reconcile_planner: false,
         });
 
         app.delete_selected_agent();
@@ -3352,6 +3354,272 @@ branch refs/heads/main\n";
             app.agents.iter().all(|run| run.node_id.is_none()),
             "evaluate must not launch any worker"
         );
+    }
+
+    // --- RECONCILE: add work into the existing DAG ---------------------------
+
+    /// A RudderPlan agent flagged as a reconcile planner, whose PTY printed the
+    /// given RUDDER_PLAN_TASKS block. Used to drive the APPEND path in tests.
+    #[cfg(not(windows))]
+    fn reconcile_planner_with_block(app: &App, block: &str) -> AgentRun {
+        let mut run = planner_with_block(app, block);
+        run.reconcile_planner = true;
+        run.task = "add a docs page".to_string();
+        run
+    }
+
+    #[test]
+    fn second_task_routes_to_reconcile_when_plan_active() {
+        let mut app = App::new();
+        app.cwd = std::env::temp_dir();
+        // A plan is active: a node is queued. A newly typed task must reconcile into
+        // the existing plan, not spawn a fresh planner that would replace it.
+        app.planned_nodes = vec![test_planned_node("n0", &[])];
+        assert!(app.plan_is_active(), "queued nodes mean a plan is active");
+
+        let before_agents = app.agents.len();
+        let before_nodes = app.planned_nodes.len();
+        app.start_task_from_input("add a second feature");
+
+        // Exactly one new agent appeared and it is a reconcile planner (not a fresh
+        // initial planner). The existing queued node is untouched (not replaced).
+        assert_eq!(app.agents.len(), before_agents + 1, "one planner spawned");
+        let spawned = app.agents.last().expect("a spawned planner");
+        assert_eq!(spawned.mode, AgentMode::RudderPlan);
+        assert!(
+            spawned.reconcile_planner,
+            "an active plan routes the second task to a RECONCILE planner"
+        );
+        assert_eq!(
+            app.planned_nodes.len(),
+            before_nodes,
+            "the existing queued node is preserved, not wiped by a fresh plan"
+        );
+    }
+
+    #[test]
+    fn no_plan_active_first_task_uses_initial_planner_not_reconcile() {
+        let mut app = App::new();
+        app.cwd = std::env::temp_dir();
+        // No nodes queued, no orchestrator, no live plan-launched agent.
+        assert!(!app.plan_is_active(), "no plan active on a clean session");
+
+        app.start_task_from_input("build the first feature");
+
+        let spawned = app.agents.last().expect("a spawned planner");
+        assert_eq!(spawned.mode, AgentMode::RudderPlan);
+        assert!(
+            !spawned.reconcile_planner,
+            "the first task with no active plan uses the INITIAL planner (replace path)"
+        );
+    }
+
+    #[test]
+    fn plan_active_when_unmerged_node_agent_running() {
+        let mut app = App::new();
+        app.cwd = std::env::temp_dir();
+        // No queued nodes, but a plan-launched agent is still running (not merged).
+        app.agents.push(node_agent("n0", AgentStatus::Running));
+        assert!(
+            app.plan_is_active(),
+            "an unmerged plan-launched agent keeps the plan active"
+        );
+
+        // Once that agent merges and nothing else is in flight, the plan is no
+        // longer active and the next task starts a fresh plan.
+        app.agents[0].status = AgentStatus::Merged;
+        assert!(
+            !app.plan_is_active(),
+            "a fully-merged plan is no longer active"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn evaluate_completed_reconcile_appends_and_does_not_replace() {
+        let mut app = App::new();
+        app.cwd = std::env::temp_dir();
+        // Existing plan: two queued nodes n0 + n1, gating for approval so the
+        // append does not immediately schedule (we inspect the queue directly).
+        app.planned_nodes = vec![test_planned_node("n0", &[]), test_planned_node("n1", &["n0"])];
+        app.planned_origin = "build it".to_string();
+        app.awaiting_approval = true;
+
+        // Reconcile planner returns ONE node with a soft dep on the queued node n1.
+        let block = "RUDDER_PLAN_TASKS_START\n{\"tasks\":[\
+            {\"id\":\"new\",\"title\":\"docs\",\"prompt\":\"write docs\",\"goal\":\"docs\",\"success\":\"docs build\",\"deps\":[{\"on\":\"n1\",\"type\":\"soft\"}]}\
+        ]}\nRUDDER_PLAN_TASKS_END\n";
+        let planner = reconcile_planner_with_block(&app, block);
+        let planner_index = app.agents.len();
+        app.agents.push(planner);
+
+        app.evaluate_completed_reconcile(planner_index);
+
+        // Both existing queued nodes survived (NOT replaced); the new node was
+        // APPENDED (push). The queue now holds n0, n1, and new.
+        let queued_ids: Vec<&str> = app.planned_nodes.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(app.planned_nodes.len(), 3, "appended, not replaced: {queued_ids:?}");
+        assert!(queued_ids.contains(&"n0"), "existing node n0 preserved: {queued_ids:?}");
+        assert!(queued_ids.contains(&"n1"), "existing node n1 preserved: {queued_ids:?}");
+        assert!(queued_ids.contains(&"new"), "new node appended: {queued_ids:?}");
+        // The appended node carries its soft dep on the queued node n1.
+        let added = app.planned_nodes.iter().find(|n| n.id == "new").unwrap();
+        assert_eq!(added.soft_deps, vec!["n1".to_string()], "soft dep on n1 retained");
+        assert!(added.deps.is_empty(), "no hard dep");
+        // The transient reconcile planner was removed (no lingering orchestrator).
+        assert!(
+            !app.agents.iter().any(|run| run.reconcile_planner),
+            "reconcile planner removed after append"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn evaluate_completed_reconcile_schedules_when_session_running() {
+        let mut app = App::new();
+        app.cwd = std::env::temp_dir();
+        // No queued nodes, but a plan-launched agent n0 is running: the session is
+        // approved/running (not awaiting approval), so an appended ready node should
+        // be drained into a live worker by the scheduler.
+        app.agents.push(node_agent("n0", AgentStatus::Running));
+        app.planned_origin = "build it".to_string();
+        app.awaiting_approval = false;
+
+        // The added node is fully independent (no deps), so it is ready immediately.
+        let block = "RUDDER_PLAN_TASKS_START\n{\"tasks\":[\
+            {\"id\":\"new\",\"title\":\"docs\",\"prompt\":\"write docs\",\"goal\":\"docs\",\"success\":\"ok\"}\
+        ]}\nRUDDER_PLAN_TASKS_END\n";
+        let planner = reconcile_planner_with_block(&app, block);
+        let planner_index = app.agents.len();
+        app.agents.push(planner);
+
+        app.evaluate_completed_reconcile(planner_index);
+
+        // The scheduler launched the ready appended node: it left the queue and now
+        // exists as a node-tagged worker agent.
+        assert!(
+            app.planned_nodes.iter().all(|n| n.id != "new"),
+            "ready appended node was scheduled out of the queue"
+        );
+        assert!(
+            app.agents.iter().any(|run| {
+                run.node_id.as_deref() == Some("new") || run.node_id.as_deref() == Some("new-2")
+            }),
+            "the appended node launched as a node-tagged agent"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn evaluate_completed_reconcile_uniquifies_colliding_id() {
+        let mut app = App::new();
+        app.cwd = std::env::temp_dir();
+        // An existing queued node already uses id "new"; the reconcile node also
+        // claims "new" and must be uniquified so dep resolution stays unambiguous.
+        app.planned_nodes = vec![test_planned_node("new", &[])];
+        app.awaiting_approval = true; // initial plan still gating
+
+        let block = "RUDDER_PLAN_TASKS_START\n{\"tasks\":[\
+            {\"id\":\"new\",\"title\":\"docs\",\"prompt\":\"write docs\",\"goal\":\"docs\",\"success\":\"ok\"}\
+        ]}\nRUDDER_PLAN_TASKS_END\n";
+        let planner = reconcile_planner_with_block(&app, block);
+        let planner_index = app.agents.len();
+        app.agents.push(planner);
+
+        app.evaluate_completed_reconcile(planner_index);
+
+        let ids: Vec<&str> = app.planned_nodes.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(app.planned_nodes.len(), 2, "both nodes queued: {ids:?}");
+        assert!(ids.contains(&"new"), "original id kept: {ids:?}");
+        assert!(
+            ids.iter().any(|id| *id == "new-2"),
+            "colliding id was uniquified to new-2: {ids:?}"
+        );
+        // Awaiting approval: the appended node is left QUEUED, nothing launched.
+        assert!(
+            !app.agents.iter().any(|run| run.node_id.is_some()),
+            "nothing launches while the plan awaits approval"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn evaluate_completed_reconcile_no_deps_falls_back_to_soft_frontier() {
+        let mut app = App::new();
+        app.cwd = std::env::temp_dir();
+        // Frontier: one queued node n0 + one running plan-launched agent n1. Gate
+        // for approval so the no-deps node stays queued (we inspect its soft edges).
+        app.planned_nodes = vec![test_planned_node("n0", &[])];
+        app.agents.push(node_agent("n1", AgentStatus::Running));
+        app.awaiting_approval = true;
+
+        // Reconcile planner returns a node with NO deps at all.
+        let block = "RUDDER_PLAN_TASKS_START\n{\"tasks\":[\
+            {\"id\":\"new\",\"title\":\"docs\",\"prompt\":\"write docs\",\"goal\":\"docs\",\"success\":\"ok\"}\
+        ]}\nRUDDER_PLAN_TASKS_END\n";
+        let planner = reconcile_planner_with_block(&app, block);
+        let planner_index = app.agents.len();
+        app.agents.push(planner);
+
+        app.evaluate_completed_reconcile(planner_index);
+
+        let added = app
+            .planned_nodes
+            .iter()
+            .find(|n| n.id == "new")
+            .expect("appended node present");
+        // FALLBACK: a soft edge to every current frontier id (n0 and n1), and no
+        // hard deps so it can never deadlock.
+        assert!(added.deps.is_empty(), "no hard deps from the fallback");
+        let mut soft = added.soft_deps.clone();
+        soft.sort();
+        assert_eq!(
+            soft,
+            vec!["n0".to_string(), "n1".to_string()],
+            "no-deps node gets soft edges to the whole frontier"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn reconcile_planner_is_discriminated_from_initial_planner() {
+        let mut app = App::new();
+        app.cwd = std::env::temp_dir();
+        // An initial planner (replace) and a reconcile planner (append) both Done.
+        let block_initial = "RUDDER_PLAN_TASKS_START\n{\"tasks\":[{\"id\":\"n0\",\"title\":\"a\",\"prompt\":\"do a\",\"goal\":\"a\",\"success\":\"ok\"}]}\nRUDDER_PLAN_TASKS_END\n";
+        let initial = planner_with_block(&app, block_initial);
+        assert!(!initial.reconcile_planner, "initial planner is not a reconcile planner");
+
+        let block_reconcile = "RUDDER_PLAN_TASKS_START\n{\"tasks\":[{\"id\":\"new\",\"title\":\"b\",\"prompt\":\"do b\",\"goal\":\"b\",\"success\":\"ok\"}]}\nRUDDER_PLAN_TASKS_END\n";
+        let reconcile = reconcile_planner_with_block(&app, block_reconcile);
+        assert!(reconcile.reconcile_planner, "reconcile planner carries the discriminator");
+
+        // The discriminator is what the poll loop branches on: capture the initial
+        // plan (replace) and verify the queue holds exactly its node.
+        app.agents.push(initial);
+        app.evaluate_completed_plan(0);
+        assert_eq!(app.planned_nodes.len(), 1);
+        assert_eq!(app.planned_nodes[0].id, "n0", "initial plan captured via replace path");
+    }
+
+    #[test]
+    fn reconcile_prompt_names_frontier_and_asks_for_one_node() {
+        let frontier = vec![
+            ("n0".to_string(), "build api".to_string()),
+            ("n1".to_string(), "build ui".to_string()),
+        ];
+        let prompt = rudder_reconcile_prompt("add a docs page", &frontier);
+        // Plan-mode safety mirrors the initial planner.
+        assert!(prompt.contains("Do NOT call ExitPlanMode"));
+        assert!(prompt.contains("plan mode"));
+        // It names the existing frontier nodes and asks for exactly one new node.
+        assert!(prompt.contains("n0: build api"), "frontier listed: {prompt}");
+        assert!(prompt.contains("n1: build ui"), "frontier listed: {prompt}");
+        assert!(prompt.contains("EXACTLY ONE node"), "asks for one node: {prompt}");
+        assert!(prompt.contains("unique from every existing node id"));
+        assert!(prompt.contains("hard") && prompt.contains("soft"));
+        assert!(prompt.contains("ALREADY in flight"), "states the plan is in flight");
+        assert!(prompt.contains("RUDDER_PLAN_TASKS_START") && prompt.contains("RUDDER_PLAN_TASKS_END"));
     }
 
     #[test]

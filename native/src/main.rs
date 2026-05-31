@@ -480,6 +480,12 @@ struct AgentRun {
     /// scheduler. `None` for manually started agents and planner runs. When the
     /// run reaches Merged, this id enters the merged set and unblocks dependents.
     node_id: Option<String>,
+    /// True when this is a RECONCILE planner: a RudderPlan agent spawned to fold
+    /// one ADDED task into an already-active plan. The poll loop routes its
+    /// completion to the APPEND path (`evaluate_completed_reconcile`) instead of
+    /// the REPLACE path (`evaluate_completed_plan`), so the existing plan's
+    /// not-yet-launched nodes are preserved. Ordinary planners have this `false`.
+    reconcile_planner: bool,
 }
 
 #[derive(Debug)]
@@ -2286,12 +2292,219 @@ impl App {
 
         if self.plan_mode {
             // Explicit /plan mode: a read-only planner that never spawns workers.
+            // The /plan toggle is unchanged by reconcile: it always runs a fresh
+            // read-only planner regardless of any active plan.
             self.start_plan_task(&input);
-        } else {
-            // Default: run the adaptive planner. It inspects the repo read-only and
-            // emits a task list; the poll loop then either auto-runs a single task
-            // or gates a multi-task plan for the user to approve (Enter) or discard.
-            self.start_rudder_plan_task(&input);
+            return;
+        }
+
+        // RECONCILE: when a plan is already active, a second task must be folded
+        // INTO the existing DAG, not handed to a fresh planner that would replace
+        // it. Route to the append pipeline and return so the in-flight nodes are
+        // preserved. The no-plan-active first task falls through to the planner.
+        if self.plan_is_active() {
+            self.reconcile_injection(&input);
+            return;
+        }
+
+        // Default first task (no active plan): run the adaptive planner. It
+        // inspects the repo read-only and emits a task DAG; the poll loop then
+        // gates the plan for the user to approve (Enter) or discard.
+        self.start_rudder_plan_task(&input);
+    }
+
+    /// True when a plan is currently active: nodes are queued/awaiting approval,
+    /// an orchestrator is still planning, OR at least one plan-launched agent (one
+    /// carrying a `node_id`) has not yet merged. While this holds, a newly typed
+    /// task is RECONCILED into the existing plan instead of starting a fresh one.
+    fn plan_is_active(&self) -> bool {
+        if !self.planned_nodes.is_empty() || self.has_planning_orchestrator() {
+            return true;
+        }
+        self.agents
+            .iter()
+            .any(|run| run.node_id.is_some() && run.status != AgentStatus::Merged)
+    }
+
+    /// The current plan FRONTIER: the `(id, title)` of every node the added task
+    /// can depend on. That is the still-queued planned nodes PLUS every
+    /// plan-launched agent (carrying a `node_id`) that has not yet merged.
+    fn plan_frontier(&self) -> Vec<(String, String)> {
+        let mut frontier: Vec<(String, String)> = self
+            .planned_nodes
+            .iter()
+            .map(|node| (node.id.clone(), node.title.clone()))
+            .collect();
+        for run in &self.agents {
+            if run.status == AgentStatus::Merged {
+                continue;
+            }
+            let Some(node_id) = run.node_id.as_ref() else {
+                continue;
+            };
+            if frontier.iter().any(|(id, _)| id == node_id) {
+                continue;
+            }
+            frontier.push((node_id.clone(), run.task_summary.clone()));
+        }
+        frontier
+    }
+
+    /// Build the RECONCILE planner command: same plan-mode + read-only backend
+    /// flags as the orchestrator, but carrying the reconcile prompt directly (which
+    /// is already plan-mode-safe) instead of the fresh-plan prompt. Mirrors the
+    /// `AgentMode::RudderPlan` branch of `agent_command` without re-wrapping the
+    /// prompt as a brand-new plan.
+    fn reconcile_planner_command(
+        &self,
+        backend: Backend,
+        model: &str,
+        effort: Option<EffortLevel>,
+        prompt: &str,
+        session_id: Option<&str>,
+    ) -> TerminalCommand {
+        match backend {
+            Backend::Claude => {
+                let mut args = vec![
+                    "--permission-mode".to_string(),
+                    "plan".to_string(),
+                    "--name".to_string(),
+                    format!("reconcile:{}", short_task(prompt)),
+                ];
+                if !model.trim().is_empty() {
+                    args.push("--model".to_string());
+                    args.push(model.to_string());
+                }
+                if let Some(effort) = effort {
+                    args.push("--effort".to_string());
+                    args.push(effort.as_str().to_string());
+                }
+                if let Some(sid) = session_id {
+                    args.push("--session-id".to_string());
+                    args.push(sid.to_string());
+                }
+                args.push(prompt.to_string());
+                TerminalCommand::with_args("claude", args).with_env("CLAUDE_CODE_NO_FLICKER", "0")
+            }
+            Backend::Codex => {
+                let mut args = vec!["--no-alt-screen".to_string()];
+                args.push("--enable".to_string());
+                args.push("goals".to_string());
+                args.push("--sandbox".to_string());
+                args.push("read-only".to_string());
+                args.push("--ask-for-approval".to_string());
+                args.push("never".to_string());
+                args.push("--search".to_string());
+                push_codex_rudder_config_overrides(&mut args, effort);
+                if !model.trim().is_empty() {
+                    args.push("-m".to_string());
+                    args.push(model.to_string());
+                }
+                args.push(prompt.to_string());
+                TerminalCommand::with_args(codex_program(), args)
+                    .with_env("CODEX_RUDDER_SCROLLBACK_SAFE", "1")
+            }
+        }
+    }
+
+    /// Fold an ADDED task into the active plan. Spawns a RudderPlan agent flagged as
+    /// a RECONCILE planner whose prompt names the current frontier and asks for
+    /// exactly one new node with inferred deps. The poll loop routes that planner's
+    /// completion to `evaluate_completed_reconcile`, which APPENDS the node to
+    /// `planned_nodes` (never replaces) and schedules it if the session is running.
+    fn reconcile_injection(&mut self, input: &str) {
+        let frontier = self.plan_frontier();
+        let model = self.model.clone();
+        let backend = self.backend;
+        // Reconciling one task against a known frontier does not need max reasoning;
+        // cap the planner's effort just like the initial planner does.
+        let effort = match self.effort {
+            Some(EffortLevel::High) | Some(EffortLevel::XHigh) | Some(EffortLevel::Max) => {
+                Some(EffortLevel::Medium)
+            }
+            other => other,
+        };
+        let session_id = mint_session_id_for(backend);
+        let prompt = rudder_reconcile_prompt(input, &frontier);
+        let command =
+            self.reconcile_planner_command(backend, &model, effort, &prompt, session_id.as_deref());
+        let options = TerminalPaneOptions {
+            size: TerminalSize::default(),
+            cwd: Some(self.cwd.clone()),
+            ..TerminalPaneOptions::default()
+        };
+
+        let created_at = now_stamp();
+        let mut run = AgentRun {
+            id: new_run_id(input),
+            created_at: created_at.clone(),
+            mode: AgentMode::RudderPlan,
+            task: input.to_string(),
+            task_summary: format!("add {}", summarize_task(input)),
+            current_prompt: input.to_string(),
+            turns: vec![AgentTurn {
+                ts: created_at.clone(),
+                prompt: input.to_string(),
+                source: "user".to_string(),
+            }],
+            last_user_input_at: created_at,
+            backend,
+            model,
+            effort,
+            status: AgentStatus::Running,
+            cwd: self.cwd.clone(),
+            worktree_branch: None,
+            worktree_path: None,
+            workspace_name: None,
+            jj_change_id: None,
+            session_id,
+            terminal: None,
+            terminal_size: None,
+            review_terminal: None,
+            review_size: None,
+            review_error: None,
+            last_output_at: Instant::now(),
+            completed_at: None,
+            autosteered: true,
+            needs_permission: false,
+            permission_notified: false,
+            needs_user_input: false,
+            user_input_notified: false,
+            last_error: None,
+            worker_input_draft: String::new(),
+            worker_input_cursor: 0,
+            worker_input_is_prompt: false,
+            last_drain_at: None,
+            review_source_ids: Vec::new(),
+            deps: Vec::new(),
+            soft_deps: Vec::new(),
+            node_id: None,
+            // Discriminator: route completion to the APPEND path, not REPLACE.
+            reconcile_planner: true,
+        };
+
+        match TerminalPane::spawn_shell_or_command(Some(command), options) {
+            Ok(mut terminal) => {
+                let _ = terminal.drain_output();
+                run.terminal = Some(terminal);
+                self.notice = Some("reconciling added task into the plan".to_string());
+            }
+            Err(error) => {
+                run.status = AgentStatus::Failed;
+                run.last_error = Some(error.to_string());
+                self.notice = Some(format!(
+                    "failed to start {} reconcile planner: {error}",
+                    backend.as_str()
+                ));
+            }
+        }
+
+        self.agents.push(run);
+        self.selected_agent = self.agents.len().saturating_sub(1);
+        self.delete_pending = None;
+        self.focus = FocusPane::Worker;
+        if let Some(run) = self.agents.get(self.selected_agent) {
+            let _ = save_native_run_record(&self.cwd, run);
         }
     }
 
@@ -2416,6 +2629,7 @@ impl App {
             deps: node_deps,
             soft_deps: Vec::new(),
             node_id,
+            reconcile_planner: false,
         };
 
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
@@ -2508,6 +2722,7 @@ impl App {
             deps: Vec::new(),
             soft_deps: Vec::new(),
             node_id: None,
+            reconcile_planner: false,
         };
 
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
@@ -2607,6 +2822,7 @@ impl App {
             deps: Vec::new(),
             soft_deps: Vec::new(),
             node_id: None,
+            reconcile_planner: false,
         };
 
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
@@ -3533,6 +3749,7 @@ impl App {
             deps: Vec::new(),
             soft_deps: Vec::new(),
             node_id: None,
+            reconcile_planner: false,
         };
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
             Ok(mut terminal) => {
@@ -3643,13 +3860,31 @@ impl App {
     /// `autosteered` flag on the run gates re-entry, and we only act while no plan
     /// is already pending approval / queued.
     fn maybe_detect_plan_ready(&mut self) {
-        // A plan is already captured (awaiting approval, or some nodes queued): do
-        // not re-capture from a still-streaming orchestrator.
+        // RECONCILE planners are detected FIRST and independently of the
+        // initial-plan guard below: a reconcile planner runs WHILE a plan is
+        // already active (planned_nodes non-empty, possibly awaiting approval), so
+        // it must be captured from streaming output regardless of that state.
+        // Plan mode may block the planner at an approval prompt without exiting, so
+        // we route as soon as a parseable block appears in the live output.
+        let reconcile_index = self.agents.iter().position(|run| {
+            run.mode == AgentMode::RudderPlan
+                && run.reconcile_planner
+                && run.autosteered
+                && extract_rudder_plan_tasks(&rudder_plan_output_for_run(run)).is_ok()
+        });
+        if let Some(index) = reconcile_index {
+            self.evaluate_completed_reconcile(index);
+            return;
+        }
+
+        // INITIAL plan: a fresh plan is already captured (awaiting approval, or
+        // some nodes queued): do not re-capture from a still-streaming orchestrator.
         if self.awaiting_approval || !self.planned_nodes.is_empty() {
             return;
         }
         let index = self.agents.iter().position(|run| {
             run.mode == AgentMode::RudderPlan
+                && !run.reconcile_planner
                 && run.autosteered
                 && extract_rudder_plan_tasks(&rudder_plan_output_for_run(run)).is_ok()
         });
@@ -3711,6 +3946,131 @@ impl App {
             "plan ready: {count} node(s). Enter approve · d remove/discard"
         ));
         self.dirty = true;
+    }
+
+    /// APPEND a reconcile planner's node(s) into the active plan (parallel to
+    /// `evaluate_completed_plan`, but it pushes instead of replacing). Each parsed
+    /// task becomes a PlannedNode whose id is UNIQUIFIED against the existing
+    /// planned-node ids and agent node ids (so dep ids resolve), then PUSHED onto
+    /// `planned_nodes`. FALLBACK: a node the model returned with no deps gets a SOFT
+    /// edge to every current frontier id (mirrors src/scheduler.ts:901-911) so the
+    /// added work is aware of the in-flight work but never deadlocks. The reconcile
+    /// planner agent is then removed. If the session is already approved/running
+    /// (not awaiting approval), the scheduler runs so the new node launches when its
+    /// deps are met; if the initial plan is still awaiting approval, the node is
+    /// left queued so it becomes part of the plan the user approves.
+    fn evaluate_completed_reconcile(&mut self, index: usize) {
+        // Read + validate the planner run inside a scoped mutable borrow, then drop
+        // it before touching other `self` state (frontier, uniquify, append). On a
+        // parse failure the captured-once flag is cleared and we bail.
+        let (planner_task, output) = {
+            let Some(run) = self.agents.get_mut(index) else {
+                return;
+            };
+            if run.mode != AgentMode::RudderPlan || !run.reconcile_planner || !run.autosteered {
+                return;
+            }
+            // Clear the captured-once flag now so a re-poll of the same Done planner
+            // is a no-op even if it lingers a moment before removal.
+            run.autosteered = false;
+            let _ = save_native_run_record(&self.cwd, run);
+            (run.task.clone(), rudder_plan_output_for_run(run))
+        };
+
+        // The frontier the new node(s) reconcile against: existing queued nodes plus
+        // not-yet-merged plan-launched agents. The reconcile planner carries no node
+        // id, so it never appears in the frontier. Feeds BOTH the dep parser (so
+        // cross-block deps on these ids survive) and the no-deps soft fallback.
+        let frontier: Vec<String> = self
+            .plan_frontier()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+
+        let tasks = match extract_rudder_plan_tasks_with_frontier(&output, &frontier) {
+            Ok(tasks) => tasks,
+            Err(error) => {
+                self.notice =
+                    Some(format!("added task did not produce a runnable node: {error}"));
+                return;
+            }
+        };
+        if tasks.is_empty() {
+            self.notice = Some("added task produced no runnable node".to_string());
+            return;
+        }
+
+        let mut appended = 0usize;
+        for task in &tasks {
+            let mut node = PlannedNode::from_task(task);
+            // UNIQUIFY against every id already known to the plan (queued nodes +
+            // launched agent node ids) so the appended node's id never collides and
+            // its dep ids continue to resolve against the real frontier.
+            node.id = self.uniquify_node_id(&node.id);
+
+            // FALLBACK: the model returned no dependencies. Attach a SOFT edge to
+            // every current frontier id so the added work is aware of in-flight
+            // work, but it can never deadlock (soft edges never gate launch).
+            if node.deps.is_empty() && node.soft_deps.is_empty() {
+                node.soft_deps = frontier.clone();
+            }
+
+            self.planned_nodes.push(node);
+            appended += 1;
+        }
+
+        // Keep the planned-origin populated so worker prompts have an origin even
+        // when reconcile happens before any initial plan was captured.
+        if self.planned_origin.trim().is_empty() {
+            self.planned_origin = planner_task;
+        }
+
+        // The reconcile planner has done its job; remove it so it does not linger as
+        // a second pinned orchestrator. (The initial planner is KEPT as the
+        // orchestrator; a reconcile planner is transient.)
+        self.agents.remove(index);
+        if self.selected_agent >= self.agents.len() {
+            self.selected_agent = self.agents.len().saturating_sub(1);
+        }
+
+        // If the session is already approved/running, schedule so the new node
+        // launches as soon as its deps are met. If the initial plan is still
+        // awaiting approval, leave the node QUEUED: it joins the plan the user
+        // approves at the gate.
+        if self.awaiting_approval {
+            self.notice = Some(format!(
+                "added {appended} node(s) to the plan awaiting approval"
+            ));
+        } else {
+            self.notice = Some(format!("added {appended} node(s) to the plan"));
+            self.run_scheduler();
+        }
+        self.dirty = true;
+    }
+
+    /// Make `id` unique against every node id already known to the active plan:
+    /// queued planned-node ids plus the node ids of launched agents. Appends a
+    /// numeric suffix (`-2`, `-3`, ...) until no collision remains so an appended
+    /// node never shadows an existing node and its dep references still resolve.
+    fn uniquify_node_id(&self, id: &str) -> String {
+        let taken = |candidate: &str| -> bool {
+            self.planned_nodes.iter().any(|node| node.id == candidate)
+                || self
+                    .agents
+                    .iter()
+                    .any(|run| run.node_id.as_deref() == Some(candidate))
+        };
+        if !taken(id) {
+            return id.to_string();
+        }
+        let mut suffix = 2usize;
+        loop {
+            let candidate = format!("{id}-{suffix}");
+            if !taken(&candidate) {
+                return candidate;
+            }
+            suffix += 1;
+        }
     }
 
     /// APPROVE the pending plan: clear the approval gate and drain the queue into
@@ -4866,14 +5226,27 @@ What to do\n\
             }
         }
 
-        // The planner run is now KEPT as the pinned orchestrator (no removal), so
-        // indices stay stable. Process once each; `autosteered` is cleared inside
-        // so a re-poll of the same Done planner is a no-op. This handles the case
-        // where the planner process actually exits after printing the block.
+        // The INITIAL planner run is KEPT as the pinned orchestrator (no removal),
+        // so its index stays stable. A RECONCILE planner is transient and removed by
+        // the APPEND path. Process highest-index first so a reconcile removal never
+        // shifts an index we still need. Route on the `reconcile_planner`
+        // discriminator: the append path preserves the existing plan's not-yet-
+        // launched nodes, while the replace path captures a fresh plan. `autosteered`
+        // is cleared inside each path so a re-poll of the same Done planner is a
+        // no-op. This handles the case where the planner process actually exits
+        // after printing the block.
         completed_rudder_plans.sort_unstable();
         completed_rudder_plans.dedup();
         for index in completed_rudder_plans.into_iter().rev() {
-            self.evaluate_completed_plan(index);
+            let is_reconcile = self
+                .agents
+                .get(index)
+                .is_some_and(|run| run.reconcile_planner);
+            if is_reconcile {
+                self.evaluate_completed_reconcile(index);
+            } else {
+                self.evaluate_completed_plan(index);
+            }
         }
 
         // STREAMING DETECTION: a plan-mode planner may print the RUDDER_PLAN_TASKS

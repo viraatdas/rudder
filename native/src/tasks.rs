@@ -61,6 +61,32 @@ pub(crate) fn rudder_plan_prompt(task: &str) -> String {
     )
 }
 
+/// Build the RECONCILE planner prompt: a multi-agent plan is already in flight and
+/// the user is ADDING one task. The planner must emit exactly ONE node whose
+/// `deps` reference the existing frontier ids (never replace the plan). Mirrors the
+/// TS `reconcileSystemPrompt` shape in src/planner.ts. `frontier` is the list of
+/// `(id, title)` pairs for the current plan nodes the new task can depend on.
+pub(crate) fn rudder_reconcile_prompt(task: &str, frontier: &[(String, String)]) -> String {
+    let task = strip_rudder_prompt_wrappers(task);
+    let existing = if frontier.is_empty() {
+        "(none: the plan currently has no in-flight nodes)".to_string()
+    } else {
+        frontier
+            .iter()
+            .map(|(id, title)| format!("- {id}: {title}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let existing_ids = frontier
+        .iter()
+        .map(|(id, _)| id.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "You are Rudder's injection coordinator. A multi-agent plan is ALREADY in flight; a separate set of worker agents is implementing its nodes in isolated git worktrees. The user is now ADDING one more task to that running plan. You inspect the repository in READ-ONLY mode. You do NOT implement anything yourself, and you do NOT re-plan or replace the existing work.\n\nExisting plan nodes (the frontier, in-flight, not yet merged):\n{existing}\n\nExisting node ids: [{existing_ids}]\n\nNew task the user is ADDING:\n{task}\n\nProcess:\n1. Inspect the relevant files read-only to understand how the new task relates to the in-flight nodes.\n2. Emit EXACTLY ONE node in the RUDDER_PLAN_TASKS block. Its `id` MUST be unique from every existing node id above. Its `deps` reference the existing frontier ids.\n3. Edge rules: add a `hard` dep only if the new task genuinely CANNOT start until that node merges (it edits that node's not-yet-merged code, or needs an interface that node defines) and justify it with a one-line `why`. Otherwise use `soft` deps for nodes the new task should be aware of, or no deps at all if the new task is fully independent. Prefer soft; a hard edge without a `why` is treated as soft.\n4. The node must be self-contained, name concrete files or modules to inspect when known, and carry both a `goal` (one-line objective for the `/goal` slash command, without the leading slash) and a verifiable `success` (the DONE-WHEN condition). Never omit either.\n\nPLAN MODE: You are running in plan mode. Do NOT call ExitPlanMode. Do NOT implement, edit, or write any files. When the node is ready, print exactly the block below as a NORMAL assistant message and then stop. Rudder reads the block directly from your output; it does not need you to exit plan mode.\n\nPrint exactly this block and no other JSON block:\nRUDDER_PLAN_TASKS_START\n{{\"tasks\":[{{\"id\":\"new\",\"title\":\"short task title\",\"prompt\":\"full implementation prompt for one worker agent\",\"goal\":\"one-line objective for /goal, without the leading slash command\",\"success\":\"verifiable done-when condition\",\"deps\":[{{\"on\":\"<existing frontier id>\",\"type\":\"soft\",\"why\":\"context the new task should be aware of\"}}]}}]}}\nRUDDER_PLAN_TASKS_END\n\nAfter the block, add a short human summary of how the added node relates to the in-flight plan."
+    )
+}
+
 /// Dependency edge type. `hard` blocks the child from starting until the parent
 /// has merged; `soft` never blocks (the parent's diff is delivered as context once
 /// it lands). `soft` is the safe default.
@@ -269,6 +295,17 @@ pub(crate) fn rudder_plan_output_for_run(run: &AgentRun) -> String {
 }
 
 pub(crate) fn extract_rudder_plan_tasks(output: &str) -> Result<Vec<RudderPlanTask>> {
+    extract_rudder_plan_tasks_with_frontier(output, &[])
+}
+
+/// Like `extract_rudder_plan_tasks`, but `frontier_ids` are ALSO treated as known
+/// ids so a RECONCILE node's `deps` referencing existing (out-of-block) frontier
+/// nodes are kept instead of dropped. The initial-plan path passes an empty slice,
+/// preserving its block-local resolution exactly.
+pub(crate) fn extract_rudder_plan_tasks_with_frontier(
+    output: &str,
+    frontier_ids: &[String],
+) -> Result<Vec<RudderPlanTask>> {
     const START: &str = "RUDDER_PLAN_TASKS_START";
     const END: &str = "RUDDER_PLAN_TASKS_END";
 
@@ -302,12 +339,15 @@ pub(crate) fn extract_rudder_plan_tasks(output: &str) -> Result<Vec<RudderPlanTa
     let capped: Vec<&serde_json::Value> = tasks.iter().take(6).collect();
 
     // Known ids across the capped block. An explicit id wins; otherwise the
-    // positional fallback `n{i}` is used (matching the synthesized id below).
-    let known_ids: std::collections::HashSet<String> = capped
+    // positional fallback `n{i}` is used (matching the synthesized id below). The
+    // reconcile frontier ids are merged in so cross-block deps on existing nodes
+    // survive `parse_plan_deps`.
+    let mut known_ids: std::collections::HashSet<String> = capped
         .iter()
         .enumerate()
         .map(|(index, task)| plan_task_id(task, index))
         .collect();
+    known_ids.extend(frontier_ids.iter().cloned());
 
     let mut out = Vec::new();
     for (index, task) in capped.iter().enumerate() {

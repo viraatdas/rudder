@@ -255,6 +255,7 @@ pub(crate) fn create_main_agent(
         deps: Vec::new(),
         soft_deps: Vec::new(),
         node_id: None,
+        reconcile_planner: false,
     }
 }
 
@@ -444,6 +445,9 @@ pub(crate) fn agent_from_run_record(repo_root: &Path, record: serde_json::Value)
         deps,
         soft_deps,
         node_id,
+        // Reconcile-planner is ephemeral runtime routing state, never persisted; a
+        // restored run is never mid-reconcile.
+        reconcile_planner: false,
     })
 }
 
