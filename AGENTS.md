@@ -42,8 +42,21 @@ plus a worker image, used only when a task is handed off to the cloud.
 .
 ├── src/                  TypeScript orchestrator (compiled to dist/)
 ├── native/               Rust native dashboard crate (rudder-native)
-│   ├── src/main.rs        the whole dashboard (~12k lines): state, input, render
-│   └── src/pty_terminal.rs PTY wrapper + terminal emulation/scrollback
+│   ├── src/main.rs        the App state machine + domain types + entry/run loop
+│   ├── src/render.rs      ratatui rendering: panes, prompts, layout, styles
+│   ├── src/selection.rs   mouse->coordinate mapping, selection, clipboard, cells
+│   ├── src/detect.rs      worker-output heuristics (idle/permission/prompt)
+│   ├── src/models.rs      model/effort tables, model picker, suggestion ranking
+│   ├── src/launch.rs      agent launch/resume command building, review-all runs
+│   ├── src/tasks.rs       prompt construction, task summaries, rudder-plan parsing
+│   ├── src/gitio.rs       git/worktree/run-record persistence + fs helpers
+│   ├── src/cloudio.rs     cloud command plumbing + Codex session-log scanning
+│   ├── src/usage.rs       token-usage accounting, pricing, date helpers
+│   ├── src/config.rs      ~/.rudder config + model defaults + update notices
+│   ├── src/textedit.rs    input editing (drafts, history, cursor/word ops)
+│   ├── src/keys.rs        key/mouse event -> terminal byte encoding
+│   ├── src/app_tests.rs   #[cfg(test)] dashboard tests
+│   └── src/pty_terminal.rs PTY wrapper + terminal emulation/scrollback (in lib.rs)
 ├── cloud/                Rudder Cloud control plane (Node http server) + worker image
 │   ├── src/server.ts      auth, CLI login, sail (workers), workspace (snapshots)
 │   └── worker/            the cloud worker container (entrypoint + supervisor)
@@ -280,8 +293,23 @@ title and persists it via the atomic path above.
 ## 7. Native dashboard (`native/src/main.rs`, `native/src/pty_terminal.rs`)
 
 Stack: `ratatui` (rendering) over `crossterm` (input + raw mode + mouse), with
-`portable-pty` for real pseudo-terminals. One large `App` struct holds all state;
+`portable-pty` for real pseudo-terminals. One `App` struct holds all state;
 a render loop draws three panes and an input loop dispatches key/mouse events.
+
+The crate is split into focused modules (see the layout in section 2).
+`main.rs` keeps the domain types (the enums + structs like `AgentRun`) and the
+whole `App` struct + `impl App`, plus the `main`/`run` entry. Free functions live
+in topic modules (`render`, `selection`, `detect`, `models`, `launch`, `tasks`,
+`gitio`, `cloudio`, `usage`, `config`, `textedit`, `keys`). Module convention:
+every module is a child of the binary crate and pulls shared scope with
+`use super::*`; the crate root re-exports each module (`mod x; use crate::x::*;`)
+so call sites stay unchanged and modules can use each other. Because the modules
+are descendants of the crate root, they read crate-root-private items (the `App`
+struct's fields and methods, the domain types' fields) for free; only items moved
+*out* of the root are marked `pub(crate)`. Keeping the entire `impl App` in
+`main.rs` is deliberate: it avoids having to widen the visibility of `App`'s many
+private methods. Splitting `App` itself out later would require that visibility
+churn, so it was left whole.
 
 ### Panes and focus
 `FocusPane = Agents | Worker | Task`.
@@ -327,8 +355,9 @@ completed worktrees; `M` (merge-all) opens a confirmation to merge them. Review-
 spins up a dedicated agent whose task is a `/review` over the combined diff.
 
 ### Tests
-`native/src/main.rs` has an inline `app_tests` module (101 tests). Includes the
-new leader/Option-key coverage: `ctrl_w_leader_then_digit_focuses_pane`,
+`native/src/app_tests.rs` holds the dashboard tests (101; declared
+`#[cfg(test)] mod app_tests;` in `main.rs`). Includes the
+leader/Option-key coverage: `ctrl_w_leader_then_digit_focuses_pane`,
 `ctrl_w_leader_is_one_shot`, `ctrl_w_leader_escape_cancels_without_action`,
 `option_typographic_chars_focus_panes`, `alt_digit_still_focuses_pane`, plus the
 existing nav-mode, worker-scroll, and rendering tests.
@@ -465,8 +494,9 @@ Always, before shipping a source change:
 - New backend behavior: `src/backends.ts` (`BackendAdapter`) + `src/codex-binary.ts`
   for Codex specifics.
 - Run/merge/worktree behavior: `src/git.ts` + `src/run-manager.ts`.
-- Dashboard UI/keys/panes: `native/src/main.rs` (and `pty_terminal.rs` for
-  terminal emulation/scroll). Add `app_tests` coverage.
+- Dashboard input/state/keys: `native/src/main.rs` (`App` + `impl App`).
+  Rendering: `render.rs`. Terminal emulation/scroll: `pty_terminal.rs`. Output
+  heuristics: `detect.rs`. Add coverage in `app_tests.rs`.
 - Persistence/schema: `src/types.ts` + `src/state.ts` (+ `src/util.ts` for write
   primitives).
 - Cloud: `src/cloud.ts` (client) + `cloud/src/server.ts` (control plane) +
