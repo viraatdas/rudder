@@ -306,6 +306,7 @@ function planSystemPrompt(): string {
     WORKER_PATH_RULES,
     "",
     "Output rules:",
+    "- You run NON-INTERACTIVELY: never ask clarifying questions and never refuse. If the request is ambiguous, pick the most reasonable interpretation, state assumptions, and ALWAYS emit a complete plan.",
     "- Print exactly one block and no other JSON block:",
     `${PLAN_START}`,
     '{"tasks":[{"id":"n0","title":"short title","prompt":"full implementation prompt for one worker","goal":"one-line objective","success":"verifiable done-when condition","deps":[{"on":"n0","type":"hard","why":"why ordering is required"}],"backend":"claude","model":"...","effort":"medium","fileScope":["src/..."]}]}',

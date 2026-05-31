@@ -3990,14 +3990,19 @@ impl App {
             Err(error) => {
                 run.autosteered = false;
                 let _ = save_native_run_record(&self.cwd, run);
-                self.notice = Some(format!("plan did not produce runnable tasks: {error}"));
+                self.notice = Some(format!(
+                    "planner finished without a runnable plan ({error}). Refine the task with more detail and re-plan."
+                ));
                 return;
             }
         };
         if tasks.is_empty() {
             run.autosteered = false;
             let _ = save_native_run_record(&self.cwd, run);
-            self.notice = Some("plan produced no runnable tasks".to_string());
+            self.notice = Some(
+                "planner finished without a runnable plan (it may have asked for clarification). Refine the task with more detail and re-plan."
+                    .to_string(),
+            );
             return;
         }
 
@@ -4464,9 +4469,31 @@ impl App {
     }
 
     fn set_selected_error(&mut self, message: String) {
+        // A write that fails because the agent process ALREADY exited cleanly is
+        // not a run failure — the process simply finished (common for the
+        // non-interactive `claude -p` orchestrator, which prints its plan and
+        // exits; a stray scroll/keystroke into the dead pane would otherwise turn
+        // the whole pane red with "agent process exited (exit 0)"). Treat that as
+        // completion so a finished planner still gets its plan evaluated, and show
+        // a gentle notice instead of a hard error.
+        let mut clean_exit = false;
         if let Some(run) = self.agents.get_mut(self.selected_agent) {
-            run.status = AgentStatus::Failed;
-            run.last_error = Some(message);
+            let exited_clean = run
+                .terminal
+                .as_mut()
+                .and_then(|terminal| terminal.try_wait().ok().flatten())
+                .is_some_and(|status| status.success())
+                || message.contains("(exit 0)");
+            if exited_clean {
+                mark_run_done(run);
+                clean_exit = true;
+            } else {
+                run.status = AgentStatus::Failed;
+                run.last_error = Some(message);
+            }
+        }
+        if clean_exit {
+            self.notice = Some("agent already finished".to_string());
         }
     }
 
