@@ -1,0 +1,67 @@
+name: Release
+
+# Publishes @viraatdas/rudder to npm when a vX.Y.Z tag is pushed, so the
+# published version is always pinned to a committed git tag. No more repo vs
+# registry drift.
+#
+# Release flow (from a clean, pushed main):
+#   npm version patch        # bumps package.json + lock, commits, tags vX.Y.Z
+#   git push --follow-tags   # pushes the commit and the tag -> triggers this
+#
+# One-time setup: add an npm "Automation" access token as the repo secret
+# NPM_TOKEN (Settings -> Secrets and variables -> Actions -> New secret).
+# Generate it at npmjs.com -> Access Tokens -> Generate New Token -> Automation.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  publish:
+    # macOS runner so the bundled native binary (dist/native/rudder-native,
+    # built by `prepack`) matches the macOS build currently shipped. See the
+    # cross-platform note in AGENTS.md "Releasing". GitHub macOS runners ship
+    # with a Rust toolchain preinstalled, which the cargo build needs.
+    runs-on: macos-14
+    permissions:
+      contents: read
+      id-token: write # required for npm provenance
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Verify tag matches package.json version
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          echo "tag=$TAG_VERSION  package.json=$PKG_VERSION"
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "::error::Tag v$TAG_VERSION does not match package.json version $PKG_VERSION. Bump with 'npm version' so they always agree."
+            exit 1
+          fi
+
+      - name: Configure git (rebase-first test creates temp repos)
+        run: |
+          git config --global user.email "ci@rudder.local"
+          git config --global user.name "Rudder CI"
+          git config --global init.defaultBranch main
+
+      - run: npm ci
+
+      - name: Typecheck + JS tests
+        run: npm test
+
+      - name: Native tests
+        run: cargo test --manifest-path native/Cargo.toml
+
+      # `npm publish` runs `prepack` (tsc + cargo build --release + copy-native),
+      # so the published dist/ and native binary are always freshly built here.
+      - name: Publish to npm
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

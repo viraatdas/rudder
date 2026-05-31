@@ -457,6 +457,39 @@ Always, before shipping a source change:
    `dist/native/rudder-native`) is current. `prepack` does this automatically;
    `dist/` is not committed, so there is nothing to stage.
 
+### Releasing (tag-driven, drift-proof)
+
+Releases publish to npm from CI when a `vX.Y.Z` tag is pushed
+(`.github/workflows/release.yml`), so the published version is always pinned to a
+committed git tag. The workflow refuses to publish if the tag does not match
+`package.json` `version`, so the repo and the registry can never drift apart (the
+failure mode that left `1.0.70`–`1.0.73` on npm but never in git).
+
+Cut a release from a clean, pushed `main`:
+
+```bash
+npm version patch          # bumps package.json + package-lock, commits, tags vX.Y.Z
+git push --follow-tags     # pushes the commit and the tag; CI publishes
+```
+
+`npm publish` runs in CI via `prepack` (tsc + `cargo build --release` +
+copy-native), with `--provenance` (hence the `repository` field and
+`id-token: write` permission). One-time setup: add an npm "Automation" token as
+the repo secret `NPM_TOKEN`.
+
+Do NOT run `npm publish` by hand anymore. Hand-publishing is exactly what caused
+the drift, and it also ties the bundled native binary to whatever machine you
+publish from.
+
+Cross-platform caveat (pre-existing, not solved by this workflow): the package
+ships a single `dist/native/rudder-native` built for one platform. The release
+runs on `macos-14`, so the published binary is macOS (arm64), matching what was
+shipped before. Linux and Intel-mac users get a binary that will not exec; the
+dashboard should fall back, but the native path is effectively macOS-arm64 only.
+Fixing that properly means a per-platform build matrix publishing
+`@viraatdas/rudder-<os>-<arch>` optional packages (the esbuild/swc model), which
+is a separate piece of work.
+
 ---
 
 ## 12. Conventions and gotchas
