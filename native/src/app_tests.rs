@@ -3779,21 +3779,26 @@ branch refs/heads/main\n";
     }
 
     #[test]
-    fn render_orchestrator_shows_spinner_while_planning() {
+    fn render_worker_shows_planner_terminal_while_planning() {
         let mut app = App::new();
         app.focus = FocusPane::Worker;
         let mut orch = test_agent_run("orch", "build a feature");
         orch.mode = AgentMode::RudderPlan;
-        orch.status = AgentStatus::Running; // no PTY, no plan block -> planning phase
+        orch.status = AgentStatus::Running; // no plan block yet -> planning phase
         app.agents = vec![orch];
         app.selected_agent = 0;
 
         let text = render_worker_text(&mut app, 60, 20);
-        assert!(text.contains("ORCHESTRATOR"), "header present: {text}");
-        assert!(text.contains("decomposing the task"), "spinner caption present: {text}");
-        // The pane title is "orchestrator", not "worker".
+        // While planning, the pane shows the raw planner terminal (titled
+        // "orchestrator") so the live plan-mode session - questions, menus,
+        // approval - renders through the terminal emulator and fills the pane.
+        // It must NOT use the custom DAG command-center view yet.
         assert!(text.contains("orchestrator"), "pane title is orchestrator: {text}");
-        assert!(!text.contains("decomposing the task...running"), "no DAG summary while planning");
+        assert!(
+            !text.contains("decomposing the task"),
+            "planning shows the planner terminal, not the custom spinner caption: {text}"
+        );
+        assert!(!text.contains("running 1"), "no DAG summary while planning: {text}");
     }
 
     #[cfg(not(windows))]

@@ -1573,17 +1573,25 @@ pub(crate) fn render_worker(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let terminal_size = TerminalSize::new(inner.height.max(1), inner.width.max(1)).ok();
     let focused = app.focus == FocusPane::Worker;
 
-    // The selected orchestrator (RudderPlan) gets the custom command-center view
-    // instead of its raw planner PTY: a spinner while decomposing, then a DAG tree.
-    // The diff/review view still falls through to the normal terminal path.
-    if app.worker_view == WorkerView::Terminal
-        && app
+    // The selected orchestrator gets the custom DAG command-center view ONLY once
+    // its plan is ready. While it is still planning, show its raw PTY so the live
+    // plan-mode session (clarifying questions, selection menus, approval) renders
+    // cleanly through the terminal emulator and fills the pane. A custom extracted
+    // -lines view mangled spacing, leaked OSC escape sequences, and broke menu
+    // navigation. The diff/review view always uses the normal terminal path.
+    let selected_is_orchestrator = app
+        .agents
+        .get(app.selected_agent)
+        .is_some_and(|run| run.is_orchestrator());
+    if app.worker_view == WorkerView::Terminal && selected_is_orchestrator {
+        let plan_ready = app
             .agents
             .get(app.selected_agent)
-            .is_some_and(|run| run.is_orchestrator())
-    {
-        render_orchestrator(frame, area, app);
-        return;
+            .is_some_and(|run| matches!(orchestrator_phase(run), OrchestratorPhase::PlanReady(_)));
+        if plan_ready {
+            render_orchestrator(frame, area, app);
+            return;
+        }
     }
 
     if let Some(size) = terminal_size {
@@ -1613,7 +1621,13 @@ pub(crate) fn render_worker(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         .style(app_style())
         .block(pane_block(
             match app.worker_view {
-                WorkerView::Terminal => "worker",
+                WorkerView::Terminal => {
+                    if selected_is_orchestrator {
+                        "orchestrator"
+                    } else {
+                        "worker"
+                    }
+                }
                 WorkerView::Diff => "review",
             },
             focused,
