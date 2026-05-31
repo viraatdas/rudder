@@ -666,6 +666,22 @@ async function runNativeDashboard(): Promise<boolean> {
   } catch {
     // ignore
   }
+  // Start the board daemon in-process so the web board is live and reflects this
+  // TUI session (this also registers the project so /api/projects is populated).
+  // ensureBoardRunning sets up the server + scheduler and returns promptly; the
+  // listeners keep running on the Node event loop while the native TUI is in the
+  // foreground. Strictly non-fatal: if it throws, log a notice and keep launching
+  // the TUI - the daemon must never block or break the session.
+  try {
+    const repoRoot = findRepoRoot();
+    if (repoRoot) {
+      await ensureBoardRunning(repoRoot, { open: false });
+    }
+  } catch (err) {
+    if (isTty()) {
+      console.warn(`rudder board daemon did not start: ${(err as Error)?.message ?? err}`);
+    }
+  }
   try {
     const code = await new Promise<number | null>((resolve, reject) => {
       const child = spawn(nativeBinary, process.argv.slice(2), {

@@ -2491,7 +2491,15 @@ impl App {
     fn start_rudder_plan_task(&mut self, input: &str) {
         let model = self.model.clone();
         let backend = self.backend;
-        let effort = self.effort;
+        // Decomposing a task into a node DAG does not need max reasoning. Cap the
+        // planner's effort so plan mode stays responsive even when the dashboard
+        // default is a heavy model at high effort. The model itself is unchanged.
+        let effort = match self.effort {
+            Some(EffortLevel::High) | Some(EffortLevel::XHigh) | Some(EffortLevel::Max) => {
+                Some(EffortLevel::Medium)
+            }
+            other => other,
+        };
         let session_id = mint_session_id_for(backend);
         let command = agent_command(
             backend,

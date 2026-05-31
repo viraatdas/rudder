@@ -777,7 +777,11 @@ function CardDetail({
   });
   const token = statusToken(node);
   const running = isRunning(node);
-  const completed = node.status === "completed";
+  // A node is mergeable when its worker has finished and it is awaiting the
+  // merge gate. Run-derived nodes carry status "completed"; graph-projected
+  // scheduled nodes carry status "review" (and land in the review column).
+  const mergeable =
+    node.status === "completed" || node.status === "review" || node.column === "review";
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -815,8 +819,17 @@ function CardDetail({
     setAction({ busy: true, msg: null, err: null });
     try {
       const r = await postMerge(slug, node.id);
-      if (r.status === "merge-conflict" && r.conflictedFiles?.length) {
-        setAction({ busy: false, msg: null, err: `conflict in ${r.conflictedFiles.length} file(s)` });
+      // Server normalizes to "merge-conflict"; also treat the raw jj/graph
+      // signals "conflict"/"blocked" as conflicts so server + UI agree.
+      const isConflict =
+        r.status === "merge-conflict" || r.status === "conflict" || r.status === "blocked";
+      if (isConflict) {
+        const files = r.conflictedFiles?.length ?? 0;
+        setAction({
+          busy: false,
+          msg: null,
+          err: files ? `conflict in ${files} file(s)` : "merge conflict",
+        });
       } else {
         setAction({ busy: false, msg: r.status, err: null });
       }
@@ -867,7 +880,7 @@ function CardDetail({
         </header>
 
         <div class="drawer-actions">
-          {completed && (
+          {mergeable && (
             <button type="button" class="btn btn-accent" onClick={doMerge} disabled={action.busy}>
               {action.busy ? "Merging…" : "Merge"}
             </button>

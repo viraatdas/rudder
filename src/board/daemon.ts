@@ -288,9 +288,11 @@ async function handleProjectApi(
         await inRepo(project.repoRoot, () => mergeNodeIntoIntegration(project.repoRoot, node, bus));
         const fresh = await readGraph(project.repoRoot);
         const refreshed = fresh.nodes[node.id];
+        // A graph node that did not merge (blocked) signals a conflict to the UI.
+        const conflicted = refreshed?.status === "blocked" || refreshed?.merge?.status === "conflict";
         sendJson(res, 200, {
-          status: refreshed?.status ?? "merged",
-          conflictedFiles: [],
+          status: conflicted ? "merge-conflict" : refreshed?.status ?? "merged",
+          conflictedFiles: refreshed?.merge?.conflictedFiles ?? [],
         });
         return;
       }
@@ -301,8 +303,11 @@ async function handleProjectApi(
       return;
     }
     const merged = await inRepo(project.repoRoot, () => mergeJjRunIntoCurrentWorkspace(run));
+    // mergeJjRunIntoCurrentWorkspace records merge.status "conflict"; normalize to
+    // the single "merge-conflict" signal the UI reacts to so server + UI agree.
+    const conflicted = merged.merge?.status === "conflict" || merged.status === "merge-conflict";
     sendJson(res, 200, {
-      status: merged.merge?.status ?? merged.status,
+      status: conflicted ? "merge-conflict" : merged.merge?.status ?? merged.status,
       conflictedFiles: merged.merge?.conflictedFiles ?? [],
     });
     return;
@@ -687,10 +692,19 @@ async function buildSnapshot(project: ProjectEntry): Promise<BoardSnapshot> {
   for (const run of runs) {
     const lastLine = await lastNonEmptyLine(project.repoRoot, run.id);
     const boardNode = projectRunToNode(run, lastLine);
-    // If a graph node points at this run, carry its DAG deps onto the run node.
-    const graphNode = Object.values(graph.nodes).find((candidate) => candidate.runId === run.id);
+    // If a graph node points at this run (by runId, or by node id), the GRAPH node
+    // is authoritative for scheduled nodes: the daemon writes merged/blocked/review
+    // to graph.json, not run.json. Override the projected column/status/blocked so
+    // merged nodes leave Review and blocked nodes surface. Pure run-derived nodes
+    // (no graph entry) keep their run-projected status untouched.
+    const graphNode =
+      Object.values(graph.nodes).find((candidate) => candidate.runId === run.id) ??
+      graph.nodes[run.id];
     if (graphNode) {
       boardNode.deps = depsByNode.get(graphNode.id) ?? boardNode.deps;
+      boardNode.column = columnForNodeStatus(graphNode.status);
+      boardNode.status = graphNode.status as unknown as RunStatus;
+      boardNode.blocked = graphNode.status === "blocked";
     }
     nodes.push(boardNode);
   }
@@ -720,9 +734,13 @@ async function buildProjectSummary(project: ProjectEntry): Promise<ProjectSummar
   const counts = { todo: 0, running: 0, review: 0, done: 0, blocked: 0, failed: 0 };
   let lastActivityAt = "";
   for (const run of runs) {
-    counts[columnForStatus(run.status)] += 1;
-    if (run.status === "failed") {
+    // Count each run exactly once so the per-status tallies sum to the node total.
+    // failed/cancelled get their own bucket and do NOT also fall into `done`
+    // (columnForStatus maps both to "done", which would double-count failed).
+    if (run.status === "failed" || run.status === "cancelled") {
       counts.failed += 1;
+    } else {
+      counts[columnForStatus(run.status)] += 1;
     }
     const stamp = run.updatedAt || run.createdAt;
     if (stamp && stamp > lastActivityAt) {

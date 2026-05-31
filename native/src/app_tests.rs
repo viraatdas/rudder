@@ -1346,8 +1346,8 @@ branch refs/heads/main\n";
             .iter()
             .any(|arg| arg.contains("Plan this task before implementation")));
 
-        // The orchestrator (RudderPlan) runs prompt-free under Claude, not plan
-        // mode, so decomposition never stalls on a permission ask.
+        // The orchestrator (RudderPlan) runs in Claude's native plan mode:
+        // read-only, asks clarifying questions, presents a plan to approve.
         let orchestrator_claude = agent_command(
             Backend::Claude,
             "sonnet",
@@ -1360,13 +1360,9 @@ branch refs/heads/main\n";
             orchestrator_claude
                 .args
                 .windows(2)
-                .any(|window| window[0] == "--permission-mode" && window[1] == "bypassPermissions"),
-            "orchestrator runs prompt-free (bypassPermissions)"
+                .any(|window| window[0] == "--permission-mode" && window[1] == "plan"),
+            "orchestrator runs in native plan mode"
         );
-        assert!(!orchestrator_claude
-            .args
-            .windows(2)
-            .any(|window| window[0] == "--permission-mode" && window[1] == "plan"));
 
         let rudder_plan = agent_command(
             Backend::Codex,
