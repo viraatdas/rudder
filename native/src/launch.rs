@@ -2,6 +2,13 @@
 //! Building agent launch/resume commands and review-all runs.
 use super::*;
 
+// The orchestrator (decomposer) runs read-only: only inspection tools are
+// available and edit/write/shell tools are blocked, so it literally cannot
+// implement - it only decomposes the task into a DAG that separate worker agents
+// run. Comma-joined for Claude's --tools/--allowedTools/--disallowedTools flags.
+const CLAUDE_DECOMPOSER_TOOLS: &str = "Read,Grep,Glob,LS,WebSearch,WebFetch";
+const CLAUDE_DECOMPOSER_DISALLOWED: &str = "Edit,Write,MultiEdit,NotebookEdit,Bash";
+
 pub(crate) fn mint_session_id_for(backend: Backend) -> Option<String> {
     match backend {
         Backend::Claude => Some(uuid::Uuid::new_v4().to_string()),
@@ -87,11 +94,28 @@ pub(crate) fn agent_command(
                     "--permission-mode".to_string(),
                     "bypassPermissions".to_string(),
                 ],
-                // Both the orchestrator and explicit /plan run in Claude's native
-                // plan mode: read-only exploration, clarifying questions, and a
-                // plan the user approves before workers launch. Workers (Execute)
-                // run prompt-free; only planning is interactive.
-                AgentMode::Plan | AgentMode::RudderPlan => vec![
+                // The orchestrator is a DECOMPOSER, not a Claude plan-mode session.
+                // Claude plan mode frames as "approve my plan so I implement it",
+                // which reads like a single agent. Instead it runs read-only by
+                // tool allowlist (only inspection tools; Edit/Write/Bash blocked),
+                // permission-mode default so the allowed read tools auto-run with no
+                // prompts and no plan-mode approve-to-implement UI. It cannot
+                // implement; it only inspects and emits the task DAG, and Rudder
+                // spawns the separate worker agents.
+                AgentMode::RudderPlan => vec![
+                    "--permission-mode".to_string(),
+                    "default".to_string(),
+                    "--tools".to_string(),
+                    CLAUDE_DECOMPOSER_TOOLS.to_string(),
+                    "--allowedTools".to_string(),
+                    CLAUDE_DECOMPOSER_TOOLS.to_string(),
+                    "--disallowedTools".to_string(),
+                    CLAUDE_DECOMPOSER_DISALLOWED.to_string(),
+                    "--name".to_string(),
+                    format!("orchestrator:{}", short_task(task)),
+                ],
+                // Explicit /plan stays Claude's native read-only plan mode.
+                AgentMode::Plan => vec![
                     "--permission-mode".to_string(),
                     "plan".to_string(),
                     "--name".to_string(),

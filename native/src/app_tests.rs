@@ -1346,8 +1346,8 @@ branch refs/heads/main\n";
             .iter()
             .any(|arg| arg.contains("Plan this task before implementation")));
 
-        // The orchestrator (RudderPlan) runs in Claude's native plan mode:
-        // read-only, asks clarifying questions, presents a plan to approve.
+        // The orchestrator (RudderPlan) is a read-only DECOMPOSER, not Claude plan
+        // mode: inspection-only tools, edit/write/bash blocked, no plan-mode UI.
         let orchestrator_claude = agent_command(
             Backend::Claude,
             "sonnet",
@@ -1360,8 +1360,29 @@ branch refs/heads/main\n";
             orchestrator_claude
                 .args
                 .windows(2)
+                .any(|window| window[0] == "--permission-mode" && window[1] == "default"),
+            "orchestrator runs read-only (permission-mode default), not plan mode"
+        );
+        assert!(
+            !orchestrator_claude
+                .args
+                .windows(2)
                 .any(|window| window[0] == "--permission-mode" && window[1] == "plan"),
-            "orchestrator runs in native plan mode"
+            "orchestrator is not Claude plan mode"
+        );
+        assert!(
+            orchestrator_claude
+                .args
+                .windows(2)
+                .any(|window| window[0] == "--allowedTools" && window[1].contains("Read")),
+            "orchestrator allows read-only inspection tools"
+        );
+        assert!(
+            orchestrator_claude
+                .args
+                .windows(2)
+                .any(|window| window[0] == "--disallowedTools" && window[1].contains("Edit")),
+            "orchestrator blocks edit/write tools"
         );
 
         let rudder_plan = agent_command(
@@ -1397,18 +1418,17 @@ branch refs/heads/main\n";
     }
 
     #[test]
-    fn rudder_plan_prompt_is_plan_mode_safe_and_asks_for_typed_deps() {
+    fn rudder_plan_prompt_is_a_read_only_decomposer_with_typed_deps() {
         let prompt = rudder_plan_prompt("build the feature");
-        // Plan-mode safety: it must tell the planner NOT to call ExitPlanMode and to
-        // print the block as a normal assistant message (so the block reaches stdout
-        // even if plan mode would otherwise block at an approval prompt).
+        // Decomposer framing: the planner is read-only and must NOT implement; it
+        // only emits the DAG, which it prints as a normal assistant message.
         assert!(
-            prompt.contains("Do NOT call ExitPlanMode"),
-            "prompt must forbid ExitPlanMode so the block reaches stdout"
+            prompt.contains("read-only DECOMPOSER") && prompt.contains("not an implementer"),
+            "prompt must frame the planner as a read-only decomposer, not an implementer"
         );
         assert!(
-            prompt.contains("plan mode"),
-            "prompt must state it is running in plan mode"
+            prompt.contains("Do NOT implement"),
+            "prompt must tell the planner not to implement the work"
         );
         assert!(
             prompt.contains("separate set of worker agents"),
