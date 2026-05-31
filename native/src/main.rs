@@ -83,6 +83,10 @@ const TASK_SUMMARY_MODEL: &str = "claude-haiku-4-5-20251001";
 const DEFAULT_MAX_PARALLEL: usize = 1000;
 /// Run the scheduler every N poll ticks (a coarse cadence; the tick rate is 33ms).
 const SCHEDULER_TICK_INTERVAL: u64 = 8;
+/// Max plan nodes to launch per scheduler pass. Each launch synchronously sets up
+/// a jj workspace (a brief UI-thread block), so launches are spread across passes
+/// to keep the TUI responsive when a merge unblocks a whole wave of children.
+const MAX_LAUNCH_PER_TICK: usize = 2;
 /// Braille spinner frames for the orchestrator "planning" phase (and, as a nice
 /// touch, running agents' status badge). Advances one frame per poll tick so it
 /// animates while the planner decomposes the task.
@@ -4370,9 +4374,18 @@ impl App {
         let planner_task = self.planned_origin.clone();
         let mut launched = 0usize;
 
-        // Recompute the launch decision each iteration so a node launched this pass
+        // Launch at most MAX_LAUNCH_PER_TICK nodes per pass. Each launch shells a
+        // synchronous jj-workspace setup that briefly blocks the UI thread, so
+        // draining a whole wave of newly-ready nodes at once (e.g. when a parent
+        // merge unblocks several children) would freeze the TUI. The periodic
+        // scheduler tick and merge transitions keep calling run_scheduler, so the
+        // remaining nodes launch progressively and the UI stays responsive. The
+        // launch decision is recomputed each iteration so a node launched this pass
         // (now Running) updates the cap accounting before the next pick.
-        while let Some(position) = self.next_node_to_launch(cap) {
+        while launched < MAX_LAUNCH_PER_TICK {
+            let Some(position) = self.next_node_to_launch(cap) else {
+                break;
+            };
             let node = self.planned_nodes.remove(position);
             let title = node.title.clone();
             let prompt = planned_node_worker_prompt(&planner_task, &node);

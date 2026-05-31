@@ -1585,6 +1585,19 @@ branch refs/heads/main\n";
     }
 
     #[test]
+    fn extracts_rudder_plan_tasks_through_osc_and_csi_noise() {
+        // The non-interactive planner PTY stream carries CSI color codes AND OSC
+        // sequences (Claude's OSC 777 "needs your permission" notification). The
+        // parser must strip all of them so the JSON block is recovered intact.
+        let output = "\x1b[1msome reasoning\x1b[0m\n\x1b]777;notify;Claude Code;Claude needs your permission\x07\nRUDDER_PLAN_TASKS_START\n{\"tasks\":[{\"id\":\"n0\",\"title\":\"client\",\"prompt\":\"build client\",\"goal\":\"client\",\"success\":\"ok\",\"deps\":[]},{\"id\":\"n1\",\"title\":\"loop\",\"prompt\":\"build loop\",\"goal\":\"loop\",\"success\":\"ok\",\"deps\":[{\"on\":\"n0\",\"type\":\"hard\",\"why\":\"needs client\"}]}]}\nRUDDER_PLAN_TASKS_END\n\x1b]0;done\x07";
+        let tasks = extract_rudder_plan_tasks(output).expect("parse through OSC/CSI noise");
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[1].deps.len(), 1, "the hard edge survives stripping");
+        // And the stripper removes the OSC payload entirely.
+        assert!(!strip_ansi_for_plan(output).contains("needs your permission"));
+    }
+
+    #[test]
     fn extracts_rudder_plan_tasks_from_last_marked_json_block() {
         let output = "Planner prompt example:\nRUDDER_PLAN_TASKS_START\n{\"tasks\":[{\"title\":\"placeholder\",\"prompt\":\"do not run this\"}]}\nRUDDER_PLAN_TASKS_END\n\nFinal answer:\nRUDDER_PLAN_TASKS_START\n{\"tasks\":[{\"title\":\"Backend\",\"prompt\":\"Implement backend.\"}]}\nRUDDER_PLAN_TASKS_END";
         let tasks = extract_rudder_plan_tasks(output).expect("parse tasks");

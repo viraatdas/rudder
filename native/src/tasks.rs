@@ -568,13 +568,42 @@ pub(crate) fn strip_ansi_for_plan(value: &str) -> String {
             out.push(ch);
             continue;
         }
-        if chars.peek() == Some(&'[') {
-            chars.next();
-            for next in chars.by_ref() {
-                if ('@'..='~').contains(&next) {
-                    break;
+        match chars.peek() {
+            // CSI: ESC [ ... <final byte @-~> (colors, cursor moves).
+            Some('[') => {
+                chars.next();
+                for next in chars.by_ref() {
+                    if ('@'..='~').contains(&next) {
+                        break;
+                    }
                 }
             }
+            // OSC: ESC ] ... terminated by BEL (\x07) or ST (ESC \). Claude emits
+            // OSC 777 desktop notifications ("Claude needs your permission"); without
+            // this their payload leaks into the output and can pollute the parse.
+            Some(']') => {
+                chars.next();
+                while let Some(&next) = chars.peek() {
+                    if next == '\x07' {
+                        chars.next();
+                        break;
+                    }
+                    if next == '\x1b' {
+                        chars.next();
+                        if chars.peek() == Some(&'\\') {
+                            chars.next();
+                        }
+                        break;
+                    }
+                    chars.next();
+                }
+            }
+            // Other ESC sequences (e.g. charset selection ESC ( B): drop ESC + the
+            // intermediate/final byte so a stray escape never breaks block parsing.
+            Some(_) => {
+                chars.next();
+            }
+            None => {}
         }
     }
     out
