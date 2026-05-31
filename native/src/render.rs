@@ -674,10 +674,10 @@ fn render_planned_section<'a>(
         Span::styled(format!(" {}", nodes.len()), muted_style(focused)),
     ])));
     // APPROVAL GATE hint: while the plan awaits approval nothing has launched yet;
-    // the user approves (Enter) or fixes/discards (d) from the orchestrator row.
+    // the user refines it (type into the task pane) or approves (Enter).
     if awaiting_approval {
         lines.push(ListItem::new(Line::from(Span::styled(
-            "  Enter approve  ·  d remove/discard",
+            "  type to refine  ·  Enter approve",
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ))));
     }
@@ -1549,12 +1549,30 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
                 format!("running {running} · review {review} · done {done} · todo {todo}"),
                 muted_style(focused),
             )));
-            // While the plan awaits approval, show the gate hint: nothing has
-            // launched yet and the user can approve or fix the DAG.
+            // While the plan awaits approval, show the planner's notes/assumptions
+            // (so the user knows what it assumed and what to discuss) plus the gate
+            // hint: type to refine the DAG, or Enter to approve and launch.
             if app.awaiting_approval {
+                if let Some(summary) = app.plan_summary.as_ref() {
+                    lines.push(Line::default());
+                    lines.push(Line::from(Span::styled(
+                        "planner notes & assumptions",
+                        header_style(focused),
+                    )));
+                    for raw in summary.lines().take(12) {
+                        let trimmed = raw.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        lines.push(Line::from(Span::styled(
+                            trimmed.to_string(),
+                            muted_style(focused),
+                        )));
+                    }
+                }
                 lines.push(Line::default());
                 lines.push(Line::from(Span::styled(
-                    "plan awaiting approval  ·  Enter approve  ·  d remove/discard",
+                    "type to refine the plan  ·  Enter approve",
                     Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
                 )));
             }
@@ -1855,13 +1873,21 @@ pub(crate) fn review_lines(app: &mut App, height: usize) -> Vec<Line<'static>> {
     lines
 }
 
+/// The default task-pane hint shown when there is no transient notice. Centralised
+/// so render_task, task_pane_height, and selection's height/hit-test calc all wrap
+/// the SAME string: if these drift, the pane height and mouse selection bounds
+/// disagree and clicks on valid input rows get rejected.
+pub(crate) fn task_default_hint(app: &App) -> &'static str {
+    if app.awaiting_approval {
+        "type to refine the plan  ·  Enter (empty) to approve & launch  ·  Option-1/2/3 or ^W pane"
+    } else {
+        "Enter to plan + run  ·  Up/Down history  ·  Option-1/2/3 or ^W pane"
+    }
+}
+
 pub(crate) fn render_task(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let focused = app.focus == FocusPane::Task;
-    let default_hint = if app.plan_mode {
-        "Enter plan  Up/Down history  Option-1/2/3 or ^W pane  /plan off"
-    } else {
-        "Enter plan + run  Up/Down history  Option-1/2/3 or ^W pane  /plan  /sync"
-    };
+    let default_hint = task_default_hint(app);
     let hint = app.notice.as_deref().unwrap_or(default_hint);
     let inner_width = area.width.saturating_sub(2).max(1);
     let input_lines = task_input_lines(&app.task_input, app.task_cursor, inner_width);
@@ -1891,10 +1917,10 @@ pub(crate) fn render_task(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .enumerate()
         .map(|(offset, line)| {
             let display = if app.task_input.is_empty() {
-                if app.plan_mode {
-                    "Type a task to plan"
+                if app.awaiting_approval {
+                    "Type to refine the plan, or press Enter to approve"
                 } else {
-                    "Type a task, /plan, or /sync"
+                    "Type a task to plan and run"
                 }
             } else {
                 line.as_str()
@@ -1923,7 +1949,7 @@ pub(crate) fn render_task(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Span::styled(first_hint, muted_style(focused)),
             Span::raw("  "),
             Span::styled(
-                if app.plan_mode { "plan" } else { "run" },
+                if app.awaiting_approval { "refine" } else { "run" },
                 accent_style(focused),
             ),
             Span::raw("  "),
@@ -1958,11 +1984,7 @@ pub(crate) fn render_task(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 pub(crate) fn task_pane_height(app: &App, width: u16) -> u16 {
-    let default_hint = if app.plan_mode {
-        "Enter plan  Up/Down history  Option-1/2/3 or ^W pane  /plan off"
-    } else {
-        "Enter plan + run  Up/Down history  Option-1/2/3 or ^W pane  /plan  /sync"
-    };
+    let default_hint = task_default_hint(app);
     let hint = app.notice.as_deref().unwrap_or(default_hint);
     let inner_width = width.saturating_sub(2).max(1);
     let input_lines = task_input_lines(&app.task_input, app.task_cursor, inner_width)

@@ -390,6 +390,34 @@ pub(crate) fn extract_rudder_plan_tasks_with_frontier(
     Ok(out)
 }
 
+/// The orchestrator's human-readable prose printed AFTER the RUDDER_PLAN_TASKS_END
+/// marker: its assumptions, why-this-is-safe, and any open questions. Shown under
+/// the DAG so the user knows what the planner assumed and what to discuss. Returns
+/// None when there is no trailing prose. ANSI-stripped, trimmed, and length-capped.
+pub(crate) fn extract_rudder_plan_summary(output: &str) -> Option<String> {
+    const END: &str = "RUDDER_PLAN_TASKS_END";
+    let clean = strip_ansi_for_plan(output).replace('\r', "");
+    let idx = clean.rfind(END)?;
+    let after = clean[idx + END.len()..].trim();
+    // Drop a stray closing fence if the whole reply was fenced.
+    let after = after.trim_start_matches("```").trim();
+    if after.is_empty() {
+        return None;
+    }
+    Some(after.chars().take(1500).collect())
+}
+
+/// Build the composite request handed to the orchestrator when the user REFINES a
+/// pending plan: the original ask, the current DAG outline, and the user's
+/// feedback, framed so the planner revises the whole DAG (reusing stable ids)
+/// rather than starting over. This string is the orchestrator's task; the
+/// decomposer system prompt (`rudder_plan_prompt`) still wraps it.
+pub(crate) fn build_refine_request(original: &str, current_plan: &str, feedback: &str) -> String {
+    format!(
+        "You previously produced the task DAG below for the original request. The user has reviewed it and wants changes. Produce the REVISED, COMPLETE task DAG with the changes applied: keep the parts that still make sense (reuse their ids), add, remove, or edit tasks and dependencies as needed, and re-emit the full plan. Apply the user's feedback directly and do not ask questions.\n\nOriginal request:\n{original}\n\nCurrent plan:\n{current_plan}\n\nUser feedback / requested changes:\n{feedback}"
+    )
+}
+
 /// Read a non-empty trimmed string field, or `None`.
 fn plan_optional_str(task: &serde_json::Value, key: &str) -> Option<String> {
     task.get(key)

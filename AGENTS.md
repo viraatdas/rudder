@@ -357,9 +357,12 @@ Order of handling matters; the early returns gate everything else.
 - Otherwise the key is dispatched to the focused pane's handler.
 
 ### Slash commands (parsed in `handle_command`)
-`/model [backend] [model] [effort]`, `/plan`, `/rudder-plan`, `/main` or `/m`
-(start a main-branch agent), `/sync`, `/goal` (forwarded to the focused agent),
-`/usage`, `/cloud [list]`, `/merge-all`.
+`/model [backend] [model] [effort]`, `/main` or `/m` (start a main-branch agent),
+`/goal` (forwarded to the focused agent), `/usage`, `/cloud [list]`, `/merge-all`,
+`/review-all`. Planning is the default paradigm now: typing a task runs the
+orchestrator, which decomposes it into a DAG you refine (type into the task pane)
+and approve (Enter). `/plan` and `/sync` are retired no-ops that print a hint;
+the `u` sync keybinding was removed.
 
 ### Review and merge-all
 `v` opens a review pane. When `hunk diff --watch` is available Rudder opens a live

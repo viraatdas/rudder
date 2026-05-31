@@ -3340,14 +3340,15 @@ branch refs/heads/main\n";
     }
 
     #[test]
-    fn d_key_discards_plan_queue_when_no_agents() {
+    fn d_key_does_not_discard_plan_queue() {
+        // The plan is refined by typing into the task pane, never discarded with `d`.
         let mut app = App::new();
         app.cwd = std::env::temp_dir();
         app.planned_nodes = vec![test_planned_node("n0", &[])];
         app.focus = FocusPane::Agents;
 
         app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::empty()));
-        assert!(app.planned_nodes.is_empty(), "d discards the plan queue");
+        assert_eq!(app.planned_nodes.len(), 1, "d no longer discards the plan queue");
     }
 
     #[test]
@@ -3768,7 +3769,7 @@ branch refs/heads/main\n";
     }
 
     #[test]
-    fn d_on_orchestrator_discards_pending_plan() {
+    fn d_on_orchestrator_does_not_discard_pending_plan() {
         let mut app = App::new();
         let mut orch = test_agent_run("orch", "build a feature");
         orch.mode = AgentMode::RudderPlan;
@@ -3778,10 +3779,11 @@ branch refs/heads/main\n";
         app.planned_nodes = vec![test_planned_node("n0", &[]), test_planned_node("n1", &["n0"])];
         app.awaiting_approval = true;
 
-        // d on the selected orchestrator discards the whole plan, clearing the gate.
+        // d on the orchestrator must NOT throw the plan away: the plan is refined by
+        // typing into the task pane and approved with Enter. The gate stays open.
         app.handle_agents_key(KeyEvent::from(KeyCode::Char('d')));
-        assert!(app.planned_nodes.is_empty(), "d on orchestrator discards the plan");
-        assert!(!app.awaiting_approval, "discard clears the approval gate");
+        assert_eq!(app.planned_nodes.len(), 2, "d does not discard the plan");
+        assert!(app.awaiting_approval, "the approval gate stays open");
     }
 
     #[test]
@@ -3804,6 +3806,53 @@ branch refs/heads/main\n";
         assert!(app.planned_origin.is_empty());
         // A node id not in the queue is a no-op.
         assert!(!app.remove_planned_node("ghost"));
+    }
+
+    // --- Plan refinement (plan-mode-style discussion before approval) --------
+
+    #[test]
+    fn extract_rudder_plan_summary_reads_prose_after_the_block() {
+        let output = "RUDDER_PLAN_TASKS_START\n{\"tasks\":[]}\nRUDDER_PLAN_TASKS_END\n\nAssumptions: I assumed a Node CLI.\nOpen question: which package manager?";
+        let summary = extract_rudder_plan_summary(output).expect("summary present");
+        assert!(summary.contains("Assumptions: I assumed a Node CLI."));
+        assert!(summary.contains("Open question: which package manager?"));
+        // No trailing prose -> None.
+        assert!(extract_rudder_plan_summary("RUDDER_PLAN_TASKS_START\n{}\nRUDDER_PLAN_TASKS_END").is_none());
+    }
+
+    #[test]
+    fn build_refine_request_carries_original_plan_and_feedback() {
+        let req = build_refine_request("make a CLI", "- n0 [scaffold] deps: none", "use Python not Node");
+        assert!(req.contains("make a CLI"), "keeps the original request");
+        assert!(req.contains("n0 [scaffold]"), "includes the current plan");
+        assert!(req.contains("use Python not Node"), "includes the feedback");
+        assert!(req.contains("REVISED"), "asks for a revised full DAG");
+    }
+
+    #[test]
+    fn approve_is_blocked_while_refining() {
+        // Empty-Enter (or Enter on the orchestrator) must NOT launch the stale plan
+        // while a refine is in flight; the gate stays up until the revised DAG lands.
+        let mut app = App::new();
+        app.cwd = std::env::temp_dir();
+        app.planned_nodes = vec![test_planned_node("n0", &[]), test_planned_node("n1", &["n0"])];
+        app.awaiting_approval = true;
+        app.refining = true;
+
+        app.approve_planned_queue();
+
+        assert!(app.awaiting_approval, "refining blocks approval; gate stays up");
+        assert_eq!(app.planned_nodes.len(), 2, "the stale plan is not launched");
+    }
+
+    #[test]
+    fn current_plan_outline_lists_nodes_with_deps() {
+        let mut app = App::new();
+        app.planned_nodes = vec![test_planned_node("n0", &[]), test_planned_node("n1", &["n0"])];
+        let outline = app.current_plan_outline();
+        assert!(outline.contains("n0"));
+        assert!(outline.contains("n1"));
+        assert!(outline.contains("n0:hard"), "hard dep is shown: {outline}");
     }
 
     // --- Orchestrator view: pinned row + spinner/DAG worker pane -------------

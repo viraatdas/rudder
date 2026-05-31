@@ -108,6 +108,11 @@ pub(crate) fn agent_command(
                     // NOT the interactive Claude Code TUI (which buried the plan
                     // block and sat waiting for input).
                     "-p".to_string(),
+                    // Verbose so the planner streams its repo-inspection steps (the
+                    // files it reads/greps) into the pane as it works, instead of the
+                    // pane sitting silent during the model's thinking phase. The
+                    // RUDDER_PLAN_TASKS block still appears at the end and parses.
+                    "--verbose".to_string(),
                     "--permission-mode".to_string(),
                     "default".to_string(),
                     "--tools".to_string(),

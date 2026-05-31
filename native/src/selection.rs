@@ -80,11 +80,9 @@ pub(crate) fn task_visible_input_start(app: &App, area: Rect, input_lines: &[Str
 }
 
 pub(crate) fn task_visible_input_count(app: &App, area: Rect, input_line_count: usize) -> usize {
-    let default_hint = if app.plan_mode {
-        "Enter plan  Up/Down history  Option-1/2/3 or ^W pane  /plan off"
-    } else {
-        "Enter plan + run  Up/Down history  Option-1/2/3 or ^W pane  /plan  /sync"
-    };
+    // Use the SAME hint render_task/task_pane_height wrap, or the pane height and
+    // these mouse-selection bounds disagree and valid clicks get rejected.
+    let default_hint = crate::render::task_default_hint(app);
     let hint = app.notice.as_deref().unwrap_or(default_hint);
     let hint_line_count = wrap_text(hint, task_inner_width(area)).len().max(1);
     (area.height.max(1) as usize)

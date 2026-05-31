@@ -100,7 +100,6 @@ const AGENT_PANE_HINTS: &[&str] = &[
     "r rename",
     "v review",
     "g nest",
-    "u sync",
     "R review all",
     "m merge",
     "M merge all",
@@ -275,6 +274,20 @@ struct App {
     /// The original user request that produced `planned_nodes`, used to build each
     /// worker launch prompt so the worker sees the coordinating request.
     planned_origin: String,
+    /// The canonical first request the user typed for this plan, preserved verbatim
+    /// across refine rounds so each refinement re-plans against the ORIGINAL ask
+    /// (plus the running DAG + feedback) rather than the previous composite prompt.
+    plan_request: String,
+    /// The orchestrator's human-readable summary/assumptions/open-questions prose
+    /// printed AFTER the RUDDER_PLAN_TASKS block. Shown under the DAG so the user
+    /// knows what the planner assumed and what to discuss/refine.
+    plan_summary: Option<String>,
+    /// True while the orchestrator is RE-PLANNING in response to refinement feedback
+    /// (between relaunch and the revised DAG being captured). It lets plan detection
+    /// run even though `awaiting_approval` is still true (so the refined plan is
+    /// captured), blocks premature approval of the stale plan, and is cleared the
+    /// moment the revised plan lands (or the re-plan fails).
+    refining: bool,
     /// While true, a plan has been parsed into `planned_nodes` but is awaiting the
     /// user's APPROVAL gate: nothing launches. Enter approves (clears this and runs
     /// the scheduler); d removes the selected node, or discards the whole plan when
@@ -605,6 +618,9 @@ impl App {
             agents,
             planned_nodes: Vec::new(),
             planned_origin: String::new(),
+            plan_request: String::new(),
+            plan_summary: None,
+            refining: false,
             awaiting_approval: false,
             scheduler_tick: 0,
             spinner_frame: 0,
@@ -938,7 +954,6 @@ impl App {
             }
             KeyCode::Char('v') => self.toggle_worker_view(),
             KeyCode::Char('r') => self.start_rename_selected_agent(),
-            KeyCode::Char('u') => self.request_sync_selected_agent(),
             KeyCode::Up | KeyCode::Char('k') => self.select_previous_agent(),
             KeyCode::Down | KeyCode::Char('j') => self.select_next_agent(),
             KeyCode::Char('m') => self.request_merge_selected_agent(),
@@ -987,7 +1002,6 @@ impl App {
             }
             KeyCode::Char('v') | KeyCode::Char('\u{221a}') => self.toggle_worker_view(),
             KeyCode::Char('r') => self.start_rename_selected_agent(),
-            KeyCode::Char('u') => self.request_sync_selected_agent(),
             KeyCode::Up | KeyCode::Char('k') => self.select_previous_agent(),
             KeyCode::Down | KeyCode::Char('j') => self.select_next_agent(),
             KeyCode::Char('m') => self.request_merge_selected_agent(),
@@ -1030,21 +1044,14 @@ impl App {
             KeyCode::Char('v') => self.toggle_worker_view(),
             KeyCode::Char('g') => self.toggle_nest_view(),
             KeyCode::Char('r') => self.start_rename_selected_agent(),
-            KeyCode::Char('u') => self.request_sync_selected_agent(),
             KeyCode::Char('R') => self.review_all_ready(),
             KeyCode::Char('M') => self.request_merge_all_ready(),
             KeyCode::Char('m') => self.request_merge_selected_agent(),
             KeyCode::Char('d') => {
-                // FIX/DISCARD the pending plan: while a plan awaits approval and the
-                // pinned orchestrator is selected, `d` discards the whole plan.
-                // Reachable whenever there are planned nodes (no agents.is_empty
-                // guard): an orchestrator agent is present even when no worker has
-                // launched yet. Otherwise `d` deletes the selected agent as usual.
-                if !self.planned_nodes.is_empty()
-                    && (self.selected_is_orchestrator() || self.agents.is_empty())
-                {
-                    self.discard_planned_queue();
-                } else {
+                // The pinned orchestrator is never deleted/discarded with `d`; the
+                // pending plan is refined by typing into the task pane, not thrown
+                // away. For any other agent, `d` deletes it as usual.
+                if !self.selected_is_orchestrator() {
                     self.delete_selected_agent();
                 }
             }
@@ -1566,7 +1573,7 @@ impl App {
                 self.task_cursor = 1;
                 self.picker_index = 0;
                 self.notice = Some(
-                    "type /plan, /model, /main|/m, /sync, /goal, /usage, or /cloud".to_string(),
+                    "type /model, /main|/m, /goal, /usage, or /cloud".to_string(),
                 );
             }
             KeyCode::Char(ch) => {
@@ -2350,6 +2357,11 @@ impl App {
     fn start_task(&mut self) {
         let input = self.task_input.trim().to_string();
         if input.is_empty() {
+            // Empty Enter while a plan awaits approval = approve & launch. This makes
+            // the task pane the single plan-mode surface: type to refine, Enter to go.
+            if self.awaiting_approval {
+                self.approve_planned_queue();
+            }
             return;
         }
         self.remember_task_history(&input);
@@ -2364,6 +2376,16 @@ impl App {
             return;
         }
         self.notice = None;
+
+        // REFINE (plan-mode-style discussion): while a plan is parsed but not yet
+        // approved, a typed message is feedback to the orchestrator, not a new node.
+        // Re-run the planner with the current DAG + the feedback so it REVISES the
+        // whole plan and the DAG tree updates in place. The user iterates until they
+        // approve with Enter.
+        if self.awaiting_approval {
+            self.refine_plan(&input);
+            return;
+        }
 
         if self.plan_mode {
             // Explicit /plan mode: a read-only planner that never spawns workers.
@@ -2826,6 +2848,10 @@ impl App {
     }
 
     fn start_rudder_plan_task(&mut self, input: &str) {
+        // Remember the original request so the refine loop can re-plan against it
+        // (each refinement layers the user's feedback on top of this, not on top of
+        // the previous composite prompt).
+        self.plan_request = input.to_string();
         let model = self.model.clone();
         let backend = self.backend;
         // Decomposing a task into a node DAG does not need max reasoning. Cap the
@@ -2923,6 +2949,131 @@ impl App {
         if let Some(run) = self.agents.get(self.selected_agent) {
             let _ = save_native_run_record(&self.cwd, run);
         }
+    }
+
+    /// REFINE the pending plan with the user's feedback (plan-mode-style
+    /// discussion). Re-runs the pinned orchestrator with the original request, the
+    /// current DAG, and the feedback so it emits a REVISED full DAG that REPLACES
+    /// the pending plan. Stays at the approval gate; nothing launches until Enter.
+    fn refine_plan(&mut self, feedback: &str) {
+        let Some(index) = self.agents.iter().position(|run| run.is_orchestrator()) else {
+            // No orchestrator to refine (shouldn't happen while awaiting approval):
+            // fall back to a fresh plan from the feedback.
+            self.start_rudder_plan_task(feedback);
+            return;
+        };
+        let original = if self.plan_request.trim().is_empty() {
+            self.planned_origin.clone()
+        } else {
+            self.plan_request.clone()
+        };
+        let outline = self.current_plan_outline();
+        let composite = build_refine_request(&original, &outline, feedback);
+        // Mark the refine in flight: this keeps awaiting_approval = true (so the
+        // scheduler never launches the stale plan and Enter cannot approve it mid
+        // -refine) while still letting maybe_detect_plan_ready capture the revised
+        // DAG. evaluate_completed_plan clears `refining` once the new plan lands.
+        self.refining = true;
+        if self.relaunch_orchestrator_with(index, composite, feedback) {
+            self.notice = Some("refining the plan with your feedback…".to_string());
+        } else {
+            // The planner could not be relaunched: drop back to the existing plan so
+            // the user is not stuck (they can still approve it or try again).
+            self.refining = false;
+            self.notice = Some("could not relaunch the planner; the current plan still stands".to_string());
+        }
+    }
+
+    /// A compact, human-readable outline of the currently-queued plan, fed back to
+    /// the orchestrator so it can revise rather than start from scratch.
+    fn current_plan_outline(&self) -> String {
+        let mut lines: Vec<String> = Vec::new();
+        for node in &self.planned_nodes {
+            let mut deps: Vec<String> = node.deps.iter().map(|d| format!("{d}:hard")).collect();
+            deps.extend(node.soft_deps.iter().map(|d| format!("{d}:soft")));
+            let deps_str = if deps.is_empty() {
+                "none".to_string()
+            } else {
+                deps.join(", ")
+            };
+            let goal = node.goal.clone().unwrap_or_default();
+            lines.push(format!(
+                "- {} [{}]{} deps: {}",
+                node.id,
+                node.title,
+                if goal.is_empty() {
+                    String::new()
+                } else {
+                    format!(" goal: {goal}")
+                },
+                deps_str
+            ));
+        }
+        if lines.is_empty() {
+            "(no tasks yet)".to_string()
+        } else {
+            lines.join("\n")
+        }
+    }
+
+    /// Re-launch an existing orchestrator run (by index) with a NEW composite task
+    /// and re-arm autosteer so its revised plan is captured. Mirrors the spawn in
+    /// start_rudder_plan_task but reuses the pinned orchestrator row in place.
+    fn relaunch_orchestrator_with(&mut self, index: usize, new_task: String, feedback: &str) -> bool {
+        let cwd = self.cwd.clone();
+        let Some(run) = self.agents.get_mut(index) else {
+            return false;
+        };
+        let session_id = mint_session_id_for(run.backend);
+        let command = agent_command(
+            run.backend,
+            &run.model,
+            run.effort,
+            &new_task,
+            AgentMode::RudderPlan,
+            session_id.as_deref(),
+        );
+        let options = TerminalPaneOptions {
+            size: run.terminal_size.unwrap_or_default(),
+            cwd: Some(run.cwd.clone()),
+            ..TerminalPaneOptions::default()
+        };
+        let launched = match TerminalPane::spawn_shell_or_command(Some(command), options) {
+            Ok(mut terminal) => {
+                let _ = terminal.drain_output();
+                run.terminal = Some(terminal);
+                run.task = new_task.clone();
+                run.current_prompt = new_task;
+                let now = now_stamp();
+                run.turns.push(AgentTurn {
+                    ts: now.clone(),
+                    prompt: feedback.to_string(),
+                    source: "user".to_string(),
+                });
+                run.last_user_input_at = now;
+                run.status = AgentStatus::Running;
+                run.session_id = session_id;
+                run.completed_at = None;
+                run.last_output_at = Instant::now();
+                run.autosteered = true;
+                run.needs_permission = false;
+                run.permission_notified = false;
+                run.needs_user_input = false;
+                run.user_input_notified = false;
+                run.last_error = None;
+                let _ = save_native_run_record(&cwd, run);
+                true
+            }
+            Err(error) => {
+                run.status = AgentStatus::Failed;
+                run.last_error = Some(error.to_string());
+                false
+            }
+        };
+        self.selected_agent = index;
+        self.focus = FocusPane::Worker;
+        self.worker_view = WorkerView::Terminal;
+        launched
     }
 
     fn restore_running_agents(&mut self) {
@@ -3406,22 +3557,18 @@ impl App {
                 true
             }
             Some("/plan") => {
-                let task = parts.collect::<Vec<_>>().join(" ");
-                if task.trim().is_empty() {
-                    self.plan_mode = !self.plan_mode;
-                    self.notice = Some(if self.plan_mode {
-                        "plan mode on: Enter starts a read-only planner".to_string()
-                    } else {
-                        "plan mode off".to_string()
-                    });
-                } else {
-                    self.start_plan_task(task.trim());
-                }
+                // Planning is the default paradigm now: just type a task and the
+                // orchestrator plans it, then you refine before approving. The old
+                // standalone /plan read-only mode is retired.
+                self.notice = Some(
+                    "planning is the default — just type your task; the orchestrator plans it and you refine before approving"
+                        .to_string(),
+                );
                 true
             }
             Some("/help") => {
                 self.notice = Some(
-                    "Option-1/2/3 or ^W pane  Enter start/focus  /plan  /model  /main|/m  /sync  /goal"
+                    "Option-1/2/3 or ^W pane  Enter start/focus  type to refine the plan  /model  /main|/m  /goal"
                         .to_string(),
                 );
                 true
@@ -3479,7 +3626,10 @@ impl App {
                 true
             }
             Some("/sync") => {
-                self.request_sync_selected_agent();
+                // Retired: jj keeps node workspaces current automatically, so manual
+                // worktree sync no longer fits the orchestrator paradigm.
+                self.notice =
+                    Some("sync is retired; jj keeps node workspaces current automatically".to_string());
                 true
             }
             Some("/review-all") => {
@@ -3954,7 +4104,11 @@ impl App {
 
         // INITIAL plan: a fresh plan is already captured (awaiting approval, or
         // some nodes queued): do not re-capture from a still-streaming orchestrator.
-        if self.awaiting_approval || !self.planned_nodes.is_empty() {
+        // EXCEPTION: while `refining`, the orchestrator has been relaunched to revise
+        // the plan, so we MUST capture its new block even though a (stale) plan is
+        // still pending; evaluate_completed_plan replaces the queue and clears the
+        // flag.
+        if !self.refining && (self.awaiting_approval || !self.planned_nodes.is_empty()) {
             return;
         }
         let index = self.agents.iter().position(|run| {
@@ -3990,15 +4144,20 @@ impl App {
             Err(error) => {
                 run.autosteered = false;
                 let _ = save_native_run_record(&self.cwd, run);
+                self.refining = false;
                 self.notice = Some(format!(
                     "planner finished without a runnable plan ({error}). Refine the task with more detail and re-plan."
                 ));
                 return;
             }
         };
+        // Capture the planner's prose after the block (assumptions / open questions)
+        // so the orchestrator pane can show what it assumed and invite refinement.
+        let summary = extract_rudder_plan_summary(&output);
         if tasks.is_empty() {
             run.autosteered = false;
             let _ = save_native_run_record(&self.cwd, run);
+            self.refining = false;
             self.notice = Some(
                 "planner finished without a runnable plan (it may have asked for clarification). Refine the task with more detail and re-plan."
                     .to_string(),
@@ -4011,7 +4170,17 @@ impl App {
         let nodes: Vec<PlannedNode> = tasks.iter().map(PlannedNode::from_task).collect();
         let count = nodes.len();
         self.planned_nodes = nodes;
-        self.planned_origin = planner_task;
+        // Keep planned_origin anchored to the ORIGINAL request so refine rounds (whose
+        // run.task is a composite "revise this" prompt) do not overwrite it; worker
+        // launch prompts and further refinements stay tied to what the user asked for.
+        self.planned_origin = if self.plan_request.trim().is_empty() {
+            planner_task
+        } else {
+            self.plan_request.clone()
+        };
+        self.plan_summary = summary;
+        // The revised plan has landed: the refine round is complete.
+        self.refining = false;
 
         // Clear the planner's autosteer flag so it is captured once, but KEEP the
         // run: it stays pinned at the top of the list as the orchestrator that owns
@@ -4020,10 +4189,10 @@ impl App {
         let _ = save_native_run_record(&self.cwd, run);
 
         // APPROVAL GATE: do NOT launch. Hold the plan until the user approves so
-        // they can review and fix the DAG first.
+        // they can review, discuss/refine (type in the task pane), or approve it.
         self.awaiting_approval = true;
         self.notice = Some(format!(
-            "plan ready: {count} node(s). Enter approve · d remove/discard"
+            "plan ready: {count} node(s). Type to refine · Enter approve"
         ));
         self.dirty = true;
     }
@@ -4162,6 +4331,12 @@ impl App {
     /// immediate scheduler pass; the rest stay in Todo until their deps merge.
     fn approve_planned_queue(&mut self) {
         if !self.awaiting_approval {
+            return;
+        }
+        // A refine is in flight: the revised DAG is still being produced. Do NOT
+        // approve/launch the stale plan; tell the user to wait for the update.
+        if self.refining {
+            self.notice = Some("still refining — the updated plan is on its way".to_string());
             return;
         }
         if self.planned_nodes.is_empty() {
@@ -4442,8 +4617,9 @@ impl App {
         ids
     }
 
-    /// Discard the entire pending plan queue (the `d` key on a planned node when no
-    /// agent is selected for deletion). Clears Todo of planned nodes.
+    /// Discard the entire pending plan queue. No longer bound to a key (the plan is
+    /// refined by typing into the task pane, not discarded), but kept for now.
+    #[allow(dead_code)]
     fn discard_planned_queue(&mut self) {
         if self.planned_nodes.is_empty() {
             return;
@@ -4643,6 +4819,8 @@ impl App {
         let _ = write_rudder_context(&self.cwd, &self.agents, None);
     }
 
+    // Retired from the UI (no keybinding, /sync is a no-op); kept for now.
+    #[allow(dead_code)]
     fn request_sync_selected_agent(&mut self) {
         if self.selected_is_main() {
             self.notice = Some("main agent: sync disabled".to_string());

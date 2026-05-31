@@ -148,11 +148,6 @@ with `Enter`.
 | --- | --- |
 | `/model` | Pick provider, then model, then effort |
 | `/main` or `/m` | Start a new main-branch agent |
-| `/plan` | Toggle read-only plan mode |
-| `/plan <task>` | Run one read-only planning session |
-| `/rudder-plan <task>` | Plan, then spawn worker agents for the steps |
-| `/run <task>` | Start an implementation run even when plan mode is on |
-| `/sync` | Rebase the selected worktree onto its base branch |
 | `/review-all` | Combine completed worktrees and start a Codex review-all agent |
 | `/merge-all` | Merge all completed worktrees |
 | `/login` | Browser login for Rudder Cloud |
@@ -171,14 +166,15 @@ Your last provider, model, and effort are saved in `~/.rudder/config.json` and
 reused next time. Rudder refreshes model metadata from
 `https://models.dev/api.json` and falls back to local caches when offline.
 
-## Plan mode
+## Planning (the default)
 
-Type `/plan` to toggle planning on or off. While on, `Enter` starts a read-only
-planner instead of an implementation run. Use `/plan <task>` for a one-off plan,
-or `/run <task>` to bypass plan mode. `/rudder-plan <task>` plans and then starts
-each resulting step as its own worktree agent. Planners run in the current
-checkout and use each backend's native read-only mode, so they do not write
-files.
+Just type a task. The orchestrator decomposes it into a DAG of worker tasks and
+shows it for approval. While the plan awaits approval you can **discuss and refine
+it**: type changes into the task pane and the orchestrator re-plans and updates the
+DAG tree. The pane also shows the planner's assumptions/notes. Press `Enter` with an
+empty input to approve and launch; the scheduler then drains the DAG (todo →
+in-progress → review → done) as dependencies merge. After launch, typing a new task
+folds it into the running DAG as a new node.
 
 ## Worktrees and merging
 
@@ -189,7 +185,6 @@ the next time you open Rudder in that repo.
 
 - Press `m` to merge the selected completed agent back into its branch.
 - Press `M` to merge all completed agents. Rudder confirms first.
-- Press `u` (or run `/sync`) to only rebase a worktree onto its base.
 
 Clean merges become merge commits. If git reports conflicts, Rudder leaves the
 conflicted state in place and can open an agent in the main checkout to help

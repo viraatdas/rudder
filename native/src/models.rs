@@ -248,16 +248,6 @@ pub(crate) fn bounded_edit_distance(left: &str, right: &str, max_distance: usize
 pub(crate) fn command_suggestions() -> Vec<Suggestion> {
     vec![
         Suggestion {
-            label: "/plan".to_string(),
-            detail: "toggle Rudder read-only planning".to_string(),
-            action: SuggestionAction::Insert("/plan".to_string()),
-        },
-        Suggestion {
-            label: "/plan <task>".to_string(),
-            detail: "plan one task without toggling".to_string(),
-            action: SuggestionAction::Insert("/plan ".to_string()),
-        },
-        Suggestion {
             label: "/model".to_string(),
             detail: "pick Claude or Codex model".to_string(),
             action: SuggestionAction::Insert("/model ".to_string()),
@@ -296,11 +286,6 @@ pub(crate) fn command_suggestions() -> Vec<Suggestion> {
             label: "/merge-all".to_string(),
             detail: "merge all completed worktrees".to_string(),
             action: SuggestionAction::RunCommand("/merge-all".to_string()),
-        },
-        Suggestion {
-            label: "/sync".to_string(),
-            detail: "rebase selected worktree without merging".to_string(),
-            action: SuggestionAction::RunCommand("/sync".to_string()),
         },
         Suggestion {
             label: "/usage".to_string(),
