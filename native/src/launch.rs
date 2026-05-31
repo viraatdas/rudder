@@ -203,6 +203,8 @@ pub(crate) fn review_all_run(
         cwd: worktree.path.clone(),
         worktree_branch: worktree.branch.clone(),
         worktree_path: worktree.path_is_worktree.then_some(worktree.path),
+        workspace_name: worktree.workspace_name.clone(),
+        jj_change_id: worktree.jj_change_id.clone(),
         session_id,
         terminal: None,
         terminal_size: None,

@@ -1631,6 +1631,81 @@ branch refs/heads/main\n";
     }
 
     #[test]
+    fn jj_run_record_writes_vcs_jj_and_workspace_fields() {
+        let repo_root = std::env::temp_dir().join(format!(
+            "rudder-jj-record-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&repo_root).expect("create test repo root");
+
+        let mut run = test_agent_run("jj-run-1", "wire up jj isolation");
+        run.cwd = repo_root.join("workspace");
+        run.worktree_path = Some(run.cwd.clone());
+        run.worktree_branch = None;
+        run.workspace_name = Some("rudder-jj-run-1-abc123".to_string());
+        run.jj_change_id = Some("zzzzzzzz".to_string());
+
+        save_native_run_record(&repo_root, &run).expect("save jj run record");
+        let raw = fs::read_to_string(native_run_dir(&repo_root, "jj-run-1").join("run.json"))
+            .expect("read run.json");
+        let value: serde_json::Value = serde_json::from_str(&raw).expect("parse run.json");
+
+        assert_eq!(value.get("vcs").and_then(|v| v.as_str()), Some("jj"));
+        let worktree = value.get("worktree").expect("worktree object");
+        assert_eq!(
+            worktree.get("workspaceName").and_then(|v| v.as_str()),
+            Some("rudder-jj-run-1-abc123")
+        );
+        assert_eq!(
+            worktree.get("jjChangeId").and_then(|v| v.as_str()),
+            Some("zzzzzzzz")
+        );
+        // jj runs omit the legacy git branch field.
+        assert!(worktree.get("branch").is_none());
+
+        let _ = fs::remove_dir_all(repo_root);
+    }
+
+    #[test]
+    fn legacy_git_run_record_keeps_vcs_git_and_branch() {
+        let repo_root = std::env::temp_dir().join(format!(
+            "rudder-git-record-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&repo_root).expect("create test repo root");
+
+        let mut run = test_agent_run("git-run-1", "legacy worktree run");
+        run.cwd = repo_root.join("worktree");
+        run.worktree_path = Some(run.cwd.clone());
+        run.worktree_branch = Some("rudder/legacy-1".to_string());
+        run.workspace_name = None;
+        run.jj_change_id = None;
+
+        save_native_run_record(&repo_root, &run).expect("save git run record");
+        let raw = fs::read_to_string(native_run_dir(&repo_root, "git-run-1").join("run.json"))
+            .expect("read run.json");
+        let value: serde_json::Value = serde_json::from_str(&raw).expect("parse run.json");
+
+        assert_eq!(value.get("vcs").and_then(|v| v.as_str()), Some("git"));
+        let worktree = value.get("worktree").expect("worktree object");
+        assert_eq!(
+            worktree.get("branch").and_then(|v| v.as_str()),
+            Some("rudder/legacy-1")
+        );
+        assert!(worktree.get("workspaceName").is_none());
+
+        let _ = fs::remove_dir_all(repo_root);
+    }
+
+    #[test]
     fn cloud_command_defaults_to_generated_cloud_worker() {
         let app = App::new();
         let generated = app.cloud_command_args(Vec::new());
@@ -2338,6 +2413,8 @@ branch refs/heads/main\n";
             cwd: std::env::temp_dir(),
             worktree_branch: None,
             worktree_path: None,
+            workspace_name: None,
+            jj_change_id: None,
             session_id: None,
             terminal: None,
             terminal_size: None,
@@ -2678,7 +2755,7 @@ branch refs/heads/main\n";
         assert!(app
             .notice
             .as_deref()
-            .is_some_and(|notice| notice.contains("no completed worktrees")));
+            .is_some_and(|notice| notice.contains("no completed workspaces")));
     }
 
     #[test]
@@ -2751,6 +2828,8 @@ branch refs/heads/main\n";
             cwd: app.cwd.clone(),
             worktree_branch: None,
             worktree_path: None,
+            workspace_name: None,
+            jj_change_id: None,
             session_id: None,
             terminal: None,
             terminal_size: None,

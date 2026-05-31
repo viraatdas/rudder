@@ -231,6 +231,8 @@ pub(crate) fn create_main_agent(
         cwd: repo_root.to_path_buf(),
         worktree_branch: None,
         worktree_path: None,
+        workspace_name: None,
+        jj_change_id: None,
         session_id: None,
         terminal: None,
         terminal_size: None,
@@ -350,8 +352,19 @@ pub(crate) fn agent_from_run_record(repo_root: &Path, record: serde_json::Value)
     let worktree_branch = worktree
         .and_then(|value| value.get("branch"))
         .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
         .map(ToOwned::to_owned);
     let worktree_path = worktree_enabled.then_some(cwd.clone());
+    let workspace_name = worktree
+        .and_then(|value| value.get("workspaceName"))
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned);
+    let jj_change_id = worktree
+        .and_then(|value| value.get("jjChangeId"))
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned);
     let session_id = record
         .get("session")
         .and_then(|value| value.get("nativeSessionId"))
@@ -407,6 +420,8 @@ pub(crate) fn agent_from_run_record(repo_root: &Path, record: serde_json::Value)
         cwd,
         worktree_branch,
         worktree_path,
+        workspace_name,
+        jj_change_id,
         session_id,
         terminal: None,
         terminal_size: None,
@@ -518,9 +533,32 @@ pub(crate) fn save_native_run_record(repo_root: &Path, run: &AgentRun) -> Result
             })
         })
         .collect::<Vec<_>>();
+    // A run isolated in a jj workspace carries a workspace name. Those records
+    // declare `vcs:"jj"` so the TS merge/sync path routes through jj. Legacy
+    // git-worktree runs (a branch but no jj workspace, e.g. the review-all
+    // aggregate) stay `vcs:"git"` for back-compat.
+    let is_jj_run = run.workspace_name.is_some() || run.jj_change_id.is_some();
+    let mut worktree = serde_json::json!({
+        "enabled": run.worktree_path.is_some(),
+        "path": run.cwd,
+    });
+    if let Some(map) = worktree.as_object_mut() {
+        if is_jj_run {
+            if let Some(name) = run.workspace_name.as_ref() {
+                map.insert("workspaceName".to_string(), serde_json::json!(name));
+            }
+            if let Some(change_id) = run.jj_change_id.as_ref() {
+                map.insert("jjChangeId".to_string(), serde_json::json!(change_id));
+            }
+        } else if let Some(branch) = run.worktree_branch.as_ref() {
+            // Only legacy git runs keep a branch field; jj runs omit it.
+            map.insert("branch".to_string(), serde_json::json!(branch));
+        }
+    }
     let record = serde_json::json!({
         "id": run.id,
         "status": run_record_status(run.status),
+        "vcs": if is_jj_run { "jj" } else { "git" },
         "mode": run.mode.as_str(),
         "task": run.task,
         "taskSummary": run.task_summary,
@@ -532,11 +570,7 @@ pub(crate) fn save_native_run_record(repo_root: &Path, run: &AgentRun) -> Result
         "repoRoot": repo_root,
         "targetBranch": target_branch,
         "baseCommit": base_commit,
-        "worktree": {
-            "enabled": run.worktree_path.is_some(),
-            "path": run.cwd,
-            "branch": run.worktree_branch,
-        },
+        "worktree": worktree,
         "currentPrompt": run.current_prompt,
         "turns": turns,
         "lastUserInputAt": run.last_user_input_at,
@@ -565,6 +599,99 @@ pub(crate) fn save_native_run_record(repo_root: &Path, run: &AgentRun) -> Result
     Ok(())
 }
 
+/// Read the `merge` (or `sync`) state object back from a run's run.json. The TS
+/// `rudder merge`/`rudder sync` commands record their outcome there and exit 0
+/// even on conflict, so the native side reads the recorded status rather than
+/// the process exit code to tell merged/synced from conflict.
+pub(crate) fn read_run_record_field(
+    repo_root: &Path,
+    run_id: &str,
+    field: &str,
+) -> Option<serde_json::Value> {
+    let path = native_run_dir(repo_root, run_id).join("run.json");
+    let raw = fs::read_to_string(path).ok()?;
+    let value = serde_json::from_str::<serde_json::Value>(&raw).ok()?;
+    value.get(field).cloned()
+}
+
+/// Outcome of shelling out to a `rudder merge`/`rudder sync` jj run.
+pub(crate) enum JjCliOutcome {
+    Ok,
+    Conflict { files: Vec<String> },
+    Failed { error: String },
+}
+
+/// Run `rudder <command> <run_id>` synchronously (the TS command routes through
+/// the jj merge/sync helpers for vcs:jj runs and captures op-log for undo), then
+/// read back run.json to classify the outcome. Mirrors the cloudio.rs
+/// locate_rudder_cli + Command::output pattern.
+pub(crate) fn run_rudder_jj_command(
+    repo_root: &Path,
+    command: &str,
+    run_id: &str,
+    state_field: &str,
+) -> JjCliOutcome {
+    let Some(rudder) = locate_rudder_cli() else {
+        return JjCliOutcome::Failed {
+            error: "rudder CLI not found on PATH".to_string(),
+        };
+    };
+    let output = match Command::new(&rudder)
+        .arg(command)
+        .arg(run_id)
+        .current_dir(repo_root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) => {
+            return JjCliOutcome::Failed {
+                error: format!("failed to run rudder {command}: {error}"),
+            };
+        }
+    };
+
+    let state = read_run_record_field(repo_root, run_id, state_field);
+    let status = state
+        .as_ref()
+        .and_then(|value| value.get("status"))
+        .and_then(serde_json::Value::as_str);
+    match status {
+        Some("merged") | Some("synced") => JjCliOutcome::Ok,
+        Some("conflict") => {
+            let files = state
+                .as_ref()
+                .and_then(|value| value.get("conflictedFiles"))
+                .and_then(serde_json::Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(ToOwned::to_owned))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            JjCliOutcome::Conflict { files }
+        }
+        _ => {
+            let recorded = state
+                .as_ref()
+                .and_then(|value| value.get("error"))
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned);
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let error = recorded
+                .filter(|value| !value.is_empty())
+                .or(Some(stderr).filter(|value| !value.is_empty()))
+                .or(Some(stdout).filter(|value| !value.is_empty()))
+                .unwrap_or_else(|| format!("rudder {command} failed"));
+            JjCliOutcome::Failed { error }
+        }
+    }
+}
+
 pub(crate) fn remove_native_run_record(repo_root: &Path, run_id: &str) -> Result<()> {
     let dir = native_run_dir(repo_root, run_id);
     if dir.exists() {
@@ -579,6 +706,11 @@ pub(crate) struct WorktreeInfo {
     pub(crate) path: PathBuf,
     pub(crate) branch: Option<String>,
     pub(crate) path_is_worktree: bool,
+    /// jj workspace name for the run (e.g. `rudder-<id>-<hash>`). Present for new
+    /// runs isolated in a jj workspace; `None` for the dedicated main agent.
+    pub(crate) workspace_name: Option<String>,
+    /// The jj change id of the workspace's working-copy commit at launch.
+    pub(crate) jj_change_id: Option<String>,
 }
 
 impl WorktreeInfo {
@@ -588,8 +720,84 @@ impl WorktreeInfo {
             path,
             branch: None,
             path_is_worktree: false,
+            workspace_name: None,
+            jj_change_id: None,
         }
     }
+}
+
+/// Isolate a worker in a jj workspace instead of a git worktree. Shells out to
+/// `rudder __launch-node` (the TS shim that owns the jj logic via src/jj.ts) so
+/// the worker runs against a per-node jj workspace whose change id is captured
+/// for merge/sync. The returned WorktreeInfo carries the workspace path, name,
+/// and jj change id; `branch` stays empty for jj runs. New runs never silently
+/// fall back to git: if the shim is unavailable or fails, this surfaces a clear
+/// error to the caller.
+pub(crate) fn prepare_jj_workspace(cwd: &Path, task: &str) -> Result<WorktreeInfo> {
+    let repo = dashboard_root(cwd);
+    if !is_git_repo(&repo) {
+        return Ok(WorktreeInfo::current(cwd.to_path_buf()));
+    }
+
+    let id = new_run_id(task);
+    let rudder = locate_rudder_cli()
+        .context("rudder CLI not found on PATH; cannot create a jj workspace for the run")?;
+    let output = Command::new(&rudder)
+        .arg("__launch-node")
+        .arg("--repo")
+        .arg(&repo)
+        .arg("--task")
+        .arg(task)
+        .arg("--node")
+        .arg(&id)
+        .current_dir(&repo)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .context("failed to run rudder __launch-node")?;
+    if !output.status.success() {
+        let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        anyhow::bail!(if message.is_empty() {
+            "rudder __launch-node failed".to_string()
+        } else {
+            message
+        });
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout
+        .lines()
+        .rev()
+        .find(|line| line.trim_start().starts_with('{'))
+        .context("rudder __launch-node printed no JSON line")?;
+    let value: serde_json::Value =
+        serde_json::from_str(line.trim()).context("could not parse rudder __launch-node output")?;
+    let path = value
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .context("rudder __launch-node output is missing a workspace path")?
+        .to_string();
+    let workspace_name = value
+        .get("workspaceName")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    let jj_change_id = value
+        .get("jjChangeId")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+
+    Ok(WorktreeInfo {
+        id,
+        path: PathBuf::from(path),
+        branch: None,
+        path_is_worktree: true,
+        workspace_name,
+        jj_change_id,
+    })
 }
 
 pub(crate) fn prepare_worktree(cwd: &Path, task: &str) -> Result<WorktreeInfo> {
@@ -633,6 +841,8 @@ pub(crate) fn prepare_worktree(cwd: &Path, task: &str) -> Result<WorktreeInfo> {
         path,
         branch: Some(branch),
         path_is_worktree: true,
+        workspace_name: None,
+        jj_change_id: None,
     })
 }
 
@@ -970,7 +1180,7 @@ pub(crate) fn ensure_hunk_config(cwd: &Path) -> Result<()> {
     let contents = [
         format!("theme = \"{theme}\""),
         "mode = \"auto\"".to_string(),
-        "vcs = \"git\"".to_string(),
+        "vcs = \"jj\"".to_string(),
         "exclude_untracked = false".to_string(),
         "line_numbers = true".to_string(),
         "wrap_lines = false".to_string(),

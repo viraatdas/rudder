@@ -7,7 +7,15 @@ import { codexEnvVars, codexLaunchEnv } from "./codex-binary.js";
 import { runCloudCommand } from "./cloud.js";
 import { currentBranch, findRepoRoot } from "./git.js";
 import { ensureBoardRunning } from "./daemon.js";
-import { currentOpId, ensureColocated, ensureJj, undoLast, undoToOp } from "./jj.js";
+import {
+  createNodeWorkspace,
+  currentJjChangeId,
+  currentOpId,
+  ensureColocated,
+  ensureJj,
+  undoLast,
+  undoToOp,
+} from "./jj.js";
 import { graphPath } from "./graph.js";
 import { buildFanoutDag, gateDecision, planTask, scaffoldPlan } from "./planner.js";
 import { backfillLlmTaskSummaries, popUndoEntry, projectStateDir, registerProject, runsDir } from "./state.js";
@@ -31,7 +39,7 @@ import { appendDecision } from "./surfaces.js";
 import { runTmuxAgentPane, runTmuxTaskPane, runTmuxWorkerIdle } from "./tmux-dashboard.js";
 import { runInteractiveTui } from "./tui.js";
 import type { BackendId } from "./types.js";
-import { commandExists, isTty, MissingToolError, runCommand } from "./util.js";
+import { commandExists, isTty, MissingToolError, newRunId, runCommand } from "./util.js";
 import { getUpdateAvailable } from "./version-check.js";
 import { attachTmuxSession, ensureTmuxDashboardSession, hasTmux, repoTmuxSessionName, shellCommand } from "./tmux.js";
 
@@ -54,6 +62,9 @@ type Parsed = {
     cwd?: string;
     repo?: string;
     run?: string;
+    task?: string;
+    node?: string;
+    base?: string;
     help?: boolean;
     version?: boolean;
     noTmux?: boolean;
@@ -203,6 +214,10 @@ export async function main(): Promise<void> {
         throw new Error("__worker requires --repo and --run");
       }
       await workerRun(repo, run);
+      return;
+    }
+    case "__launch-node": {
+      await runLaunchNode(parsed);
       return;
     }
     case "onboard":
@@ -496,6 +511,18 @@ function parseArgs(argv: string[]): Parsed {
       parsed.flags.run = readValue(argv, ++i, arg);
       continue;
     }
+    if (takesValue(arg, "--task")) {
+      parsed.flags.task = readValue(argv, ++i, arg);
+      continue;
+    }
+    if (takesValue(arg, "--node")) {
+      parsed.flags.node = readValue(argv, ++i, arg);
+      continue;
+    }
+    if (takesValue(arg, "--base")) {
+      parsed.flags.base = readValue(argv, ++i, arg);
+      continue;
+    }
     if (takesValue(arg, "--tmux-session")) {
       parsed.flags.tmuxSession = readValue(argv, ++i, arg);
       continue;
@@ -526,6 +553,18 @@ function parseArgs(argv: string[]): Parsed {
     }
     if (arg.startsWith("--run=")) {
       parsed.flags.run = arg.slice("--run=".length);
+      continue;
+    }
+    if (arg.startsWith("--task=")) {
+      parsed.flags.task = arg.slice("--task=".length);
+      continue;
+    }
+    if (arg.startsWith("--node=")) {
+      parsed.flags.node = arg.slice("--node=".length);
+      continue;
+    }
+    if (arg.startsWith("--base=")) {
+      parsed.flags.base = arg.slice("--base=".length);
       continue;
     }
     if (arg.startsWith("--tmux-session=")) {
@@ -805,6 +844,41 @@ async function runBoard(parsed: Parsed): Promise<void> {
   }
   // Keep the process alive while the in-process daemon serves the board.
   await new Promise<void>(() => {});
+}
+
+/**
+ * `rudder __launch-node`: the native TUI calls this synchronously to isolate a
+ * worker in a jj workspace (replacing `git worktree add`). It colocates jj with
+ * the git repo, creates a per-node workspace, reads back its change id, and
+ * prints a single JSON line {path, workspaceName, jjChangeId} to stdout. Errors
+ * go to stderr and exit non-zero so the native side surfaces a clear failure.
+ */
+async function runLaunchNode(parsed: Parsed): Promise<void> {
+  const repoRoot = parsed.flags.repo;
+  const task = parsed.flags.task;
+  if (!repoRoot) {
+    throw new Error("__launch-node requires --repo");
+  }
+  if (!task) {
+    throw new Error("__launch-node requires --task");
+  }
+  const runId = parsed.flags.node ?? newRunId(task);
+  ensureJj();
+  await ensureColocated(repoRoot);
+  const workspace = await createNodeWorkspace({
+    repoRoot,
+    runId,
+    task,
+    ...(parsed.flags.base ? { atChangeId: parsed.flags.base } : {}),
+  });
+  const jjChangeId = await currentJjChangeId(workspace.path);
+  process.stdout.write(
+    `${JSON.stringify({
+      path: workspace.path,
+      workspaceName: workspace.workspaceName,
+      jjChangeId,
+    })}\n`,
+  );
 }
 
 async function runUndo(opId?: string): Promise<void> {

@@ -286,6 +286,10 @@ struct App {
     delete_pending: Option<String>,
     merge_confirm: Option<MergeConfirmation>,
     conflict_prompt: Option<MergeConflictPrompt>,
+    /// Conflicted files reported by a jj `rudder merge`/`rudder sync` shell-out.
+    /// jj records conflicts in the change rather than leaving git unmerged paths,
+    /// so handle_merge_error reads them from here instead of `git diff -U`.
+    pending_jj_conflict: Option<Vec<String>>,
     picker_index: usize,
     worker_selection: Option<WorkerSelection>,
     task_selection: Option<WorkerSelection>,
@@ -436,6 +440,12 @@ struct AgentRun {
     cwd: PathBuf,
     worktree_branch: Option<String>,
     worktree_path: Option<PathBuf>,
+    /// jj workspace name for runs isolated in a jj workspace. `None` for the
+    /// main agent and legacy git-worktree runs.
+    workspace_name: Option<String>,
+    /// jj change id captured when the run's workspace was created. Used to route
+    /// merge/sync through jj for new (vcs:jj) runs.
+    jj_change_id: Option<String>,
     session_id: Option<String>,
     terminal: Option<TerminalPane>,
     terminal_size: Option<TerminalSize>,
@@ -580,6 +590,7 @@ impl App {
             delete_pending: None,
             merge_confirm: None,
             conflict_prompt: None,
+            pending_jj_conflict: None,
             picker_index: 0,
             worker_selection: None,
             task_selection: None,
@@ -1257,6 +1268,8 @@ impl App {
             path: self.cwd.join(".rudder-review-all-test"),
             branch: Some("rudder/test-review-all".to_string()),
             path_is_worktree: true,
+            workspace_name: None,
+            jj_change_id: None,
         };
         let premerge = ReviewAllPremerge {
             merged_branches: sources.iter().map(|source| source.branch.clone()).collect(),
@@ -2276,10 +2289,13 @@ impl App {
             .as_deref()
             .map(|title| truncate_chars(title, 56))
             .unwrap_or_else(|| summarize_task(input));
-        let worktree = match prepare_worktree(&self.cwd, worktree_label) {
+        let worktree = match prepare_jj_workspace(&self.cwd, worktree_label) {
             Ok(worktree) => worktree,
             Err(error) => {
-                self.notice = Some(format!("worktree failed: {error}"));
+                // New runs are jj-isolated; never silently fall back to git.
+                // Surface the failure and run in the current checkout so the user
+                // sees the error rather than a half-broken merge later.
+                self.notice = Some(format!("jj workspace failed: {error}"));
                 WorktreeInfo::current(self.cwd.clone())
             }
         };
@@ -2349,6 +2365,8 @@ impl App {
             cwd: worktree.path.clone(),
             worktree_branch: worktree.branch.clone(),
             worktree_path: worktree.path_is_worktree.then_some(worktree.path.clone()),
+            workspace_name: worktree.workspace_name.clone(),
+            jj_change_id: worktree.jj_change_id.clone(),
             session_id,
             terminal: None,
             terminal_size: None,
@@ -2439,6 +2457,8 @@ impl App {
             cwd: self.cwd.clone(),
             worktree_branch: None,
             worktree_path: None,
+            workspace_name: None,
+            jj_change_id: None,
             session_id,
             terminal: None,
             terminal_size: None,
@@ -2536,6 +2556,8 @@ impl App {
             cwd: self.cwd.clone(),
             worktree_branch: None,
             worktree_path: None,
+            workspace_name: None,
+            jj_change_id: None,
             session_id,
             terminal: None,
             terminal_size: None,
@@ -3460,6 +3482,8 @@ impl App {
             cwd: self.cwd.clone(),
             worktree_branch: None,
             worktree_path: None,
+            workspace_name: None,
+            jj_change_id: None,
             session_id: None,
             terminal: None,
             terminal_size: None,
@@ -3912,8 +3936,10 @@ impl App {
             self.notice = Some("selected agent is already merged".to_string());
             return;
         }
-        if run.worktree_branch.is_none() || run.worktree_path.is_none() {
-            self.notice = Some("selected agent has no worktree to sync".to_string());
+        // A run is isolated (and thus syncable) when it has a workspace path,
+        // whether that is a jj workspace (new runs) or a git worktree (legacy).
+        if run.worktree_path.is_none() && run.worktree_branch.is_none() {
+            self.notice = Some("selected agent has no workspace to sync".to_string());
             return;
         }
         let task = run.task.clone();
@@ -3948,8 +3974,10 @@ impl App {
             self.notice = Some("selected agent is already merged".to_string());
             return;
         }
-        if run.worktree_branch.is_none() {
-            self.notice = Some("selected agent has no worktree to merge".to_string());
+        // A run is mergeable when it has a workspace path (jj workspace for new
+        // runs, git worktree for legacy runs) or a legacy git branch.
+        if run.worktree_path.is_none() && run.worktree_branch.is_none() {
+            self.notice = Some("selected agent has no workspace to merge".to_string());
             return;
         }
         let pending = run
@@ -3992,13 +4020,14 @@ impl App {
             .iter()
             .filter(|run| {
                 run.status == AgentStatus::Done
-                    && run.worktree_branch.is_some()
+                    && (run.worktree_path.is_some() || run.worktree_branch.is_some())
+                    && !run.is_main()
                     && !claimed.contains(&run.id)
             })
             .collect();
 
         if ready_runs.is_empty() {
-            self.notice = Some("no completed worktrees ready to merge".to_string());
+            self.notice = Some("no completed workspaces ready to merge".to_string());
             return;
         }
 
@@ -4147,7 +4176,11 @@ impl App {
     ) {
         let mut operation = ConflictOperation::Merge;
         let mut conflict_root = self.cwd.clone();
-        let mut conflicts = conflicted_files(&self.cwd);
+        // jj runs report their conflicted files through pending_jj_conflict (jj
+        // records conflicts in the change, not as git unmerged paths). Prefer
+        // those; fall back to git's unmerged paths for legacy git-worktree runs.
+        let jj_conflicts = self.pending_jj_conflict.take();
+        let mut conflicts = jj_conflicts.unwrap_or_else(|| conflicted_files(&self.cwd));
         if conflicts.is_empty() {
             if let Some(path) = worktree_path.as_ref() {
                 let worktree_conflicts = conflicted_files(path);
@@ -4445,32 +4478,56 @@ What to do\n\
         ))
     }
 
+    /// A run is jj-isolated when it carries a jj workspace name or change id. New
+    /// runs are always jj; only pre-existing git-worktree runs (a git branch and
+    /// no jj workspace, e.g. the review-all aggregate) take the legacy git path.
+    fn run_is_jj(run: &AgentRun) -> bool {
+        run.workspace_name.is_some() || run.jj_change_id.is_some()
+    }
+
     fn merge_agent_at(&mut self, index: usize) -> Result<()> {
+        self.pending_jj_conflict = None;
         let Some(run) = self.agents.get(index) else {
             anyhow::bail!("no selected agent");
         };
-        let Some(branch) = run.worktree_branch.clone() else {
-            anyhow::bail!("selected agent is not in a worktree");
-        };
+        let is_jj = Self::run_is_jj(run);
         let review_source_ids = run.review_source_ids.clone();
 
-        commit_pending_changes_for_run(run)?;
-
-        match merge_strategy() {
-            MergeStrategy::Merge => {
-                git_status_command(&self.cwd, &["merge", "--no-ff", &branch])?;
+        if is_jj {
+            // jj runs merge through the TS `rudder merge <id>` command, which
+            // routes to mergeJjRunIntoCurrentWorkspace and captures op-log for
+            // `rudder undo`. The command records its outcome in run.json and
+            // exits 0 even on conflict, so classify by the recorded state.
+            let run_id = run.id.clone();
+            match run_rudder_jj_command(&self.cwd, "merge", &run_id, "merge") {
+                JjCliOutcome::Ok => {}
+                JjCliOutcome::Conflict { files } => {
+                    self.pending_jj_conflict = Some(files);
+                    anyhow::bail!("jj merge created conflicts");
+                }
+                JjCliOutcome::Failed { error } => anyhow::bail!(error),
             }
-            MergeStrategy::Rebase => {
-                let base_branch = current_branch_at(&self.cwd).unwrap_or_else(|| "HEAD".to_string());
-                rebase_worktree_onto_base(&self.cwd, &run.cwd, &base_branch)?;
-                git_status_command(&self.cwd, &["merge", "--ff-only", &branch])?;
+        } else {
+            let Some(branch) = run.worktree_branch.clone() else {
+                anyhow::bail!("selected agent is not in a worktree");
+            };
+            commit_pending_changes_for_run(run)?;
+            match merge_strategy() {
+                MergeStrategy::Merge => {
+                    git_status_command(&self.cwd, &["merge", "--no-ff", &branch])?;
+                }
+                MergeStrategy::Rebase => {
+                    let base_branch =
+                        current_branch_at(&self.cwd).unwrap_or_else(|| "HEAD".to_string());
+                    rebase_worktree_onto_base(&self.cwd, &run.cwd, &base_branch)?;
+                    git_status_command(&self.cwd, &["merge", "--ff-only", &branch])?;
+                }
             }
         }
         // Successful merge: keep the agent's row in the dashboard but flip it
         // to Merged so it appears in a dedicated section. Keep the worktree
-        // path on the record and defer `git worktree remove` to delete, which
-        // keeps merge confirmation responsive and preserves cleanup control.
-        // Never touch the dedicated main agent.
+        // path on the record and defer cleanup to delete, which keeps merge
+        // confirmation responsive. Never touch the dedicated main agent.
         if index < self.agents.len() && !self.agents[index].is_main() {
             self.mark_agent_and_review_sources_merged(index, review_source_ids);
         }
@@ -4478,9 +4535,26 @@ What to do\n\
     }
 
     fn sync_agent_at(&mut self, index: usize) -> Result<()> {
+        self.pending_jj_conflict = None;
         let Some(run) = self.agents.get(index) else {
             anyhow::bail!("no selected agent");
         };
+        if Self::run_is_jj(run) {
+            // jj sync rebases the run's change onto the base via `rudder sync`.
+            let run_id = run.id.clone();
+            match run_rudder_jj_command(&self.cwd, "sync", &run_id, "sync") {
+                JjCliOutcome::Ok => {}
+                JjCliOutcome::Conflict { files } => {
+                    self.pending_jj_conflict = Some(files);
+                    anyhow::bail!("jj sync created conflicts");
+                }
+                JjCliOutcome::Failed { error } => anyhow::bail!(error),
+            }
+            if let Some(run) = self.agents.get(index) {
+                save_native_run_record(&self.cwd, run)?;
+            }
+            return Ok(());
+        }
         if run.worktree_branch.is_none() {
             anyhow::bail!("selected agent is not in a worktree");
         }
