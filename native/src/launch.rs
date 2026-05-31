@@ -103,6 +103,11 @@ pub(crate) fn agent_command(
                 // implement; it only inspects and emits the task DAG, and Rudder
                 // spawns the separate worker agents.
                 AgentMode::RudderPlan => vec![
+                    // Print mode: run non-interactively so the decomposition streams
+                    // as clean stdout that Rudder parses, then the process exits.
+                    // NOT the interactive Claude Code TUI (which buried the plan
+                    // block and sat waiting for input).
+                    "-p".to_string(),
                     "--permission-mode".to_string(),
                     "default".to_string(),
                     "--tools".to_string(),
@@ -111,8 +116,6 @@ pub(crate) fn agent_command(
                     CLAUDE_DECOMPOSER_TOOLS.to_string(),
                     "--disallowedTools".to_string(),
                     CLAUDE_DECOMPOSER_DISALLOWED.to_string(),
-                    "--name".to_string(),
-                    format!("orchestrator:{}", short_task(task)),
                 ],
                 // Explicit /plan stays Claude's native read-only plan mode.
                 AgentMode::Plan => vec![
@@ -130,9 +133,13 @@ pub(crate) fn agent_command(
                 args.push("--effort".to_string());
                 args.push(effort.as_str().to_string());
             }
+            // The orchestrator runs one-shot in print mode, so it needs no resumable
+            // session id (passing one is meaningless for a non-interactive print run).
             if let Some(sid) = session_id {
-                args.push("--session-id".to_string());
-                args.push(sid.to_string());
+                if mode != AgentMode::RudderPlan {
+                    args.push("--session-id".to_string());
+                    args.push(sid.to_string());
+                }
             }
             if let Some(prompt) = prompt {
                 args.push(prompt);
@@ -140,6 +147,26 @@ pub(crate) fn agent_command(
             TerminalCommand::with_args("claude", args).with_env("CLAUDE_CODE_NO_FLICKER", "0")
         }
         Backend::Codex => {
+            // The orchestrator runs non-interactively via `codex exec` (read-only):
+            // it prints the decomposition + DAG and exits, so Rudder parses it.
+            // Other modes use the interactive codex TUI.
+            if mode == AgentMode::RudderPlan {
+                let mut args = vec![
+                    "exec".to_string(),
+                    "--sandbox".to_string(),
+                    "read-only".to_string(),
+                ];
+                push_codex_rudder_config_overrides(&mut args, effort);
+                if !model.trim().is_empty() {
+                    args.push("-m".to_string());
+                    args.push(model.to_string());
+                }
+                if let Some(prompt) = prompt {
+                    args.push(prompt);
+                }
+                return TerminalCommand::with_args(codex_program(), args)
+                    .with_env("CODEX_RUDDER_SCROLLBACK_SAFE", "1");
+            }
             let mut args = vec!["--no-alt-screen".to_string()];
             args.push("--enable".to_string());
             args.push("goals".to_string());

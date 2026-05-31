@@ -1384,6 +1384,10 @@ branch refs/heads/main\n";
                 .any(|window| window[0] == "--disallowedTools" && window[1].contains("Edit")),
             "orchestrator blocks edit/write tools"
         );
+        assert!(
+            orchestrator_claude.args.iter().any(|arg| arg == "-p"),
+            "orchestrator runs non-interactively (claude -p), not the interactive TUI"
+        );
 
         let rudder_plan = agent_command(
             Backend::Codex,
@@ -1393,7 +1397,15 @@ branch refs/heads/main\n";
             AgentMode::RudderPlan,
             None,
         );
-        assert!(rudder_plan.args.iter().any(|arg| arg == "--no-alt-screen"));
+        assert_eq!(
+            rudder_plan.args.first().map(String::as_str),
+            Some("exec"),
+            "codex orchestrator runs non-interactively via codex exec"
+        );
+        assert!(
+            !rudder_plan.args.iter().any(|arg| arg == "--no-alt-screen"),
+            "codex exec is not the interactive TUI"
+        );
         assert!(rudder_plan
             .args
             .windows(2)
