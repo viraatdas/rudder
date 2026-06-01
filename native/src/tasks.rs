@@ -335,8 +335,38 @@ pub(crate) fn rudder_plan_output_for_run(run: &AgentRun) -> String {
     output
 }
 
+/// Upper bound on tasks accepted from ONE plan block. This is NOT a feature limit
+/// (real plans are far smaller); it is a runaway/cost backstop: every task becomes
+/// a real worker agent (a Claude/Codex process), so an unbounded or hallucinated
+/// block could spawn hundreds of processes. 50 is far above any legitimate single
+/// plan, and a plan that exceeds it is surfaced (never silently truncated). Add
+/// more work incrementally by typing into the task pane (reconcile) rather than one
+/// giant block.
+pub(crate) const MAX_PLAN_TASKS: usize = 50;
+
 pub(crate) fn extract_rudder_plan_tasks(output: &str) -> Result<Vec<RudderPlanTask>> {
     extract_rudder_plan_tasks_with_frontier(output, &[])
+}
+
+/// The number of tasks the planner actually emitted in its block, BEFORE the
+/// `MAX_PLAN_TASKS` backstop. Lets the caller tell the user when a plan was
+/// truncated instead of silently dropping tasks. None if there is no valid block.
+pub(crate) fn rudder_plan_block_task_count(output: &str) -> Option<usize> {
+    const START: &str = "RUDDER_PLAN_TASKS_START";
+    const END: &str = "RUDDER_PLAN_TASKS_END";
+    let clean = strip_ansi_for_plan(output).replace('\r', "");
+    let start = clean.rfind(START)?;
+    let after_start = &clean[start + START.len()..];
+    let end = after_start.find(END)?;
+    let mut json = after_start[..end].trim();
+    json = json.strip_prefix("```json").unwrap_or(json).trim();
+    json = json.strip_prefix("```").unwrap_or(json).trim();
+    json = json.strip_suffix("```").unwrap_or(json).trim();
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    value
+        .get("tasks")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len)
 }
 
 /// Like `extract_rudder_plan_tasks`, but `frontier_ids` are ALSO treated as known
@@ -377,7 +407,7 @@ pub(crate) fn extract_rudder_plan_tasks_with_frontier(
 
     // Cap first, then synthesize ids by position so `deps` referencing dropped
     // (beyond-cap) tasks are treated as unknown and dropped below.
-    let capped: Vec<&serde_json::Value> = tasks.iter().take(10).collect();
+    let capped: Vec<&serde_json::Value> = tasks.iter().take(MAX_PLAN_TASKS).collect();
 
     // Known ids across the capped block. An explicit id wins; otherwise the
     // positional fallback `n{i}` is used (matching the synthesized id below). The

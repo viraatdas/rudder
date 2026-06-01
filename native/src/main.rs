@@ -4649,9 +4649,16 @@ impl App {
         // APPROVAL GATE: do NOT launch. Hold the plan until the user approves so
         // they can review, discuss/refine (type in the task pane), or approve it.
         self.awaiting_approval = true;
-        self.notice = Some(format!(
-            "plan ready: {count} node(s). Type to refine · Enter approve"
-        ));
+        // Surface (never silently drop) when the planner emitted more tasks than the
+        // runaway backstop allows.
+        let emitted = rudder_plan_block_task_count(&output).unwrap_or(count);
+        self.notice = Some(if emitted > MAX_PLAN_TASKS {
+            format!(
+                "plan ready: {count} of {emitted} node(s) (capped at {MAX_PLAN_TASKS}; add more by typing). Type to refine · Enter approve"
+            )
+        } else {
+            format!("plan ready: {count} node(s). Type to refine · Enter approve")
+        });
         self.dirty = true;
     }
 
