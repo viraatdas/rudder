@@ -453,6 +453,76 @@ branch refs/heads/main\n";
         assert!(worker_render_cursor(Backend::Codex, &pane, false, 5, 20, 0).is_none());
     }
 
+    #[cfg(not(windows))]
+    #[test]
+    fn real_pty_planner_full_summary_survives_stream_then_exit() {
+        // EMPIRICAL end-to-end check of the truncation fix against a REAL PTY+process.
+        // A script streams claude-style stream-json the way `claude -p` does: the
+        // RUDDER_PLAN_TASKS block + a summary whose streamed text is TRUNCATED
+        // mid-sentence, then (after a lag, like the real planner) the authoritative
+        // `result` event with the COMPLETE text, then it exits. We drive it through
+        // the exact drain -> ingest -> (on exit) final-drain flow poll_agents +
+        // evaluate_completed_plan use, then assert the captured summary is COMPLETE.
+        let block = "RUDDER_PLAN_TASKS_START {\\\"tasks\\\":[{\\\"id\\\":\\\"n0\\\",\\\"title\\\":\\\"scaffold\\\",\\\"prompt\\\":\\\"p\\\",\\\"goal\\\":\\\"g\\\",\\\"success\\\":\\\"s\\\",\\\"deps\\\":[]}]} RUDDER_PLAN_TASKS_END";
+        // Streamed deltas cut off mid-sentence at "frozen (" (the reported symptom).
+        let l1 = format!(
+            "{{\"type\":\"stream_event\",\"event\":{{\"type\":\"content_block_delta\",\"delta\":{{\"type\":\"text_delta\",\"text\":\"{block}\\nThis DAG is safe because config is frozen (\"}}}}}}"
+        );
+        // The result event carries the FULL final text (block + complete summary).
+        let l2 = format!(
+            "{{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"{block}\\nThis DAG is safe because config is frozen (no edits) and the modules are independent.\"}}"
+        );
+        let command = TerminalCommand::with_args(
+            "sh",
+            ["-lc", "printf '%s\\n' \"$L1\"; sleep 0.2; printf '%s\\n' \"$L2\""],
+        )
+        .with_env("L1", l1)
+        .with_env("L2", l2);
+        let mut pane = TerminalPane::spawn_shell_or_command(
+            Some(command),
+            TerminalPaneOptions {
+                size: TerminalSize { rows: 10, cols: 80 },
+                scrollback_lines: 200,
+                ..Default::default()
+            },
+        )
+        .expect("spawn test pty");
+
+        let mut stream = PlanStreamState::new();
+        let mut exited = false;
+        for _ in 0..400 {
+            let _ = pane.drain_output();
+            stream.ingest(pane.output_log_snapshot());
+            if matches!(pane.try_wait(), Ok(Some(_))) {
+                // Final drain after exit (mirrors evaluate_completed_plan).
+                for _ in 0..64 {
+                    let had = !pane.drain_output().is_empty();
+                    stream.ingest(pane.output_log_snapshot());
+                    if !had {
+                        break;
+                    }
+                }
+                exited = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        assert!(exited, "planner process exited");
+
+        // The plan still parses, and the summary is the COMPLETE sentence, not the
+        // truncated "...frozen (" the user was seeing.
+        let output = stream.parse_text();
+        assert!(
+            extract_rudder_plan_tasks(output).is_ok(),
+            "plan block parses: {output:?}"
+        );
+        let summary = extract_rudder_plan_summary(output).expect("summary present");
+        assert!(
+            summary.contains("the modules are independent"),
+            "full summary recovered (not truncated): {summary:?}"
+        );
+    }
+
     #[test]
     fn worker_wheel_scroll_rows_scale_with_viewport() {
         assert_eq!(wheel_scroll_rows(2, KeyModifiers::empty()), 1);
