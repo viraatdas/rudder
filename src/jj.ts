@@ -308,8 +308,14 @@ export async function mergeJjRunIntoCurrentWorkspace(run: RunRecord, allowDirty 
   }
   ensureJjRepo(run.repoRoot);
   ensureJjRepo(run.worktree.path);
-  if (!allowDirty && (await jjStatus(run.repoRoot)).length > 0) {
-    throw new Error("Target workspace is dirty. Squash/abandon changes or pass --allow-dirty.");
+  // Rudder writes its own files (.rudder/ is already filtered by jjStatus; RUDDER.md
+  // and DECISIONS.md are the live coordination surfaces) into the main workspace
+  // continuously, so they must not count as "dirty" and block a merge.
+  if (!allowDirty) {
+    const dirty = (await jjStatus(run.repoRoot)).filter((line) => !isMergeIgnorablePath(line));
+    if (dirty.length > 0) {
+      throw new Error("Target workspace is dirty. Squash/abandon changes or pass --allow-dirty.");
+    }
   }
   const opIdBefore = await currentOpId(run.repoRoot);
   run.merge = {
@@ -631,6 +637,19 @@ function statusPathFromSummaryLine(line: string): string | null {
 function isRudderMetadataPath(filePath: string): boolean {
   const normalized = filePath.replace(/\\/g, "/").replace(/^["']|["']$/g, "");
   return normalized === ".rudder" || normalized.startsWith(".rudder/");
+}
+
+/// A jj-status line that names a Rudder-managed file (a status path or a `C path`
+/// conflict line), which should never count toward the target-dirty merge gate.
+function isMergeIgnorablePath(line: string): boolean {
+  const path = line.replace(/^[ACMDR?]\s+/, "").replace(/^C\s+/, "").trim();
+  return (
+    isRudderMetadataPath(path) ||
+    path === "RUDDER.md" ||
+    path === "DECISIONS.md" ||
+    path.endsWith("/RUDDER.md") ||
+    path.endsWith("/DECISIONS.md")
+  );
 }
 
 async function markMergeFailed(run: RunRecord, error: string): Promise<void> {

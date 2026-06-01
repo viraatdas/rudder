@@ -2,6 +2,17 @@
 //! Heuristics that read worker output to detect idle/permission/prompt states.
 use super::*;
 
+/// Whether post-completion output should re-open a finished agent as a NEW turn.
+/// True only when the user sent input (a keystroke) at/after the agent completed;
+/// output with no input since completion is a repaint (e.g. the resize when you
+/// highlight a finished agent) and must NOT flip done -> in-progress.
+pub(crate) fn post_completion_output_is_new_turn(
+    last_input_at: Option<Instant>,
+    completed_at: Option<Instant>,
+) -> bool {
+    last_input_at.is_some_and(|input| completed_at.is_none_or(|done| input >= done))
+}
+
 pub(crate) fn mark_run_done(run: &mut AgentRun) {
     if run.status != AgentStatus::Done {
         run.status = AgentStatus::Done;

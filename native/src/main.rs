@@ -100,7 +100,7 @@ const AGENT_PANE_HINTS: &[&str] = &[
     "j/k move",
     "Enter focus",
     "r rename",
-    "v review",
+    "v diff",
     "g nest",
     "R review all",
     "m merge",
@@ -520,6 +520,11 @@ struct AgentRun {
     /// text the RUDDER_PLAN_TASKS parser reads, and captures the session id for
     /// refine-via-resume. `None` for non-planner agents and until first ingest.
     plan_stream: Option<PlanStreamState>,
+    /// When the user last sent input (a keystroke/prompt) to this agent's PTY. Used
+    /// to decide whether post-completion output is a genuine NEW turn (user typed)
+    /// vs incidental repaint (e.g. a resize when the pane is focused). Without this,
+    /// highlighting a finished agent flips it from done back to in-progress.
+    last_worker_input_at: Option<Instant>,
 }
 
 #[derive(Debug)]
@@ -1177,6 +1182,11 @@ impl App {
             self.set_selected_error(error.to_string());
             return false;
         }
+        // Mark genuine user input so post-completion output is recognized as a new
+        // turn (and a finished agent re-enters in-progress) — repaints do not.
+        if let Some(run) = self.agents.get_mut(self.selected_agent) {
+            run.last_worker_input_at = Some(Instant::now());
+        }
         self.clear_selected_attention_flags();
         if let Some(prompt) = self.capture_selected_worker_key(key, capture_as_prompt) {
             self.record_selected_worker_prompt(prompt);
@@ -1227,6 +1237,53 @@ impl App {
                 if let Some(run) = self.agents.get_mut(self.selected_agent) {
                     run.worker_input_draft.clear();
                     run.worker_input_cursor = 0;
+                }
+            }
+            // Cursor editing in the chat draft, matching the task pane's basics so
+            // a follow-up can be edited mid-line, not just appended/backspaced.
+            KeyCode::Left => {
+                if let Some(run) = self.agents.get_mut(self.selected_agent) {
+                    run.worker_input_cursor = run.worker_input_cursor.saturating_sub(1);
+                }
+            }
+            KeyCode::Right => {
+                if let Some(run) = self.agents.get_mut(self.selected_agent) {
+                    let len = run.worker_input_draft.chars().count();
+                    run.worker_input_cursor = (run.worker_input_cursor + 1).min(len);
+                }
+            }
+            KeyCode::Home => {
+                if let Some(run) = self.agents.get_mut(self.selected_agent) {
+                    run.worker_input_cursor = 0;
+                }
+            }
+            KeyCode::End => {
+                if let Some(run) = self.agents.get_mut(self.selected_agent) {
+                    run.worker_input_cursor = run.worker_input_draft.chars().count();
+                }
+            }
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(run) = self.agents.get_mut(self.selected_agent) {
+                    run.worker_input_cursor = 0;
+                }
+            }
+            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(run) = self.agents.get_mut(self.selected_agent) {
+                    run.worker_input_cursor = run.worker_input_draft.chars().count();
+                }
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(run) = self.agents.get_mut(self.selected_agent) {
+                    run.worker_input_draft.clear();
+                    run.worker_input_cursor = 0;
+                }
+            }
+            KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(run) = self.agents.get_mut(self.selected_agent) {
+                    delete_previous_word_at(
+                        &mut run.worker_input_draft,
+                        &mut run.worker_input_cursor,
+                    );
                 }
             }
             KeyCode::PageUp => {
@@ -2664,6 +2721,7 @@ impl App {
             // Discriminator: route completion to the APPEND path, not REPLACE.
             reconcile_planner: true,
             plan_stream: None,
+            last_worker_input_at: None,
         };
 
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
@@ -2814,6 +2872,7 @@ impl App {
             node_id,
             reconcile_planner: false,
             plan_stream: None,
+            last_worker_input_at: None,
         };
 
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
@@ -2908,6 +2967,7 @@ impl App {
             node_id: None,
             reconcile_planner: false,
             plan_stream: None,
+            last_worker_input_at: None,
         };
 
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
@@ -3013,6 +3073,7 @@ impl App {
             node_id: None,
             reconcile_planner: false,
             plan_stream: None,
+            last_worker_input_at: None,
         };
 
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
@@ -4109,6 +4170,7 @@ impl App {
             node_id: None,
             reconcile_planner: false,
             plan_stream: None,
+            last_worker_input_at: None,
         };
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
             Ok(mut terminal) => {
@@ -5726,9 +5788,20 @@ What to do\n\
             if had_output {
                 run.last_output_at = Instant::now();
                 if run.status == AgentStatus::Done {
-                    run.status = AgentStatus::Running;
-                    run.completed_at = None;
-                    changed = true;
+                    // Only treat post-completion output as a NEW turn if the user
+                    // actually sent input since the agent finished. Otherwise this is
+                    // just a repaint (e.g. the resize that fires when you HIGHLIGHT a
+                    // finished agent), and flipping done->in-progress is the flicker
+                    // the pane suffered from. Require user input after completion.
+                    let user_started_new_turn = post_completion_output_is_new_turn(
+                        run.last_worker_input_at,
+                        run.completed_at,
+                    );
+                    if user_started_new_turn {
+                        run.status = AgentStatus::Running;
+                        run.completed_at = None;
+                        changed = true;
+                    }
                 }
             }
             if run.status == AgentStatus::Running {

@@ -2464,6 +2464,22 @@ branch refs/heads/main\n";
     }
 
     #[test]
+    fn finished_agent_does_not_reopen_on_repaint() {
+        // The flicker: highlighting a done agent triggers a resize/repaint -> output,
+        // which previously flipped done -> in-progress. Output with no user input
+        // since completion must NOT re-open the agent; input after completion does.
+        let done = Instant::now();
+        // No input at all -> repaint, stays done.
+        assert!(!post_completion_output_is_new_turn(None, Some(done)));
+        // Input BEFORE completion (the original turn) -> still just a repaint.
+        let before = done.checked_sub(Duration::from_secs(5)).unwrap_or(done);
+        assert!(!post_completion_output_is_new_turn(Some(before), Some(done)));
+        // Input AFTER completion -> a genuine new turn, re-open as in-progress.
+        let after = done + Duration::from_secs(1);
+        assert!(post_completion_output_is_new_turn(Some(after), Some(done)));
+    }
+
+    #[test]
     fn merge_confirm_hint_highlights_merge_action() {
         let line = merge_confirm_hint_line();
         let text = line
@@ -2472,7 +2488,7 @@ branch refs/heads/main\n";
             .map(|span| span.content.as_ref())
             .collect::<String>();
 
-        assert_eq!(text, "Press y to merge, n to cancel.");
+        assert_eq!(text, "Press y to merge, n or Esc to cancel.");
         assert_eq!(line.spans.len(), 3);
         assert_eq!(line.spans[1].style.fg, Some(FAILED_COLOR));
         assert!(line.spans[1].style.add_modifier.contains(Modifier::BOLD));
@@ -2633,6 +2649,7 @@ branch refs/heads/main\n";
             node_id: None,
             reconcile_planner: false,
             plan_stream: None,
+            last_worker_input_at: None,
         }
     }
 
@@ -3050,6 +3067,7 @@ branch refs/heads/main\n";
             node_id: None,
             reconcile_planner: false,
             plan_stream: None,
+            last_worker_input_at: None,
         });
 
         app.delete_selected_agent();

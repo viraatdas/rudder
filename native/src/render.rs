@@ -1738,7 +1738,7 @@ pub(crate) fn render_worker(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                         "worker"
                     }
                 }
-                WorkerView::Diff => "review",
+                WorkerView::Diff => "review · Esc/v back · m merge",
             },
             focused,
             app.nav_mode,
@@ -2186,7 +2186,7 @@ pub(crate) fn render_merge_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) 
                     app_style(),
                 )),
                 Line::from(Span::styled(
-                    "Press y to start an AI resolver, n to handle manually.",
+                    "Press y to start an AI resolver, n to handle manually, Esc to cancel.",
                     app_style(),
                 )),
             ],
@@ -2293,7 +2293,7 @@ pub(crate) fn merge_confirm_hint_line() -> Line<'static> {
                 .fg(FAILED_COLOR)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(", n to cancel.", app_style()),
+        Span::styled(", n or Esc to cancel.", app_style()),
     ])
 }
 

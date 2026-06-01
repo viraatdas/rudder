@@ -257,6 +257,7 @@ pub(crate) fn create_main_agent(
         node_id: None,
         reconcile_planner: false,
         plan_stream: None,
+        last_worker_input_at: None,
     }
 }
 
@@ -450,6 +451,7 @@ pub(crate) fn agent_from_run_record(repo_root: &Path, record: serde_json::Value)
         // restored run is never mid-reconcile.
         reconcile_planner: false,
         plan_stream: None,
+        last_worker_input_at: None,
     })
 }
 
@@ -642,9 +644,19 @@ pub(crate) fn run_rudder_jj_command(
             error: "rudder CLI not found on PATH".to_string(),
         };
     };
+    // A merge from the TUI is an explicit user action; allow a dirty target. jj
+    // preserves the main workspace's working copy as a merge parent (no data loss,
+    // undoable via `rudder undo`), so the git-style dirty gate would only get in the
+    // way. (Rudder's own files no longer count as dirty either; see jj.ts.)
+    let extra: &[&str] = if command == "merge" {
+        &["--allow-dirty"]
+    } else {
+        &[]
+    };
     let output = match Command::new(&rudder)
         .arg(command)
         .arg(run_id)
+        .args(extra)
         .current_dir(repo_root)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

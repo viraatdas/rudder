@@ -35,8 +35,9 @@ export const DECISIONS_HEADER =
 // preamble so an agent reading only RUDDER.md still gets them. Kept here so the
 // two surfaces never drift. No em dashes.
 export const PROPAGATION_RULES: string[] = [
-  "Before each significant step, re-read RUDDER.md (live orchestrator status) and DECISIONS.md (shared decisions from sibling agents); they change while you work.",
-  "RUDDER.md carries a freshness stamp. If it is newer than when you last read it, a sibling changed state - re-read both before continuing.",
+  "Before each significant step, re-read RUDDER.md (live orchestrator status + the current plan/DAG) and DECISIONS.md (shared decisions from sibling agents); they change while you work.",
+  "RUDDER.md carries a freshness stamp. If it is newer than when you last read it, the plan or a sibling changed state - re-read both before continuing.",
+  "If the plan or architecture has shifted in a way that affects your task (the user refined it, or a sibling recorded a conflicting decision), ADAPT your in-progress work to the new direction instead of continuing on the old plan, so the work does not stray; note the adjustment in DECISIONS.md.",
   "Record any cross-cutting decision other agents must honor by appending a bullet to DECISIONS.md (decision, rationale, owning node id). Never edit RUDDER.md; it is orchestrator-owned.",
 ];
 

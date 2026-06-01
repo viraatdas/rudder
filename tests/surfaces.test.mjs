@@ -106,7 +106,7 @@ test("appendDecision appends a parseable (owner, ts) bullet", async () => {
 // renderContract includes the three propagation rules.
 // ---------------------------------------------------------------------------
 
-test("renderContract injects all three propagation rules", () => {
+test("renderContract injects the propagation rules incl. the adapt-on-change rule", () => {
   const spec = {
     runId: "r1",
     task: "do the thing",
@@ -117,10 +117,15 @@ test("renderContract injects all three propagation rules", () => {
     suggestedTests: [],
   };
   const contract = renderContract(spec);
-  assert.equal(PROPAGATION_RULES.length, 3);
+  assert.equal(PROPAGATION_RULES.length, 4);
   for (const rule of PROPAGATION_RULES) {
     assert.ok(contract.includes(rule), `contract is missing rule: ${rule}`);
   }
+  // The anti-drift rule: agents adapt to a changed plan rather than straying.
+  assert.ok(
+    PROPAGATION_RULES.some((rule) => /ADAPT/.test(rule) && /does not stray/.test(rule)),
+    "an adapt-on-plan-change rule must be present",
+  );
   // No em dashes in the rules (project constraint).
   for (const rule of PROPAGATION_RULES) {
     assert.ok(!rule.includes("—"), "propagation rule must not contain an em dash");
