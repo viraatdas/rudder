@@ -2494,6 +2494,62 @@ branch refs/heads/main\n";
     }
 
     #[test]
+    fn orchestrator_pane_mouse_drag_selects_visible_text() {
+        let mut app = App::new();
+        app.focus = FocusPane::Worker;
+        app.worker_area = Some(Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 10,
+        });
+        let mut orch = test_agent_run("orch", "build a feature");
+        orch.mode = AgentMode::RudderPlan;
+        app.agents = vec![orch];
+        app.selected_agent = 0;
+        // render() normally captures these from the buffer; set them directly here.
+        app.orch_visible_rows = vec!["hello world".to_string(), "second line".to_string()];
+
+        // inner = block_inner(worker_area) = {x:1,y:1,...}; column/row 1,1 -> (0,0).
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert!(app.orch_selection.is_some(), "down starts a selection");
+
+        // Drag right to inner col 4 (column 5) on the same row.
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 5,
+            row: 1,
+            modifiers: KeyModifiers::empty(),
+        });
+        let sel = app.orch_selection.expect("selection still active");
+        assert_eq!(sel.start.row, 0);
+        assert_eq!(sel.start.col, 0);
+        assert_eq!(sel.end.col, 4);
+        // The text the Up handler would copy: chars 0..=4 of row 0 -> "hello".
+        assert_eq!(selected_text_from_lines(&app.orch_visible_rows, sel), "hello");
+
+        // A plain click (down+up, no movement) clears the highlight.
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 3,
+            row: 2,
+            modifiers: KeyModifiers::empty(),
+        });
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 3,
+            row: 2,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert!(app.orch_selection.is_none(), "empty click clears selection");
+    }
+
+    #[test]
     fn planning_redraw_gate_tracks_running_not_parse_state() {
         // The spinner animation depends on this gate forcing a per-tick redraw. It
         // must stay true for the whole time the planner is alive, regardless of

@@ -343,6 +343,13 @@ struct App {
     picker_index: usize,
     worker_selection: Option<WorkerSelection>,
     task_selection: Option<WorkerSelection>,
+    /// Mouse text selection over the orchestrator pane. That pane composes Lines
+    /// (transcript + DAG), not the planner PTY, so it cannot reuse the worker PTY
+    /// selection. Coordinates are relative to the pane's inner area and index into
+    /// `orch_visible_rows`, which `render_orchestrator` captures from the rendered
+    /// buffer each frame (so the selection is over exactly what is on screen).
+    orch_selection: Option<WorkerSelection>,
+    orch_visible_rows: Vec<String>,
     /// Scroll offset (lines from the top) for the orchestrator DAG command-center
     /// view. The DAG is a static line list (not a PTY), so it needs its own offset
     /// to read a long plan. Reset to 0 whenever the selected agent changes; clamped
@@ -687,6 +694,8 @@ impl App {
             picker_index: 0,
             worker_selection: None,
             task_selection: None,
+            orch_selection: None,
+            orch_visible_rows: Vec::new(),
             orch_dag_scroll: 0,
             agents_area: None,
             worker_area: None,
@@ -1492,6 +1501,7 @@ impl App {
     fn select_previous_agent(&mut self) {
         self.delete_pending = None;
         self.orch_dag_scroll = 0;
+        self.orch_selection = None;
         let visible = self.visible_agent_indices();
         if visible.is_empty() {
             self.selected_agent = 0;
@@ -1512,6 +1522,7 @@ impl App {
     fn select_next_agent(&mut self) {
         self.delete_pending = None;
         self.orch_dag_scroll = 0;
+        self.orch_selection = None;
         let visible = self.visible_agent_indices();
         if visible.is_empty() {
             self.selected_agent = 0;
@@ -2123,6 +2134,23 @@ impl App {
             return;
         }
 
+        // Continue an in-progress drag even if the pointer leaves the pane, so a fast
+        // drag does not drop the selection. Orchestrator and worker selections are
+        // tracked separately (the orchestrator pane is composed Lines, not a PTY).
+        if self.orch_selection.is_some()
+            && matches!(
+                mouse.kind,
+                MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
+            )
+        {
+            if let Some(worker_area) = self.worker_area {
+                self.task_selection = None;
+                if self.handle_orchestrator_selection_mouse(mouse, block_inner(worker_area)) {
+                    return;
+                }
+            }
+        }
+
         if self.worker_selection.is_some()
             && matches!(
                 mouse.kind,
@@ -2175,6 +2203,14 @@ impl App {
             return;
         }
 
+        // The orchestrator pane renders composed Lines, not the planner PTY: select
+        // over the captured visible rows instead of forwarding to / selecting the PTY.
+        if self.selected_is_orchestrator() {
+            self.worker_selection = None;
+            self.handle_orchestrator_selection_mouse(mouse, inner);
+            return;
+        }
+
         if self.handle_worker_selection_mouse(mouse, inner) {
             return;
         }
@@ -2197,6 +2233,7 @@ impl App {
         if let Some(index) = agent_index_from_mouse(self, mouse, area) {
             if index != self.selected_agent {
                 self.orch_dag_scroll = 0;
+                self.orch_selection = None;
             }
             self.selected_agent = index;
         }
@@ -2334,6 +2371,57 @@ impl App {
                 }
                 match copy_text_to_clipboard(&text) {
                     Ok(()) => self.notice = Some("copied worker selection".to_string()),
+                    Err(error) => self.notice = Some(format!("copy failed: {error}")),
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Mouse selection over the orchestrator pane (transcript / DAG / prose). Works
+    /// against `orch_visible_rows`, the plain text `render_orchestrator` captures
+    /// from the rendered buffer, so a drag highlights and copies exactly what is on
+    /// screen regardless of wrapping or scroll. Mirrors `handle_worker_selection_mouse`.
+    fn handle_orchestrator_selection_mouse(&mut self, mouse: MouseEvent, area: Rect) -> bool {
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let point = selection_point_from_mouse(mouse, area);
+                self.orch_selection = Some(WorkerSelection {
+                    start: point,
+                    end: point,
+                });
+                self.dirty = true;
+                true
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(selection) = self.orch_selection.as_mut() {
+                    selection.end = selection_point_from_mouse(mouse, area);
+                    self.dirty = true;
+                    true
+                } else {
+                    false
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                let Some(mut selection) = self.orch_selection else {
+                    return false;
+                };
+                selection.end = selection_point_from_mouse(mouse, area);
+                self.orch_selection = Some(selection);
+                self.dirty = true;
+                if selection_is_empty(normalize_selection(selection)) {
+                    // A plain click (no drag) clears any prior highlight.
+                    self.orch_selection = None;
+                    return true;
+                }
+                let text = selected_text_from_lines(&self.orch_visible_rows, selection);
+                if text.trim().is_empty() {
+                    self.notice = Some("selection empty".to_string());
+                    return true;
+                }
+                match copy_text_to_clipboard(&text) {
+                    Ok(()) => self.notice = Some("copied orchestrator selection".to_string()),
                     Err(error) => self.notice = Some(format!("copy failed: {error}")),
                 }
                 true
@@ -2510,6 +2598,9 @@ impl App {
         if delta == 0 {
             return;
         }
+        // Scrolling shifts which rows are on screen; a stale selection would then
+        // highlight the wrong text, so drop it.
+        self.orch_selection = None;
         let before = self.orch_dag_scroll;
         // Positive delta is ScrollUp (toward the top), which lowers the offset.
         self.orch_dag_scroll = if delta > 0 {

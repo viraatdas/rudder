@@ -1675,6 +1675,32 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
             );
         }
     }
+
+    // Read the pane back from the rendered buffer as plain-text rows (post wrap +
+    // scroll) so a mouse drag can select and copy exactly what is on screen — the
+    // pane composes Lines, not the PTY, so this is the only faithful source for the
+    // selection machinery. Then paint the active selection by reversing its cells.
+    let selection = app.orch_selection.map(normalize_selection);
+    let buf = frame.buffer_mut();
+    let mut rows: Vec<String> = Vec::with_capacity(inner.height as usize);
+    for (row_idx, y) in (inner.y..inner.bottom()).enumerate() {
+        let sel_cols = selection_for_row(selection, row_idx);
+        let mut text = String::new();
+        for (col_idx, x) in (inner.x..inner.right()).enumerate() {
+            let symbol = buf
+                .cell((x, y))
+                .map(|cell| cell.symbol().to_string())
+                .unwrap_or_else(|| " ".to_string());
+            text.push_str(&symbol);
+            if sel_cols.is_some_and(|(start, end)| col_idx >= start && col_idx <= end) {
+                if let Some(cell) = buf.cell_mut((x, y)) {
+                    cell.set_style(Style::default().fg(Color::Black).bg(FOCUS_COLOR));
+                }
+            }
+        }
+        rows.push(text);
+    }
+    app.orch_visible_rows = rows;
 }
 
 /// Lay out the orchestrator pane inside `inner` as: header (fixed) · top/DAG
