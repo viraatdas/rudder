@@ -259,6 +259,7 @@ pub(crate) fn create_main_agent(
         plan_stream: None,
         last_worker_input_at: None,
         ready_since: None,
+        merge_resolver: false,
     }
 }
 
@@ -454,6 +455,7 @@ pub(crate) fn agent_from_run_record(repo_root: &Path, record: serde_json::Value)
         plan_stream: None,
         last_worker_input_at: None,
         ready_since: None,
+        merge_resolver: false,
     })
 }
 
@@ -1027,6 +1029,32 @@ pub(crate) fn conflicted_files(cwd: &Path) -> Vec<String> {
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+/// Files with unresolved jj conflicts in `cwd` (via `jj resolve --list`). Empty when
+/// the working copy is conflict-free. `jj resolve --list` exits non-zero and prints
+/// to stderr when there are no conflicts, so a failed/empty stdout means "none".
+pub(crate) fn jj_unresolved_conflicts(cwd: &Path) -> Vec<String> {
+    let Ok(output) = Command::new("jj")
+        .args(["resolve", "--list"])
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        // `jj resolve --list` lines look like "path/to/file    2-sided conflict";
+        // take the leading path token.
+        .filter_map(|line| line.split_whitespace().next())
         .map(ToOwned::to_owned)
         .collect()
 }

@@ -545,6 +545,11 @@ struct AgentRun {
     /// (cursor blink/animation) is still detected as done. Reset when it looks busy
     /// again or starts a new turn.
     ready_since: Option<Instant>,
+    /// True when this row is currently an AI merge-conflict resolver (its jj merge
+    /// recorded a conflict and an agent is resolving it in place). When it finishes
+    /// with no conflicts left, the merge is finalized (the node flips to Merged so
+    /// its children unblock); if conflicts remain it drops to manual.
+    merge_resolver: bool,
 }
 
 #[derive(Debug)]
@@ -2745,6 +2750,7 @@ impl App {
             plan_stream: None,
             last_worker_input_at: None,
             ready_since: None,
+            merge_resolver: false,
         };
 
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
@@ -2897,6 +2903,7 @@ impl App {
             plan_stream: None,
             last_worker_input_at: None,
             ready_since: None,
+            merge_resolver: false,
         };
 
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
@@ -2993,6 +3000,7 @@ impl App {
             plan_stream: None,
             last_worker_input_at: None,
             ready_since: None,
+            merge_resolver: false,
         };
 
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
@@ -3100,6 +3108,7 @@ impl App {
             plan_stream: None,
             last_worker_input_at: None,
             ready_since: None,
+            merge_resolver: false,
         };
 
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
@@ -4212,6 +4221,7 @@ impl App {
             plan_stream: None,
             last_worker_input_at: None,
             ready_since: None,
+            merge_resolver: false,
         };
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
             Ok(mut terminal) => {
@@ -4799,26 +4809,105 @@ impl App {
                 run.node_id.is_some()
                     && run.status == AgentStatus::Done
                     && !run.is_main()
+                    && !run.merge_resolver
                     && !self.auto_merge_skip.contains(&run.id)
             });
             let Some(index) = next else { break };
             let id = self.agents[index].id.clone();
             let label = self.agents[index].task_summary.clone();
+            let task = self.agents[index].task.clone();
             match self.merge_agent_at(index) {
                 Ok(()) => merged_any = true,
-                Err(_) => {
-                    // Conflict: leave it for manual resolution and stop this pass.
-                    self.auto_merge_skip.push(id);
-                    self.pending_jj_conflict = None;
-                    self.notice = Some(format!(
-                        "auto-merge paused on a conflict in {}; press m to resolve & merge",
-                        short_task(&label)
-                    ));
-                    break;
+                Err(error) => {
+                    // Conflict: auto-spawn the AI resolver to integrate both sides in
+                    // the integration workspace. finalize_merge_resolvers flips the
+                    // node to Merged (unblocking children) once it finishes clean.
+                    // Clone (don't consume) the recorded conflict so it survives a
+                    // resolver spawn failure for any later manual recovery.
+                    let files = self.pending_jj_conflict.clone().unwrap_or_default();
+                    self.conflict_prompt = Some(MergeConflictPrompt {
+                        operation: ConflictOperation::Merge,
+                        task,
+                        conflicted_files: files,
+                        error: error.to_string(),
+                        repo_root: self.cwd.clone(),
+                        target_branch: None,
+                        source_branch: None,
+                        worktree_path: None,
+                        agent_id: Some(id.clone()),
+                    });
+                    self.start_conflict_resolution_agent();
+                    let resolver_running = self
+                        .agents
+                        .iter()
+                        .any(|r| r.id == id && r.merge_resolver);
+                    if resolver_running {
+                        self.notice = Some(format!(
+                            "conflict in {} — AI resolver integrating it",
+                            short_task(&label)
+                        ));
+                    } else {
+                        // Resolver did not start; do not retry every tick.
+                        self.auto_merge_skip.push(id);
+                    }
+                    break; // one conflict at a time
                 }
             }
         }
         if merged_any {
+            self.run_scheduler();
+            self.mirror_graph();
+            self.dirty = true;
+        }
+    }
+
+    /// Finalize any AI merge-conflict resolver that has finished its turn. If no jj
+    /// conflicts remain in its workspace the integration succeeded: flip the node to
+    /// Merged (its hard children unblock) and drain the scheduler. If conflicts
+    /// remain, drop it back to manual (clear the resolver flag + notify) so the user
+    /// can finish. Runs for both auto-spawned and manually-started (y) resolvers.
+    fn finalize_merge_resolvers(&mut self) {
+        // Iterate by agent id, not index: marking one merged can shift the agents
+        // vector, so a cached index could point at the wrong row (or out of bounds).
+        let done_ids: Vec<String> = self
+            .agents
+            .iter()
+            .filter(|run| run.merge_resolver && run.status == AgentStatus::Done)
+            .map(|run| run.id.clone())
+            .collect();
+        if done_ids.is_empty() {
+            return;
+        }
+        let mut finalized_any = false;
+        for id in done_ids {
+            let Some(index) = self.agents.iter().position(|run| run.id == id) else {
+                continue;
+            };
+            let cwd = self.agents[index].cwd.clone();
+            let label = self.agents[index].task_summary.clone();
+            // `jj resolve --list` reads jj's COMMITTED state, and the resolver agent's
+            // turn only ends after its tool calls return, so an empty list here means
+            // the conflict is genuinely resolved in the workspace (not mid-flight).
+            let conflicts = jj_unresolved_conflicts(&cwd);
+            if let Some(run) = self.agents.get_mut(index) {
+                run.merge_resolver = false;
+            }
+            if conflicts.is_empty() {
+                let sources = self.agents[index].review_source_ids.clone();
+                if !self.agents[index].is_main() {
+                    self.mark_agent_and_review_sources_merged(index, sources);
+                }
+                finalized_any = true;
+                self.notice = Some(format!("AI resolved & merged {}", short_task(&label)));
+            } else {
+                self.notice = Some(format!(
+                    "resolver left {} conflict(s) in {}; resolve and press m",
+                    conflicts.len(),
+                    short_task(&label)
+                ));
+            }
+        }
+        if finalized_any {
             self.run_scheduler();
             self.mirror_graph();
             self.dirty = true;
@@ -5419,7 +5508,7 @@ impl App {
             "merge"
         };
         self.notice = Some(format!(
-            "{operation_label} conflict in {count} file{}: press y for AI help or n to resolve manually",
+            "{operation_label} conflict in {count} file{}: press y to let AI resolve & complete the merge, or n to do it manually",
             if count == 1 { "" } else { "s" }
         ));
     }
@@ -5511,6 +5600,11 @@ impl App {
                     run.needs_user_input = false;
                     run.user_input_notified = false;
                     run.last_error = None;
+                    // Track jj merge resolvers so the poll loop finalizes the merge
+                    // (flip the node to Merged, unblock children) once they finish
+                    // with no conflicts left. Git rebase resolvers keep manual flow.
+                    run.merge_resolver = operation == ConflictOperation::Merge;
+                    run.ready_since = None;
                     run.task = if original_task.is_empty() {
                         if operation == ConflictOperation::Rebase {
                             "Resolve rebase conflicts".to_string()
@@ -6059,6 +6153,12 @@ What to do\n\
             && self.scheduler_tick % SCHEDULER_TICK_INTERVAL == 0
         {
             self.maybe_auto_merge();
+        }
+        // Finalize any AI merge-conflict resolver that just finished (auto-spawned or
+        // started manually with y): a clean workspace flips the node to Merged and
+        // unblocks its children; leftover conflicts drop back to manual.
+        if self.scheduler_tick % SCHEDULER_TICK_INTERVAL == 0 {
+            self.finalize_merge_resolvers();
         }
 
         // Advance the spinner each tick and force a redraw while an orchestrator is

@@ -2662,6 +2662,7 @@ branch refs/heads/main\n";
             plan_stream: None,
             last_worker_input_at: None,
             ready_since: None,
+            merge_resolver: false,
         }
     }
 
@@ -3081,6 +3082,7 @@ branch refs/heads/main\n";
             plan_stream: None,
             last_worker_input_at: None,
             ready_since: None,
+            merge_resolver: false,
         });
 
         app.delete_selected_agent();
