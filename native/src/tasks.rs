@@ -445,7 +445,10 @@ pub(crate) fn extract_rudder_plan_summary(output: &str) -> Option<String> {
     if after.is_empty() {
         return None;
     }
-    Some(after.chars().take(1500).collect())
+    // Show the FULL human summary (the orchestrator pane scrolls it). A generous
+    // upper bound only guards against a pathological reply, not normal prose; the
+    // old 1500-char cap chopped real summaries off mid-sentence.
+    Some(after.chars().take(20_000).collect())
 }
 
 /// Build the composite request handed to the orchestrator when the user REFINES a

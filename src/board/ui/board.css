@@ -1,37 +1,39 @@
 /* ==========================================================================
-   Rudder board — warm-brutalist design system.
-   Warm paper, hard block shadows (no blur), zero border-radius, system
-   sans + mono. Status-forward color is the antidote to gray. Mirrors
-   site/index.html. Exact tokens per plan section 8.
+   Rudder board — modern light design system.
+   Pure-white paper, near-black ink, hairline lines, soft (not block) shadows,
+   thin weights, system sans + mono. Status-forward color is the antidote to
+   gray. Mirrors the native TUI (theme.rs) and site/index.html so the whole
+   product reads as one consistent surface.
    ========================================================================== */
 
 :root {
-  /* surface */
-  --paper: #f5f3ee;
-  --paper-2: #efece4;
-  --card: #fbfaf6;
-  --ink: #151515;
-  --ink-2: #4a4843;
-  --line: #d8d3c8;
-  --line-strong: #1f1d18;
+  /* surface — modern light: pure white paper, near-black ink, hairline lines */
+  --paper: #ffffff;
+  --paper-2: #f6f7f9;
+  --card: #ffffff;
+  --ink: #1a1a1a;
+  --ink-2: #5b6470;
+  --line: #e6e7eb;
+  --line-strong: #d3d6dc;
 
   /* brand */
-  --accent: #006d75;
-  --accent-deep: #00565c;
+  --accent: #0b747c;
+  --accent-deep: #0b6e74;
 
-  /* status */
-  --st-todo: #7c756a;
-  --st-running: #934e04;
-  --st-review: #006d75;
-  --st-done: #0a7030;
-  --st-failed: #a01b1b;
-  --st-conflict: #95306f;
-  --st-blocked: #5a5750;
+  /* status — quiet, legible on white */
+  --st-todo: #6b7280;
+  --st-running: #b45309;
+  --st-review: #0b747c;
+  --st-done: #15803d;
+  --st-failed: #c0392b;
+  --st-conflict: #a21caf;
+  --st-blocked: #64748b;
 
-  /* shadows — hard blocks, never blurred */
-  --shadow-sm: 4px 4px 0 var(--line-strong);
-  --shadow: 6px 6px 0 var(--line-strong);
-  --shadow-lg: 12px 12px 0 var(--line-strong);
+  /* shadows — soft + subtle (modern, not brutalist blocks) */
+  --shadow-sm: 0 1px 2px rgba(16, 24, 40, 0.06);
+  --shadow: 0 4px 14px rgba(16, 24, 40, 0.08);
+  --shadow-lg: 0 16px 40px rgba(16, 24, 40, 0.1);
+  --radius: 10px;
 
   /* fonts */
   --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
@@ -192,16 +194,16 @@ button {
 }
 .btn:hover:not(:disabled) {
   transform: translate(-2px, -2px);
-  box-shadow: 6px 6px 0 var(--line-strong);
+  box-shadow: var(--shadow);
 }
 .btn:active:not(:disabled) {
   transform: translate(0, 0);
-  box-shadow: 2px 2px 0 var(--line-strong);
+  box-shadow: var(--shadow-sm);
 }
 .btn:disabled {
   opacity: 0.5;
   cursor: not-allowed;
-  box-shadow: 2px 2px 0 var(--line-strong);
+  box-shadow: var(--shadow-sm);
 }
 .btn:focus-visible {
   outline: 2px solid var(--accent);

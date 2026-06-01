@@ -2728,7 +2728,8 @@ branch refs/heads/main\n";
         assert_eq!(text, "Press y to merge, n or Esc to cancel.");
         assert_eq!(line.spans.len(), 3);
         assert_eq!(line.spans[1].style.fg, Some(FAILED_COLOR));
-        assert!(line.spans[1].style.add_modifier.contains(Modifier::BOLD));
+        // Thin theme: emphasis is by color, not weight.
+        assert!(!line.spans[1].style.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]
@@ -2834,7 +2835,7 @@ branch refs/heads/main\n";
             "single hard child uses the corner connector"
         );
         assert!(
-            child_dbg.contains("154, 147, 132"),
+            child_dbg.contains("107, 114, 128"),
             "hard connector is MUTED"
         );
     }
@@ -4446,6 +4447,63 @@ branch refs/heads/main\n";
             hint.contains("add it to the running plan"),
             "post-launch hint invites reconcile: {hint}"
         );
+    }
+
+    #[test]
+    fn app_style_paints_white_with_ink_text() {
+        // The light theme paints its own canvas; primary text must set an explicit
+        // dark fg (terminal-default fg could be light = invisible on white).
+        assert_eq!(app_style().bg, Some(PAPER));
+        assert_eq!(app_style().fg, Some(INK));
+        assert_eq!(pane_text_style(true).fg, Some(INK));
+        // Thin theme: helpers carry no bold.
+        assert!(!accent_style(true).add_modifier.contains(Modifier::BOLD));
+        assert!(!header_style(true).add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn plan_summary_is_not_truncated_at_1500() {
+        let long = "word ".repeat(600); // ~3000 chars, well past the old cap
+        let output = format!(
+            "RUDDER_PLAN_TASKS_START\n{{\"tasks\":[{{\"title\":\"a\",\"prompt\":\"p\"}}]}}\nRUDDER_PLAN_TASKS_END\n{long}"
+        );
+        let summary = extract_rudder_plan_summary(&output).expect("summary present");
+        assert!(summary.len() > 1500, "full summary kept (len {})", summary.len());
+    }
+
+    #[test]
+    fn plan_stream_result_recovers_dropped_streaming_tail() {
+        let mut s = PlanStreamState::new();
+        // Streaming dropped the tail mid-sentence (PTY ring/partial-event loss).
+        s.ingest("{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"Summary: the repo has config with\"}}}\n");
+        assert!(s.assistant_text().ends_with("with"));
+        // The authoritative result carries the full text; only the missing tail is
+        // appended, with no double-append of the streamed prefix.
+        s.ingest("{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"Summary: the repo has config with auth and tracks modules.\"}\n");
+        assert!(
+            s.assistant_text().contains("auth and tracks modules"),
+            "dropped tail recovered: {}",
+            s.assistant_text()
+        );
+        assert_eq!(
+            s.assistant_text().matches("Summary: the repo has config").count(),
+            1,
+            "prefix not double-appended"
+        );
+    }
+
+    #[test]
+    fn orchestrator_pageup_pagedown_scroll_the_prose() {
+        let mut app = App::new();
+        let mut orch = test_agent_run("orch", "build");
+        orch.mode = AgentMode::RudderPlan;
+        app.agents = vec![orch];
+        app.selected_agent = 0;
+        app.worker_area = Some(Rect::new(0, 0, 60, 20));
+        app.handle_orchestrator_chat_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::empty()));
+        assert!(app.orch_dag_scroll > 0, "PageDown scrolls the prose plan down");
+        app.handle_orchestrator_chat_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::empty()));
+        assert_eq!(app.orch_dag_scroll, 0, "PageUp scrolls back toward the top");
     }
 
     #[test]

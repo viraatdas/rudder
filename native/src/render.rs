@@ -6,6 +6,9 @@ use crate::plan_stream::{PlanEntry, PlanEntryKind};
 pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
     frame.render_widget(Clear, area);
+    // Paint the white canvas so the whole UI is light regardless of the user's
+    // terminal background, and bare text inherits the ink fg.
+    frame.render_widget(Block::default().style(app_style()), area);
 
     let task_height = task_pane_height(app, area.width);
 
@@ -81,9 +84,10 @@ pub(crate) fn render_mouse_debug(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             text.to_string(),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(ACCENT_2),
         )))
-        .block(Block::default().borders(Borders::ALL).title("mouse debug"))
+        .style(app_style())
+        .block(Block::default().borders(Borders::ALL).title("mouse debug").style(app_style()))
         .style(app_style())
         .wrap(Wrap { trim: false }),
         rect,
@@ -129,7 +133,7 @@ pub(crate) fn push_agent_row_with_trailing<'a>(
     let selected = index == app.selected_agent;
     let marker = if selected { "> " } else { "  " };
     let task_style = if selected {
-        pane_text_style(focused).add_modifier(Modifier::BOLD)
+        pane_text_style(focused)
     } else {
         pane_text_style(focused)
     };
@@ -150,7 +154,7 @@ pub(crate) fn push_agent_row_with_trailing<'a>(
         if is_cloud_agent(agent) {
             Span::styled(
                 "☁ ",
-                cloud_style(true, focused).add_modifier(Modifier::BOLD),
+                cloud_style(true, focused),
             )
         } else {
             Span::raw("")
@@ -176,9 +180,9 @@ pub(crate) fn push_agent_row_with_trailing<'a>(
         Span::styled(status_label, status_style),
         Span::raw("  "),
         if agent.is_main() {
-            Span::styled("main", accent_style(focused).add_modifier(Modifier::BOLD))
+            Span::styled("main", accent_style(focused))
         } else if is_cloud_agent(agent) {
-            Span::styled("cloud", accent_style(focused).add_modifier(Modifier::BOLD))
+            Span::styled("cloud", accent_style(focused))
         } else if agent.mode == AgentMode::RudderPlan {
             Span::styled("rudder-plan", accent_style(focused))
         } else if agent.mode == AgentMode::ReviewAll {
@@ -679,7 +683,7 @@ fn render_planned_section<'a>(
     if awaiting_approval {
         lines.push(ListItem::new(Line::from(Span::styled(
             "  type to refine  ·  Enter approve",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            Style::default().fg(ACCENT),
         ))));
     }
 
@@ -867,7 +871,7 @@ fn push_orchestrator_row<'a>(
         agent.task_summary.clone()
     };
     let label_style = if selected {
-        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+        Style::default().fg(ACCENT)
     } else {
         Style::default().fg(ACCENT)
     };
@@ -916,7 +920,7 @@ pub(crate) fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let mut lines = vec![
         ListItem::new(Line::from(Span::styled(
             "rudder",
-            pane_text_style(focused).add_modifier(Modifier::BOLD),
+            pane_text_style(focused),
         ))),
         ListItem::new(Line::from(vec![
             Span::styled(app.cwd.display().to_string(), pane_text_style(focused)),
@@ -939,11 +943,11 @@ pub(crate) fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             ListItem::new(Line::from(vec![
                 Span::styled(
                     "\u{2191} ",
-                    accent_style(focused).add_modifier(Modifier::BOLD),
+                    accent_style(focused),
                 ),
                 Span::styled(
                     format!("update: {current} -> {latest}"),
-                    pane_text_style(focused).add_modifier(Modifier::BOLD),
+                    pane_text_style(focused),
                 ),
             ])),
         );
@@ -1465,7 +1469,7 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
     let mut header_spans = vec![
         Span::styled(
             format!("{ORCH_MARK} ORCHESTRATOR"),
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            Style::default().fg(ACCENT),
         ),
         Span::styled("  ·  ", muted_style(focused)),
         Span::styled(phase_label, muted_style(focused)),
@@ -1474,7 +1478,7 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
         header_spans.push(Span::styled("  ·  ", muted_style(focused)));
         header_spans.push(Span::styled(
             "auto-merge",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            Style::default().fg(ACCENT),
         ));
     }
     let header: Vec<Line<'static>> = vec![Line::from(header_spans)];
@@ -1488,7 +1492,7 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
     let input: Vec<Line<'static>> = if focused {
         let mut spans = vec![Span::styled(
             "› ",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            Style::default().fg(ACCENT),
         )];
         let cursor_style = pane_text_style(focused).add_modifier(Modifier::REVERSED);
         let chars: Vec<char> = draft.chars().collect();
@@ -1535,7 +1539,7 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
             body.push(Line::from(vec![
                 Span::styled(
                     app.spinner_glyph(),
-                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                    Style::default().fg(ACCENT),
                 ),
                 Span::raw(" "),
                 Span::styled(spinner_label, pane_text_style(true)),
@@ -1633,7 +1637,7 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
             if app.awaiting_approval {
                 dag.push(Line::from(Span::styled(
                     "chat to refine  ·  Enter to approve & launch",
-                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                    Style::default().fg(ACCENT),
                 )));
             }
 
@@ -1704,7 +1708,7 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
             text.push_str(&symbol);
             if sel_cols.is_some_and(|(start, end)| col_idx >= start && col_idx <= end) {
                 if let Some(cell) = buf.cell_mut((x, y)) {
-                    cell.set_style(Style::default().fg(Color::Black).bg(FOCUS_COLOR));
+                    cell.set_style(Style::default().fg(INK).bg(SURFACE_SEL));
                 }
             }
         }
@@ -1800,7 +1804,7 @@ fn push_transcript_lines(out: &mut Vec<Line<'static>>, transcript: &[PlanEntry],
             PlanEntryKind::System => ("", muted_style(focused)),
             PlanEntryKind::UserTurn => (
                 "you: ",
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                Style::default().fg(ACCENT),
             ),
             PlanEntryKind::Text => ("", pane_text_style(focused)),
         };
@@ -2255,7 +2259,7 @@ pub(crate) fn render_suggestions(frame: &mut Frame<'_>, task_area: Rect, app: &A
             .border_style(
                 Style::default()
                     .fg(FOCUS_COLOR)
-                    .add_modifier(Modifier::BOLD),
+                    ,
             )
             .style(app_style()),
     );
@@ -2340,7 +2344,7 @@ pub(crate) fn render_merge_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) 
         .border_style(
             Style::default()
                 .fg(border_color)
-                .add_modifier(Modifier::BOLD),
+                ,
         )
         .style(app_style());
     let paragraph = Paragraph::new(lines)
@@ -2369,7 +2373,7 @@ pub(crate) fn render_cloud_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) 
     let scratch_selected = prompt.choice == CloudLaunchChoice::Scratch;
     let row_style = |selected: bool| {
         if selected {
-            accent_style(true).add_modifier(Modifier::BOLD)
+            accent_style(true)
         } else {
             app_style()
         }
@@ -2408,7 +2412,7 @@ pub(crate) fn render_cloud_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) 
         .border_style(
             Style::default()
                 .fg(CLOUD_COLOR)
-                .add_modifier(Modifier::BOLD),
+                ,
         )
         .style(app_style());
     frame.render_widget(Clear, modal);
@@ -2428,7 +2432,7 @@ pub(crate) fn merge_confirm_hint_line() -> Line<'static> {
             "y to merge",
             Style::default()
                 .fg(FAILED_COLOR)
-                .add_modifier(Modifier::BOLD),
+                ,
         ),
         Span::styled(", n or Esc to cancel.", app_style()),
     ])
@@ -2447,27 +2451,27 @@ pub(crate) fn centered_modal(area: Rect, desired_width: u16, desired_height: u16
 
 pub(crate) fn pane_block(title: &'static str, focused: bool, nav_mode: bool) -> Block<'static> {
     let border_style = if focused {
-        Style::default()
-            .fg(FOCUS_COLOR)
-            .add_modifier(Modifier::BOLD)
+        Style::default().fg(FOCUS_COLOR)
     } else {
         Style::default().fg(INACTIVE_COLOR)
     };
 
+    // Focused: white text on a teal title fill. Unfocused: a quiet ink-on-paper
+    // label. No bold anywhere (the theme is thin).
     let title_style = if focused {
-        Style::default()
-            .fg(Color::Black)
-            .bg(FOCUS_COLOR)
-            .add_modifier(Modifier::BOLD)
+        Style::default().fg(PAPER).bg(FOCUS_COLOR)
     } else {
-        Style::default().fg(Color::Gray)
+        Style::default().fg(MUTED).bg(PAPER)
     };
     let _ = nav_mode;
 
+    // Carry the white canvas style so the pane interior is painted paper, not the
+    // terminal background.
     Block::default()
         .title(Line::from(Span::styled(format!(" {title} "), title_style)))
         .borders(Borders::ALL)
         .border_style(border_style)
+        .style(app_style())
 }
 
 pub(crate) fn task_input_lines(value: &str, cursor: usize, width: u16) -> Vec<String> {
@@ -2577,10 +2581,10 @@ pub(crate) fn push_wrapped_word(lines: &mut Vec<String>, current: &mut String, w
 
 pub(crate) fn pane_text_style(focused: bool) -> Style {
     if focused {
-        // Terminal default fg so primary text adapts to the user's theme.
-        Style::default()
+        // Explicit ink. The app paints its own white canvas, so primary text must
+        // set a dark fg; the terminal-default fg could be light = invisible on white.
+        Style::default().fg(INK)
     } else {
-        // Warm, readable muted instead of DarkGray+DIM (the old gray wash).
         Style::default().fg(MUTED)
     }
 }
@@ -2590,13 +2594,7 @@ pub(crate) fn muted_style(focused: bool) -> Style {
 }
 
 pub(crate) fn accent_style(focused: bool) -> Style {
-    if focused {
-        Style::default()
-            .fg(FOCUS_COLOR)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(FAINT).add_modifier(Modifier::BOLD)
-    }
+    Style::default().fg(if focused { FOCUS_COLOR } else { FAINT })
 }
 
 pub(crate) fn model_style(focused: bool) -> Style {
@@ -2605,22 +2603,19 @@ pub(crate) fn model_style(focused: bool) -> Style {
 
 pub(crate) fn cloud_style(connected: bool, focused: bool) -> Style {
     let color = if connected { CLOUD_COLOR } else { FAINT };
-    let style = Style::default().fg(color);
-    if focused {
-        style.add_modifier(Modifier::BOLD)
-    } else {
-        style
-    }
+    let _ = focused;
+    Style::default().fg(color)
 }
 
+/// Base style for the whole UI: ink on the white canvas. Every pane block and
+/// paragraph carries this so the background is white regardless of the user's
+/// terminal theme, and bare `Span::raw` text inherits the ink fg.
 pub(crate) fn app_style() -> Style {
-    Style::default()
+    Style::default().fg(INK).bg(PAPER)
 }
 
 pub(crate) fn error_style() -> Style {
-    Style::default()
-        .fg(FAILED_COLOR)
-        .add_modifier(Modifier::BOLD)
+    Style::default().fg(FAILED_COLOR)
 }
 
 pub(crate) fn block_inner(area: Rect) -> Rect {
@@ -2717,7 +2712,7 @@ pub(crate) fn agent_status_style(agent: &AgentRun) -> Style {
     if agent.needs_permission || agent.needs_user_input {
         Style::default()
             .fg(RUNNING_COLOR)
-            .add_modifier(Modifier::BOLD)
+            
     } else {
         status_style(agent.status)
     }

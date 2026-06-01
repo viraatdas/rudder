@@ -201,10 +201,24 @@ impl PlanStreamState {
                 self.tools_from_assistant_message(message);
             }
             "result" => {
-                if !self.saw_streaming_text {
-                    if value.get("subtype").and_then(Value::as_str) == Some("success") {
-                        if let Some(result) = value.get("result").and_then(Value::as_str) {
+                if value.get("subtype").and_then(Value::as_str) == Some("success") {
+                    if let Some(result) = value.get("result").and_then(Value::as_str) {
+                        if !self.saw_streaming_text {
                             self.push_text(result);
+                        } else {
+                            // The `result` event carries the AUTHORITATIVE full text.
+                            // Streaming deltas can drop the tail (the PTY ring buffer
+                            // truncates, or partial-message events are lossy), which
+                            // truncated the post-plan human summary mid-sentence. If
+                            // the result strictly EXTENDS what we streamed this turn,
+                            // append only the missing suffix so the full summary lands
+                            // without double-appending.
+                            let start = self.parse_baseline.min(self.assistant_text.len());
+                            let turn = self.assistant_text[start..].to_string();
+                            if result.len() > turn.len() && result.starts_with(&turn) {
+                                let tail = result[turn.len()..].to_string();
+                                self.push_text(&tail);
+                            }
                         }
                     }
                 }

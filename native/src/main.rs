@@ -1417,11 +1417,17 @@ impl App {
                     );
                 }
             }
+            // Scroll the orchestrator's PROSE plan with the keyboard. Previously these
+            // went to the PTY (which is JSON now), so a long plan could not be read
+            // without a mouse. orch_dag_scroll drives the scrollable body; render
+            // clamps it to the content height.
             KeyCode::PageUp => {
-                self.handle_worker_page_key(key, page_scroll_rows(self.worker_area));
+                let page = page_scroll_rows(self.worker_area).max(1) as usize;
+                self.orch_dag_scroll = self.orch_dag_scroll.saturating_sub(page);
             }
             KeyCode::PageDown => {
-                self.handle_worker_page_key(key, -page_scroll_rows(self.worker_area));
+                let page = page_scroll_rows(self.worker_area).max(1) as usize;
+                self.orch_dag_scroll = self.orch_dag_scroll.saturating_add(page);
             }
             KeyCode::Char(ch)
                 if !key

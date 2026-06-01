@@ -241,7 +241,9 @@ pub(crate) fn styled_terminal_line(
                 .unwrap_or_else(|| plain_terminal_cell(" ".to_string()));
             let mut style = terminal_cell_style(&cell);
             if selection.is_some_and(|(start, end)| col >= start && col <= end) {
-                style = style.fg(Color::Black).bg(FOCUS_COLOR);
+                // Light-theme text selection: a pale teal highlight with ink text,
+                // not a heavy dark block.
+                style = style.fg(INK).bg(SURFACE_SEL);
             }
             if cursor_col == Some(col) {
                 style = cursor_cell_style();
@@ -252,11 +254,10 @@ pub(crate) fn styled_terminal_line(
     Line::from(spans)
 }
 
+/// A solid block cursor for the light theme: paper text on a teal accent fill, so
+/// it reads as a clear caret on white.
 pub(crate) fn cursor_cell_style() -> Style {
-    Style::default()
-        .fg(Color::Black)
-        .bg(FOCUS_COLOR)
-        .add_modifier(Modifier::BOLD)
+    Style::default().fg(PAPER).bg(ACCENT)
 }
 
 pub(crate) fn plain_terminal_cell(contents: String) -> StyledTerminalCell {
@@ -289,7 +290,7 @@ pub(crate) fn styled_plain_line(text: &str, style: Style, selection: Option<(usi
     if clamped_end > clamped_start {
         spans.push(Span::styled(
             chars[clamped_start..clamped_end].iter().collect::<String>(),
-            style.fg(Color::Black).bg(FOCUS_COLOR),
+            style.fg(INK).bg(SURFACE_SEL),
         ));
     }
     if clamped_end < chars.len() {
