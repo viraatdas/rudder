@@ -351,6 +351,7 @@ pub(crate) fn review_all_run(
         reconcile_planner: false,
         plan_stream: None,
         last_worker_input_at: None,
+        ready_since: None,
     }
 }
 

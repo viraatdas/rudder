@@ -67,7 +67,14 @@ use crate::plan_stream::*;
 
 const TICK_RATE: Duration = Duration::from_millis(33);
 const MAX_EVENTS_PER_FRAME: usize = 64;
-const INTERACTIVE_COMPLETION_IDLE: Duration = Duration::from_secs(4);
+/// After this brief output lull, re-check the screen for the idle prompt even if the
+/// agent is still emitting cursor-blink/animation repaints (which would otherwise
+/// keep it looking busy forever).
+const READY_EVAL_LULL: Duration = Duration::from_millis(900);
+/// Once an agent has looked ready-for-input (idle chrome, not busy) continuously for
+/// this long, declare the turn complete. Independent of output-silence, so an idle
+/// TUI that keeps repainting is still detected as done.
+const READY_GRACE: Duration = Duration::from_millis(1800);
 // Dashboard colors now live in `theme.rs` (FOCUS_COLOR, INACTIVE_COLOR, ...),
 // re-exported above so call sites are unchanged.
 const DEFAULT_WHEEL_SCROLL_ROWS: u16 = 1;
@@ -532,6 +539,12 @@ struct AgentRun {
     /// vs incidental repaint (e.g. a resize when the pane is focused). Without this,
     /// highlighting a finished agent flips it from done back to in-progress.
     last_worker_input_at: Option<Instant>,
+    /// When the agent FIRST looked ready-for-input (idle chrome present, not busy) in
+    /// the current turn. Completion is declared once it stays ready for a short grace
+    /// window, independent of output-silence — so a TUI that repaints while idle
+    /// (cursor blink/animation) is still detected as done. Reset when it looks busy
+    /// again or starts a new turn.
+    ready_since: Option<Instant>,
 }
 
 #[derive(Debug)]
@@ -2731,6 +2744,7 @@ impl App {
             reconcile_planner: true,
             plan_stream: None,
             last_worker_input_at: None,
+            ready_since: None,
         };
 
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
@@ -2882,6 +2896,7 @@ impl App {
             reconcile_planner: false,
             plan_stream: None,
             last_worker_input_at: None,
+            ready_since: None,
         };
 
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
@@ -2977,6 +2992,7 @@ impl App {
             reconcile_planner: false,
             plan_stream: None,
             last_worker_input_at: None,
+            ready_since: None,
         };
 
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
@@ -3083,6 +3099,7 @@ impl App {
             reconcile_planner: false,
             plan_stream: None,
             last_worker_input_at: None,
+            ready_since: None,
         };
 
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
@@ -4194,6 +4211,7 @@ impl App {
             reconcile_planner: false,
             plan_stream: None,
             last_worker_input_at: None,
+            ready_since: None,
         };
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
             Ok(mut terminal) => {
@@ -5865,18 +5883,28 @@ What to do\n\
                     if user_started_new_turn {
                         run.status = AgentStatus::Running;
                         run.completed_at = None;
+                        run.ready_since = None;
                         changed = true;
                     }
                 }
             }
             if run.status == AgentStatus::Running {
-                let idle_enough = run.last_output_at.elapsed() >= INTERACTIVE_COMPLETION_IDLE;
-                let visible_lines =
-                    if had_output || run.needs_permission || run.needs_user_input || idle_enough {
-                        Some(terminal.visible_lines_snapshot())
-                    } else {
-                        None
-                    };
+                // Evaluate the screen when there is activity, when we are already
+                // tracking readiness, or after a brief output lull. The lull (not a
+                // full 4s silence) is key: an idle agent whose TUI keeps repainting
+                // (cursor blink/animation) still gets re-checked, so completion no
+                // longer depends on output going fully silent.
+                let lull = run.last_output_at.elapsed() >= READY_EVAL_LULL;
+                let visible_lines = if had_output
+                    || run.needs_permission
+                    || run.needs_user_input
+                    || run.ready_since.is_some()
+                    || lull
+                {
+                    Some(terminal.visible_lines_snapshot())
+                } else {
+                    None
+                };
                 let needs_permission = visible_lines
                     .as_ref()
                     .is_some_and(|lines| terminal_needs_permission_from_lines(lines));
@@ -5905,6 +5933,9 @@ What to do\n\
                 }
                 match terminal.try_wait() {
                     Ok(Some(status)) => {
+                        // Process exit is the most reliable signal: done if it
+                        // succeeded, failed otherwise.
+                        run.ready_since = None;
                         if status.success() {
                             mark_run_done(run);
                             changed = true;
@@ -5920,16 +5951,29 @@ What to do\n\
                         };
                     }
                     Ok(None) => {
-                        if idle_enough
-                            && visible_lines.as_ref().is_some_and(|lines| {
-                                terminal_looks_ready_for_input_from_lines(run.backend, lines)
-                            })
-                        {
-                            mark_run_done(run);
-                            changed = true;
+                        // The process is still alive (interactive agents do not exit
+                        // when a turn ends). Declare completion once it has looked
+                        // ready-for-input continuously for READY_GRACE. Tracking the
+                        // ready window (not output-silence) is what makes this robust
+                        // against a TUI that repaints while idle.
+                        let ready = visible_lines.as_ref().is_some_and(|lines| {
+                            terminal_looks_ready_for_input_from_lines(run.backend, lines)
+                        });
+                        if ready {
+                            let since = *run.ready_since.get_or_insert_with(Instant::now);
+                            if since.elapsed() >= READY_GRACE {
+                                run.ready_since = None;
+                                mark_run_done(run);
+                                changed = true;
+                            }
+                        } else if visible_lines.is_some() {
+                            // We could read the screen and it is NOT idle (busy or a
+                            // prompt/permission): reset the window.
+                            run.ready_since = None;
                         }
                     }
                     Err(error) => {
+                        run.ready_since = None;
                         run.status = AgentStatus::Failed;
                         run.completed_at = Some(Instant::now());
                         run.last_error = Some(error.to_string());

@@ -258,6 +258,7 @@ pub(crate) fn create_main_agent(
         reconcile_planner: false,
         plan_stream: None,
         last_worker_input_at: None,
+        ready_since: None,
     }
 }
 
@@ -452,6 +453,7 @@ pub(crate) fn agent_from_run_record(repo_root: &Path, record: serde_json::Value)
         reconcile_planner: false,
         plan_stream: None,
         last_worker_input_at: None,
+        ready_since: None,
     })
 }
 
