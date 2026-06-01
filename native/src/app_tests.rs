@@ -2464,6 +2464,53 @@ branch refs/heads/main\n";
     }
 
     #[test]
+    fn orchestrator_chat_cursor_edits_mid_line() {
+        let mut app = App::new();
+        let mut orch = test_agent_run("orch", "build a feature");
+        orch.mode = AgentMode::RudderPlan;
+        app.agents = vec![orch];
+        app.selected_agent = 0;
+        let key = |c: char| KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty());
+        for c in "abc".chars() {
+            app.handle_orchestrator_chat_key(key(c));
+        }
+        assert_eq!(app.agents[0].worker_input_draft, "abc");
+        assert_eq!(app.agents[0].worker_input_cursor, 3);
+        // Move left and insert mid-line.
+        app.handle_orchestrator_chat_key(KeyEvent::new(KeyCode::Left, KeyModifiers::empty()));
+        assert_eq!(app.agents[0].worker_input_cursor, 2);
+        app.handle_orchestrator_chat_key(key('X'));
+        assert_eq!(app.agents[0].worker_input_draft, "abXc");
+        assert_eq!(app.agents[0].worker_input_cursor, 3);
+        // Home / End jump to the ends.
+        app.handle_orchestrator_chat_key(KeyEvent::new(KeyCode::Home, KeyModifiers::empty()));
+        assert_eq!(app.agents[0].worker_input_cursor, 0);
+        app.handle_orchestrator_chat_key(KeyEvent::new(KeyCode::End, KeyModifiers::empty()));
+        assert_eq!(app.agents[0].worker_input_cursor, 4);
+        // Backspace deletes before the cursor.
+        app.handle_orchestrator_chat_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::empty()));
+        assert_eq!(app.agents[0].worker_input_draft, "abX");
+        assert_eq!(app.agents[0].worker_input_cursor, 3);
+    }
+
+    #[test]
+    fn orchestrator_chat_renders_cursor_block() {
+        let mut app = App::new();
+        app.focus = FocusPane::Worker;
+        let mut orch = test_agent_run("orch", "build a feature");
+        orch.mode = AgentMode::RudderPlan;
+        orch.worker_input_draft = "use python".to_string();
+        orch.worker_input_cursor = 3;
+        app.agents = vec![orch];
+        app.selected_agent = 0;
+        // Render: the draft text appears in the orchestrator pane (with the cursor at
+        // index 3 drawn as a reversed cell over the 4th char). We assert the text is
+        // present; the cursor styling is exercised by the render path not panicking.
+        let text = render_worker_text(&mut app, 72, 24);
+        assert!(text.contains("use") && text.contains("python"), "draft renders: {text}");
+    }
+
+    #[test]
     fn automerge_command_toggles_the_flag() {
         let mut app = App::new();
         app.cwd = std::env::temp_dir();

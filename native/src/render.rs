@@ -1479,20 +1479,42 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
     }
     let header: Vec<Line<'static>> = vec![Line::from(header_spans)];
 
-    // Chat input (pinned at the bottom when focused): the follow-up being composed.
+    // Chat input (pinned at the bottom when focused): the follow-up being composed,
+    // with a visible block cursor at worker_input_cursor so Left/Right/Home/End and
+    // typing show where the insertion point is. Rendered inline (a reversed cell) so
+    // it tracks the text through wrapping without any coordinate math.
     let draft = agent.worker_input_draft.clone();
+    let cursor_col = agent.worker_input_cursor;
     let input: Vec<Line<'static>> = if focused {
         let mut spans = vec![Span::styled(
             "› ",
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         )];
-        if draft.is_empty() {
+        let cursor_style = pane_text_style(focused).add_modifier(Modifier::REVERSED);
+        let chars: Vec<char> = draft.chars().collect();
+        if chars.is_empty() {
+            // Cursor block, then the dimmed hint.
+            spans.push(Span::styled(" ", cursor_style));
             spans.push(Span::styled(
                 "chat to refine the plan, or press Enter to approve & launch",
                 muted_style(focused),
             ));
         } else {
-            spans.push(Span::styled(draft, pane_text_style(focused)));
+            let cursor = cursor_col.min(chars.len());
+            let before: String = chars[..cursor].iter().collect();
+            if !before.is_empty() {
+                spans.push(Span::styled(before, pane_text_style(focused)));
+            }
+            if cursor < chars.len() {
+                spans.push(Span::styled(chars[cursor].to_string(), cursor_style));
+                let after: String = chars[cursor + 1..].iter().collect();
+                if !after.is_empty() {
+                    spans.push(Span::styled(after, pane_text_style(focused)));
+                }
+            } else {
+                // Cursor at end of the draft: a trailing block.
+                spans.push(Span::styled(" ", cursor_style));
+            }
         }
         vec![Line::default(), Line::from(spans)]
     } else {
