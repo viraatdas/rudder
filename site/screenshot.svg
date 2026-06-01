@@ -1,0 +1,98 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 2000 930" width="2000" height="930" font-family="ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, monospace">
+  <defs>
+    <style>
+      .ink { fill: #1a1a1a; }
+      .muted { fill: #6b7280; }
+      .teal { fill: #0b747c; }
+      .amber { fill: #b45309; }
+      .green { fill: #15803d; }
+      .magenta { fill: #a21caf; }
+      .t { font-size: 22px; }
+      .sm { font-size: 19px; }
+    </style>
+  </defs>
+
+  <!-- canvas -->
+  <rect x="0" y="0" width="2000" height="930" fill="#ffffff"/>
+
+  <!-- window chrome -->
+  <rect x="0" y="0" width="2000" height="56" fill="#ffffff"/>
+  <circle cx="36" cy="28" r="8" fill="#e6e7eb"/>
+  <circle cx="64" cy="28" r="8" fill="#e6e7eb"/>
+  <circle cx="92" cy="28" r="8" fill="#e6e7eb"/>
+  <text x="1000" y="35" text-anchor="middle" class="muted sm">rudder</text>
+  <line x1="0" y1="56" x2="2000" y2="56" stroke="#e6e7eb" stroke-width="1"/>
+
+  <!-- ===== left pane: agents ===== -->
+  <rect x="24" y="80" width="520" height="800" fill="#ffffff" stroke="#e6e7eb" stroke-width="1"/>
+  <rect x="24" y="80" width="120" height="28" fill="#0b747c"/>
+  <text x="40" y="100" fill="#ffffff" class="sm">agents</text>
+
+  <!-- orchestrator row -->
+  <text x="48" y="150" class="teal t">◆ orchestrator</text>
+  <text x="48" y="182" class="muted sm">plan · 4 tasks</text>
+
+  <!-- agent rows -->
+  <g>
+    <circle cx="56" cy="232" r="7" class="amber"/>
+    <text x="80" y="240" class="ink t">spotify auth module</text>
+    <text x="80" y="268" class="amber sm">running</text>
+
+    <circle cx="56" cy="318" r="7" class="magenta"/>
+    <text x="80" y="326" class="ink t">top tracks fetch</text>
+    <text x="80" y="354" class="magenta sm">review</text>
+
+    <circle cx="56" cy="404" r="7" class="green"/>
+    <text x="80" y="412" class="ink t">html scaffold + theme</text>
+    <text x="80" y="440" class="green sm">merged</text>
+
+    <circle cx="56" cy="490" r="7" class="muted"/>
+    <text x="80" y="498" class="ink t">app wiring entry point</text>
+    <text x="80" y="526" class="muted sm">todo</text>
+  </g>
+
+  <!-- ===== right pane: orchestrator ===== -->
+  <rect x="568" y="80" width="1408" height="800" fill="#ffffff" stroke="#0b747c" stroke-width="1.5"/>
+  <rect x="568" y="80" width="220" height="28" fill="#0b747c"/>
+  <text x="584" y="100" fill="#ffffff" class="sm">orchestrator</text>
+
+  <text x="600" y="156" class="teal t">◆ ORCHESTRATOR  ·  plan · 4 tasks</text>
+
+  <!-- DAG tree -->
+  <g class="t">
+    <circle cx="612" cy="212" r="7" class="green"/>
+    <text x="636" y="220" class="ink">html scaffold + dark theme styles</text>
+    <text x="1120" y="220" class="green sm">merged</text>
+
+    <path d="M 612 232 L 612 268 L 648 268" fill="none" stroke="#a6adb8" stroke-width="1.5"/>
+    <circle cx="664" cy="268" r="7" class="muted"/>
+    <text x="688" y="276" class="ink">app wiring entry point</text>
+    <text x="1120" y="276" class="muted sm">todo</text>
+
+    <circle cx="612" cy="332" r="7" class="amber"/>
+    <text x="636" y="340" class="ink">spotify auth module</text>
+    <text x="1120" y="340" class="amber sm">running</text>
+
+    <circle cx="612" cy="392" r="7" class="magenta"/>
+    <text x="636" y="400" class="ink">top tracks fetch module</text>
+    <text x="1120" y="400" class="magenta sm">review</text>
+  </g>
+
+  <text x="600" y="456" class="muted sm">running 1 · review 1 · done 1 · todo 1</text>
+  <line x1="600" y1="486" x2="1944" y2="486" stroke="#eef0f3" stroke-width="1"/>
+
+  <!-- prose plan -->
+  <text x="600" y="528" class="ink t">Plan</text>
+  <text x="600" y="566" class="muted sm">The repo already has js/config.js with the Spotify client id and redirect</text>
+  <text x="600" y="594" class="muted sm">URI. The auth module handles the PKCE flow and token refresh; the top-tracks</text>
+  <text x="600" y="622" class="muted sm">module fetches /me/top/tracks once a session token exists. The scaffold +</text>
+  <text x="600" y="650" class="muted sm">dark theme styles land first so the wiring node can mount the views.</text>
+
+  <!-- chat input pinned -->
+  <line x1="600" y1="804" x2="1944" y2="804" stroke="#eef0f3" stroke-width="1"/>
+  <text x="600" y="846" class="teal t">›</text>
+  <text x="628" y="846" class="muted t">chat to refine the plan, or press Enter to approve &amp; launch</text>
+
+  <!-- ===== bottom task bar ===== -->
+  <rect x="24" y="892" width="1952" height="14" fill="none"/>
+</svg>

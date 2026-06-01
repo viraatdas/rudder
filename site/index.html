@@ -6,20 +6,20 @@
     <title>Rudder</title>
     <meta
       name="description"
-      content="Rudder is the terminal OS for running Claude Code and Codex agents in parallel, with native panes, isolated worktrees, review, and merge."
+      content="Rudder is a terminal orchestrator for coding agents. Describe a goal; it plans a task DAG, runs Claude Code and Codex agents in parallel across isolated jj workspaces, then helps you review and merge."
     />
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <meta property="og:title" content="Rudder" />
     <meta
       property="og:description"
-      content="Run Claude Code and Codex in parallel with native worker panes, isolated git worktrees, review, and merge."
+      content="A terminal orchestrator for coding agents: plan a task DAG, run Claude Code and Codex in parallel across isolated jj workspaces, review, and merge."
     />
-    <meta property="og:image" content="/screenshot.png" />
-    <meta name="theme-color" content="#f5f3ee" />
+    <meta property="og:image" content="/screenshot.svg" />
+    <meta name="theme-color" content="#ffffff" />
     <style>
       :root {
-        color: #151515;
-        background: #f5f3ee;
+        color: #1a1a1a;
+        background: #ffffff;
         font-family:
           ui-sans-serif,
           system-ui,
@@ -28,19 +28,19 @@
           "Segoe UI",
           sans-serif;
         font-weight: 400;
-        --paper: #f5f3ee;
-        --ink: #151515;
-        --muted: #46433d;
-        --line: #24231f;
-        --soft-line: #d8d3c8;
-        --panel: #fffdf7;
-        --cyan: #006d75;
-        --green: #0a7030;
-        --amber: #934e04;
-        --magenta: #95306f;
-        --shadow-color: #1f1d18;
-        --shadow-sm: 6px 6px 0 var(--shadow-color);
-        --shadow-lg: 12px 12px 0 var(--shadow-color);
+        --paper: #ffffff;
+        --ink: #1a1a1a;
+        --muted: #5b6470;
+        --line: #e6e7eb;
+        --soft-line: #eef0f3;
+        --panel: #ffffff;
+        --cyan: #0b747c;
+        --green: #15803d;
+        --amber: #b45309;
+        --magenta: #a21caf;
+        --shadow-color: rgba(16, 24, 40, 0.1);
+        --shadow-sm: 0 1px 2px rgba(16, 24, 40, 0.06);
+        --shadow-lg: 0 18px 44px rgba(16, 24, 40, 0.1);
       }
 
       * {
@@ -153,7 +153,7 @@
         max-width: 820px;
         font-size: clamp(19px, 2.2vw, 28px);
         line-height: 1.35;
-        color: #34322d;
+        color: #3a3f47;
       }
 
       .actions {
@@ -234,7 +234,7 @@
         overflow: hidden;
         aspect-ratio: 2000 / 930;
         border: 1px solid var(--line);
-        background: #e9ebf0;
+        background: var(--paper);
         box-shadow: var(--shadow-lg);
       }
 
@@ -322,7 +322,7 @@
 
       .card:hover {
         transform: translate(-2px, -2px);
-        box-shadow: 8px 8px 0 var(--shadow-color);
+        box-shadow: var(--shadow-lg);
       }
 
       .card h3 {
@@ -400,7 +400,7 @@
       }
 
       .key-tile:hover {
-        background: #f8f6ee;
+        background: var(--paper-2, #f6f7f9);
         transform: translateY(-2px);
       }
 
@@ -410,7 +410,7 @@
         padding: 5px 8px;
         border: 1px solid currentColor;
         border-radius: 2px;
-        box-shadow: 2px 2px 0 currentColor;
+        box-shadow: none;
         color: var(--cyan);
         font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
         font-size: 13px;
@@ -577,7 +577,7 @@
 
         .shot,
         .terminal-bar {
-          box-shadow: 6px 6px 0 var(--shadow-color);
+          box-shadow: var(--shadow-lg);
         }
 
         .shot {
@@ -642,12 +642,12 @@
 
       <main>
         <section class="hero" aria-labelledby="hero-title">
-          <p class="eyebrow" data-reveal>Native worker panes for real agent CLIs</p>
-          <h1 id="hero-title" data-reveal>The terminal OS for coding agents.</h1>
+          <p class="eyebrow" data-reveal>Plan. Run in parallel. Review. Merge.</p>
+          <h1 id="hero-title" data-reveal>The terminal orchestrator for coding agents.</h1>
           <p class="lede" data-reveal>
-            Rudder runs Claude Code and Codex side by side in actual terminal
-            panes, gives every task an isolated git worktree, and keeps review,
-            merge, and focused task control in one dashboard.
+            Describe a goal. Rudder plans it into a task DAG, runs Claude Code and
+            Codex agents in parallel across isolated jj workspaces, and keeps
+            planning, review, and merge in one terminal dashboard.
           </p>
           <div class="actions" data-reveal>
             <div class="install">
@@ -659,70 +659,70 @@ rudder</code>
           </div>
         </section>
 
-        <section class="product" aria-label="Rudder product screenshot" data-reveal>
+        <section class="product" aria-label="Rudder orchestrator pane" data-reveal>
           <div class="shot">
             <img
-              src="/screenshot.png"
-              alt="Rudder dashboard with an agents list, a live worker terminal, and task input."
+              src="/screenshot.svg"
+              alt="Rudder's orchestrator pane: an agents list, a live task DAG with running, review, merged, and todo nodes, and a plan you can refine by chat."
             />
           </div>
-          <div class="terminal-bar" aria-label="Current Rudder behavior">
+          <div class="terminal-bar" aria-label="How Rudder works">
             <div class="terminal-stat">
-              <strong>Option-1/2/3</strong>
-              <span>Direct focus for agents, worker, and task panes.</span>
+              <strong>Describe a goal</strong>
+              <span>Rudder plans it into a task DAG with typed dependencies, read-only first.</span>
             </div>
             <div class="terminal-stat">
-              <strong>Tab in worker</strong>
-              <span>Forwarded to Claude Code or Codex, so native queues and menus keep working.</span>
+              <strong>Run in parallel</strong>
+              <span>Claude Code and Codex implement the nodes in isolated jj workspaces.</span>
             </div>
             <div class="terminal-stat">
-              <strong>Trackpad scroll</strong>
-              <span>Moves Rudder pane history like terminal scrollback.</span>
+              <strong>v to review</strong>
+              <span>A live jj diff of any agent's workspace, right in the pane.</span>
             </div>
             <div class="terminal-stat">
-              <strong>/main or /m</strong>
-              <span>Starts a main-branch agent and groups it separately from worktrees.</span>
+              <strong>m to merge</strong>
+              <span>Clean nodes merge mechanically; conflicts can start an AI resolver.</span>
             </div>
           </div>
         </section>
 
         <section class="section" aria-labelledby="why-title">
           <div class="section-head" data-reveal>
-            <h2 id="why-title">Built around real terminal sessions.</h2>
+            <h2 id="why-title">A plan you can watch and steer.</h2>
             <p>
-              Rudder does not replay a simplified transcript UI. The worker pane
-              is the harness itself, with Rudder handling the outer workflow:
-              pane focus, scrollback, worktree isolation, task summaries, review,
-              and merge.
+              Rudder is not a transcript UI. You give it a goal, it decomposes the
+              work into a task DAG, and the orchestrator pane shows the plan and
+              every node's status live. Refine the plan by chat, add tasks while it
+              runs, then review and merge.
             </p>
           </div>
 
           <div class="grid" data-reveal-group>
             <article class="card">
-              <span class="tag green">parallel</span>
-              <h3>Task isolation</h3>
+              <span class="tag cyan">orchestrate</span>
+              <h3>Plan into a DAG</h3>
               <p>
-                Each normal task gets a git worktree, run metadata, and shared
-                RUDDER.md context so agents can work concurrently without
+                Describe a goal once. A read-only planner inspects the repo and
+                emits a task DAG with typed hard and soft dependencies, which you
+                refine in chat before it launches.
+              </p>
+            </article>
+            <article class="card">
+              <span class="tag green">parallel</span>
+              <h3>Agents in jj workspaces</h3>
+              <p>
+                Ready nodes run Claude Code and Codex in parallel, each in its own
+                isolated jj workspace, so they build concurrently without
                 trampling the main checkout.
               </p>
             </article>
             <article class="card">
-              <span class="tag cyan">native</span>
-              <h3>Claude and Codex</h3>
-              <p>
-                Claude Code and Codex stay native. Their prompts, slash commands,
-                cursor movement, selection, and Tab behavior remain inside the
-                worker pane.
-              </p>
-            </article>
-            <article class="card">
               <span class="tag amber">review</span>
-              <h3>Diff and merge</h3>
+              <h3>Review and merge</h3>
               <p>
-                Toggle live review, inspect changes, merge one completed
-                worktree, or combine all completed worktrees when the run is
-                ready.
+                Watch a live jj diff of any node, merge clean work mechanically,
+                and let an AI resolver integrate conflicts. Merging a parent
+                unblocks its children automatically.
               </p>
             </article>
           </div>
@@ -752,14 +752,14 @@ rudder</code>
               <div class="key-tile">
                 <span class="key">Option-3</span>
                 <strong>Task</strong>
-                <span>Start the next agent without leaving the dashboard.</span>
+                <span>Describe a goal to plan, or add a task to a running plan.</span>
               </div>
             </div>
 
             <div class="control-side">
               <div class="type-card" data-type-card>
                 <span class="type-label">task pane</span>
-                <div class="typed-line"><span data-type-text>/main audit worker scroll</span><span class="cursor">_</span></div>
+                <div class="typed-line"><span data-type-text>build a spotify top-tracks dashboard</span><span class="cursor">_</span></div>
               </div>
 
               <div class="command-strip">
@@ -822,7 +822,7 @@ rudder</code>
           const target = document.querySelector("[data-type-text]");
           if (!target) return;
 
-          const phrases = ["/main audit worker scroll", "/model codex gpt-5.5", "fix parser edge cases", "v review  m merge"];
+          const phrases = ["build a spotify top-tracks dashboard", "/model codex gpt-5.5", "add a settings page", "v review  m merge"];
           let phraseIndex = 0;
           let charIndex = 0;
           let deleting = false;
