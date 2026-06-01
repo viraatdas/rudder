@@ -66,6 +66,10 @@ mod plan_stream;
 use crate::plan_stream::*;
 
 const TICK_RATE: Duration = Duration::from_millis(33);
+/// Faster event-loop tick used only while a planner is actively streaming, so the
+/// orchestrator's live transcript appears in finer increments (snappier streaming)
+/// instead of being batched into 33ms bursts.
+const STREAM_TICK_RATE: Duration = Duration::from_millis(11);
 const MAX_EVENTS_PER_FRAME: usize = 64;
 /// After this brief output lull, re-check the screen for the idle prompt even if the
 /// agent is still emitting cursor-blink/animation repaints (which would otherwise
@@ -6142,7 +6146,13 @@ What to do\n\
                 continue;
             };
             let is_focused = index == focused_index;
+            // An actively-streaming planner is always drained every tick (even if not
+            // the selected row), so its live transcript never falls into the 500ms
+            // unfocused throttle and streams smoothly.
+            let is_streaming_planner =
+                run.mode == AgentMode::RudderPlan && run.status == AgentStatus::Running;
             let due_to_drain = is_focused
+                || is_streaming_planner
                 || run
                     .last_drain_at
                     .is_none_or(|stamp| now.duration_since(stamp) >= UNFOCUSED_DRAIN_INTERVAL);
@@ -6687,7 +6697,15 @@ fn run(terminal: &mut Tui) -> Result<()> {
             terminal.draw(|frame| render(frame, &mut app))?;
         }
 
-        if event::poll(TICK_RATE)? {
+        // While a planner is actively streaming, poll faster so its live transcript
+        // lands ~3x sooner (text appears in finer increments instead of 33ms bursts).
+        // Idle/normal use stays at the calmer 33ms tick to keep CPU low.
+        let poll_timeout = if app.has_planning_orchestrator() {
+            STREAM_TICK_RATE
+        } else {
+            TICK_RATE
+        };
+        if event::poll(poll_timeout)? {
             if handle_event(&mut app, event::read()?) {
                 app.shutdown();
                 break;
