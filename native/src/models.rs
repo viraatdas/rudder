@@ -288,6 +288,11 @@ pub(crate) fn command_suggestions() -> Vec<Suggestion> {
             action: SuggestionAction::RunCommand("/merge-all".to_string()),
         },
         Suggestion {
+            label: "/automerge".to_string(),
+            detail: "toggle auto-merge: clean finished nodes merge + unblock children".to_string(),
+            action: SuggestionAction::RunCommand("/automerge".to_string()),
+        },
+        Suggestion {
             label: "/usage".to_string(),
             detail: "show tokens and estimated cost per model".to_string(),
             action: SuggestionAction::RunCommand("/usage".to_string()),

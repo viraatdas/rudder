@@ -290,6 +290,13 @@ struct App {
     /// captured), blocks premature approval of the stale plan, and is cleared the
     /// moment the revised plan lands (or the re-plan fails).
     refining: bool,
+    /// When true, a plan node that finishes cleanly (review, no conflict) is merged
+    /// automatically so its children unblock and the DAG drains hands-free. Toggled
+    /// by `/automerge`. Default OFF: review-before-merge stays the norm.
+    auto_merge: bool,
+    /// Agent ids auto-merge has already hit a conflict on; skipped on later passes so
+    /// it does not retry (and spam) every tick. The user resolves + merges manually.
+    auto_merge_skip: Vec<String>,
     /// While true, a plan has been parsed into `planned_nodes` but is awaiting the
     /// user's APPROVAL gate: nothing launches. Enter approves (clears this and runs
     /// the scheduler); d removes the selected node, or discards the whole plan when
@@ -633,6 +640,8 @@ impl App {
             plan_request: String::new(),
             plan_summary: None,
             refining: false,
+            auto_merge: false,
+            auto_merge_skip: Vec::new(),
             awaiting_approval: false,
             scheduler_tick: 0,
             spinner_frame: 0,
@@ -3762,7 +3771,7 @@ impl App {
             }
             Some("/help") => {
                 self.notice = Some(
-                    "Option-1/2/3 or ^W pane  Enter start/focus  type to refine the plan  /model  /main|/m  /goal"
+                    "Option-1/2/3 or ^W pane  Enter start/focus  type to refine the plan  /model  /main|/m  /goal  /automerge"
                         .to_string(),
                 );
                 true
@@ -3817,6 +3826,20 @@ impl App {
             }
             Some("/merge-all") => {
                 self.request_merge_all_ready();
+                true
+            }
+            Some("/automerge") => {
+                self.auto_merge = !self.auto_merge;
+                if self.auto_merge {
+                    self.auto_merge_skip.clear();
+                    self.notice = Some(
+                        "auto-merge ON: clean finished nodes merge themselves and unblock children (conflicts still pause for you)".to_string(),
+                    );
+                    self.maybe_auto_merge();
+                } else {
+                    self.notice =
+                        Some("auto-merge OFF: merge finished nodes yourself with m / M".to_string());
+                }
                 true
             }
             Some("/sync") => {
@@ -4742,6 +4765,48 @@ impl App {
     /// free. A node is ready when all its hard deps are merged (or reference ids
     /// absent from the plan, treated as satisfied so the DAG never deadlocks).
     /// Soft deps never gate. Runs on a coarse tick and after a plan is queued.
+    /// When auto-merge is on, merge every plan node that has finished cleanly (in
+    /// review, not main, not already skipped for a conflict) so its hard children
+    /// unblock. A node that conflicts is recorded in `auto_merge_skip` and left for
+    /// the user (press m to resolve + merge); auto-merge stops at the first conflict
+    /// this pass to avoid cascading on a broken base. After merging, drain the
+    /// scheduler so newly-ready children launch.
+    fn maybe_auto_merge(&mut self) {
+        if !self.auto_merge {
+            return;
+        }
+        let mut merged_any = false;
+        loop {
+            let next = self.agents.iter().position(|run| {
+                run.node_id.is_some()
+                    && run.status == AgentStatus::Done
+                    && !run.is_main()
+                    && !self.auto_merge_skip.contains(&run.id)
+            });
+            let Some(index) = next else { break };
+            let id = self.agents[index].id.clone();
+            let label = self.agents[index].task_summary.clone();
+            match self.merge_agent_at(index) {
+                Ok(()) => merged_any = true,
+                Err(_) => {
+                    // Conflict: leave it for manual resolution and stop this pass.
+                    self.auto_merge_skip.push(id);
+                    self.pending_jj_conflict = None;
+                    self.notice = Some(format!(
+                        "auto-merge paused on a conflict in {}; press m to resolve & merge",
+                        short_task(&label)
+                    ));
+                    break;
+                }
+            }
+        }
+        if merged_any {
+            self.run_scheduler();
+            self.mirror_graph();
+            self.dirty = true;
+        }
+    }
+
     fn run_scheduler(&mut self) {
         if self.planned_nodes.is_empty() {
             return;
@@ -5941,6 +6006,15 @@ What to do\n\
             && self.scheduler_tick % SCHEDULER_TICK_INTERVAL == 0
         {
             self.run_scheduler();
+        }
+        // When auto-merge is on, merge clean finished nodes on the same cadence so
+        // their children unblock and the chain flows without manual m/M. Runs even
+        // when the queue is empty (to merge the final nodes), but not at the gate.
+        if self.auto_merge
+            && !self.awaiting_approval
+            && self.scheduler_tick % SCHEDULER_TICK_INTERVAL == 0
+        {
+            self.maybe_auto_merge();
         }
 
         // Advance the spinner each tick and force a redraw while an orchestrator is

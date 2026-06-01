@@ -2464,6 +2464,17 @@ branch refs/heads/main\n";
     }
 
     #[test]
+    fn automerge_command_toggles_the_flag() {
+        let mut app = App::new();
+        app.cwd = std::env::temp_dir();
+        assert!(!app.auto_merge, "auto-merge defaults off");
+        assert!(app.handle_command("/automerge"));
+        assert!(app.auto_merge, "first /automerge turns it on");
+        assert!(app.handle_command("/automerge"));
+        assert!(!app.auto_merge, "second /automerge turns it off");
+    }
+
+    #[test]
     fn finished_agent_does_not_reopen_on_repaint() {
         // The flicker: highlighting a done agent triggers a resize/repaint -> output,
         // which previously flipped done -> in-progress. Output with no user input

@@ -1461,15 +1461,23 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // Header: ◆ ORCHESTRATOR · phase.
-    let header: Vec<Line<'static>> = vec![Line::from(vec![
+    // Header: ◆ ORCHESTRATOR · phase [· auto-merge].
+    let mut header_spans = vec![
         Span::styled(
             format!("{ORCH_MARK} ORCHESTRATOR"),
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ),
         Span::styled("  ·  ", muted_style(focused)),
         Span::styled(phase_label, muted_style(focused)),
-    ])];
+    ];
+    if app.auto_merge {
+        header_spans.push(Span::styled("  ·  ", muted_style(focused)));
+        header_spans.push(Span::styled(
+            "auto-merge",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ));
+    }
+    let header: Vec<Line<'static>> = vec![Line::from(header_spans)];
 
     // Chat input (pinned at the bottom when focused): the follow-up being composed.
     let draft = agent.worker_input_draft.clone();
