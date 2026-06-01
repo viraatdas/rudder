@@ -4577,6 +4577,52 @@ branch refs/heads/main\n";
     }
 
     #[test]
+    fn orchestrator_tree_nests_by_hard_edges_not_soft() {
+        // The my-charts case: n1 and n2 are SOFT-only (they run in parallel); n3 is
+        // the hard integrator. Soft edges must not nest (that drew a misleading
+        // sequential staircase that contradicted the "run fully in parallel" prose).
+        let task = |id: &str, deps: Vec<(&str, EdgeType)>| RudderPlanTask {
+            id: id.to_string(),
+            title: id.to_string(),
+            prompt: "p".to_string(),
+            goal: None,
+            success: None,
+            deps: deps
+                .into_iter()
+                .map(|(on, edge)| PlanEdge {
+                    on: on.to_string(),
+                    edge,
+                    why: None,
+                })
+                .collect(),
+            backend: None,
+            model: None,
+            effort: None,
+        };
+        let tasks = vec![
+            task("n0", vec![]),
+            task("n1", vec![("n0", EdgeType::Soft)]),
+            task("n2", vec![("n0", EdgeType::Soft), ("n1", EdgeType::Soft)]),
+            task(
+                "n3",
+                vec![
+                    ("n0", EdgeType::Hard),
+                    ("n1", EdgeType::Hard),
+                    ("n2", EdgeType::Hard),
+                ],
+            ),
+        ];
+        let (children, has_parent) = orchestrator_hard_tree(&tasks);
+        // n0/n1/n2 are top-level (parallel) roots; only the hard integrator nests.
+        assert!(!has_parent[0] && !has_parent[1] && !has_parent[2], "soft-only tasks are roots");
+        assert!(has_parent[3], "the hard integrator nests");
+        // n3 nests under its LATEST hard prerequisite (n2), not n0 or n1.
+        assert_eq!(children.get(&2), Some(&vec![(3usize, EdgeType::Hard)]));
+        assert!(children.get(&0).is_none(), "n0 has no hard children (links to n1/n2 are soft)");
+        assert!(children.get(&1).is_none(), "n1 has no hard children");
+    }
+
+    #[test]
     fn orchestrator_prose_reads_live_summary_when_frozen_is_empty() {
         // The truncation bug: app.plan_summary was captured once at exit-detection,
         // before the planner's tail drained. The prose must re-extract from the LIVE

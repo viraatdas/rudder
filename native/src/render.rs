@@ -1406,6 +1406,46 @@ fn push_orchestrator_task_row<'a>(
 /// Nests a task under a parent that is also in the plan (hard edges solid MUTED,
 /// soft edges dashed/dimmed), reusing the same nest glyphs as the agents pane.
 #[allow(clippy::too_many_arguments)]
+/// Build the orchestrator DAG tree structure. Nesting follows HARD edges only:
+/// soft edges are advisory "context" that never gate launch, so soft-linked tasks
+/// run in parallel and must NOT be drawn as a sequential chain. Each node nests
+/// under its LATEST hard prerequisite (max index) so an integrator renders below
+/// its inputs; a node with no hard parent is a top-level (parallel) root. Returns
+/// the children adjacency and which nodes have a hard parent. Pure, so the nesting
+/// is unit-testable.
+pub(crate) fn orchestrator_hard_tree(
+    tasks: &[RudderPlanTask],
+) -> (
+    std::collections::HashMap<usize, Vec<(usize, EdgeType)>>,
+    Vec<bool>,
+) {
+    use std::collections::HashMap;
+    let id_to_index: HashMap<&str, usize> = tasks
+        .iter()
+        .enumerate()
+        .map(|(index, task)| (task.id.as_str(), index))
+        .collect();
+    let mut children: HashMap<usize, Vec<(usize, EdgeType)>> = HashMap::new();
+    let mut has_parent = vec![false; tasks.len()];
+    for (child_index, task) in tasks.iter().enumerate() {
+        let hard_parent = task
+            .deps
+            .iter()
+            .filter(|edge| edge.edge == EdgeType::Hard)
+            .filter_map(|edge| id_to_index.get(edge.on.as_str()).copied())
+            .filter(|&parent_index| parent_index != child_index)
+            .max();
+        if let Some(parent_index) = hard_parent {
+            children
+                .entry(parent_index)
+                .or_default()
+                .push((child_index, EdgeType::Hard));
+            has_parent[child_index] = true;
+        }
+    }
+    (children, has_parent)
+}
+
 fn orchestrator_tree_walk<'a>(
     lines: &mut Vec<Line<'a>>,
     app: &App,
@@ -1581,29 +1621,11 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
                     tasks.push(node.to_task());
                 }
             }
-            // PINNED top region: the DAG tree + a live status line.
+            // PINNED top region: the DAG tree + a live status line. The tree nests
+            // by HARD edges only (see orchestrator_hard_tree) so parallel soft-linked
+            // tasks render as top-level roots instead of a misleading chain.
             let mut dag: Vec<Line<'static>> = Vec::new();
-            let id_to_index: HashMap<&str, usize> = tasks
-                .iter()
-                .enumerate()
-                .map(|(index, task)| (task.id.as_str(), index))
-                .collect();
-            let mut children: HashMap<usize, Vec<(usize, EdgeType)>> = HashMap::new();
-            let mut has_parent = vec![false; tasks.len()];
-            for (child_index, task) in tasks.iter().enumerate() {
-                for edge in &task.deps {
-                    if let Some(&parent_index) = id_to_index.get(edge.on.as_str()) {
-                        if parent_index == child_index {
-                            continue;
-                        }
-                        children
-                            .entry(parent_index)
-                            .or_default()
-                            .push((child_index, edge.edge));
-                        has_parent[child_index] = true;
-                    }
-                }
-            }
+            let (children, has_parent) = orchestrator_hard_tree(&tasks);
             let mut visited = vec![false; tasks.len()];
             let mut lanes: Vec<bool> = Vec::new();
             for index in 0..tasks.len() {
