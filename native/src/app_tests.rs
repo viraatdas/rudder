@@ -2582,6 +2582,28 @@ branch refs/heads/main\n";
     }
 
     #[test]
+    fn busy_spinner_reopens_a_falsely_completed_agent() {
+        // A reappearing spinner proves the agent is still working: reopen even with
+        // no user input (mis-detected completion during an inter-step lull).
+        let busy: Vec<String> = vec![
+            "Editing src/main.rs".to_string(),
+            "> ".to_string(),
+            "* Cogitating... (12s \u{00b7} esc to interrupt)".to_string(),
+            "  bypass permissions on (shift+tab to cycle)".to_string(),
+        ];
+        assert!(recent_lines_look_busy(&busy));
+
+        // The idle resize/repaint that caused the old flicker shows NO spinner, so it
+        // must NOT reopen a finished agent.
+        let idle: Vec<String> = vec![
+            "Edited 3 files".to_string(),
+            "> ".to_string(),
+            "  bypass permissions on (shift+tab to cycle)".to_string(),
+        ];
+        assert!(!recent_lines_look_busy(&idle));
+    }
+
+    #[test]
     fn merge_confirm_hint_highlights_merge_action() {
         let line = merge_confirm_hint_line();
         let text = line

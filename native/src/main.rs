@@ -74,7 +74,18 @@ const READY_EVAL_LULL: Duration = Duration::from_millis(900);
 /// Once an agent has looked ready-for-input (idle chrome, not busy) continuously for
 /// this long, declare the turn complete. Independent of output-silence, so an idle
 /// TUI that keeps repainting is still detected as done.
-const READY_GRACE: Duration = Duration::from_millis(1800);
+///
+/// This window must outlast the longest spinner GAP a still-working interactive agent
+/// can show. Execution agents run as interactive TUIs (not `claude -p`), and their
+/// footer chrome ("bypass permissions on (shift+tab to cycle)", the "> " prompt) is
+/// drawn persistently — even mid-turn — so the ONLY thing distinguishing busy from
+/// idle is the spinner's "esc to interrupt" line. Between steps (model done streaming
+/// a chunk, about to call a tool, waiting on a slow tool) that spinner can briefly
+/// vanish; a short grace would read that lull as "done" and, because post-completion
+/// agent output does not reopen a finished agent, leave it stuck in review while still
+/// working. Keep this comfortably longer than those gaps; the busy-spinner reopen
+/// below is the backstop if a false completion still slips through.
+const READY_GRACE: Duration = Duration::from_millis(3200);
 // Dashboard colors now live in `theme.rs` (FOCUS_COLOR, INACTIVE_COLOR, ...),
 // re-exported above so call sites are unchanged.
 const DEFAULT_WHEEL_SCROLL_ROWS: u16 = 1;
@@ -6049,7 +6060,15 @@ What to do\n\
                         run.last_worker_input_at,
                         run.completed_at,
                     );
-                    if user_started_new_turn {
+                    // Backstop against a false completion: a reappearing busy spinner
+                    // ("esc to interrupt") is unambiguous proof the agent is actively
+                    // working, so reopen it even without user input — we mis-detected
+                    // done during a transient inter-step lull. A genuine idle repaint
+                    // (the highlight resize) shows no spinner, so this never revives
+                    // the flicker the user-input guard was added to kill.
+                    let resumed_work = !user_started_new_turn
+                        && recent_lines_look_busy(&terminal.visible_lines_snapshot());
+                    if user_started_new_turn || resumed_work {
                         run.status = AgentStatus::Running;
                         run.completed_at = None;
                         run.ready_since = None;

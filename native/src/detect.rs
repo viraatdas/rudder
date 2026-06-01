@@ -13,6 +13,18 @@ pub(crate) fn post_completion_output_is_new_turn(
     last_input_at.is_some_and(|input| completed_at.is_none_or(|done| input >= done))
 }
 
+/// True if the recent visible lines show a busy spinner ("esc to interrupt" etc.).
+/// Used as a backstop to reopen an agent that was mis-flagged done while still
+/// working: a live spinner is unambiguous proof the turn never actually ended,
+/// whereas an idle resize/repaint shows no spinner.
+pub(crate) fn recent_lines_look_busy(lines: &[String]) -> bool {
+    lines
+        .iter()
+        .rev()
+        .take(14)
+        .any(|line| looks_busy(line.as_str()))
+}
+
 pub(crate) fn mark_run_done(run: &mut AgentRun) {
     if run.status != AgentStatus::Done {
         run.status = AgentStatus::Done;
