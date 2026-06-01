@@ -142,8 +142,6 @@ const DEFAULT_HOME_PATHS = [
   "~/.kube/config",
   // Netrc for tools that auth via netrc
   "~/.netrc",
-  // Rudder + Hunk
-  "~/.config/hunk",
 ];
 // Paths or path components that should never be uploaded under any
 // circumstance — even if a user's DEFAULT_HOME_PATHS entry references them.

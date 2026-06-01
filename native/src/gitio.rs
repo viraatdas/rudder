@@ -1208,7 +1208,7 @@ pub(crate) fn write_rudder_context(
         "\nRead this file before making changes so you know what other Rudder agents are doing.\n",
     );
     body.push_str(
-        "\n## Rudder review integration\n\nRudder opens `hunk diff --watch` in the review pane when available. If a live Hunk review is open, run `hunk skill path`, load that skill, then use `hunk session review --repo . --json` to inspect the review and `hunk session comment add/apply --repo .` to leave inline notes for the user.\n",
+        "\n## Version control\n\nThis repo uses jj (Jujutsu), colocated with git. Each agent works in its own jj workspace; jj is authoritative. Inspect changes with `jj status` / `jj diff`. Do not run commit/branch/merge commands yourself; Rudder snapshots and integrates your working copy.\n",
     );
     fs::write(repo_root.join("RUDDER.md"), body.as_bytes())?;
     if let Some(worktree) = pending {
@@ -1219,35 +1219,7 @@ pub(crate) fn write_rudder_context(
     Ok(())
 }
 
-pub(crate) fn ensure_hunk_config(cwd: &Path) -> Result<()> {
-    ensure_git_info_exclude_contains(cwd, ".hunk/")?;
-    let dir = cwd.join(".hunk");
-    fs::create_dir_all(&dir)?;
-    let config = dir.join("config.toml");
-    let theme = hunk_light_theme();
-    let contents = [
-        format!("theme = \"{theme}\""),
-        "mode = \"auto\"".to_string(),
-        "vcs = \"jj\"".to_string(),
-        "exclude_untracked = false".to_string(),
-        "line_numbers = true".to_string(),
-        "wrap_lines = false".to_string(),
-        "agent_notes = true".to_string(),
-        String::new(),
-    ]
-    .join("\n");
-    fs::write(config, contents)?;
-    Ok(())
-}
-
-pub(crate) fn hunk_light_theme() -> String {
-    match env::var("RUDDER_HUNK_THEME") {
-        Ok(value) if value == "light" => "paper".to_string(),
-        Ok(value) if matches!(value.as_str(), "paper" | "graphite" | "midnight" | "ember") => value,
-        _ => "paper".to_string(),
-    }
-}
-
+#[allow(dead_code)]
 pub(crate) fn ensure_git_info_exclude_contains(cwd: &Path, line: &str) -> Result<()> {
     let path = git_output(cwd, ["rev-parse", "--git-path", "info/exclude"])?;
     let trimmed = path.trim();

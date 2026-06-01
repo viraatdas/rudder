@@ -2033,7 +2033,7 @@ pub(crate) fn review_lines(app: &mut App, height: usize) -> Vec<Line<'static>> {
 
     if let Some(error) = &run.review_error {
         return vec![
-            Line::from(Span::styled("Hunk review failed", error_style())),
+            Line::from(Span::styled("diff failed", error_style())),
             Line::from(Span::styled(error.clone(), error_style())),
             Line::from(""),
             Line::from(Span::styled(
@@ -2045,10 +2045,10 @@ pub(crate) fn review_lines(app: &mut App, height: usize) -> Vec<Line<'static>> {
 
     let Some(review) = run.review_terminal.as_mut() else {
         return vec![
-            Line::from(Span::styled("Opening Hunk review...", muted_style(true))),
+            Line::from(Span::styled("Opening jj diff...", muted_style(true))),
             Line::from(""),
             Line::from(Span::styled(
-                "If Hunk is unavailable, Rudder falls back to a live git diff.",
+                "Live `jj diff` of this agent's workspace.",
                 pane_text_style(true),
             )),
         ];

@@ -1552,7 +1552,7 @@ impl App {
         self.worker_selection = None;
         self.worker_view = match self.worker_view {
             WorkerView::Terminal => {
-                self.ensure_hunk_review();
+                self.ensure_review_diff();
                 WorkerView::Diff
             }
             WorkerView::Diff => {
@@ -2997,9 +2997,6 @@ impl App {
         };
         if let Err(error) = write_rudder_context(&self.cwd, &self.agents, Some(&worktree)) {
             self.notice = Some(format!("context warning: {error}"));
-        }
-        if let Err(error) = ensure_hunk_config(&worktree.path) {
-            self.notice = Some(format!("hunk config warning: {error}"));
         }
 
         // Plan node overrides win over the dashboard defaults when supplied.
@@ -5233,7 +5230,7 @@ impl App {
         }
     }
 
-    fn ensure_hunk_review(&mut self) {
+    fn ensure_review_diff(&mut self) {
         let Some(run) = self.agents.get_mut(self.selected_agent) else {
             return;
         };
@@ -5250,17 +5247,18 @@ impl App {
 
         #[cfg(not(test))]
         {
+            // The review pane is jj's own diff, watched live: `jj status` (the
+            // working-copy summary) + `jj diff` (jj's default diff program), redrawn
+            // every 2s so edits the agent makes show up. The agent works in a jj
+            // workspace, so this is the faithful view of its changes. Falls back to
+            // `git diff` only if jj is somehow unavailable.
             let command = TerminalCommand::with_args(
                 "sh",
                 [
                     "-lc",
-                    "theme=\"${RUDDER_HUNK_THEME:-paper}\"; if [ \"$theme\" = light ]; then theme=paper; fi; if command -v hunk >/dev/null 2>&1; then exec hunk diff --watch --theme \"$theme\"; fi; if command -v hunkdiff >/dev/null 2>&1; then exec hunkdiff diff --watch --theme \"$theme\"; fi; while :; do printf '\\033[2J\\033[H'; git status --short; printf '\\n'; git diff --stat HEAD; printf '\\n'; git diff --color=always HEAD; sleep 2; done",
+                    "if command -v jj >/dev/null 2>&1; then while :; do printf '\\033[2J\\033[H'; jj --color=always status 2>&1; printf '\\n'; jj --color=always diff 2>&1; sleep 2; done; else while :; do printf '\\033[2J\\033[H'; git status --short; printf '\\n'; git diff --color=always HEAD; sleep 2; done; fi",
                 ],
             );
-            if let Err(error) = ensure_hunk_config(&run.cwd) {
-                run.review_error = Some(error.to_string());
-                self.notice = Some(format!("hunk config warning: {error}"));
-            }
             let options = TerminalPaneOptions {
                 size: run.terminal_size.unwrap_or_default(),
                 cwd: Some(run.cwd.clone()),
@@ -5276,7 +5274,7 @@ impl App {
                 }
                 Err(error) => {
                     run.review_error = Some(error.to_string());
-                    self.notice = Some(format!("failed to open Hunk: {error}"));
+                    self.notice = Some(format!("failed to open diff: {error}"));
                 }
             }
         }
@@ -5619,6 +5617,10 @@ impl App {
                 ));
             }
         }
+        // A merge can satisfy a child's hard dep on the just-merged parent. Drain the
+        // scheduler now so those children leave todo immediately instead of waiting
+        // for the next periodic tick. No-op when nothing newly became ready.
+        self.run_scheduler();
     }
 
     fn handle_merge_error(
@@ -5844,7 +5846,7 @@ impl App {
     fn conflict_resolution_prompt(&self) -> Option<String> {
         let prompt = self.conflict_prompt.as_ref()?;
         let files = if prompt.conflicted_files.is_empty() {
-            "(git did not report conflicted files)".to_string()
+            "(no specific conflicted files were reported; run the status command to find them)".to_string()
         } else {
             prompt
                 .conflicted_files
@@ -5862,11 +5864,6 @@ impl App {
             .source_branch
             .clone()
             .unwrap_or_else(|| "(unknown branch)".to_string());
-        let worktree = prompt
-            .worktree_path
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "(unknown worktree)".to_string());
         if prompt.operation == ConflictOperation::Rebase {
             return Some(format!(
                 "A git rebase stopped with conflicts in the agent worktree.\n\
@@ -5900,39 +5897,34 @@ What to do\n\
             ));
         }
         Some(format!(
-            "A git merge stopped with conflicts and you are now the conflict resolver.\n\
+            "A jj (Jujutsu) merge created conflicts and you are now the conflict resolver.\n\
+\n\
+This repo uses jj, NOT git. Use jj commands. Do NOT use git (`git add`/`git commit`/`git merge`); those do not resolve jj conflicts and will desync the repo.\n\
 \n\
 Where you are working\n\
 - You are running inside the main repo at: {repo}\n\
-- The merge is happening on the target branch (currently checked out here): {target}\n\
-- The branch being merged in is the agent's worktree branch: {source}\n\
-- That branch was developed in this worktree (separate checkout): {worktree}\n\
+- jj already created the merge commit; it is the current working-copy change (`@`) here. Both the original code and the agent's new work are its parents, and jj has written conflict markers into the working copy for the files that could not auto-merge.\n\
 \n\
 What was being attempted\n\
-- Original task on {source}: {task}\n\
+- Original task being merged in: {task}\n\
 \n\
 What conflicted\n\
 {files}\n\
 \n\
-Git reported\n\
+jj reported\n\
 {err}\n\
 \n\
 How to think about the sides\n\
-- The 'ours' side in every conflict marker is {target} (what is already on the main branch).\n\
-- The 'theirs' side is {source} (the agent's new work coming from {worktree}).\n\
-- Preserve the intent of the task on {source} while not regressing existing behavior on {target}.\n\
+- Conflict markers wrap the competing versions. One side is the existing code already integrated; the other is the agent's new work for the task above.\n\
+- Preserve the intent of the task while not regressing existing behavior.\n\
 \n\
 What to do\n\
-1. Run `git status` from {repo} to see the merge state.\n\
-2. Open each conflicted file at {repo} and resolve the markers. Edit files in {repo}, not in {worktree}.\n\
-3. After every file is resolved, run any relevant tests or checks the repo provides.\n\
-4. Stage the resolved files with `git add` and tell me what you changed and why.\n\
-5. Do NOT run `git commit` (the merge is in progress; the user will commit when they are ready).\n\
-6. Do NOT run `git merge --abort` unless the conflicts are truly unresolvable, and if so explain why.\n",
+1. Run `jj status` from {repo} to see the merge state, and `jj resolve --list` to list the files jj still considers conflicted.\n\
+2. Open each conflicted file and resolve the markers by hand (or run `jj resolve` to use the configured merge tool). Editing the working copy IS the resolution in jj. There is no staging step and no `git add`.\n\
+3. After every file is resolved, confirm `jj resolve --list` reports nothing left, then run any relevant tests or checks the repo provides.\n\
+4. Tell me what you changed and why. Do NOT run `jj commit`, `jj squash`, `jj new`, or `jj abandon`: the merge change already exists and Rudder finalizes it once `jj resolve --list` is empty.\n\
+5. Do NOT undo the merge (`jj undo`/`jj op undo`) unless the conflicts are truly unresolvable, and if so explain why.\n",
             repo = repo,
-            target = target,
-            source = source,
-            worktree = worktree,
             task = prompt.task,
             files = files,
             err = prompt.error,

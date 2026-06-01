@@ -233,6 +233,41 @@ branch refs/heads/main\n";
     }
 
     #[test]
+    fn execution_prompt_tells_the_worker_it_is_a_jj_runtime() {
+        let prompt = execution_prompt("add a feature");
+        assert!(prompt.contains("jj (Jujutsu)"), "names the VCS: {prompt}");
+        assert!(prompt.contains("jj status") && prompt.contains("jj diff"));
+        // The old Hunk review integration paragraph is gone.
+        assert!(!prompt.to_lowercase().contains("hunk"), "no hunk: {prompt}");
+    }
+
+    #[test]
+    fn jj_merge_conflict_prompt_uses_jj_not_git() {
+        let mut app = App::new();
+        app.conflict_prompt = Some(MergeConflictPrompt {
+            operation: ConflictOperation::Merge,
+            task: "wire up the parser".to_string(),
+            conflicted_files: vec!["src/parser.rs".to_string()],
+            error: "jj merge created conflicts.".to_string(),
+            repo_root: std::env::temp_dir(),
+            target_branch: None,
+            source_branch: None,
+            worktree_path: None,
+            agent_id: Some("agent-1".to_string()),
+        });
+        let prompt = app.conflict_resolution_prompt().expect("merge prompt");
+        assert!(prompt.contains("jj resolve --list"), "uses jj resolve: {prompt}");
+        assert!(prompt.contains("jj status"));
+        // The old git INSTRUCTIONS must be gone (the prompt now only mentions git to
+        // warn the resolver away from it, which does not resolve jj conflicts).
+        assert!(!prompt.contains("Run `git status`"), "no git status step: {prompt}");
+        assert!(
+            !prompt.contains("Stage the resolved files"),
+            "no git staging step: {prompt}"
+        );
+    }
+
+    #[test]
     fn manual_goal_prompt_leads_with_goal_and_done_when() {
         let prompt = manual_goal_prompt("fix the flaky login test");
         assert!(prompt.starts_with("/goal fix the flaky login test\n"));

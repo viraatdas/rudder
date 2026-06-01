@@ -444,7 +444,7 @@ export async function undoLast(repoRoot: string): Promise<void> {
 
 /**
  * Export jj changes to the colocated git repo. Call after each merge, before
- * opening a Hunk review, and before a PR.
+ * opening a diff review, and before a PR.
  */
 export async function exportToGit(repoRoot: string): Promise<void> {
   await runCommand("jj", ["git", "export"], { cwd: repoRoot, allowFailure: true });

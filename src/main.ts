@@ -637,7 +637,7 @@ async function openDashboard(parsed: Parsed): Promise<void> {
     });
     return;
   }
-  await Promise.all([refreshModelCache(), ensureReviewTool()]);
+  await refreshModelCache();
   if (!parsed.flags.noNative && process.env.RUDDER_LEGACY_TMUX !== "1" && await runNativeDashboard()) {
     return;
   }
@@ -658,33 +658,6 @@ async function refreshModelCache(): Promise<void> {
     discoverModelOptions("claude").catch(() => []),
     discoverModelOptions("codex").catch(() => []),
   ]);
-}
-
-let reviewToolChecked = false;
-
-async function ensureReviewTool(): Promise<void> {
-  if (reviewToolChecked || process.env.RUDDER_REVIEW_TOOL === "git") {
-    return;
-  }
-  reviewToolChecked = true;
-  if (commandExists("hunk") || commandExists("hunkdiff")) {
-    return;
-  }
-  if (!commandExists("npm")) {
-    if (isTty()) {
-      console.warn("hunkdiff unavailable; review pane will use live git diff fallback.");
-    }
-    return;
-  }
-  if (isTty()) {
-    console.log("Installing hunkdiff@latest for the review pane...");
-  }
-  const result = await runCommand("npm", ["install", "-g", "hunkdiff@latest"], {
-    allowFailure: true,
-  });
-  if (result.code !== 0 && isTty()) {
-    console.warn("hunkdiff install failed; review pane will use live git diff fallback.");
-  }
 }
 
 async function runNativeDashboard(): Promise<boolean> {
@@ -776,7 +749,6 @@ async function openTmuxDashboard(parsed: Parsed): Promise<void> {
     });
     return;
   }
-  await ensureReviewTool();
   const repoRoot = findRepoRoot();
   const sessionName = parsed.flags.tmuxSession ?? repoTmuxSessionName(repoRoot);
   const entry = process.argv[1];

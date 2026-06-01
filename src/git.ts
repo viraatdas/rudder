@@ -17,7 +17,7 @@ export type RebaseResult = {
 //
 // Rudder's internal run isolation/merge runs on jj (see src/jj.ts). git.ts now
 // only owns the surface where Rudder still talks plain git: discovering the repo
-// root, reporting branch/commit, and producing status/diff for the Hunk review
+// root, reporting branch/commit, and producing status/diff for the diff review
 // surface. Legacy runs created before the jj switch (run.vcs === "git") still
 // merge/sync through the git helpers below, guarded by the vcs mode.
 // ---------------------------------------------------------------------------
