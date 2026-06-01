@@ -306,7 +306,7 @@ test("parsePlanBlock tolerates a soft cycle (no deadlock risk)", () => {
   assert.equal(dag.edges.length, 2);
 });
 
-test("parsePlanBlock skips tasks with an empty prompt and caps at 6", () => {
+test("parsePlanBlock skips tasks with an empty prompt and caps at 10", () => {
   const dag = parsePlanBlock(
     block([
       { id: "a", title: "a", prompt: "" },
@@ -317,6 +317,11 @@ test("parsePlanBlock skips tasks with an empty prompt and caps at 6", () => {
     dag.nodes.map((n) => n.id),
     ["b"],
   );
+  // The cap is 10: an 11-task block keeps only the first 10.
+  const big = parsePlanBlock(
+    block(Array.from({ length: 11 }, (_, i) => ({ id: `t${i}`, title: `t${i}`, prompt: "real" }))),
+  );
+  assert.equal(big.nodes.length, 10, "caps at 10 tasks");
 });
 
 test("parsePlanBlock throws on a missing block", () => {

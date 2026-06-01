@@ -4577,6 +4577,29 @@ branch refs/heads/main\n";
     }
 
     #[test]
+    fn orchestrator_pane_shows_per_node_goal_and_done_when() {
+        // The pane now fills with a per-node breakdown (goal + done-when + deps),
+        // surfacing the plan's depth instead of leaving the space blank.
+        let mut app = App::new();
+        app.focus = FocusPane::Worker;
+        let mut orch = test_agent_run("orch", "build");
+        orch.mode = AgentMode::RudderPlan;
+        let mut stream = PlanStreamState::new();
+        stream.ingest("{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"RUDDER_PLAN_TASKS_START {\\\"tasks\\\":[{\\\"id\\\":\\\"n0\\\",\\\"title\\\":\\\"scaffold\\\",\\\"prompt\\\":\\\"p\\\",\\\"goal\\\":\\\"set up indexpage\\\",\\\"success\\\":\\\"pageloads\\\",\\\"deps\\\":[]}]} RUDDER_PLAN_TASKS_END\"}}}\n");
+        orch.plan_stream = Some(stream);
+        app.agents = vec![orch];
+        app.selected_agent = 0;
+
+        let text = render_worker_text(&mut app, 90, 30);
+        assert!(text.contains("Tasks"), "tasks section heading: {text}");
+        assert!(text.contains("set up indexpage"), "per-node goal shown: {text}");
+        assert!(
+            text.contains("done when:") && text.contains("pageloads"),
+            "per-node done-when shown: {text}"
+        );
+    }
+
+    #[test]
     fn orchestrator_tree_nests_by_hard_edges_not_soft() {
         // The my-charts case: n1 and n2 are SOFT-only (they run in parallel); n3 is
         // the hard integrator. Soft edges must not nest (that drew a misleading

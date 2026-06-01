@@ -1663,9 +1663,10 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
                 )));
             }
 
-            // SCROLLABLE body: the prose plan — what the orchestrator intends to do.
-            // Prefer the planner's own narrative; fall back to one line per node so
-            // there is always a readable plan beneath the tree.
+            // SCROLLABLE body: the human summary, THEN a per-node breakdown. Showing
+            // each task's goal, done-when, and dependencies surfaces the plan's full
+            // depth and fills the pane instead of leaving it blank below a short
+            // summary.
             let mut prose: Vec<Line<'static>> = Vec::new();
             prose.push(Line::from(Span::styled("Plan", header_style(focused))));
             // Re-extract the summary from the LIVE planner text every frame, not the
@@ -1679,26 +1680,59 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
                 .filter(|s| !s.is_empty());
             if let Some(summary) = summary {
                 for raw in summary.lines() {
-                    let trimmed = raw.trim_end();
                     prose.push(Line::from(Span::styled(
-                        trimmed.to_string(),
+                        raw.trim_end().to_string(),
                         pane_text_style(focused),
                     )));
                 }
-            } else {
-                for task in &tasks {
-                    let goal = task
-                        .goal
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|g| !g.is_empty())
-                        .unwrap_or_else(|| task.title.as_str());
-                    prose.push(Line::from(vec![
-                        Span::styled(format!("{}  ", task.id), muted_style(focused)),
-                        Span::styled(task.title.clone(), pane_text_style(focused)),
-                    ]));
+            }
+
+            // Per-node breakdown: title (+ dependency note), goal, and done-when for
+            // every task, so the plan reads in full without launching anything.
+            prose.push(Line::default());
+            prose.push(Line::from(Span::styled("Tasks", header_style(focused))));
+            for task in &tasks {
+                let hard: Vec<&str> = task
+                    .deps
+                    .iter()
+                    .filter(|edge| edge.edge == EdgeType::Hard)
+                    .map(|edge| edge.on.as_str())
+                    .collect();
+                let soft: Vec<&str> = task
+                    .deps
+                    .iter()
+                    .filter(|edge| edge.edge == EdgeType::Soft)
+                    .map(|edge| edge.on.as_str())
+                    .collect();
+                let note = if hard.is_empty() && soft.is_empty() {
+                    "  ·  parallel".to_string()
+                } else {
+                    let mut parts = String::new();
+                    if !hard.is_empty() {
+                        parts.push_str(&format!("  ·  after {}", hard.join(", ")));
+                    }
+                    if !soft.is_empty() {
+                        parts.push_str(&format!("  ·  with {}", soft.join(", ")));
+                    }
+                    parts
+                };
+                prose.push(Line::default());
+                prose.push(Line::from(vec![
+                    Span::styled(format!("{}  ", task.id), accent_style(focused)),
+                    Span::styled(task.title.clone(), pane_text_style(focused)),
+                    Span::styled(note, muted_style(focused)),
+                ]));
+                if let Some(goal) = task.goal.as_deref().map(str::trim).filter(|g| !g.is_empty()) {
                     prose.push(Line::from(Span::styled(
-                        format!("    {goal}"),
+                        format!("    goal: {goal}"),
+                        muted_style(focused),
+                    )));
+                }
+                if let Some(success) =
+                    task.success.as_deref().map(str::trim).filter(|s| !s.is_empty())
+                {
+                    prose.push(Line::from(Span::styled(
+                        format!("    done when: {success}"),
                         muted_style(focused),
                     )));
                 }
