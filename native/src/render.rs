@@ -1454,37 +1454,63 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
         OrchestratorPhase::PlanReady(tasks) => format!("plan · {} tasks", tasks.len()),
     };
 
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    // Header: ◆ ORCHESTRATOR (accent bold) · phase.
-    lines.push(Line::from(vec![
+    // Draw the pane border first; content is laid out inside it. Splitting the
+    // inner area into fixed (header + DAG) and scrollable (plan prose) regions lets
+    // the DAG tree stay PINNED on top while only the prose plan scrolls.
+    let block = pane_block("orchestrator", focused, app.nav_mode);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // Header: ◆ ORCHESTRATOR · phase.
+    let header: Vec<Line<'static>> = vec![Line::from(vec![
         Span::styled(
             format!("{ORCH_MARK} ORCHESTRATOR"),
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ),
         Span::styled("  ·  ", muted_style(focused)),
         Span::styled(phase_label, muted_style(focused)),
-    ]));
-    lines.push(Line::default());
+    ])];
+
+    // Chat input (pinned at the bottom when focused): the follow-up being composed.
+    let draft = agent.worker_input_draft.clone();
+    let input: Vec<Line<'static>> = if focused {
+        let mut spans = vec![Span::styled(
+            "› ",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )];
+        if draft.is_empty() {
+            spans.push(Span::styled(
+                "chat to refine the plan, or press Enter to approve & launch",
+                muted_style(focused),
+            ));
+        } else {
+            spans.push(Span::styled(draft, pane_text_style(focused)));
+        }
+        vec![Line::default(), Line::from(spans)]
+    } else {
+        Vec::new()
+    };
 
     match phase {
         OrchestratorPhase::Planning => {
-            let header = if app.refining {
+            // Smooth live stream: the model's reasoning (dim), the files it inspects,
+            // and the plan as it writes it. No pinned region; the whole transcript
+            // scrolls and sticks to the bottom so new output stays in view.
+            let mut body: Vec<Line<'static>> = Vec::new();
+            let spinner_label = if app.refining {
                 "refining the plan…"
             } else {
                 "decomposing the task…"
             };
-            lines.push(Line::from(vec![
+            body.push(Line::from(vec![
                 Span::styled(
                     app.spinner_glyph(),
                     Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(" "),
-                Span::styled(header, pane_text_style(true)),
+                Span::styled(spinner_label, pane_text_style(true)),
             ]));
-            lines.push(Line::default());
-            // Live conversation transcript: the model's reasoning, the files it is
-            // inspecting, and the plan as it streams (parsed from the backend's JSON
-            // event stream by plan_stream.rs). Empty until the first events arrive.
+            body.push(Line::default());
             let empty: &[PlanEntry] = &[];
             let transcript = agent
                 .plan_stream
@@ -1492,44 +1518,27 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
                 .map(|stream| stream.transcript())
                 .unwrap_or(empty);
             if transcript.is_empty() {
-                lines.push(Line::from(Span::styled(
+                body.push(Line::from(Span::styled(
                     "starting the planner…",
                     muted_style(focused),
                 )));
             } else {
-                for entry in transcript {
-                    let (prefix, style) = match entry.kind {
-                        PlanEntryKind::Thinking => {
-                            ("· ", muted_style(focused).add_modifier(Modifier::ITALIC))
-                        }
-                        PlanEntryKind::Tool => ("  ", muted_style(focused)),
-                        PlanEntryKind::Result | PlanEntryKind::System => {
-                            ("", muted_style(focused))
-                        }
-                        PlanEntryKind::UserTurn => (
-                            "you: ",
-                            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                        ),
-                        PlanEntryKind::Text => ("", pane_text_style(focused)),
-                    };
-                    let mut first = true;
-                    for sub in entry.text.split('\n') {
-                        let content = if first {
-                            format!("{prefix}{}", sub.trim_end())
-                        } else {
-                            sub.trim_end().to_string()
-                        };
-                        first = false;
-                        if content.is_empty() {
-                            continue;
-                        }
-                        lines.push(Line::from(Span::styled(content, style)));
-                    }
-                }
+                push_transcript_lines(&mut body, transcript, focused);
             }
+            render_orchestrator_layout(
+                frame,
+                inner,
+                &header,
+                &[],
+                &body,
+                &input,
+                &mut app.orch_dag_scroll,
+                true,
+            );
         }
         OrchestratorPhase::PlanReady(tasks) => {
-            // Build hard+soft adjacency over the parsed tasks. Hard edges bind first.
+            // PINNED top region: the DAG tree + a live status line.
+            let mut dag: Vec<Line<'static>> = Vec::new();
             let id_to_index: HashMap<&str, usize> = tasks
                 .iter()
                 .enumerate()
@@ -1551,29 +1560,23 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
                     }
                 }
             }
-
             let mut visited = vec![false; tasks.len()];
             let mut lanes: Vec<bool> = Vec::new();
             for index in 0..tasks.len() {
                 if !has_parent[index] {
                     orchestrator_tree_walk(
-                        &mut lines, app, &tasks, &children, index, None, true, &mut lanes,
+                        &mut dag, app, &tasks, &children, index, None, true, &mut lanes,
                         &mut visited,
                     );
                 }
             }
-            // Anything trapped in a cycle renders at root so nothing hides.
             for index in 0..tasks.len() {
                 orchestrator_tree_walk(
-                    &mut lines, app, &tasks, &children, index, None, true, &mut lanes,
+                    &mut dag, app, &tasks, &children, index, None, true, &mut lanes,
                     &mut visited,
                 );
             }
-
-            let mut running = 0usize;
-            let mut review = 0usize;
-            let mut done = 0usize;
-            let mut todo = 0usize;
+            let (mut running, mut review, mut done, mut todo) = (0usize, 0usize, 0usize, 0usize);
             for task in &tasks {
                 match orchestrator_task_status(app, &task.id) {
                     OrchTaskStatus::Running => running += 1,
@@ -1583,102 +1586,172 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
                     OrchTaskStatus::Todo => todo += 1,
                 }
             }
-            lines.push(Line::default());
-            lines.push(Line::from(Span::styled(
+            dag.push(Line::from(Span::styled(
                 format!("running {running} · review {review} · done {done} · todo {todo}"),
                 muted_style(focused),
             )));
-            // While the plan awaits approval, show the planner's notes/assumptions
-            // (so the user knows what it assumed and what to discuss) plus the gate
-            // hint: type to refine the DAG, or Enter to approve and launch.
             if app.awaiting_approval {
-                if let Some(summary) = app.plan_summary.as_ref() {
-                    lines.push(Line::default());
-                    lines.push(Line::from(Span::styled(
-                        "planner notes & assumptions",
-                        header_style(focused),
-                    )));
-                    for raw in summary.lines().take(12) {
-                        let trimmed = raw.trim();
-                        if trimmed.is_empty() {
-                            continue;
-                        }
-                        lines.push(Line::from(Span::styled(
-                            trimmed.to_string(),
-                            muted_style(focused),
-                        )));
-                    }
-                }
-                lines.push(Line::default());
-                lines.push(Line::from(Span::styled(
-                    "type to refine the plan  ·  Enter approve",
+                dag.push(Line::from(Span::styled(
+                    "chat to refine  ·  Enter to approve & launch",
                     Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
                 )));
             }
+
+            // SCROLLABLE body: the prose plan — what the orchestrator intends to do.
+            // Prefer the planner's own narrative; fall back to one line per node so
+            // there is always a readable plan beneath the tree.
+            let mut prose: Vec<Line<'static>> = Vec::new();
+            prose.push(Line::from(Span::styled("Plan", header_style(focused))));
+            let summary = app
+                .plan_summary
+                .as_ref()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            if let Some(summary) = summary {
+                for raw in summary.lines() {
+                    let trimmed = raw.trim_end();
+                    prose.push(Line::from(Span::styled(
+                        trimmed.to_string(),
+                        pane_text_style(focused),
+                    )));
+                }
+            } else {
+                for task in &tasks {
+                    let goal = task
+                        .goal
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|g| !g.is_empty())
+                        .unwrap_or_else(|| task.title.as_str());
+                    prose.push(Line::from(vec![
+                        Span::styled(format!("{}  ", task.id), muted_style(focused)),
+                        Span::styled(task.title.clone(), pane_text_style(focused)),
+                    ]));
+                    prose.push(Line::from(Span::styled(
+                        format!("    {goal}"),
+                        muted_style(focused),
+                    )));
+                }
+            }
+            render_orchestrator_layout(
+                frame,
+                inner,
+                &header,
+                &dag,
+                &prose,
+                &input,
+                &mut app.orch_dag_scroll,
+                false,
+            );
         }
     }
+}
 
-    // Chat input: when the orchestrator pane is focused it is a conversation with the
-    // planner. Show the follow-up line being composed; keys route through
-    // handle_orchestrator_chat_key (Enter refines, empty Enter approves).
-    let draft = agent.worker_input_draft.clone();
-    if focused {
-        lines.push(Line::default());
-        let mut spans = vec![Span::styled(
-            "› ",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        )];
-        if draft.is_empty() {
-            spans.push(Span::styled(
-                "chat to refine the plan, or press Enter to approve & launch",
-                muted_style(focused),
-            ));
-        } else {
-            spans.push(Span::styled(draft.clone(), pane_text_style(focused)));
-        }
-        lines.push(Line::from(spans));
-    }
-
-    let inner = block_inner(area);
-    let inner_width = inner.width.max(1) as usize;
-    let visible_height = inner.height.max(1) as usize;
-    // The paragraph wraps (Wrap { trim: false }), so the on-screen row count can
-    // exceed lines.len(). Sum each line's wrapped row count so the scroll offset
-    // clamps against what is actually drawn and the last line can reach the top.
-    let wrapped_rows: usize = lines
-        .iter()
-        .map(|line| line.width().max(1))
-        .map(|width| wrapped_row_count(width, inner_width))
-        .sum();
-    let max_scroll = orchestrator_dag_max_scroll(wrapped_rows, visible_height);
-    app.orch_dag_scroll = app.orch_dag_scroll.min(max_scroll);
-    // When focused, stick to the bottom so the live transcript + the chat input line
-    // stay in view; when unfocused, honor the user's scroll so they can read the DAG.
-    let scroll = if focused {
-        max_scroll
-    } else {
-        app.orch_dag_scroll
+/// Lay out the orchestrator pane inside `inner` as: header (fixed) · top/DAG
+/// (PINNED, capped) · body (SCROLLABLE) · input (pinned bottom). Only the body
+/// scrolls (via `scroll`); the DAG stays on top. `stick_bottom` pins the body to
+/// its last line (used for the live planning stream).
+#[allow(clippy::too_many_arguments)]
+fn render_orchestrator_layout(
+    frame: &mut Frame<'_>,
+    inner: Rect,
+    header: &[Line<'static>],
+    top: &[Line<'static>],
+    body: &[Line<'static>],
+    input: &[Line<'static>],
+    scroll: &mut usize,
+    stick_bottom: bool,
+) {
+    let width = inner.width.max(1) as usize;
+    let rows = |lines: &[Line<'static>]| -> u16 {
+        lines
+            .iter()
+            .map(|line| wrapped_row_count(line.width().max(1), width))
+            .sum::<usize>()
+            .min(u16::MAX as usize) as u16
     };
+    let header_h = rows(header);
+    let input_h = rows(input);
+    let avail = inner.height.saturating_sub(header_h).saturating_sub(input_h);
+    // Pin the DAG but never let it eat more than half the body area, so the prose
+    // plan always has room; it shows the top of the tree if it is very tall.
+    let top_h = if top.is_empty() {
+        0
+    } else {
+        rows(top).min((avail / 2).max(3)).min(avail)
+    };
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(header_h),
+            Constraint::Length(top_h),
+            Constraint::Min(1),
+            Constraint::Length(input_h),
+        ])
+        .split(inner);
 
-    // When the plan overflows the pane, append a one-line scroll hint so the user
-    // knows there is more below (and how to reach it).
-    if max_scroll > 0 {
-        let at_bottom = scroll >= max_scroll;
-        let hint = if at_bottom {
-            "scroll up for more  ·  wheel to scroll".to_string()
-        } else {
-            "scroll for more".to_string()
-        };
-        lines.push(Line::default());
-        lines.push(Line::from(Span::styled(hint, muted_style(focused))));
+    frame.render_widget(
+        Paragraph::new(header.to_vec()).style(app_style()).wrap(Wrap { trim: false }),
+        chunks[0],
+    );
+    if top_h > 0 {
+        frame.render_widget(
+            Paragraph::new(top.to_vec()).style(app_style()).wrap(Wrap { trim: false }),
+            chunks[1],
+        );
     }
+    let body_area = chunks[2];
+    let body_visible = body_area.height.max(1) as usize;
+    let body_rows: usize = body
+        .iter()
+        .map(|line| wrapped_row_count(line.width().max(1), width))
+        .sum();
+    let max_scroll = body_rows.saturating_sub(body_visible);
+    *scroll = (*scroll).min(max_scroll);
+    let effective = if stick_bottom { max_scroll } else { *scroll };
+    frame.render_widget(
+        Paragraph::new(body.to_vec())
+            .style(app_style())
+            .scroll((effective as u16, 0))
+            .wrap(Wrap { trim: false }),
+        body_area,
+    );
+    if input_h > 0 {
+        frame.render_widget(
+            Paragraph::new(input.to_vec()).style(app_style()).wrap(Wrap { trim: false }),
+            chunks[3],
+        );
+    }
+}
 
-    let paragraph = Paragraph::new(lines)
-        .style(app_style())
-        .block(pane_block("orchestrator", focused, app.nav_mode))
-        .scroll((scroll as u16, 0))
-        .wrap(Wrap { trim: false });
-    frame.render_widget(paragraph, area);
+/// Render a planner transcript (reasoning/tool/text/user turns) into `out`, with
+/// dim italic thinking, muted tool/system lines, and accented user turns.
+fn push_transcript_lines(out: &mut Vec<Line<'static>>, transcript: &[PlanEntry], focused: bool) {
+    for entry in transcript {
+        let (prefix, style) = match entry.kind {
+            PlanEntryKind::Thinking => ("· ", muted_style(focused).add_modifier(Modifier::ITALIC)),
+            PlanEntryKind::Tool => ("  ", muted_style(focused)),
+            PlanEntryKind::Result | PlanEntryKind::System => ("", muted_style(focused)),
+            PlanEntryKind::UserTurn => (
+                "you: ",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            PlanEntryKind::Text => ("", pane_text_style(focused)),
+        };
+        let mut first = true;
+        for sub in entry.text.split('\n') {
+            let content = if first {
+                format!("{prefix}{}", sub.trim_end())
+            } else {
+                sub.trim_end().to_string()
+            };
+            first = false;
+            if content.is_empty() {
+                continue;
+            }
+            out.push(Line::from(Span::styled(content, style)));
+        }
+    }
 }
 
 pub(crate) fn render_worker(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
@@ -2517,6 +2590,7 @@ pub(crate) fn wrapped_row_count(line_width: usize, width: usize) -> usize {
 
 /// Largest valid scroll offset (lines from the top) for a list of `content_rows`
 /// drawn in a `visible_height`-row viewport. Zero when everything fits.
+#[allow(dead_code)]
 pub(crate) fn orchestrator_dag_max_scroll(content_rows: usize, visible_height: usize) -> usize {
     content_rows.saturating_sub(visible_height)
 }

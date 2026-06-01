@@ -4102,6 +4102,30 @@ branch refs/heads/main\n";
     }
 
     #[test]
+    fn render_orchestrator_pins_dag_and_shows_plan_prose() {
+        // PlanReady: the DAG tree (node titles) is pinned on top and the prose plan
+        // (the planner's narrative) renders below it in the scrollable body.
+        let mut app = App::new();
+        app.focus = FocusPane::Worker;
+        let mut orch = test_agent_run("orch", "build a feature");
+        orch.mode = AgentMode::RudderPlan;
+        let mut stream = PlanStreamState::new();
+        stream.ingest("{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"RUDDER_PLAN_TASKS_START {\\\"tasks\\\":[{\\\"id\\\":\\\"n0\\\",\\\"title\\\":\\\"scaffold\\\",\\\"prompt\\\":\\\"p\\\",\\\"goal\\\":\\\"set up project\\\",\\\"success\\\":\\\"s\\\",\\\"deps\\\":[]}]} RUDDER_PLAN_TASKS_END\"}}}\n");
+        orch.plan_stream = Some(stream);
+        app.agents = vec![orch];
+        app.selected_agent = 0;
+        app.plan_summary = Some("This plan scaffolds the project first.".to_string());
+
+        let text = render_worker_text(&mut app, 72, 24);
+        assert!(text.contains("scaffold"), "DAG tree shows the node title: {text}");
+        assert!(text.contains("Plan"), "the prose plan section heading is shown: {text}");
+        assert!(
+            text.contains("scaffolds the project"),
+            "the prose plan narrative is shown: {text}"
+        );
+    }
+
+    #[test]
     fn render_worker_shows_live_transcript_while_planning() {
         let mut app = App::new();
         app.focus = FocusPane::Worker;
