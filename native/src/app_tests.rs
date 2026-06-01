@@ -4388,6 +4388,67 @@ branch refs/heads/main\n";
     }
 
     #[test]
+    fn planned_node_to_task_round_trips_hard_and_soft_deps() {
+        let mut node = test_planned_node("extra", &["a"]);
+        node.soft_deps = vec!["b".to_string()];
+        let task = node.to_task();
+        assert_eq!(task.id, "extra");
+        let hard: Vec<&str> = task
+            .deps
+            .iter()
+            .filter(|e| e.edge == EdgeType::Hard)
+            .map(|e| e.on.as_str())
+            .collect();
+        let soft: Vec<&str> = task
+            .deps
+            .iter()
+            .filter(|e| e.edge == EdgeType::Soft)
+            .map(|e| e.on.as_str())
+            .collect();
+        assert_eq!(hard, vec!["a"]);
+        assert_eq!(soft, vec!["b"]);
+    }
+
+    #[test]
+    fn orchestrator_dag_shows_reconciled_nodes_added_after_launch() {
+        // The orchestrator's frozen plan block has node "scaffold". The user then
+        // typed a task post-launch, which appended a reconciled node to planned_nodes.
+        // That node lives ONLY in planned_nodes, so it must still appear in the DAG.
+        let mut app = App::new();
+        app.focus = FocusPane::Worker;
+        let mut orch = test_agent_run("orch", "build a feature");
+        orch.mode = AgentMode::RudderPlan;
+        let mut stream = PlanStreamState::new();
+        stream.ingest("{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"RUDDER_PLAN_TASKS_START {\\\"tasks\\\":[{\\\"id\\\":\\\"n0\\\",\\\"title\\\":\\\"scaffold\\\",\\\"prompt\\\":\\\"p\\\",\\\"goal\\\":\\\"g\\\",\\\"success\\\":\\\"s\\\",\\\"deps\\\":[]}]} RUDDER_PLAN_TASKS_END\"}}}\n");
+        orch.plan_stream = Some(stream);
+        app.agents = vec![orch];
+        app.selected_agent = 0;
+        // A reconciled node added after launch (distinct id/title not in the block).
+        app.planned_nodes = vec![test_planned_node("addeddocs", &["n0"])];
+
+        let text = render_worker_text(&mut app, 72, 24);
+        assert!(text.contains("scaffold"), "initial node shown: {text}");
+        assert!(
+            text.contains("addeddocs"),
+            "reconciled node appears in the orchestrator DAG: {text}"
+        );
+    }
+
+    #[test]
+    fn task_hint_invites_adding_to_running_plan_post_launch() {
+        let mut app = App::new();
+        // A plan is active (queued node) but not awaiting approval -> post-launch.
+        app.planned_nodes = vec![test_planned_node("n0", &[])];
+        app.awaiting_approval = false;
+        assert!(app.plan_is_active());
+        let hint = task_default_hint(&app);
+        assert!(
+            hint.contains("add it to the running plan"),
+            "post-launch hint invites reconcile: {hint}"
+        );
+    }
+
+    #[test]
     fn render_worker_shows_live_transcript_while_planning() {
         let mut app = App::new();
         app.focus = FocusPane::Worker;

@@ -2769,7 +2769,7 @@ impl App {
     /// an orchestrator is still planning, OR at least one plan-launched agent (one
     /// carrying a `node_id`) has not yet merged. While this holds, a newly typed
     /// task is RECONCILED into the existing plan instead of starting a fresh one.
-    fn plan_is_active(&self) -> bool {
+    pub(crate) fn plan_is_active(&self) -> bool {
         if !self.planned_nodes.is_empty() || self.has_planning_orchestrator() {
             return true;
         }
@@ -4707,7 +4707,18 @@ impl App {
         // The reconcile planner has done its job; remove it so it does not linger as
         // a second pinned orchestrator. (The initial planner is KEPT as the
         // orchestrator; a reconcile planner is transient.)
+        // If the user was watching the (transient) reconcile planner, return them to
+        // the orchestrator afterwards so they SEE the new node land in the DAG. If
+        // they navigated elsewhere, leave their selection alone.
+        let was_watching_reconcile = self.selected_agent == index;
         self.agents.remove(index);
+        if was_watching_reconcile {
+            if let Some(orch_index) = self.agents.iter().position(|run| run.is_orchestrator()) {
+                self.selected_agent = orch_index;
+                self.focus = FocusPane::Worker;
+                self.worker_view = WorkerView::Terminal;
+            }
+        }
         if self.selected_agent >= self.agents.len() {
             self.selected_agent = self.agents.len().saturating_sub(1);
         }
@@ -5252,11 +5263,16 @@ impl App {
             // every 2s so edits the agent makes show up. The agent works in a jj
             // workspace, so this is the faithful view of its changes. Falls back to
             // `git diff` only if jj is somehow unavailable.
+            //
+            // CRITICAL: pipe jj through `cat` (and use git `--no-pager`). The pane is
+            // a real PTY, so jj/git see a tty on stdout and would launch a PAGER on a
+            // long diff, blocking the watch loop forever. Piping to cat makes stdout a
+            // pipe, so jj's auto-pager stays off and the loop keeps refreshing.
             let command = TerminalCommand::with_args(
                 "sh",
                 [
                     "-lc",
-                    "if command -v jj >/dev/null 2>&1; then while :; do printf '\\033[2J\\033[H'; jj --color=always status 2>&1; printf '\\n'; jj --color=always diff 2>&1; sleep 2; done; else while :; do printf '\\033[2J\\033[H'; git status --short; printf '\\n'; git diff --color=always HEAD; sleep 2; done; fi",
+                    "if command -v jj >/dev/null 2>&1; then while :; do printf '\\033[2J\\033[H'; jj --color=always status 2>&1 | cat; printf '\\n'; jj --color=always diff 2>&1 | cat; sleep 2; done; else while :; do printf '\\033[2J\\033[H'; git --no-pager status --short 2>&1; printf '\\n'; git --no-pager diff --color=always HEAD 2>&1; sleep 2; done; fi",
                 ],
             );
             let options = TerminalPaneOptions {

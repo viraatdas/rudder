@@ -206,6 +206,38 @@ impl PlannedNode {
         }
     }
 
+    /// View this queued node as a plan task so the orchestrator pane can render a
+    /// reconciled (post-launch) addition in the SAME DAG as the initial nodes. The
+    /// initial nodes live in the orchestrator's frozen plan block; reconciled nodes
+    /// live only here, so without this they would be invisible in the DAG.
+    pub(crate) fn to_task(&self) -> RudderPlanTask {
+        let mut deps: Vec<PlanEdge> = self
+            .deps
+            .iter()
+            .map(|on| PlanEdge {
+                on: on.clone(),
+                edge: EdgeType::Hard,
+                why: None,
+            })
+            .collect();
+        deps.extend(self.soft_deps.iter().map(|on| PlanEdge {
+            on: on.clone(),
+            edge: EdgeType::Soft,
+            why: None,
+        }));
+        RudderPlanTask {
+            id: self.id.clone(),
+            title: self.title.clone(),
+            prompt: self.prompt.clone(),
+            goal: self.goal.clone(),
+            success: self.success.clone(),
+            deps,
+            backend: self.backend.clone(),
+            model: self.model.clone(),
+            effort: self.effort.clone(),
+        }
+    }
+
     /// A planned node is launchable when every hard dep is satisfied: either the
     /// dep id is in `merged_ids`, or it is not present in `plan_ids` (the set of
     /// node ids known to this plan: still-queued nodes plus already-launched ones).

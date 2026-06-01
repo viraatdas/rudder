@@ -1566,7 +1566,17 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
                 true,
             );
         }
-        OrchestratorPhase::PlanReady(tasks) => {
+        OrchestratorPhase::PlanReady(mut tasks) => {
+            // Fold in nodes the user RECONCILED into the plan after launch. They live
+            // only in `planned_nodes` (never in the orchestrator's frozen plan block),
+            // so without this they are invisible in the orchestrator DAG. The initial
+            // nodes share ids with `tasks`, so only post-launch additions get appended
+            // here, and the user sees a typed task show up in the DAG.
+            for node in &app.planned_nodes {
+                if !tasks.iter().any(|task| task.id == node.id) {
+                    tasks.push(node.to_task());
+                }
+            }
             // PINNED top region: the DAG tree + a live status line.
             let mut dag: Vec<Line<'static>> = Vec::new();
             let id_to_index: HashMap<&str, usize> = tasks
@@ -2072,6 +2082,8 @@ pub(crate) fn review_lines(app: &mut App, height: usize) -> Vec<Line<'static>> {
 pub(crate) fn task_default_hint(app: &App) -> &'static str {
     if app.awaiting_approval {
         "type to refine the plan  ·  Enter (empty) to approve & launch  ·  Option-1/2/3 or ^W pane"
+    } else if app.plan_is_active() {
+        "type a task to add it to the running plan (shows up in the orchestrator DAG)  ·  ^W pane"
     } else {
         "Enter to plan + run  ·  Up/Down history  ·  Option-1/2/3 or ^W pane"
     }
@@ -2269,11 +2281,7 @@ pub(crate) fn render_merge_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) 
             vec![
                 Line::from(Span::styled(summary, app_style())),
                 Line::from(Span::styled(
-                    if merge_strategy() == MergeStrategy::Rebase {
-                        "This will rebase the worktree first, then fast-forward merge. Rebase conflicts stay in the worktree."
-                    } else {
-                        "This will run git merge into the current branch."
-                    },
+                    "Rudder integrates this into your workspace and unblocks dependent nodes. A clean merge is mechanical (no AI); on conflict you can start an AI resolver or resolve it yourself.",
                     app_style(),
                 )),
                 merge_confirm_hint_line(),
@@ -2308,7 +2316,7 @@ pub(crate) fn render_merge_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) 
                 )),
                 Line::from(Span::styled(
                     if files.is_empty() {
-                        "Git did not report conflicted files.".to_string()
+                        "No conflicted files were reported.".to_string()
                     } else {
                         format!("Files: {files}")
                     },
