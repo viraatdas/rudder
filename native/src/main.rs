@@ -1252,12 +1252,33 @@ impl App {
                     self.refine_plan(&draft);
                 }
             }
+            // Editing in the chat draft, at full parity with the task pane so a
+            // follow-up can be edited mid-line: Option/Alt+Backspace deletes the
+            // previous word, Alt/Meta+arrows + Alt+b/f navigate by word, plus the
+            // emacs basics (Ctrl+A/E/K/U/W/D/H).
             KeyCode::Backspace => {
                 if let Some(run) = self.agents.get_mut(self.selected_agent) {
-                    delete_char_before_cursor(
-                        &mut run.worker_input_draft,
-                        &mut run.worker_input_cursor,
-                    );
+                    if key.modifiers.intersects(
+                        KeyModifiers::ALT
+                            | KeyModifiers::CONTROL
+                            | KeyModifiers::SUPER
+                            | KeyModifiers::META,
+                    ) {
+                        delete_previous_word_at(
+                            &mut run.worker_input_draft,
+                            &mut run.worker_input_cursor,
+                        );
+                    } else {
+                        delete_char_before_cursor(
+                            &mut run.worker_input_draft,
+                            &mut run.worker_input_cursor,
+                        );
+                    }
+                }
+            }
+            KeyCode::Delete => {
+                if let Some(run) = self.agents.get_mut(self.selected_agent) {
+                    delete_char_at_cursor(&mut run.worker_input_draft, run.worker_input_cursor);
                 }
             }
             KeyCode::Esc => {
@@ -1266,17 +1287,53 @@ impl App {
                     run.worker_input_cursor = 0;
                 }
             }
-            // Cursor editing in the chat draft, matching the task pane's basics so
-            // a follow-up can be edited mid-line, not just appended/backspaced.
             KeyCode::Left => {
                 if let Some(run) = self.agents.get_mut(self.selected_agent) {
-                    run.worker_input_cursor = run.worker_input_cursor.saturating_sub(1);
+                    if key
+                        .modifiers
+                        .intersects(KeyModifiers::ALT | KeyModifiers::META)
+                    {
+                        run.worker_input_cursor = previous_word_position(
+                            &run.worker_input_draft,
+                            run.worker_input_cursor,
+                        );
+                    } else {
+                        run.worker_input_cursor = run.worker_input_cursor.saturating_sub(1);
+                    }
                 }
             }
             KeyCode::Right => {
                 if let Some(run) = self.agents.get_mut(self.selected_agent) {
-                    let len = run.worker_input_draft.chars().count();
-                    run.worker_input_cursor = (run.worker_input_cursor + 1).min(len);
+                    if key
+                        .modifiers
+                        .intersects(KeyModifiers::ALT | KeyModifiers::META)
+                    {
+                        run.worker_input_cursor =
+                            next_word_position(&run.worker_input_draft, run.worker_input_cursor);
+                    } else {
+                        let len = run.worker_input_draft.chars().count();
+                        run.worker_input_cursor = (run.worker_input_cursor + 1).min(len);
+                    }
+                }
+            }
+            KeyCode::Char('b') | KeyCode::Char('B')
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::ALT | KeyModifiers::META) =>
+            {
+                if let Some(run) = self.agents.get_mut(self.selected_agent) {
+                    run.worker_input_cursor =
+                        previous_word_position(&run.worker_input_draft, run.worker_input_cursor);
+                }
+            }
+            KeyCode::Char('f') | KeyCode::Char('F')
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::ALT | KeyModifiers::META) =>
+            {
+                if let Some(run) = self.agents.get_mut(self.selected_agent) {
+                    run.worker_input_cursor =
+                        next_word_position(&run.worker_input_draft, run.worker_input_cursor);
                 }
             }
             KeyCode::Home => {
@@ -1308,6 +1365,24 @@ impl App {
             KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if let Some(run) = self.agents.get_mut(self.selected_agent) {
                     delete_previous_word_at(
+                        &mut run.worker_input_draft,
+                        &mut run.worker_input_cursor,
+                    );
+                }
+            }
+            KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(run) = self.agents.get_mut(self.selected_agent) {
+                    truncate_at_cursor(&mut run.worker_input_draft, run.worker_input_cursor);
+                }
+            }
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(run) = self.agents.get_mut(self.selected_agent) {
+                    delete_char_at_cursor(&mut run.worker_input_draft, run.worker_input_cursor);
+                }
+            }
+            KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(run) = self.agents.get_mut(self.selected_agent) {
+                    delete_char_before_cursor(
                         &mut run.worker_input_draft,
                         &mut run.worker_input_cursor,
                     );

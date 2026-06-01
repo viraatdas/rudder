@@ -2494,6 +2494,50 @@ branch refs/heads/main\n";
     }
 
     #[test]
+    fn orchestrator_chat_word_editing_keys() {
+        let mut app = App::new();
+        let mut orch = test_agent_run("orch", "build a feature");
+        orch.mode = AgentMode::RudderPlan;
+        orch.worker_input_draft = "use python instead".to_string();
+        orch.worker_input_cursor = "use python instead".chars().count();
+        app.agents = vec![orch];
+        app.selected_agent = 0;
+
+        // Option/Alt+Backspace deletes the previous word ("instead").
+        app.handle_orchestrator_chat_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT));
+        assert_eq!(app.agents[0].worker_input_draft, "use python ");
+        assert_eq!(app.agents[0].worker_input_cursor, "use python ".chars().count());
+
+        // Alt+Left jumps back over a word ("python "), then Alt+Backspace removes it.
+        app.handle_orchestrator_chat_key(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT));
+        assert_eq!(app.agents[0].worker_input_cursor, "use ".chars().count());
+        app.handle_orchestrator_chat_key(KeyEvent::new(
+            KeyCode::Char('b'),
+            KeyModifiers::ALT,
+        ));
+        assert_eq!(app.agents[0].worker_input_cursor, 0);
+
+        // Ctrl+K truncates from the cursor to the end of the line.
+        app.handle_orchestrator_chat_key(KeyEvent::new(KeyCode::End, KeyModifiers::empty()));
+        app.handle_orchestrator_chat_key(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT));
+        app.handle_orchestrator_chat_key(KeyEvent::new(
+            KeyCode::Char('k'),
+            KeyModifiers::CONTROL,
+        ));
+        assert_eq!(app.agents[0].worker_input_draft, "use ");
+
+        // Ctrl+D deletes the char at the cursor; Delete does the same.
+        app.handle_orchestrator_chat_key(KeyEvent::new(KeyCode::Home, KeyModifiers::empty()));
+        app.handle_orchestrator_chat_key(KeyEvent::new(
+            KeyCode::Char('d'),
+            KeyModifiers::CONTROL,
+        ));
+        assert_eq!(app.agents[0].worker_input_draft, "se ");
+        app.handle_orchestrator_chat_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::empty()));
+        assert_eq!(app.agents[0].worker_input_draft, "e ");
+    }
+
+    #[test]
     fn orchestrator_chat_renders_cursor_block() {
         let mut app = App::new();
         app.focus = FocusPane::Worker;
