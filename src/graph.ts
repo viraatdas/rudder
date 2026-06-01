@@ -107,6 +107,7 @@ export type MirrorDep = { on: string; type: DepType };
 export type MirrorNode = {
   id: string;
   title: string;
+  prompt?: string;
   status: string;
   runId?: string;
   jjChangeId?: string;
@@ -168,8 +169,10 @@ function mirrorEdgeId(from: string, to: string, type: EdgeType): string {
  * payload (mapping TUI status -> NodeStatus), rebuilds each node's incoming edges
  * from its deps, and PRUNES any graph node/edge no longer present in the payload
  * so the mirror exactly reflects the current TUI plan (not an append-only log).
- * Pure (no IO): callers wrap it in updateGraph. Existing prompt/source/createdAt
- * are preserved on upsert; everything else is overwritten from the payload.
+ * Pure (no IO): callers wrap it in updateGraph. The prompt is taken from the
+ * payload when present (so a re-plan that reuses a node id cannot leave a stale
+ * prompt from the previous plan); source/createdAt are preserved on upsert;
+ * everything else is overwritten from the payload.
  */
 export function mirrorPlanIntoGraph(graph: RudderGraph, payload: MirrorPayload): RudderGraph {
   const inNodes = Array.isArray(payload.nodes) ? payload.nodes : [];
@@ -200,10 +203,16 @@ export function mirrorPlanIntoGraph(graph: RudderGraph, payload: MirrorPayload):
 
     const existing = graph.nodes[incoming.id];
     const effort = mirrorEffort(incoming.effort);
+    // Prompt comes from the payload when it carries one, so a re-plan that reuses
+    // this id overwrites the previous plan's prompt instead of keeping it stale.
+    const prompt =
+      typeof incoming.prompt === "string" && incoming.prompt.trim()
+        ? incoming.prompt
+        : existing?.prompt ?? title;
     graph.nodes[incoming.id] = {
       id: incoming.id,
       title,
-      prompt: existing?.prompt ?? title,
+      prompt,
       backend: mirrorBackend(incoming.backend),
       ...(incoming.model ? { model: incoming.model } : {}),
       ...(effort ? { effort } : {}),

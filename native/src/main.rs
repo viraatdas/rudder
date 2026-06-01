@@ -4883,6 +4883,7 @@ impl App {
             let mut value = serde_json::json!({
                 "id": node.id,
                 "title": node.title,
+                "prompt": node.prompt,
                 "status": "planned",
                 "deps": deps,
             });
@@ -4925,9 +4926,18 @@ impl App {
             } else {
                 run.task_summary.clone()
             };
+            // Carry the node's actual prompt so graph.json never shows a stale prompt
+            // from an earlier plan that reused this node id. Prefer the launched
+            // prompt; fall back to the title.
+            let prompt = if run.current_prompt.trim().is_empty() {
+                title.clone()
+            } else {
+                run.current_prompt.clone()
+            };
             let mut value = serde_json::json!({
                 "id": node_id,
                 "title": title,
+                "prompt": prompt,
                 "status": status,
                 "runId": run.id,
                 "backend": run.backend.as_str(),

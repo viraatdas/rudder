@@ -540,6 +540,42 @@ test("mirrorPlanIntoGraph preserves prompt/source/createdAt across re-mirror", (
   assert.equal(g.nodes.n0.status, "review");
 });
 
+test("mirrorPlanIntoGraph OVERWRITES a stale prompt when the new payload carries one", () => {
+  // Reproduces the my-charts symptom: a node id reused by a later, different plan
+  // kept the previous plan's prompt. The payload now carries the prompt, so it wins.
+  let g = emptyGraph();
+  g.nodes.n1 = {
+    id: "n1",
+    title: "Chart ranking",
+    prompt: "Chart ranking + cross-period dedup logic",
+    backend: "claude",
+    status: "planned",
+    deps: [],
+    source: "planner",
+    createdAt: "2020-01-01T00:00:00.000Z",
+    updatedAt: "2020-01-01T00:00:00.000Z",
+  };
+  g = mirrorPlanIntoGraph(g, {
+    nodes: [
+      {
+        id: "n1",
+        title: "Implement js/auth.js (browser-only PKCE)",
+        prompt: "Implement js/auth.js with PKCE",
+        status: "planned",
+      },
+    ],
+  });
+  assert.equal(g.nodes.n1.title, "Implement js/auth.js (browser-only PKCE)");
+  assert.equal(
+    g.nodes.n1.prompt,
+    "Implement js/auth.js with PKCE",
+    "stale prompt overwritten by the new plan",
+  );
+  // createdAt/source still preserved on upsert (cosmetic identity).
+  assert.equal(g.nodes.n1.createdAt, "2020-01-01T00:00:00.000Z");
+  assert.equal(g.nodes.n1.source, "planner");
+});
+
 test("mirrorPlanIntoGraph on an empty payload clears the whole graph", () => {
   let g = mirrorPlanIntoGraph(emptyGraph(), { nodes: [{ id: "n0", title: "a", status: "running" }] });
   assert.equal(Object.keys(g.nodes).length, 1);
