@@ -1739,7 +1739,7 @@ fn push_transcript_lines(out: &mut Vec<Line<'static>>, transcript: &[PlanEntry],
         let (prefix, style) = match entry.kind {
             PlanEntryKind::Thinking => ("· ", muted_style(focused).add_modifier(Modifier::ITALIC)),
             PlanEntryKind::Tool => ("  ", muted_style(focused)),
-            PlanEntryKind::Result | PlanEntryKind::System => ("", muted_style(focused)),
+            PlanEntryKind::System => ("", muted_style(focused)),
             PlanEntryKind::UserTurn => (
                 "you: ",
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),

@@ -23,8 +23,6 @@ pub(crate) enum PlanEntryKind {
     Text,
     /// A tool/inspection step, e.g. "Reading mathutils.py", "Grep TODO".
     Tool,
-    /// A terminal result / status line.
-    Result,
     /// System/init or a backend error line.
     System,
     /// A user follow-up turn the human typed into the orchestrator chat.
@@ -57,13 +55,6 @@ pub(crate) struct PlanStreamState {
     parse_baseline: usize,
     /// Bytes of the latest snapshot already split into complete lines.
     consumed: usize,
-    /// JSON line tally, used to decide whether the stream is JSON at all.
-    json_ok: usize,
-    json_fail: usize,
-    /// Once true, we stop appending raw non-JSON lines to the transcript (the
-    /// stream is structured). Until decided, raw lines show so the pane is never
-    /// blank if a backend ignored the JSON flag.
-    decided_json: bool,
 }
 
 const MAX_TRANSCRIPT: usize = 400;
@@ -84,9 +75,6 @@ impl PlanStreamState {
             saw_streaming_text: false,
             parse_baseline: 0,
             consumed: 0,
-            json_ok: 0,
-            json_fail: 0,
-            decided_json: false,
         }
     }
 
@@ -163,39 +151,32 @@ impl PlanStreamState {
     }
 
     fn ingest_line(&mut self, raw: &str) {
-        let trimmed = raw.trim_end_matches('\r').trim();
-        if trimmed.is_empty() {
-            return;
-        }
-        // A JSON event line starts with '{'. Otherwise it may be an ANSI/OSC-wrapped
-        // event or plain noise; strip control sequences and retry.
-        let candidate = if trimmed.starts_with('{') {
-            trimmed.to_string()
-        } else {
-            let stripped = strip_ansi_for_plan(trimmed);
-            let stripped = stripped.trim();
-            if stripped.starts_with('{') {
-                stripped.to_string()
-            } else {
-                // Non-JSON line. Until we have decided the stream is JSON, surface it
-                // so the pane is never blank; afterwards, drop noise (e.g. stderr).
-                if !self.decided_json && !stripped.is_empty() {
-                    self.push(PlanEntryKind::System, stripped);
-                }
-                return;
+        // A single newline-delimited chunk can carry several CARRIAGE-RETURN-separated
+        // terminal redraws (codex/claude print a status bar like "12s · 432 tokens"
+        // that repaints in place) followed by a real JSON event. Split on '\r' and
+        // ONLY ever act on a segment that parses as a JSON object. Terminal chrome is
+        // dropped, never shown as transcript — that is what keeps the pane clean.
+        for segment in raw.split('\r') {
+            let trimmed = segment.trim();
+            if trimmed.is_empty() {
+                continue;
             }
-        };
-        match serde_json::from_str::<Value>(&candidate) {
-            Ok(value) => {
-                self.json_ok += 1;
-                if self.json_ok >= 2 {
-                    self.decided_json = true;
+            let candidate = if trimmed.starts_with('{') {
+                trimmed.to_string()
+            } else {
+                let stripped = strip_ansi_for_plan(trimmed);
+                let stripped = stripped.trim();
+                // The JSON event may sit after a chrome prefix on the same segment;
+                // start at the first brace. Pure chrome (no brace) is dropped.
+                match stripped.find('{') {
+                    Some(brace) => stripped[brace..].to_string(),
+                    None => continue,
                 }
+            };
+            if let Ok(value) = serde_json::from_str::<Value>(&candidate) {
                 self.dispatch(&value);
             }
-            Err(_) => {
-                self.json_fail += 1;
-            }
+            // Non-JSON segments are intentionally dropped (no raw fallback).
         }
     }
 

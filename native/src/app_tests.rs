@@ -3999,6 +3999,27 @@ branch refs/heads/main\n";
         assert_eq!(s.assistant_text(), "plan text");
     }
 
+    #[test]
+    fn plan_stream_drops_terminal_chrome_redraws() {
+        // Codex/claude print a status bar that repaints in place with \r ("12s · 432
+        // tokens · thinking..."), interleaved with JSON events on the same \n-chunk.
+        // Only the JSON text must render; the chrome must be dropped entirely.
+        let mut s = PlanStreamState::new();
+        let mut buf = String::new();
+        buf.push_str("9 · thinking with medium effort\r30 · thinking with medium effort\r");
+        buf.push_str(&text_delta_line("the real plan text"));
+        s.ingest(&buf);
+        assert_eq!(s.assistant_text(), "the real plan text", "chrome excluded from text");
+        assert!(
+            !s.transcript().iter().any(|e| e.text.contains("thinking with medium effort")),
+            "status-bar chrome must not render as transcript"
+        );
+        assert!(
+            s.transcript().iter().any(|e| e.text.contains("the real plan text")),
+            "the real plan text renders"
+        );
+    }
+
     // --- Orchestrator view: pinned row + spinner/DAG worker pane -------------
 
     #[test]
