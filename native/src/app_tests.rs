@@ -2494,6 +2494,28 @@ branch refs/heads/main\n";
     }
 
     #[test]
+    fn planning_redraw_gate_tracks_running_not_parse_state() {
+        // The spinner animation depends on this gate forcing a per-tick redraw. It
+        // must stay true for the whole time the planner is alive, regardless of
+        // whether a plan block has parsed yet (the old is_err() gate froze the
+        // spinner the moment a present-but-empty block appeared).
+        let mut app = App::new();
+        let mut orch = test_agent_run("orch", "build a feature");
+        orch.mode = AgentMode::RudderPlan;
+        orch.status = AgentStatus::Running;
+        app.agents = vec![orch];
+        assert!(app.has_planning_orchestrator(), "running planner animates");
+
+        // Planner finished -> nothing is spinning, so the gate releases.
+        app.agents[0].status = AgentStatus::Done;
+        assert!(!app.has_planning_orchestrator(), "done planner does not animate");
+
+        // A refine in flight keeps redraws coming even between status snapshots.
+        app.refining = true;
+        assert!(app.has_planning_orchestrator(), "refining animates");
+    }
+
+    #[test]
     fn orchestrator_chat_word_editing_keys() {
         let mut app = App::new();
         let mut orch = test_agent_run("orch", "build a feature");

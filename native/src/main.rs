@@ -773,15 +773,24 @@ impl App {
         SPINNER_FRAMES[self.spinner_frame % SPINNER_FRAMES.len()]
     }
 
-    /// True when at least one pinned orchestrator (a RudderPlan agent) is still
-    /// running AND has not yet produced a parseable plan block. While this holds,
-    /// the spinner must keep animating, so the render loop redraws on every tick.
+    /// True while an orchestrator (a RudderPlan agent) is actively working: its
+    /// planner process is Running, or a refine is in flight. While this holds the
+    /// pane shows the "decomposing…/refining…" spinner, so the render loop must
+    /// redraw on every tick to animate it.
+    ///
+    /// This deliberately keys off the planner being ALIVE, NOT off whether a plan
+    /// block has parsed yet. Tying it to `extract_rudder_plan_tasks(...).is_err()`
+    /// silently diverged from `orchestrator_phase` (which is what actually decides
+    /// to draw the spinner): a present-but-empty task block parses to `Ok(empty)`,
+    /// so the pane shows Planning while `.is_err()` was false — no redraw fired and
+    /// the spinner froze, only advancing a frame per input event. Running-or-refining
+    /// can never diverge that way.
     pub(crate) fn has_planning_orchestrator(&self) -> bool {
-        self.agents.iter().any(|run| {
-            run.mode == AgentMode::RudderPlan
-                && run.status == AgentStatus::Running
-                && extract_rudder_plan_tasks(&rudder_plan_output_for_run(run)).is_err()
-        })
+        self.refining
+            || self
+                .agents
+                .iter()
+                .any(|run| run.mode == AgentMode::RudderPlan && run.status == AgentStatus::Running)
     }
 
     fn cached_diff_summary(&mut self, id: &str, cwd: &Path) -> Option<String> {
