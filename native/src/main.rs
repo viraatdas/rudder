@@ -4572,6 +4572,24 @@ impl App {
         if run.mode != AgentMode::RudderPlan || !run.autosteered {
             return;
         }
+        // The planner process just exited; its FINAL stdout (the rest of the human
+        // summary and the authoritative `result` event) can still be buffered in the
+        // PTY and not yet ingested, which truncated the captured summary mid-sentence.
+        // Pull everything still buffered and ingest it before snapshotting. Cheap and
+        // non-blocking; the orchestrator pane also re-extracts the summary live, so
+        // this is immediacy on top of that safeguard.
+        if let Some(terminal) = run.terminal.as_mut() {
+            for _ in 0..64 {
+                let had = !terminal.drain_output().is_empty();
+                let snapshot = terminal.output_log_snapshot().to_string();
+                if let Some(stream) = run.plan_stream.as_mut() {
+                    stream.ingest(&snapshot);
+                }
+                if !had {
+                    break;
+                }
+            }
+        }
         let planner_task = run.task.clone();
         let output = rudder_plan_output_for_run(run);
 

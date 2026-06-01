@@ -1646,9 +1646,13 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
             // there is always a readable plan beneath the tree.
             let mut prose: Vec<Line<'static>> = Vec::new();
             prose.push(Line::from(Span::styled("Plan", header_style(focused))));
-            let summary = app
-                .plan_summary
-                .as_ref()
+            // Re-extract the summary from the LIVE planner text every frame, not the
+            // frozen app.plan_summary captured at exit-detection: the planner's final
+            // bytes (the rest of the summary) often arrive a tick or two AFTER it is
+            // marked done, so a one-shot capture truncated it mid-sentence. Reading
+            // live lets the prose self-heal as the post-exit drain ingests the tail.
+            let summary = extract_rudder_plan_summary(&rudder_plan_output_for_run(agent))
+                .or_else(|| app.plan_summary.clone())
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty());
             if let Some(summary) = summary {

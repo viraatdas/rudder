@@ -4507,6 +4507,29 @@ branch refs/heads/main\n";
     }
 
     #[test]
+    fn orchestrator_prose_reads_live_summary_when_frozen_is_empty() {
+        // The truncation bug: app.plan_summary was captured once at exit-detection,
+        // before the planner's tail drained. The prose must re-extract from the LIVE
+        // plan_stream so it shows the full summary even when the frozen copy is empty.
+        let mut app = App::new();
+        app.focus = FocusPane::Worker;
+        let mut orch = test_agent_run("orch", "build");
+        orch.mode = AgentMode::RudderPlan;
+        let mut stream = PlanStreamState::new();
+        stream.ingest("{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"RUDDER_PLAN_TASKS_START {\\\"tasks\\\":[{\\\"id\\\":\\\"n0\\\",\\\"title\\\":\\\"scaffold\\\",\\\"prompt\\\":\\\"p\\\",\\\"goal\\\":\\\"g\\\",\\\"success\\\":\\\"s\\\",\\\"deps\\\":[]}]} RUDDER_PLAN_TASKS_END\\nThis DAG is safe because config is frozen.\"}}}\n");
+        orch.plan_stream = Some(stream);
+        app.agents = vec![orch];
+        app.selected_agent = 0;
+        app.plan_summary = None; // not captured yet -> must read live
+
+        let text = render_worker_text(&mut app, 80, 24);
+        assert!(
+            text.contains("DAG is safe because config is frozen"),
+            "prose reads the live summary: {text}"
+        );
+    }
+
+    #[test]
     fn render_worker_shows_live_transcript_while_planning() {
         let mut app = App::new();
         app.focus = FocusPane::Worker;
