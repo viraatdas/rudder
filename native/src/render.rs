@@ -2325,83 +2325,83 @@ pub(crate) fn render_suggestions(frame: &mut Frame<'_>, task_area: Rect, app: &A
 }
 
 pub(crate) fn render_merge_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let (title, lines, border_color) = if let Some(confirm) = &app.merge_confirm {
-        let summary = match &confirm.intent {
-            MergeIntent::Selected { task, .. } => {
-                format!("Merge selected worktree: {}", short_task(task))
-            }
-            MergeIntent::All { ids } => format!(
-                "Merge {} completed worktree{}",
-                ids.len(),
-                if ids.len() == 1 { "" } else { "s" }
-            ),
-        };
-        (
-            " confirm merge ",
-            vec![
-                Line::from(Span::styled(summary, app_style())),
-                Line::from(Span::styled(
-                    "Rudder integrates this into your workspace and unblocks dependent nodes. A clean merge is mechanical (no AI); on conflict you can start an AI resolver or resolve it yourself.",
-                    app_style(),
-                )),
-                merge_confirm_hint_line(),
-            ],
-            RUNNING_COLOR,
-        )
-    } else if let Some(prompt) = &app.conflict_prompt {
-        let files = prompt.conflicted_files.join(", ");
-        let operation_label = if prompt.operation == ConflictOperation::Rebase {
-            "Rebase"
-        } else {
-            "Merge"
-        };
-        (
-            if prompt.operation == ConflictOperation::Rebase {
-                " rebase conflict "
+    let (title, lines, border_color): (Span<'static>, Vec<Line<'static>>, Color) =
+        if let Some(confirm) = &app.merge_confirm {
+            let headline = match &confirm.intent {
+                MergeIntent::Selected { task, .. } => format!("Merge:  {}", short_task(task)),
+                MergeIntent::All { ids } => format!(
+                    "Merge {} completed worktree{}",
+                    ids.len(),
+                    if ids.len() == 1 { "" } else { "s" }
+                ),
+            };
+            (
+                Span::styled(" Confirm merge ", Style::default().fg(ACCENT)),
+                vec![
+                    Line::from(Span::styled(headline, app_style())),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "Dependent nodes unblock once it lands. A clean merge is mechanical (no AI); on conflict you can launch an AI resolver or resolve it yourself.",
+                        muted_style(true),
+                    )),
+                    Line::from(""),
+                    merge_confirm_hint_line(),
+                ],
+                ACCENT,
+            )
+        } else if let Some(prompt) = &app.conflict_prompt {
+            let operation_label = if prompt.operation == ConflictOperation::Rebase {
+                "Rebase"
             } else {
-                " merge conflict "
-            },
-            vec![
+                "Merge"
+            };
+            let count = prompt.conflicted_files.len();
+            let mut lines = vec![
                 Line::from(Span::styled(
                     format!(
-                        "{operation_label} stopped with {} conflicted file{}.",
-                        prompt.conflicted_files.len(),
-                        if prompt.conflicted_files.len() == 1 {
-                            ""
-                        } else {
-                            "s"
-                        }
+                        "{operation_label} stopped on {count} conflicted file{}.",
+                        if count == 1 { "" } else { "s" }
                     ),
-                    app_style(),
+                    Style::default().fg(FAILED_COLOR),
                 )),
-                Line::from(Span::styled(
-                    if files.is_empty() {
-                        "No conflicted files were reported.".to_string()
+                Line::from(""),
+            ];
+            if prompt.conflicted_files.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "No specific files were reported.",
+                    muted_style(true),
+                )));
+            } else {
+                for file in &prompt.conflicted_files {
+                    lines.push(Line::from(vec![
+                        Span::styled("   • ", muted_style(true)),
+                        Span::styled(file.clone(), app_style()),
+                    ]));
+                }
+            }
+            lines.push(Line::from(""));
+            lines.push(conflict_resolve_hint_line());
+            (
+                Span::styled(
+                    if prompt.operation == ConflictOperation::Rebase {
+                        " Rebase conflict "
                     } else {
-                        format!("Files: {files}")
+                        " Merge conflict "
                     },
-                    app_style(),
-                )),
-                Line::from(Span::styled(
-                    "Press y to start an AI resolver, n to handle manually, Esc to cancel.",
-                    app_style(),
-                )),
-            ],
-            FAILED_COLOR,
-        )
-    } else {
-        return;
-    };
+                    Style::default().fg(FAILED_COLOR),
+                ),
+                lines,
+                FAILED_COLOR,
+            )
+        } else {
+            return;
+        };
 
-    let modal = centered_modal(area, 74, (lines.len() as u16).saturating_add(2));
+    let modal = centered_modal(area, 76, (lines.len() as u16).saturating_add(2));
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
-        .border_style(
-            Style::default()
-                .fg(border_color)
-                ,
-        )
+        .border_style(Style::default().fg(border_color))
         .style(app_style());
     let paragraph = Paragraph::new(lines)
         .style(app_style())
@@ -2483,14 +2483,22 @@ pub(crate) fn render_cloud_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) 
 
 pub(crate) fn merge_confirm_hint_line() -> Line<'static> {
     Line::from(vec![
-        Span::styled("Press ", app_style()),
-        Span::styled(
-            "y to merge",
-            Style::default()
-                .fg(FAILED_COLOR)
-                ,
-        ),
-        Span::styled(", n or Esc to cancel.", app_style()),
+        Span::styled("Press ", muted_style(true)),
+        Span::styled("y", accent_style(true)),
+        Span::styled(" to merge  ·  n or Esc to cancel", muted_style(true)),
+    ])
+}
+
+/// Hint for the conflict modal: the keys are color-emphasized (teal), the rest muted,
+/// matching the thin theme (emphasis by color, not weight) and the "·"-separated style
+/// used in the orchestrator pane.
+pub(crate) fn conflict_resolve_hint_line() -> Line<'static> {
+    Line::from(vec![
+        Span::styled("Press ", muted_style(true)),
+        Span::styled("y", accent_style(true)),
+        Span::styled(" for an AI resolver  ·  ", muted_style(true)),
+        Span::styled("n", accent_style(true)),
+        Span::styled(" to resolve it yourself  ·  Esc to cancel", muted_style(true)),
     ])
 }
 

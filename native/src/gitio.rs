@@ -1098,6 +1098,30 @@ pub(crate) fn jj_touched_files(cwd: &Path) -> Vec<String> {
         .collect()
 }
 
+/// The worker's working-copy diff as git-format text, capped to `max_chars` (the caller
+/// bounds the summarizer prompt). Used by the completion-note backstop to reconstruct a
+/// report for an agent that finished without filing one. Empty on any failure.
+pub(crate) fn jj_diff_text(cwd: &Path, max_chars: usize) -> String {
+    let Ok(output) = Command::new("jj")
+        .args(["diff", "--no-pager", "--git"])
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .output()
+    else {
+        return String::new();
+    };
+    if !output.status.success() {
+        return String::new();
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    if text.chars().count() > max_chars {
+        let head: String = text.chars().take(max_chars).collect();
+        format!("{head}\n...(diff truncated)...")
+    } else {
+        text.into_owned()
+    }
+}
+
 pub(crate) fn jj_unresolved_conflicts(cwd: &Path) -> Vec<String> {
     let Ok(output) = Command::new("jj")
         .args(["resolve", "--list"])

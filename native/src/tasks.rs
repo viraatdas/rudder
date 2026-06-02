@@ -961,6 +961,73 @@ pub(crate) fn spawn_task_summary_worker(tx: mpsc::Sender<TaskSummaryResult>, run
     });
 }
 
+/// Build the prompt for the completion-note BACKSTOP: a finished worker filed no `rudder
+/// done` report, so a cheap one-shot summarizer reconstructs the note from the task + the
+/// worker's diff. Asks for the same CompletionNote shape `rudder done` records.
+pub(crate) fn build_completion_summary_prompt(task: &str, diff: &str) -> String {
+    let task = normalize_task_text(task);
+    let diff = if diff.trim().is_empty() {
+        "(no file changes detected)"
+    } else {
+        diff
+    };
+    format!(
+        "A coding agent finished the task below but did not file a structured report. From its TASK and the DIFF of what it changed, reconstruct a completion note. Return EXACTLY one JSON object and NO markdown:\n\
+{{\"summary\":\"1-2 sentence plain summary of what was done\",\"interfaces\":\"key files/types/functions it added or changed\",\"followups\":[{{\"title\":\"short imperative task\",\"why\":\"why it follows\",\"scope\":\"in\"}}]}}\n\
+Only include follow-ups clearly implied by the work (e.g. tests for new code, wiring a new-but-unused function, a TODO it left). If none are obvious, use an empty followups array. Use scope \"in\" for same-area work and \"out\" otherwise. Do not invent unrelated work.\n\n\
+TASK:\n{task}\n\nDIFF:\n{diff}"
+    )
+}
+
+/// Parse the backstop summarizer's stdout into a CompletionNote JSON value (the same
+/// shape `parse_worker_done_block` yields), tolerant of surrounding prose/markdown.
+pub(crate) fn completion_note_from_summary_output(output: &str) -> Option<serde_json::Value> {
+    let trimmed = output.trim();
+    let start = trimmed.find('{')?;
+    let end = trimmed.rfind('}')?;
+    if end < start {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(&trimmed[start..=end]).ok()?;
+    value.is_object().then_some(value)
+}
+
+/// Spawn the completion-note BACKSTOP off-thread: a one-shot haiku summarizer over the
+/// worker's diff, sending the reconstructed note back over `tx`. Mirrors
+/// `spawn_task_summary_worker`. ALWAYS sends a result (note `None` on any failure) so the
+/// caller clears its pending flag and never re-spawns for the same run.
+pub(crate) fn spawn_completion_summary_worker(
+    tx: mpsc::Sender<CompletionSummaryResult>,
+    run_id: String,
+    node_id: String,
+    task: String,
+    diff: String,
+) {
+    thread::spawn(move || {
+        let note = generate_completion_summary(&task, &diff);
+        let _ = tx.send(CompletionSummaryResult {
+            run_id,
+            node_id,
+            note,
+        });
+    });
+}
+
+fn generate_completion_summary(task: &str, diff: &str) -> Option<serde_json::Value> {
+    let prompt = build_completion_summary_prompt(task, diff);
+    let output = Command::new("claude")
+        .args(["-p", &prompt, "--model", TASK_SUMMARY_MODEL])
+        .env("CLAUDE_CODE_NO_FLICKER", "0")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    completion_note_from_summary_output(&String::from_utf8_lossy(&output.stdout))
+}
+
 pub(crate) fn generate_task_summary_title(task: &str) -> Option<String> {
     let task = normalize_task_text(task);
     if task.is_empty() {

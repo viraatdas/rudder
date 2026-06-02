@@ -3028,11 +3028,67 @@ branch refs/heads/main\n";
             .map(|span| span.content.as_ref())
             .collect::<String>();
 
-        assert_eq!(text, "Press y to merge, n or Esc to cancel.");
+        assert_eq!(text, "Press y to merge  ·  n or Esc to cancel");
         assert_eq!(line.spans.len(), 3);
-        assert_eq!(line.spans[1].style.fg, Some(FAILED_COLOR));
+        // The action key is color-emphasized in the focus accent (teal), not red.
+        assert_eq!(line.spans[1].content.as_ref(), "y");
+        assert_eq!(line.spans[1].style.fg, Some(ACCENT));
         // Thin theme: emphasis is by color, not weight.
         assert!(!line.spans[1].style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn conflict_hint_color_emphasizes_keys_not_weight() {
+        let line = conflict_resolve_hint_line();
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(
+            text,
+            "Press y for an AI resolver  ·  n to resolve it yourself  ·  Esc to cancel"
+        );
+        assert_eq!(line.spans[1].content.as_ref(), "y");
+        assert_eq!(line.spans[1].style.fg, Some(ACCENT));
+        assert_eq!(line.spans[3].content.as_ref(), "n");
+        assert_eq!(line.spans[3].style.fg, Some(ACCENT));
+        assert!(
+            line.spans.iter().all(|s| !s.style.add_modifier.contains(Modifier::BOLD)),
+            "emphasis is by color, not weight"
+        );
+    }
+
+    #[test]
+    fn render_merge_conflict_modal_lists_files_and_hint() {
+        let mut app = App::new();
+        app.conflict_prompt = Some(MergeConflictPrompt {
+            operation: ConflictOperation::Merge,
+            task: "build auth".to_string(),
+            conflicted_files: vec!["src/auth.rs".to_string(), "src/router.rs".to_string()],
+            error: "conflict".to_string(),
+            repo_root: std::env::temp_dir(),
+            target_branch: None,
+            source_branch: None,
+            worktree_path: None,
+            agent_id: None,
+        });
+
+        let area = Rect::new(0, 0, 80, 16);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 16)).expect("test backend");
+        terminal
+            .draw(|frame| render_merge_prompt(frame, area, &app))
+            .expect("draw merge prompt");
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+
+        assert!(text.contains("Merge conflict"), "modal is titled");
+        assert!(text.contains("2 conflicted files"), "headline counts the files");
+        assert!(text.contains("src/auth.rs") && text.contains("src/router.rs"), "every file is listed");
+        assert!(text.contains("\u{2022}"), "files render as bullets");
+        assert!(text.contains("AI resolver"), "the action hint is shown");
     }
 
     #[test]
@@ -5700,6 +5756,78 @@ branch refs/heads/main\n";
         assert_eq!(app.planned_nodes[0].title, "add docs");
         assert!(app.followups_ingested.contains("n0"), "the worker is marked ingested once");
         let _ = fs::remove_dir_all(&repo);
+    }
+
+    // ---- backstop summarizer (silent agents) ------------------------------------
+
+    #[test]
+    fn completion_summary_prompt_carries_task_and_diff() {
+        let prompt = build_completion_summary_prompt("wire up auth", "diff --git a/auth.rs b/auth.rs");
+        assert!(prompt.contains("wire up auth"), "the task is included");
+        assert!(prompt.contains("auth.rs"), "the diff is included");
+        assert!(prompt.contains("\"followups\""), "asks for the CompletionNote shape");
+        // An empty diff is labeled rather than left blank.
+        assert!(build_completion_summary_prompt("x", "   ").contains("no file changes detected"));
+    }
+
+    #[test]
+    fn completion_note_parser_extracts_json_amid_prose() {
+        let out = "Here is the note:\n```json\n{\"summary\":\"did x\",\"followups\":[{\"title\":\"add tests\",\"scope\":\"in\"}]}\n```\nDone.";
+        let note = completion_note_from_summary_output(out).expect("parsed a note");
+        assert_eq!(note.get("summary").and_then(|v| v.as_str()), Some("did x"));
+        assert!(completion_note_from_summary_output("no json here at all").is_none());
+        assert!(completion_note_from_summary_output("}{ broken").is_none());
+    }
+
+    #[test]
+    fn backstop_result_grows_dag_via_poll() {
+        // The summarizer ran off-thread and returned a reconstructed note; poll applies it
+        // exactly like a real `rudder done` report would.
+        let mut app = App::new();
+        app.cwd = std::env::temp_dir();
+        app.awaiting_approval = true; // hold scheduling; assert the DAG grew
+        let mut worker = node_agent("n0", AgentStatus::Done); // run.id == node_id == "n0"
+        worker.mode = AgentMode::Execute;
+        app.agents = vec![worker];
+        app.completion_summary_pending.insert("n0".to_string());
+
+        app.completion_summary_tx
+            .send(CompletionSummaryResult {
+                run_id: "n0".to_string(),
+                node_id: "n0".to_string(),
+                note: Some(serde_json::json!({
+                    "summary": "implemented it",
+                    "followups": [{ "title": "add tests", "scope": "in" }]
+                })),
+            })
+            .unwrap();
+
+        app.poll_completion_summary_workers();
+
+        assert!(!app.completion_summary_pending.contains("n0"), "pending cleared");
+        assert!(app.followups_ingested.contains("n0"), "marked ingested (never re-summarized)");
+        assert_eq!(app.planned_nodes.len(), 1, "the reconstructed note grew the DAG");
+        assert_eq!(app.planned_nodes[0].title, "add tests");
+    }
+
+    #[test]
+    fn ingest_without_note_or_node_id_does_not_spawn_backstop() {
+        // A Done worker carrying NO node id (a manual run, not a plan node) has nothing to
+        // attach follow-ups to: mark it handled, never spawn a summarizer (which would
+        // shell out to claude). Keeps the test suite hermetic.
+        let mut app = App::new();
+        app.cwd = std::env::temp_dir();
+        let mut worker = test_agent_run("manual", "did stuff");
+        worker.mode = AgentMode::Execute;
+        worker.status = AgentStatus::Done;
+        worker.node_id = None;
+        worker.terminal = None;
+        app.agents = vec![worker];
+
+        let grew = app.ingest_worker_followups(0);
+        assert!(!grew);
+        assert!(app.followups_ingested.contains("manual"), "marked handled");
+        assert!(app.completion_summary_pending.is_empty(), "no backstop without a node id");
     }
 
     // ---- LIVE conductor simulation (opt-in) -------------------------------------

@@ -399,6 +399,12 @@ struct App {
     workspace_idle_notified: bool,
     task_summary_tx: mpsc::Sender<TaskSummaryResult>,
     task_summary_rx: mpsc::Receiver<TaskSummaryResult>,
+    /// BACKSTOP channel: a finished worker that filed no report has a one-shot summarizer
+    /// run over its diff; the reconstructed note arrives here. `pending` holds the run ids
+    /// with a summarizer in flight so the poll loop never re-spawns one.
+    completion_summary_tx: mpsc::Sender<CompletionSummaryResult>,
+    completion_summary_rx: mpsc::Receiver<CompletionSummaryResult>,
+    completion_summary_pending: HashSet<String>,
     last_user_activity: Instant,
     mouse_debug: bool,
     mouse_debug_last: Option<String>,
@@ -608,6 +614,16 @@ struct TaskSummaryResult {
     title: Option<String>,
 }
 
+/// Result of the completion-note BACKSTOP: a one-shot summarizer reconstructed a report
+/// (or not) for a worker that finished without filing one. `note` is the same JSON shape
+/// `parse_worker_done_block` yields; `None` when the summarizer failed or had nothing.
+#[derive(Debug)]
+struct CompletionSummaryResult {
+    run_id: String,
+    node_id: String,
+    note: Option<serde_json::Value>,
+}
+
 impl AgentRun {
     fn is_main(&self) -> bool {
         self.mode == AgentMode::Main || self.id == MAIN_AGENT_ID
@@ -687,6 +703,7 @@ impl App {
         let cloud = read_cloud_summary();
         let session_started_iso = load_or_init_session_started(&cwd);
         let (task_summary_tx, task_summary_rx) = mpsc::channel();
+        let (completion_summary_tx, completion_summary_rx) = mpsc::channel();
         let branch = current_branch_at(&cwd);
         Self {
             focus: FocusPane::Task,
@@ -747,6 +764,9 @@ impl App {
             workspace_idle_notified: false,
             task_summary_tx,
             task_summary_rx,
+            completion_summary_tx,
+            completion_summary_rx,
+            completion_summary_pending: HashSet::new(),
             last_user_activity: Instant::now(),
             mouse_debug: env::var(MOUSE_DEBUG_ENV).is_ok_and(|value| value != "0"),
             mouse_debug_last: None,
@@ -5232,6 +5252,7 @@ impl App {
                     && run.status == AgentStatus::Done
                     && !run.merge_resolver
                     && !self.followups_ingested.contains(&run.id)
+                    && !self.completion_summary_pending.contains(&run.id)
             })
             .map(|(index, _)| index)
             .collect();
@@ -5247,11 +5268,14 @@ impl App {
         }
     }
 
-    /// Parse the finishing worker's RUDDER_DONE block and append its in-scope
-    /// follow-ups as new planned nodes (deduped, depth- and cap-guarded). Returns
-    /// true if any node was added. Idempotent: the run id is marked ingested up front.
+    /// Recover the finishing worker's completion note over the file channel (preferred)
+    /// or the PTY-scrape fallback, and append its in-scope follow-ups (deduped, depth- and
+    /// cap-guarded). If NEITHER channel produced a note, fall back to the BACKSTOP: spawn a
+    /// one-shot summarizer over the worker's diff so a silent agent still advances the plan
+    /// (the run is held `pending`, not marked ingested, until that result lands). Returns
+    /// true only when a node was added synchronously here.
     fn ingest_worker_followups(&mut self, index: usize) -> bool {
-        let (run_id, node_id, sidecar_note, output) = {
+        let (run_id, node_id, sidecar_note, output, cwd, task) = {
             let Some(run) = self.agents.get_mut(index) else {
                 return false;
             };
@@ -5283,14 +5307,62 @@ impl App {
                 .as_ref()
                 .map(|t| t.output_log_snapshot().to_string())
                 .unwrap_or_default();
-            (run.id.clone(), node_id, sidecar_note, output)
+            (
+                run.id.clone(),
+                node_id,
+                sidecar_note,
+                output,
+                run.cwd.clone(),
+                run.task_summary.clone(),
+            )
         };
-        self.followups_ingested.insert(run_id);
 
-        let Some(note) = sidecar_note.or_else(|| parse_worker_done_block(&output)) else {
+        // A report came through one of the direct channels: apply it and we are done.
+        if let Some(note) = sidecar_note.or_else(|| parse_worker_done_block(&output)) {
+            self.followups_ingested.insert(run_id);
+            return self.apply_worker_followups(&node_id, &note);
+        }
+
+        // No report filed. Without a node id there is nothing to attach follow-ups to, so
+        // just mark it handled. Otherwise spawn the BACKSTOP: a one-shot summarizer over
+        // the worker's diff reconstructs the note off-thread. Hold the run `pending` (not
+        // ingested) so it is not re-spawned; poll_completion_summary_workers applies the
+        // result and marks it ingested then.
+        if node_id.is_empty() {
+            self.followups_ingested.insert(run_id);
             return false;
-        };
-        self.apply_worker_followups(&node_id, &note)
+        }
+        let diff = jj_diff_text(&cwd, 8000);
+        self.completion_summary_pending.insert(run_id.clone());
+        spawn_completion_summary_worker(
+            self.completion_summary_tx.clone(),
+            run_id,
+            node_id,
+            task,
+            diff,
+        );
+        self.push_activity("agent finished without a report; summarizing its diff to extract follow-ups");
+        false
+    }
+
+    /// Drain BACKSTOP summarizer results: apply each reconstructed note (growing the DAG)
+    /// and mark the run ingested so it is never re-processed. Mirrors
+    /// `poll_task_summary_workers`; called from the poll loop.
+    fn poll_completion_summary_workers(&mut self) {
+        let mut grew = false;
+        while let Ok(result) = self.completion_summary_rx.try_recv() {
+            self.completion_summary_pending.remove(&result.run_id);
+            self.followups_ingested.insert(result.run_id);
+            if let Some(note) = result.note {
+                if self.apply_worker_followups(&result.node_id, &note) {
+                    grew = true;
+                }
+            }
+        }
+        if grew && !self.awaiting_approval {
+            self.run_scheduler();
+            self.mirror_graph();
+        }
     }
 
     /// Grow the DAG from a parsed completion note: dedupe, depth- and cap-guard,
@@ -5734,7 +5806,7 @@ impl App {
                     self.mark_agent_and_review_sources_merged(index, sources);
                 }
                 finalized_any = true;
-                self.notice = Some(format!("AI resolved & merged {}", short_task(&label)));
+                self.notice = Some(format!("resolved conflict and merged {}", short_task(&label)));
             } else {
                 self.notice = Some(format!(
                     "resolver left {} conflict(s) in {}; resolve and press m",
@@ -6145,7 +6217,7 @@ impl App {
                 match self.merge_agent_at(index) {
                     Ok(()) => {
                         self.delete_pending = None;
-                        self.notice = Some("merged selected worktree".to_string());
+                        self.notice = Some("merged · dependent nodes unblocked".to_string());
                     }
                     Err(error) => {
                         self.handle_merge_error(
@@ -6829,6 +6901,7 @@ What to do\n\
 
     fn poll_agents(&mut self) {
         self.poll_task_summary_workers();
+        self.poll_completion_summary_workers();
 
         if self.last_cloud_check.elapsed() >= Duration::from_secs(2) {
             let cloud = read_cloud_summary();
