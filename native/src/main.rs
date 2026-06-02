@@ -317,6 +317,14 @@ struct App {
     /// captured), blocks premature approval of the stale plan, and is cleared the
     /// moment the revised plan lands (or the re-plan fails).
     refining: bool,
+    /// Set while a STRUCTURAL plan-rebase is in flight: the orchestrator session has
+    /// been resumed with a `build_rebase_request` (a mid-flight pivot), and we are
+    /// waiting for its revised DAG. Like `refining` it lets plan detection run even
+    /// though a plan is already active (post-approval, nodes launched), but it routes
+    /// capture to `evaluate_completed_rebase` (build-forward diff/apply) instead of
+    /// `evaluate_completed_plan`. Suppresses `maybe_auto_merge` while set so the zones
+    /// stay stable until the diff is applied. Cleared the moment the rebase lands or fails.
+    rebasing: bool,
     /// When true, a plan node that finishes cleanly (review, no conflict) is merged
     /// automatically so its children unblock and the DAG drains hands-free. Toggled
     /// by `/automerge`. Default OFF: review-before-merge stays the norm.
@@ -700,6 +708,7 @@ impl App {
             plan_request: String::new(),
             plan_summary: None,
             refining: false,
+            rebasing: false,
             auto_merge: false,
             auto_merge_skip: Vec::new(),
             awaiting_approval: false,
@@ -825,6 +834,7 @@ impl App {
     /// can never diverge that way.
     pub(crate) fn has_planning_orchestrator(&self) -> bool {
         self.refining
+            || self.rebasing
             || self
                 .agents
                 .iter()
@@ -1301,7 +1311,12 @@ impl App {
                     .map(|run| run.worker_input_draft.trim().to_string())
                     .unwrap_or_default();
                 if draft.is_empty() {
-                    if self.refining {
+                    if self.rebasing {
+                        self.notice = Some(
+                            "still rebasing — applying the new direction to the live plan"
+                                .to_string(),
+                        );
+                    } else if self.refining {
                         self.notice =
                             Some("still refining — the updated plan is on its way".to_string());
                     } else if self.awaiting_approval {
@@ -2794,12 +2809,19 @@ impl App {
             return;
         }
 
-        // RECONCILE: when a plan is already active, a second task must be folded
-        // INTO the existing DAG, not handed to a fresh planner that would replace
-        // it. Route to the append pipeline and return so the in-flight nodes are
-        // preserved. The no-plan-active first task falls through to the planner.
+        // CONDUCTING: a plan is already active and approved. Classify the typed message.
+        // ADDITIVE (default) → fold one node into the existing DAG (reconcile), preserving
+        // the in-flight nodes. STRUCTURAL (a pivot: "instead…", "rewrite…", or a message
+        // that reshapes a majority of the plan) → re-plan the whole DAG against the live
+        // zones (rebase), building forward on merged work. The choice is logged with its
+        // reason; a misfire is cheaply reversible. The no-plan-active first task falls
+        // through to the planner.
         if self.plan_is_active() {
-            self.reconcile_injection(&input);
+            if self.classify_new_direction(&input) {
+                self.start_plan_rebase(&input);
+            } else {
+                self.reconcile_injection(&input);
+            }
             return;
         }
 
@@ -2820,6 +2842,30 @@ impl App {
         self.agents
             .iter()
             .any(|run| run.node_id.is_some() && run.status != AgentStatus::Merged)
+    }
+
+    /// Every live plan node title: queued (TODO) nodes plus in-flight (not-yet-merged)
+    /// plan agents. Feeds the structural-vs-additive classifier's title-overlap heuristic.
+    fn plan_node_titles(&self) -> Vec<String> {
+        let mut titles: Vec<String> = self
+            .planned_nodes
+            .iter()
+            .map(|node| node.title.clone())
+            .collect();
+        for run in &self.agents {
+            if run.node_id.is_some() && run.status != AgentStatus::Merged {
+                titles.push(run.task_summary.clone());
+            }
+        }
+        titles
+    }
+
+    /// Classify a typed message while CONDUCTING: STRUCTURAL pivot (true → rebase the
+    /// whole plan) vs ADDITIVE request (false → reconcile one node). Thin wrapper over
+    /// the pure `is_structural_direction` (replacement verbs OR majority title-overlap)
+    /// that sources the live node titles. Autonomous + logged; never a confirm gate.
+    fn classify_new_direction(&self, input: &str) -> bool {
+        is_structural_direction(input, &self.plan_node_titles())
     }
 
     /// The current plan FRONTIER: the `(id, title)` of every node the added task
@@ -3440,6 +3486,121 @@ impl App {
             // the user is not stuck (they can still approve it or try again).
             self.refining = false;
             self.notice = Some("could not relaunch the planner; the current plan still stands".to_string());
+        }
+    }
+
+    /// STRUCTURAL pivot (D): re-decompose the WHOLE plan against the live zones instead
+    /// of folding in one node. Reuses the refine machinery (resume the orchestrator
+    /// session) but with a `build_rebase_request` that states which work has MERGED
+    /// (baseline — build forward), which is RUNNING (keep/re-goal/stop), and which is
+    /// TODO (replace freely). Sets `rebasing` so `maybe_detect_plan_ready` routes the
+    /// revised DAG to `evaluate_completed_rebase` (a build-forward diff/apply), and
+    /// `maybe_auto_merge` is suppressed until the diff lands. Autonomous + logged.
+    fn start_plan_rebase(&mut self, input: &str) {
+        let Some(index) = self.agents.iter().position(|run| run.is_orchestrator()) else {
+            // No orchestrator session to resume (e.g. a daemon-launched plan): a
+            // structural change with no planner to re-decompose against falls back to
+            // a fresh plan from the new direction.
+            self.start_rudder_plan_task(input);
+            return;
+        };
+        let (backend, model, effort, session) = {
+            let run = &self.agents[index];
+            (
+                run.backend,
+                run.model.clone(),
+                run.effort,
+                run.session_id.clone().filter(|s| !s.trim().is_empty()),
+            )
+        };
+        let request = build_rebase_request(
+            &self.rebase_zone_merged(),
+            &self.rebase_zone_running(),
+            &self.current_plan_outline(),
+            input,
+        );
+        // Resume the orchestrator's session when we have one (it remembers the prior
+        // plan + reasoning); otherwise fall back to a fresh decompose carrying the
+        // full zone context in the prompt.
+        let resume = session.is_some();
+        let command = match &session {
+            Some(sid) => rudder_plan_refine_command(backend, &model, effort, &request, sid),
+            None => agent_command(
+                backend,
+                &model,
+                effort,
+                &request,
+                AgentMode::RudderPlan,
+                mint_session_id_for(backend).as_deref(),
+            ),
+        };
+        // Mark the rebase in flight BEFORE relaunch so the poll loop routes the revised
+        // block to evaluate_completed_rebase and holds auto-merge steady.
+        self.rebasing = true;
+        if let Some(run) = self.agents.get_mut(index) {
+            if resume {
+                if let Some(stream) = run.plan_stream.as_mut() {
+                    stream.begin_user_turn(input);
+                    stream.rebind_stream();
+                }
+            } else {
+                run.plan_stream = Some(PlanStreamState::new());
+            }
+        }
+        if self.relaunch_orchestrator_with(index, command, input) {
+            self.push_activity(format!("rebasing the plan: {}", short_task(input)));
+        } else {
+            // Could not relaunch: drop back to the current plan so the fleet keeps
+            // running. Nothing was changed; the rebase is simply abandoned.
+            self.rebasing = false;
+            self.notice = Some(
+                "could not relaunch the planner to rebase; the current plan still stands"
+                    .to_string(),
+            );
+        }
+    }
+
+    /// The MERGED zone for a rebase request: already-landed plan nodes (the immutable
+    /// build-forward baseline). One `- id [title]` line each.
+    fn rebase_zone_merged(&self) -> String {
+        let lines: Vec<String> = self
+            .agents
+            .iter()
+            .filter(|run| run.status == AgentStatus::Merged)
+            .filter_map(|run| {
+                run.node_id
+                    .as_ref()
+                    .map(|id| format!("- {id} [{}]", run.task_summary))
+            })
+            .collect();
+        if lines.is_empty() {
+            "(nothing merged yet)".to_string()
+        } else {
+            lines.join("\n")
+        }
+    }
+
+    /// The RUNNING zone for a rebase request: plan agents in flight (carry a node id,
+    /// not main, not merged/failed/stopped). One `- id [title]` line each.
+    fn rebase_zone_running(&self) -> String {
+        let lines: Vec<String> = self
+            .agents
+            .iter()
+            .filter(|run| {
+                run.node_id.is_some()
+                    && !run.is_main()
+                    && matches!(run.status, AgentStatus::Running | AgentStatus::Done)
+            })
+            .filter_map(|run| {
+                run.node_id
+                    .as_ref()
+                    .map(|id| format!("- {id} [{}]", run.task_summary))
+            })
+            .collect();
+        if lines.is_empty() {
+            "(nothing running yet)".to_string()
+        } else {
+            lines.join("\n")
         }
     }
 
@@ -4576,6 +4737,23 @@ impl App {
             return;
         }
 
+        // REBASE: a structural pivot resumed the orchestrator WHILE a plan is active
+        // (post-approval, nodes launched), so its revised block must be captured from
+        // streaming output regardless of the initial-plan guard below (which would bail
+        // on the non-empty queue). Detected before that guard, like reconcile.
+        if self.rebasing {
+            let index = self.agents.iter().position(|run| {
+                run.mode == AgentMode::RudderPlan
+                    && !run.reconcile_planner
+                    && run.autosteered
+                    && extract_rudder_plan_tasks(&rudder_plan_output_for_run(run)).is_ok()
+            });
+            if let Some(index) = index {
+                self.evaluate_completed_rebase(index);
+            }
+            return;
+        }
+
         // INITIAL plan: a fresh plan is already captured (awaiting approval, or
         // some nodes queued): do not re-capture from a still-streaming orchestrator.
         // EXCEPTION: while `refining`, the orchestrator has been relaunched to revise
@@ -4808,6 +4986,136 @@ impl App {
         // node was only queued (run_scheduler did not run), so mirror here too so
         // the board reflects the reconcile. Coalesced + non-fatal.
         self.mirror_graph();
+        self.dirty = true;
+    }
+
+    /// Apply a STRUCTURAL plan-rebase once the resumed orchestrator emits its revised
+    /// DAG (routed here by `maybe_detect_plan_ready` while `rebasing`). Builds the three
+    /// live zones (MERGED baseline / RUNNING in-flight / TODO queued), diffs the new plan
+    /// against them with the pure `diff_plan`, then applies build-forward, AUTONOMOUSLY:
+    /// merged nodes are untouched; running nodes are kept, re-goaled (objective changed),
+    /// or stopped (dropped); the TODO queue is rebuilt; the scheduler launches newly-ready
+    /// work. No confirm — the diff is logged to the activity feed (visible) and every
+    /// jj-touching step rides the op-log (undoable). If the planner produced no runnable
+    /// block, the current plan stands unchanged.
+    fn evaluate_completed_rebase(&mut self, index: usize) {
+        // Drain + ingest the planner's FINAL buffered output before snapshotting (the
+        // process may have blocked at a plan-mode approval prompt without exiting, so the
+        // authoritative block can still be in the PTY). Mirrors evaluate_completed_plan.
+        {
+            let Some(run) = self.agents.get_mut(index) else {
+                return;
+            };
+            if run.mode != AgentMode::RudderPlan || run.reconcile_planner || !run.autosteered {
+                return;
+            }
+            if let Some(terminal) = run.terminal.as_mut() {
+                for _ in 0..64 {
+                    let had = !terminal.drain_output().is_empty();
+                    let snapshot = terminal.output_log_snapshot().to_string();
+                    if let Some(stream) = run.plan_stream.as_mut() {
+                        stream.ingest(&snapshot);
+                    }
+                    if !had {
+                        break;
+                    }
+                }
+            }
+        }
+        let output = rudder_plan_output_for_run(&self.agents[index]);
+
+        // Parse against the frontier so cross-block deps onto in-flight ids survive.
+        let frontier: Vec<String> = self.plan_frontier().into_iter().map(|(id, _)| id).collect();
+        let new_tasks = match extract_rudder_plan_tasks_with_frontier(&output, &frontier) {
+            Ok(tasks) if !tasks.is_empty() => tasks,
+            other => {
+                // No runnable block: KEEP the current plan, clear the rebase, surface why.
+                if let Some(run) = self.agents.get_mut(index) {
+                    run.autosteered = false;
+                    let _ = save_native_run_record(&self.cwd, run);
+                }
+                self.rebasing = false;
+                self.notice = Some(match other {
+                    Err(error) => format!(
+                        "rebase produced no runnable plan ({error}); the current plan still stands"
+                    ),
+                    _ => "rebase produced no runnable plan; the current plan still stands"
+                        .to_string(),
+                });
+                self.dirty = true;
+                return;
+            }
+        };
+        let summary = extract_rudder_plan_summary(&output);
+
+        // Snapshot the three zones from the live fleet.
+        let merged_ids: Vec<String> = self
+            .agents
+            .iter()
+            .filter(|run| run.status == AgentStatus::Merged)
+            .filter_map(|run| run.node_id.clone())
+            .collect();
+        let running: Vec<RunningNode> = self
+            .agents
+            .iter()
+            .filter(|run| {
+                run.node_id.is_some()
+                    && !run.is_main()
+                    && matches!(run.status, AgentStatus::Running | AgentStatus::Done)
+            })
+            .map(|run| RunningNode {
+                id: run.node_id.clone().unwrap_or_default(),
+                title: run.task_summary.clone(),
+                context: run.current_prompt.clone(),
+            })
+            .collect();
+        let todo = self.planned_nodes.clone();
+
+        let diff = diff_plan(&running, &todo, &merged_ids, &new_tasks);
+        let (added, regoaled, dropped, kept) = (
+            diff.added.len(),
+            diff.regoaled.len(),
+            diff.dropped.len(),
+            diff.kept.len(),
+        );
+
+        // APPLY (build-forward). 1) Stop running agents the new plan abandoned — keep
+        // their jj workspace (undoable). Re-find by id each time since indices shift.
+        for id in &diff.dropped {
+            if let Some(idx) = self.agents.iter().position(|run| {
+                run.node_id.as_deref() == Some(id.as_str())
+                    && matches!(run.status, AgentStatus::Running | AgentStatus::Done)
+            }) {
+                self.stop_agent_at(idx);
+            }
+        }
+        // 2) Re-goal running agents whose objective changed (resume session, files kept).
+        for (id, goal) in &diff.regoaled {
+            if let Some(idx) = self.agents.iter().position(|run| {
+                run.node_id.as_deref() == Some(id.as_str())
+                    && matches!(run.status, AgentStatus::Running | AgentStatus::Done)
+            }) {
+                self.regoal_agent_at(idx, goal);
+            }
+        }
+        // 3) Replace the TODO queue with the rebuilt one (planner ids; the permissive
+        // dangling-dep rule keeps the DAG from deadlocking on any stale reference).
+        self.planned_nodes = diff.todo;
+        self.plan_summary = summary;
+
+        // The rebase has landed: clear the flag + the planner's capture-once flag.
+        self.rebasing = false;
+        if let Some(run) = self.agents.get_mut(index) {
+            run.autosteered = false;
+            let _ = save_native_run_record(&self.cwd, run);
+        }
+
+        // 4) Launch newly-ready work + mirror, then log the diff (visible, no confirm).
+        self.run_scheduler();
+        self.mirror_graph();
+        self.push_activity(format!(
+            "rebased plan: +{added} added · {regoaled} re-goaled · {dropped} stopped/dropped · {kept} kept"
+        ));
         self.dirty = true;
     }
 
@@ -5262,6 +5570,12 @@ impl App {
     /// scheduler so newly-ready children launch.
     fn maybe_auto_merge(&mut self) {
         if !self.auto_merge {
+            return;
+        }
+        // Hold auto-merge steady while a structural rebase is in flight: merging would
+        // shift a RUNNING node into the MERGED zone mid-diff and the build-forward apply
+        // would compute its zones against a moving target. Resume once the rebase lands.
+        if self.rebasing {
             return;
         }
         let mut merged_any = false;

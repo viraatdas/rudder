@@ -5271,3 +5271,201 @@ branch refs/heads/main\n";
             "a changed plan moves the signature"
         );
     }
+
+    // ---- Phase 3: plan-rebase (structural mid-flight change) --------------------
+
+    /// A plan task with an optional goal and hard deps, for the rebase differ tests.
+    fn rebase_task(id: &str, title: &str, goal: Option<&str>, hard: &[&str]) -> RudderPlanTask {
+        RudderPlanTask {
+            id: id.to_string(),
+            title: title.to_string(),
+            prompt: format!("do {id}"),
+            goal: goal.map(ToString::to_string),
+            success: None,
+            deps: hard
+                .iter()
+                .map(|on| PlanEdge {
+                    on: on.to_string(),
+                    edge: EdgeType::Hard,
+                    why: Some("consumes".to_string()),
+                })
+                .collect(),
+            backend: None,
+            model: None,
+            effort: None,
+        }
+    }
+
+    fn titled_planned_node(id: &str, title: &str) -> PlannedNode {
+        let mut node = test_planned_node(id, &[]);
+        node.title = title.to_string();
+        node
+    }
+
+    #[test]
+    fn norm_title_collapses_punctuation_and_case() {
+        assert_eq!(norm_title("Add Rate-Limiting!"), "add rate limiting");
+        assert_eq!(norm_title("  set   up  DB  "), "set up db");
+        assert_eq!(norm_title("---"), "");
+    }
+
+    #[test]
+    fn goal_changed_only_when_new_goal_absent_from_context() {
+        // The launch context embeds the original goal, so re-stating it is a KEEP.
+        assert!(!goal_changed(
+            "/goal build the api endpoint done when ...",
+            "build the api endpoint"
+        ));
+        // A genuinely new objective is a re-goal.
+        assert!(goal_changed(
+            "/goal build the api endpoint",
+            "switch the api to graphql"
+        ));
+        // An empty new goal never forces a re-goal.
+        assert!(!goal_changed("anything", "   "));
+    }
+
+    #[test]
+    fn diff_plan_keeps_running_drops_obsolete_and_adds_new() {
+        let merged = vec!["m0".to_string()];
+        let running = vec![RunningNode {
+            id: "r0".to_string(),
+            title: "build api".to_string(),
+            context: "/goal build api endpoint done when tests pass".to_string(),
+        }];
+        let todo = vec![titled_planned_node("t0", "write docs"), titled_planned_node("t1", "old task")];
+        let new_tasks = vec![
+            // Re-describes merged work → ignored (build-forward).
+            rebase_task("m0", "schema", Some("redo schema"), &[]),
+            // Running node, same objective → kept.
+            rebase_task("r0", "build api", Some("build api endpoint"), &[]),
+            // Carried-over todo → todo, not "added".
+            rebase_task("t0", "write docs", None, &[]),
+            // Brand new todo node → added + todo.
+            rebase_task("t2", "new feature", None, &["r0"]),
+            // (t1 is not re-emitted → dropped.)
+        ];
+
+        let diff = diff_plan(&running, &todo, &merged, &new_tasks);
+
+        assert_eq!(diff.kept, vec!["r0".to_string()], "matched running, same goal → kept");
+        assert!(diff.regoaled.is_empty(), "no objective changed");
+        assert_eq!(diff.dropped, vec!["t1".to_string()], "obsolete todo dropped");
+        let added_ids: Vec<&str> = diff.added.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(added_ids, vec!["t2"], "only the brand-new node is added");
+        let todo_ids: Vec<&str> = diff.todo.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(todo_ids, vec!["t0", "t2"], "todo rebuilt; merged + running excluded");
+    }
+
+    #[test]
+    fn diff_plan_regoals_running_when_objective_changes() {
+        let running = vec![RunningNode {
+            id: "r0".to_string(),
+            title: "auth".to_string(),
+            context: "/goal add password login".to_string(),
+        }];
+        let new_tasks = vec![rebase_task("r0", "auth", Some("switch to oauth"), &[])];
+
+        let diff = diff_plan(&running, &[], &[], &new_tasks);
+        assert!(diff.kept.is_empty());
+        assert_eq!(
+            diff.regoaled,
+            vec![("r0".to_string(), "switch to oauth".to_string())],
+            "changed objective → re-goal"
+        );
+        assert!(diff.dropped.is_empty(), "still in the plan, just re-goaled");
+    }
+
+    #[test]
+    fn diff_plan_matches_running_by_title_when_id_renamed() {
+        // Planner renamed the id but kept the title: match by title so the agent is not
+        // stopped-and-readded. Same objective → kept under its ORIGINAL id.
+        let running = vec![RunningNode {
+            id: "r0".to_string(),
+            title: "payment flow".to_string(),
+            context: "/goal implement the payment flow".to_string(),
+        }];
+        let new_tasks = vec![rebase_task("payments", "Payment Flow", Some("implement the payment flow"), &[])];
+
+        let diff = diff_plan(&running, &[], &[], &new_tasks);
+        assert_eq!(diff.kept, vec!["r0".to_string()], "title match keeps the original id");
+        assert!(diff.dropped.is_empty());
+        assert!(diff.added.is_empty(), "the renamed task is not a new todo node");
+    }
+
+    #[test]
+    fn is_structural_direction_detects_replacement_verbs() {
+        let titles = vec!["build login".to_string(), "set up database".to_string()];
+        for msg in [
+            "scrap that and rewrite it in rust",
+            "let's pivot to a CLI instead",
+            "start over from scratch",
+            "actually, ditch the whole approach",
+        ] {
+            assert!(is_structural_direction(msg, &titles), "structural: {msg}");
+        }
+    }
+
+    #[test]
+    fn is_structural_direction_triggers_on_majority_title_overlap() {
+        let titles = vec![
+            "build login page".to_string(),
+            "set up database".to_string(),
+            "add payments".to_string(),
+        ];
+        // No replacement verb, but references a MAJORITY of node titles → structural.
+        assert!(is_structural_direction(
+            "make the login and database screens match the new mockups",
+            &titles
+        ));
+    }
+
+    #[test]
+    fn is_structural_direction_additive_request_is_not_structural() {
+        let titles = vec![
+            "build login page".to_string(),
+            "set up database".to_string(),
+            "add payments".to_string(),
+        ];
+        // Touches only one node, no replacement verb → additive (reconcile path).
+        assert!(!is_structural_direction(
+            "also add a logout button to the navbar",
+            &titles
+        ));
+        // Too few titles to judge overlap, no verb → additive.
+        assert!(!is_structural_direction("tweak the spacing", &["build login".to_string()]));
+    }
+
+    #[test]
+    fn classify_new_direction_reads_live_plan_titles() {
+        let mut app = App::new();
+        app.cwd = std::env::temp_dir();
+        app.planned_nodes = vec![
+            titled_planned_node("n0", "implement billing"),
+            titled_planned_node("n1", "wire up notifications"),
+        ];
+        let mut running = node_agent("n2", AgentStatus::Running);
+        running.task_summary = "render the dashboard".to_string();
+        app.agents.push(running);
+
+        // Additive: one new feature, no pivot.
+        assert!(!app.classify_new_direction("also add a settings page"));
+        // Structural: a replacement verb.
+        assert!(app.classify_new_direction("scrap billing and start over with stripe"));
+    }
+
+    #[test]
+    fn rebasing_suppresses_auto_merge() {
+        let mut app = App::new();
+        app.cwd = std::env::temp_dir();
+        app.auto_merge = true;
+        app.rebasing = true;
+        // A clean Done node would normally be auto-merged; the rebase guard holds it.
+        app.agents.push(node_agent("n0", AgentStatus::Done));
+        app.maybe_auto_merge();
+        assert_eq!(
+            app.agents[0].status,
+            AgentStatus::Done,
+            "auto-merge is suppressed while a rebase is in flight"
+        );
+    }

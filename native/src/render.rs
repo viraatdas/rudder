@@ -1571,7 +1571,9 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
             // and the plan as it writes it. No pinned region; the whole transcript
             // scrolls and sticks to the bottom so new output stays in view.
             let mut body: Vec<Line<'static>> = Vec::new();
-            let spinner_label = if app.refining {
+            let spinner_label = if app.rebasing {
+                "rebasing the plan…"
+            } else if app.refining {
                 "refining the plan…"
             } else {
                 "decomposing the task…"

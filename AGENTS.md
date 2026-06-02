@@ -643,9 +643,19 @@ ref), and every JUDGE parent is `review`|`merged`. SOFT parents never gate.
   backstop if they still conflict. Each pair is nudged once (`surfaced_overlaps`) and
   every action is logged to `activity_log`. (Semantic/interface drift via an LLM
   classifier is a gated future enhancement; file-overlap is the shipped heuristic.)
-- **Plan-rebase** (PLANNED): a structural mid-flight change re-decomposes against the
-  current repo; MERGED = baseline (build-forward, never auto-undo), RUNNING =
-  keep/re-goal/stop, TODO = replace; applied as a reviewable diff.
+- **Plan-rebase** (BUILT). A typed message while CONDUCTING is classified by
+  `classify_new_direction` → `is_structural_direction` (replacement verbs like
+  "instead/scrap/rewrite/pivot", OR a message that references a MAJORITY of node
+  titles). ADDITIVE → reconcile one node; STRUCTURAL → `start_plan_rebase`, which
+  RESUMES the orchestrator session with `build_rebase_request` (states the three zones)
+  and sets `rebasing`. `maybe_detect_plan_ready` routes the revised block to
+  `evaluate_completed_rebase`, which diffs it against the live zones with the pure
+  `diff_plan` (id-join, title-overlap fallback) and applies build-forward, AUTONOMOUSLY:
+  **MERGED = baseline** (untouched, referenced as satisfied deps), **RUNNING =
+  keep / re-goal (objective changed) / stop (dropped, workspace kept)**, **TODO =
+  replaced**. `maybe_auto_merge` is suppressed while `rebasing` so the zones stay stable.
+  The diff is logged to `activity_log` (`+N added · M re-goaled · K stopped · J kept`);
+  undo rides the jj op-log. A planner that emits no block leaves the current plan intact.
 
 ### 14.6 Coordination surfaces
 - **`DECISIONS.md`** — jj-tracked, agent-authored shared knowledge. Appended via
@@ -671,7 +681,10 @@ surfaced, never silently truncated). `MAX_FOLLOWUP_DEPTH = 3`. Concurrency:
 
 ### 14.9 Status
 Built so far: cap=100, `rudder done` + completion notes, readiness dedup, auto-expand +
-activity log, steering primitives (re-goal/inject/stop, `x` keybinding), and
-**autonomous drift handling** (file-overlap → coordination nudge). Planned (approved v3
-plan): the `OrchestratorMode` plan→conduct state machine + chat routing, the remaining
-DAG-edit steering (edge promote/demote, extract-shared, reorder), and plan-rebase.
+activity log, steering primitives (re-goal/inject/stop, `x` keybinding),
+**autonomous drift handling** (file-overlap → coordination nudge), and **plan-rebase**
+(structural-vs-additive classify → build-forward diff/apply, §14.5). The conductor
+loop — plan → approve → CONDUCT (auto-expand, steer, drift, rebase) — is functionally
+complete. Planned (approved v3 plan): an explicit `OrchestratorMode` enum/header
+(behaviour already derives from `refining`/`rebasing`/`awaiting_approval`), and the
+remaining DAG-edit steering (edge promote/demote, extract-shared, reorder).

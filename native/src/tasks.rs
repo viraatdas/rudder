@@ -502,6 +502,231 @@ pub(crate) fn build_refine_request(original: &str, current_plan: &str, feedback:
     )
 }
 
+/// Build the REBASE prompt: a structural mid-flight change while work is already in
+/// flight. Unlike refine (pre-launch), this re-decomposes against THREE live zones:
+/// MERGED work has already landed and is the baseline (build forward — do NOT re-plan
+/// it; reference its ids as satisfied deps); RUNNING work is in flight (keep its id to
+/// preserve the agent, change its goal to re-task it, or omit it to stop it); TODO work
+/// is unlaunched and may be replaced freely. Reuse stable ids so the diff can match
+/// nodes across the rewrite. The planner re-emits ONE full RUDDER_PLAN_TASKS block.
+pub(crate) fn build_rebase_request(
+    merged: &str,
+    running: &str,
+    todo: &str,
+    direction: &str,
+) -> String {
+    format!(
+        "The user is steering the project in a new direction MID-FLIGHT. Re-plan the work as a single complete task DAG that honours what has already happened. There are three zones; treat each differently and REUSE existing ids so the change can be applied surgically.\n\nMERGED (already landed — the baseline; do NOT re-plan these, build FORWARD on them; you may reference their ids as already-satisfied dependencies):\n{merged}\n\nRUNNING (in flight right now — keep an id to leave that agent working, restate its goal to re-task it, or omit it to stop it):\n{running}\n\nTODO (queued, not started — replace freely):\n{todo}\n\nNew direction from the user:\n{direction}\n\nRe-emit the FULL updated plan as one block exactly as before:\nRUDDER_PLAN_TASKS_START\n{{\"tasks\":[...]}}\nRUDDER_PLAN_TASKS_END\nApply the new direction directly — do not ask questions. After the block, add a short note on what changed and why.",
+    )
+}
+
+/// A running plan node as seen by the rebase differ: its stable id, its title (for the
+/// title-overlap fallback when the planner renames ids), and `context` — the text the
+/// agent is currently working from (its launch prompt / last goal). `context` is used
+/// only to decide whether the new plan's goal for this node is materially different
+/// (re-goal) or effectively the same (keep): if the new goal text is not already
+/// present in the agent's context, its objective changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RunningNode {
+    pub(crate) id: String,
+    pub(crate) title: String,
+    pub(crate) context: String,
+}
+
+/// The result of diffing a revised plan against the live RUNNING + TODO zones (MERGED
+/// is excluded — it is the immutable baseline). Drives the autonomous apply in
+/// `evaluate_completed_rebase`: running nodes are kept/re-goaled/stopped, the TODO queue
+/// is rebuilt from `todo`, and `added` is the subset of `todo` that is brand new.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct PlanDiff {
+    /// Running node ids the new plan keeps unchanged (matched, same objective).
+    pub(crate) kept: Vec<String>,
+    /// Running nodes whose objective changed: `(node_id, new_goal)` → re-goal.
+    pub(crate) regoaled: Vec<(String, String)>,
+    /// Running ids the new plan dropped + old TODO ids it no longer contains → stop/drop.
+    pub(crate) dropped: Vec<String>,
+    /// Brand-new planned nodes (in `todo` but with an id not previously queued).
+    pub(crate) added: Vec<PlannedNode>,
+    /// The full rebuilt TODO queue, in plan order, ready to REPLACE `planned_nodes`:
+    /// every new task that is not a running or merged node.
+    pub(crate) todo: Vec<PlannedNode>,
+}
+
+/// Normalize a title/goal for matching: lowercase, collapse runs of non-alphanumerics
+/// to single spaces, trim. So "Add Rate-Limiting!" and "add rate limiting" compare equal.
+pub(crate) fn norm_title(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut prev_space = true; // trims leading separators
+    for ch in value.chars() {
+        if ch.is_alphanumeric() {
+            for lower in ch.to_lowercase() {
+                out.push(lower);
+            }
+            prev_space = false;
+        } else if !prev_space {
+            out.push(' ');
+            prev_space = true;
+        }
+    }
+    while out.ends_with(' ') {
+        out.pop();
+    }
+    out
+}
+
+/// The new plan's goal for a still-running node is a re-goal (objective changed) when
+/// it is non-empty AND not already contained in what the agent is working from. A
+/// planner that re-states the same objective produces a goal already present in the
+/// agent's launch context, so that stays a KEEP (no disruptive PTY respawn).
+pub(crate) fn goal_changed(context: &str, new_goal: &str) -> bool {
+    let goal = norm_title(new_goal);
+    if goal.is_empty() {
+        return false;
+    }
+    !norm_title(context).contains(&goal)
+}
+
+/// Pure structural diff of a revised plan against the live zones. MERGED ids are the
+/// baseline (their tasks are skipped — already landed). Each new task is matched to a
+/// RUNNING node by id, then by normalized title; a match is kept or re-goaled. Unmatched
+/// new tasks become TODO nodes (flagged `added` when their id was not already queued).
+/// Running nodes no match touched → dropped; old TODO ids absent from the new plan are
+/// also reported dropped (the queue is rebuilt regardless, but the diff stays visible).
+pub(crate) fn diff_plan(
+    running: &[RunningNode],
+    todo: &[PlannedNode],
+    merged_ids: &[String],
+    new_tasks: &[RudderPlanTask],
+) -> PlanDiff {
+    use std::collections::HashSet;
+    let merged: HashSet<&str> = merged_ids.iter().map(String::as_str).collect();
+    let old_todo_ids: HashSet<&str> = todo.iter().map(|n| n.id.as_str()).collect();
+
+    let mut diff = PlanDiff::default();
+    let mut matched_running: HashSet<String> = HashSet::new();
+
+    for task in new_tasks {
+        // Build-forward: a task that re-describes already-merged work is ignored.
+        if merged.contains(task.id.as_str()) {
+            continue;
+        }
+        // Match to a RUNNING node: id first, then normalized title (planner renamed id).
+        let run_match = running
+            .iter()
+            .find(|node| node.id == task.id)
+            .or_else(|| {
+                let nt = norm_title(&task.title);
+                running.iter().find(|node| norm_title(&node.title) == nt)
+            });
+        if let Some(node) = run_match {
+            matched_running.insert(node.id.clone());
+            let new_goal = task.goal.clone().unwrap_or_default();
+            if goal_changed(&node.context, &new_goal) {
+                diff.regoaled.push((node.id.clone(), new_goal));
+            } else {
+                diff.kept.push(node.id.clone());
+            }
+            continue;
+        }
+        // Otherwise it is a TODO node (carried over or brand new).
+        let planned = PlannedNode::from_task(task);
+        if !old_todo_ids.contains(planned.id.as_str()) {
+            diff.added.push(planned.clone());
+        }
+        diff.todo.push(planned);
+    }
+
+    // Running nodes the new plan abandoned → stop.
+    for node in running {
+        if !matched_running.contains(&node.id) {
+            diff.dropped.push(node.id.clone());
+        }
+    }
+    // Old TODO ids absent from the new plan → dropped (visible in the diff).
+    let new_ids: HashSet<&str> = new_tasks.iter().map(|t| t.id.as_str()).collect();
+    for node in todo {
+        if !new_ids.contains(node.id.as_str()) {
+            diff.dropped.push(node.id.clone());
+        }
+    }
+    diff
+}
+
+/// Replacement verbs / phrases that signal a typed message is a STRUCTURAL pivot away
+/// from the current plan (re-plan the whole DAG) rather than an ADDITIVE request (fold
+/// one node in). Matched case-insensitively as substrings of the message.
+const STRUCTURAL_MARKERS: &[&str] = &[
+    "instead",
+    "scrap",
+    "rewrite",
+    "re-write",
+    "pivot",
+    "start over",
+    "start from scratch",
+    "throw out",
+    "throw away",
+    "ditch",
+    "abandon",
+    "rather than",
+    "no longer",
+    "forget the",
+    "forget about",
+    "drop everything",
+    "different approach",
+    "rethink",
+    "redo the",
+    "redo everything",
+    "overhaul",
+    "completely change",
+    "change the whole",
+    "change everything",
+    "replace the plan",
+    "replan",
+    "re-plan",
+];
+
+/// Stopwords excluded from the title-overlap heuristic so a shared common word does not
+/// make an additive request look structural.
+const TITLE_STOPWORDS: &[&str] = &[
+    "about", "after", "again", "their", "there", "these", "those", "which", "while",
+    "would", "could", "should", "with", "from", "into", "that", "this", "then", "them",
+    "they", "have", "your", "make", "code", "task", "node", "using", "based", "where",
+];
+
+/// Decide whether a typed message during CONDUCTING is a STRUCTURAL pivot (true → rebase
+/// the whole plan) or an ADDITIVE request (false → reconcile one node). Two cheap signals:
+/// (1) any replacement verb/phrase, or (2) the message references a MAJORITY of existing
+/// node titles (reshaping the plan wholesale, not adding to it). Pure + unit-tested; a
+/// misfire is cheaply reversible (a rebase that yields no changes pops the plan back).
+pub(crate) fn is_structural_direction(input: &str, titles: &[String]) -> bool {
+    let lower = input.to_lowercase();
+    if STRUCTURAL_MARKERS.iter().any(|marker| lower.contains(marker)) {
+        return true;
+    }
+    if titles.len() < 2 {
+        return false;
+    }
+    let words: std::collections::HashSet<String> = norm_title(&lower)
+        .split(' ')
+        .filter(|w| w.len() >= 4)
+        .map(ToString::to_string)
+        .collect();
+    let referenced = titles
+        .iter()
+        .filter(|title| title_referenced(&words, title))
+        .count();
+    referenced * 2 > titles.len()
+}
+
+/// A title is "referenced" by the message when one of its distinctive tokens (length ≥ 5,
+/// not a stopword) appears as a whole word in the message.
+fn title_referenced(message_words: &std::collections::HashSet<String>, title: &str) -> bool {
+    norm_title(title)
+        .split(' ')
+        .filter(|w| w.len() >= 5 && !TITLE_STOPWORDS.contains(w))
+        .any(|w| message_words.contains(w))
+}
+
 /// Read a non-empty trimmed string field, or `None`.
 fn plan_optional_str(task: &serde_json::Value, key: &str) -> Option<String> {
     task.get(key)
