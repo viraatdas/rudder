@@ -12,7 +12,9 @@ import {
   appendCompletionNote,
   appendDecision,
   ensureDecisionsFile,
+  writeCompletionNoteFile,
 } from "../dist/surfaces.js";
+import { readdir } from "node:fs/promises";
 import { buildResolverPrompt, resolverShouldFinalize } from "../dist/scheduler.js";
 
 // ---------------------------------------------------------------------------
@@ -134,6 +136,33 @@ test("appendCompletionNote writes a DONE bullet with interfaces + scoped follow-
     assert.match(content, /wire login into the router/);
     assert.match(content, /\[scope: out\]/, "out-of-lane follow-up is flagged");
     assert.match(content, /login needs a caller/, "the why is recorded");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("writeCompletionNoteFile drops machine-readable JSON the orchestrator reads off disk", async () => {
+  // The robust, terminal-independent channel: rudder done writes this file; the
+  // orchestrator reads it directly instead of scraping the PTY.
+  const dir = await mkdtemp(path.join(tmpdir(), "rudder-donefile-"));
+  try {
+    // Nested path that does not exist yet: the helper must mkdir -p.
+    const doneFile = path.join(dir, ".rudder", "done", "n3.json");
+    const note = {
+      node: "n3",
+      summary: "built it",
+      followups: [{ title: "add docs", scope: "in" }],
+    };
+    const ok = await writeCompletionNoteFile(doneFile, note);
+    assert.equal(ok, true, "write succeeds");
+
+    const parsed = JSON.parse(await readFile(doneFile, "utf8"));
+    assert.equal(parsed.node, "n3");
+    assert.equal(parsed.followups[0].title, "add docs");
+
+    // The write is atomic (temp + rename): no .tmp file is left for the reader to trip on.
+    const leftover = (await readdir(path.dirname(doneFile))).filter((f) => f.endsWith(".tmp"));
+    assert.equal(leftover.length, 0, "the atomic temp file was renamed away");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

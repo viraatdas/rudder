@@ -5664,6 +5664,44 @@ branch refs/heads/main\n";
         assert!(app.agents[0].terminal.is_none(), "reconcile planner is not resumed");
     }
 
+    #[test]
+    fn auto_expand_recovers_followups_from_sidecar_file_without_a_pty() {
+        // The ROBUST channel in isolation: a finished worker with NO terminal at all. The
+        // only way to recover its follow-ups is the file `rudder done` dropped at
+        // <workspace>/.rudder/done/<node>.json. This is what makes auto-expand survive a
+        // real Claude/Codex agent whose interactive TUI would have boxed/truncated the
+        // echoed block in the PTY beyond recovery.
+        let repo = unique_test_repo("done-sidecar");
+        let mut app = App::new();
+        app.cwd = repo.clone();
+        app.awaiting_approval = true; // hold scheduling; we only assert the DAG grew
+
+        let mut worker = node_agent("n0", AgentStatus::Done); // mode Execute, node_id "n0"
+        worker.cwd = repo.clone();
+        worker.terminal = None; // no PTY: the file on disk is the ONLY source
+        app.agents = vec![worker];
+
+        // Exactly what `rudder done` (pointed at RUDDER_DONE_FILE) writes into the workspace.
+        let done = worker_done_file(&repo, "n0");
+        fs::create_dir_all(done.parent().unwrap()).unwrap();
+        fs::write(
+            &done,
+            "{\"summary\":\"did it\",\"followups\":[{\"title\":\"add docs\",\"scope\":\"in\"},{\"title\":\"out of lane\",\"scope\":\"out\"}]}",
+        )
+        .unwrap();
+
+        app.maybe_ingest_worker_followups();
+
+        assert_eq!(
+            app.planned_nodes.len(),
+            1,
+            "the in-scope follow-up is recovered from the file (no PTY involved)"
+        );
+        assert_eq!(app.planned_nodes[0].title, "add docs");
+        assert!(app.followups_ingested.contains("n0"), "the worker is marked ingested once");
+        let _ = fs::remove_dir_all(&repo);
+    }
+
     // ---- LIVE conductor simulation (opt-in) -------------------------------------
     //
     // A scripted end-to-end run of the REAL conductor brain: the real scheduler, real
@@ -5673,12 +5711,18 @@ branch refs/heads/main\n";
     // worker in place). It spawns real processes + sleeps, so it is #[ignore]d; run it
     // with: `cargo test conductor_live -- --ignored --nocapture` to watch the timeline.
 
+    // A stand-in for `codex exec` (RUDDER_CODEX_BIN). It prints only NON-parseable TUI
+    // noise to the PTY (as a real agent's UI would, after boxing/truncating tool output)
+    // and reports its real note over the ROBUST FILE CHANNEL the launcher points it at
+    // (RUDDER_DONE_FILE), exactly as `rudder done` does. So the conductor must recover the
+    // follow-up from the file on disk, NOT from the terminal.
     const FAKE_CONDUCTOR_WORKER: &str = "#!/bin/sh\n\
-        # A stand-in for `codex exec` (RUDDER_CODEX_BIN). Ignores all args; reports a\n\
-        # completion note with one in-scope follow-up, then exits cleanly.\n\
-        printf 'RUDDER_DONE_START\\n'\n\
-        printf '{\"summary\":\"did the work\",\"interfaces\":\"added a module\",\"followups\":[{\"title\":\"write integration tests\",\"why\":\"cover the new module\",\"scope\":\"in\"}]}\\n'\n\
-        printf 'RUDDER_DONE_END\\n'\n";
+        echo 'working on it...'\n\
+        echo '[tool result truncated by the agent UI]'\n\
+        if [ -n \"$RUDDER_DONE_FILE\" ]; then\n\
+          mkdir -p \"$(dirname \"$RUDDER_DONE_FILE\")\"\n\
+          printf '%s' '{\"summary\":\"did the work\",\"followups\":[{\"title\":\"write integration tests\",\"why\":\"cover it\",\"scope\":\"in\"}]}' > \"$RUDDER_DONE_FILE\"\n\
+        fi\n";
 
     #[test]
     #[ignore = "live conductor simulation: spawns fake worker processes + sleeps; run with --ignored --nocapture"]

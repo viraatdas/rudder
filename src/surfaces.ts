@@ -107,6 +107,29 @@ export type CompletionNote = {
   followups?: FollowupProposal[];
 };
 
+/** Drop the structured completion note as a machine-readable JSON file the orchestrator
+ *  reads straight off disk. This is the AUTHORITATIVE, terminal-independent channel: it
+ *  never passes through the agent's interactive TUI, so a real Claude/Codex worker's
+ *  report survives however that UI boxes/truncates/wraps the echoed block in the PTY.
+ *  The launcher sets RUDDER_DONE_FILE to <workspace>/.rudder/done/<node>.json and the
+ *  orchestrator reads that exact path on completion. Atomic (temp + rename) so the reader
+ *  never sees a partial file. Best-effort: returns false on any error (the DECISIONS.md
+ *  and stdout channels still carry the note). */
+export async function writeCompletionNoteFile(
+  doneFile: string,
+  note: CompletionNote,
+): Promise<boolean> {
+  try {
+    await fsp.mkdir(path.dirname(doneFile), { recursive: true });
+    const tmp = `${doneFile}.${process.pid}.tmp`;
+    await fsp.writeFile(tmp, JSON.stringify(note), "utf8");
+    await fsp.rename(tmp, doneFile);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** Append a worker's completion note to DECISIONS.md as human-legible bullets (so
  *  siblings re-reading DECISIONS.md and the board both see it). The orchestrator
  *  also reads the same note from the RUDDER_DONE block `rudder done` echoes to

@@ -3113,7 +3113,7 @@ impl App {
         // condition. Idempotent: a /rudder-plan worker prompt that already leads
         // with /goal is left unchanged.
         let goal_prompt = manual_goal_prompt(input);
-        let command = agent_command(
+        let mut command = agent_command(
             backend,
             &model,
             effort,
@@ -3121,6 +3121,18 @@ impl App {
             AgentMode::Execute,
             session_id.as_deref(),
         );
+        // ROBUST completion channel: tell this worker's `rudder done` EXACTLY where to
+        // drop its machine-readable note. The orchestrator reads this same file when the
+        // worker finishes, so the report survives no matter how Claude or Codex render
+        // tool output in their interactive TUI (which would otherwise box/truncate/wrap
+        // the echoed block in the PTY). The path lives inside the worker's own gitignored
+        // .rudder dir: writable under either backend's (here unsandboxed) Bash tool, and
+        // never snapshotted into the merge. The env propagates to the `rudder done`
+        // subprocess the agent spawns. The PTY-scrape stays as a fallback.
+        if let Some(id) = node_id.as_deref() {
+            let done_file = worker_done_file(&worktree.path, id);
+            command = command.with_env("RUDDER_DONE_FILE", done_file.to_string_lossy().to_string());
+        }
         let options = TerminalPaneOptions {
             size: TerminalSize::default(),
             cwd: Some(worktree.path.clone()),
@@ -5239,34 +5251,43 @@ impl App {
     /// follow-ups as new planned nodes (deduped, depth- and cap-guarded). Returns
     /// true if any node was added. Idempotent: the run id is marked ingested up front.
     fn ingest_worker_followups(&mut self, index: usize) -> bool {
-        let (run_id, node_id, output) = {
+        let (run_id, node_id, sidecar_note, output) = {
             let Some(run) = self.agents.get_mut(index) else {
                 return false;
             };
-            // FLUSH the buffered tail before reading: a worker that printed its
-            // RUDDER_DONE block and exited while UNFOCUSED may have been marked Done by
-            // the cheap try_wait path without a final drain, so its block is still in the
-            // PTY buffer. We mark the run ingested below (once, no retry), so a not-yet-
-            // drained block would be lost permanently. One drain here closes that race.
-            if let Some(terminal) = run.terminal.as_mut() {
-                for _ in 0..16 {
-                    if terminal.drain_output().is_empty() {
-                        break;
+            let node_id = run.node_id.clone().unwrap_or_default();
+            // PRIMARY, backend-agnostic channel: `rudder done` writes the structured note
+            // to <workspace>/.rudder/done/<node>.json (see worker_done_file). This does
+            // NOT pass through the agent's terminal, so it survives however Claude or
+            // Codex render the echoed block in their interactive TUI (boxes, truncation,
+            // wrapping). Read + parse it directly from the worker's workspace on disk.
+            let sidecar_note = (!node_id.is_empty())
+                .then(|| worker_done_file(&run.cwd, &node_id))
+                .and_then(|path| std::fs::read_to_string(path).ok())
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
+            // FALLBACK channel: scrape the echoed RUDDER_DONE block from the PTY. Flush
+            // the tail first (a worker that printed-and-exited while UNFOCUSED may have
+            // been marked Done by the cheap try_wait path without a final drain). We mark
+            // the run ingested below (once, no retry), so this is the last chance.
+            if sidecar_note.is_none() {
+                if let Some(terminal) = run.terminal.as_mut() {
+                    for _ in 0..16 {
+                        if terminal.drain_output().is_empty() {
+                            break;
+                        }
                     }
                 }
             }
-            (
-                run.id.clone(),
-                run.node_id.clone().unwrap_or_default(),
-                run.terminal
-                    .as_ref()
-                    .map(|t| t.output_log_snapshot().to_string())
-                    .unwrap_or_default(),
-            )
+            let output = run
+                .terminal
+                .as_ref()
+                .map(|t| t.output_log_snapshot().to_string())
+                .unwrap_or_default();
+            (run.id.clone(), node_id, sidecar_note, output)
         };
         self.followups_ingested.insert(run_id);
 
-        let Some(note) = parse_worker_done_block(&output) else {
+        let Some(note) = sidecar_note.or_else(|| parse_worker_done_block(&output)) else {
             return false;
         };
         self.apply_worker_followups(&node_id, &note)
@@ -7436,6 +7457,18 @@ fn overlapping_files(a: &[String], b: &[String]) -> Vec<String> {
 
 /// Parse the LAST RUDDER_DONE block a finished worker echoed (via `rudder done`)
 /// out of its PTY scrollback into the completion-note JSON. None if absent/invalid.
+/// Path where a finished worker drops its machine-readable completion note: the ROBUST,
+/// rendering-independent half of the `rudder done` report. Lives inside the worker's own
+/// gitignored `.rudder` dir (so it is writable under either backend's Bash tool and is
+/// never merged), keyed by node id so workers that share a checkout never collide. The
+/// launcher sets RUDDER_DONE_FILE to this path; the orchestrator reads it on completion.
+fn worker_done_file(workspace: &Path, node_id: &str) -> PathBuf {
+    workspace
+        .join(".rudder")
+        .join("done")
+        .join(format!("{node_id}.json"))
+}
+
 fn parse_worker_done_block(output: &str) -> Option<serde_json::Value> {
     const START: &str = "RUDDER_DONE_START";
     const END: &str = "RUDDER_DONE_END";

@@ -36,7 +36,7 @@ import {
   workerRun,
 } from "./run-manager.js";
 import { runInteractiveShell } from "./repl.js";
-import { appendCompletionNote, appendDecision, RUDDER_DONE_END, RUDDER_DONE_START } from "./surfaces.js";
+import { appendCompletionNote, appendDecision, RUDDER_DONE_END, RUDDER_DONE_START, writeCompletionNoteFile } from "./surfaces.js";
 import type { CompletionNote } from "./surfaces.js";
 import { runTmuxAgentPane, runTmuxTaskPane, runTmuxWorkerIdle } from "./tmux-dashboard.js";
 import { runInteractiveTui } from "./tui.js";
@@ -969,8 +969,14 @@ async function readPipedStdin(timeoutMs = 3000): Promise<string> {
 
 /** `rudder done [--node <id>] ['<json>']`: a worker's end-of-task report. Accepts
  *  a CompletionNote JSON via stdin (piped) or as the joined args; a non-JSON arg
- *  is treated as a freeform summary. Appends it to DECISIONS.md and echoes a
- *  RUDDER_DONE block to stdout so the orchestrator parses it from the worker PTY.
+ *  is treated as a freeform summary. The note travels back to the orchestrator over
+ *  THREE channels of decreasing robustness so a real Claude/Codex worker's report is
+ *  not lost to terminal rendering:
+ *    1. RUDDER_DONE_FILE (set by the launcher to <workspace>/.rudder/done/<node>.json):
+ *       a machine-readable JSON drop the orchestrator reads straight off disk. This is
+ *       the authoritative channel - it never passes through the agent's TUI.
+ *    2. DECISIONS.md: a human-legible bullet siblings re-read.
+ *    3. The RUDDER_DONE block echoed to stdout: the legacy PTY-scrape fallback.
  *  Never manages jj - just records, like `rudder remember`. */
 async function runDone(parsed: Parsed): Promise<void> {
   const repoRoot = findRepoRoot();
@@ -989,6 +995,16 @@ async function runDone(parsed: Parsed): Promise<void> {
   if (node && !note.node) {
     note.node = node;
   }
+  // (1) Authoritative file drop. Prefer the launcher-provided absolute path; otherwise
+  // fall back to the conventional path under the cwd (.rudder/done/<node>.json) so a
+  // hand-run `rudder done --node X` still reports.
+  const doneFile =
+    process.env.RUDDER_DONE_FILE ||
+    (node ? path.join(process.cwd(), ".rudder", "done", `${node}.json`) : "");
+  if (doneFile) {
+    await writeCompletionNoteFile(doneFile, note);
+  }
+  // (2) human-legible record + (3) PTY-scrape fallback.
   await appendCompletionNote(repoRoot, note, node || "worker");
   process.stdout.write(`${RUDDER_DONE_START}\n${JSON.stringify(note)}\n${RUDDER_DONE_END}\n`);
 }
