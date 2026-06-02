@@ -2713,6 +2713,60 @@ branch refs/heads/main\n";
     }
 
     #[test]
+    fn parse_worker_done_block_extracts_last_block() {
+        let out = "chatter\nRUDDER_DONE_START\n{\"summary\":\"did x\",\"followups\":[{\"title\":\"t\"}]}\nRUDDER_DONE_END\ntrailing";
+        let note = parse_worker_done_block(out).expect("parsed");
+        assert_eq!(note["summary"], "did x");
+        assert_eq!(note["followups"][0]["title"], "t");
+        assert!(parse_worker_done_block("no block here").is_none());
+    }
+
+    #[test]
+    fn auto_expand_grows_dag_from_in_scope_followups() {
+        let mut app = App::new();
+        app.cwd = std::env::temp_dir();
+        // A launched plan node n0 (so the frontier is real); not awaiting approval.
+        let mut a = test_agent_run("n0agent", "scaffold");
+        a.node_id = Some("n0".to_string());
+        a.mode = AgentMode::Execute;
+        app.agents = vec![a];
+        let note = serde_json::json!({
+            "summary": "built auth",
+            "followups": [
+                { "title": "add token refresh", "scope": "in" },
+                { "title": "rate limit handling", "scope": "out" }
+            ]
+        });
+        let grew = app.apply_worker_followups("n0", &note);
+        assert!(grew, "an in-scope follow-up grows the DAG");
+        assert_eq!(app.planned_nodes.len(), 1, "only the in-scope follow-up is injected");
+        let added = &app.planned_nodes[0];
+        assert_eq!(added.title, "add token refresh");
+        assert!(
+            added.soft_deps.contains(&"n0".to_string()),
+            "soft-linked to the finishing node (never deadlocks)"
+        );
+        assert!(
+            app.activity_log.iter().any(|l| l.contains("grew 1 node")),
+            "auto-expansion is surfaced in the activity log: {:?}",
+            app.activity_log
+        );
+        // A second identical note adds nothing (title dedupe).
+        assert!(!app.apply_worker_followups("n0", &note), "duplicate title is skipped");
+        assert_eq!(app.planned_nodes.len(), 1);
+    }
+
+    #[test]
+    fn auto_expand_respects_depth_cap() {
+        let mut app = App::new();
+        app.followup_gen.insert("deep".to_string(), MAX_FOLLOWUP_DEPTH);
+        let note = serde_json::json!({ "followups": [{ "title": "more work", "scope": "in" }] });
+        assert!(!app.apply_worker_followups("deep", &note), "depth cap blocks runaway expansion");
+        assert!(app.planned_nodes.is_empty());
+        assert!(app.activity_log.iter().any(|l| l.contains("depth cap")));
+    }
+
+    #[test]
     fn planning_redraw_gate_tracks_running_not_parse_state() {
         // The spinner animation depends on this gate forcing a per-tick redraw. It
         // must stay true for the whole time the planner is alive, regardless of

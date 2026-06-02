@@ -1737,6 +1737,20 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
                     )));
                 }
             }
+
+            // Activity: the conductor's autonomous actions (auto-expand, steering),
+            // so the user always sees what the brain did without a confirm gate.
+            if !app.activity_log.is_empty() {
+                prose.push(Line::default());
+                prose.push(Line::from(Span::styled("Activity", header_style(focused))));
+                let start = app.activity_log.len().saturating_sub(8);
+                for entry in &app.activity_log[start..] {
+                    prose.push(Line::from(Span::styled(
+                        format!("· {entry}"),
+                        muted_style(focused),
+                    )));
+                }
+            }
             render_orchestrator_layout(
                 frame,
                 inner,

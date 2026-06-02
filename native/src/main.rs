@@ -111,6 +111,10 @@ const SCHEDULER_TICK_INTERVAL: u64 = 8;
 /// a jj workspace (a brief UI-thread block), so launches are spread across passes
 /// to keep the TUI responsive when a merge unblocks a whole wave of children.
 const MAX_LAUNCH_PER_TICK: usize = 2;
+/// Max auto-expansion depth: a node created from a finishing agent's follow-ups
+/// inherits parent generation + 1; beyond this we record the follow-ups but stop
+/// growing the DAG, so a chain of agents proposing follow-ups can't run away.
+const MAX_FOLLOWUP_DEPTH: u8 = 3;
 /// Braille spinner frames for the orchestrator "planning" phase (and, as a nice
 /// touch, running agents' status badge). Advances one frame per poll tick so it
 /// animates while the planner decomposes the task.
@@ -354,6 +358,16 @@ struct App {
     /// buffer each frame (so the selection is over exactly what is on screen).
     orch_selection: Option<WorkerSelection>,
     orch_visible_rows: Vec<String>,
+    /// Conductor activity log: an append-only, bounded record of every autonomous
+    /// action the orchestrator takes (auto-expanded a node, steered an agent, etc.),
+    /// shown in the orchestrator pane. The "visible" half of the no-confirm bargain.
+    activity_log: Vec<String>,
+    /// Run ids whose completion follow-ups have already been ingested, so a Done
+    /// worker grows the DAG exactly once even as it is re-polled.
+    followups_ingested: HashSet<String>,
+    /// Auto-expansion depth per node id (0 = human/plan/reconcile origin; a node
+    /// auto-created from a finishing node inherits parent+1). Caps runaway chains.
+    followup_gen: HashMap<String, u8>,
     /// Scroll offset (lines from the top) for the orchestrator DAG command-center
     /// view. The DAG is a static line list (not a PTY), so it needs its own offset
     /// to read a long plan. Reset to 0 whenever the selected agent changes; clamped
@@ -700,6 +714,9 @@ impl App {
             task_selection: None,
             orch_selection: None,
             orch_visible_rows: Vec::new(),
+            activity_log: Vec::new(),
+            followups_ingested: HashSet::new(),
+            followup_gen: HashMap::new(),
             orch_dag_scroll: 0,
             agents_area: None,
             worker_area: None,
@@ -4777,6 +4794,194 @@ impl App {
         self.dirty = true;
     }
 
+    /// Append a one-line entry to the conductor activity log (bounded) and surface it
+    /// as the current notice. This is how every AUTONOMOUS action stays visible
+    /// without a confirm gate.
+    fn push_activity(&mut self, msg: impl Into<String>) {
+        let msg = msg.into();
+        self.notice = Some(msg.clone());
+        self.activity_log.push(msg);
+        const MAX_ACTIVITY: usize = 200;
+        if self.activity_log.len() > MAX_ACTIVITY {
+            let overflow = self.activity_log.len() - MAX_ACTIVITY;
+            self.activity_log.drain(0..overflow);
+        }
+        self.dirty = true;
+    }
+
+    /// Live plan size = queued nodes + launched-but-not-merged plan agents. The
+    /// auto-expansion backstop guards this against MAX_PLAN_TASKS.
+    fn plan_node_count(&self) -> usize {
+        self.planned_nodes.len()
+            + self
+                .agents
+                .iter()
+                .filter(|run| run.node_id.is_some() && run.status != AgentStatus::Merged)
+                .count()
+    }
+
+    /// True if a node with a title that normalizes to `title` already exists (queued
+    /// or launched), so an auto-expanded follow-up does not duplicate existing work.
+    fn followup_title_exists(&self, title: &str) -> bool {
+        let norm = |s: &str| s.to_ascii_lowercase().split_whitespace().collect::<Vec<_>>().join(" ");
+        let want = norm(title);
+        if want.is_empty() {
+            return true;
+        }
+        self.planned_nodes.iter().any(|n| norm(&n.title) == want)
+            || self.agents.iter().any(|r| {
+                r.node_id.is_some() && (norm(&r.task_summary) == want || norm(&r.task) == want)
+            })
+    }
+
+    /// Scan finished plan workers and GROW the DAG from each one's `rudder done`
+    /// report exactly once. Autonomous (no confirm); surfaced via the activity log.
+    fn maybe_ingest_worker_followups(&mut self) {
+        let candidates: Vec<usize> = self
+            .agents
+            .iter()
+            .enumerate()
+            .filter(|(_, run)| {
+                run.node_id.is_some()
+                    && matches!(run.mode, AgentMode::Execute)
+                    && run.status == AgentStatus::Done
+                    && !run.merge_resolver
+                    && !self.followups_ingested.contains(&run.id)
+            })
+            .map(|(index, _)| index)
+            .collect();
+        let mut grew = false;
+        for index in candidates {
+            if self.ingest_worker_followups(index) {
+                grew = true;
+            }
+        }
+        if grew && !self.awaiting_approval {
+            self.run_scheduler();
+            self.mirror_graph();
+        }
+    }
+
+    /// Parse the finishing worker's RUDDER_DONE block and append its in-scope
+    /// follow-ups as new planned nodes (deduped, depth- and cap-guarded). Returns
+    /// true if any node was added. Idempotent: the run id is marked ingested up front.
+    fn ingest_worker_followups(&mut self, index: usize) -> bool {
+        let (run_id, node_id, output) = {
+            let Some(run) = self.agents.get(index) else {
+                return false;
+            };
+            (
+                run.id.clone(),
+                run.node_id.clone().unwrap_or_default(),
+                run.terminal
+                    .as_ref()
+                    .map(|t| t.output_log_snapshot().to_string())
+                    .unwrap_or_default(),
+            )
+        };
+        self.followups_ingested.insert(run_id);
+
+        let Some(note) = parse_worker_done_block(&output) else {
+            return false;
+        };
+        self.apply_worker_followups(&node_id, &note)
+    }
+
+    /// Grow the DAG from a parsed completion note: dedupe, depth- and cap-guard,
+    /// infer deps, and push the in-scope follow-ups as planned nodes. Pure of any
+    /// PTY/terminal access (split out of ingest_worker_followups so it is testable).
+    /// Returns true if any node was added.
+    fn apply_worker_followups(&mut self, node_id: &str, note: &serde_json::Value) -> bool {
+        let followups = note
+            .get("followups")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if followups.is_empty() {
+            return false;
+        }
+        // Depth guard: a node that is itself deep in an auto-expansion chain does not
+        // get to spawn more; record the intent instead of growing without bound.
+        let gen = self.followup_gen.get(node_id).copied().unwrap_or(0);
+        if gen >= MAX_FOLLOWUP_DEPTH {
+            self.push_activity(format!(
+                "follow-ups from {node_id} not expanded (depth cap {MAX_FOLLOWUP_DEPTH}); recorded to DECISIONS.md"
+            ));
+            return false;
+        }
+        let frontier: Vec<String> = self.plan_frontier().into_iter().map(|(id, _)| id).collect();
+        let mut added = 0usize;
+        for f in &followups {
+            if f.get("scope").and_then(serde_json::Value::as_str) == Some("out") {
+                continue; // out-of-lane: recorded in DECISIONS.md, not auto-injected
+            }
+            let title = f
+                .get("title")
+                .or_else(|| f.get("prompt"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let Some(title) = title else { continue };
+            if self.followup_title_exists(title) {
+                continue;
+            }
+            if self.plan_node_count() >= MAX_PLAN_TASKS {
+                self.push_activity(format!(
+                    "plan at {MAX_PLAN_TASKS}-node cap; remaining follow-ups from {node_id} recorded, not launched"
+                ));
+                break;
+            }
+            let prompt = f
+                .get("prompt")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(title)
+                .to_string();
+            let explicit: Vec<String> = f
+                .get("deps")
+                .and_then(serde_json::Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|d| d.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut node = PlannedNode {
+                id: self.uniquify_node_id("followup"),
+                title: title.to_string(),
+                prompt,
+                goal: Some(title.to_string()),
+                success: None,
+                deps: Vec::new(),
+                soft_deps: Vec::new(),
+                backend: None,
+                model: None,
+                effort: None,
+            };
+            if explicit.is_empty() {
+                // Default: a SOFT edge to the finishing node + the frontier, so the
+                // new work is aware of in-flight work but never gates/deadlocks.
+                let mut soft = vec![node_id.to_string()];
+                soft.extend(frontier.iter().cloned());
+                soft.retain(|id| !id.is_empty());
+                soft.sort();
+                soft.dedup();
+                node.soft_deps = soft;
+            } else {
+                // The agent said this follow-up consumes those nodes: treat as hard.
+                node.deps = explicit;
+            }
+            self.followup_gen.insert(node.id.clone(), gen + 1);
+            self.planned_nodes.push(node);
+            added += 1;
+        }
+        if added > 0 {
+            self.push_activity(format!("grew {added} node(s) from {node_id}'s completion"));
+        }
+        added > 0
+    }
+
     /// Make `id` unique against every node id already known to the active plan:
     /// queued planned-node ids plus the node ids of launched agents. Appends a
     /// numeric suffix (`-2`, `-3`, ...) until no collision remains so an appended
@@ -6413,6 +6618,12 @@ What to do\n\
         if self.scheduler_tick % SCHEDULER_TICK_INTERVAL == 0 {
             self.finalize_merge_resolvers();
         }
+        // Grow the DAG from finished workers' `rudder done` reports (auto-expand):
+        // a finishing agent's recommended follow-ups become new planned nodes,
+        // surfaced in the activity log. Autonomous, no confirm.
+        if self.scheduler_tick % SCHEDULER_TICK_INTERVAL == 0 {
+            self.maybe_ingest_worker_followups();
+        }
 
         // Advance the spinner each tick and force a redraw while an orchestrator is
         // still planning, so "decomposing the task..." animates even when the
@@ -6731,6 +6942,18 @@ fn run(terminal: &mut Tui) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Parse the LAST RUDDER_DONE block a finished worker echoed (via `rudder done`)
+/// out of its PTY scrollback into the completion-note JSON. None if absent/invalid.
+fn parse_worker_done_block(output: &str) -> Option<serde_json::Value> {
+    const START: &str = "RUDDER_DONE_START";
+    const END: &str = "RUDDER_DONE_END";
+    let clean = strip_ansi_for_plan(output).replace('\r', "");
+    let start = clean.rfind(START)?;
+    let after = &clean[start + START.len()..];
+    let end = after.find(END)?;
+    serde_json::from_str(after[..end].trim()).ok()
 }
 
 fn handle_event(app: &mut App, event: Event) -> bool {
