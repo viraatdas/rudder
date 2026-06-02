@@ -486,7 +486,32 @@ async function spawnResolver(
     context as unknown as JsonValue,
   ).catch(() => undefined);
 
-  // Hold the original node blocked and back-point at its resolver.
+  // Spawn the resolver worker FIRST. With detached + ignored stdio a failed spawn
+  // returns undefined; if we back-pointed the node at resolverRunId before knowing
+  // that, the node would stay blocked forever (the auto-retry cap skips any node that
+  // already has a resolverRunId). So only persist the back-pointer once the worker is
+  // actually live; on a failed spawn, leave the node blocked WITHOUT a resolverRunId so
+  // a later merge attempt can retry, and surface the failure.
+  const pid = spawnWorker(repoRoot, run.id);
+  if (pid === undefined) {
+    await updateGraph(repoRoot, (g) => {
+      const current = g.nodes[node.id];
+      if (current) {
+        current.status = "blocked";
+        current.merge = {
+          ...(current.merge ?? { status: "conflict" }),
+          status: "conflict",
+          mergeChangeId: input.mergeChangeId,
+          conflictedFiles: input.conflictedFiles,
+        };
+        current.updatedAt = nowIso();
+      }
+      return g;
+    });
+    throw new Error(`failed to spawn conflict resolver ${run.id} for node ${node.id}`);
+  }
+
+  // Resolver is live: hold the original node blocked and back-point at its resolver.
   await updateGraph(repoRoot, (g) => {
     const current = g.nodes[node.id];
     if (current) {
@@ -502,8 +527,6 @@ async function spawnResolver(
     }
     return g;
   });
-
-  spawnWorker(repoRoot, run.id);
 
   bus.publish({
     ts: nowIso(),
@@ -547,7 +570,10 @@ export async function deliverSoftDiff(repoRoot: string, edge: GraphEdge, bus: Ru
         ? `\n\n--- Variant ${parent.id} (${parent.title}) diff to evaluate ---\n`
         : `\n\n--- Context from merged sibling ${parent.id} (${parent.title}) ---\n`;
       if (!childNode.prompt.includes(header)) {
-        childNode.prompt = `${childNode.prompt}${header}${diff.slice(0, 8000)}`;
+        // Real repo diffs commonly exceed 8k chars; a too-small slice silently starves a
+        // judge of comparison context (each variant is truncated independently). 16k keeps
+        // it bounded while carrying typical diffs whole.
+        childNode.prompt = `${childNode.prompt}${header}${diff.slice(0, 16000)}`;
       }
       childNode.updatedAt = nowIso();
     }

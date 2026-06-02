@@ -1032,7 +1032,7 @@ pub(crate) fn commit_pending_changes_for_run(run: &AgentRun) -> Result<()> {
     } else {
         format!("{headline}\n\n{}", run.task.trim())
     };
-    let _ = git_status_command(&run.cwd, &["commit", "-m", &message]);
+    git_status_command(&run.cwd, &["commit", "-m", &message])?;
     Ok(())
 }
 

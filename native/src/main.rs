@@ -6095,7 +6095,9 @@ impl App {
             self.notice = Some("main agent: delete disabled".to_string());
             return;
         }
-        let selected = &self.agents[self.selected_agent];
+        let Some(selected) = self.agents.get(self.selected_agent) else {
+            return;
+        };
         if self.delete_pending.as_deref() != Some(&selected.id) {
             self.delete_pending = Some(selected.id.clone());
             self.notice = Some(if selected.worktree_path.is_some() {

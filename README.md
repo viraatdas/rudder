@@ -119,7 +119,6 @@ command, even while typing inside the worker pane:
 | `M` | Merge all completed worktrees |
 | `R` | Review all completed worktrees (Codex review-all agent) |
 | `r` | Rename the selected agent |
-| `u` | Sync (rebase) the selected worktree onto its base branch |
 | `d` | Delete the selected agent and its worktree |
 | `j` / `k` | Move the agent selection |
 | `q` | Quit |
@@ -133,7 +132,8 @@ forwarded to it, `Shift+Enter` inserts a newline, and `PageUp` / `PageDown`
 scroll the pane.
 
 **In the agents pane:** `j` / `k` or arrows move the selection, `Enter` focuses
-the worker, and `m` / `M` / `R` / `r` / `u` / `d` act on the selection.
+the worker, `m` / `M` / `R` / `r` / `d` act on the selection, `x` stops a running
+agent (keeping its worktree), and `g` toggles the nested DAG view.
 
 **In the task pane:** `Enter` starts the task, `Up` / `Down` browse history,
 `Alt-Left` / `Alt-Right` move by word, `Alt-Backspace` (or `Ctrl-Backspace`)
@@ -174,7 +174,10 @@ it**: type changes into the task pane and the orchestrator re-plans and updates 
 DAG tree. The pane also shows the planner's assumptions/notes. Press `Enter` with an
 empty input to approve and launch; the scheduler then drains the DAG (todo →
 in-progress → review → done) as dependencies merge. After launch, typing a new task
-folds it into the running DAG as a new node.
+folds it into the running DAG as a new node. When a worker finishes, Rudder reads back
+what it did and what work it found remaining (and reconstructs that from the diff if the
+agent did not say), so the plan keeps growing on its own. Type a sweeping change
+(\"rewrite this in Rust instead\") and the plan re-plans around the work already done.
 
 ## Worktrees and merging
 
@@ -209,11 +212,8 @@ rudder cleanup
 
 ## Review
 
-Press `v` on an agent to toggle a review of its worktree. Rudder uses
-[Hunk](https://hunk.dev) when available (installing `hunkdiff` on first use) and
-falls back to a live `git diff` otherwise. Press `v` or `Esc` to return to the
-worker. Set `RUDDER_REVIEW_TOOL=git` to force the diff fallback, or
-`RUDDER_HUNK_THEME=<name>` to change the review theme.
+Press `v` on an agent to toggle a review of its worktree, showing the run's diff.
+Press `v` or `Esc` to return to the worker.
 
 Press `R` to review all completed worktrees as one bundle: Rudder builds an
 aggregate branch and starts a Codex review-all agent over the combined diff. When
@@ -239,7 +239,13 @@ snapshot plus selected auth/config) to a Fly worker; press Down to start a fresh
 scratch worker instead. Completed cloud work returns through the same review and
 merge path as local work.
 
-Cloud workers use Fly Machines by default. To use your own server over SSH:
+Cloud comes in two shapes: a **sail** is an ephemeral, task-scoped worker (it goes away
+when the task is done; idle sails pause and can resume), while a **workspace** is a
+persistent, volume-backed dev environment you can come back to. Both restore the same
+workspace snapshot.
+
+Cloud workers use Fly Machines by default. To use your own server over SSH (Docker over
+SSH; bring-your-own-compute can be stopped but not paused/resumed):
 
 ```bash
 rudder cloud byoc <ssh-host>   # an entry from ~/.ssh/config, key auth + Docker

@@ -294,7 +294,6 @@ fn section_nest(
     for &child_index in members {
         let agent = &agents[child_index];
         // Hard parents bind before soft so the most-binding edge wins.
-        let mut seen_parent = false;
         for parent_id in &agent.deps {
             if let Some(&parent_index) = id_to_index.get(parent_id.as_str()) {
                 if parent_index == child_index {
@@ -309,7 +308,6 @@ fn section_nest(
                 } else {
                     has_out_of_section_parent.insert(child_index);
                 }
-                seen_parent = true;
             }
         }
         for parent_id in &agent.soft_deps {
@@ -329,10 +327,8 @@ fn section_nest(
                 } else {
                     has_out_of_section_parent.insert(child_index);
                 }
-                seen_parent = true;
             }
         }
-        let _ = seen_parent;
     }
 
     (children, has_in_section_parent, has_out_of_section_parent)
@@ -1618,11 +1614,15 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
                     );
                 }
             }
+            // Any node trapped in a cycle (e.g. part of a dependency loop) has a parent
+            // and so was skipped above; render it at depth 0 so a cycle never hides work.
             for index in 0..tasks.len() {
-                orchestrator_tree_walk(
-                    &mut dag, app, &tasks, &children, index, None, true, &mut lanes,
-                    &mut visited,
-                );
+                if !visited[index] {
+                    orchestrator_tree_walk(
+                        &mut dag, app, &tasks, &children, index, None, true, &mut lanes,
+                        &mut visited,
+                    );
+                }
             }
             let (mut running, mut review, mut done, mut todo) = (0usize, 0usize, 0usize, 0usize);
             for task in &tasks {

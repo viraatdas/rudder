@@ -324,11 +324,43 @@ struct's fields and methods, the domain types' fields) for free; only items move
 private methods. Splitting `App` itself out later would require that visibility
 churn, so it was left whole.
 
+### The run loop and the single-thread mutation model
+`run()` (in `main.rs`) is the whole engine: one thread, one owned `App`. Each
+iteration it (1) calls `poll_agents()` (the heartbeat), (2) redraws if `dirty`, then
+(3) blocks on `event::poll(timeout)` for input. The timeout adapts: `TICK_RATE` =
+33 ms normally, `STREAM_TICK_RATE` = 11 ms while a planner is streaming (so the live
+transcript lands ~3x sooner). Up to `MAX_EVENTS_PER_FRAME` = 64 queued events drain
+per frame.
+
+**Single-writer invariant.** `App` is mutated ONLY from this loop, via `&mut self`
+methods, so mutation is serialized: no locks, no races. There is no separate
+"scheduler object" to poke; `run_scheduler`/`next_node_to_launch` are stateless logic
+that *reads* `App` state, so changing scheduling behavior means changing the state
+they read (e.g. `stop_agent_at` sets a node `Stopped`, which the next tick observes).
+Exactly three things trigger a mutation: (a) your keystrokes (`handle_key`/
+`handle_mouse`), (b) the heartbeat (`poll_agents` → on its tick cadence:
+`run_scheduler`, `maybe_ingest_worker_followups`, `maybe_auto_merge`,
+`finalize_merge_resolvers`, `maybe_handle_drift`), and (c) background results drained
+from mpsc channels. Work that must not block the UI (the haiku task-summary and
+completion-note summarizers, cloud status) runs on background threads that COMPUTE and
+SEND a message; the loop drains the channel and applies the write. Threads never touch
+`App`. The LLM agents are likewise pure data producers (plan blocks, `rudder done`
+notes); they feed data that the loop ingests, they do not mutate `App`.
+
+**PTY drain throttling.** `poll_agents` fully drains the FOCUSED agent's PTY every
+frame, throttles unfocused agents to once per `UNFOCUSED_DRAIN_INTERVAL` = 500 ms (so
+vt100 parse cost scales with focus, not agent count), and always drains a streaming
+planner every tick. Completion of an interactive agent is declared once it has looked
+idle for `READY_GRACE` = 3200 ms (or on clean process exit), which is robust against a
+TUI that repaints while idle.
+
 ### Panes and focus
 `FocusPane = Agents | Worker | Task`.
 - **Agents**: the run list. Grouped: a `main`-branch agent section first, then
   worktree runs, then a merged section. Select with `j/k` or arrows; `Enter`
-  focuses/starts; `m` merge, `d` delete, `r` rename, `u` sync, `v` review.
+  focuses/starts; `m` merge, `d` delete, `r` rename, `v` review, `x` stop (a running
+  plan worker; keeps its workspace), `g` toggle nested DAG view. (The `u` sync key was
+  removed along with `/sync`; jj keeps workspaces current.)
 - **Worker**: the real PTY of the focused agent (claude/codex). Keystrokes are
   forwarded to the child so its prompts, slash commands, selection, and `Tab`
   behave natively. Trackpad scroll moves scrollback like a terminal; alternate
@@ -342,7 +374,7 @@ Order of handling matters; the early returns gate everything else.
 - **Ctrl+C**: quit, with a confirm guard if agents are still running.
 - **Ctrl+W (leader)**: arms a one-shot leader. The *next* key runs a dashboard
   command and disarms: `1/2/3` focus panes, `v` review, `m` merge, `R` review-all,
-  `M` merge-all, `r` rename, `u` sync, `j/k` move, `d` delete, `q` quit, `Esc`
+  `M` merge-all, `r` rename, `j/k` move, `d` delete, `q` quit, `Esc`
   cancels. See `handle_leader_key`. This is the reliable cross-terminal way to
   drive the dashboard from inside the worker pane. Tradeoff: Ctrl+W no longer
   reaches the worker PTY as readline "delete word".
@@ -365,14 +397,15 @@ and approve (Enter). `/plan` and `/sync` are retired no-ops that print a hint;
 the `u` sync keybinding was removed.
 
 ### Review and merge-all
-`v` opens a review pane. When `hunk diff --watch` is available Rudder opens a live
-Hunk review there. `R` (review-all) creates an aggregate Codex agent over all
-completed worktrees; `M` (merge-all) opens a confirmation to merge them. Review-all
-spins up a dedicated agent whose task is a `/review` over the combined diff.
+`v` opens a review pane showing the run's `jj diff` (`ensure_review_diff`). The old
+Hunk (`hunk diff --watch`) integration was removed in favor of native jj diff
+inspection. `R` (review-all) creates an aggregate Codex agent over all completed
+worktrees; `M` (merge-all) opens a confirmation to merge them. Review-all spins up a
+dedicated agent whose task is a `/review` over the combined diff.
 
 ### Tests
-`native/src/app_tests.rs` holds the dashboard tests (101; declared
-`#[cfg(test)] mod app_tests;` in `main.rs`). Includes the
+`native/src/app_tests.rs` holds the dashboard tests (231, plus one `#[ignore]`d live
+conductor harness; declared `#[cfg(test)] mod app_tests;` in `main.rs`). Includes the
 leader/Option-key coverage: `ctrl_w_leader_then_digit_focuses_pane`,
 `ctrl_w_leader_is_one_shot`, `ctrl_w_leader_escape_cancels_without_action`,
 `option_typographic_chars_focus_panes`, `alt_digit_still_focuses_pane`, plus the
@@ -398,40 +431,107 @@ existing nav-mode, worker-scroll, and rendering tests.
 
 ## 9. Rudder Cloud (`src/cloud.ts` + `cloud/`)
 
-Optional hosted worker mode. The local dashboard stays the control surface; you
-choose to hand a task to the cloud.
+Optional hosted worker mode: run the same agents on a remote machine while the local
+dashboard stays the control surface. The CLI client is `src/cloud.ts`; the control
+plane is a standalone deployable in `cloud/` (currently hosted at
+`https://rudder-cloud-control.fly.dev`, override with `RUDDER_CLOUD_URL`). It is
+optional and decoupled: the npm package stays light, and nothing here runs unless you
+`rudder login` and hand off a task.
 
-### CLI (`src/cloud.ts`)
-Subcommands: `login`, `launch`, `sail`, `byoc`, `vm`/`byo-vm`, `list`/`ls`,
-`status`, `logs`, `attach`, `workspace`, `onload`, `bootstrap`, `pause`,
-`resume`, `stop`, `setup-github`, `setup-google`, `setup-byoc`, `setup-vm`,
-`setup-fly`, `setup`, `runtime`.
-- Defaults to the hosted control plane
-  `https://rudder-cloud-control.fly.dev`; override with `RUDDER_CLOUD_URL`.
-- `login` runs a browser/device-style flow (poll `/api/cli/login/poll`) and stores
-  `CloudAuthState` in `~/.rudder/cloud.json`.
-- `onload` snapshots the current Rudder workspace (repo snapshot + selected HOME
-  auth/config) and uploads it (S3 presigned) so a cloud worker can continue the
-  task.
-- Error messages prefer the parsed server error, then the response body, then
-  `<status> <statusText>` (so empty gateway responses still report a code).
+### 9.1 Two shapes: sails vs workspaces
+Both use the same worker image and snapshot format; they differ in lifecycle + storage.
+- **Sails** — ephemeral, task-oriented. The Fly machine lives only as long as the task;
+  storage is transient. Statuses: `queued | running | paused | completed | failed`.
+  Idle sails are PAUSED (suspended, not destroyed) after `RUDDER_IDLE_PAUSE_MS`
+  (default ~2h) so they can resume without re-downloading the snapshot; a separate admin
+  GC does true cleanup.
+- **Workspaces** — persistent dev environments (Fly-only). Backed by a persistent volume
+  (default ~3GB). Statuses: `queued | running | paused | stopped | failed`. Idle-swept
+  (`sweepIdleWorkspaces`, every ~60s) and stopped after `RUDDER_WORKSPACE_IDLE_MS`
+  (~30 min). Keyed by `(account_id, workspace_key)` so re-launch reuses the same volume.
 
-### Control plane (`cloud/src/server.ts`)
+### 9.2 CLI (`src/cloud.ts`)
+Subcommands: `login`, `launch`, `sail`, `byoc`, `vm`/`byo-vm`, `list`/`ls`, `status`,
+`logs`, `attach`, `workspace`, `onload`, `bootstrap`, `pause`, `resume`, `stop`,
+`setup-github`, `setup-google`, `setup-byoc`, `setup-vm`, `setup-fly`, `setup`,
+`runtime`.
+- `login` runs a browser/device-style flow (polls `/api/cli/login/poll`) and stores
+  `CloudAuthState` in `~/.rudder/cloud.json` (`cloudAuthPath()`, mode `0o600`): `token`,
+  `cloudUrl`, `defaultRuntime`, `byocSshHost`, `accountId`, `email`, `expiresAt`.
+- `onload` snapshots the current Rudder workspace (repo + selected HOME auth/config) and
+  uploads it via an S3 presigned URL so a worker can continue the task.
+- Error messages prefer the parsed server error, then the body, then `<status>
+  <statusText>` (so empty gateway responses still report a code).
+
+### 9.3 Auth + account isolation
+Better Auth handles Google + GitHub OAuth; there is also a GitHub device flow and a
+`gh auth token` exchange. The control plane issues a Rudder CLI token stored HASHED as
+`rdr_<base64>` in `rudder_tokens`. Every query is keyed to an `account_id`
+(`github:<id>` or `better-auth:<uuid>`), so tenants never see each other's sails or
+workspaces. Worker-to-control-plane auth uses a separate `RUDDER_WORKER_TOKEN`
+(`rdrw_*`); client streaming uses the user token. Admin endpoints are gated by
+`RUDDER_ADMIN_EMAILS`.
+
+### 9.4 Snapshots
+`createSnapshot` stages the repo (via `git ls-files`) + a small set of HOME paths +
+metadata, packaged as a `.tgz` (`repo/`, `home/`, `env/cloud-env.json`,
+`manifest.json`) and stored to S3 at `snapshots/{accountId}/{date}/{uuid}.tgz`
+(AES256, 1-hour presigned URLs). It deliberately EXCLUDES secrets and bulk: `.ssh`,
+`.gnupg`, keychains, `.env*`, key files, and `.cache`/`node_modules`/worktrees. On
+macOS it extracts Claude OAuth tokens from the Keychain into `.claude/.credentials.json`
+so the worker can authenticate. Env capture is allow-listed (`*_API_KEY`/`*_TOKEN`/
+`*_SECRET` plus `RUDDER_CLOUD_ENV_VARS`) and excludes `PATH`/`HOME`/`USER`/shell/Rudder
+internals.
+
+### 9.5 Control plane (`cloud/src/server.ts`)
 A plain Node `http` server (no framework). Dependencies: `better-auth` +
-`better-sqlite3` (sessions/accounts), `@aws-sdk/client-s3` +
-`s3-request-presigner` (workspace snapshots), `ws` (streaming).
-Route groups:
-- `/api/auth/*` (better-auth)
-- `/api/cli/login`, `/api/cli/login/github-token`, `/api/cli/login/poll`
-- `/api/rudder/setup/{github,google}`
-- `/api/rudder/sail*` (launch/list/manage cloud workers, backed by Fly Machines)
-- `/api/rudder/workspace*` (onload, lookup, attach, snapshot presign)
-- `/api/admin/workspace/gc`
-Deploy config in `cloud/fly.toml` + `cloud/Dockerfile`.
+`better-sqlite3` (auth + state), `@aws-sdk/client-s3` + `s3-request-presigner`
+(snapshots), `ws` (streaming). Route groups: `/api/auth/*` (better-auth), `/api/cli/
+login*`, `/api/rudder/setup/{github,google}`, `/api/rudder/sail*`,
+`/api/rudder/workspace*`, `/api/admin/workspace/gc`. State is a SQLite db (`/tmp/
+rudder-cloud/rudder-cloud.sqlite` locally, or restored from S3 at
+`RUDDER_CLOUD_STATE_KEY`) with tables: `rudder_tokens`, `rudder_sails`,
+`rudder_workspaces` (unique on `account_id + workspace_key`), `rudder_settings` (OAuth
+client ids/secrets), plus the Better Auth tables. **Stateless control plane:** when
+`RUDDER_CLOUD_PERSIST_STATE=1` and `RUDDER_S3_BUCKET` is set, SQLite is restored from S3
+on boot and persisted after each request (debounced), so the Fly app can restart without
+losing sails/workspaces. Deploy config: `cloud/fly.toml` + `cloud/Dockerfile`.
 
-### Worker image (`cloud/worker/`)
-`Dockerfile` + `entrypoint.sh` + `supervisor.mjs`: the container that restores a
-snapshot and runs the agent away from the laptop.
+### 9.6 Runtimes: Fly Machines + BYOC
+- **Fly Machines (managed):** `createFlyMachine` POSTs `/v1/apps/{app}/machines` with
+  `RUDDER_WORKER_IMAGE` (`auto_destroy:false`). Idle pause via `shouldPauseStaleSail`;
+  workspace idle-stop via `sweepIdleWorkspaces`; true cleanup via the admin GC.
+- **BYOC (bring your own compute):** `byoVmBootstrapCommand` emits a `docker run` script
+  (with `arm64` detection) that `startByoVmWorkerOverSsh` runs over SSH (under `nohup`
+  unless `RUDDER_BYOC_AUTOSTART=0`). BYOC cannot pause/resume (only stop); its state
+  comes from heartbeats only.
+
+### 9.7 WebSocket streaming
+Each sail/workspace has a `Channel`: one worker WS + N client WS + a ~256KB ring buffer
+replayed on attach. The worker pipes PTY bytes as binary frames; the control plane
+broadcasts them to clients (permessage-deflate for frames over ~1KB). A channel is
+disposed when the worker and all clients disconnect. (This is a WebSocket bridge, not an
+SSH tunnel: no key distribution, simpler firewall traversal, but Fly must not strip the
+`Upgrade` header.)
+
+### 9.8 Worker image (`cloud/worker/`)
+`Dockerfile` (base `node:22-slim`, runs as non-root `rudder`) + `entrypoint.sh` +
+`supervisor.mjs`. The supervisor installs the agent CLIs (claude-code, codex, acpx,
+hunkdiff), fetches + restores the snapshot from `RUDDER_SNAPSHOT_URL`, handles migrated
+agents (`migration.json`), spawns `rudder` (workspace) or `rudder codex --worktree
+<task>` (sail) under a `node-pty` 120x32, bridges I/O to the control-plane WS, and
+reports a final heartbeat on exit. On restart it checks `.rudder-staged.json` and
+re-fetches a fresh signed URL from the snapshot-url endpoint.
+
+### 9.9 Known limitations (current state, not action items)
+Documented so they are not rediscovered: workspace re-use ignores a newer snapshot with
+the same fingerprint; migrated-agent fresh-prompt fallback is silent on a corrupt
+`run.json`; deleting a workspace SQLite row can orphan its Fly volume; worker tokens
+(`rdrw_*`) and Rudder CLI tokens never expire/rotate; an expired presigned URL can hang
+silently if the snapshot-url endpoint is unreachable; BYOC has no crash timeout (can sit
+"running"); OAuth reconfig has no rollback; attach-during-restart replays the pre-pause
+buffer; `includeRudderState` copies all `run.json` with no pruning. The cloud path is
+functional but less battle-tested than the local dashboard; treat it as beta.
 
 ---
 
@@ -460,7 +560,8 @@ From `package.json`:
 - `npm test` = `tsc` then `node --test tests/*.test.mjs`.
 - `npm run test:worker-scroll` = a focused subset of cargo tests for worker-pane
   scrollback behavior.
-- Native tests: `cargo test --manifest-path native/Cargo.toml` (101 tests).
+- Native tests: `cargo test --manifest-path native/Cargo.toml` (231 tests + one
+  `#[ignore]`d live conductor harness, run with `-- --ignored --nocapture`).
 
 `tests/` are integration tests that import from `dist/` (so build first):
 `rebase-first.test.mjs` exercises merge/rebase/sync via `git.ts` + `state.ts`.
@@ -589,9 +690,28 @@ and runs them as a fleet. This section is the map of that orchestrator.
   `rudder __worker` subprocesses. When the TUI is up it starts the daemon
   **projector-only** (`scheduler:false`): the board serves HTTP+SSE and reflects
   `graph.json` but never launches — so there is no double-launch.
-- `graph.json` is a **one-way mirror**: the TUI writes it, the daemon/board read it;
-  the TUI never reads it back for scheduling. They are mutually-exclusive schedulers,
-  not duplicates — one runtime for live panes (Rust), one for headless/web (TS).
+- `graph.json` is a **one-way mirror**: the TUI writes it (coalesced — the payload is
+  hashed and the write skipped when unchanged), the daemon/board read it; the TUI never
+  reads it back for scheduling. They are mutually-exclusive schedulers, not duplicates —
+  one runtime for live panes (Rust), one for headless/web (TS).
+
+**The scheduler: queue, gates, cadence.** `planned_nodes` IS the queue (the Todo
+section); a node is "launched" when `run_scheduler` removes it and spawns a worker
+(`AgentRun`, `Running`). `run_scheduler` runs on approval and on the
+`SCHEDULER_TICK_INTERVAL = 8`-poll-tick cadence (~260 ms), and a node leaves the queue
+only when **three gates** all pass: (1) **approval** — nothing launches while
+`awaiting_approval`; (2) **readiness** — `next_node_to_launch` picks the first node
+whose every hard dep is `merged` (`PlannedNode::is_ready`; a dep absent from the plan
+counts satisfied, so dangling deps never deadlock; soft deps never gate); (3)
+**parallelism** — `running_plan_agents()` is under `max_parallel()` (config
+`orchestrator.maxParallel`, default 1000). At most `MAX_LAUNCH_PER_TICK = 2` start per
+pass (each launch synchronously shells a jj-workspace setup, so launches are spread to
+keep the UI responsive); readiness is recomputed before each pick. `next_node_to_launch`
+is a **pure decision** (no side effects), which is why scheduling is deterministic and
+unit-testable without spawning PTYs. A merge flips a node to `Merged`, which satisfies
+its children's hard deps so they launch on the next tick — that ripple is how the DAG
+flows. Stopping a node (`stop_agent_at`, `x`) keeps its jj workspace, frees its slot
+(`Stopped` is not counted), and never enters the merged set (hard children stay blocked).
 
 ### 14.3 Readiness contract (the dedup)
 A node is READY iff: it is still `planned`, every HARD parent is `merged` (a hard dep
@@ -620,12 +740,38 @@ ref), and every JUDGE parent is `review`|`merged`. SOFT parents never gate.
    orchestrator pane) and **undoable** (jj op-log via `rudder undo`).
 
 ### 14.5 Conductor capabilities (BUILT vs PLANNED)
-- **Auto-expand from completion** (BUILT). A finished worker calls **`rudder done`**
-  (it echoes a `RUDDER_DONE` block to its PTY and appends to `DECISIONS.md`); the poll
-  loop's `maybe_ingest_worker_followups` → `parse_worker_done_block` →
-  `apply_worker_followups` grows the DAG from the agent's recommended follow-ups
-  (dedupe by title, `MAX_FOLLOWUP_DEPTH` via `followup_gen`, `MAX_PLAN_TASKS` cap,
-  soft-by-default deps, `scope:"out"` recorded-not-injected). Logged to `activity_log`.
+- **Auto-expand from completion** (BUILT). A finished worker reports via **`rudder
+  done`**, and `maybe_ingest_worker_followups` → `ingest_worker_followups` →
+  `apply_worker_followups` grows the DAG from its recommended follow-ups. The report
+  travels back over **three channels of decreasing robustness**, read in order so a
+  real interactive Claude/Codex agent's report is not lost to terminal rendering:
+  1. **Sidecar file (authoritative).** The launcher sets `RUDDER_DONE_FILE =
+     <workspace>/.rudder/done/<node>.json` on the worker; `rudder done` writes the JSON
+     note there (atomic temp+rename, `surfaces.writeCompletionNoteFile`). The conductor
+     reads it straight off disk — it never passes through the agent's TUI, so it
+     survives any boxing/truncation/wrapping. Keyed by node id; under the gitignored
+     `.rudder/` so jj never merges it.
+  2. **PTY-scrape (fallback).** `parse_worker_done_block` scans the worker's scrollback
+     for the last `RUDDER_DONE_START..END` block (ANSI-stripped). The tail is flushed
+     before reading so an unfocused worker that printed-and-exited isn't missed.
+  3. **Haiku backstop (final).** If neither channel yielded structured follow-ups —
+     including a FREEFORM prose report (`{summary: raw}` with no `followups` field) —
+     `spawn_completion_backstop` runs a one-shot haiku summarizer over the worker's
+     `jj_diff_text` (≤16k chars) to reconstruct the note, feeding it the agent's own
+     prose. Cleanly-Done workers only (a Failed/Stopped worker's note is read but not
+     backstopped, since its half-finished diff invites noise). The run is held
+     `pending` (not ingested) until the summarizer returns, so it is never re-spawned.
+  An explicit empty `followups: []` is TRUSTED (no backstop). Guards in
+  `apply_worker_followups`: dedupe by normalized title (`followup_title_exists` checks
+  queued + running), `MAX_FOLLOWUP_DEPTH = 3` via `followup_gen`, `MAX_PLAN_TASKS = 100`
+  cap, soft-by-default deps (hard only with explicit deps), `scope:"out"`
+  case-insensitive and recorded-not-injected. The "ingested" ledger
+  (`followups_ingested`) is persisted to `.rudder/ingestion-ledger.json` and reloaded
+  on startup so a restart never re-ingests/re-summarizes a handled worker; re-goaling a
+  worker clears its entry so its NEXT report is ingested. CRITICAL ORDERING: ingest runs
+  BEFORE `maybe_auto_merge` in the poll loop — a candidate is only ingested while still
+  `Done`, and auto-merge flips `Done → Merged`, so merging first would drop follow-ups
+  under `/automerge`. Every grow is logged to `activity_log`.
 - **Reconcile** (BUILT). Typing a task post-launch injects ONE node
   (`reconcile_injection` → `evaluate_completed_reconcile`).
 - **Steering** (BUILT: `stop_agent_at` wired to `x`; `regoal_agent_at`/`live_inject_at`
@@ -665,7 +811,12 @@ ref), and every JUDGE parent is `review`|`merged`. SOFT parents never gate.
 - **`RUDDER.md`** — read-only, orchestrator-owned, `freshness:`-stamped projection of
   the plan/status that workers re-read (`renderLiveRudderMd`). Git-excluded.
 - **`rudder done [--node <id>] '<json>'`** — `{summary, interfaces, followups:[{title,
-  why, scope}]}` from stdin or args (freeform fallback). Records only; no jj.
+  why, scope}]}` from stdin or args. `parseCompletionNoteArg` (`src/surfaces.ts`)
+  accepts a bare object, a fenced ```json block, and falls back to `{summary: raw}` for
+  prose/arrays/primitives. Writes ALL THREE completion channels: the sidecar file at
+  `$RUDDER_DONE_FILE` (authoritative), a human bullet in `DECISIONS.md`, and the
+  `RUDDER_DONE` stdout block (legacy scrape). Records only; no jj. See §14.5 for how the
+  conductor consumes them.
 
 ### 14.7 Merge model
 Manual by default (`m`/`M`); a hard-dep child launches only once its parent reaches
@@ -680,11 +831,42 @@ surfaced, never silently truncated). `MAX_FOLLOWUP_DEPTH = 3`. Concurrency:
 `max_parallel()` (config `orchestrator.maxParallel`, default 1000), `MAX_LAUNCH_PER_TICK`.
 
 ### 14.9 Status
-Built so far: cap=100, `rudder done` + completion notes, readiness dedup, auto-expand +
-activity log, steering primitives (re-goal/inject/stop, `x` keybinding),
-**autonomous drift handling** (file-overlap → coordination nudge), and **plan-rebase**
-(structural-vs-additive classify → build-forward diff/apply, §14.5). The conductor
-loop — plan → approve → CONDUCT (auto-expand, steer, drift, rebase) — is functionally
-complete. Planned (approved v3 plan): an explicit `OrchestratorMode` enum/header
-(behaviour already derives from `refining`/`rebasing`/`awaiting_approval`), and the
-remaining DAG-edit steering (edge promote/demote, extract-shared, reorder).
+Built and shipped: cap=100; the `rudder done` completion report over three channels
+(sidecar file, PTY scrape, haiku diff-backstop) with a persisted ingest ledger;
+readiness dedup; auto-expand + activity log; steering primitives (re-goal/inject/stop,
+`x`); autonomous drift handling (file-overlap to coordination nudge); and plan-rebase
+(structural-vs-additive classify to build-forward diff/apply, §14.5). The conductor
+loop (plan, approve, then CONDUCT: auto-expand, steer, drift, rebase) is functionally
+complete and adversarially hardened across the completion pathway (freeform recovery,
+ingest-before-merge ordering, restart durability via the ledger). Planned (approved v3
+plan): an explicit `OrchestratorMode` enum/header (behaviour already derives from
+`refining`/`rebasing`/`awaiting_approval`), and the remaining DAG-edit steering (edge
+promote/demote, extract-shared, reorder).
+
+### 14.10 Product decisions (the durable "why")
+Recorded so future contributors do not relitigate them:
+- **Autonomy without a confirm gate.** The conductor acts unilaterally (auto-expand,
+  drift-fix, plan-rebase, merges). The bargain is VISIBLE (every action lands in
+  `activity_log`) and UNDOABLE (jj op-log via `rudder undo`), not gated. The only
+  explicit-intent action is reverting already-MERGED work (build-forward).
+- **Worktree isolation.** Every run gets its own jj workspace, never nested in the repo,
+  so concurrent agents never collide live; the only real cross-agent risks are a future
+  merge conflict (jj records it, the AI resolver fixes it) or interface drift (the hard
+  edge is the guard).
+- **TUI-primary scheduler, daemon projector.** The Rust TUI is the sole dispatcher in
+  interactive use and hosts the PTYs in-process; the daemon runs projector-only
+  (`scheduler:false`) while the TUI is live, so there is never a double-launch. One
+  one-way, coalesced `graph.json` mirror; the TUI never reads it back.
+- **Determinism by construction.** Scheduling, merge, and lifecycle are a pure state
+  machine over the DAG (`next_node_to_launch` has no side effects); the LLM
+  non-determinism is quarantined in isolated workspaces and rejoins only at explicit
+  gates. Readiness is a single shared spec (`tests/fixtures/readiness-cases.json`),
+  parity-tested across Rust and TS.
+- **Soft vs hard edges.** Hard edges (wait for MERGE) are the minimal blocking set; soft
+  edges are context-only so siblings run in parallel.
+- **Graceful completion capture.** Three channels plus a diff-backstop so even a silent
+  or prose-only agent advances the plan; an explicit empty follow-up list is trusted.
+- **Thin theme.** Emphasis by COLOR, not weight (uniform font). No em dashes in UI or
+  copy; no "massively parallel" framing in marketing.
+- **jj is the substrate.** Internally jj (Jujutsu), externally git; global undo via
+  `jj op restore`. Never reintroduce the removed "R restart" agent feature.
