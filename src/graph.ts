@@ -331,15 +331,19 @@ export function isReady(graph: RudderGraph, node: TaskNode): boolean {
   if (node.status !== "planned") {
     return false;
   }
-  const hardMet = hardParents(graph, node.id).every(
-    (parentId) => graph.nodes[parentId]?.status === "merged",
-  );
+  // A hard dep id that is NOT part of the plan (pruned or never existed) is treated
+  // as satisfied, matching the Rust scheduler's permissive rule: never deadlock on a
+  // dangling reference. Otherwise the parent must be merged.
+  const hardMet = hardParents(graph, node.id).every((parentId) => {
+    const parent = graph.nodes[parentId];
+    return parent === undefined || parent.status === "merged";
+  });
   if (!hardMet) {
     return false;
   }
   return judgeParents(graph, node.id).every((parentId) => {
-    const status = graph.nodes[parentId]?.status;
-    return status === "review" || status === "merged";
+    const parent = graph.nodes[parentId];
+    return parent === undefined || parent.status === "review" || parent.status === "merged";
   });
 }
 

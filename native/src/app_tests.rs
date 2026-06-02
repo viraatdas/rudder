@@ -1848,6 +1848,64 @@ branch refs/heads/main\n";
     }
 
     #[test]
+    fn readiness_parity_fixture() {
+        // The SAME fixture is consumed by the TS parity test
+        // (tests/readiness-parity.test.mjs). If the readiness rule changes, edit the
+        // fixture once and both suites fail until both implementations agree. This is
+        // the dedup that keeps the TUI (Rust) and daemon (TS) schedulers from drifting.
+        let raw = include_str!("../../tests/fixtures/readiness-cases.json");
+        let fixture: serde_json::Value = serde_json::from_str(raw).expect("fixture json");
+        for case in fixture["cases"].as_array().expect("cases") {
+            let name = case["name"].as_str().unwrap_or("?");
+            let nodes = case["nodes"].as_object().expect("nodes");
+            let edges = case["edges"].as_array().expect("edges");
+            let merged: Vec<String> = nodes
+                .iter()
+                .filter(|(_, v)| v.as_str() == Some("merged"))
+                .map(|(k, _)| k.clone())
+                .collect();
+            let plan_ids: Vec<String> = nodes.keys().cloned().collect();
+            let parents = |to: &str, kind: &str| -> Vec<String> {
+                edges
+                    .iter()
+                    .filter(|e| e["to"].as_str() == Some(to) && e["type"].as_str() == Some(kind))
+                    .filter_map(|e| e["from"].as_str().map(str::to_string))
+                    .collect()
+            };
+            let mut ready: Vec<String> = Vec::new();
+            for (id, status) in nodes.iter() {
+                if status.as_str() != Some("planned") {
+                    continue; // is_ready only governs queued nodes
+                }
+                let node = PlannedNode {
+                    id: id.clone(),
+                    title: id.clone(),
+                    prompt: "p".to_string(),
+                    goal: None,
+                    success: None,
+                    deps: parents(id, "hard"),
+                    soft_deps: parents(id, "soft"),
+                    backend: None,
+                    model: None,
+                    effort: None,
+                };
+                if node.is_ready(&merged, &plan_ids) {
+                    ready.push(id.clone());
+                }
+            }
+            ready.sort();
+            let mut expected: Vec<String> = case["expectedReady"]
+                .as_array()
+                .expect("expectedReady")
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect();
+            expected.sort();
+            assert_eq!(ready, expected, "readiness parity case: {name}");
+        }
+    }
+
+    #[test]
     fn rudder_plan_worker_prompt_always_leads_with_goal_and_done_when() {
         let task = RudderPlanTask {
             id: "n0".to_string(),

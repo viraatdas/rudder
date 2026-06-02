@@ -1,0 +1,61 @@
+{
+  "comment": "Shared readiness contract for BOTH schedulers (Rust native/src/tasks.rs PlannedNode::is_ready and TS src/graph.ts isReady). A node is READY when: it is still 'planned', every HARD parent is 'merged', and a hard dep id that is NOT part of the plan is treated as satisfied (permissive: never deadlock on a dangling ref). SOFT parents never gate. (Judge parents gate on review|merged; judge is exercised only in the TS suite until the TUI grows fan-out, so judge cases live in graph.test.mjs, not here.) Edit this file once; the Rust + TS parity tests both fail until both implementations match.",
+  "cases": [
+    {
+      "name": "zero-dep root is ready",
+      "nodes": { "n0": "planned" },
+      "edges": [],
+      "expectedReady": ["n0"]
+    },
+    {
+      "name": "hard dep blocks until the parent merges",
+      "nodes": { "n0": "planned", "n1": "planned" },
+      "edges": [{ "from": "n0", "to": "n1", "type": "hard" }],
+      "expectedReady": ["n0"]
+    },
+    {
+      "name": "hard dep satisfied once the parent is merged",
+      "nodes": { "n0": "merged", "n1": "planned" },
+      "edges": [{ "from": "n0", "to": "n1", "type": "hard" }],
+      "expectedReady": ["n1"]
+    },
+    {
+      "name": "soft dep never gates (both run in parallel)",
+      "nodes": { "n0": "planned", "n1": "planned" },
+      "edges": [{ "from": "n0", "to": "n1", "type": "soft" }],
+      "expectedReady": ["n0", "n1"]
+    },
+    {
+      "name": "dangling hard dep is satisfied (no deadlock on a pruned/unknown parent)",
+      "nodes": { "n1": "planned" },
+      "edges": [{ "from": "ghost", "to": "n1", "type": "hard" }],
+      "expectedReady": ["n1"]
+    },
+    {
+      "name": "a non-planned (running) node is never ready",
+      "nodes": { "n0": "running" },
+      "edges": [],
+      "expectedReady": []
+    },
+    {
+      "name": "diamond: D waits for BOTH B and C to merge",
+      "nodes": { "a": "merged", "b": "planned", "c": "planned", "d": "planned" },
+      "edges": [
+        { "from": "a", "to": "b", "type": "hard" },
+        { "from": "a", "to": "c", "type": "hard" },
+        { "from": "b", "to": "d", "type": "hard" },
+        { "from": "c", "to": "d", "type": "hard" }
+      ],
+      "expectedReady": ["b", "c"]
+    },
+    {
+      "name": "multiple hard deps, all merged → ready",
+      "nodes": { "a": "merged", "b": "merged", "d": "planned" },
+      "edges": [
+        { "from": "a", "to": "d", "type": "hard" },
+        { "from": "b", "to": "d", "type": "hard" }
+      ],
+      "expectedReady": ["d"]
+    }
+  ]
+}
