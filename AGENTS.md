@@ -628,11 +628,21 @@ ref), and every JUDGE parent is `review`|`merged`. SOFT parents never gate.
   soft-by-default deps, `scope:"out"` recorded-not-injected). Logged to `activity_log`.
 - **Reconcile** (BUILT). Typing a task post-launch injects ONE node
   (`reconcile_injection` → `evaluate_completed_reconcile`).
-- **Steering** (PLANNED): re-goal-via-session-resume, live-inject, stop, edge
-  promote/demote, extract-shared-node, drop, reorder.
-- **Drift detection + fix** (PLANNED): file-overlap (`jj diff --name-only`) +
-  DECISIONS.md interface notes → serialize / extract / order; the merge-time AI
-  resolver is the last resort.
+- **Steering** (BUILT: `stop_agent_at` wired to `x`; `regoal_agent_at`/`live_inject_at`
+  are the toolkit the autonomous drift-fix uses and chat routing will use):
+  re-goal-via-session-resume, live-inject, stop. (PLANNED: edge promote/demote,
+  extract-shared-node, drop, reorder.)
+- **Drift detection + fix** (BUILT). `maybe_handle_drift` (poll loop, ~5s throttle)
+  predicts cross-agent collisions: agents are isolated so the signal is two RUNNING
+  workers modifying the SAME file (`jj_touched_files` = `jj diff --name-only`).
+  **Product decision — AUTONOMOUS, no confirm** (the user chose this; it is consistent
+  with the no-confirm conductor bargain): on a newly-detected collision the conductor
+  **live-injects a coordination note** into the later-launched agent so it adapts
+  in-flight (integrate on top, coordinate via DECISIONS.md) — the LEAST-disruptive
+  autonomous fix (no restart, no stop), with the merge-time AI resolver as the
+  backstop if they still conflict. Each pair is nudged once (`surfaced_overlaps`) and
+  every action is logged to `activity_log`. (Semantic/interface drift via an LLM
+  classifier is a gated future enhancement; file-overlap is the shipped heuristic.)
 - **Plan-rebase** (PLANNED): a structural mid-flight change re-decomposes against the
   current repo; MERGED = baseline (build-forward, never auto-undo), RUNNING =
   keep/re-goal/stop, TODO = replace; applied as a reviewable diff.
@@ -661,5 +671,7 @@ surfaced, never silently truncated). `MAX_FOLLOWUP_DEPTH = 3`. Concurrency:
 
 ### 14.9 Status
 Built so far: cap=100, `rudder done` + completion notes, readiness dedup, auto-expand +
-activity log. Planned (approved v3 plan): the `OrchestratorMode` plan→conduct state
-machine + chat routing, steering primitives, drift detection/fix, and plan-rebase.
+activity log, steering primitives (re-goal/inject/stop, `x` keybinding), and
+**autonomous drift handling** (file-overlap → coordination nudge). Planned (approved v3
+plan): the `OrchestratorMode` plan→conduct state machine + chat routing, the remaining
+DAG-edit steering (edge promote/demote, extract-shared, reorder), and plan-rebase.

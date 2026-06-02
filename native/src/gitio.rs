@@ -1036,6 +1036,35 @@ pub(crate) fn conflicted_files(cwd: &Path) -> Vec<String> {
 /// Files with unresolved jj conflicts in `cwd` (via `jj resolve --list`). Empty when
 /// the working copy is conflict-free. `jj resolve --list` exits non-zero and prints
 /// to stderr when there are no conflicts, so a failed/empty stdout means "none".
+/// The repo-relative paths a jj workspace has modified in its working-copy change
+/// (`jj diff --name-only`), excluding Rudder's own coordination files. Cheap; used
+/// to predict cross-agent collisions before they reach a merge. Empty on any error
+/// or non-jj cwd.
+pub(crate) fn jj_touched_files(cwd: &Path) -> Vec<String> {
+    let Ok(output) = Command::new("jj")
+        .args(["diff", "--name-only", "--no-pager"])
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| {
+            // Rudder writes RUDDER.md / DECISIONS.md as coordination surfaces; they
+            // are not real cross-agent collisions.
+            !line.ends_with("RUDDER.md") && !line.ends_with("DECISIONS.md")
+        })
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
 pub(crate) fn jj_unresolved_conflicts(cwd: &Path) -> Vec<String> {
     let Ok(output) = Command::new("jj")
         .args(["resolve", "--list"])

@@ -2777,6 +2777,28 @@ branch refs/heads/main\n";
     }
 
     #[test]
+    fn overlapping_files_finds_shared_paths() {
+        let a = vec!["src/app.js".to_string(), "README.md".to_string()];
+        let b = vec!["src/app.js".to_string(), "src/auth.js".to_string()];
+        assert_eq!(overlapping_files(&a, &b), vec!["src/app.js".to_string()]);
+        assert!(overlapping_files(&a, &["x".to_string()]).is_empty());
+    }
+
+    #[test]
+    fn drift_scan_noops_without_two_running_agents() {
+        let mut app = App::new();
+        app.cwd = std::env::temp_dir();
+        let mut a = test_agent_run("n0a", "x");
+        a.node_id = Some("n0".to_string());
+        a.mode = AgentMode::Execute;
+        a.status = AgentStatus::Running;
+        app.agents = vec![a];
+        app.maybe_handle_drift();
+        assert!(app.activity_log.is_empty(), "no drift action with <2 running agents");
+        assert!(app.last_drift_scan.is_some(), "the scan still stamps its throttle");
+    }
+
+    #[test]
     fn steering_guards_refuse_unsafe_targets() {
         // No real agent spawn happens in these (early-return guards only).
         let mut app = App::new();

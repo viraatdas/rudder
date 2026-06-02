@@ -369,6 +369,11 @@ struct App {
     /// Auto-expansion depth per node id (0 = human/plan/reconcile origin; a node
     /// auto-created from a finishing node inherits parent+1). Caps runaway chains.
     followup_gen: HashMap<String, u8>,
+    /// Node-id pairs the drift scan has already acted on, so a given collision is
+    /// nudged once (not every scan). Key is the pair sorted lexically.
+    surfaced_overlaps: HashSet<(String, String)>,
+    /// Throttle for the (shell-out) cross-agent drift scan; runs at most ~every 5s.
+    last_drift_scan: Option<Instant>,
     /// Scroll offset (lines from the top) for the orchestrator DAG command-center
     /// view. The DAG is a static line list (not a PTY), so it needs its own offset
     /// to read a long plan. Reset to 0 whenever the selected agent changes; clamped
@@ -718,6 +723,8 @@ impl App {
             activity_log: Vec::new(),
             followups_ingested: HashSet::new(),
             followup_gen: HashMap::new(),
+            surfaced_overlaps: HashSet::new(),
+            last_drift_scan: None,
             orch_dag_scroll: 0,
             agents_area: None,
             worker_area: None,
@@ -6078,7 +6085,6 @@ impl App {
     /// STEERING: write a line of context straight into a RUNNING agent's PTY (it
     /// picks it up on its next turn). Returns false if there is no live terminal
     /// (the caller can fall back to re-goal-via-resume).
-    #[allow(dead_code)]
     fn live_inject_at(&mut self, index: usize, text: &str) -> bool {
         let result = match self.agents.get_mut(index).and_then(|run| run.terminal.as_mut()) {
             Some(terminal) => {
@@ -6126,6 +6132,83 @@ impl App {
         self.push_activity(format!("stopped {label}"));
         self.mirror_graph();
         true
+    }
+
+    /// AUTONOMOUS DRIFT (2c): predict cross-agent collisions and act WITHOUT a confirm
+    /// (product decision: autonomous, see AGENTS.md §14.5). Agents are isolated, so the
+    /// concrete signal is two RUNNING workers modifying the SAME file in their separate
+    /// jj workspaces (a future merge conflict). The least-disruptive autonomous fix is
+    /// to live-INJECT a coordination note into the later-launched agent so it adapts
+    /// in-flight (no restart, no stop) and the merge stays clean; the merge-time AI
+    /// resolver remains the backstop. Each colliding pair is nudged once. Throttled.
+    fn maybe_handle_drift(&mut self) {
+        if let Some(last) = self.last_drift_scan {
+            if last.elapsed() < Duration::from_secs(5) {
+                return;
+            }
+        }
+        self.last_drift_scan = Some(Instant::now());
+
+        let running: Vec<(usize, String, PathBuf)> = self
+            .agents
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| {
+                r.node_id.is_some()
+                    && matches!(r.mode, AgentMode::Execute)
+                    && r.status == AgentStatus::Running
+                    && !r.merge_resolver
+            })
+            .map(|(i, r)| (i, r.node_id.clone().unwrap_or_default(), r.cwd.clone()))
+            .collect();
+        if running.len() < 2 {
+            return;
+        }
+        let touched: Vec<(usize, String, Vec<String>)> = running
+            .into_iter()
+            .map(|(i, id, cwd)| (i, id, jj_touched_files(&cwd)))
+            .collect();
+
+        // Phase 1: find newly-colliding pairs (mutates only surfaced_overlaps).
+        let mut nudges: Vec<(usize, String, String, Vec<String>)> = Vec::new();
+        for a in 0..touched.len() {
+            for b in (a + 1)..touched.len() {
+                let overlap = overlapping_files(&touched[a].2, &touched[b].2);
+                if overlap.is_empty() {
+                    continue;
+                }
+                let (ia, ida) = (touched[a].0, touched[a].1.clone());
+                let (ib, idb) = (touched[b].0, touched[b].1.clone());
+                let key = if ida <= idb {
+                    (ida.clone(), idb.clone())
+                } else {
+                    (idb.clone(), ida.clone())
+                };
+                if !self.surfaced_overlaps.insert(key) {
+                    continue; // already nudged this pair
+                }
+                // Nudge the LATER-launched agent (higher index ~ later, less invested).
+                let later_index = if ia >= ib { ia } else { ib };
+                nudges.push((later_index, ida, idb, overlap));
+            }
+        }
+        // Phase 2: act (mutates agents + activity log).
+        for (later_index, a_id, b_id, files) in nudges {
+            let note = format!(
+                "Heads up from Rudder: a sibling agent is also editing {} (predicted merge overlap). Coordinate via DECISIONS.md and integrate ON TOP of those files rather than restructuring them; whoever merges first sets the base.",
+                files.join(", ")
+            );
+            let injected = self.live_inject_at(later_index, &note);
+            self.push_activity(format!(
+                "drift: {a_id} & {b_id} overlap on {} - {}",
+                files.join(","),
+                if injected {
+                    "nudged the later agent to coordinate"
+                } else {
+                    "noted (no live pane); merge resolver will reconcile"
+                }
+            ));
+        }
     }
 
     fn start_conflict_resolution_agent(&mut self) {
@@ -6785,6 +6868,11 @@ What to do\n\
         if self.scheduler_tick % SCHEDULER_TICK_INTERVAL == 0 {
             self.maybe_ingest_worker_followups();
         }
+        // Predict cross-agent collisions and nudge the later agent to coordinate
+        // (autonomous; self-throttled to ~5s). No confirm.
+        if self.scheduler_tick % SCHEDULER_TICK_INTERVAL == 0 {
+            self.maybe_handle_drift();
+        }
 
         // Advance the spinner each tick and force a redraw while an orchestrator is
         // still planning, so "decomposing the task..." animates even when the
@@ -7103,6 +7191,12 @@ fn run(terminal: &mut Tui) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The files two agents' touched-file sets share (the predicted merge collision).
+/// Pure, so the drift pairing is unit-testable without jj.
+fn overlapping_files(a: &[String], b: &[String]) -> Vec<String> {
+    a.iter().filter(|f| b.contains(f)).cloned().collect()
 }
 
 /// Parse the LAST RUDDER_DONE block a finished worker echoed (via `rudder done`)
