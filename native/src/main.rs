@@ -5240,9 +5240,21 @@ impl App {
     /// true if any node was added. Idempotent: the run id is marked ingested up front.
     fn ingest_worker_followups(&mut self, index: usize) -> bool {
         let (run_id, node_id, output) = {
-            let Some(run) = self.agents.get(index) else {
+            let Some(run) = self.agents.get_mut(index) else {
                 return false;
             };
+            // FLUSH the buffered tail before reading: a worker that printed its
+            // RUDDER_DONE block and exited while UNFOCUSED may have been marked Done by
+            // the cheap try_wait path without a final drain, so its block is still in the
+            // PTY buffer. We mark the run ingested below (once, no retry), so a not-yet-
+            // drained block would be lost permanently. One drain here closes that race.
+            if let Some(terminal) = run.terminal.as_mut() {
+                for _ in 0..16 {
+                    if terminal.drain_output().is_empty() {
+                        break;
+                    }
+                }
+            }
             (
                 run.id.clone(),
                 run.node_id.clone().unwrap_or_default(),

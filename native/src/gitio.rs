@@ -851,6 +851,10 @@ pub(crate) fn prepare_jj_workspace(cwd: &Path, task: &str) -> Result<WorktreeInf
     })
 }
 
+// Live in the bin (start_review_all_agent, main.rs), but reachable only through
+// `fn main`'s event loop. In `--test` builds `fn main` is not a root, so this looks
+// unused; allow it so `cargo test` stays warning-free without deleting live code.
+#[allow(dead_code)]
 pub(crate) fn prepare_worktree(cwd: &Path, task: &str) -> Result<WorktreeInfo> {
     let repo = dashboard_root(cwd);
     if !is_git_repo(&repo) {
@@ -1205,6 +1209,9 @@ pub(crate) fn count_uncommitted_changes(cwd: &Path) -> usize {
         .unwrap_or(0)
 }
 
+// Called only by prepare_worktree (above), so it shares the same `fn main`-only
+// reachability and the same test-build dead-code false positive.
+#[allow(dead_code)]
 pub(crate) fn worktree_path(repo_root: &Path, run_id: &str, task: &str) -> PathBuf {
     let parent = repo_root.parent().unwrap_or(repo_root);
     let repo_name = format!(

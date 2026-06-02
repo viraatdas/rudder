@@ -5663,3 +5663,152 @@ branch refs/heads/main\n";
         // no terminal and its status was left untouched.
         assert!(app.agents[0].terminal.is_none(), "reconcile planner is not resumed");
     }
+
+    // ---- LIVE conductor simulation (opt-in) -------------------------------------
+    //
+    // A scripted end-to-end run of the REAL conductor brain: the real scheduler, real
+    // worker PTYs, and the real auto-expand loop, driven headlessly. Workers are FAKE
+    // (a tiny shell script injected via RUDDER_CODEX_BIN) so there are no API keys, no
+    // network, and no jj/rudder shim (a non-git cwd makes prepare_jj_workspace run the
+    // worker in place). It spawns real processes + sleeps, so it is #[ignore]d; run it
+    // with: `cargo test conductor_live -- --ignored --nocapture` to watch the timeline.
+
+    const FAKE_CONDUCTOR_WORKER: &str = "#!/bin/sh\n\
+        # A stand-in for `codex exec` (RUDDER_CODEX_BIN). Ignores all args; reports a\n\
+        # completion note with one in-scope follow-up, then exits cleanly.\n\
+        printf 'RUDDER_DONE_START\\n'\n\
+        printf '{\"summary\":\"did the work\",\"interfaces\":\"added a module\",\"followups\":[{\"title\":\"write integration tests\",\"why\":\"cover the new module\",\"scope\":\"in\"}]}\\n'\n\
+        printf 'RUDDER_DONE_END\\n'\n";
+
+    #[test]
+    #[ignore = "live conductor simulation: spawns fake worker processes + sleeps; run with --ignored --nocapture"]
+    fn conductor_live_run_drains_dag_with_fake_workers() {
+        let repo = unique_test_repo("conductor-live");
+        let worker = repo.join("fake-worker.sh");
+        fs::write(&worker, FAKE_CONDUCTOR_WORKER).expect("write fake worker");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&worker).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&worker, perms).unwrap();
+        }
+        std::env::set_var("RUDDER_CODEX_BIN", &worker);
+
+        let mut app = App::new();
+        app.cwd = repo.clone();
+        app.backend = Backend::Codex;
+        app.auto_merge = false; // merge has its own tests; we simulate the merge event here
+        // Seed a 2-node plan: a root + a child that HARD-depends on it.
+        app.planned_nodes = vec![titled_planned_node("setup", "scaffold the project"), {
+            let mut n = titled_planned_node("feature", "build the feature");
+            n.deps = vec!["setup".to_string()];
+            n
+        }];
+        app.planned_origin = "build a small app".to_string();
+
+        println!("\n=== conductor live run ===");
+        println!("seed: [setup] (root)  ->hard->  [feature]");
+        app.run_scheduler();
+        println!("after approve: launched the ready root, feature held on its hard dep");
+
+        let node_status = |app: &App, id: &str| {
+            app.agents
+                .iter()
+                .find(|r| r.node_id.as_deref() == Some(id))
+                .map(|r| r.status)
+        };
+
+        // A node is "present" whether it is still queued in planned_nodes OR has already
+        // been launched into an agent: the conductor launches a grown follow-up the same
+        // tick it ingests it, so it leaves planned_nodes almost immediately.
+        let followup_present = |app: &App| {
+            app.planned_nodes.iter().any(|n| n.title == "write integration tests")
+                || app.agents.iter().any(|r| r.task_summary == "write integration tests")
+        };
+
+        let mut saw_followup = false;
+        let mut drained = false;
+        for tick in 0..300 {
+            app.poll_agents();
+            app.maybe_ingest_worker_followups();
+
+            // The conductor grows the DAG from a finished worker's RUDDER_DONE block;
+            // the grown node launches the same tick, so check queue AND agents.
+            if !saw_followup && followup_present(&app) {
+                saw_followup = true;
+                println!("[tick {tick}] auto-expand: a finished worker's `rudder done` grew the DAG with 'write integration tests'");
+            }
+
+            // Simulate the conductor's MERGE: any finished plan worker merges, which
+            // unblocks its hard children on the next scheduler pass (feature waits for
+            // setup's merge, not just its completion).
+            let just_done: Vec<(usize, String)> = app
+                .agents
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.node_id.is_some() && r.status == AgentStatus::Done)
+                .map(|(i, r)| (i, r.node_id.clone().unwrap_or_default()))
+                .collect();
+            if !just_done.is_empty() {
+                for (i, id) in &just_done {
+                    // A real merge (mark_agent_and_review_sources_merged) drops the PTY
+                    // too, so poll_agents stops re-marking the exited process Done; mirror
+                    // that here for a faithful simulation.
+                    app.agents[*i].terminal = None;
+                    app.agents[*i].status = AgentStatus::Merged;
+                    println!("[tick {tick}] {id} finished -> merged");
+                }
+                app.run_scheduler();
+            }
+
+            let running = app
+                .agents
+                .iter()
+                .filter(|r| r.node_id.is_some() && r.status == AgentStatus::Running)
+                .count();
+            if saw_followup
+                && app.planned_nodes.is_empty()
+                && running == 0
+                && node_status(&app, "setup") == Some(AgentStatus::Merged)
+                && node_status(&app, "feature") == Some(AgentStatus::Merged)
+            {
+                println!("[tick {tick}] DAG drained: the hard-dep child waited for its parent's merge, and the auto-grown node launched + finished");
+                drained = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        println!("\n--- activity log ---");
+        for line in &app.activity_log {
+            println!("  · {line}");
+        }
+        println!("--- final node states ---");
+        for run in &app.agents {
+            if let Some(id) = &run.node_id {
+                println!("  {id:<10} {:?}  ({})", run.status, run.task_summary);
+            }
+        }
+        println!();
+
+        std::env::remove_var("RUDDER_CODEX_BIN");
+
+        assert!(saw_followup, "a finished worker's `rudder done` grew the DAG");
+        assert!(
+            node_status(&app, "setup") == Some(AgentStatus::Merged),
+            "the root ran and merged"
+        );
+        assert!(
+            node_status(&app, "feature") == Some(AgentStatus::Merged),
+            "the hard-dependent child launched after its parent merged, then merged"
+        );
+        let followup_launched = app.agents.iter().any(|r| {
+            r.task_summary.contains("write integration tests")
+                || r.current_prompt.contains("write integration tests")
+        });
+        assert!(followup_launched, "the auto-grown follow-up node was scheduled into a worker");
+        assert!(drained, "the whole DAG drained within the tick budget");
+
+        let _ = fs::remove_dir_all(&repo);
+    }
