@@ -36,7 +36,8 @@ import {
   workerRun,
 } from "./run-manager.js";
 import { runInteractiveShell } from "./repl.js";
-import { appendDecision } from "./surfaces.js";
+import { appendCompletionNote, appendDecision, RUDDER_DONE_END, RUDDER_DONE_START } from "./surfaces.js";
+import type { CompletionNote } from "./surfaces.js";
 import { runTmuxAgentPane, runTmuxTaskPane, runTmuxWorkerIdle } from "./tmux-dashboard.js";
 import { runInteractiveTui } from "./tui.js";
 import type { BackendId } from "./types.js";
@@ -368,6 +369,11 @@ export async function main(): Promise<void> {
         throw new Error('Missing insight. Usage: rudder remember "the parser owns token budget"');
       }
       await runRemember(insight);
+      return;
+    }
+    case "done": {
+      // Worker end-of-task report (summary + interfaces + recommended follow-ups).
+      await runDone(parsed);
       return;
     }
     case "plan": {
@@ -934,6 +940,57 @@ async function runRemember(insight: string): Promise<void> {
   const repoRoot = findRepoRoot();
   await appendDecision(repoRoot, insight, "cli");
   console.log("Remembered. Appended to DECISIONS.md (shared, jj-tracked).");
+}
+
+/** Read all of stdin when it is piped (never when interactive), with a short
+ *  timeout so a worker that calls `rudder done` without piping never hangs. */
+async function readPipedStdin(timeoutMs = 3000): Promise<string> {
+  if (process.stdin.isTTY) {
+    return "";
+  }
+  return await new Promise<string>((resolve) => {
+    const chunks: Buffer[] = [];
+    const done = (): void => {
+      process.stdin.removeAllListeners("data");
+      resolve(Buffer.concat(chunks).toString("utf8"));
+    };
+    const timer = setTimeout(done, timeoutMs);
+    process.stdin.on("data", (c) => chunks.push(Buffer.from(c)));
+    process.stdin.on("end", () => {
+      clearTimeout(timer);
+      done();
+    });
+    process.stdin.on("error", () => {
+      clearTimeout(timer);
+      resolve("");
+    });
+  });
+}
+
+/** `rudder done [--node <id>] ['<json>']`: a worker's end-of-task report. Accepts
+ *  a CompletionNote JSON via stdin (piped) or as the joined args; a non-JSON arg
+ *  is treated as a freeform summary. Appends it to DECISIONS.md and echoes a
+ *  RUDDER_DONE block to stdout so the orchestrator parses it from the worker PTY.
+ *  Never manages jj - just records, like `rudder remember`. */
+async function runDone(parsed: Parsed): Promise<void> {
+  const repoRoot = findRepoRoot();
+  const node = parsed.flags.node;
+  let raw = (await readPipedStdin()).trim();
+  if (!raw && parsed.args.length) {
+    raw = parsed.args.join(" ").trim();
+  }
+  let note: CompletionNote;
+  try {
+    const parsedNote = JSON.parse(raw);
+    note = parsedNote && typeof parsedNote === "object" ? (parsedNote as CompletionNote) : { summary: raw };
+  } catch {
+    note = { summary: raw };
+  }
+  if (node && !note.node) {
+    note.node = node;
+  }
+  await appendCompletionNote(repoRoot, note, node || "worker");
+  process.stdout.write(`${RUDDER_DONE_START}\n${JSON.stringify(note)}\n${RUDDER_DONE_END}\n`);
 }
 
 async function runPlan(task: string): Promise<void> {

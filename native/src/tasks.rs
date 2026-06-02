@@ -5,7 +5,7 @@ use super::*;
 
 pub(crate) fn execution_prompt(task: &str) -> String {
     let task = strip_rudder_prompt_wrappers(task);
-    const CONTEXT: &str = "Rudder-specific context injected by Rudder:\n- Version control: this repo uses jj (Jujutsu), colocated with git. You are working inside your own isolated jj workspace and jj is authoritative here. Inspect your work with `jj status` and `jj diff` (NOT `git status`/`git diff`). Just edit files: do NOT manage version control yourself (no `jj commit`, `jj new`, `jj squash`, `jj describe`, `git commit`, `git add`, `git branch`, `git checkout`, or `git merge`). Rudder snapshots your working copy and integrates it for you, and raw git commit/branch commands would desync jj. `jj log` is safe if you want to see history.\n- Read RUDDER.md first if it exists. Rudder generated it to show the CURRENT PLAN (the task DAG and each node's status), the active agents, and their worktrees. DECISIONS.md holds cross-cutting decisions other agents have recorded.\n- The plan can CHANGE while you work: the user may refine the architecture, or a sibling may record a decision. Before each significant step, re-read RUDDER.md and DECISIONS.md. RUDDER.md carries a `freshness:` stamp; if it is newer than when you last read it, something changed, so re-read both. If the plan or architecture has shifted in a way that affects your task, ADAPT your implementation to the new direction instead of continuing on the old one, and append a short note to DECISIONS.md describing the adjustment. Never edit RUDDER.md; it is orchestrator-owned.";
+    const CONTEXT: &str = "Rudder-specific context injected by Rudder:\n- Version control: this repo uses jj (Jujutsu), colocated with git. You are working inside your own isolated jj workspace and jj is authoritative here. Inspect your work with `jj status` and `jj diff` (NOT `git status`/`git diff`). Just edit files: do NOT manage version control yourself (no `jj commit`, `jj new`, `jj squash`, `jj describe`, `git commit`, `git add`, `git branch`, `git checkout`, or `git merge`). Rudder snapshots your working copy and integrates it for you, and raw git commit/branch commands would desync jj. `jj log` is safe if you want to see history.\n- Read RUDDER.md first if it exists. Rudder generated it to show the CURRENT PLAN (the task DAG and each node's status), the active agents, and their worktrees. DECISIONS.md holds cross-cutting decisions other agents have recorded.\n- The plan can CHANGE while you work: the user may refine the architecture, or a sibling may record a decision. Before each significant step, re-read RUDDER.md and DECISIONS.md. RUDDER.md carries a `freshness:` stamp; if it is newer than when you last read it, something changed, so re-read both. If the plan or architecture has shifted in a way that affects your task, ADAPT your implementation to the new direction instead of continuing on the old one, and append a short note to DECISIONS.md describing the adjustment. Never edit RUDDER.md; it is orchestrator-owned.\n- When you FINISH, run `rudder done` to report what happened so the orchestrator and your siblings pick it up. Pipe a JSON object: `echo '{\"summary\":\"...\",\"interfaces\":\"files/types/functions you created or assumed\",\"followups\":[{\"title\":\"...\",\"why\":\"...\",\"scope\":\"in|out\"}]}' | rudder done --node <id>` where <id> is your `Worker node:` value shown above (omit `--node` if there is none). Use `scope:\"out\"` for follow-ups outside your lane. If you have no structured note, `rudder done --node <id> \"one-line summary\"` is fine. This only records a note (it does not touch jj).";
     // Keep the /goal block as the very first line so the backend (Claude or
     // Codex) picks it up as a slash command: hoist a leading `/goal ...` (and its
     // `Done when:` line) above the injected Rudder context.
@@ -338,11 +338,11 @@ pub(crate) fn rudder_plan_output_for_run(run: &AgentRun) -> String {
 /// Upper bound on tasks accepted from ONE plan block. This is NOT a feature limit
 /// (real plans are far smaller); it is a runaway/cost backstop: every task becomes
 /// a real worker agent (a Claude/Codex process), so an unbounded or hallucinated
-/// block could spawn hundreds of processes. 50 is far above any legitimate single
+/// block could spawn hundreds of processes. 100 is far above any legitimate single
 /// plan, and a plan that exceeds it is surfaced (never silently truncated). Add
 /// more work incrementally by typing into the task pane (reconcile) rather than one
 /// giant block.
-pub(crate) const MAX_PLAN_TASKS: usize = 50;
+pub(crate) const MAX_PLAN_TASKS: usize = 100;
 
 pub(crate) fn extract_rudder_plan_tasks(output: &str) -> Result<Vec<RudderPlanTask>> {
     extract_rudder_plan_tasks_with_frontier(output, &[])
@@ -621,8 +621,8 @@ pub(crate) fn rudder_plan_worker_prompt(
     _backend: Backend,
 ) -> String {
     let body = format!(
-        "This task was spawned by Rudder from a /rudder-plan coordinator.\n\nOriginal request:\n{planner_task}\n\nWorker task: {}\n\n{}",
-        task.title, task.prompt
+        "This task was spawned by Rudder from a /rudder-plan coordinator.\n\nWorker node: {}\n\nOriginal request:\n{planner_task}\n\nWorker task: {}\n\n{}",
+        task.id, task.title, task.prompt
     );
     format!(
         "/goal {}\nDone when: {}\n\n{}",

@@ -306,7 +306,7 @@ test("parsePlanBlock tolerates a soft cycle (no deadlock risk)", () => {
   assert.equal(dag.edges.length, 2);
 });
 
-test("parsePlanBlock skips tasks with an empty prompt and caps at the runaway backstop (50)", () => {
+test("parsePlanBlock skips tasks with an empty prompt and caps at the runaway backstop (100)", () => {
   const dag = parsePlanBlock(
     block([
       { id: "a", title: "a", prompt: "" },
@@ -317,11 +317,11 @@ test("parsePlanBlock skips tasks with an empty prompt and caps at the runaway ba
     dag.nodes.map((n) => n.id),
     ["b"],
   );
-  // A real plan never hits it; a pathological 60-task block is capped at 50.
+  // A real plan never hits it; a pathological 120-task block is capped at 100.
   const big = parsePlanBlock(
-    block(Array.from({ length: 60 }, (_, i) => ({ id: `t${i}`, title: `t${i}`, prompt: "real" }))),
+    block(Array.from({ length: 120 }, (_, i) => ({ id: `t${i}`, title: `t${i}`, prompt: "real" }))),
   );
-  assert.equal(big.nodes.length, 50, "runaway backstop caps at 50 tasks");
+  assert.equal(big.nodes.length, 100, "runaway backstop caps at 100 tasks");
 });
 
 test("parsePlanBlock throws on a missing block", () => {

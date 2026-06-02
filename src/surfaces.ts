@@ -81,6 +81,65 @@ export async function appendDecision(
   await fsp.appendFile(decisionsPath(repoRoot), bullet, "utf8").catch(() => undefined);
 }
 
+// Markers wrapping the JSON a worker's `rudder done` echoes to stdout, so the TUI
+// brain can parse the completion note out of the worker's PTY scrollback (the same
+// way it parses RUDDER_PLAN_TASKS). Kept here so both sides agree on the shape.
+export const RUDDER_DONE_START = "RUDDER_DONE_START";
+export const RUDDER_DONE_END = "RUDDER_DONE_END";
+
+/** One piece of follow-up work a finishing agent recommends. `scope: "out"` marks
+ *  work outside the agent's lane (recorded but not auto-injected by the brain). */
+export type FollowupProposal = {
+  title: string;
+  prompt?: string;
+  deps?: string[];
+  why?: string;
+  scope?: "in" | "out";
+};
+
+/** A worker's structured end-of-task report: what it did, the interfaces it
+ *  created/assumed, and follow-up work it recommends. Appended to DECISIONS.md and
+ *  echoed (RUDDER_DONE markers) so siblings AND the orchestrator pick it up. */
+export type CompletionNote = {
+  node?: string;
+  summary?: string;
+  interfaces?: string;
+  followups?: FollowupProposal[];
+};
+
+/** Append a worker's completion note to DECISIONS.md as human-legible bullets (so
+ *  siblings re-reading DECISIONS.md and the board both see it). The orchestrator
+ *  also reads the same note from the RUDDER_DONE block `rudder done` echoes to
+ *  stdout. No jj management - just an append, exactly like appendDecision. */
+export async function appendCompletionNote(
+  repoRoot: string,
+  note: CompletionNote,
+  owner = "worker",
+): Promise<void> {
+  await ensureDecisionsFile(repoRoot);
+  const id = (note.node || owner).trim() || "worker";
+  const summary = (note.summary || "").replace(/\s+/g, " ").trim();
+  const lines: string[] = [
+    `- DONE (${id}): ${summary || "(no summary)"}  (owner: ${id}, ${nowIso()})`,
+  ];
+  const interfaces = (note.interfaces || "").replace(/\s+/g, " ").trim();
+  if (interfaces) {
+    lines.push(`  interfaces: ${interfaces}`);
+  }
+  const followups = (note.followups || []).filter((f) => f && (f.title || f.prompt));
+  if (followups.length) {
+    lines.push("  followups:");
+    for (const f of followups) {
+      const title = (f.title || f.prompt || "").replace(/\s+/g, " ").trim();
+      const deps = f.deps && f.deps.length ? ` [deps: ${f.deps.join(", ")}]` : "";
+      const scope = f.scope === "out" ? " [scope: out]" : "";
+      const why = f.why ? ` - ${f.why.replace(/\s+/g, " ").trim()}` : "";
+      lines.push(`    - ${title}${deps}${scope}${why}`);
+    }
+  }
+  await fsp.appendFile(decisionsPath(repoRoot), `${lines.join("\n")}\n`, "utf8").catch(() => undefined);
+}
+
 // The freshness stamp folds in DECISIONS.md's mtime so a sibling appending a
 // decision bumps RUDDER.md's freshness (and the board's memory.updated SSE),
 // not just a node status change. Falls back to Date.now() when stat fails.

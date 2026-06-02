@@ -96,7 +96,7 @@ export function parsePlanBlock(output: string): PlanDag {
   // First pass: build nodes, synthesizing ids n0.. for tasks without one.
   const nodes: PlanNode[] = [];
   const rawDepsById = new Map<string, PlanEdge[]>();
-  tasks.slice(0, 50).forEach((entry, index) => {
+  tasks.slice(0, 100).forEach((entry, index) => {
     const raw = (entry ?? {}) as RawTask;
     const prompt = typeof raw.prompt === "string" ? raw.prompt.trim() : "";
     if (!prompt) {
