@@ -691,6 +691,13 @@ impl App {
         } else {
             load_persisted_agents(&cwd)
         };
+        // Restore the ingested-run ledger so a worker handled before the last exit is not
+        // re-ingested (or re-summarized) when its Done record reloads. Empty in tests.
+        let followups_ingested = if cfg!(test) {
+            HashSet::new()
+        } else {
+            load_ingested_runs(&cwd)
+        };
         // Main is no longer auto-pinned. If the user wants one, they type
         // /main from the task pane. Main records render in their own section
         // instead of being mixed into ordinary worktree agents.
@@ -747,7 +754,7 @@ impl App {
             orch_selection: None,
             orch_visible_rows: Vec::new(),
             activity_log: Vec::new(),
-            followups_ingested: HashSet::new(),
+            followups_ingested,
             followup_gen: HashMap::new(),
             surfaced_overlaps: HashSet::new(),
             last_drift_scan: None,
@@ -5247,9 +5254,16 @@ impl App {
             .iter()
             .enumerate()
             .filter(|(_, run)| {
+                // Done is the normal trigger. Failed/Stopped are included so a worker that
+                // filed a report before dying still has it READ (ingest only spawns the
+                // diff-backstop for cleanly-Done workers — an incomplete diff would invite
+                // irrelevant follow-ups).
                 run.node_id.is_some()
                     && matches!(run.mode, AgentMode::Execute)
-                    && run.status == AgentStatus::Done
+                    && matches!(
+                        run.status,
+                        AgentStatus::Done | AgentStatus::Failed | AgentStatus::Stopped
+                    )
                     && !run.merge_resolver
                     && !self.followups_ingested.contains(&run.id)
                     && !self.completion_summary_pending.contains(&run.id)
@@ -5275,10 +5289,13 @@ impl App {
     /// (the run is held `pending`, not marked ingested, until that result lands). Returns
     /// true only when a node was added synchronously here.
     fn ingest_worker_followups(&mut self, index: usize) -> bool {
-        let (run_id, node_id, sidecar_note, output, cwd, task) = {
+        let (run_id, node_id, sidecar_note, output, cwd, task, is_complete) = {
             let Some(run) = self.agents.get_mut(index) else {
                 return false;
             };
+            // Only a cleanly-Done worker is eligible for the diff-backstop; a Failed/Stopped
+            // one may still have a filed note we should read, but its diff is half-finished.
+            let is_complete = run.status == AgentStatus::Done;
             let node_id = run.node_id.clone().unwrap_or_default();
             // PRIMARY, backend-agnostic channel: `rudder done` writes the structured note
             // to <workspace>/.rudder/done/<node>.json (see worker_done_file). This does
@@ -5314,35 +5331,84 @@ impl App {
                 output,
                 run.cwd.clone(),
                 run.task_summary.clone(),
+                is_complete,
             )
         };
 
-        // A report came through one of the direct channels: apply it and we are done.
         if let Some(note) = sidecar_note.or_else(|| parse_worker_done_block(&output)) {
-            self.followups_ingested.insert(run_id);
-            return self.apply_worker_followups(&node_id, &note);
+            // A note came through a direct channel. If the agent ADDRESSED follow-ups at
+            // all (a `followups` array, even empty), trust it: apply what is there and we
+            // are done (an empty list is a deliberate "nothing further"). If the note never
+            // addressed follow-ups (freeform prose, or a summary with no `followups` key),
+            // the agent's next-steps are unstructured, so fall through to the diff-backstop
+            // and feed it the agent's own words. This is the freeform-prose recovery.
+            let addressed_followups = note.get("followups").is_some();
+            let grew = self.apply_worker_followups(&node_id, &note);
+            if grew || addressed_followups {
+                self.mark_run_ingested(run_id);
+                return grew;
+            }
+            let note_summary = note
+                .get("summary")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let task = if note_summary.is_empty() {
+                task
+            } else {
+                format!("{task}\n\nThe agent's own note: {note_summary}")
+            };
+            return self.spawn_completion_backstop(
+                run_id,
+                node_id,
+                cwd,
+                task,
+                is_complete,
+                "agent reported no structured next steps; mining its diff for follow-ups",
+            );
         }
 
-        // No report filed. Without a node id there is nothing to attach follow-ups to, so
-        // just mark it handled. Otherwise spawn the BACKSTOP: a one-shot summarizer over
-        // the worker's diff reconstructs the note off-thread. Hold the run `pending` (not
-        // ingested) so it is not re-spawned; poll_completion_summary_workers applies the
-        // result and marks it ingested then.
-        if node_id.is_empty() {
-            self.followups_ingested.insert(run_id);
-            return false;
-        }
-        let diff = jj_diff_text(&cwd, 8000);
-        self.completion_summary_pending.insert(run_id.clone());
-        spawn_completion_summary_worker(
-            self.completion_summary_tx.clone(),
+        // No report filed at all: reconstruct one from the diff (cleanly-Done only).
+        self.spawn_completion_backstop(
             run_id,
             node_id,
+            cwd,
             task,
-            diff,
-        );
-        self.push_activity("agent finished without a report; summarizing its diff to extract follow-ups");
+            is_complete,
+            "agent finished without a report; summarizing its diff to extract follow-ups",
+        )
+    }
+
+    /// Spawn the one-shot diff summarizer for a worker that produced no usable structured
+    /// follow-ups. Refuses (and just marks the run handled) when the worker is not cleanly
+    /// Done (a half-finished diff invites noise) or carries no node id (nothing to attach
+    /// to). Holds the run `pending` while the summarizer runs so it is not re-spawned.
+    fn spawn_completion_backstop(
+        &mut self,
+        run_id: String,
+        node_id: String,
+        cwd: PathBuf,
+        task: String,
+        is_complete: bool,
+        reason: &str,
+    ) -> bool {
+        if !is_complete || node_id.is_empty() {
+            self.mark_run_ingested(run_id);
+            return false;
+        }
+        let diff = jj_diff_text(&cwd, 16000);
+        self.completion_summary_pending.insert(run_id.clone());
+        spawn_completion_summary_worker(self.completion_summary_tx.clone(), run_id, node_id, task, diff);
+        self.push_activity(reason);
         false
+    }
+
+    /// Mark a run's follow-ups as ingested (so it is never re-scanned) and persist the
+    /// ledger so a restart does not re-ingest or re-summarize an already-handled worker.
+    fn mark_run_ingested(&mut self, run_id: String) {
+        self.followups_ingested.insert(run_id);
+        self.persist_ingested_runs();
     }
 
     /// Drain BACKSTOP summarizer results: apply each reconstructed note (growing the DAG)
@@ -5352,7 +5418,7 @@ impl App {
         let mut grew = false;
         while let Ok(result) = self.completion_summary_rx.try_recv() {
             self.completion_summary_pending.remove(&result.run_id);
-            self.followups_ingested.insert(result.run_id);
+            self.mark_run_ingested(result.run_id);
             if let Some(note) = result.note {
                 if self.apply_worker_followups(&result.node_id, &note) {
                     grew = true;
@@ -5362,6 +5428,25 @@ impl App {
         if grew && !self.awaiting_approval {
             self.run_scheduler();
             self.mirror_graph();
+        }
+    }
+
+    /// Persist the ingested-run ledger to `.rudder/ingestion-ledger.json` (atomic) so a
+    /// restart does not re-ingest a worker (re-reading its sidecar) or, worse, re-spawn a
+    /// duplicate diff-backstop for a silent one. Best-effort; bounded by plan size.
+    fn persist_ingested_runs(&self) {
+        let ids: Vec<&String> = self.followups_ingested.iter().collect();
+        let Ok(json) = serde_json::to_string(&ids) else {
+            return;
+        };
+        let dir = self.cwd.join(".rudder");
+        if std::fs::create_dir_all(&dir).is_err() {
+            return;
+        }
+        let path = dir.join("ingestion-ledger.json");
+        let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+        if std::fs::write(&tmp, json).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
         }
     }
 
@@ -5390,8 +5475,14 @@ impl App {
         let frontier: Vec<String> = self.plan_frontier().into_iter().map(|(id, _)| id).collect();
         let mut added = 0usize;
         for f in &followups {
-            if f.get("scope").and_then(serde_json::Value::as_str) == Some("out") {
-                continue; // out-of-lane: recorded in DECISIONS.md, not auto-injected
+            // Out-of-lane work is recorded by the worker in DECISIONS.md, not auto-injected.
+            // Match case-insensitively so "Out"/"OUT" are honored (anything else, incl. a
+            // missing scope, is treated as in-lane and injected — never silently dropped).
+            if f.get("scope")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|s| s.trim().eq_ignore_ascii_case("out"))
+            {
+                continue;
             }
             let title = f
                 .get("title")
@@ -5405,7 +5496,7 @@ impl App {
             }
             if self.plan_node_count() >= MAX_PLAN_TASKS {
                 self.push_activity(format!(
-                    "plan at {MAX_PLAN_TASKS}-node cap; remaining follow-ups from {node_id} recorded, not launched"
+                    "plan at {MAX_PLAN_TASKS}-node cap; remaining follow-ups from {node_id} recorded to DECISIONS.md, not launched"
                 ));
                 break;
             }
@@ -6356,6 +6447,16 @@ impl App {
     #[allow(dead_code)]
     fn regoal_agent_at(&mut self, index: usize, new_goal: &str) -> bool {
         let cwd_default = self.cwd.clone();
+        // A re-goaled worker reuses its run id but will do NEW work and file a NEW report.
+        // Clear its ingest ledger + any in-flight backstop so that second completion is
+        // ingested afresh instead of being skipped as "already handled".
+        if let Some(id) = self.agents.get(index).map(|run| run.id.clone()) {
+            let was_ingested = self.followups_ingested.remove(&id);
+            self.completion_summary_pending.remove(&id);
+            if was_ingested {
+                self.persist_ingested_runs();
+            }
+        }
         let (command, deliver_after, new_session, size, cwd, node_label) = {
             let Some(run) = self.agents.get(index) else {
                 return false;
@@ -7176,6 +7277,18 @@ What to do\n\
         {
             self.run_scheduler();
         }
+        // Grow the DAG from finished workers' `rudder done` reports (auto-expand):
+        // a finishing agent's recommended follow-ups become new planned nodes,
+        // surfaced in the activity log. Autonomous, no confirm.
+        //
+        // This MUST run before auto-merge: a candidate is ingested only while its status
+        // is still Done, and maybe_auto_merge flips Done -> Merged. If merge ran first, an
+        // auto-merged node would never be ingested and the plan would stop growing under
+        // /automerge. Ingesting first reads the sidecar/PTY while the worker (and its
+        // workspace) are intact, then merge unblocks its children on the same tick.
+        if self.scheduler_tick % SCHEDULER_TICK_INTERVAL == 0 {
+            self.maybe_ingest_worker_followups();
+        }
         // When auto-merge is on, merge clean finished nodes on the same cadence so
         // their children unblock and the chain flows without manual m/M. Runs even
         // when the queue is empty (to merge the final nodes), but not at the gate.
@@ -7190,12 +7303,6 @@ What to do\n\
         // unblocks its children; leftover conflicts drop back to manual.
         if self.scheduler_tick % SCHEDULER_TICK_INTERVAL == 0 {
             self.finalize_merge_resolvers();
-        }
-        // Grow the DAG from finished workers' `rudder done` reports (auto-expand):
-        // a finishing agent's recommended follow-ups become new planned nodes,
-        // surfaced in the activity log. Autonomous, no confirm.
-        if self.scheduler_tick % SCHEDULER_TICK_INTERVAL == 0 {
-            self.maybe_ingest_worker_followups();
         }
         // Predict cross-agent collisions and nudge the later agent to coordinate
         // (autonomous; self-throttled to ~5s). No confirm.
@@ -7540,6 +7647,16 @@ fn worker_done_file(workspace: &Path, node_id: &str) -> PathBuf {
         .join(".rudder")
         .join("done")
         .join(format!("{node_id}.json"))
+}
+
+/// Load the persisted ingested-run ledger (run ids whose follow-ups were already handled)
+/// written by `persist_ingested_runs`. Missing/corrupt file => empty set.
+fn load_ingested_runs(cwd: &Path) -> HashSet<String> {
+    std::fs::read_to_string(cwd.join(".rudder").join("ingestion-ledger.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
+        .map(|ids| ids.into_iter().collect())
+        .unwrap_or_default()
 }
 
 fn parse_worker_done_block(output: &str) -> Option<serde_json::Value> {

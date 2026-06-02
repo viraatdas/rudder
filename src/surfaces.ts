@@ -107,6 +107,29 @@ export type CompletionNote = {
   followups?: FollowupProposal[];
 };
 
+/** Parse a `rudder done` argument into a CompletionNote. Accepts a bare JSON object, a
+ *  fenced ```json block (models love to wrap output in fences), and falls back to a
+ *  freeform `{ summary: raw }` for prose, arrays, or primitives — anything that is not a
+ *  JSON OBJECT. Keeping arrays/primitives out of the note matters: the orchestrator reads
+ *  `note.followups`, and a stray array cast would yield nothing AND lose the text. */
+export function parseCompletionNoteArg(raw: string): CompletionNote {
+  const tryObject = (text: string): CompletionNote | undefined => {
+    try {
+      const parsed: unknown = JSON.parse(text);
+      // Only a plain object is a structured note; arrays/numbers/strings are not.
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed as CompletionNote;
+      }
+    } catch {
+      // not JSON
+    }
+    return undefined;
+  };
+  // Strip a leading/trailing markdown code fence, if present, and parse the inside.
+  const fenced = raw.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/);
+  return tryObject(raw) ?? (fenced ? tryObject(fenced[1]) : undefined) ?? { summary: raw };
+}
+
 /** Drop the structured completion note as a machine-readable JSON file the orchestrator
  *  reads straight off disk. This is the AUTHORITATIVE, terminal-independent channel: it
  *  never passes through the agent's interactive TUI, so a real Claude/Codex worker's

@@ -36,7 +36,7 @@ import {
   workerRun,
 } from "./run-manager.js";
 import { runInteractiveShell } from "./repl.js";
-import { appendCompletionNote, appendDecision, RUDDER_DONE_END, RUDDER_DONE_START, writeCompletionNoteFile } from "./surfaces.js";
+import { appendCompletionNote, appendDecision, parseCompletionNoteArg, RUDDER_DONE_END, RUDDER_DONE_START, writeCompletionNoteFile } from "./surfaces.js";
 import type { CompletionNote } from "./surfaces.js";
 import { runTmuxAgentPane, runTmuxTaskPane, runTmuxWorkerIdle } from "./tmux-dashboard.js";
 import { runInteractiveTui } from "./tui.js";
@@ -985,13 +985,7 @@ async function runDone(parsed: Parsed): Promise<void> {
   if (!raw && parsed.args.length) {
     raw = parsed.args.join(" ").trim();
   }
-  let note: CompletionNote;
-  try {
-    const parsedNote = JSON.parse(raw);
-    note = parsedNote && typeof parsedNote === "object" ? (parsedNote as CompletionNote) : { summary: raw };
-  } catch {
-    note = { summary: raw };
-  }
+  let note: CompletionNote = parseCompletionNoteArg(raw);
   if (node && !note.node) {
     note.node = node;
   }

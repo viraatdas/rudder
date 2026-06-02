@@ -5830,6 +5830,141 @@ branch refs/heads/main\n";
         assert!(app.completion_summary_pending.is_empty(), "no backstop without a node id");
     }
 
+    /// Build a finished plan worker whose sidecar holds the given JSON note.
+    fn done_worker_with_sidecar(repo: &std::path::Path, node: &str, json: &str, status: AgentStatus) -> AgentRun {
+        let done = worker_done_file(repo, node);
+        fs::create_dir_all(done.parent().unwrap()).unwrap();
+        fs::write(&done, json).unwrap();
+        let mut worker = node_agent(node, status); // run.id == node_id == node
+        worker.mode = AgentMode::Execute;
+        worker.cwd = repo.to_path_buf();
+        worker.terminal = None;
+        worker
+    }
+
+    #[test]
+    fn ingest_empty_followups_is_trusted_no_backstop() {
+        // The agent ADDRESSED follow-ups with an explicit empty list: trust it, do not mine
+        // the diff. (Distinguishes the deliberate "nothing further" from a missing report.)
+        let repo = unique_test_repo("ingest-empty");
+        let mut app = App::new();
+        app.cwd = repo.clone();
+        app.awaiting_approval = true;
+        app.agents = vec![done_worker_with_sidecar(
+            &repo,
+            "n0",
+            "{\"summary\":\"done\",\"followups\":[]}",
+            AgentStatus::Done,
+        )];
+
+        let grew = app.ingest_worker_followups(0);
+        assert!(!grew, "empty list grows nothing");
+        assert!(app.followups_ingested.contains("n0"), "trusted + marked ingested");
+        assert!(app.completion_summary_pending.is_empty(), "no diff-backstop for an explicit empty list");
+        assert!(app.planned_nodes.is_empty());
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn ingest_failed_worker_reads_note_but_never_backstops() {
+        // A FAILED worker still has its filed note READ (Fix: broadened candidate filter)…
+        let repo = unique_test_repo("ingest-failed");
+        let mut app = App::new();
+        app.cwd = repo.clone();
+        app.awaiting_approval = true;
+        app.agents = vec![done_worker_with_sidecar(
+            &repo,
+            "n0",
+            "{\"summary\":\"partial\",\"followups\":[{\"title\":\"finish the refactor\",\"scope\":\"in\"}]}",
+            AgentStatus::Failed,
+        )];
+        let grew = app.ingest_worker_followups(0);
+        assert!(grew, "a failed worker's filed follow-ups are still applied");
+        assert_eq!(app.planned_nodes[0].title, "finish the refactor");
+
+        // …but a FAILED worker with only freeform prose never triggers the diff-backstop
+        // (its half-finished diff would invite noise).
+        let repo2 = unique_test_repo("ingest-failed-prose");
+        let mut app2 = App::new();
+        app2.cwd = repo2.clone();
+        app2.agents = vec![done_worker_with_sidecar(
+            &repo2,
+            "n1",
+            "{\"summary\":\"I crashed but also TODO: add caching\"}",
+            AgentStatus::Failed,
+        )];
+        let grew2 = app2.ingest_worker_followups(0);
+        assert!(!grew2);
+        assert!(app2.completion_summary_pending.is_empty(), "no backstop for an incomplete worker");
+        assert!(app2.followups_ingested.contains("n1"), "still marked handled");
+        let _ = fs::remove_dir_all(&repo);
+        let _ = fs::remove_dir_all(&repo2);
+    }
+
+    #[test]
+    fn spawn_completion_backstop_refuses_incomplete_or_unattached() {
+        let mut app = App::new();
+        app.cwd = std::env::temp_dir();
+        // Not cleanly Done -> no spawn (half-finished diff invites noise).
+        let r = app.spawn_completion_backstop(
+            "r1".to_string(),
+            "n0".to_string(),
+            std::env::temp_dir(),
+            "task".to_string(),
+            false, // is_complete
+            "x",
+        );
+        assert!(!r);
+        assert!(app.completion_summary_pending.is_empty());
+        assert!(app.followups_ingested.contains("r1"), "marked handled, not retried");
+        // Complete but no node id -> nothing to attach to -> no spawn.
+        let r2 = app.spawn_completion_backstop(
+            "r2".to_string(),
+            String::new(),
+            std::env::temp_dir(),
+            "task".to_string(),
+            true,
+            "x",
+        );
+        assert!(!r2);
+        assert!(app.completion_summary_pending.is_empty());
+        assert!(app.followups_ingested.contains("r2"));
+    }
+
+    #[test]
+    fn followup_scope_out_is_case_insensitive() {
+        let mut app = App::new();
+        app.cwd = std::env::temp_dir();
+        let mut a = node_agent("n0", AgentStatus::Done);
+        a.mode = AgentMode::Execute;
+        app.agents = vec![a];
+        let note = serde_json::json!({
+            "followups": [
+                { "title": "out of lane work", "scope": "OUT" },
+                { "title": "in lane work", "scope": "in" }
+            ]
+        });
+        let grew = app.apply_worker_followups("n0", &note);
+        assert!(grew);
+        assert_eq!(app.planned_nodes.len(), 1, "the OUT (any case) follow-up is not injected");
+        assert_eq!(app.planned_nodes[0].title, "in lane work");
+    }
+
+    #[test]
+    fn ingested_ledger_persists_and_reloads() {
+        let repo = unique_test_repo("ingest-ledger");
+        let mut app = App::new();
+        app.cwd = repo.clone();
+        app.mark_run_ingested("run-aaa".to_string());
+        app.mark_run_ingested("run-bbb".to_string());
+
+        // The on-disk ledger round-trips through the loader (used by App::new on restart).
+        let reloaded = load_ingested_runs(&repo);
+        assert!(reloaded.contains("run-aaa") && reloaded.contains("run-bbb"));
+        assert_eq!(reloaded.len(), 2);
+        let _ = fs::remove_dir_all(&repo);
+    }
+
     // ---- LIVE conductor simulation (opt-in) -------------------------------------
     //
     // A scripted end-to-end run of the REAL conductor brain: the real scheduler, real

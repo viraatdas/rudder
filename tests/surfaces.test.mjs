@@ -12,6 +12,7 @@ import {
   appendCompletionNote,
   appendDecision,
   ensureDecisionsFile,
+  parseCompletionNoteArg,
   writeCompletionNoteFile,
 } from "../dist/surfaces.js";
 import { readdir } from "node:fs/promises";
@@ -139,6 +140,32 @@ test("appendCompletionNote writes a DONE bullet with interfaces + scoped follow-
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test("parseCompletionNoteArg handles objects, fenced JSON, arrays, and freeform prose", () => {
+  // A bare JSON object is a structured note.
+  const obj = parseCompletionNoteArg('{"summary":"did x","followups":[{"title":"t","scope":"in"}]}');
+  assert.equal(obj.summary, "did x");
+  assert.equal(obj.followups[0].title, "t");
+
+  // A ```json fenced block (models love fences) is unwrapped and parsed.
+  const fenced = parseCompletionNoteArg('```json\n{"summary":"fenced","followups":[]}\n```');
+  assert.equal(fenced.summary, "fenced");
+  assert.deepEqual(fenced.followups, []);
+
+  // A JSON ARRAY is NOT a note: it falls back to freeform so followups aren't lost-cast.
+  const arr = parseCompletionNoteArg('[1,2,3]');
+  assert.equal(arr.summary, "[1,2,3]");
+  assert.equal(arr.followups, undefined);
+
+  // A primitive likewise.
+  const prim = parseCompletionNoteArg("42");
+  assert.equal(prim.summary, "42");
+
+  // Freeform prose becomes the summary (so the backstop later mines the diff for it).
+  const prose = parseCompletionNoteArg("did the thing, still need to wire it up");
+  assert.equal(prose.summary, "did the thing, still need to wire it up");
+  assert.equal(prose.followups, undefined);
 });
 
 test("writeCompletionNoteFile drops machine-readable JSON the orchestrator reads off disk", async () => {
