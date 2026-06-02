@@ -3302,6 +3302,21 @@ impl App {
     }
 
     fn start_rudder_plan_task(&mut self, input: &str) {
+        // AT-MOST-ONE ORCHESTRATOR: a brand-new plan supersedes any prior pinned
+        // planner. Retire stale orchestrator rows (and their on-disk records) before
+        // pushing the new one so completed plans never stack as phantom orchestrators
+        // in the agent pane (`is_orchestrator()` is true for any RudderPlan row).
+        // refine/rebase reuse the existing orchestrator in place and never reach here;
+        // this path only runs for a genuinely fresh plan (`!plan_is_active()`).
+        let stale_orchestrators: Vec<String> = self
+            .agents
+            .iter()
+            .filter(|run| run.is_orchestrator())
+            .map(|run| run.id.clone())
+            .collect();
+        for id in stale_orchestrators {
+            self.retire_planner_row(&id);
+        }
         // Remember the original request so the refine loop can re-plan against it
         // (each refinement layers the user's feedback on top of this, not on top of
         // the previous composite prompt).
@@ -3699,7 +3714,12 @@ impl App {
             .iter()
             .enumerate()
             .filter_map(|(idx, run)| {
-                if run.terminal.is_some() || run.status != AgentStatus::Running {
+                // Never resume a transient reconcile planner as a background orchestrator
+                // (load_persisted_agents already drops these; this is defense in depth).
+                if run.terminal.is_some()
+                    || run.status != AgentStatus::Running
+                    || run.reconcile_planner
+                {
                     return None;
                 }
                 Some((
@@ -4874,6 +4894,33 @@ impl App {
         self.dirty = true;
     }
 
+    /// Retire a planner row: drop it from BOTH `self.agents` and disk. Used for the two
+    /// rows that must not linger as phantom orchestrators (`is_orchestrator()` is true for
+    /// ANY RudderPlan row): a TRANSIENT reconcile planner once it has been evaluated, and a
+    /// STALE pinned orchestrator superseded by a brand-new plan. Deleting the on-disk
+    /// `run.json` is the crucial half: without it the orphan reloads via
+    /// `load_persisted_agents`. Idempotent: a no-op if the id is already gone. If the user
+    /// was watching the row, return them to a remaining orchestrator.
+    fn retire_planner_row(&mut self, run_id: &str) {
+        let Some(index) = self.agents.iter().position(|run| run.id == run_id) else {
+            return;
+        };
+        let was_watching = self.selected_agent == index;
+        self.agents.remove(index);
+        // Delete the persisted record too, or it reloads as an orphan orchestrator.
+        let _ = remove_native_run_record(&self.cwd, run_id);
+        if was_watching {
+            if let Some(orch_index) = self.agents.iter().position(|run| run.is_orchestrator()) {
+                self.selected_agent = orch_index;
+                self.focus = FocusPane::Worker;
+                self.worker_view = WorkerView::Terminal;
+            }
+        }
+        if self.selected_agent >= self.agents.len() {
+            self.selected_agent = self.agents.len().saturating_sub(1);
+        }
+    }
+
     /// APPEND a reconcile planner's node(s) into the active plan (parallel to
     /// `evaluate_completed_plan`, but it pushes instead of replacing). Each parsed
     /// task becomes a PlannedNode whose id is UNIQUIFIED against the existing
@@ -4889,7 +4936,7 @@ impl App {
         // Read + validate the planner run inside a scoped mutable borrow, then drop
         // it before touching other `self` state (frontier, uniquify, append). On a
         // parse failure the captured-once flag is cleared and we bail.
-        let (planner_task, output) = {
+        let (planner_task, output, run_id) = {
             let Some(run) = self.agents.get_mut(index) else {
                 return;
             };
@@ -4900,7 +4947,7 @@ impl App {
             // is a no-op even if it lingers a moment before removal.
             run.autosteered = false;
             let _ = save_native_run_record(&self.cwd, run);
-            (run.task.clone(), rudder_plan_output_for_run(run))
+            (run.task.clone(), rudder_plan_output_for_run(run), run.id.clone())
         };
 
         // The frontier the new node(s) reconcile against: existing queued nodes plus
@@ -4916,12 +4963,16 @@ impl App {
         let tasks = match extract_rudder_plan_tasks_with_frontier(&output, &frontier) {
             Ok(tasks) => tasks,
             Err(error) => {
+                // Retire the transient planner even on failure, or it lingers as a
+                // second orchestrator (in-session AND, via its run.json, after restart).
+                self.retire_planner_row(&run_id);
                 self.notice =
                     Some(format!("added task did not produce a runnable node: {error}"));
                 return;
             }
         };
         if tasks.is_empty() {
+            self.retire_planner_row(&run_id);
             self.notice = Some("added task produced no runnable node".to_string());
             return;
         }
@@ -4951,24 +5002,10 @@ impl App {
             self.planned_origin = planner_task;
         }
 
-        // The reconcile planner has done its job; remove it so it does not linger as
-        // a second pinned orchestrator. (The initial planner is KEPT as the
-        // orchestrator; a reconcile planner is transient.)
-        // If the user was watching the (transient) reconcile planner, return them to
-        // the orchestrator afterwards so they SEE the new node land in the DAG. If
-        // they navigated elsewhere, leave their selection alone.
-        let was_watching_reconcile = self.selected_agent == index;
-        self.agents.remove(index);
-        if was_watching_reconcile {
-            if let Some(orch_index) = self.agents.iter().position(|run| run.is_orchestrator()) {
-                self.selected_agent = orch_index;
-                self.focus = FocusPane::Worker;
-                self.worker_view = WorkerView::Terminal;
-            }
-        }
-        if self.selected_agent >= self.agents.len() {
-            self.selected_agent = self.agents.len().saturating_sub(1);
-        }
+        // The reconcile planner has done its job; retire it (drop from self.agents AND
+        // delete its run.json) so it never lingers as a second pinned orchestrator nor
+        // reloads as one next launch. The initial planner is KEPT as the orchestrator.
+        self.retire_planner_row(&run_id);
 
         // If the session is already approved/running, schedule so the new node
         // launches as soon as its deps are met. If the initial plan is still

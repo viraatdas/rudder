@@ -5469,3 +5469,167 @@ branch refs/heads/main\n";
             "auto-merge is suppressed while a rebase is in flight"
         );
     }
+
+    // ---- duplicate-orchestrator leak: reconcile-planner cleanup -----------------
+
+    fn unique_test_repo(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "rudder-{tag}-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("create test repo root");
+        root
+    }
+
+    /// A persisted RudderPlan row carrying a given reconcile-planner flag.
+    fn planner_run(id: &str, reconcile: bool) -> AgentRun {
+        let mut run = test_agent_run(id, &format!("plan {id}"));
+        run.mode = AgentMode::RudderPlan;
+        run.reconcile_planner = reconcile;
+        run.status = AgentStatus::Running;
+        run
+    }
+
+    #[test]
+    fn reconcile_planner_flag_survives_save_and_reload() {
+        let repo = unique_test_repo("reconcile-roundtrip");
+        let run = planner_run("rec-1", true);
+        save_native_run_record(&repo, &run).expect("save reconcile planner");
+
+        let raw = fs::read_to_string(native_run_dir(&repo, "rec-1").join("run.json"))
+            .expect("read run.json");
+        let value: serde_json::Value = serde_json::from_str(&raw).expect("parse run.json");
+        assert_eq!(
+            value.get("reconcilePlanner").and_then(|v| v.as_bool()),
+            Some(true),
+            "the discriminator is persisted"
+        );
+
+        let reloaded = agent_from_run_record(&repo, value).expect("reload run");
+        assert!(reloaded.reconcile_planner, "flag survives the round-trip");
+
+        // Old-format record (no field) defaults to false (the real planner).
+        let mut legacy: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(native_run_dir(&repo, "rec-1").join("run.json")).unwrap())
+                .unwrap();
+        legacy.as_object_mut().unwrap().remove("reconcilePlanner");
+        let legacy_run = agent_from_run_record(&repo, legacy).expect("reload legacy run");
+        assert!(
+            !legacy_run.reconcile_planner,
+            "a record without the field loads as the real planner"
+        );
+
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn load_persisted_agents_drops_reconcile_planners() {
+        let repo = unique_test_repo("load-filter");
+        save_native_run_record(&repo, &planner_run("orch-1", false)).expect("save pinned planner");
+        save_native_run_record(&repo, &planner_run("rec-1", true)).expect("save reconcile planner");
+
+        let loaded = load_persisted_agents(&repo);
+        let orchestrators: Vec<&AgentRun> =
+            loaded.iter().filter(|run| run.is_orchestrator()).collect();
+        assert_eq!(
+            orchestrators.len(),
+            1,
+            "exactly one orchestrator reloads (the reconcile planner is filtered out)"
+        );
+        assert_eq!(orchestrators[0].id, "orch-1", "the pinned planner survives");
+        assert!(
+            loaded.iter().all(|run| !run.reconcile_planner),
+            "no reconcile planner is ever reloaded"
+        );
+
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn load_persisted_agents_keeps_only_newest_orchestrator() {
+        let repo = unique_test_repo("orch-dedupe");
+        // Two initial planners from two past plans (both reconcile_planner=false). Every
+        // plan ever run persists its planner, so without dedupe a long-lived repo reloads
+        // one phantom orchestrator per plan.
+        let mut old = planner_run("orch-old", false);
+        old.created_at = "2026-01-01T00:00:00Z".to_string();
+        let mut newer = planner_run("orch-new", false);
+        newer.created_at = "2026-05-01T00:00:00Z".to_string();
+        save_native_run_record(&repo, &old).expect("save old orchestrator");
+        save_native_run_record(&repo, &newer).expect("save new orchestrator");
+
+        let loaded = load_persisted_agents(&repo);
+        let orchestrators: Vec<&AgentRun> =
+            loaded.iter().filter(|run| run.is_orchestrator()).collect();
+        assert_eq!(orchestrators.len(), 1, "only one orchestrator reloads");
+        assert_eq!(
+            orchestrators[0].id, "orch-new",
+            "the newest pinned planner survives the dedupe"
+        );
+
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn retire_reconcile_planner_clears_memory_and_disk() {
+        let repo = unique_test_repo("retire-reconcile");
+        let mut app = App::new();
+        app.cwd = repo.clone();
+
+        let orch = planner_run("orch-1", false);
+        let rec = planner_run("rec-1", true);
+        save_native_run_record(&repo, &orch).expect("save orchestrator");
+        save_native_run_record(&repo, &rec).expect("save reconcile planner");
+        app.agents.push(orch);
+        app.agents.push(rec);
+        app.selected_agent = 1; // watching the (transient) reconcile planner
+
+        // Both run.json records exist before retiring.
+        assert!(native_run_dir(&repo, "rec-1").join("run.json").exists());
+
+        app.retire_planner_row("rec-1");
+
+        // In memory: exactly one orchestrator remains, the pinned one.
+        let orchestrators: Vec<&AgentRun> =
+            app.agents.iter().filter(|run| run.is_orchestrator()).collect();
+        assert_eq!(orchestrators.len(), 1, "steady state has one orchestrator");
+        assert_eq!(orchestrators[0].id, "orch-1");
+        // Selection followed back to the real orchestrator.
+        assert_eq!(app.selected_agent, 0);
+        // On disk: the reconcile record is gone; the pinned one is untouched.
+        assert!(
+            !native_run_dir(&repo, "rec-1").join("run.json").exists(),
+            "reconcile run.json deleted so it cannot reload as an orphan orchestrator"
+        );
+        assert!(
+            native_run_dir(&repo, "orch-1").join("run.json").exists(),
+            "the pinned orchestrator's record is preserved"
+        );
+
+        // Idempotent: a second call is a harmless no-op.
+        app.retire_planner_row("rec-1");
+        assert_eq!(app.agents.len(), 1);
+
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn restore_running_agents_skips_reconcile_planners() {
+        let mut app = App::new();
+        app.cwd = std::env::temp_dir();
+        // A reloaded reconcile planner (no terminal, status Running) must NOT be queued
+        // for background resume even if it slips past the load filter.
+        let mut rec = planner_run("rec-1", true);
+        rec.terminal = None;
+        rec.session_id = Some("sid".to_string());
+        app.agents.push(rec);
+        app.migration_resumes_attempted = false;
+        app.restore_running_agents();
+        // It is still present (restore does not delete) but was never resumed: it has
+        // no terminal and its status was left untouched.
+        assert!(app.agents[0].terminal.is_none(), "reconcile planner is not resumed");
+    }

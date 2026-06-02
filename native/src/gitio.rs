@@ -274,7 +274,27 @@ pub(crate) fn load_persisted_agents(repo_root: &Path) -> Vec<AgentRun> {
         .filter_map(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
         .filter_map(|record| agent_from_run_record(repo_root, record))
         .collect::<Vec<_>>();
+    // Drop any TRANSIENT reconcile planner left on disk (e.g. by a crash mid-reconcile,
+    // or an older build that never deleted them). They are ephemeral helpers, not the
+    // pinned orchestrator: reloading one as a RudderPlan row would surface a phantom
+    // second orchestrator in the agent pane. The real planner has reconcile_planner=false.
+    agents.retain(|run| !run.reconcile_planner);
     agents.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    // AT-MOST-ONE ORCHESTRATOR on reload: keep only the NEWEST pinned planner (now first
+    // after the desc sort) and drop older ones. Every plan ever run persists its planner
+    // row, and `is_orchestrator()` is true for all of them, so without this a long-lived
+    // repo would reload one phantom orchestrator per past plan. In-memory only (no disk
+    // mutation during a read); the survivor is retired/replaced when the next plan starts.
+    let mut seen_orchestrator = false;
+    agents.retain(|run| {
+        if run.is_orchestrator() {
+            if seen_orchestrator {
+                return false;
+            }
+            seen_orchestrator = true;
+        }
+        true
+    });
     agents
 }
 
@@ -449,9 +469,13 @@ pub(crate) fn agent_from_run_record(repo_root: &Path, record: serde_json::Value)
         deps,
         soft_deps,
         node_id,
-        // Reconcile-planner is ephemeral runtime routing state, never persisted; a
-        // restored run is never mid-reconcile.
-        reconcile_planner: false,
+        // A reconcile planner is a TRANSIENT row that should never reload as a pinned
+        // orchestrator. Read the persisted discriminator (absent in old records →
+        // false, the real planner); load_persisted_agents filters true ones out.
+        reconcile_planner: record
+            .get("reconcilePlanner")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
         plan_stream: None,
         last_worker_input_at: None,
         ready_since: None,
@@ -572,6 +596,11 @@ pub(crate) fn save_native_run_record(repo_root: &Path, run: &AgentRun) -> Result
         "status": run_record_status(run.status),
         "vcs": if is_jj_run { "jj" } else { "git" },
         "mode": run.mode.as_str(),
+        // Whether this RudderPlan row is a TRANSIENT reconcile planner (vs the pinned
+        // orchestrator). Persisted so an orphan left by a crash mid-reconcile is
+        // identifiable on reload and filtered out instead of resurfacing as a second
+        // orchestrator. Absent in old records → defaults to false (the real planner).
+        "reconcilePlanner": run.reconcile_planner,
         "task": run.task,
         "taskSummary": run.task_summary,
         "backend": run.backend.as_str(),
