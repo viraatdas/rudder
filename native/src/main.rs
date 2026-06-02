@@ -131,6 +131,7 @@ const AGENT_PANE_HINTS: &[&str] = &[
     "R review all",
     "m merge",
     "M merge all",
+    "x stop",
     "dd delete",
     "P model",
 ];
@@ -1142,6 +1143,15 @@ impl App {
                 // away. For any other agent, `d` deletes it as usual.
                 if !self.selected_is_orchestrator() {
                     self.delete_selected_agent();
+                }
+            }
+            KeyCode::Char('x') => {
+                // Stop the selected worker: drops its PTY, marks it Stopped, frees a
+                // parallelism slot, and keeps its jj workspace (undoable). Not the
+                // main agent or the orchestrator.
+                if !self.selected_is_main() && !self.selected_is_orchestrator() {
+                    let idx = self.selected_agent;
+                    self.stop_agent_at(idx);
                 }
             }
             KeyCode::Char('P') => self.open_main_model_switcher(),
@@ -5965,6 +5975,157 @@ impl App {
             "{operation_label} conflict in {count} file{}: press y to let AI resolve & complete the merge, or n to do it manually",
             if count == 1 { "" } else { "s" }
         ));
+    }
+
+    /// STEERING: re-goal a running/finished worker by RESUMING its session (so it
+    /// keeps its memory and its jj-workspace edits) and delivering a new objective as
+    /// the next turn. Falls back to a fresh, context-carrying spawn when there is no
+    /// resumable session. The conflict resolver (below) is the same re-task-in-place
+    /// pattern; this differs by resuming instead of minting fresh. Returns true on
+    /// success. Never re-goals the main agent or the orchestrator.
+    // Wired by the autonomous drift-fix (2c) and conductor chat routing (2d); the
+    // stop primitive below already has a keybinding.
+    #[allow(dead_code)]
+    fn regoal_agent_at(&mut self, index: usize, new_goal: &str) -> bool {
+        let cwd_default = self.cwd.clone();
+        let (command, deliver_after, new_session, size, cwd, node_label) = {
+            let Some(run) = self.agents.get(index) else {
+                return false;
+            };
+            if run.is_main() || run.is_orchestrator() {
+                return false;
+            }
+            let backend = run.backend;
+            let size = run.terminal_size.unwrap_or_default();
+            let cwd = run.cwd.clone();
+            let label = run.node_id.clone().unwrap_or_else(|| run.id.clone());
+            let session = run.session_id.clone().filter(|s| !s.trim().is_empty());
+            let (command, deliver_after, new_session) = if let Some(sid) = session.as_deref() {
+                // Resume the SAME session; the new goal arrives as the next turn.
+                let command = match backend {
+                    Backend::Claude => claude_resume_command(run, sid),
+                    Backend::Codex => codex_resume_command(run, sid),
+                };
+                (command, Some(new_goal.to_string()), session.clone())
+            } else {
+                // No session to resume: fresh spawn carrying a handoff. Files persist
+                // in the jj workspace; only conversation memory is lost.
+                let sid = mint_session_id_for(backend);
+                let prompt = format!(
+                    "Continue your task: {}. New direction: {new_goal}. Your prior edits are in this workspace; run `jj diff` to see them.",
+                    run.task
+                );
+                let command =
+                    agent_command(backend, &run.model, run.effort, &prompt, AgentMode::Execute, sid.as_deref());
+                (command, None, sid)
+            };
+            (command, deliver_after, new_session, size, cwd, label)
+        };
+
+        let options = TerminalPaneOptions {
+            size,
+            cwd: Some(cwd),
+            ..TerminalPaneOptions::default()
+        };
+        if let Some(run) = self.agents.get_mut(index) {
+            run.terminal = None;
+            run.review_terminal = None;
+        }
+        match TerminalPane::spawn_shell_or_command(Some(command), options) {
+            Ok(mut terminal) => {
+                let _ = terminal.drain_output();
+                if let Some(text) = &deliver_after {
+                    let _ = terminal.write_input(format!("{text}\r").as_bytes());
+                }
+                let now = now_stamp();
+                if let Some(run) = self.agents.get_mut(index) {
+                    run.terminal = Some(terminal);
+                    run.status = AgentStatus::Running;
+                    run.session_id = new_session;
+                    run.completed_at = None;
+                    run.last_output_at = Instant::now();
+                    run.ready_since = None;
+                    run.needs_permission = false;
+                    run.permission_notified = false;
+                    run.needs_user_input = false;
+                    run.user_input_notified = false;
+                    run.last_error = None;
+                    run.current_prompt = new_goal.to_string();
+                    run.turns.push(AgentTurn {
+                        ts: now.clone(),
+                        prompt: new_goal.to_string(),
+                        source: "regoal".to_string(),
+                    });
+                    run.last_user_input_at = now;
+                    run.last_worker_input_at = Some(Instant::now());
+                    let _ = save_native_run_record(&cwd_default, run);
+                }
+                self.push_activity(format!("re-goaled {node_label}: {}", short_task(new_goal)));
+                self.mirror_graph();
+                true
+            }
+            Err(error) => {
+                if let Some(run) = self.agents.get_mut(index) {
+                    run.status = AgentStatus::Failed;
+                    run.last_error = Some(error.to_string());
+                }
+                self.notice = Some(format!("re-goal failed: {error}"));
+                false
+            }
+        }
+    }
+
+    /// STEERING: write a line of context straight into a RUNNING agent's PTY (it
+    /// picks it up on its next turn). Returns false if there is no live terminal
+    /// (the caller can fall back to re-goal-via-resume).
+    #[allow(dead_code)]
+    fn live_inject_at(&mut self, index: usize, text: &str) -> bool {
+        let result = match self.agents.get_mut(index).and_then(|run| run.terminal.as_mut()) {
+            Some(terminal) => {
+                terminal.reset_scrollback();
+                terminal.write_input(format!("{text}\r").as_bytes())
+            }
+            None => return false,
+        };
+        if result.is_ok() {
+            if let Some(run) = self.agents.get_mut(index) {
+                run.last_worker_input_at = Some(Instant::now());
+            }
+            self.dirty = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// STEERING: stop a running/queued worker. Drops its PTY and marks it Stopped,
+    /// freeing a parallelism slot (running_plan_agents ignores Stopped) while KEEPING
+    /// its jj workspace on disk (undoable / re-goalable). Its node id never enters the
+    /// merged set, so hard dependents stay correctly blocked.
+    fn stop_agent_at(&mut self, index: usize) -> bool {
+        let cwd = self.cwd.clone();
+        let label = {
+            let Some(run) = self.agents.get_mut(index) else {
+                return false;
+            };
+            if run.is_main() {
+                return false;
+            }
+            run.terminal = None;
+            run.review_terminal = None;
+            run.status = AgentStatus::Stopped;
+            run.completed_at = Some(Instant::now());
+            run.merge_resolver = false;
+            run.needs_permission = false;
+            run.permission_notified = false;
+            run.needs_user_input = false;
+            run.user_input_notified = false;
+            let _ = save_native_run_record(&cwd, run);
+            run.node_id.clone().unwrap_or_else(|| run.id.clone())
+        };
+        self.push_activity(format!("stopped {label}"));
+        self.mirror_graph();
+        true
     }
 
     fn start_conflict_resolution_agent(&mut self) {

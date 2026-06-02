@@ -2757,6 +2757,41 @@ branch refs/heads/main\n";
     }
 
     #[test]
+    fn stop_agent_frees_slot_and_keeps_workspace_for_undo() {
+        let mut app = App::new();
+        app.cwd = std::env::temp_dir();
+        let mut a = test_agent_run("n0agent", "scaffold");
+        a.node_id = Some("n0".to_string());
+        a.mode = AgentMode::Execute;
+        a.status = AgentStatus::Running;
+        app.agents = vec![a];
+        assert_eq!(app.running_plan_agents(), 1);
+
+        assert!(app.stop_agent_at(0));
+        assert_eq!(app.agents[0].status, AgentStatus::Stopped);
+        assert!(app.agents[0].terminal.is_none());
+        assert_eq!(app.running_plan_agents(), 0, "stop frees the parallelism slot");
+        // A stopped node never enters the merged set, so hard dependents stay blocked.
+        assert!(!app.merged_node_ids().contains(&"n0".to_string()));
+        assert!(app.activity_log.iter().any(|l| l.contains("stopped n0")));
+    }
+
+    #[test]
+    fn steering_guards_refuse_unsafe_targets() {
+        // No real agent spawn happens in these (early-return guards only).
+        let mut app = App::new();
+        // live-inject with no live terminal returns false (caller falls back).
+        let no_term = test_agent_run("a", "t");
+        app.agents = vec![no_term];
+        assert!(!app.live_inject_at(0, "hi"), "no terminal -> false");
+        // re-goal refuses the orchestrator (would never spawn a worker for it).
+        let mut orch = test_agent_run("orch", "build");
+        orch.mode = AgentMode::RudderPlan;
+        app.agents = vec![orch];
+        assert!(!app.regoal_agent_at(0, "new direction"), "orchestrator is not re-goaled");
+    }
+
+    #[test]
     fn auto_expand_respects_depth_cap() {
         let mut app = App::new();
         app.followup_gen.insert("deep".to_string(), MAX_FOLLOWUP_DEPTH);
