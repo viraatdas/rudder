@@ -558,3 +558,108 @@ is a separate piece of work.
   primitives).
 - Cloud: `src/cloud.ts` (client) + `cloud/src/server.ts` (control plane) +
   `cloud/worker/` (worker image).
+
+---
+
+## 14. Orchestrator: the DAG, the schedulers, and the conductor (v3)
+
+Beyond single runs (sections 5–7), Rudder decomposes ONE goal into a DAG of tasks
+and runs them as a fleet. This section is the map of that orchestrator.
+
+### 14.1 The model
+- A goal → a DAG of task nodes in `.rudder/graph.json`. Edges are typed: **hard**
+  (consumer cannot succeed until producer MERGES), **soft** (advisory context, never
+  gates — runs in parallel), **judge** (variant gates a judge on reaching review).
+- Each node → a worker agent in its OWN isolated jj workspace. Because workspaces are
+  isolated, two running agents NEVER collide on disk; the real risks are a future
+  *merge* conflict (jj records it; the AI resolver fixes it) or *interface DRIFT*
+  (isolated pieces that don't compose).
+- `NodeStatus`: planned → running → review → merged (+ blocked / failed). The hard
+  edge is the primary anti-drift defense: a consumer launches only after its producer
+  is MERGED, so it builds on the real, landed interface.
+
+### 14.2 Two schedulers, one brain (deliberate; deduped)
+- **TUI brain** (`native/src/main.rs`): owns the plan in memory (`planned_nodes` +
+  `agents`), spawns each worker's PTY **in-process** (that is what renders the live
+  panes), and is the **sole dispatcher** in interactive use (`run_scheduler` →
+  `next_node_to_launch` → `start_execute_task_node`). It MIRRORS its plan into
+  `graph.json` one-way via `rudder __graph-mirror` (`mirror_graph`/`build_mirror_payload`).
+- **Daemon** (`src/scheduler.ts`): dispatches **only headless** (`rudder board`/`serve`,
+  `scheduler:true`), reading `graph.json` as source of truth and spawning detached
+  `rudder __worker` subprocesses. When the TUI is up it starts the daemon
+  **projector-only** (`scheduler:false`): the board serves HTTP+SSE and reflects
+  `graph.json` but never launches — so there is no double-launch.
+- `graph.json` is a **one-way mirror**: the TUI writes it, the daemon/board read it;
+  the TUI never reads it back for scheduling. They are mutually-exclusive schedulers,
+  not duplicates — one runtime for live panes (Rust), one for headless/web (TS).
+
+### 14.3 Readiness contract (the dedup)
+A node is READY iff: it is still `planned`, every HARD parent is `merged` (a hard dep
+absent from the plan counts as satisfied — permissive, never deadlock on a dangling
+ref), and every JUDGE parent is `review`|`merged`. SOFT parents never gate.
+- Single source of truth: **`tests/fixtures/readiness-cases.json`**, consumed by BOTH
+  `app_tests::readiness_parity_fixture` (Rust, `include_str!`) and
+  `tests/readiness-parity.test.mjs` (TS). Change the rule → edit the fixture once;
+  both suites fail until both implementations agree. Judge gating is exercised TS-side
+  only until the TUI grows fan-out (noted in the fixture).
+- Rust: `PlannedNode::is_ready` (`native/src/tasks.rs`). TS: `isReady`/`readyNodes`
+  (`src/graph.ts`).
+
+### 14.4 Lifecycle: plan → approve → conduct
+1. **Plan.** Type a goal → `start_rudder_plan_task` spawns a read-only decomposer
+   (`claude -p --output-format stream-json` / `codex exec --json`). The orchestrator
+   pane streams the transcript and flips to the **pinned DAG** the instant a
+   `RUDDER_PLAN_TASKS` block parses (`orchestrator_phase`).
+2. **Refine** (awaiting approval). Chat in the orchestrator pane → `refine_plan`
+   (resumes the planner session) → the DAG updates in place, no wipe.
+3. **Approve → launch.** Empty-Enter → `approve_planned_queue` → `run_scheduler`
+   dispatches ready nodes (todo→running), each in its own jj workspace.
+4. **Conduct.** After launch the orchestrator stays live (not a dead view): it grows
+   the DAG from completions, steers agents, and can rebase. Conductor actions are
+   **autonomous (no confirm)** but **visible** (`activity_log`, rendered in the
+   orchestrator pane) and **undoable** (jj op-log via `rudder undo`).
+
+### 14.5 Conductor capabilities (BUILT vs PLANNED)
+- **Auto-expand from completion** (BUILT). A finished worker calls **`rudder done`**
+  (it echoes a `RUDDER_DONE` block to its PTY and appends to `DECISIONS.md`); the poll
+  loop's `maybe_ingest_worker_followups` → `parse_worker_done_block` →
+  `apply_worker_followups` grows the DAG from the agent's recommended follow-ups
+  (dedupe by title, `MAX_FOLLOWUP_DEPTH` via `followup_gen`, `MAX_PLAN_TASKS` cap,
+  soft-by-default deps, `scope:"out"` recorded-not-injected). Logged to `activity_log`.
+- **Reconcile** (BUILT). Typing a task post-launch injects ONE node
+  (`reconcile_injection` → `evaluate_completed_reconcile`).
+- **Steering** (PLANNED): re-goal-via-session-resume, live-inject, stop, edge
+  promote/demote, extract-shared-node, drop, reorder.
+- **Drift detection + fix** (PLANNED): file-overlap (`jj diff --name-only`) +
+  DECISIONS.md interface notes → serialize / extract / order; the merge-time AI
+  resolver is the last resort.
+- **Plan-rebase** (PLANNED): a structural mid-flight change re-decomposes against the
+  current repo; MERGED = baseline (build-forward, never auto-undo), RUNNING =
+  keep/re-goal/stop, TODO = replace; applied as a reviewable diff.
+
+### 14.6 Coordination surfaces
+- **`DECISIONS.md`** — jj-tracked, agent-authored shared knowledge. Appended via
+  `rudder remember` (a decision) or `rudder done` (a completion note). Siblings
+  re-read it; the board renders it. `appendDecision`/`appendCompletionNote`
+  (`src/surfaces.ts`).
+- **`RUDDER.md`** — read-only, orchestrator-owned, `freshness:`-stamped projection of
+  the plan/status that workers re-read (`renderLiveRudderMd`). Git-excluded.
+- **`rudder done [--node <id>] '<json>'`** — `{summary, interfaces, followups:[{title,
+  why, scope}]}` from stdin or args (freeform fallback). Records only; no jj.
+
+### 14.7 Merge model
+Manual by default (`m`/`M`); a hard-dep child launches only once its parent reaches
+`Merged`. `/automerge` = hands-free. Clean merge is mechanical jj (`jj new`); a
+conflict spawns the AI resolver (`start_conflict_resolution_agent` →
+`finalize_merge_resolvers`, jj-worded prompt). Undo via `rudder undo` (op-log). See
+section 5 / `src/jj.ts` for the run-level merge plumbing.
+
+### 14.8 Caps
+`MAX_PLAN_TASKS = 100` (per-plan parse cap AND the auto-expand backstop; overflow is
+surfaced, never silently truncated). `MAX_FOLLOWUP_DEPTH = 3`. Concurrency:
+`max_parallel()` (config `orchestrator.maxParallel`, default 1000), `MAX_LAUNCH_PER_TICK`.
+
+### 14.9 Status
+Built so far: cap=100, `rudder done` + completion notes, readiness dedup, auto-expand +
+activity log. Planned (approved v3 plan): the `OrchestratorMode` plan→conduct state
+machine + chat routing, steering primitives, drift detection/fix, and plan-rebase.
