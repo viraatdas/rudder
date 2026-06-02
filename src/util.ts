@@ -366,3 +366,58 @@ export function lineSplitBuffer(
   const rest = parts.pop() ?? "";
   return { lines: parts, rest };
 }
+
+/** A plain object (not null, not an array). Narrowing guard for untyped JSON. */
+export function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+/** Strip Rudder's prompt-injection wrappers ("USER TASK:" / "[RUDDER PROMPT
+ *  INJECTION]…[END…]") back to the bare prompt the user/orchestrator wrote, so a
+ *  follow-up never re-wraps an already-wrapped prompt. */
+export function stripRudderPromptWrappers(prompt: string): string {
+  const start = "[RUDDER PROMPT INJECTION]";
+  const endMarker = "[END RUDDER PROMPT INJECTION]";
+  let value = prompt.trimStart();
+  for (;;) {
+    if (value.startsWith("USER TASK:")) {
+      value = value.slice("USER TASK:".length).trimStart();
+      continue;
+    }
+    if (value.startsWith(start)) {
+      const afterStart = value.slice(start.length);
+      const end = afterStart.indexOf(endMarker);
+      if (end >= 0) {
+        const body = afterStart.slice(0, end).trim();
+        const rest = afterStart.slice(end + endMarker.length).trimStart();
+        value = rest.length ? rest : body;
+        continue;
+      }
+    }
+    return value;
+  }
+}
+
+/** Flatten an assistant message (string content, or an array of content blocks)
+ *  to its plain text. Tolerant of untyped shapes from either backend. */
+export function textFromAssistantMessage(message: unknown): string {
+  if (!isRecord(message)) {
+    return "";
+  }
+  const content = message.content;
+  if (typeof content === "string") {
+    return content;
+  }
+  if (!Array.isArray(content)) {
+    return "";
+  }
+  return content
+    .map((block) => {
+      if (isRecord(block) && block.type === "text" && typeof block.text === "string") {
+        return block.text;
+      }
+      return "";
+    })
+    .filter(Boolean)
+    .join("\n");
+}

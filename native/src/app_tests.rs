@@ -1821,31 +1821,6 @@ branch refs/heads/main\n";
         assert_eq!(tasks[1].deps[0].edge, EdgeType::Soft);
     }
 
-    #[test]
-    fn ready_nodes_only_blocks_on_hard_deps() {
-        let output = "RUDDER_PLAN_TASKS_START\n{\"tasks\":[\
-            {\"id\":\"n0\",\"title\":\"a\",\"prompt\":\"Do a.\"},\
-            {\"id\":\"n1\",\"title\":\"b\",\"prompt\":\"Do b.\",\"deps\":[{\"on\":\"n0\",\"type\":\"hard\",\"why\":\"needs a merged\"}]},\
-            {\"id\":\"n2\",\"title\":\"c\",\"prompt\":\"Do c.\",\"deps\":[{\"on\":\"n0\",\"type\":\"soft\"}]}\
-        ]}\nRUDDER_PLAN_TASKS_END";
-        let tasks = extract_rudder_plan_tasks(output).expect("parse tasks");
-
-        // Nothing merged: roots n0 and the soft-only child n2 are ready, n1 is not.
-        let ready: Vec<&str> = ready_nodes(&tasks, &[])
-            .iter()
-            .map(|task| task.id.as_str())
-            .collect();
-        assert!(ready.contains(&"n0"));
-        assert!(ready.contains(&"n2"), "soft deps never block readiness");
-        assert!(!ready.contains(&"n1"), "hard dep not yet merged blocks n1");
-
-        // Once n0 is merged, n1 becomes ready too.
-        let ready: Vec<&str> = ready_nodes(&tasks, &["n0".to_string()])
-            .iter()
-            .map(|task| task.id.as_str())
-            .collect();
-        assert!(ready.contains(&"n1"));
-    }
 
     #[test]
     fn readiness_parity_fixture() {
@@ -2754,6 +2729,95 @@ branch refs/heads/main\n";
         // A second identical note adds nothing (title dedupe).
         assert!(!app.apply_worker_followups("n0", &note), "duplicate title is skipped");
         assert_eq!(app.planned_nodes.len(), 1);
+    }
+
+    #[test]
+    fn auto_expand_ingests_rudder_done_block_from_worker_pty() {
+        // FULL TUI-side communication pathway against a REAL PTY: a finished worker
+        // echoes a RUDDER_DONE block to stdout; the conductor scrapes its scrollback,
+        // parses the note, and GROWS the DAG with the in-scope follow-up (scope:out is
+        // recorded, not injected). Exercises the whole glue that the piecewise unit
+        // tests skip: maybe_ingest_worker_followups -> ingest_worker_followups (PTY
+        // snapshot) -> parse_worker_done_block -> apply_worker_followups, + idempotency.
+        let json = "{\"summary\":\"built auth module\",\"interfaces\":\"added login()\",\"followups\":[{\"title\":\"wire login into router\",\"why\":\"login needs a caller\",\"scope\":\"in\"},{\"title\":\"document the auth flow\",\"scope\":\"out\"}]}";
+        let block = format!("RUDDER_DONE_START\n{json}\nRUDDER_DONE_END");
+        let command =
+            TerminalCommand::with_args("sh", ["-lc", "printf '%s\\n' \"$BLOCK\""]).with_env("BLOCK", block);
+        let mut pane = TerminalPane::spawn_shell_or_command(
+            Some(command),
+            TerminalPaneOptions {
+                size: TerminalSize { rows: 12, cols: 240 },
+                scrollback_lines: 200,
+                ..Default::default()
+            },
+        )
+        .expect("spawn test pty");
+        // Drive the PTY to completion, draining its output into the scrollback.
+        let mut exited = false;
+        for _ in 0..400 {
+            let _ = pane.drain_output();
+            if matches!(pane.try_wait(), Ok(Some(_))) {
+                for _ in 0..64 {
+                    let had = !pane.drain_output().is_empty();
+                    if !had {
+                        break;
+                    }
+                }
+                exited = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(exited, "worker pty exited");
+        assert!(
+            pane.output_log_snapshot().contains("RUDDER_DONE_END"),
+            "the done block reached the scrollback: {:?}",
+            pane.output_log_snapshot()
+        );
+
+        let mut app = App::new();
+        app.cwd = std::env::temp_dir();
+        // Hold scheduling so the grown node is not actually launched (no real worker
+        // spawn in a unit test); we only assert the DAG GREW.
+        app.awaiting_approval = true;
+        let mut worker = test_agent_run_with_terminal(&app, pane);
+        worker.id = "worker-done-1".to_string();
+        worker.node_id = Some("n0".to_string());
+        worker.mode = AgentMode::Execute;
+        worker.status = AgentStatus::Done;
+        app.agents = vec![worker];
+
+        app.maybe_ingest_worker_followups();
+
+        assert_eq!(app.planned_nodes.len(), 1, "only the in-scope follow-up is injected");
+        assert_eq!(app.planned_nodes[0].title, "wire login into router");
+        assert!(
+            app.followups_ingested.contains("worker-done-1"),
+            "the finished worker is marked ingested once"
+        );
+        // Idempotent: a second pass over the same Done worker adds nothing.
+        app.maybe_ingest_worker_followups();
+        assert_eq!(app.planned_nodes.len(), 1, "ingest is once-per-worker");
+    }
+
+    #[test]
+    fn auto_expand_skips_non_done_or_non_plan_workers() {
+        let mut app = App::new();
+        app.cwd = std::env::temp_dir();
+        // Still Running -> not a candidate.
+        let mut running = test_agent_run("r", "x");
+        running.node_id = Some("n0".to_string());
+        running.mode = AgentMode::Execute;
+        running.status = AgentStatus::Running;
+        // Done but carries no node_id (a manual run, not a plan node) -> not a candidate.
+        let mut manual = test_agent_run("m", "y");
+        manual.mode = AgentMode::Execute;
+        manual.status = AgentStatus::Done;
+        app.agents = vec![running, manual];
+
+        app.maybe_ingest_worker_followups();
+        assert!(app.planned_nodes.is_empty(), "no grow from running / non-plan workers");
+        assert!(app.followups_ingested.is_empty(), "non-candidates are never marked");
     }
 
     #[test]
@@ -3840,18 +3904,6 @@ branch refs/heads/main\n";
     }
 
     #[test]
-    fn discard_planned_queue_clears_todo() {
-        let mut app = App::new();
-        app.cwd = std::env::temp_dir();
-        app.planned_nodes = vec![test_planned_node("n0", &[]), test_planned_node("n1", &["n0"])];
-
-        app.discard_planned_queue();
-
-        assert!(app.planned_nodes.is_empty(), "queue is cleared");
-        assert_eq!(app.notice.as_deref(), Some("discarded 2 planned node(s)"));
-    }
-
-    #[test]
     fn d_key_does_not_discard_plan_queue() {
         // The plan is refined by typing into the task pane, never discarded with `d`.
         let mut app = App::new();
@@ -4296,28 +4348,6 @@ branch refs/heads/main\n";
         app.handle_agents_key(KeyEvent::from(KeyCode::Char('d')));
         assert_eq!(app.planned_nodes.len(), 2, "d does not discard the plan");
         assert!(app.awaiting_approval, "the approval gate stays open");
-    }
-
-    #[test]
-    fn remove_planned_node_drops_one_and_keeps_rest() {
-        let mut app = App::new();
-        app.planned_nodes = vec![test_planned_node("n0", &[]), test_planned_node("n1", &["n0"])];
-        app.planned_origin = "build it".to_string();
-        app.awaiting_approval = true;
-
-        assert!(app.remove_planned_node("n1"), "removes the named node");
-        assert_eq!(app.planned_nodes.len(), 1, "one node remains");
-        assert_eq!(app.planned_nodes[0].id, "n0");
-        // The plan is not empty, so the gate stays up for the surviving node.
-        assert!(app.awaiting_approval, "gate stays while nodes remain");
-
-        // Removing the last node clears the gate and the origin.
-        assert!(app.remove_planned_node("n0"));
-        assert!(app.planned_nodes.is_empty());
-        assert!(!app.awaiting_approval, "removing the last node clears the gate");
-        assert!(app.planned_origin.is_empty());
-        // A node id not in the queue is a no-op.
-        assert!(!app.remove_planned_node("ghost"));
     }
 
     // --- Plan refinement (plan-mode-style discussion before approval) --------

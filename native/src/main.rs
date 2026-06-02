@@ -4805,7 +4805,11 @@ impl App {
         let Some(run) = self.agents.get_mut(index) else {
             return;
         };
-        if run.mode != AgentMode::RudderPlan || !run.autosteered {
+        // A transient reconcile planner must never reach the initial-plan REPLACE path
+        // (it would wipe `planned_nodes`); it is routed to evaluate_completed_reconcile.
+        // Callers already filter it out; this guard matches evaluate_completed_rebase and
+        // is defensive against future refactors.
+        if run.mode != AgentMode::RudderPlan || run.reconcile_planner || !run.autosteered {
             return;
         }
         // The planner process just exited; its FINAL stdout (the rest of the human
@@ -4926,8 +4930,9 @@ impl App {
     /// task becomes a PlannedNode whose id is UNIQUIFIED against the existing
     /// planned-node ids and agent node ids (so dep ids resolve), then PUSHED onto
     /// `planned_nodes`. FALLBACK: a node the model returned with no deps gets a SOFT
-    /// edge to every current frontier id (mirrors src/scheduler.ts:901-911) so the
-    /// added work is aware of the in-flight work but never deadlocks. The reconcile
+    /// edge to every current frontier id (mirroring the daemon's soft-edge frontier
+    /// fallback in src/scheduler.ts) so the added work is aware of the in-flight work
+    /// but never deadlocks. The reconcile
     /// planner agent is then removed. If the session is already approved/running
     /// (not awaiting approval), the scheduler runs so the new node launches when its
     /// deps are met; if the initial plan is still awaiting approval, the node is
@@ -5012,11 +5017,15 @@ impl App {
         // awaiting approval, leave the node QUEUED: it joins the plan the user
         // approves at the gate.
         if self.awaiting_approval {
+            // Pre-approval: the node only joins the queue the user is reviewing, so this
+            // is a gated change (notice only), not an autonomous one.
             self.notice = Some(format!(
                 "added {appended} node(s) to the plan awaiting approval"
             ));
         } else {
-            self.notice = Some(format!("added {appended} node(s) to the plan"));
+            // Post-approval: this is an AUTONOMOUS mutation, so log it to the activity
+            // feed (visible) like every other autonomous action, then schedule.
+            self.push_activity(format!("reconciled plan: added {appended} node(s)"));
             self.run_scheduler();
         }
         // MIRROR the appended node(s) into graph.json. When awaiting approval the
@@ -5147,12 +5156,14 @@ impl App {
             let _ = save_native_run_record(&self.cwd, run);
         }
 
-        // 4) Launch newly-ready work + mirror, then log the diff (visible, no confirm).
+        // 4) Launch newly-ready work, log the diff (visible even if mirror fails), then
+        // mirror. save -> log -> mirror matches regoal_agent_at / stop_agent_at; mirror is
+        // best-effort/non-fatal so logging first guarantees the user sees the action.
         self.run_scheduler();
-        self.mirror_graph();
         self.push_activity(format!(
             "rebased plan: +{added} added · {regoaled} re-goaled · {dropped} stopped/dropped · {kept} kept"
         ));
+        self.mirror_graph();
         self.dirty = true;
     }
 
@@ -5394,26 +5405,6 @@ impl App {
         self.dirty = true;
     }
 
-    /// Remove a single planned node from the queue (FIX the plan before approval).
-    /// Returns true when a node was removed. Dropping a parent leaves its children
-    /// as roots (their dep id is simply absent from the plan, treated as satisfied).
-    fn remove_planned_node(&mut self, node_id: &str) -> bool {
-        let Some(position) = self
-            .planned_nodes
-            .iter()
-            .position(|node| node.id == node_id)
-        else {
-            return false;
-        };
-        let node = self.planned_nodes.remove(position);
-        self.notice = Some(format!("removed planned node {}", node.title));
-        if self.planned_nodes.is_empty() {
-            self.awaiting_approval = false;
-            self.planned_origin.clear();
-        }
-        self.dirty = true;
-        true
-    }
 
     /// Node ids of agents that have reached Merged. These satisfy hard deps and
     /// unblock dependents on the next scheduler pass.
@@ -5797,20 +5788,6 @@ impl App {
         ids
     }
 
-    /// Discard the entire pending plan queue. No longer bound to a key (the plan is
-    /// refined by typing into the task pane, not discarded), but kept for now.
-    #[allow(dead_code)]
-    fn discard_planned_queue(&mut self) {
-        if self.planned_nodes.is_empty() {
-            return;
-        }
-        let count = self.planned_nodes.len();
-        self.planned_nodes.clear();
-        self.planned_origin.clear();
-        self.awaiting_approval = false;
-        self.notice = Some(format!("discarded {count} planned node(s)"));
-        self.dirty = true;
-    }
 
     fn selected_terminal_mut(&mut self) -> Option<&mut TerminalPane> {
         self.agents
@@ -5975,78 +5952,6 @@ impl App {
             }
         }));
         let _ = write_rudder_context(&self.cwd, &self.agents, None);
-    }
-
-    /// Remove the agent at `index` from the dashboard and its on-disk run record,
-    /// then re-anchor `selected_agent` onto the nearest visible row. Used to abandon
-    /// a gated plan's planner run (which has no worktree to clean up).
-    // Retained as a general utility (the orchestrator is no longer removed on plan
-    // completion, which was its only caller). Kept for future deletion paths.
-    #[allow(dead_code)]
-    fn remove_agent_at(&mut self, index: usize) {
-        if index >= self.agents.len() {
-            return;
-        }
-        let run = self.agents.remove(index);
-        let _ = remove_native_run_record(&self.cwd, &run.id);
-        let last = self.agents.len().saturating_sub(1);
-        self.selected_agent = self.selected_agent.min(last);
-        if !self.agents.is_empty() {
-            let visible = self.visible_agent_indices();
-            if let Some(target) = visible
-                .iter()
-                .copied()
-                .find(|&visible_index| visible_index >= self.selected_agent)
-                .or_else(|| visible.last().copied())
-            {
-                self.selected_agent = target;
-            }
-        }
-        let _ = write_rudder_context(&self.cwd, &self.agents, None);
-    }
-
-    // Retired from the UI (no keybinding, /sync is a no-op); kept for now.
-    #[allow(dead_code)]
-    fn request_sync_selected_agent(&mut self) {
-        if self.selected_is_main() {
-            self.notice = Some("main agent: sync disabled".to_string());
-            return;
-        }
-        let Some(run) = self.agents.get(self.selected_agent) else {
-            self.notice = Some("no agent selected".to_string());
-            return;
-        };
-        if run.status == AgentStatus::Running {
-            self.notice = Some("selected agent is still running".to_string());
-            return;
-        }
-        if run.status == AgentStatus::Merged {
-            self.notice = Some("selected agent is already merged".to_string());
-            return;
-        }
-        // A run is isolated (and thus syncable) when it has a workspace path,
-        // whether that is a jj workspace (new runs) or a git worktree (legacy).
-        if run.worktree_path.is_none() && run.worktree_branch.is_none() {
-            self.notice = Some("selected agent has no workspace to sync".to_string());
-            return;
-        }
-        let task = run.task.clone();
-        let source_branch = run.worktree_branch.clone();
-        let worktree_path = run.worktree_path.clone();
-        let agent_id = Some(run.id.clone());
-        match self.sync_agent_at(self.selected_agent) {
-            Ok(()) => {
-                self.notice = Some("synced selected worktree".to_string());
-            }
-            Err(error) => self.handle_merge_error(
-                task,
-                error,
-                None,
-                source_branch,
-                worktree_path,
-                agent_id,
-            ),
-        }
     }
 
     fn request_merge_selected_agent(&mut self) {
@@ -6844,39 +6749,6 @@ What to do\n\
         // confirmation responsive. Never touch the dedicated main agent.
         if index < self.agents.len() && !self.agents[index].is_main() {
             self.mark_agent_and_review_sources_merged(index, review_source_ids);
-        }
-        Ok(())
-    }
-
-    fn sync_agent_at(&mut self, index: usize) -> Result<()> {
-        self.pending_jj_conflict = None;
-        let Some(run) = self.agents.get(index) else {
-            anyhow::bail!("no selected agent");
-        };
-        if Self::run_is_jj(run) {
-            // jj sync rebases the run's change onto the base via `rudder sync`.
-            let run_id = run.id.clone();
-            match run_rudder_jj_command(&self.cwd, "sync", &run_id, "sync") {
-                JjCliOutcome::Ok => {}
-                JjCliOutcome::Conflict { files } => {
-                    self.pending_jj_conflict = Some(files);
-                    anyhow::bail!("jj sync created conflicts");
-                }
-                JjCliOutcome::Failed { error } => anyhow::bail!(error),
-            }
-            if let Some(run) = self.agents.get(index) {
-                save_native_run_record(&self.cwd, run)?;
-            }
-            return Ok(());
-        }
-        if run.worktree_branch.is_none() {
-            anyhow::bail!("selected agent is not in a worktree");
-        }
-        commit_pending_changes_for_run(run)?;
-        let base_branch = current_branch_at(&self.cwd).unwrap_or_else(|| "HEAD".to_string());
-        rebase_worktree_onto_base(&self.cwd, &run.cwd, &base_branch)?;
-        if let Some(run) = self.agents.get(index) {
-            save_native_run_record(&self.cwd, run)?;
         }
         Ok(())
     }

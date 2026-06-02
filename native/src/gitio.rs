@@ -1277,31 +1277,6 @@ pub(crate) fn write_rudder_context(
     Ok(())
 }
 
-#[allow(dead_code)]
-pub(crate) fn ensure_git_info_exclude_contains(cwd: &Path, line: &str) -> Result<()> {
-    let path = git_output(cwd, ["rev-parse", "--git-path", "info/exclude"])?;
-    let trimmed = path.trim();
-    let path = if Path::new(trimmed).is_absolute() {
-        PathBuf::from(trimmed)
-    } else {
-        cwd.join(trimmed)
-    };
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let existing = fs::read_to_string(&path).unwrap_or_default();
-    if existing.lines().any(|existing| existing.trim() == line) {
-        return Ok(());
-    }
-    let mut next = existing;
-    if !next.ends_with('\n') && !next.is_empty() {
-        next.push('\n');
-    }
-    next.push_str(line);
-    next.push('\n');
-    fs::write(path, next)?;
-    Ok(())
-}
 
 pub(crate) fn ensure_gitignore_contains(repo_root: &Path, line: &str) -> Result<()> {
     let path = repo_root.join(".gitignore");

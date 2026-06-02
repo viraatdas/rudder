@@ -3,7 +3,7 @@ import { CODEX_RUDDER_CONFIG_ARGS } from "./codex-binary.js";
 import { normalizeEffortForBackend } from "./effort.js";
 import { PLAN_MODE_CONTRACT } from "./plan-mode.js";
 import { taskDisplayLabel } from "./task-summary.js";
-import { shellQuote } from "./util.js";
+import { shellQuote, stripRudderPromptWrappers } from "./util.js";
 
 export function nativeAgentCommand(params: {
   run: RunRecord;
@@ -135,29 +135,6 @@ function paneTitle(run: RunRecord): string {
 
 function compact(values: Array<string | undefined>): string[] {
   return values.filter((value): value is string => Boolean(value));
-}
-
-function stripRudderPromptWrappers(prompt: string): string {
-  const start = "[RUDDER PROMPT INJECTION]";
-  const endMarker = "[END RUDDER PROMPT INJECTION]";
-  let value = prompt.trimStart();
-  for (;;) {
-    if (value.startsWith("USER TASK:")) {
-      value = value.slice("USER TASK:".length).trimStart();
-      continue;
-    }
-    if (value.startsWith(start)) {
-      const afterStart = value.slice(start.length);
-      const end = afterStart.indexOf(endMarker);
-      if (end >= 0) {
-        const body = afterStart.slice(0, end).trim();
-        const rest = afterStart.slice(end + endMarker.length).trimStart();
-        value = rest.length ? rest : body;
-        continue;
-      }
-    }
-    return value;
-  }
 }
 
 const CLAUDE_PLAN_TOOLS = [

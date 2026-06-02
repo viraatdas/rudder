@@ -9,6 +9,7 @@ import { parseDecisions } from "../dist/board/daemon.js";
 import {
   DECISIONS_HEADER,
   PROPAGATION_RULES,
+  appendCompletionNote,
   appendDecision,
   ensureDecisionsFile,
 } from "../dist/surfaces.js";
@@ -97,6 +98,42 @@ test("appendDecision appends a parseable (owner, ts) bullet", async () => {
     assert.equal(entries[0].text, "use jj for isolation");
     assert.equal(entries[0].owner, "cli");
     assert.ok(entries[0].ts, "ts is populated");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("appendCompletionNote writes a DONE bullet with interfaces + scoped follow-ups", async () => {
+  // The worker side of the completion pathway: `rudder done` records what the agent
+  // did (summary + interfaces) and what it thinks is left (follow-ups, in/out of lane)
+  // to DECISIONS.md, so siblings AND the orchestrator can read it.
+  const dir = await mkdtemp(path.join(tmpdir(), "rudder-done-"));
+  try {
+    await appendCompletionNote(
+      dir,
+      {
+        node: "n3",
+        summary: "built the auth module",
+        interfaces: "added login() and a Session type",
+        followups: [
+          { title: "wire login into the router", why: "login needs a caller", scope: "in" },
+          { title: "rate-limit the login endpoint", scope: "out" },
+        ],
+      },
+      "worker",
+    );
+    const content = await readFile(path.join(dir, "DECISIONS.md"), "utf8");
+    // The headline bullet is owned by the node id and parses like any decision
+    // (the indented follow-up bullets also parse as entries, so find by owner).
+    const entries = parseDecisions(content);
+    const headline = entries.find((e) => e.owner === "n3");
+    assert.ok(headline, "a DONE bullet owned by the node id");
+    assert.match(headline.text, /DONE \(n3\): built the auth module/);
+    // The structured detail the orchestrator reads back.
+    assert.match(content, /interfaces: added login\(\) and a Session type/);
+    assert.match(content, /wire login into the router/);
+    assert.match(content, /\[scope: out\]/, "out-of-lane follow-up is flagged");
+    assert.match(content, /login needs a caller/, "the why is recorded");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

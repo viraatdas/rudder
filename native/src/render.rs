@@ -1357,26 +1357,6 @@ pub(crate) fn visible_agent_indices(agents: &[AgentRun]) -> Vec<usize> {
     sectioned_agent_order(agents)
 }
 
-/// The last `max` non-empty, ANSI-stripped output lines of a planner run, in
-/// natural (top-to-bottom) order. Surfaced under the spinner in the PLANNING phase
-/// so the orchestrator's clarifying questions (and its thinking) are visible to the
-/// user who is answering them, not just a single trailing line.
-#[allow(dead_code)]
-fn orchestrator_recent_output_lines(agent: &AgentRun, max: usize) -> Vec<String> {
-    let output = rudder_plan_output_for_run(agent);
-    let clean = strip_ansi_for_plan(&output).replace('\r', "");
-    let mut recent: Vec<String> = clean
-        .lines()
-        .rev()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .take(max)
-        .map(ToString::to_string)
-        .collect();
-    recent.reverse();
-    recent
-}
-
 /// Push one task row of the orchestrator DAG tree: nest glyphs, a live-status
 /// BADGE, the task title, and the status label. Mirrors `push_planned_row` styling
 /// but the badge color reflects the task's LIVE status.

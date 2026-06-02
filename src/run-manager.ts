@@ -48,6 +48,7 @@ import {
 import {
   commandExists,
   ensureDir,
+  isRecord,
   isTty,
   MissingToolError,
   newRunId,
@@ -55,6 +56,7 @@ import {
   pathExists,
   runCommand,
   shortenHome,
+  textFromAssistantMessage,
 } from "./util.js";
 import { createAgentPane, killPane, normalizeTmuxDashboardLayout, paneExitStatus, respawnPane, selectPane } from "./tmux.js";
 import { taskDisplayLabel } from "./task-summary.js";
@@ -1495,35 +1497,10 @@ function renderBackendForShell(
   return {};
 }
 
-function textFromAssistantMessage(message: unknown): string {
-  if (!isRecord(message)) {
-    return "";
-  }
-  const content = message.content;
-  if (typeof content === "string") {
-    return content;
-  }
-  if (!Array.isArray(content)) {
-    return "";
-  }
-  return content
-    .map((block) => {
-      if (isRecord(block) && block.type === "text" && typeof block.text === "string") {
-        return block.text;
-      }
-      return "";
-    })
-    .filter(Boolean)
-    .join("\n");
-}
-
 function objectField(data: unknown, key: string): string | undefined {
   return isRecord(data) && typeof data[key] === "string" ? data[key] : undefined;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return Boolean(value && typeof value === "object" && !Array.isArray(value));
-}
 
 function formatBackendData(data: unknown): string {
   if (typeof data === "string") {

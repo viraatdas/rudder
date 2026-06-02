@@ -8,11 +8,14 @@ import {
   commandExists,
   formatMissingToolMessage,
   isMissingToolSpawnError,
+  isRecord,
   lineSplitBuffer,
   MissingToolError,
   nowIso,
   parseJsonLine,
   runCommand,
+  stripRudderPromptWrappers,
+  textFromAssistantMessage,
 } from "./util.js";
 
 export function getBackend(id: BackendId): BackendAdapter {
@@ -168,29 +171,6 @@ function acpxBackend(): BackendAdapter {
       });
     },
   };
-}
-
-function stripRudderPromptWrappers(prompt: string): string {
-  const start = "[RUDDER PROMPT INJECTION]";
-  const endMarker = "[END RUDDER PROMPT INJECTION]";
-  let value = prompt.trimStart();
-  for (;;) {
-    if (value.startsWith("USER TASK:")) {
-      value = value.slice("USER TASK:".length).trimStart();
-      continue;
-    }
-    if (value.startsWith(start)) {
-      const afterStart = value.slice(start.length);
-      const end = afterStart.indexOf(endMarker);
-      if (end >= 0) {
-        const body = afterStart.slice(0, end).trim();
-        const rest = afterStart.slice(end + endMarker.length).trimStart();
-        value = rest.length ? rest : body;
-        continue;
-      }
-    }
-    return value;
-  }
 }
 
 function acpxCodexModel(model: string | undefined, effort: EffortLevel | undefined): string | undefined {
@@ -519,28 +499,3 @@ function isStreamingTextEvent(data: unknown): boolean {
   return event.type === "content_block_delta" && isRecord(event.delta) && typeof event.delta.text === "string";
 }
 
-function textFromAssistantMessage(message: unknown): string {
-  if (!isRecord(message)) {
-    return "";
-  }
-  const content = message.content;
-  if (typeof content === "string") {
-    return content;
-  }
-  if (!Array.isArray(content)) {
-    return "";
-  }
-  return content
-    .map((block) => {
-      if (isRecord(block) && block.type === "text" && typeof block.text === "string") {
-        return block.text;
-      }
-      return "";
-    })
-    .filter(Boolean)
-    .join("\n");
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return Boolean(value && typeof value === "object" && !Array.isArray(value));
-}

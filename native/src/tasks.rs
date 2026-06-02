@@ -96,15 +96,6 @@ pub(crate) enum EdgeType {
     Soft,
 }
 
-impl EdgeType {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::Hard => "hard",
-            Self::Soft => "soft",
-        }
-    }
-}
-
 /// A typed dependency declared by a plan task: this task depends `on` another
 /// task id, with the given `edge` type and an optional justification.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,21 +133,6 @@ impl RudderPlanTask {
             .filter(|edge| edge.edge == EdgeType::Hard)
             .map(|edge| edge.on.as_str())
     }
-}
-
-/// Ready-work detection (beads-style): a task is ready when every one of its
-/// hard-dep ids appears in `merged_ids`. Soft deps never block readiness.
-pub(crate) fn ready_nodes<'a>(
-    tasks: &'a [RudderPlanTask],
-    merged_ids: &[String],
-) -> Vec<&'a RudderPlanTask> {
-    tasks
-        .iter()
-        .filter(|task| {
-            task.hard_deps()
-                .all(|dep| merged_ids.iter().any(|id| id == dep))
-        })
-        .collect()
 }
 
 /// A queued unit of plannable work that has not launched yet. The scheduler
