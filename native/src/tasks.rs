@@ -54,29 +54,6 @@ pub(crate) fn plan_prompt(task: &str) -> String {
     )
 }
 
-/// The interactive plan-mode FRONT-END prompt (Path B), used for both backends
-/// (Claude `--permission-mode plan`, Codex `/plan`). The model researches read-only and
-/// proposes a plan the user refines in-pane. It must NOT implement: a separate fleet
-/// will. When the plan is settled it RESTATES the final plan wrapped in `<plan>...</plan>`
-/// so Rudder can capture it and hand it to the decomposer.
-pub(crate) fn plan_frontend_prompt(task: &str) -> String {
-    let task = strip_rudder_prompt_wrappers(task);
-    format!(
-        "Plan this task in plan mode. Inspect the repository READ-ONLY and propose a concrete implementation plan, then refine it with me through discussion. Do NOT implement anything and do NOT start coding: a separate set of worker agents will carry out the plan in isolated workspaces. Whenever you present your plan (initially and after each refinement), RESTATE the current full plan as prose wrapped in a single block delimited by a line `<plan>` and a line `</plan>`, so it can be captured. The `<plan>` block is your deliverable, not code changes.\n\nTask:\n{task}"
-    )
-}
-
-/// Phase-2 decomposer DIRECTIVE for Path B: wraps the APPROVED plan captured from the
-/// interactive front-end as the authoritative intent. Returned as the inner task string
-/// (the caller passes it through `start_rudder_plan_task`, which wraps it with the full
-/// `rudder_plan_prompt` contract); do NOT call `rudder_plan_prompt` here or it double-wraps.
-pub(crate) fn build_decompose_from_plan(plan_text: &str) -> String {
-    let plan = strip_rudder_prompt_wrappers(plan_text);
-    format!(
-        "Decompose the APPROVED implementation plan below into the task DAG. The plan was produced in plan mode and approved by the user, so treat it as the AUTHORITATIVE intent: cover every part of it and do not redesign it. Re-inspect the repository read-only only to ground task titles/files against what actually exists.\n\nAPPROVED PLAN:\n{plan}"
-    )
-}
-
 pub(crate) fn rudder_plan_prompt(task: &str) -> String {
     let task = strip_rudder_prompt_wrappers(task);
     format!(

@@ -4190,7 +4190,7 @@ branch refs/heads/main\n";
     }
 
     #[test]
-    fn no_plan_active_first_task_opens_interactive_plan_front_end() {
+    fn no_plan_active_first_task_launches_headless_planner() {
         let mut app = App::new();
         app.cwd = std::env::temp_dir();
         // No nodes queued, no orchestrator, no live plan-launched agent.
@@ -4198,70 +4198,14 @@ branch refs/heads/main\n";
 
         app.start_task_from_input("build the first feature");
 
-        // Path B: a typed goal with no active plan opens the INTERACTIVE plan-mode
-        // front-end (PlanFront), not the decomposer directly. The decomposer (RudderPlan)
-        // runs only AFTER the user approves the plan (capture -> decompose).
-        let spawned = app.agents.last().expect("a spawned plan-mode session");
-        assert_eq!(spawned.mode, AgentMode::PlanFront);
-        assert!(!spawned.reconcile_planner);
-        assert_eq!(
-            app.frontend_run_id.as_deref(),
-            Some(spawned.id.as_str()),
-            "the front-end run is tracked"
+        // A typed goal with no active plan launches the headless RudderPlan planner (the
+        // model in plan mode, streamed in the orchestrator pane), which emits the DAG.
+        let spawned = app.agents.last().expect("a spawned planner");
+        assert_eq!(spawned.mode, AgentMode::RudderPlan);
+        assert!(
+            !spawned.reconcile_planner,
+            "the first task with no active plan uses the INITIAL planner (replace path)"
         );
-        assert!(app.plan_is_active(), "a live front-end counts as an active plan");
-    }
-
-    #[test]
-    fn plan_front_end_pins_to_orchestrator_section_not_in_progress() {
-        let mut fe = test_agent_run("fe-1", "plan goal");
-        fe.mode = AgentMode::PlanFront;
-        fe.status = AgentStatus::Running;
-        // Pinned planner -> renders in the orchestrator section at the top...
-        assert!(fe.is_pinned_planner());
-        // ...but NOT the DAG orchestrator, so its worker pane stays a raw interactive PTY.
-        assert!(!fe.is_orchestrator());
-
-        let mut worker = test_agent_run("w-1", "do work");
-        worker.status = AgentStatus::Running;
-        let agents = vec![worker, fe];
-        // The plan-mode front-end sorts above the in-progress worker.
-        let order = sectioned_agent_order(&agents);
-        assert_eq!(order.first(), Some(&1), "front-end pins to the very top");
-        // And it is excluded from the in-progress bucket (which would have read as a
-        // confusing "needs permission / 10 files changed" worker row).
-        let in_progress: Vec<usize> = order
-            .iter()
-            .copied()
-            .filter(|&i| !agents[i].is_pinned_planner() && status_bucket(&agents[i]) == Bucket::InProgress)
-            .collect();
-        assert_eq!(in_progress, vec![0], "only the real worker is in progress");
-    }
-
-    #[test]
-    fn capture_frontend_plan_text_extracts_last_plan_block() {
-        // ANSI-laden scrollback; the <plan> block is extracted clean.
-        let out = "noise\n\u{1b}[1m<plan>\u{1b}[0m\nStep 1: do X\nStep 2: do Y\n</plan>\ntrailing";
-        assert_eq!(capture_frontend_plan_text(out), "Step 1: do X\nStep 2: do Y");
-        // The LAST block wins (the most recent restatement after refinement).
-        let two = "<plan>\nold plan\n</plan>\nlet's refine\n<plan>\nnew plan\n</plan>\n";
-        assert_eq!(capture_frontend_plan_text(two), "new plan");
-        // No marker -> fall back to the transcript tail.
-        assert!(capture_frontend_plan_text("alpha\nbeta\ngamma").contains("gamma"));
-    }
-
-    #[test]
-    fn plan_front_end_and_decompose_prompts_are_well_formed() {
-        let fp = plan_frontend_prompt("build auth");
-        assert!(fp.contains("build auth"), "carries the task");
-        assert!(fp.contains("<plan>") && fp.contains("</plan>"), "asks for the capture markers");
-        assert!(fp.to_lowercase().contains("not implement"), "instructs not to implement");
-
-        let dp = build_decompose_from_plan("Step 1: X\nStep 2: Y");
-        assert!(dp.contains("APPROVED PLAN") && dp.contains("Step 1: X"), "wraps the plan");
-        // Inner directive only: start_rudder_plan_task wraps the full contract, so this
-        // must NOT already contain it (else the prompt double-wraps).
-        assert!(!dp.contains("RUDDER_PLAN_TASKS_START"));
     }
 
     fn dag_task(id: &str, title: &str, hard: &[&str]) -> RudderPlanTask {
@@ -4369,71 +4313,6 @@ branch refs/heads/main\n";
             "the last sibling has no trailing bar: {:?}",
             rows[3]
         );
-    }
-
-    #[test]
-    fn parse_finalized_plan_seizes_on_exitplanmode_only() {
-        // A <plan> restatement during discussion must NOT count as finalized — the model
-        // emits one after every refinement, so seizing on it would cut the chat short.
-        let only_block = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"plan so far:\n<plan>\ndraft\n</plan>"}]}}"#;
-        assert_eq!(parse_finalized_plan_from_transcript(only_block), None);
-
-        // ExitPlanMode is the finalize signal; its `plan` argument is what we seize.
-        let exit = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"ExitPlanMode","input":{"plan":"Final: auth then ui"}}]}}"#;
-        assert_eq!(
-            parse_finalized_plan_from_transcript(exit).as_deref(),
-            Some("Final: auth then ui")
-        );
-
-        // The LAST ExitPlanMode wins; non-JSON / empty lines are ignored.
-        let two = format!(
-            "not json\n{}\n\n{}",
-            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"ExitPlanMode","input":{"plan":"old"}}]}}"#,
-            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"ExitPlanMode","input":{"plan":"new"}}]}}"#
-        );
-        assert_eq!(parse_finalized_plan_from_transcript(&two).as_deref(), Some("new"));
-        assert_eq!(parse_finalized_plan_from_transcript(""), None);
-    }
-
-    #[test]
-    fn encode_claude_project_dir_matches_claude_layout() {
-        use std::path::Path;
-        assert_eq!(
-            encode_claude_project_dir(Path::new("/Users/v/my-charts")),
-            "-Users-v-my-charts"
-        );
-        // Slashes AND dots both collapse to dashes (the /.rudder-worktrees case).
-        assert_eq!(
-            encode_claude_project_dir(Path::new("/Users/v/Documents/.rudder-worktrees/x")),
-            "-Users-v-Documents--rudder-worktrees-x"
-        );
-    }
-
-    #[test]
-    fn approve_frontend_plan_no_op_without_a_session() {
-        let mut app = App::new();
-        app.cwd = std::env::temp_dir();
-        app.approve_frontend_plan();
-        assert_eq!(app.notice.as_deref(), Some("no plan-mode session to approve"));
-        assert!(app.agents.is_empty());
-    }
-
-    #[test]
-    fn approve_frontend_plan_waits_when_nothing_captured_yet() {
-        // A front-end with no scrollback to capture: approve is a no-op that keeps the
-        // session and asks the model to restate (no decomposer is spawned).
-        let mut app = App::new();
-        app.cwd = std::env::temp_dir();
-        let mut fe = test_agent_run("fe-1", "plan goal");
-        fe.mode = AgentMode::PlanFront;
-        fe.terminal = None;
-        app.agents = vec![fe];
-        app.frontend_run_id = Some("fe-1".to_string());
-
-        app.approve_frontend_plan();
-        assert!(app.notice.as_deref().unwrap_or_default().contains("no plan captured"));
-        assert_eq!(app.frontend_run_id.as_deref(), Some("fe-1"), "front-end kept; still waiting");
-        assert_eq!(app.agents.len(), 1, "no decomposer spawned");
     }
 
     #[test]
@@ -4888,9 +4767,10 @@ branch refs/heads/main\n";
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(text.contains("orchestrator"), "pinned orchestrator header/label present: {text}");
-        // While Running with no plan block, the phase reads "planning".
-        assert!(text.contains("planning"), "phase reads planning: {text}");
+        assert!(text.contains("orchestrator"), "pinned orchestrator header present: {text}");
+        // While Running with no plan block, the row is labeled as the model's PLAN MODE
+        // (the product framing) rather than a generic "planning".
+        assert!(text.contains("plan mode"), "phase reads plan mode: {text}");
     }
 
     #[test]

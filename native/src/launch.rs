@@ -55,7 +55,7 @@ pub(crate) fn codex_resume_command(run: &AgentRun, session_id: &str) -> Terminal
         AgentMode::Execute | AgentMode::ReviewAll | AgentMode::Main => {
             args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
         }
-        AgentMode::Plan | AgentMode::PlanFront | AgentMode::RudderPlan => {
+        AgentMode::Plan | AgentMode::RudderPlan => {
             args.push("--sandbox".to_string());
             args.push("read-only".to_string());
             args.push("--ask-for-approval".to_string());
@@ -144,7 +144,6 @@ pub(crate) fn agent_command(
     let prompt = match mode {
         AgentMode::Execute => Some(execution_prompt(task)),
         AgentMode::Plan => Some(plan_prompt(task)),
-        AgentMode::PlanFront => Some(plan_frontend_prompt(task)),
         AgentMode::RudderPlan => Some(rudder_plan_prompt(task)),
         AgentMode::ReviewAll => Some(task.to_string()),
         AgentMode::Main => {
@@ -192,14 +191,9 @@ pub(crate) fn agent_command(
                     "--disallowedTools".to_string(),
                     CLAUDE_DECOMPOSER_DISALLOWED.to_string(),
                 ],
-                // Native Claude plan mode: the explicit `/plan` and the Path-B planning
-                // FRONT-END both run the real interactive plan-mode TUI (research +
-                // propose; it cannot edit until approved, and Rudder never approves it).
-                // Pre-approve the read-only research tools so planning never stops on a
-                // permission prompt (the "plan mode equivalent" of skip-permissions the
-                // user asked for): it stays in plan mode and still proposes via
-                // ExitPlanMode, which RUDDER — via Ctrl+W a — approves, never the user.
-                AgentMode::Plan | AgentMode::PlanFront => vec![
+                // The standalone `/plan` command: a read-only Claude plan-mode session,
+                // with the research tools pre-approved so it never stops on a prompt.
+                AgentMode::Plan => vec![
                     "--permission-mode".to_string(),
                     "plan".to_string(),
                     "--allowedTools".to_string(),
@@ -260,7 +254,7 @@ pub(crate) fn agent_command(
                 AgentMode::Execute | AgentMode::ReviewAll | AgentMode::Main => {
                     args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
                 }
-                AgentMode::Plan | AgentMode::PlanFront | AgentMode::RudderPlan => {
+                AgentMode::Plan | AgentMode::RudderPlan => {
                     args.push("--sandbox".to_string());
                     args.push("read-only".to_string());
                     args.push("--ask-for-approval".to_string());
@@ -273,10 +267,8 @@ pub(crate) fn agent_command(
                 args.push("-m".to_string());
                 args.push(model.to_string());
             }
-            // PlanFront launches Codex IDLE (no initial prompt): the caller delivers
-            // `/plan <prompt>` as the first input to switch Codex into plan mode and send
-            // the goal in one slash command. Every other mode gets its prompt as an arg.
-            if mode != AgentMode::PlanFront {
+            // Every mode gets its prompt as an arg.
+            {
                 if let Some(prompt) = prompt {
                     args.push(prompt);
                 }

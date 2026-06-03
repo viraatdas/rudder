@@ -168,13 +168,13 @@ reused next time. Rudder refreshes model metadata from
 
 ## Planning (the default)
 
-Just type a task. Rudder opens the model's **interactive plan mode** right in the pane
-(Claude's plan mode or Codex's `/plan`): the model researches your repo read-only and
-proposes a plan you discuss and refine in-pane, exactly like using the agent's own plan
-mode. It will not implement anything. When you are happy with the plan, press **`Ctrl+W`
-then `a`** to approve: Rudder captures the plan, decomposes it into a DAG of worker tasks,
-and shows you that DAG for one more approval. Press `Enter` to launch; the scheduler then
-drains the DAG (todo → in-progress → review → done) as dependencies merge.
+Just type a task. Rudder runs the model in **plan mode** (Claude Code or Codex), streamed
+live in the orchestrator pane: it researches your repo read-only, reasons about the work,
+and lays out a DAG of worker tasks. It will not implement anything. You watch it plan,
+refine by typing (Rudder re-plans and the DAG updates in place), and when you are happy
+press `Enter` to approve. The scheduler then drains the DAG (todo → in-progress → review →
+done) as dependencies merge. The whole flow stays inside Rudder: you talk to Rudder, not to
+a separate agent, and the planner can never go off and implement on its own.
 
 After launch, typing a new task folds it into the running DAG as a new node. When a
 worker finishes, Rudder reads back what it did and what work it found remaining (and

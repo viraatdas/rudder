@@ -900,20 +900,22 @@ fn push_orchestrator_row<'a>(
         Span::styled(truncate_chars(&label, task_width.saturating_sub(2)), label_style),
     ])));
 
-    // The interactive plan-mode front-end is a pinned planner but not the DAG
-    // orchestrator: label it "plan mode" with the approve hint instead of the DAG
-    // phase summary, and spin while the model is still researching/discussing.
-    let is_front_end = agent.mode == AgentMode::PlanFront;
-    let planning = is_front_end
-        || (matches!(orchestrator_phase(agent), OrchestratorPhase::Planning)
-            && agent.status == AgentStatus::Running);
-    let badge = if planning && agent.status == AgentStatus::Running {
+    // While the planner is still researching/decomposing, present it as the model's
+    // PLAN MODE (Claude Code / Codex) so it reads as genuine plan mode; once the DAG is
+    // parsed it becomes the orchestrator with its live status. Spin during planning.
+    let planning = matches!(orchestrator_phase(agent), OrchestratorPhase::Planning)
+        && agent.status == AgentStatus::Running;
+    let badge = if planning {
         app.spinner_glyph()
     } else {
         BADGE
     };
-    let (role, phase) = if is_front_end {
-        ("plan mode", "discuss · builds the DAG when ready".to_string())
+    let (role, phase) = if planning {
+        let backend = match agent.backend {
+            Backend::Claude => "Claude Code",
+            Backend::Codex => "Codex",
+        };
+        ("plan mode", format!("{backend} · researching the plan"))
     } else {
         ("orchestrator", orchestrator_phase_label(app, agent))
     };
@@ -2898,12 +2900,10 @@ pub(crate) fn agent_status_label(agent: &AgentRun) -> &'static str {
         "needs permission"
     } else if agent.needs_user_input {
         "needs input"
-    } else if matches!(
-        agent.mode,
-        AgentMode::Plan | AgentMode::PlanFront | AgentMode::RudderPlan
-    ) && agent.status == AgentStatus::Running
+    } else if matches!(agent.mode, AgentMode::Plan | AgentMode::RudderPlan)
+        && agent.status == AgentStatus::Running
     {
-        "planning"
+        "plan mode"
     } else if agent.status == AgentStatus::Merged {
         "[x] merged"
     } else {
