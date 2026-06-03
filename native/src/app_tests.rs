@@ -44,6 +44,38 @@
     }
 
     #[test]
+    fn plan_stream_lands_final_plan_emitted_after_tool_narration() {
+        // Repro of the my-charts hang: the planner narrates (streamed text), uses tools,
+        // THEN emits the plan as a final message. The `result` event's text is that final
+        // message only, so it does not prefix the full streamed turn — the fix splices on
+        // the overlap so RUDDER_PLAN_TASKS still lands (the DAG is parsed, no perpetual
+        // "decomposing" spinner).
+        let mut stream = PlanStreamState::new();
+        let plan_block = "RUDDER_PLAN_TASKS_START\n{\"tasks\":[{\"id\":\"n0\",\"title\":\"x\",\"prompt\":\"p\",\"goal\":\"g\",\"success\":\"s\",\"deps\":[]}]}\nRUDDER_PLAN_TASKS_END";
+        let result_text =
+            format!("I have a clear picture. Let me confirm.\n\n{plan_block}\n\nQuestions:\n1. scope?");
+        let snapshot = format!(
+            "{}\n{}\n{}\n",
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"I'll inspect the repo.\n"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"I have a clear picture. Let me confir"}}}"#,
+            format!(
+                r#"{{"type":"result","subtype":"success","result":{}}}"#,
+                serde_json::to_string(&result_text).unwrap()
+            )
+        );
+        stream.ingest(&snapshot);
+        let text = stream.parse_text();
+        assert!(
+            text.contains("RUDDER_PLAN_TASKS_START"),
+            "final plan landed despite tool narration: {text:?}"
+        );
+        let tasks = extract_rudder_plan_tasks(text).expect("the DAG parses");
+        assert_eq!(tasks.len(), 1);
+        // No gross duplication of the overlap ("I have a clear picture" appears once).
+        assert_eq!(text.matches("I have a clear picture").count(), 1, "{text:?}");
+    }
+
+    #[test]
     fn conductor_decision_appends_parseable_entry_with_header() {
         let dir = std::env::temp_dir().join(format!("rudder-dec-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);

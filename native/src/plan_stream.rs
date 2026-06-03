@@ -206,18 +206,30 @@ impl PlanStreamState {
                         if !self.saw_streaming_text {
                             self.push_text(result);
                         } else {
-                            // The `result` event carries the AUTHORITATIVE full text.
-                            // Streaming deltas can drop the tail (the PTY ring buffer
-                            // truncates, or partial-message events are lossy), which
-                            // truncated the post-plan human summary mid-sentence. If
-                            // the result strictly EXTENDS what we streamed this turn,
-                            // append only the missing suffix so the full summary lands
-                            // without double-appending.
+                            // The `result` event carries the AUTHORITATIVE final-message
+                            // text. Two things break a naive prefix-append: streaming
+                            // deltas can drop the tail (PTY ring-buffer truncation), AND a
+                            // single turn can hold SEVERAL assistant messages (research
+                            // narration, then the final plan), so the streamed turn is
+                            // `narration + partial-final` and is NOT a prefix of `result`
+                            // (the final message alone). Splice on the overlap: append the
+                            // part of `result` past the longest streamed-suffix == result-
+                            // prefix match. This is what lands the final plan +
+                            // RUDDER_PLAN_TASKS block when the planner used tools first.
                             let start = self.parse_baseline.min(self.assistant_text.len());
                             let turn = self.assistant_text[start..].to_string();
-                            if result.len() > turn.len() && result.starts_with(&turn) {
-                                let tail = result[turn.len()..].to_string();
-                                self.push_text(&tail);
+                            if !turn.contains(result) {
+                                let overlap = longest_suffix_prefix(&turn, result);
+                                let tail = &result[overlap..];
+                                if !tail.is_empty() {
+                                    if !turn.is_empty()
+                                        && !turn.ends_with('\n')
+                                        && !tail.starts_with('\n')
+                                    {
+                                        self.push_text("\n");
+                                    }
+                                    self.push_text(tail);
+                                }
                             }
                         }
                     }
@@ -399,6 +411,23 @@ impl PlanStreamState {
             self.transcript.drain(0..overflow);
         }
     }
+}
+
+/// Byte length of the longest suffix of `a` that is also a prefix of `b`, respecting
+/// UTF-8 char boundaries (so `b[k..]` is always sliceable). Used to splice the
+/// authoritative `result` text onto a partially-streamed turn without duplicating the
+/// overlap. Returns 0 when there is no overlap (append all of `b`).
+fn longest_suffix_prefix(a: &str, b: &str) -> usize {
+    let max = a.len().min(b.len());
+    for k in (1..=max).rev() {
+        if b.is_char_boundary(k)
+            && a.is_char_boundary(a.len() - k)
+            && a.as_bytes()[a.len() - k..] == b.as_bytes()[..k]
+        {
+            return k;
+        }
+    }
+    0
 }
 
 /// Mirror of `textFromAssistantMessage` (backends.ts): join the text blocks of an
