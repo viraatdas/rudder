@@ -256,9 +256,13 @@ impl Bucket {
 /// Main agents are rendered in their own leading section and are not bucketed.
 /// Agents never land in Todo: that section now holds planned nodes only.
 pub(crate) fn status_bucket(agent: &AgentRun) -> Bucket {
-    if agent.needs_permission || agent.needs_user_input {
-        return Bucket::Review;
-    }
+    // Bucket strictly by run status. A RUNNING agent stays "in progress" even when it is
+    // waiting on a permission prompt or a question: it is still an active session, not
+    // finished work. The "needs permission"/"needs input" state is surfaced on the row
+    // itself (agent_status_label, in amber) and via a notification, so it is discoverable
+    // without being mislabeled "review". "review" means DONE: the agent finished a turn
+    // and is awaiting your review/merge. (Previously needs_permission/needs_user_input
+    // forced a running agent into Review, which read as "finished" and was confusing.)
     match agent.status {
         AgentStatus::Running => Bucket::InProgress,
         AgentStatus::Done => Bucket::Review,

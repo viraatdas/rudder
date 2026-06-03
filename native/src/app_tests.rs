@@ -5124,9 +5124,15 @@ branch refs/heads/main\n";
         run.status = AgentStatus::Done;
         assert_eq!(status_bucket(&run), Bucket::Review);
 
+        // A RUNNING agent that needs permission/input stays IN PROGRESS (the row label
+        // flags it); only DONE means review. A running agent must never read as "review".
+        run.status = AgentStatus::Running;
         run.needs_permission = true;
-        assert_eq!(status_bucket(&run), Bucket::Review, "needs-permission is review");
+        assert_eq!(status_bucket(&run), Bucket::InProgress, "running+needs-permission is in progress");
+        run.needs_user_input = true;
+        assert_eq!(status_bucket(&run), Bucket::InProgress, "running+needs-input is in progress");
         run.needs_permission = false;
+        run.needs_user_input = false;
 
         run.status = AgentStatus::Merged;
         assert_eq!(status_bucket(&run), Bucket::Done);
