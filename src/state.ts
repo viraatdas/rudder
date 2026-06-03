@@ -87,9 +87,12 @@ export function verifierPath(repoRoot: string, runId: string): string {
 }
 
 export function worktreePath(repoRoot: string, runId: string, task?: string): string {
-  const parent = path.dirname(repoRoot);
+  // Worktrees live INSIDE the project (gitignored .rudder-worktrees/), not in the parent
+  // directory. This keeps every Rudder path within the project boundary, so a planner or
+  // agent confined to the project never reads outside it — which is what triggered
+  // Claude's "allow reading outside the project?" permission prompt.
   const repoName = `${slugify(path.basename(repoRoot), "repo")}-${shortHash(repoRoot)}`;
-  return path.join(parent, ".rudder-worktrees", repoName, worktreeDirName(runId, task));
+  return path.join(repoRoot, ".rudder-worktrees", repoName, worktreeDirName(runId, task));
 }
 
 function worktreeDirName(runId: string, task?: string): string {

@@ -184,10 +184,11 @@ around the work already done.
 
 ## Worktrees and merging
 
-Every dashboard task runs in its own git worktree under `~/.rudder-worktrees/...`,
-so parallel agents never edit the same checkout. Run records live under
-`.rudder/runs/`. If you quit Rudder, live workers stop but the agents stay listed
-the next time you open Rudder in that repo.
+Every dashboard task runs in its own git worktree under `.rudder-worktrees/` inside
+your project (gitignored), so parallel agents never edit the same checkout and every
+Rudder path stays within the project boundary. Run records live under `.rudder/runs/`.
+If you quit Rudder, live workers stop but the agents stay listed the next time you open
+Rudder in that repo.
 
 - Press `m` to merge the selected completed agent back into its branch.
 - Press `M` to merge all completed agents. Rudder confirms first.

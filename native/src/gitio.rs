@@ -1258,7 +1258,10 @@ pub(crate) fn count_uncommitted_changes(cwd: &Path) -> usize {
 // reachability and the same test-build dead-code false positive.
 #[allow(dead_code)]
 pub(crate) fn worktree_path(repo_root: &Path, run_id: &str, task: &str) -> PathBuf {
-    let parent = repo_root.parent().unwrap_or(repo_root);
+    // Worktrees live INSIDE the project (gitignored .rudder-worktrees/), not in the parent
+    // directory. This keeps every Rudder path within the project boundary, so a planner or
+    // agent confined to the project never reads outside it — which is what triggered
+    // Claude's "allow reading outside the project?" permission prompt.
     let repo_name = format!(
         "{}-{}",
         slugify(
@@ -1270,7 +1273,7 @@ pub(crate) fn worktree_path(repo_root: &Path, run_id: &str, task: &str) -> PathB
         ),
         short_hash(&repo_root.display().to_string())
     );
-    parent
+    repo_root
         .join(".rudder-worktrees")
         .join(repo_name)
         .join(worktree_dir_name(run_id, task))

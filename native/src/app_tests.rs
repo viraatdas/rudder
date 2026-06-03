@@ -19,6 +19,24 @@
     }
 
     #[test]
+    fn worktrees_live_inside_the_project_not_the_parent() {
+        // Worktrees must stay WITHIN the project so a planner/agent confined to the
+        // project never reads outside it (the source of the out-of-project permission
+        // prompt). They used to land in repo_root.parent()/.rudder-worktrees.
+        let repo = std::path::Path::new("/Users/viraat/Documents/rudder");
+        let wt = worktree_path(repo, "1779-build-thing-4029", "build a thing");
+        assert!(wt.starts_with(repo), "worktree is inside the project: {wt:?}");
+        assert!(
+            wt.to_string_lossy().contains("/rudder/.rudder-worktrees/"),
+            "under the project's gitignored .rudder-worktrees: {wt:?}"
+        );
+        assert!(
+            !wt.starts_with("/Users/viraat/Documents/.rudder-worktrees"),
+            "never the parent directory: {wt:?}"
+        );
+    }
+
+    #[test]
     fn parses_main_worktree_from_porcelain() {
         let output = "\
 worktree /repo/feature\n\
