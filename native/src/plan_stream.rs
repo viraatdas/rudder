@@ -280,6 +280,10 @@ impl PlanStreamState {
                         let name = block.get("name").and_then(Value::as_str).unwrap_or("tool");
                         let target = tool_target(block.get("input"));
                         self.push_tool(name, &target);
+                        // Mark that a block STREAMED (even with no text_delta), so the
+                        // "assistant" envelope fallback does not re-push these same tools and
+                        // double every entry on a tool-only turn.
+                        self.saw_streaming_text = true;
                     }
                 }
             }

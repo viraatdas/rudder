@@ -338,6 +338,13 @@ struct App {
     /// the orchestrator is selected. Set on streaming plan detection; cleared once
     /// the user approves (or discards the plan).
     awaiting_approval: bool,
+    /// True ONLY while a headless planner has finished a turn WITHOUT emitting a DAG (it
+    /// asked a clarifying question / needs more detail) and is waiting for the user's
+    /// reply. Distinguishes a paused planner from a COMPLETED-and-shipped plan's leftover
+    /// Done orchestrator, so a brand-new task typed after a plan finished is NOT mistakenly
+    /// routed into refining the old session. Set in evaluate_completed_plan's no-DAG
+    /// branches; cleared when a DAG is captured, on approval, and on a fresh plan.
+    planner_paused_for_input: bool,
     /// Tick counter used to run the scheduler on a coarse cadence rather than on
     /// every PTY-byte tick.
     scheduler_tick: u64,
@@ -711,6 +718,14 @@ impl App {
         } else {
             load_followup_gen(&cwd)
         };
+        // Restore the approval-gate queue (queued nodes + gate state) so a mid-plan restart
+        // resumes the plan instead of silently losing it. awaiting_approval is restored
+        // TOGETHER with the queue, so the scheduler never launches an un-approved plan.
+        let restored_queue = if cfg!(test) {
+            PlanQueueSnapshot::default()
+        } else {
+            load_plan_queue(&cwd).unwrap_or_default()
+        };
         // Main is no longer auto-pinned. If the user wants one, they type
         // /main from the task pane. Main records render in their own section
         // instead of being mixed into ordinary worktree agents.
@@ -740,15 +755,16 @@ impl App {
             task_history_draft: String::new(),
             plan_mode: false,
             agents,
-            planned_nodes: Vec::new(),
-            planned_origin: String::new(),
-            plan_request: String::new(),
-            plan_summary: None,
+            planned_nodes: restored_queue.planned_nodes,
+            planned_origin: restored_queue.planned_origin,
+            plan_request: restored_queue.plan_request,
+            plan_summary: restored_queue.plan_summary,
             refining: false,
             rebasing: false,
             auto_merge: false,
             auto_merge_skip: Vec::new(),
-            awaiting_approval: false,
+            awaiting_approval: restored_queue.awaiting_approval,
+            planner_paused_for_input: false,
             scheduler_tick: 0,
             spinner_frame: 0,
             selected_agent: 0,
@@ -2896,6 +2912,13 @@ impl App {
     /// queued nodes, no approval gate, and no refine/rebase in flight. A typed message in
     /// this state RESUMES the planner (refine_plan) rather than starting a fresh one.
     fn planner_awaiting_input(&self) -> bool {
+        // The flag is the discriminator: it is set ONLY when a planner finished a turn
+        // without a DAG (asked a question), and cleared on DAG-capture / approval / fresh
+        // plan. Without it, a COMPLETED plan's leftover Done orchestrator (empty queue, no
+        // gate, all workers merged) would also look "paused" and hijack a new task.
+        if !self.planner_paused_for_input {
+            return false;
+        }
         if self.awaiting_approval || self.refining || self.rebasing || !self.planned_nodes.is_empty()
         {
             return false;
@@ -3406,6 +3429,8 @@ impl App {
     }
 
     fn start_rudder_plan_task(&mut self, input: &str) {
+        // A fresh plan supersedes any paused planner.
+        self.planner_paused_for_input = false;
         // AT-MOST-ONE ORCHESTRATOR: a brand-new plan supersedes any prior pinned
         // planner. Retire stale orchestrator rows (and their on-disk records) before
         // pushing the new one so completed plans never stack as phantom orchestrators
@@ -3957,7 +3982,14 @@ impl App {
                 true
             }
             Err(error) => {
+                // The resume spawn failed: do NOT leave the agent stuck in Running with no
+                // terminal forever (it would consume a parallelism slot and deadlock hard
+                // dependents silently). Mark it Failed so the slot frees and the
+                // "blocked by a FAILED dependency" notice can fire for its dependents.
+                run.status = AgentStatus::Failed;
+                run.completed_at = Some(Instant::now());
                 run.last_error = Some(error.to_string());
+                let _ = save_native_run_record(&self.cwd, run);
                 false
             }
         }
@@ -4376,7 +4408,11 @@ impl App {
             Some("/automerge") => {
                 self.auto_merge = !self.auto_merge;
                 if self.auto_merge {
-                    self.auto_merge_skip.clear();
+                    // Do NOT blanket-clear auto_merge_skip here: a node parked there by the
+                    // conflict-resolver (resolver finished with conflicts still left) would
+                    // be un-skipped and immediately re-merged -> re-conflict -> re-spawn a
+                    // resolver every tick, the exact stacking loop the skip prevents. Skip
+                    // entries are already cleared per-id on a successful merge / re-goal.
                     self.notice = Some(
                         "auto-merge ON: clean finished nodes merge themselves and unblock children (conflicts still pause for you)".to_string(),
                     );
@@ -4957,9 +4993,10 @@ impl App {
                 let _ = save_native_run_record(&self.cwd, run);
                 self.refining = false;
                 // No DAG yet: the planner likely asked a clarifying question or needs more
-                // detail. The orchestrator stays resumable (Done, with its session) so the
-                // next typed message RESUMES this planning conversation (see
-                // planner_awaiting_input + start_task_from_input) instead of starting fresh.
+                // detail. Mark it PAUSED-for-input so the next typed message RESUMES this
+                // planning conversation (NOT a leftover Done orchestrator from a shipped
+                // plan, which must start fresh).
+                self.planner_paused_for_input = true;
                 self.notice = Some(format!(
                     "planner is waiting ({error}) — type your answer or more detail to continue planning"
                 ));
@@ -4973,6 +5010,7 @@ impl App {
             run.autosteered = false;
             let _ = save_native_run_record(&self.cwd, run);
             self.refining = false;
+            self.planner_paused_for_input = true;
             // Same as the Err branch: keep the planner resumable so a typed answer
             // continues this conversation rather than starting a fresh planner.
             self.notice = Some(
@@ -4981,6 +5019,8 @@ impl App {
             );
             return;
         }
+        // A DAG WAS captured: this planner is no longer paused for input.
+        self.planner_paused_for_input = false;
 
         // Queue every task as a PLANNED node. A new plan replaces any pending queue
         // (the planner is the single source of truth for the active plan).
@@ -5008,6 +5048,8 @@ impl App {
         // APPROVAL GATE: do NOT launch. Hold the plan until the user approves so
         // they can review, discuss/refine (type in the task pane), or approve it.
         self.awaiting_approval = true;
+        // Persist the captured queue + gate so a restart resumes at this gate.
+        self.persist_plan_queue();
         // Surface (never silently drop) when the planner emitted more tasks than the
         // runaway backstop allows.
         let emitted = rudder_plan_block_task_count(&output).unwrap_or(count);
@@ -5272,6 +5314,7 @@ impl App {
         // dangling-dep rule keeps the DAG from deadlocking on any stale reference).
         self.planned_nodes = diff.todo;
         self.plan_summary = summary;
+        self.persist_plan_queue();
 
         // The rebase has landed: clear the rebase + refine flags + the planner's
         // capture-once flag (refining may have been set by an interleaved refine; leaving
@@ -5573,6 +5616,31 @@ impl App {
         }
     }
 
+    /// Persist the approval-gate queue + gate state to `.rudder/plan-queue.json` (atomic) so
+    /// a mid-plan restart resumes the queued DAG instead of silently dropping it. Called on
+    /// every queue mutation (plan captured, reconcile, rebase, approve, scheduler drain).
+    fn persist_plan_queue(&self) {
+        let snapshot = PlanQueueSnapshot {
+            planned_nodes: self.planned_nodes.clone(),
+            planned_origin: self.planned_origin.clone(),
+            plan_request: self.plan_request.clone(),
+            plan_summary: self.plan_summary.clone(),
+            awaiting_approval: self.awaiting_approval,
+        };
+        let Ok(json) = serde_json::to_string(&snapshot) else {
+            return;
+        };
+        let dir = self.cwd.join(".rudder");
+        if std::fs::create_dir_all(&dir).is_err() {
+            return;
+        }
+        let path = dir.join("plan-queue.json");
+        let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+        if std::fs::write(&tmp, json).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+
     /// Grow the DAG from a parsed completion note: dedupe, depth- and cap-guard,
     /// infer deps, and push the in-scope follow-ups as planned nodes. Pure of any
     /// PTY/terminal access (split out of ingest_worker_followups so it is testable).
@@ -5765,9 +5833,12 @@ impl App {
         }
         if self.planned_nodes.is_empty() {
             self.awaiting_approval = false;
+            self.persist_plan_queue();
             return;
         }
         self.awaiting_approval = false;
+        self.planner_paused_for_input = false;
+        self.persist_plan_queue();
         // Record the plan approval as a cross-cutting decision so the fleet has the
         // authoritative goal + shape in DECISIONS.md from the start.
         let goal = if self.plan_request.trim().is_empty() {
@@ -6189,6 +6260,9 @@ impl App {
         // both the just-launched nodes (now Running agents) and the queue that
         // remains in Todo. Coalesced + non-fatal inside mirror_graph.
         self.mirror_graph();
+        // The queue shrank as nodes launched; persist so a restart does not re-launch
+        // an already-launched node or lose the remaining queue.
+        self.persist_plan_queue();
     }
 
     /// Position in `planned_nodes` of the next node to launch, or `None` when the
@@ -7184,6 +7258,12 @@ What to do\n\
         let Some(run) = self.agents.get(index) else {
             anyhow::bail!("no selected agent");
         };
+        // Already merged: a confirm prompt acted on a stale snapshot and an intervening
+        // auto-merge already merged this run. Re-running `rudder merge` would create a
+        // spurious second merge. No-op instead.
+        if run.status == AgentStatus::Merged {
+            return Ok(());
+        }
         let is_jj = Self::run_is_jj(run);
         let review_source_ids = run.review_source_ids.clone();
         let run_id = run.id.clone();
@@ -7462,9 +7542,17 @@ What to do\n\
                         // ready-for-input continuously for READY_GRACE. Tracking the
                         // ready window (not output-silence) is what makes this robust
                         // against a TUI that repaints while idle.
-                        let ready = visible_lines.as_ref().is_some_and(|lines| {
-                            terminal_looks_ready_for_input_from_lines(run.backend, lines)
-                        });
+                        //
+                        // EXCEPT a headless planner (RudderPlan runs `claude -p` / `codex
+                        // exec`): its stdout is raw JSONL, not interactive idle-chrome, so
+                        // this heuristic does not apply and could falsely mark it Done while
+                        // it is still streaming — clearing autosteered and making a
+                        // later-printed plan unrecoverable. Its completion is driven solely
+                        // by process exit (try_wait Ok(Some)) and streaming plan detection.
+                        let ready = !run.is_orchestrator()
+                            && visible_lines.as_ref().is_some_and(|lines| {
+                                terminal_looks_ready_for_input_from_lines(run.backend, lines)
+                            });
                         if ready {
                             let since = *run.ready_since.get_or_insert_with(Instant::now);
                             if since.elapsed() >= READY_GRACE {
@@ -7876,6 +7964,10 @@ fn run(terminal: &mut Tui) -> Result<()> {
     let mut app = App::new();
     app.resume_migrated_agents();
     app.restore_running_agents();
+    // Reconcile graph.json with the restored in-memory state on startup so the board does
+    // not show stale "planned" nodes from a previous session (and reflects the restored
+    // plan queue / reloaded agents). last_mirror_signature is None here, so this runs once.
+    app.mirror_graph();
 
     loop {
         // poll_agents flips app.dirty when any state mutates (PTY bytes,
@@ -7950,6 +8042,27 @@ fn load_followup_gen(cwd: &Path) -> HashMap<String, u8> {
         .ok()
         .and_then(|raw| serde_json::from_str::<HashMap<String, u8>>(&raw).ok())
         .unwrap_or_default()
+}
+
+/// The approval-gate queue persisted to `.rudder/plan-queue.json` so a mid-plan restart
+/// does not silently lose the queued DAG (the not-yet-launched nodes + the gate state).
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct PlanQueueSnapshot {
+    #[serde(default)]
+    planned_nodes: Vec<PlannedNode>,
+    #[serde(default)]
+    planned_origin: String,
+    #[serde(default)]
+    plan_request: String,
+    #[serde(default)]
+    plan_summary: Option<String>,
+    #[serde(default)]
+    awaiting_approval: bool,
+}
+
+fn load_plan_queue(cwd: &Path) -> Option<PlanQueueSnapshot> {
+    let raw = std::fs::read_to_string(cwd.join(".rudder").join("plan-queue.json")).ok()?;
+    serde_json::from_str::<PlanQueueSnapshot>(&raw).ok()
 }
 
 fn parse_worker_done_block(output: &str) -> Option<serde_json::Value> {

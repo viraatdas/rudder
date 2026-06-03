@@ -153,7 +153,7 @@ impl RudderPlanTask {
 /// drains these into live `AgentRun`s as their hard deps merge and parallelism
 /// slots free. Created one-per-task when a planner agent completes; rendered in
 /// the Todo section until launched.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct PlannedNode {
     /// Stable node id (the plan task id). Becomes the launched `AgentRun.node_id`.
     pub(crate) id: String,

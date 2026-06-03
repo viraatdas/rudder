@@ -4341,6 +4341,35 @@ branch refs/heads/main\n";
     }
 
     #[test]
+    fn completed_plan_does_not_hijack_a_new_task_into_refine() {
+        // Regression guard: a SHIPPED plan leaves a Done orchestrator (with a session),
+        // empty queue, and Merged workers. Without the paused flag that state looked
+        // "awaiting input" and a brand-new task got routed into refining the old session.
+        let mut app = App::new();
+        app.cwd = std::env::temp_dir();
+        let mut orch = test_agent_run("orch", "ship it");
+        orch.mode = AgentMode::RudderPlan;
+        orch.status = AgentStatus::Done;
+        orch.session_id = Some("sid-1".to_string());
+        let mut worker = test_agent_run("w", "node n0");
+        worker.node_id = Some("n0".to_string());
+        worker.status = AgentStatus::Merged;
+        app.agents = vec![orch, worker];
+
+        // Flag NOT set (plan completed normally) -> not awaiting input -> fresh plan.
+        assert!(
+            !app.planner_awaiting_input(),
+            "a completed plan must not look like a paused planner"
+        );
+        // Only when the planner actually paused for a clarifying question does it resume.
+        app.planner_paused_for_input = true;
+        assert!(
+            app.planner_awaiting_input(),
+            "a genuinely paused planner resumes on the next typed message"
+        );
+    }
+
+    #[test]
     fn no_plan_active_first_task_launches_headless_planner() {
         let mut app = App::new();
         app.cwd = std::env::temp_dir();

@@ -1109,6 +1109,7 @@ dependencies = [
  "crossterm",
  "portable-pty",
  "ratatui",
+ "serde",
  "serde_json",
  "uuid",
  "vt100",
