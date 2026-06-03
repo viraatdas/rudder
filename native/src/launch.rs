@@ -8,6 +8,13 @@ use super::*;
 // run. Comma-joined for Claude's --tools/--allowedTools/--disallowedTools flags.
 const CLAUDE_DECOMPOSER_TOOLS: &str = "Read,Grep,Glob,LS,WebSearch,WebFetch";
 const CLAUDE_DECOMPOSER_DISALLOWED: &str = "Edit,Write,MultiEdit,NotebookEdit,Bash";
+// The interactive plan-mode FRONT-END pre-approves the same read tools PLUS Bash, so the
+// model can investigate (find/ls/grep/git) without permission prompts. Per the Claude CLI
+// reference, --allowedTools lists "tools that execute without prompting"; a bare tool name
+// auto-approves all its invocations. --permission-mode plan still blocks edits, so the
+// front-end stays research-only and never implements (Rudder, not the model, approves and
+// then STOPS it). Bash stays OUT of the decomposer's set (that one is strictly read-only).
+const CLAUDE_PLAN_FRONTEND_TOOLS: &str = "Read,Grep,Glob,LS,WebSearch,WebFetch,Bash";
 
 pub(crate) fn mint_session_id_for(backend: Backend) -> Option<String> {
     match backend {
@@ -196,7 +203,7 @@ pub(crate) fn agent_command(
                     "--permission-mode".to_string(),
                     "plan".to_string(),
                     "--allowedTools".to_string(),
-                    CLAUDE_DECOMPOSER_TOOLS.to_string(),
+                    CLAUDE_PLAN_FRONTEND_TOOLS.to_string(),
                     "--name".to_string(),
                     format!("plan:{}", short_task(task)),
                 ],

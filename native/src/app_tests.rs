@@ -1538,14 +1538,14 @@ branch refs/heads/main\n";
             .args
             .windows(2)
             .any(|window| window[0] == "--permission-mode" && window[1] == "plan"));
-        // Plan mode PRE-APPROVES the read-only research tools (so investigation runs
-        // without permission prompts) but does NOT restrict the tool set (--tools) or
+        // Plan mode PRE-APPROVES the research tools INCLUDING Bash (so find/ls/grep/git
+        // run without permission prompts) but does NOT restrict the tool set (--tools) or
         // block tools (--disallowedTools): that restrictive profile is the decomposer's.
         assert!(claude
             .args
             .windows(2)
             .any(|window| window[0] == "--allowedTools"
-                && window[1] == "Read,Grep,Glob,LS,WebSearch,WebFetch"));
+                && window[1] == "Read,Grep,Glob,LS,WebSearch,WebFetch,Bash"));
         assert!(!claude
             .args
             .windows(2)
