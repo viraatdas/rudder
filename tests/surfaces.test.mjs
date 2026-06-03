@@ -130,12 +130,12 @@ test("appendCompletionNote writes a DONE bullet with interfaces + scoped follow-
     // (the indented follow-up bullets also parse as entries, so find by owner).
     const entries = parseDecisions(content);
     const headline = entries.find((e) => e.owner === "n3");
-    assert.ok(headline, "a DONE bullet owned by the node id");
-    assert.match(headline.text, /DONE \(n3\): built the auth module/);
-    // The structured detail the orchestrator reads back.
-    assert.match(content, /interfaces: added login\(\) and a Session type/);
+    assert.ok(headline, "a decision entry owned by the node id");
+    assert.match(headline.text, /built the auth module/);
+    // The structured detail the orchestrator reads back (new ## block format).
+    assert.match(content, /\*\*Interfaces:\*\* added login\(\) and a Session type/);
     assert.match(content, /wire login into the router/);
-    assert.match(content, /\[scope: out\]/, "out-of-lane follow-up is flagged");
+    assert.match(content, /\[out of lane\]/, "out-of-lane follow-up is flagged");
     assert.match(content, /login needs a caller/, "the why is recorded");
   } finally {
     await rm(dir, { recursive: true, force: true });

@@ -813,10 +813,17 @@ below makes the pane update dynamically and keeps the user talking only to Rudde
   undo rides the jj op-log. A planner that emits no block leaves the current plan intact.
 
 ### 14.6 Coordination surfaces
-- **`DECISIONS.md`** — jj-tracked, agent-authored shared knowledge. Appended via
-  `rudder remember` (a decision) or `rudder done` (a completion note). Siblings
-  re-read it; the board renders it. `appendDecision`/`appendCompletionNote`
-  (`src/surfaces.ts`).
+- **`DECISIONS.md`** — jj-tracked, agent-authored shared decisions log. ONE canonical
+  entry format (`renderDecisionEntry` in `src/surfaces.ts`): a `## title` heading, labeled
+  body lines (**What** / **Did** / **Interfaces** / **Follow-ups** / optional **Why**), and
+  a `- **By:** owner · <iso>` footer — uniform and scannable. Three writers, all that
+  format: `rudder remember` → `appendDecision`; `rudder done` → `appendCompletionNote`
+  (worker completion notes); and the CONDUCTOR → `append_conductor_decision`
+  (`native/src/gitio.rs`, via `App::record_decision`) for plan-approval / follow-up
+  depth+size-cap deferrals, so its plan/steer reasoning is durable and visible to the
+  fleet, not just in the in-pane `activity_log`. Workers re-read it before each step (the
+  propagation rules); the board parses it for the memory view (`parseDecisions` in
+  `src/board/daemon.ts`, which reads the `## ` blocks and still tolerates legacy bullets).
 - **`RUDDER.md`** — read-only, orchestrator-owned, `freshness:`-stamped projection of
   the plan/status that workers re-read (`renderLiveRudderMd`). Git-excluded.
 - **`rudder done [--node <id>] '<json>'`** — `{summary, interfaces, followups:[{title,

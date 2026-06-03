@@ -821,20 +821,58 @@ async function readLogTail(repoRoot: string, runId: string, tail: number): Promi
 }
 
 /**
- * Memory view: parse DECISIONS.md (repo root) into bullet entries. Each
- * top-level "-" / "*" bullet becomes one MemoryEntry; absent file yields [].
- * A trailing "(owner: X, <iso>)" suffix (written by `rudder remember` and the
- * agent contract) is extracted into owner/ts; plain bullets just get text.
+ * Memory view: parse DECISIONS.md (repo root) into entries. The current format is one
+ * `## title` block per decision, with `- **What:**` / `- **Did:**` / `- **Decision:**`
+ * body lines and a `- **By:** owner · <iso>` footer; each block becomes one MemoryEntry
+ * (text from the What/Did/Decision line or the title, owner+ts from By). Legacy top-level
+ * `-`/`*` bullets with a trailing "(owner: X, <iso>)" suffix are still parsed for back
+ * compat. Absent file yields [].
  */
 export function parseDecisions(raw: string): MemoryEntry[] {
   const entries: MemoryEntry[] = [];
-  for (const line of raw.split(/\r?\n/)) {
-    const match = line.match(/^\s*[-*]\s+(.*)$/);
-    const body = match?.[1]?.trim();
-    if (!body) {
+  const lines = raw.split(/\r?\n/);
+  let i = 0;
+  while (i < lines.length) {
+    const heading = lines[i].match(/^##\s+(.*)$/);
+    if (heading) {
+      const title = heading[1].trim();
+      let text: string | undefined;
+      let owner: string | undefined;
+      let ts: string | undefined;
+      i++;
+      // Gather the block until the next `## ` heading (or EOF).
+      while (i < lines.length && !/^##\s+/.test(lines[i])) {
+        const field = lines[i].trim().match(/^[-*]\s+\*\*([^:*]+):\*\*\s*(.*)$/);
+        if (field) {
+          const label = field[1].trim().toLowerCase();
+          const value = field[2].trim();
+          if (label === "by") {
+            const by = value.match(/^(.*?)\s*·\s*(.*)$/);
+            owner = (by ? by[1] : value).trim() || undefined;
+            ts = by?.[2]?.trim() || undefined;
+          } else if (
+            text === undefined &&
+            (label === "what" || label === "did" || label === "decision")
+          ) {
+            text = value;
+          }
+        }
+        i++;
+      }
+      entries.push({
+        text: text || title,
+        ...(owner ? { owner } : {}),
+        ...(ts ? { ts } : {}),
+      });
       continue;
     }
-    entries.push(parseDecisionBullet(body));
+    // Legacy: a top-level "-"/"*" bullet (optionally with an "(owner: X, <iso>)" suffix).
+    const bullet = lines[i].match(/^\s*[-*]\s+(.*)$/);
+    const body = bullet?.[1]?.trim();
+    if (body) {
+      entries.push(parseDecisionBullet(body));
+    }
+    i++;
   }
   return entries;
 }

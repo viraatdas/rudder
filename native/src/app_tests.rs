@@ -44,6 +44,33 @@
     }
 
     #[test]
+    fn conductor_decision_appends_parseable_entry_with_header() {
+        let dir = std::env::temp_dir().join(format!("rudder-dec-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join("DECISIONS.md");
+        let _ = std::fs::remove_file(&file);
+
+        append_conductor_decision(&dir, "Plan approved", "Approved a 3-task plan", Some("user approved"));
+        let content = std::fs::read_to_string(&file).unwrap();
+        // Header created on first write, then the canonical ## block format.
+        assert!(content.starts_with("# Decisions"), "header present: {content}");
+        assert!(content.contains("## Plan approved"));
+        assert!(content.contains("- **What:** Approved a 3-task plan"));
+        assert!(content.contains("- **Why:** user approved"));
+        assert!(content.contains("- **By:** conductor · "));
+
+        // A second decision appends (does not clobber).
+        append_conductor_decision(&dir, "Plan at cap", "deferred follow-ups", None);
+        let content = std::fs::read_to_string(&file).unwrap();
+        assert!(content.contains("## Plan approved") && content.contains("## Plan at cap"));
+        // Empty `what` is a no-op (never writes a blank decision).
+        let before = content.len();
+        append_conductor_decision(&dir, "x", "   ", None);
+        assert_eq!(std::fs::read_to_string(&file).unwrap().len(), before);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
     fn worktree_dir_name_leads_with_task_slug() {
         let name = worktree_dir_name(
             "1779248379804-add-dark-and-light-mode-56991",

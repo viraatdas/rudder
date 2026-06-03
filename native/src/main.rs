@@ -5238,6 +5238,14 @@ impl App {
         self.dirty = true;
     }
 
+    /// Record a cross-cutting conductor DECISION: surface it in the in-pane activity log
+    /// AND append it durably to DECISIONS.md, so the fleet (workers re-read that file) sees
+    /// the conductor's plan/steer reasoning, not just the ephemeral activity line.
+    fn record_decision(&mut self, title: &str, what: &str, why: Option<&str>) {
+        self.push_activity(what.to_string());
+        append_conductor_decision(&self.cwd, title, what, why);
+    }
+
     /// Live plan size = queued nodes + launched-but-not-merged plan agents. The
     /// auto-expansion backstop guards this against MAX_PLAN_TASKS.
     fn plan_node_count(&self) -> usize {
@@ -5484,9 +5492,24 @@ impl App {
         // get to spawn more; record the intent instead of growing without bound.
         let gen = self.followup_gen.get(node_id).copied().unwrap_or(0);
         if gen >= MAX_FOLLOWUP_DEPTH {
-            self.push_activity(format!(
-                "follow-ups from {node_id} not expanded (depth cap {MAX_FOLLOWUP_DEPTH}); recorded to DECISIONS.md"
-            ));
+            let titles: Vec<String> = followups
+                .iter()
+                .filter_map(|f| {
+                    f.get("title")
+                        .or_else(|| f.get("prompt"))
+                        .and_then(serde_json::Value::as_str)
+                })
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            self.record_decision(
+                &format!("Deferred follow-ups from {node_id} (depth cap)"),
+                &format!(
+                    "Auto-expansion stopped at depth cap {MAX_FOLLOWUP_DEPTH}; these follow-ups were NOT launched and need manual scheduling if wanted: {}",
+                    if titles.is_empty() { "(unnamed)".to_string() } else { titles.join("; ") }
+                ),
+                Some("the depth cap prevents unbounded auto-growth of the DAG"),
+            );
             return false;
         }
         // Every node id known to the plan (queued + launched). Used to (a) skip a batch
@@ -5521,9 +5544,13 @@ impl App {
                 continue;
             }
             if self.plan_node_count() >= MAX_PLAN_TASKS {
-                self.push_activity(format!(
-                    "plan at {MAX_PLAN_TASKS}-node cap; remaining follow-ups from {node_id} recorded to DECISIONS.md, not launched"
-                ));
+                self.record_decision(
+                    &format!("Plan at {MAX_PLAN_TASKS}-node cap"),
+                    &format!(
+                        "Remaining follow-ups from {node_id} (incl. '{title}') were NOT launched: the plan hit the {MAX_PLAN_TASKS}-node cap. Schedule manually if still needed."
+                    ),
+                    Some("the plan-size cap prevents runaway auto-growth"),
+                );
                 break;
             }
             let prompt = f
@@ -5635,7 +5662,28 @@ impl App {
             return;
         }
         self.awaiting_approval = false;
-        self.notice = Some("plan approved".to_string());
+        // Record the plan approval as a cross-cutting decision so the fleet has the
+        // authoritative goal + shape in DECISIONS.md from the start.
+        let goal = if self.plan_request.trim().is_empty() {
+            self.planned_origin.clone()
+        } else {
+            self.plan_request.clone()
+        };
+        let titles: Vec<String> = self
+            .planned_nodes
+            .iter()
+            .map(|n| n.title.clone())
+            .collect();
+        self.record_decision(
+            "Plan approved",
+            &format!(
+                "Approved a {}-task plan for: {}. Tasks: {}.",
+                titles.len(),
+                goal.trim(),
+                titles.join("; ")
+            ),
+            Some("user-approved plan; workers implement these nodes in isolated workspaces, honoring the dependency edges"),
+        );
         // Drain immediately so a ready node moves todo->in progress without waiting
         // a full scheduler interval (covers the trivial 1-node case visibly).
         self.run_scheduler();

@@ -28,7 +28,36 @@ const STATUS_BADGE: Record<TaskNode["status"], string> = {
 // RUDDER.md: it is agent-authored shared knowledge that jj merges as first-class
 // conflicts on fan-in.
 export const DECISIONS_HEADER =
-  "# Decisions  (shared, agent-authored. Append one bullet per cross-cutting decision: what, why, owning node.)";
+  "# Decisions\n\nShared, agent-authored log of cross-cutting decisions the fleet must honor. The conductor records plan/rebase/steer decisions here; workers record interface contracts + adjustments. Each entry is a `##` heading with **What / Why / By** so it scans. Re-read before each significant step; jj merges concurrent edits as first-class conflicts on fan-in.";
+
+/** A short scannable title from free text: the first ~9 words, single line, capped. */
+function decisionTitle(text: string, max = 9): string {
+  const flat = text.replace(/\s+/g, " ").trim();
+  if (!flat) {
+    return "decision";
+  }
+  const words = flat.split(" ").slice(0, max).join(" ");
+  return words.length > 80 ? `${words.slice(0, 79)}…` : words;
+}
+
+/** Render ONE canonical DECISIONS.md entry: a `## title` heading, labeled body lines,
+ *  and a `**By:** owner · when` footer. Shared shape for every writer (remember, the
+ *  conductor, completion notes) so the log stays uniform and scannable. */
+export function renderDecisionEntry(opts: {
+  title: string;
+  body: string[];
+  owner: string;
+  when?: string;
+}): string {
+  const lines = [`## ${opts.title.replace(/\s+/g, " ").trim() || "decision"}`];
+  for (const line of opts.body) {
+    if (line.trim()) {
+      lines.push(line);
+    }
+  }
+  lines.push(`- **By:** ${opts.owner.trim() || "rudder"} · ${opts.when || nowIso()}`);
+  return `${lines.join("\n")}\n\n`;
+}
 
 // The propagation contract. These three lines live in the worker system-prompt
 // (brain.renderContract working rules) and are mirrored into the RUDDER.md
@@ -77,8 +106,12 @@ export async function appendDecision(
   if (!text) {
     return;
   }
-  const bullet = `- ${text}  (owner: ${owner}, ${nowIso()})\n`;
-  await fsp.appendFile(decisionsPath(repoRoot), bullet, "utf8").catch(() => undefined);
+  const entry = renderDecisionEntry({
+    title: decisionTitle(text),
+    body: [`- **What:** ${text}`],
+    owner,
+  });
+  await fsp.appendFile(decisionsPath(repoRoot), entry, "utf8").catch(() => undefined);
 }
 
 // Markers wrapping the JSON a worker's `rudder done` echoes to stdout, so the TUI
@@ -165,25 +198,28 @@ export async function appendCompletionNote(
   await ensureDecisionsFile(repoRoot);
   const id = (note.node || owner).trim() || "worker";
   const summary = (note.summary || "").replace(/\s+/g, " ").trim();
-  const lines: string[] = [
-    `- DONE (${id}): ${summary || "(no summary)"}  (owner: ${id}, ${nowIso()})`,
-  ];
+  const body: string[] = [`- **Did:** ${summary || "(no summary)"}`];
   const interfaces = (note.interfaces || "").replace(/\s+/g, " ").trim();
   if (interfaces) {
-    lines.push(`  interfaces: ${interfaces}`);
+    body.push(`- **Interfaces:** ${interfaces}`);
   }
   const followups = (note.followups || []).filter((f) => f && (f.title || f.prompt));
   if (followups.length) {
-    lines.push("  followups:");
+    body.push("- **Follow-ups:**");
     for (const f of followups) {
       const title = (f.title || f.prompt || "").replace(/\s+/g, " ").trim();
       const deps = f.deps && f.deps.length ? ` [deps: ${f.deps.join(", ")}]` : "";
-      const scope = f.scope === "out" ? " [scope: out]" : "";
-      const why = f.why ? ` - ${f.why.replace(/\s+/g, " ").trim()}` : "";
-      lines.push(`    - ${title}${deps}${scope}${why}`);
+      const scope = f.scope === "out" ? " [out of lane]" : "";
+      const why = f.why ? ` — ${f.why.replace(/\s+/g, " ").trim()}` : "";
+      body.push(`  - ${title}${deps}${scope}${why}`);
     }
   }
-  await fsp.appendFile(decisionsPath(repoRoot), `${lines.join("\n")}\n`, "utf8").catch(() => undefined);
+  const entry = renderDecisionEntry({
+    title: `${id}: ${decisionTitle(summary || "done")}`,
+    body,
+    owner: id,
+  });
+  await fsp.appendFile(decisionsPath(repoRoot), entry, "utf8").catch(() => undefined);
 }
 
 // The freshness stamp folds in DECISIONS.md's mtime so a sibling appending a
