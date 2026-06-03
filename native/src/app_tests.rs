@@ -44,6 +44,62 @@
     }
 
     #[test]
+    fn execution_prompt_caps_a_long_leading_goal_line() {
+        // The real 4000-char source: a planner node prompt that LEADS with its own long
+        // /goal line, hoisted by execution_prompt. The hoisted line must be capped.
+        let task = format!("/goal {}\nDone when: ok\n\nimplement the thing", "G".repeat(4595));
+        let out = execution_prompt(&task);
+        let goal_line = out.lines().next().unwrap();
+        assert!(goal_line.starts_with("/goal "));
+        let arg = goal_line.chars().count() - "/goal ".chars().count();
+        assert!(arg <= 4000, "hoisted /goal arg capped: was {arg}");
+        assert!(out.contains("implement the thing"), "body preserved");
+    }
+
+    #[test]
+    fn duplicate_task_ids_are_accepted_not_rejected_as_a_cycle() {
+        // assert_no_hard_cycle previously compared visited against tasks.len(), so duplicate
+        // ids (which dedupe in the maps) falsely looked like a cycle and rejected the plan.
+        let block = "RUDDER_PLAN_TASKS_START\n{\"tasks\":[{\"id\":\"n0\",\"title\":\"a\",\"prompt\":\"p\"},{\"id\":\"n0\",\"title\":\"b\",\"prompt\":\"q\"}]}\nRUDDER_PLAN_TASKS_END";
+        let tasks = extract_rudder_plan_tasks(block).expect("dup ids accepted, not a cycle");
+        assert_eq!(tasks.len(), 2);
+    }
+
+    #[test]
+    fn bare_string_dep_becomes_a_soft_edge() {
+        // A dep given as a bare string "n0" (not {on,type}) must be a soft edge (TS parity),
+        // not silently dropped.
+        let block = "RUDDER_PLAN_TASKS_START\n{\"tasks\":[{\"id\":\"n0\",\"title\":\"a\",\"prompt\":\"p\"},{\"id\":\"n1\",\"title\":\"b\",\"prompt\":\"q\",\"deps\":[\"n0\"]}]}\nRUDDER_PLAN_TASKS_END";
+        let tasks = extract_rudder_plan_tasks(block).expect("parses");
+        let n1 = tasks.iter().find(|t| t.id == "n1").expect("n1");
+        assert_eq!(n1.deps.len(), 1, "bare-string dep kept");
+        assert_eq!(n1.deps[0].on, "n0");
+        assert_eq!(n1.deps[0].edge, EdgeType::Soft);
+    }
+
+    #[test]
+    fn structural_markers_match_whole_words_not_substrings() {
+        // A marker inside a longer word must NOT force a rebase.
+        assert!(!is_structural_direction("make the pivotal config change", &[]));
+        // The marker as a real word does.
+        assert!(is_structural_direction("pivot to a new design", &[]));
+        assert!(is_structural_direction("rewrite the auth flow", &[]));
+    }
+
+    #[test]
+    fn orchestrator_task_status_prefers_a_live_relaunch_over_a_stale_failed_run() {
+        let mut app = App::new();
+        let mut failed = test_agent_run("a", "x");
+        failed.node_id = Some("n1".to_string());
+        failed.status = AgentStatus::Failed;
+        let mut running = test_agent_run("b", "y");
+        running.node_id = Some("n1".to_string());
+        running.status = AgentStatus::Running;
+        app.agents = vec![failed, running];
+        assert_eq!(orchestrator_task_status(&app, "n1"), OrchTaskStatus::Running);
+    }
+
+    #[test]
     fn plan_stream_lands_final_plan_emitted_after_tool_narration() {
         // Repro of the my-charts hang: the planner narrates (streamed text), uses tools,
         // THEN emits the plan as a final message. The `result` event's text is that final

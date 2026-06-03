@@ -59,6 +59,23 @@ export function renderDecisionEntry(opts: {
   return `${lines.join("\n")}\n\n`;
 }
 
+/** Append a rendered entry to DECISIONS.md, prepending a newline when the file does not
+ *  already end in one so a new `##` heading never fuses onto a previous non-terminated
+ *  line (mirrors the Rust gitio.rs append_conductor_decision guard). */
+async function appendDecisionsEntry(repoRoot: string, entry: string): Promise<void> {
+  const target = await ensureDecisionsFile(repoRoot);
+  let prefix = "";
+  try {
+    const existing = await fsp.readFile(target, "utf8");
+    if (existing.length > 0 && !existing.endsWith("\n")) {
+      prefix = "\n";
+    }
+  } catch {
+    // Absent (just created by ensureDecisionsFile); no prefix needed.
+  }
+  await fsp.appendFile(target, `${prefix}${entry}`, "utf8").catch(() => undefined);
+}
+
 // The propagation contract. These three lines live in the worker system-prompt
 // (brain.renderContract working rules) and are mirrored into the RUDDER.md
 // preamble so an agent reading only RUDDER.md still gets them. Kept here so the
@@ -111,7 +128,7 @@ export async function appendDecision(
     body: [`- **What:** ${text}`],
     owner,
   });
-  await fsp.appendFile(decisionsPath(repoRoot), entry, "utf8").catch(() => undefined);
+  await appendDecisionsEntry(repoRoot, entry);
 }
 
 // Markers wrapping the JSON a worker's `rudder done` echoes to stdout, so the TUI
@@ -219,7 +236,7 @@ export async function appendCompletionNote(
     body,
     owner: id,
   });
-  await fsp.appendFile(decisionsPath(repoRoot), entry, "utf8").catch(() => undefined);
+  await appendDecisionsEntry(repoRoot, entry);
 }
 
 // The freshness stamp folds in DECISIONS.md's mtime so a sibling appending a
@@ -329,6 +346,8 @@ function oneLine(value: string, max: number): string {
 // snapshot's exclusion handling (run-manager.writeRudderContextFiles).
 async function writeLiveRudderMd(repoRoot: string, graph: RudderGraph, content: string): Promise<void> {
   await ensureLine(path.join(repoRoot, ".gitignore"), "RUDDER.md");
+  // Worktrees live inside the project; ignore them so worker checkouts are not untracked.
+  await ensureLine(path.join(repoRoot, ".gitignore"), ".rudder-worktrees/");
   const workspaces = new Set<string>([repoRoot]);
   for (const node of Object.values(graph.nodes)) {
     if (node.worktree?.path) {

@@ -777,6 +777,10 @@ function formatAgentContextRun(run: RunRecord): string {
 
 async function writeRudderContextFiles(repoRoot: string, activeRuns: RunRecord[], content: string): Promise<void> {
   await ensureLine(path.join(repoRoot, ".gitignore"), "RUDDER.md");
+  // Worktrees live INSIDE the project at <repo>/.rudder-worktrees; ignore them in the
+  // user's repo so each worker checkout does not show up as untracked files (Rust parity:
+  // gitio.rs write_rudder_context).
+  await ensureLine(path.join(repoRoot, ".gitignore"), ".rudder-worktrees/");
   const workspaces = new Set([
     repoRoot,
     ...activeRuns.map((run) => run.worktree.path),

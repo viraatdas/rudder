@@ -850,6 +850,14 @@ export function parseDecisions(raw: string): MemoryEntry[] {
             const by = value.match(/^(.*?)\s*·\s*(.*)$/);
             owner = (by ? by[1] : value).trim() || undefined;
             ts = by?.[2]?.trim() || undefined;
+            // Normalize an epoch-ms stamp (the conductor's now_stamp) to ISO so the board
+            // shows one consistent format alongside the worker/CLI ISO stamps.
+            if (ts && /^\d{13}$/.test(ts)) {
+              const iso = new Date(Number(ts)).toISOString();
+              if (!Number.isNaN(Date.parse(iso))) {
+                ts = iso;
+              }
+            }
           } else if (
             text === undefined &&
             (label === "what" || label === "did" || label === "decision")

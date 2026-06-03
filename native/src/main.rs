@@ -705,6 +705,12 @@ impl App {
         } else {
             load_ingested_runs(&cwd)
         };
+        // Restore the auto-expansion depth map so MAX_FOLLOWUP_DEPTH survives a restart.
+        let followup_gen = if cfg!(test) {
+            HashMap::new()
+        } else {
+            load_followup_gen(&cwd)
+        };
         // Main is no longer auto-pinned. If the user wants one, they type
         // /main from the task pane. Main records render in their own section
         // instead of being mixed into ordinary worktree agents.
@@ -762,7 +768,7 @@ impl App {
             orch_visible_rows: Vec::new(),
             activity_log: Vec::new(),
             followups_ingested,
-            followup_gen: HashMap::new(),
+            followup_gen,
             surfaced_overlaps: HashSet::new(),
             last_drift_scan: None,
             orch_dag_scroll: 0,
@@ -2867,12 +2873,47 @@ impl App {
             return;
         }
 
+        // The planner ran but produced NO DAG (it asked a clarifying question, or needs
+        // more detail). It is left resumable; RESUME the same session with this message so
+        // the planning conversation continues, instead of starting a fresh planner that
+        // loses all prior context.
+        if self.planner_awaiting_input() {
+            self.refine_plan(&input);
+            return;
+        }
+
         // Default first task (no active plan): launch the headless, Rudder-owned planner
         // (the model in plan mode, streamed live in the orchestrator pane). Rudder fully
         // controls it — it researches read-only, the pane updates dynamically, and it
         // emits the task DAG which flows through the approval gate to the fleet. No
         // interactive TUI to hand control to a single in-process agent.
         self.start_rudder_plan_task(&input);
+    }
+
+    /// True when a planner ran and EXITED without producing a DAG (it asked a clarifying
+    /// question or needs more detail) and is waiting for the user's reply: a pinned
+    /// orchestrator that is no longer Running, still has its resumable session, with no
+    /// queued nodes, no approval gate, and no refine/rebase in flight. A typed message in
+    /// this state RESUMES the planner (refine_plan) rather than starting a fresh one.
+    fn planner_awaiting_input(&self) -> bool {
+        if self.awaiting_approval || self.refining || self.rebasing || !self.planned_nodes.is_empty()
+        {
+            return false;
+        }
+        let has_paused_planner = self.agents.iter().any(|run| {
+            run.is_orchestrator()
+                && run.status != AgentStatus::Running
+                && run
+                    .session_id
+                    .as_deref()
+                    .is_some_and(|sid| !sid.trim().is_empty())
+        });
+        // No in-flight plan workers (that would be a conducting plan, routed elsewhere).
+        let no_live_plan_workers = !self
+            .agents
+            .iter()
+            .any(|run| run.node_id.is_some() && run.status != AgentStatus::Merged);
+        has_paused_planner && no_live_plan_workers
     }
 
     /// True when a plan is currently active: nodes are queued/awaiting approval,
@@ -2922,7 +2963,14 @@ impl App {
             .map(|node| (node.id.clone(), node.title.clone()))
             .collect();
         for run in &self.agents {
-            if run.status == AgentStatus::Merged {
+            // Skip Merged (already a satisfied/dangling ref) AND Failed/Stopped: a dead
+            // node id must never be advertised as a hard-dep target, or a reconcile/rebase
+            // node hard-linked to it would deadlock on arrival (is_ready never satisfies a
+            // hard dep whose node is not Merged).
+            if matches!(
+                run.status,
+                AgentStatus::Merged | AgentStatus::Failed | AgentStatus::Stopped
+            ) {
                 continue;
             }
             let Some(node_id) = run.node_id.as_ref() else {
@@ -3485,6 +3533,13 @@ impl App {
     /// current DAG, and the feedback so it emits a REVISED full DAG that REPLACES
     /// the pending plan. Stays at the approval gate; nothing launches until Enter.
     fn refine_plan(&mut self, feedback: &str) {
+        // A refine/rebase is already in flight: the revised plan is on its way. Relaunching
+        // the orchestrator now would kill the in-flight planner and race its capture, so
+        // hold (mirrors the empty-Enter and approve_planned_queue guards).
+        if self.refining || self.rebasing {
+            self.notice = Some("still refining — the updated plan is on its way".to_string());
+            return;
+        }
         let Some(index) = self.agents.iter().position(|run| run.is_orchestrator()) else {
             // No orchestrator to refine (shouldn't happen while awaiting approval):
             // fall back to a fresh plan from the feedback.
@@ -4858,6 +4913,12 @@ impl App {
     /// is KEPT as the pinned orchestrator that owns the plan (its worker pane
     /// renders the DAG view); we clear `autosteered` so it is captured once.
     fn evaluate_completed_plan(&mut self, index: usize) {
+        // A REBASE in flight must NEVER reach the initial-plan REPLACE path (it would wipe
+        // the running plan's todo queue and re-gate the fleet); evaluate_completed_rebase
+        // owns that case. Defensive guard in case a caller routes a rebase planner here.
+        if self.rebasing {
+            return;
+        }
         let Some(run) = self.agents.get_mut(index) else {
             return;
         };
@@ -4895,8 +4956,12 @@ impl App {
                 run.autosteered = false;
                 let _ = save_native_run_record(&self.cwd, run);
                 self.refining = false;
+                // No DAG yet: the planner likely asked a clarifying question or needs more
+                // detail. The orchestrator stays resumable (Done, with its session) so the
+                // next typed message RESUMES this planning conversation (see
+                // planner_awaiting_input + start_task_from_input) instead of starting fresh.
                 self.notice = Some(format!(
-                    "planner finished without a runnable plan ({error}). Refine the task with more detail and re-plan."
+                    "planner is waiting ({error}) — type your answer or more detail to continue planning"
                 ));
                 return;
             }
@@ -4908,8 +4973,10 @@ impl App {
             run.autosteered = false;
             let _ = save_native_run_record(&self.cwd, run);
             self.refining = false;
+            // Same as the Err branch: keep the planner resumable so a typed answer
+            // continues this conversation rather than starting a fresh planner.
             self.notice = Some(
-                "planner finished without a runnable plan (it may have asked for clarification). Refine the task with more detail and re-plan."
+                "planner is waiting (it asked a question or needs detail) — type your answer to continue planning"
                     .to_string(),
             );
             return;
@@ -5137,6 +5204,7 @@ impl App {
                     let _ = save_native_run_record(&self.cwd, run);
                 }
                 self.rebasing = false;
+                self.refining = false;
                 self.notice = Some(match other {
                     Err(error) => format!(
                         "rebase produced no runnable plan ({error}); the current plan still stands"
@@ -5205,8 +5273,11 @@ impl App {
         self.planned_nodes = diff.todo;
         self.plan_summary = summary;
 
-        // The rebase has landed: clear the flag + the planner's capture-once flag.
+        // The rebase has landed: clear the rebase + refine flags + the planner's
+        // capture-once flag (refining may have been set by an interleaved refine; leaving
+        // it true would wedge the approval gate forever).
         self.rebasing = false;
+        self.refining = false;
         if let Some(run) = self.agents.get_mut(index) {
             run.autosteered = false;
             let _ = save_native_run_record(&self.cwd, run);
@@ -5442,7 +5513,15 @@ impl App {
     fn poll_completion_summary_workers(&mut self) {
         let mut grew = false;
         while let Ok(result) = self.completion_summary_rx.try_recv() {
-            self.completion_summary_pending.remove(&result.run_id);
+            // The backstop summarizer thread is fire-and-forget: it cannot be cancelled, so
+            // a result can land AFTER the run was re-goaled (regoal clears it from pending +
+            // the ledger to re-ingest the NEW work) or deleted. Only honor the result if the
+            // run is STILL pending — otherwise marking it ingested would permanently skip the
+            // re-goaled run's new completion (or resurrect a deleted run into the ledger).
+            let still_wanted = self.completion_summary_pending.remove(&result.run_id);
+            if !still_wanted {
+                continue;
+            }
             self.mark_run_ingested(result.run_id);
             if let Some(note) = result.note {
                 if self.apply_worker_followups(&result.node_id, &note) {
@@ -5469,6 +5548,25 @@ impl App {
             return;
         }
         let path = dir.join("ingestion-ledger.json");
+        let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+        if std::fs::write(&tmp, json).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+
+    /// Persist the auto-expansion DEPTH map to `.rudder/followup-gen.json` (atomic) so the
+    /// MAX_FOLLOWUP_DEPTH cap survives a restart. Without this, reopening Rudder mid-plan
+    /// resets every node's depth to 0 and an auto-expansion chain could grow further than
+    /// the cap intends (still bounded by MAX_PLAN_TASKS, but the depth guard would be lost).
+    fn persist_followup_gen(&self) {
+        let Ok(json) = serde_json::to_string(&self.followup_gen) else {
+            return;
+        };
+        let dir = self.cwd.join(".rudder");
+        if std::fs::create_dir_all(&dir).is_err() {
+            return;
+        }
+        let path = dir.join("followup-gen.json");
         let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
         if std::fs::write(&tmp, json).is_ok() {
             let _ = std::fs::rename(&tmp, &path);
@@ -5581,20 +5679,27 @@ impl App {
                 model: None,
                 effort: None,
             };
-            // Explicit hard deps must reference real plan nodes. A dep absent from the
+            // Explicit hard deps must reference real, LIVE plan nodes. A dep absent from the
             // plan is treated as already-satisfied by is_ready, so a typo'd id (e.g. "n_0"
-            // for "n0") would make the node launch IMMEDIATELY, silently losing the gate.
-            // Only keep explicit deps that resolve; if any are unknown, fall back to the
-            // soft-frontier edge and surface it.
+            // for "n0") would make the node launch IMMEDIATELY, losing the gate. A dep that
+            // resolves to a FAILED/STOPPED node is the opposite trap: is_ready only satisfies
+            // a hard dep that MERGED, so it would deadlock forever. Treat BOTH (unknown and
+            // dead) as bad: fall back to the soft-frontier edge and surface it.
+            let dead: Vec<String> = self
+                .agents
+                .iter()
+                .filter(|r| matches!(r.status, AgentStatus::Failed | AgentStatus::Stopped))
+                .filter_map(|r| r.node_id.clone())
+                .collect();
             let unknown: Vec<&str> = explicit
                 .iter()
-                .filter(|d| !known.iter().any(|k| k == *d))
+                .filter(|d| !known.iter().any(|k| k == *d) || dead.iter().any(|x| x == *d))
                 .map(String::as_str)
                 .collect();
             if explicit.is_empty() || !unknown.is_empty() {
                 if !unknown.is_empty() {
                     self.push_activity(format!(
-                        "follow-up '{title}' had unknown dep(s) {unknown:?}; soft-linked instead of hard-gated"
+                        "follow-up '{title}' had unknown or failed dep(s) {unknown:?}; soft-linked instead of hard-gated"
                     ));
                 }
                 // Default / fallback: a SOFT edge to the finishing node + the frontier, so
@@ -5610,6 +5715,7 @@ impl App {
                 node.deps = explicit;
             }
             self.followup_gen.insert(node.id.clone(), gen + 1);
+            self.persist_followup_gen();
             self.planned_nodes.push(node);
             added += 1;
         }
@@ -5988,6 +6094,14 @@ impl App {
                 finalized_any = true;
                 self.notice = Some(format!("resolved conflict and merged {}", short_task(&label)));
             } else {
+                // Conflicts still remain: drop back to manual. CRUCIALLY, skip it from
+                // auto-merge — otherwise (resolver flag now cleared, status still Done) the
+                // next maybe_auto_merge tick re-merges, re-conflicts, and re-spawns a
+                // resolver every tick, stacking jj merge changes forever. Cleared again on a
+                // successful manual merge / re-goal (see merge_agent_at, regoal_agent_at).
+                if !self.auto_merge_skip.contains(&id) {
+                    self.auto_merge_skip.push(id.clone());
+                }
                 self.notice = Some(format!(
                     "resolver left {} conflict(s) in {}; resolve and press m",
                     conflicts.len(),
@@ -6037,6 +6151,38 @@ impl App {
                 format!("launched {launched} node(s)")
             });
             self.dirty = true;
+        } else {
+            // DEADLOCK SURFACE: a queued node whose HARD dep FAILED can never become ready
+            // (is_ready only satisfies a hard dep that MERGED), so it would sit in Todo
+            // forever with no explanation. When nothing launched this pass, detect those
+            // and tell the user how to unblock. notice (not activity_log) so it does not
+            // flood; idempotent if it persists across ticks.
+            let failed_ids: Vec<String> = self
+                .agents
+                .iter()
+                .filter(|run| run.status == AgentStatus::Failed)
+                .filter_map(|run| run.node_id.clone())
+                .collect();
+            if !failed_ids.is_empty() {
+                let blocked: Vec<&str> = self
+                    .planned_nodes
+                    .iter()
+                    .filter(|node| {
+                        node.deps
+                            .iter()
+                            .any(|dep| failed_ids.iter().any(|f| f == dep))
+                    })
+                    .map(|node| node.title.as_str())
+                    .collect();
+                if !blocked.is_empty() {
+                    self.notice = Some(format!(
+                        "{} task(s) blocked by a FAILED dependency ({}) — retry or re-goal the failed node to unblock, or delete it",
+                        blocked.len(),
+                        failed_ids.join(", ")
+                    ));
+                    self.dirty = true;
+                }
+            }
         }
 
         // MIRROR the plan into graph.json so the board reflects this DAG. Covers
@@ -6548,7 +6694,11 @@ impl App {
         // A re-goaled worker reuses its run id but will do NEW work and file a NEW report.
         // Clear its ingest ledger + any in-flight backstop so that second completion is
         // ingested afresh instead of being skipped as "already handled".
-        if let Some(id) = self.agents.get(index).map(|run| run.id.clone()) {
+        if let Some((id, node_id, run_cwd)) = self
+            .agents
+            .get(index)
+            .map(|run| (run.id.clone(), run.node_id.clone(), run.cwd.clone()))
+        {
             let was_ingested = self.followups_ingested.remove(&id);
             let was_pending = self.completion_summary_pending.remove(&id);
             // Persist if EITHER set changed. If only `pending` was set (a backstop is in
@@ -6558,6 +6708,13 @@ impl App {
             if was_ingested || was_pending {
                 self.persist_ingested_runs();
             }
+            // Delete the STALE completion sidecar so the re-goaled run cannot re-ingest its
+            // previous turn's note before it has written a new one.
+            if let Some(node_id) = node_id.as_deref() {
+                let _ = std::fs::remove_file(worker_done_file(&run_cwd, node_id));
+            }
+            // A re-goaled run is no longer a conflict to skip; let it auto-merge again.
+            self.auto_merge_skip.retain(|x| x != &id);
         }
         let (command, deliver_after, new_session, size, cwd, node_label) = {
             let Some(run) = self.agents.get(index) else {
@@ -7029,6 +7186,7 @@ What to do\n\
         };
         let is_jj = Self::run_is_jj(run);
         let review_source_ids = run.review_source_ids.clone();
+        let run_id = run.id.clone();
 
         if is_jj {
             // jj runs merge through the TS `rudder merge <id>` command, which
@@ -7066,8 +7224,27 @@ What to do\n\
         // path on the record and defer cleanup to delete, which keeps merge
         // confirmation responsive. Never touch the dedicated main agent.
         if index < self.agents.len() && !self.agents[index].is_main() {
+            // INGEST the worker's completion follow-ups BEFORE flipping it to Merged: a
+            // Merged run is excluded from the follow-up candidate set, so a MANUAL merge
+            // (m/M) racing ahead of the cadence-bound maybe_ingest_worker_followups would
+            // otherwise drop its follow-ups permanently. Idempotent via the guards (the
+            // auto-merge path already ingested on an earlier tick → this is a no-op there).
+            let should_ingest = self.agents.get(index).is_some_and(|r| {
+                r.node_id.is_some()
+                    && matches!(r.mode, AgentMode::Execute)
+                    && !r.merge_resolver
+                    && !self.followups_ingested.contains(&r.id)
+                    && !self.completion_summary_pending.contains(&r.id)
+            });
+            if should_ingest {
+                self.ingest_worker_followups(index);
+            }
             self.mark_agent_and_review_sources_merged(index, review_source_ids);
         }
+        // A successful merge clears any prior conflict-skip for this run, so it can
+        // auto-merge again if it ever returns to review (and does not stay permanently
+        // un-auto-merged for the session).
+        self.auto_merge_skip.retain(|x| x != &run_id);
         Ok(())
     }
 
@@ -7356,6 +7533,13 @@ What to do\n\
                 .is_some_and(|run| run.reconcile_planner);
             if is_reconcile {
                 self.evaluate_completed_reconcile(index);
+            } else if self.rebasing {
+                // A REBASE planner exits headless right after printing the revised DAG. It
+                // is not a reconcile planner, so without this branch it would fall to the
+                // initial-plan REPLACE path (evaluate_completed_plan), wiping the running
+                // plan's todo queue and re-gating the whole fleet. Route it to the
+                // build-forward rebase evaluator (which preserves merged/running zones).
+                self.evaluate_completed_rebase(index);
             } else {
                 self.evaluate_completed_plan(index);
             }
@@ -7758,6 +7942,13 @@ fn load_ingested_runs(cwd: &Path) -> HashSet<String> {
         .ok()
         .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
         .map(|ids| ids.into_iter().collect())
+        .unwrap_or_default()
+}
+
+fn load_followup_gen(cwd: &Path) -> HashMap<String, u8> {
+    std::fs::read_to_string(cwd.join(".rudder").join("followup-gen.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<HashMap<String, u8>>(&raw).ok())
         .unwrap_or_default()
 }
 

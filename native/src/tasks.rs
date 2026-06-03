@@ -21,9 +21,9 @@ pub(crate) fn execution_prompt(task: &str) -> String {
 fn split_leading_goal_block(task: &str) -> (String, String) {
     let task = task.trim_start();
     let mut lines = task.lines();
-    let mut block = Vec::new();
+    let mut block: Vec<String> = Vec::new();
     if let Some(goal_line) = lines.next() {
-        block.push(goal_line);
+        block.push(cap_goal_command_line(goal_line));
     }
     // The optional Done-when line immediately follows the /goal line.
     let mut rest_lines: Vec<&str> = Vec::new();
@@ -32,7 +32,7 @@ fn split_leading_goal_block(task: &str) -> (String, String) {
         if !consumed_done {
             consumed_done = true;
             if line.trim_start().to_ascii_lowercase().starts_with("done when:") {
-                block.push(line);
+                block.push(cap_goal_command_line(line));
                 continue;
             }
         }
@@ -45,6 +45,20 @@ fn split_leading_goal_block(task: &str) -> (String, String) {
         .collect::<Vec<_>>()
         .join("\n");
     (block.join("\n"), body)
+}
+
+/// Cap a hoisted `/goal …` / `Done when: …` line's ARGUMENT to MAX_GOAL_LINE_CHARS while
+/// keeping the slash-command / label prefix intact. A planner node prompt that LEADS with
+/// its own (uncapped) `/goal` line is otherwise passed through verbatim, which is the real
+/// source of the backend's "Goal condition is limited to 4000 characters" rejection (the
+/// `goal_objective`/`goal_success` paths are already capped to 200 by `one_line`).
+fn cap_goal_command_line(line: &str) -> String {
+    for prefix in ["/goal ", "Done when: "] {
+        if let Some(arg) = line.strip_prefix(prefix) {
+            return format!("{prefix}{}", cap_goal_line(arg.to_string()));
+        }
+    }
+    line.to_string()
 }
 
 pub(crate) fn plan_prompt(task: &str) -> String {
@@ -281,7 +295,11 @@ fn assert_no_hard_cycle(tasks: &[RudderPlanTask]) -> Result<()> {
         }
     }
 
-    if visited != tasks.len() {
+    // Compare against the count of DISTINCT ids (indegree is keyed by id), not tasks.len():
+    // duplicate ids dedupe in the maps, so tasks.len() would over-count and falsely report a
+    // cycle, rejecting the whole plan. The TS daemon parser accepts duplicate ids, so this
+    // keeps the two parsers in parity (a real cycle still leaves a node unvisited).
+    if visited != indegree.len() {
         bail!("rudder-plan tasks form a hard-dependency cycle");
     }
     Ok(())
@@ -674,9 +692,40 @@ const TITLE_STOPWORDS: &[&str] = &[
 /// (1) any replacement verb/phrase, or (2) the message references a MAJORITY of existing
 /// node titles (reshaping the plan wholesale, not adding to it). Pure + unit-tested; a
 /// misfire is cheaply reversible (a rebase that yields no changes pops the plan back).
+/// True if `needle` appears in `haystack` bounded by non-alphanumeric chars (or string
+/// edges) on both sides, so a marker like "instead" matches the word but not a longer
+/// word that merely contains it. Multi-word markers ("rather than") match as a phrase.
+fn contains_word_phrase(haystack: &str, needle: &str) -> bool {
+    let mut from = 0;
+    while let Some(rel) = haystack[from..].find(needle) {
+        let at = from + rel;
+        let before_ok = at == 0
+            || !haystack[..at]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric());
+        let after = at + needle.len();
+        let after_ok = after >= haystack.len()
+            || !haystack[after..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_alphanumeric());
+        if before_ok && after_ok {
+            return true;
+        }
+        from = at + 1;
+    }
+    false
+}
+
 pub(crate) fn is_structural_direction(input: &str, titles: &[String]) -> bool {
     let lower = input.to_lowercase();
-    if STRUCTURAL_MARKERS.iter().any(|marker| lower.contains(marker)) {
+    // Whole-word/phrase match so a marker inside a longer word (or an incidental
+    // substring) does not force a full plan rebase.
+    if STRUCTURAL_MARKERS
+        .iter()
+        .any(|marker| contains_word_phrase(&lower, marker))
+    {
         return true;
     }
     if titles.len() < 2 {
@@ -730,6 +779,18 @@ fn parse_plan_deps(
     };
     let mut out = Vec::new();
     for dep in deps {
+        // A BARE STRING dep ("n0") is a SOFT edge on that id (parity with the TS daemon's
+        // parseRawDeps; the Rust parser previously dropped these silently).
+        if let Some(bare) = dep.as_str().map(str::trim).filter(|v| !v.is_empty()) {
+            if bare != self_id && known_ids.contains(bare) {
+                out.push(PlanEdge {
+                    on: bare.to_string(),
+                    edge: EdgeType::Soft,
+                    why: None,
+                });
+            }
+            continue;
+        }
         // Models phrase the parent id as either "on" or "from"; accept both.
         let on = dep
             .get("on")

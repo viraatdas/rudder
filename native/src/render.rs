@@ -823,19 +823,34 @@ impl OrchTaskStatus {
 /// Mirrors the agents-pane status buckets: Review is reserved for finished-but-
 /// unmerged, Done for Merged.
 pub(crate) fn orchestrator_task_status(app: &App, node_id: &str) -> OrchTaskStatus {
-    if let Some(run) = app
+    // A node id can map to more than one run (e.g. a failed launch followed by a relaunch).
+    // Pick the MOST SIGNIFICANT rather than the first match, so a live/merged relaunch is
+    // not masked by a stale Failed/Stopped run; ties resolve to the most recent (later)
+    // run since agents are appended in order.
+    let rank = |s: &OrchTaskStatus| match s {
+        OrchTaskStatus::Done => 4, // merged
+        OrchTaskStatus::Running => 3,
+        OrchTaskStatus::Review => 2,
+        OrchTaskStatus::Failed => 1,
+        OrchTaskStatus::Todo => 0,
+    };
+    let mut best: Option<OrchTaskStatus> = None;
+    for run in app
         .agents
         .iter()
-        .find(|run| run.node_id.as_deref() == Some(node_id))
+        .filter(|run| run.node_id.as_deref() == Some(node_id))
     {
-        return match run.status {
+        let status = match run.status {
             AgentStatus::Merged => OrchTaskStatus::Done,
             AgentStatus::Done => OrchTaskStatus::Review,
             AgentStatus::Failed | AgentStatus::Stopped => OrchTaskStatus::Failed,
             _ => OrchTaskStatus::Running,
         };
+        if best.as_ref().is_none_or(|b| rank(&status) >= rank(b)) {
+            best = Some(status);
+        }
     }
-    OrchTaskStatus::Todo
+    best.unwrap_or(OrchTaskStatus::Todo)
 }
 
 /// The orchestrator's current phase. `Planning` shows the spinner; `PlanReady`
@@ -1290,7 +1305,18 @@ fn nest_walk<'a>(
         .filter(|(child, _)| !visited[*child])
         .collect();
     for (position, (child_index, child_edge)) in pending.iter().enumerate() {
-        let child_is_last = position + 1 == pending.len();
+        // In a diamond DAG an earlier sibling's subtree may have already drawn this child
+        // (it has two parents); it would be skipped on entry, so skip it here too and do
+        // not let it affect the is_last decision for the children that ARE drawn.
+        if visited[*child_index] {
+            continue;
+        }
+        // "Last" = no LATER pending child is still undrawn — computed dynamically so the
+        // connector is a corner (not a tee) for the child that is actually drawn last,
+        // even when later pending entries were already placed under an earlier sibling.
+        let child_is_last = pending[position + 1..]
+            .iter()
+            .all(|(later, _)| visited[*later]);
         // Push THIS node's continuation (does it have a following sibling) as the ancestor
         // lane for its descendants — not the child's own flag, which double-counted and
         // misaligned the connectors.
@@ -1720,21 +1746,33 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
             // and the plan as it writes it. No pinned region; the whole transcript
             // scrolls and sticks to the bottom so new output stays in view.
             let mut body: Vec<Line<'static>> = Vec::new();
-            let spinner_label = if app.rebasing {
-                "rebasing the plan…"
-            } else if app.refining {
-                "refining the plan…"
+            // If the planner process has EXITED without a parseable DAG (it asked a
+            // clarifying question or needs more detail), show a terminal PAUSED state with
+            // a static badge instead of an animated spinner that would imply it is still
+            // working forever. A typed message resumes the session (planner_awaiting_input).
+            if agent.status != AgentStatus::Running {
+                body.push(Line::from(vec![
+                    Span::styled(BADGE, Style::default().fg(ACCENT)),
+                    Span::raw(" "),
+                    Span::styled(
+                        "planner paused — type your answer or more detail to continue",
+                        pane_text_style(true),
+                    ),
+                ]));
             } else {
-                "decomposing the task…"
-            };
-            body.push(Line::from(vec![
-                Span::styled(
-                    app.spinner_glyph(),
-                    Style::default().fg(ACCENT),
-                ),
-                Span::raw(" "),
-                Span::styled(spinner_label, pane_text_style(true)),
-            ]));
+                let spinner_label = if app.rebasing {
+                    "rebasing the plan…"
+                } else if app.refining {
+                    "refining the plan…"
+                } else {
+                    "decomposing the task…"
+                };
+                body.push(Line::from(vec![
+                    Span::styled(app.spinner_glyph(), Style::default().fg(ACCENT)),
+                    Span::raw(" "),
+                    Span::styled(spinner_label, pane_text_style(true)),
+                ]));
+            }
             body.push(Line::default());
             let empty: &[PlanEntry] = &[];
             let transcript = agent
@@ -1776,18 +1814,26 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
             // by HARD edges only (see orchestrator_hard_tree) so parallel soft-linked
             // tasks render as top-level roots instead of a misleading chain.
             let mut dag: Vec<Line<'static>> = orchestrator_dag_tree_lines(app, &tasks);
-            let (mut running, mut review, mut done, mut todo) = (0usize, 0usize, 0usize, 0usize);
+            let (mut running, mut review, mut done, mut todo, mut failed) =
+                (0usize, 0usize, 0usize, 0usize, 0usize);
             for task in &tasks {
                 match orchestrator_task_status(app, &task.id) {
                     OrchTaskStatus::Running => running += 1,
                     OrchTaskStatus::Review => review += 1,
                     OrchTaskStatus::Done => done += 1,
-                    OrchTaskStatus::Failed => {}
+                    OrchTaskStatus::Failed => failed += 1,
                     OrchTaskStatus::Todo => todo += 1,
                 }
             }
+            // Surface failed tasks too (they were silently dropped from the tally, hiding
+            // that a node failed and is blocking its dependents). Only shown when > 0.
+            let failed_suffix = if failed > 0 {
+                format!(" · failed {failed}")
+            } else {
+                String::new()
+            };
             dag.push(Line::from(Span::styled(
-                format!("running {running} · review {review} · done {done} · todo {todo}"),
+                format!("running {running} · review {review} · done {done} · todo {todo}{failed_suffix}"),
                 muted_style(focused),
             )));
             if app.awaiting_approval {

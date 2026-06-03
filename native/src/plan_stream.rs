@@ -192,44 +192,43 @@ impl PlanStreamState {
             "stream_event" => self.claude_stream_event(value.get("event")),
             "assistant" => {
                 let message = value.get("message");
+                // When deltas streamed, content_block_start already pushed both the text
+                // and each tool_use; re-reading the final assistant message would DOUBLE
+                // every tool entry (and the text). Only fall back to the assembled message
+                // when nothing streamed.
                 if !self.saw_streaming_text {
                     let text = text_from_assistant_message(message);
                     if !text.is_empty() {
                         self.push_text(&text);
                     }
+                    self.tools_from_assistant_message(message);
                 }
-                self.tools_from_assistant_message(message);
             }
             "result" => {
                 if value.get("subtype").and_then(Value::as_str) == Some("success") {
                     if let Some(result) = value.get("result").and_then(Value::as_str) {
-                        if !self.saw_streaming_text {
-                            self.push_text(result);
-                        } else {
-                            // The `result` event carries the AUTHORITATIVE final-message
-                            // text. Two things break a naive prefix-append: streaming
-                            // deltas can drop the tail (PTY ring-buffer truncation), AND a
-                            // single turn can hold SEVERAL assistant messages (research
-                            // narration, then the final plan), so the streamed turn is
-                            // `narration + partial-final` and is NOT a prefix of `result`
-                            // (the final message alone). Splice on the overlap: append the
-                            // part of `result` past the longest streamed-suffix == result-
-                            // prefix match. This is what lands the final plan +
-                            // RUDDER_PLAN_TASKS block when the planner used tools first.
-                            let start = self.parse_baseline.min(self.assistant_text.len());
-                            let turn = self.assistant_text[start..].to_string();
-                            if !turn.contains(result) {
-                                let overlap = longest_suffix_prefix(&turn, result);
-                                let tail = &result[overlap..];
-                                if !tail.is_empty() {
-                                    if !turn.is_empty()
-                                        && !turn.ends_with('\n')
-                                        && !tail.starts_with('\n')
-                                    {
-                                        self.push_text("\n");
-                                    }
-                                    self.push_text(tail);
+                        // The `result` event carries the AUTHORITATIVE final-message text.
+                        // It may ALREADY be present: the non-streaming "assistant" arm just
+                        // appended the same text (double-append bug), or streaming deltas
+                        // appended a partial of it (and a turn can hold several messages:
+                        // narration, then the final plan, so the streamed turn is NOT a
+                        // prefix of `result`). Unify both: splice the part of `result` past
+                        // the longest streamed-suffix == result-prefix overlap, appending
+                        // nothing when it is already contained. Lands the final plan +
+                        // RUDDER_PLAN_TASKS block exactly once.
+                        let start = self.parse_baseline.min(self.assistant_text.len());
+                        let turn = self.assistant_text[start..].to_string();
+                        if !turn.contains(result) {
+                            let overlap = longest_suffix_prefix(&turn, result);
+                            let tail = &result[overlap..];
+                            if !tail.is_empty() {
+                                if !turn.is_empty()
+                                    && !turn.ends_with('\n')
+                                    && !tail.starts_with('\n')
+                                {
+                                    self.push_text("\n");
                                 }
+                                self.push_text(tail);
                             }
                         }
                     }
@@ -316,26 +315,36 @@ impl PlanStreamState {
                 }
             }
             "reasoning" | "agent_reasoning" => {
-                if let Some(text) = item.get("text").and_then(Value::as_str) {
-                    self.push_thinking(text);
-                } else if let Some(text) = item.get("summary").and_then(Value::as_str) {
-                    self.push_thinking(text);
+                // Only on completion: codex dispatches item.started AND item.completed for
+                // the same item, so acting on both double-pushes the entry.
+                if completed {
+                    if let Some(text) = item.get("text").and_then(Value::as_str) {
+                        self.push_thinking(text);
+                    } else if let Some(text) = item.get("summary").and_then(Value::as_str) {
+                        self.push_thinking(text);
+                    }
                 }
             }
             "command_execution" | "local_shell_call" | "exec_command" => {
-                let cmd = item
-                    .get("command")
-                    .and_then(Value::as_str)
-                    .or_else(|| item.get("text").and_then(Value::as_str))
-                    .unwrap_or("");
-                self.push_tool("Bash", cmd);
+                if completed {
+                    let cmd = item
+                        .get("command")
+                        .and_then(Value::as_str)
+                        .or_else(|| item.get("text").and_then(Value::as_str))
+                        .unwrap_or("");
+                    self.push_tool("Bash", cmd);
+                }
             }
             "file_change" | "patch" | "apply_patch" => {
-                self.push(PlanEntryKind::Tool, "Editing files");
+                if completed {
+                    self.push(PlanEntryKind::Tool, "Editing files");
+                }
             }
             "mcp_tool_call" => {
-                let name = item.get("server").and_then(Value::as_str).unwrap_or("mcp");
-                self.push_tool(name, "");
+                if completed {
+                    let name = item.get("server").and_then(Value::as_str).unwrap_or("mcp");
+                    self.push_tool(name, "");
+                }
             }
             "error" => {
                 if let Some(text) = item.get("message").and_then(Value::as_str) {
