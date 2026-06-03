@@ -3648,6 +3648,12 @@ impl App {
     /// revised DAG to `evaluate_completed_rebase` (a build-forward diff/apply), and
     /// `maybe_auto_merge` is suppressed until the diff lands. Autonomous + logged.
     fn start_plan_rebase(&mut self, input: &str) {
+        // A refine/rebase is already in flight: relaunching the orchestrator now would kill
+        // the in-flight planner and race its capture (same guard refine_plan has).
+        if self.refining || self.rebasing {
+            self.notice = Some("still refining — the updated plan is on its way".to_string());
+            return;
+        }
         let Some(index) = self.agents.iter().position(|run| run.is_orchestrator()) else {
             // No orchestrator session to resume (e.g. a daemon-launched plan): a
             // structural change with no planner to re-decompose against falls back to
@@ -6228,12 +6234,19 @@ impl App {
             // forever with no explanation. When nothing launched this pass, detect those
             // and tell the user how to unblock. notice (not activity_log) so it does not
             // flood; idempotent if it persists across ticks.
-            let failed_ids: Vec<String> = self
-                .agents
-                .iter()
-                .filter(|run| run.status == AgentStatus::Failed)
-                .filter_map(|run| run.node_id.clone())
-                .collect();
+            // Only a genuine deadlock, not a cap wait: if the parallelism cap is saturated,
+            // nothing launched simply because every slot is busy — not because a dependency
+            // failed. Suppress the notice then to avoid a spurious "blocked by FAILED dep".
+            let cap_saturated = self.running_plan_agents() >= max_parallel();
+            let failed_ids: Vec<String> = if cap_saturated {
+                Vec::new()
+            } else {
+                self.agents
+                    .iter()
+                    .filter(|run| run.status == AgentStatus::Failed)
+                    .filter_map(|run| run.node_id.clone())
+                    .collect()
+            };
             if !failed_ids.is_empty() {
                 let blocked: Vec<&str> = self
                     .planned_nodes
