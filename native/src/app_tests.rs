@@ -8,6 +8,42 @@
     }
 
     #[test]
+    fn goal_line_capped_under_backend_limit() {
+        // The backend's /goal rejects a goal condition over 4000 chars ("got 4595"). A
+        // planner that emits a huge goal/success must still produce launchable lines.
+        let task = RudderPlanTask {
+            id: "n0".to_string(),
+            title: "t".to_string(),
+            prompt: "do the thing".to_string(),
+            goal: Some("G".repeat(4595)),
+            success: Some("S".repeat(5000)),
+            deps: vec![],
+            backend: None,
+            model: None,
+            effort: None,
+        };
+        let prompt = rudder_plan_worker_prompt("original request", &task, Backend::Claude);
+        let mut lines = prompt.lines();
+        let goal_line = lines.next().unwrap();
+        assert!(goal_line.starts_with("/goal "));
+        // The /goal argument must be <= 4000 chars (it was 4595).
+        let arg_len = goal_line.chars().count() - "/goal ".chars().count();
+        assert!(arg_len <= 4000, "/goal arg capped under 4000: was {arg_len}");
+        // The Done-when line is capped too.
+        let done_line = lines.next().unwrap();
+        assert!(done_line.starts_with("Done when: "));
+        let done_len = done_line.chars().count() - "Done when: ".chars().count();
+        assert!(done_len <= 4000, "done-when capped under 4000: was {done_len}");
+        // The full prompt body still carries the detail (nothing silently lost upstream).
+        assert!(prompt.contains("do the thing"));
+    }
+
+    #[test]
+    fn cap_goal_line_is_a_passthrough_when_short() {
+        assert_eq!(cap_goal_line("short objective".to_string()), "short objective");
+    }
+
+    #[test]
     fn worktree_dir_name_leads_with_task_slug() {
         let name = worktree_dir_name(
             "1779248379804-add-dark-and-light-mode-56991",

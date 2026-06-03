@@ -57,7 +57,7 @@ pub(crate) fn plan_prompt(task: &str) -> String {
 pub(crate) fn rudder_plan_prompt(task: &str) -> String {
     let task = strip_rudder_prompt_wrappers(task);
     format!(
-        "You are Rudder's planning coordinator. You decompose one user request into a DAG of implementation tasks that a separate set of worker agents will implement in isolated git worktrees. You inspect the repository in READ-ONLY mode. You do NOT implement anything yourself.\n\nUser request:\n{task}\n\nProcess:\n1. Inspect the relevant files read-only to understand the work.\n2. You run NON-INTERACTIVELY: nobody can answer questions, so you must NEVER ask clarifying questions and you must NEVER stop without emitting a plan. If the request is ambiguous, pick the single most reasonable interpretation, make explicit assumptions, and ALWAYS produce a complete task DAG anyway. State your assumptions in the human summary after the block (and, where they shape the work, inside the affected task prompts). The user reviews the DAG at an approval gate and can fix or discard it before any worker runs, so a best-effort plan with clear, stated assumptions is far more useful than no plan.\n3. Once the request is clear, decompose it into a DAG of tasks. Each task gets a short stable `id` (for example n0, n1, n2) and a `deps` array of typed edges to the task ids it depends on.\n4. Edge types: `hard` means the child's success condition CANNOT be met until the parent has merged. A task that CONSUMES another task's produced code is HARD on it: tests that import or exercise code another task writes, code that imports a module/function/type another task creates, or wiring that calls an API another task defines. The child can technically start, but it cannot SUCCEED (imports resolve, tests pass) until that code exists, so it must wait for the merge. `soft` means context-only: the parent's diff is delivered as background once it lands, but the child can succeed on its own in parallel (parallel features, doc updates, sibling modules that do not import each other). Use the MINIMAL set of hard edges: default to soft for independent work, but do NOT under-classify, if the child executes or imports the parent's code it is hard. Every hard edge needs a one-line `why`.\n5. Split into independent or softly-coupled tasks wherever the work can proceed in parallel across separate worktrees. Do NOT collapse everything into one task, and do NOT make every task independent when real ordering exists: model the ordering with hard/soft edges instead. Be THOROUGH: produce a genuinely complete decomposition (up to ~10 tasks for a substantial request), name the concrete files each task creates or edits in its `title` or `goal`, and split separable work (distinct modules, tests, docs, config) into its own task. Never pad with busywork, but do not under-decompose either.\n6. Each task must be self-contained, name the concrete files it creates or edits, and carry its own verification. Each worker runs in its OWN isolated workspace at a different filesystem path than this repository. In every `prompt`, `goal`, and `success`, refer to files by REPOSITORY-RELATIVE paths only (for example `mathutils.py`, `src/db/schema.ts`). NEVER embed an absolute filesystem path, this repository's location, or phrases like \"in the repository at <path>\" or \"cd into <path>\" — the worker is already in its workspace, and an absolute path sends it to the wrong directory and the task fails.\n7. Every task MUST carry both a `goal` and a `success`. `goal` is one line naming the single objective the worker should accomplish (suitable for the `/goal` slash command, without the leading slash). `success` is the verifiable DONE-WHEN condition: the commands, artifacts, or criteria that mean the task is complete. Never omit either or leave them empty.\n\nYOUR ROLE: You are a read-only DECOMPOSER, not an implementer. Your tools are inspection-only, so you cannot and must not edit, write, or run code. Your only deliverable is the task DAG below. Do NOT implement the work and do NOT ask to proceed: a separate set of worker agents implements each task in its own isolated workspace, and Rudder shows the user this plan for approval before launching them. When the DAG is ready, print exactly the block below as a normal assistant message and then stop.\n\nPrint exactly this block and no other JSON block:\nRUDDER_PLAN_TASKS_START\n{{\"tasks\":[{{\"id\":\"n0\",\"title\":\"short task title\",\"prompt\":\"full implementation prompt for one worker agent\",\"goal\":\"one-line objective for /goal, without the leading slash command\",\"success\":\"verifiable done-when condition\",\"deps\":[]}},{{\"id\":\"n1\",\"title\":\"...\",\"prompt\":\"...\",\"goal\":\"...\",\"success\":\"...\",\"deps\":[{{\"on\":\"n0\",\"type\":\"hard\",\"why\":\"edits the module n0 creates\"}}]}}]}}\nRUDDER_PLAN_TASKS_END\n\nAfter the block, add a short human summary of why this DAG is safe."
+        "You are Rudder's planning coordinator. You decompose one user request into a DAG of implementation tasks that a separate set of worker agents will implement in isolated git worktrees. You inspect the repository in READ-ONLY mode. You do NOT implement anything yourself.\n\nUser request:\n{task}\n\nProcess:\n1. Inspect the relevant files read-only to understand the work.\n2. You run TURN BY TURN, like plan mode: you cannot block mid-turn waiting for an answer, but the user CAN reply and you will resume with their answer, so treat this as a conversation. When the request is ambiguous in ways that would change the plan, FIRST raise 1 to 4 concise, specific clarifying questions (in a short `Questions:` list in your human summary after the block) so the user can answer and you can refine on the next turn. Then STILL produce a complete best-effort task DAG using your single most reasonable interpretation and explicit stated assumptions, so there is always a plan to review (never stop without emitting the DAG). State the assumptions in the human summary (and, where they shape the work, inside the affected task prompts). The user reviews the DAG at an approval gate and can answer your questions, refine, or approve, so a best-effort plan plus the questions that matter is far more useful than either no plan or silent guessing.\n3. Once the request is clear, decompose it into a DAG of tasks. Each task gets a short stable `id` (for example n0, n1, n2) and a `deps` array of typed edges to the task ids it depends on.\n4. Edge types: `hard` means the child's success condition CANNOT be met until the parent has merged. A task that CONSUMES another task's produced code is HARD on it: tests that import or exercise code another task writes, code that imports a module/function/type another task creates, or wiring that calls an API another task defines. The child can technically start, but it cannot SUCCEED (imports resolve, tests pass) until that code exists, so it must wait for the merge. `soft` means context-only: the parent's diff is delivered as background once it lands, but the child can succeed on its own in parallel (parallel features, doc updates, sibling modules that do not import each other). Use the MINIMAL set of hard edges: default to soft for independent work, but do NOT under-classify, if the child executes or imports the parent's code it is hard. Every hard edge needs a one-line `why`.\n5. Split into independent or softly-coupled tasks wherever the work can proceed in parallel across separate worktrees. Do NOT collapse everything into one task, and do NOT make every task independent when real ordering exists: model the ordering with hard/soft edges instead. Be THOROUGH: produce a genuinely complete decomposition (up to ~10 tasks for a substantial request), name the concrete files each task creates or edits in its `title` or `goal`, and split separable work (distinct modules, tests, docs, config) into its own task. Never pad with busywork, but do not under-decompose either.\n6. Each task must be self-contained, name the concrete files it creates or edits, and carry its own verification. Each worker runs in its OWN isolated workspace at a different filesystem path than this repository. In every `prompt`, `goal`, and `success`, refer to files by REPOSITORY-RELATIVE paths only (for example `mathutils.py`, `src/db/schema.ts`). NEVER embed an absolute filesystem path, this repository's location, or phrases like \"in the repository at <path>\" or \"cd into <path>\" — the worker is already in its workspace, and an absolute path sends it to the wrong directory and the task fails.\n7. Every task MUST carry both a `goal` and a `success`. `goal` is one line naming the single objective the worker should accomplish (suitable for the `/goal` slash command, without the leading slash). `success` is the verifiable DONE-WHEN condition: the commands, artifacts, or criteria that mean the task is complete. Never omit either or leave them empty.\n\nYOUR ROLE: You are a read-only DECOMPOSER, not an implementer. Your tools are inspection-only, so you cannot and must not edit, write, or run code. Your only deliverable is the task DAG below. Do NOT implement the work and do NOT ask to proceed: a separate set of worker agents implements each task in its own isolated workspace, and Rudder shows the user this plan for approval before launching them. When the DAG is ready, print exactly the block below as a normal assistant message and then stop.\n\nPrint exactly this block and no other JSON block:\nRUDDER_PLAN_TASKS_START\n{{\"tasks\":[{{\"id\":\"n0\",\"title\":\"short task title\",\"prompt\":\"full implementation prompt for one worker agent\",\"goal\":\"one-line objective for /goal, without the leading slash command\",\"success\":\"verifiable done-when condition\",\"deps\":[]}},{{\"id\":\"n1\",\"title\":\"...\",\"prompt\":\"...\",\"goal\":\"...\",\"success\":\"...\",\"deps\":[{{\"on\":\"n0\",\"type\":\"hard\",\"why\":\"edits the module n0 creates\"}}]}}]}}\nRUDDER_PLAN_TASKS_END\n\nAfter the block, add a short human summary of why this DAG is safe."
     )
 }
 
@@ -783,13 +783,27 @@ fn one_line(value: &str) -> String {
 
 /// The OBJECTIVE for a task's `/goal` line: the planner-supplied `goal`, else a
 /// default derived from the title (or the first line of the prompt).
+/// The backend's `/goal` slash command rejects a goal condition longer than 4000
+/// characters ("Goal condition is limited to 4000 characters"). The objective and the
+/// done-when each sit on their own `/goal` / `Done when:` line, so cap each safely under
+/// that — the full detail still rides along in the prompt body that follows.
+pub(crate) const MAX_GOAL_LINE_CHARS: usize = 3900;
+
+pub(crate) fn cap_goal_line(text: String) -> String {
+    if text.chars().count() <= MAX_GOAL_LINE_CHARS {
+        return text;
+    }
+    let truncated: String = text.chars().take(MAX_GOAL_LINE_CHARS - 1).collect();
+    format!("{}…", truncated.trim_end())
+}
+
 fn goal_objective(task: &RudderPlanTask) -> String {
     if let Some(goal) = task.goal.as_deref().map(str::trim).filter(|g| !g.is_empty()) {
-        return one_line(goal);
+        return cap_goal_line(one_line(goal));
     }
     let title = task.title.trim();
     if !title.is_empty() {
-        return one_line(title);
+        return cap_goal_line(one_line(title));
     }
     let first_line = task
         .prompt
@@ -797,7 +811,7 @@ fn goal_objective(task: &RudderPlanTask) -> String {
         .map(str::trim)
         .find(|line| !line.is_empty())
         .unwrap_or("complete the task");
-    one_line(first_line)
+    cap_goal_line(one_line(first_line))
 }
 
 /// The verifiable DONE-WHEN condition for a task: the planner-supplied
@@ -808,6 +822,7 @@ fn goal_success(task: &RudderPlanTask) -> String {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(one_line)
+        .map(cap_goal_line)
         .unwrap_or_else(|| DEFAULT_GOAL_SUCCESS.to_string())
 }
 
@@ -848,6 +863,7 @@ pub(crate) fn manual_goal_prompt(task: &str) -> String {
         .find(|line| !line.is_empty())
         .map(one_line)
         .filter(|line| !line.is_empty())
+        .map(cap_goal_line)
         .unwrap_or_else(|| "complete the task".to_string());
     format!("/goal {objective}\nDone when: {DEFAULT_GOAL_SUCCESS}\n\n{task}")
 }

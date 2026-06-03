@@ -1630,8 +1630,19 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
 
     let phase = orchestrator_phase(agent);
     let phase_label = match &phase {
-        OrchestratorPhase::Planning => "planning".to_string(),
+        OrchestratorPhase::Planning => "plan mode".to_string(),
         OrchestratorPhase::PlanReady(tasks) => format!("plan · {} tasks", tasks.len()),
+    };
+    // The model + version doing the planning, shown on the header so it is always clear
+    // which agent/version is in plan mode (e.g. "Claude Code · opus[1m]").
+    let backend_label = match agent.backend {
+        Backend::Claude => "Claude Code",
+        Backend::Codex => "Codex",
+    };
+    let model_label = if agent.model.trim().is_empty() {
+        backend_label.to_string()
+    } else {
+        format!("{backend_label} · {}", agent.model.trim())
     };
 
     // Draw the pane border first; content is laid out inside it. Splitting the
@@ -1641,7 +1652,7 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // Header: ◆ ORCHESTRATOR · phase [· auto-merge].
+    // Header: ◆ ORCHESTRATOR · phase · <backend · model> [· auto-merge].
     let mut header_spans = vec![
         Span::styled(
             format!("{ORCH_MARK} ORCHESTRATOR"),
@@ -1649,6 +1660,8 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
         ),
         Span::styled("  ·  ", muted_style(focused)),
         Span::styled(phase_label, muted_style(focused)),
+        Span::styled("  ·  ", muted_style(focused)),
+        Span::styled(model_label, Style::default().fg(ACCENT)),
     ];
     if app.auto_merge {
         header_spans.push(Span::styled("  ·  ", muted_style(focused)));
