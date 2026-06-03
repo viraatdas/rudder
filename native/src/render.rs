@@ -913,7 +913,7 @@ fn push_orchestrator_row<'a>(
         BADGE
     };
     let (role, phase) = if is_front_end {
-        ("plan mode", "Ctrl+W a → build the DAG".to_string())
+        ("plan mode", "discuss · builds the DAG when ready".to_string())
     } else {
         ("orchestrator", orchestrator_phase_label(app, agent))
     };

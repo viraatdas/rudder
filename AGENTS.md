@@ -733,11 +733,19 @@ ref), and every JUDGE parent is `review`|`merged`. SOFT parents never gate.
    converses/refines (keys forward; or type in the task pane, which `start_task_from_input`
    forwards to the front-end PTY). The `plan_frontend_prompt` tells it to research
    read-only, NOT implement, and restate its final plan wrapped in `<plan>…</plan>`.
-2. **Approve (`Ctrl+W a`).** `approve_frontend_plan` scrapes the proposed plan from the
-   session (`capture_frontend_plan_text`: last `<plan>` block, transcript fallback),
-   STOPS the session (it must never implement — the no-forward-approve invariant), and
-   hands the plan to phase 2. A live front-end is `frontend_run_id`; `plan_is_active()`
-   is true while it exists.
+2. **Seize on finalize (automatic).** Rudder mints the session id, so it knows where
+   Claude streams its JSONL transcript (`~/.claude/projects/<enc-cwd>/<sid>.jsonl`). The
+   poll loop tails it; the instant the model calls **`ExitPlanMode`** (its "planning done,
+   proceed" signal) `parse_finalized_plan_from_transcript` returns that plan and
+   `finalize_frontend_plan` STOPS the session — so Claude's ExitPlanMode menu can never
+   hand control to a single in-process agent (the brittle handoff that skipped the DAG
+   entirely) — and hands the plan to phase 3. `<plan>` blocks are NOT the trigger: the
+   front-end prompt has the model restate one after every refinement, so only ExitPlanMode
+   means "final". Manual override: **`Ctrl+W a`** (`approve_frontend_plan`) captures the
+   latest `<plan>` block from the PTY (`capture_frontend_plan_text`) and finalizes early.
+   A live front-end is `frontend_run_id`; `plan_is_active()` is true while it exists.
+   (Codex still uses the manual `Ctrl+W a` path until its finalize signal is wired
+   symmetrically.)
 3. **Decompose.** `start_decompose_from_plan_task` → `start_rudder_plan_task` with
    `build_decompose_from_plan(plan)` (the read-only decomposer: `claude -p
    --output-format stream-json` / `codex exec --json`). The orchestrator pane streams the

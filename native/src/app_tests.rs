@@ -4265,6 +4265,44 @@ branch refs/heads/main\n";
     }
 
     #[test]
+    fn parse_finalized_plan_seizes_on_exitplanmode_only() {
+        // A <plan> restatement during discussion must NOT count as finalized — the model
+        // emits one after every refinement, so seizing on it would cut the chat short.
+        let only_block = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"plan so far:\n<plan>\ndraft\n</plan>"}]}}"#;
+        assert_eq!(parse_finalized_plan_from_transcript(only_block), None);
+
+        // ExitPlanMode is the finalize signal; its `plan` argument is what we seize.
+        let exit = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"ExitPlanMode","input":{"plan":"Final: auth then ui"}}]}}"#;
+        assert_eq!(
+            parse_finalized_plan_from_transcript(exit).as_deref(),
+            Some("Final: auth then ui")
+        );
+
+        // The LAST ExitPlanMode wins; non-JSON / empty lines are ignored.
+        let two = format!(
+            "not json\n{}\n\n{}",
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"ExitPlanMode","input":{"plan":"old"}}]}}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"ExitPlanMode","input":{"plan":"new"}}]}}"#
+        );
+        assert_eq!(parse_finalized_plan_from_transcript(&two).as_deref(), Some("new"));
+        assert_eq!(parse_finalized_plan_from_transcript(""), None);
+    }
+
+    #[test]
+    fn encode_claude_project_dir_matches_claude_layout() {
+        use std::path::Path;
+        assert_eq!(
+            encode_claude_project_dir(Path::new("/Users/v/my-charts")),
+            "-Users-v-my-charts"
+        );
+        // Slashes AND dots both collapse to dashes (the /.rudder-worktrees case).
+        assert_eq!(
+            encode_claude_project_dir(Path::new("/Users/v/Documents/.rudder-worktrees/x")),
+            "-Users-v-Documents--rudder-worktrees-x"
+        );
+    }
+
+    #[test]
     fn approve_frontend_plan_no_op_without_a_session() {
         let mut app = App::new();
         app.cwd = std::env::temp_dir();

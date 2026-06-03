@@ -2865,8 +2865,9 @@ impl App {
                 if let Some(term) = run.terminal.as_mut() {
                     let _ = term.write_input(format!("{input}\r").as_bytes());
                     run.last_worker_input_at = Some(Instant::now());
-                    self.notice =
-                        Some("sent to plan mode · Ctrl+W a to approve & build the DAG".to_string());
+                    self.notice = Some(
+                        "sent to plan mode · the DAG builds when the plan's finalized (Ctrl+W a forces it)".to_string(),
+                    );
                     self.dirty = true;
                     return;
                 }
@@ -3503,7 +3504,7 @@ impl App {
                 }
                 run.terminal = Some(terminal);
                 self.notice = Some(
-                    "plan mode: discuss the plan in the pane, then Ctrl+W a to approve & build the DAG"
+                    "plan mode: discuss in the pane; the DAG builds automatically when the model finalizes the plan (Ctrl+W a forces it now)"
                         .to_string(),
                 );
             }
@@ -3561,11 +3562,27 @@ impl App {
             );
             return;
         }
-        // Stop the front-end (drops its PTY; it never implements) and clear the pointer.
-        self.stop_agent_at(index);
+        self.finalize_frontend_plan(plan_text, "plan approved; decomposing into a task DAG");
+    }
+
+    /// Seize the captured plan and hand it to the decomposer: stop the front-end session
+    /// (drops its PTY so it can NEVER implement), record the plan, and launch the
+    /// decomposer over it. Shared by the manual approve (`Ctrl+W a`) and the automatic
+    /// seize that fires the instant the model calls ExitPlanMode (see `poll_agents`).
+    /// Looks the run up by `frontend_run_id` so a shifted index can't desync it.
+    fn finalize_frontend_plan(&mut self, plan_text: String, activity: &str) {
+        if plan_text.trim().is_empty() {
+            return;
+        }
+        let Some(fid) = self.frontend_run_id.clone() else {
+            return;
+        };
+        if let Some(index) = self.agents.iter().position(|run| run.id == fid) {
+            self.stop_agent_at(index);
+        }
         self.frontend_run_id = None;
         self.captured_plan_text = Some(plan_text.clone());
-        self.push_activity("plan approved; decomposing into a task DAG");
+        self.push_activity(activity);
         self.start_decompose_from_plan_task(&plan_text);
     }
 
@@ -7308,8 +7325,13 @@ What to do\n\
         let focused_index = self.selected_agent;
         let now = Instant::now();
         let repo_root = self.cwd.clone();
+        let frontend_id = self.frontend_run_id.clone();
         let mut any_dirty = false;
         let mut completed_rudder_plans = Vec::new();
+        // Auto-seize: the captured plan when the live plan-mode front-end finalizes (the
+        // model calls ExitPlanMode). Collected in the loop, applied after it (finalize
+        // needs &mut self). See parse_finalized_plan_from_transcript.
+        let mut seized_frontend_plan: Option<String> = None;
         for (index, run) in self.agents.iter_mut().enumerate() {
             let mut changed = false;
             let Some(terminal) = run.terminal.as_mut() else {
@@ -7352,6 +7374,30 @@ What to do\n\
             let had_output = !terminal.drain_output().is_empty();
             if had_output {
                 any_dirty = true;
+            }
+            // AUTO-SEIZE the plan the moment the interactive plan-mode front-end finalizes.
+            // When the model calls ExitPlanMode (its "planning is done, proceed" signal),
+            // Claude's native menu would hand control to THIS one agent to implement
+            // in-process — skipping Rudder's decompose -> DAG -> fleet entirely (the bug the
+            // my-charts session hit). Instead, read the plan straight from Claude's session
+            // transcript (we mint the session id) and hand it to the decomposer; the run is
+            // stopped in finalize_frontend_plan before it can implement. `<plan>` blocks are
+            // ignored here on purpose: the model restates one after every refinement, so
+            // only ExitPlanMode means "done". Gated on had_output to avoid re-reading idly.
+            if had_output
+                && run.mode == AgentMode::PlanFront
+                && run.backend == Backend::Claude
+                && Some(run.id.as_str()) == frontend_id.as_deref()
+                && seized_frontend_plan.is_none()
+            {
+                if let Some(plan) = run
+                    .session_id
+                    .as_deref()
+                    .and_then(|sid| claude_transcript_path(&repo_root, sid))
+                    .and_then(|path| finalized_plan_from_claude_transcript(&path))
+                {
+                    seized_frontend_plan = Some(plan);
+                }
             }
             // Feed the orchestrator's JSON event stream into its live transcript +
             // reconstructed plan text, and capture the backend session id so a refine
@@ -7531,6 +7577,13 @@ What to do\n\
             } else {
                 self.evaluate_completed_plan(index);
             }
+        }
+
+        // The plan-mode front-end finalized (ExitPlanMode): seize the plan and decompose
+        // it. Done after the loop because finalize_frontend_plan needs &mut self.
+        if let Some(plan) = seized_frontend_plan {
+            self.finalize_frontend_plan(plan, "plan finalized; decomposing into a task DAG");
+            self.dirty = true;
         }
 
         // STREAMING DETECTION: a plan-mode planner may print the RUDDER_PLAN_TASKS
@@ -7958,6 +8011,89 @@ fn capture_frontend_plan_text(output: &str) -> String {
         .collect();
     let start = lines.len().saturating_sub(60);
     lines[start..].join("\n")
+}
+
+/// Encode a working directory the way Claude Code names its session-transcript folder
+/// under `~/.claude/projects/`: every non-alphanumeric character becomes `-`
+/// (`/Users/v/my-charts` -> `-Users-v-my-charts`).
+fn encode_claude_project_dir(cwd: &Path) -> String {
+    cwd.to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
+/// Path to the live Claude session transcript for `session_id` run in `cwd`. Rudder mints
+/// the session id (passed via `--session-id`), so we always know where Claude streams the
+/// JSONL. Falls back to a scan-by-id when the directory encoding does not match (Claude
+/// may normalize paths differently across versions).
+fn claude_transcript_path(cwd: &Path, session_id: &str) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    let projects = home.join(".claude").join("projects");
+    let direct = projects
+        .join(encode_claude_project_dir(cwd))
+        .join(format!("{session_id}.jsonl"));
+    if direct.is_file() {
+        return Some(direct);
+    }
+    let entries = std::fs::read_dir(&projects).ok()?;
+    for entry in entries.flatten() {
+        let candidate = entry.path().join(format!("{session_id}.jsonl"));
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// The FINALIZED plan from a Claude plan-mode transcript, or None if the model has not
+/// finalized yet. The finalize signal is an `ExitPlanMode` tool call (the model saying
+/// "planning is done, proceed") — NOT a `<plan>` block, which the front-end prompt has
+/// the model restate after every refinement (so seizing on that would cut the discussion
+/// short). Returns the `plan` argument of the LAST ExitPlanMode call. This is what lets
+/// Rudder seize the plan and decompose it instead of letting Claude's ExitPlanMode menu
+/// hand control to a single in-process agent.
+fn parse_finalized_plan_from_transcript(text: &str) -> Option<String> {
+    let mut plan: Option<String> = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(blocks) = value
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_array())
+        else {
+            continue;
+        };
+        for block in blocks {
+            if block.get("type").and_then(|t| t.as_str()) != Some("tool_use") {
+                continue;
+            }
+            if block.get("name").and_then(|n| n.as_str()) != Some("ExitPlanMode") {
+                continue;
+            }
+            if let Some(text) = block
+                .get("input")
+                .and_then(|i| i.get("plan"))
+                .and_then(|p| p.as_str())
+            {
+                if !text.trim().is_empty() {
+                    plan = Some(text.trim().to_string());
+                }
+            }
+        }
+    }
+    plan
+}
+
+fn finalized_plan_from_claude_transcript(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    parse_finalized_plan_from_transcript(&text)
 }
 
 fn parse_worker_done_block(output: &str) -> Option<serde_json::Value> {
