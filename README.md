@@ -168,16 +168,19 @@ reused next time. Rudder refreshes model metadata from
 
 ## Planning (the default)
 
-Just type a task. The orchestrator decomposes it into a DAG of worker tasks and
-shows it for approval. While the plan awaits approval you can **discuss and refine
-it**: type changes into the task pane and the orchestrator re-plans and updates the
-DAG tree. The pane also shows the planner's assumptions/notes. Press `Enter` with an
-empty input to approve and launch; the scheduler then drains the DAG (todo →
-in-progress → review → done) as dependencies merge. After launch, typing a new task
-folds it into the running DAG as a new node. When a worker finishes, Rudder reads back
-what it did and what work it found remaining (and reconstructs that from the diff if the
-agent did not say), so the plan keeps growing on its own. Type a sweeping change
-(\"rewrite this in Rust instead\") and the plan re-plans around the work already done.
+Just type a task. Rudder opens the model's **interactive plan mode** right in the pane
+(Claude's plan mode or Codex's `/plan`): the model researches your repo read-only and
+proposes a plan you discuss and refine in-pane, exactly like using the agent's own plan
+mode. It will not implement anything. When you are happy with the plan, press **`Ctrl+W`
+then `a`** to approve: Rudder captures the plan, decomposes it into a DAG of worker tasks,
+and shows you that DAG for one more approval. Press `Enter` to launch; the scheduler then
+drains the DAG (todo → in-progress → review → done) as dependencies merge.
+
+After launch, typing a new task folds it into the running DAG as a new node. When a
+worker finishes, Rudder reads back what it did and what work it found remaining (and
+reconstructs that from the diff if the agent did not say), so the plan keeps growing on
+its own. Type a sweeping change (\"rewrite this in Rust instead\") and the plan re-plans
+around the work already done.
 
 ## Worktrees and merging
 

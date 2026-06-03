@@ -244,6 +244,12 @@ impl MergeStrategy {
 enum AgentMode {
     Execute,
     Plan,
+    /// The interactive plan-mode FRONT-END (Path B): a real `claude --permission-mode
+    /// plan` / `codex /plan` session the user converses with in-pane. On approval Rudder
+    /// captures the proposed plan and hands it to the RudderPlan decomposer (it never
+    /// implements). Distinct from `Plan` (the old standalone `/plan`) so its launch
+    /// prompt + Codex `/plan` driving are controlled separately.
+    PlanFront,
     RudderPlan,
     ReviewAll,
     Main,
@@ -259,6 +265,7 @@ impl AgentMode {
         match self {
             Self::Execute => "execute",
             Self::Plan => "plan",
+            Self::PlanFront => "plan-front",
             Self::RudderPlan => "rudder-plan",
             Self::ReviewAll => "review-all",
             Self::Main => "main",
@@ -269,6 +276,7 @@ impl AgentMode {
         match value {
             "execute" | "run" | "task" => Some(Self::Execute),
             "plan" | "planning" => Some(Self::Plan),
+            "plan-front" | "plan_front" | "planfront" => Some(Self::PlanFront),
             "rudder-plan" | "rudder_plan" | "orchestrate" => Some(Self::RudderPlan),
             "review-all" | "review_all" | "reviewall" => Some(Self::ReviewAll),
             "main" => Some(Self::Main),
@@ -338,6 +346,14 @@ struct App {
     /// the orchestrator is selected. Set on streaming plan detection; cleared once
     /// the user approves (or discards the plan).
     awaiting_approval: bool,
+    /// Path B (interactive plan-mode front-end). When `Some`, an `AgentMode::PlanFront`
+    /// session is live: the user is conversing with the model's native plan mode in-pane.
+    /// On approval (the leader `a` action) Rudder captures the proposed plan, stops this
+    /// run, and launches the decomposer over the captured text. `None` = no front-end.
+    frontend_run_id: Option<String>,
+    /// The approved plan prose captured from the front-end, handed to the decomposer.
+    /// Set at capture, consumed by `start_decompose_from_plan_task`.
+    captured_plan_text: Option<String>,
     /// Tick counter used to run the scheduler on a coarse cadence rather than on
     /// every PTY-byte tick.
     scheduler_tick: u64,
@@ -736,6 +752,8 @@ impl App {
             auto_merge: false,
             auto_merge_skip: Vec::new(),
             awaiting_approval: false,
+            frontend_run_id: None,
+            captured_plan_text: None,
             scheduler_tick: 0,
             spinner_frame: 0,
             selected_agent: 0,
@@ -1135,6 +1153,8 @@ impl App {
                 self.focus = FocusPane::Task;
             }
             KeyCode::Char('v') | KeyCode::Char('\u{221a}') => self.toggle_worker_view(),
+            // Approve the interactive plan-mode front-end: capture the plan + decompose.
+            KeyCode::Char('a') => self.approve_frontend_plan(),
             KeyCode::Char('r') => self.start_rename_selected_agent(),
             KeyCode::Up | KeyCode::Char('k') => self.select_previous_agent(),
             KeyCode::Down | KeyCode::Char('j') => self.select_next_agent(),
@@ -2826,6 +2846,25 @@ impl App {
         }
         self.notice = None;
 
+        // PLAN-MODE FRONT-END live: a typed task-pane message is a message TO that
+        // interactive session (the user can converse from here or by focusing the worker
+        // pane), not a new plan. Forward it to the front-end PTY. Approval is the leader
+        // `a` action, not Enter here.
+        if let Some(fid) = self.frontend_run_id.clone() {
+            if let Some(run) = self.agents.iter_mut().find(|r| r.id == fid) {
+                if let Some(term) = run.terminal.as_mut() {
+                    let _ = term.write_input(format!("{input}\r").as_bytes());
+                    run.last_worker_input_at = Some(Instant::now());
+                    self.notice =
+                        Some("sent to plan mode · Ctrl+W a to approve & build the DAG".to_string());
+                    self.dirty = true;
+                    return;
+                }
+            }
+            // The front-end run vanished; clear the stale pointer and fall through.
+            self.frontend_run_id = None;
+        }
+
         // REFINE (plan-mode-style discussion): while a plan is parsed but not yet
         // approved, a typed message is feedback to the orchestrator, not a new node.
         // Re-run the planner with the current DAG + the feedback so it REVISES the
@@ -2860,10 +2899,10 @@ impl App {
             return;
         }
 
-        // Default first task (no active plan): run the adaptive planner. It
-        // inspects the repo read-only and emits a task DAG; the poll loop then
-        // gates the plan for the user to approve (Enter) or discard.
-        self.start_rudder_plan_task(&input);
+        // Default first task (no active plan): open the INTERACTIVE plan-mode front-end
+        // (Path B). The user discusses the plan with the model in-pane and approves with
+        // `Ctrl+W a`, which captures the plan and hands it to the decomposer.
+        self.start_plan_frontend_task(&input);
     }
 
     /// True when a plan is currently active: nodes are queued/awaiting approval,
@@ -2871,6 +2910,11 @@ impl App {
     /// carrying a `node_id`) has not yet merged. While this holds, a newly typed
     /// task is RECONCILED into the existing plan instead of starting a fresh one.
     pub(crate) fn plan_is_active(&self) -> bool {
+        // An interactive plan-mode front-end is an active plan: a second typed goal must
+        // not spawn a duplicate front-end or fall through to the decomposer.
+        if self.frontend_run_id.is_some() {
+            return true;
+        }
         if !self.planned_nodes.is_empty() || self.has_planning_orchestrator() {
             return true;
         }
@@ -3346,6 +3390,177 @@ impl App {
         if let Some(run) = self.agents.get(self.selected_agent) {
             let _ = save_native_run_record(&self.cwd, run);
         }
+    }
+
+    /// Path B: launch the INTERACTIVE plan-mode FRONT-END for a typed goal. The model
+    /// researches read-only and proposes a plan the user refines IN-PANE (raw PTY);
+    /// `Ctrl+W a` then approves it (capture + hand to the decomposer). Claude uses native
+    /// `--permission-mode plan`; Codex is launched idle and driven with `/plan <goal>`. It
+    /// never implements: on approval Rudder captures the plan and stops this session.
+    fn start_plan_frontend_task(&mut self, input: &str) {
+        let model = self.model.clone();
+        let backend = self.backend;
+        let effort = self.effort;
+        let session_id = mint_session_id_for(backend);
+        // Remember the original ask so the phase-2 decomposer has an origin.
+        self.plan_request = input.to_string();
+        let command = agent_command(
+            backend,
+            &model,
+            effort,
+            input,
+            AgentMode::PlanFront,
+            session_id.as_deref(),
+        );
+        // Codex launches idle (no prompt arg, see agent_command); drive it into plan mode
+        // and send the goal in one `/plan <prompt>` slash command. Claude carries its
+        // prompt + `--permission-mode plan` directly, so nothing to deliver.
+        let deliver_after = match backend {
+            Backend::Codex => Some(format!("/plan {}", plan_frontend_prompt(input))),
+            Backend::Claude => None,
+        };
+        let options = TerminalPaneOptions {
+            size: TerminalSize::default(),
+            cwd: Some(self.cwd.clone()),
+            ..TerminalPaneOptions::default()
+        };
+        let created_at = now_stamp();
+        let mut run = AgentRun {
+            id: new_run_id(input),
+            created_at: created_at.clone(),
+            mode: AgentMode::PlanFront,
+            task: input.to_string(),
+            task_summary: format!("plan {}", summarize_task(input)),
+            current_prompt: input.to_string(),
+            turns: vec![AgentTurn {
+                ts: created_at.clone(),
+                prompt: input.to_string(),
+                source: "user".to_string(),
+            }],
+            last_user_input_at: created_at,
+            backend,
+            model,
+            effort,
+            status: AgentStatus::Running,
+            cwd: self.cwd.clone(),
+            worktree_branch: None,
+            worktree_path: None,
+            workspace_name: None,
+            jj_change_id: None,
+            session_id,
+            terminal: None,
+            terminal_size: None,
+            review_terminal: None,
+            review_size: None,
+            review_error: None,
+            last_output_at: Instant::now(),
+            completed_at: None,
+            autosteered: false,
+            needs_permission: false,
+            permission_notified: false,
+            needs_user_input: false,
+            user_input_notified: false,
+            last_error: None,
+            worker_input_draft: String::new(),
+            worker_input_cursor: 0,
+            worker_input_is_prompt: false,
+            last_drain_at: None,
+            review_source_ids: Vec::new(),
+            deps: Vec::new(),
+            soft_deps: Vec::new(),
+            node_id: None,
+            reconcile_planner: false,
+            plan_stream: None,
+            last_worker_input_at: None,
+            ready_since: None,
+            merge_resolver: false,
+        };
+        let run_id = run.id.clone();
+        // Track the front-end regardless of spawn outcome: the row is pushed either way,
+        // and the task-pane forward branch self-heals (clears the pointer) if the run has
+        // no terminal, so a failed spawn never wedges the session.
+        self.frontend_run_id = Some(run_id.clone());
+        self.captured_plan_text = None;
+        match TerminalPane::spawn_shell_or_command(Some(command), options) {
+            Ok(mut terminal) => {
+                let _ = terminal.drain_output();
+                if let Some(text) = &deliver_after {
+                    let _ = terminal.write_input(format!("{text}\r").as_bytes());
+                }
+                run.terminal = Some(terminal);
+                self.notice = Some(
+                    "plan mode: discuss the plan in the pane, then Ctrl+W a to approve & build the DAG"
+                        .to_string(),
+                );
+            }
+            Err(error) => {
+                run.status = AgentStatus::Failed;
+                run.last_error = Some(error.to_string());
+                self.notice = Some(format!(
+                    "failed to start {} plan mode: {error}",
+                    backend.as_str()
+                ));
+            }
+        }
+        self.agents.push(run);
+        self.selected_agent = self.agents.len().saturating_sub(1);
+        self.delete_pending = None;
+        self.focus = FocusPane::Worker;
+        if let Some(run) = self.agents.get(self.selected_agent) {
+            let _ = save_native_run_record(&self.cwd, run);
+        }
+    }
+
+    /// Approve the live plan-mode front-end (Path B, the `Ctrl+W a` action): capture the
+    /// proposed plan from the session's scrollback, STOP the session (never let it
+    /// implement), and hand the plan to the decomposer. A no-op with a hint if there is no
+    /// front-end or no plan has been proposed yet.
+    fn approve_frontend_plan(&mut self) {
+        let Some(fid) = self.frontend_run_id.clone() else {
+            self.notice = Some("no plan-mode session to approve".to_string());
+            return;
+        };
+        let Some(index) = self.agents.iter().position(|run| run.id == fid) else {
+            self.frontend_run_id = None;
+            return;
+        };
+        // Capture the proposed plan BEFORE stopping the session. Drain the tail first so a
+        // just-printed <plan> block is in the snapshot.
+        let plan_text = {
+            let run = &mut self.agents[index];
+            if let Some(terminal) = run.terminal.as_mut() {
+                for _ in 0..16 {
+                    if terminal.drain_output().is_empty() {
+                        break;
+                    }
+                }
+            }
+            run.terminal
+                .as_ref()
+                .map(|t| capture_frontend_plan_text(t.output_log_snapshot()))
+                .unwrap_or_default()
+        };
+        if plan_text.trim().is_empty() {
+            self.notice = Some(
+                "no plan captured yet; ask the model to restate its plan, then Ctrl+W a again"
+                    .to_string(),
+            );
+            return;
+        }
+        // Stop the front-end (drops its PTY; it never implements) and clear the pointer.
+        self.stop_agent_at(index);
+        self.frontend_run_id = None;
+        self.captured_plan_text = Some(plan_text.clone());
+        self.push_activity("plan approved; decomposing into a task DAG");
+        self.start_decompose_from_plan_task(&plan_text);
+    }
+
+    /// Phase 2 of Path B: launch the decomposer over the captured, approved plan. Reuses
+    /// `start_rudder_plan_task` (which wraps the directive with the full decomposer
+    /// contract), so the resulting DAG flows through the existing approval gate + conductor.
+    fn start_decompose_from_plan_task(&mut self, plan_text: &str) {
+        self.frontend_run_id = None;
+        self.start_rudder_plan_task(&build_decompose_from_plan(plan_text));
     }
 
     fn start_rudder_plan_task(&mut self, input: &str) {
@@ -7712,6 +7927,33 @@ fn load_ingested_runs(cwd: &Path) -> HashSet<String> {
         .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
         .map(|ids| ids.into_iter().collect())
         .unwrap_or_default()
+}
+
+/// Extract the proposed plan from an interactive plan-mode session's scrollback. The
+/// front-end prompt asks the model to wrap its plan in `<plan>...</plan>`, so prefer the
+/// LAST such block (the most recent restatement). Falls back to the tail of the
+/// transcript when no marker is present (older output / the model ignored the marker).
+fn capture_frontend_plan_text(output: &str) -> String {
+    let clean = strip_ansi_for_plan(output).replace('\r', "");
+    if let Some(start) = clean.rfind("<plan>") {
+        let after = &clean[start + "<plan>".len()..];
+        let body = match after.find("</plan>") {
+            Some(end) => &after[..end],
+            None => after, // open marker, still streaming: take what's there
+        };
+        let body = body.trim();
+        if !body.is_empty() {
+            return body.to_string();
+        }
+    }
+    // Fallback: the last 60 non-empty transcript lines.
+    let lines: Vec<&str> = clean
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let start = lines.len().saturating_sub(60);
+    lines[start..].join("\n")
 }
 
 fn parse_worker_done_block(output: &str) -> Option<serde_json::Value> {

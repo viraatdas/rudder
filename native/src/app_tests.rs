@@ -4164,7 +4164,7 @@ branch refs/heads/main\n";
     }
 
     #[test]
-    fn no_plan_active_first_task_uses_initial_planner_not_reconcile() {
+    fn no_plan_active_first_task_opens_interactive_plan_front_end() {
         let mut app = App::new();
         app.cwd = std::env::temp_dir();
         // No nodes queued, no orchestrator, no live plan-launched agent.
@@ -4172,12 +4172,71 @@ branch refs/heads/main\n";
 
         app.start_task_from_input("build the first feature");
 
-        let spawned = app.agents.last().expect("a spawned planner");
-        assert_eq!(spawned.mode, AgentMode::RudderPlan);
-        assert!(
-            !spawned.reconcile_planner,
-            "the first task with no active plan uses the INITIAL planner (replace path)"
+        // Path B: a typed goal with no active plan opens the INTERACTIVE plan-mode
+        // front-end (PlanFront), not the decomposer directly. The decomposer (RudderPlan)
+        // runs only AFTER the user approves the plan (capture -> decompose).
+        let spawned = app.agents.last().expect("a spawned plan-mode session");
+        assert_eq!(spawned.mode, AgentMode::PlanFront);
+        assert!(!spawned.reconcile_planner);
+        assert_eq!(
+            app.frontend_run_id.as_deref(),
+            Some(spawned.id.as_str()),
+            "the front-end run is tracked"
         );
+        assert!(app.plan_is_active(), "a live front-end counts as an active plan");
+    }
+
+    #[test]
+    fn capture_frontend_plan_text_extracts_last_plan_block() {
+        // ANSI-laden scrollback; the <plan> block is extracted clean.
+        let out = "noise\n\u{1b}[1m<plan>\u{1b}[0m\nStep 1: do X\nStep 2: do Y\n</plan>\ntrailing";
+        assert_eq!(capture_frontend_plan_text(out), "Step 1: do X\nStep 2: do Y");
+        // The LAST block wins (the most recent restatement after refinement).
+        let two = "<plan>\nold plan\n</plan>\nlet's refine\n<plan>\nnew plan\n</plan>\n";
+        assert_eq!(capture_frontend_plan_text(two), "new plan");
+        // No marker -> fall back to the transcript tail.
+        assert!(capture_frontend_plan_text("alpha\nbeta\ngamma").contains("gamma"));
+    }
+
+    #[test]
+    fn plan_front_end_and_decompose_prompts_are_well_formed() {
+        let fp = plan_frontend_prompt("build auth");
+        assert!(fp.contains("build auth"), "carries the task");
+        assert!(fp.contains("<plan>") && fp.contains("</plan>"), "asks for the capture markers");
+        assert!(fp.to_lowercase().contains("not implement"), "instructs not to implement");
+
+        let dp = build_decompose_from_plan("Step 1: X\nStep 2: Y");
+        assert!(dp.contains("APPROVED PLAN") && dp.contains("Step 1: X"), "wraps the plan");
+        // Inner directive only: start_rudder_plan_task wraps the full contract, so this
+        // must NOT already contain it (else the prompt double-wraps).
+        assert!(!dp.contains("RUDDER_PLAN_TASKS_START"));
+    }
+
+    #[test]
+    fn approve_frontend_plan_no_op_without_a_session() {
+        let mut app = App::new();
+        app.cwd = std::env::temp_dir();
+        app.approve_frontend_plan();
+        assert_eq!(app.notice.as_deref(), Some("no plan-mode session to approve"));
+        assert!(app.agents.is_empty());
+    }
+
+    #[test]
+    fn approve_frontend_plan_waits_when_nothing_captured_yet() {
+        // A front-end with no scrollback to capture: approve is a no-op that keeps the
+        // session and asks the model to restate (no decomposer is spawned).
+        let mut app = App::new();
+        app.cwd = std::env::temp_dir();
+        let mut fe = test_agent_run("fe-1", "plan goal");
+        fe.mode = AgentMode::PlanFront;
+        fe.terminal = None;
+        app.agents = vec![fe];
+        app.frontend_run_id = Some("fe-1".to_string());
+
+        app.approve_frontend_plan();
+        assert!(app.notice.as_deref().unwrap_or_default().contains("no plan captured"));
+        assert_eq!(app.frontend_run_id.as_deref(), Some("fe-1"), "front-end kept; still waiting");
+        assert_eq!(app.agents.len(), 1, "no decomposer spawned");
     }
 
     #[test]

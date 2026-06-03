@@ -2834,8 +2834,10 @@ pub(crate) fn agent_status_label(agent: &AgentRun) -> &'static str {
         "needs permission"
     } else if agent.needs_user_input {
         "needs input"
-    } else if matches!(agent.mode, AgentMode::Plan | AgentMode::RudderPlan)
-        && agent.status == AgentStatus::Running
+    } else if matches!(
+        agent.mode,
+        AgentMode::Plan | AgentMode::PlanFront | AgentMode::RudderPlan
+    ) && agent.status == AgentStatus::Running
     {
         "planning"
     } else if agent.status == AgentStatus::Merged {

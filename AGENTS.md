@@ -725,16 +725,28 @@ ref), and every JUDGE parent is `review`|`merged`. SOFT parents never gate.
 - Rust: `PlannedNode::is_ready` (`native/src/tasks.rs`). TS: `isReady`/`readyNodes`
   (`src/graph.ts`).
 
-### 14.4 Lifecycle: plan → approve → conduct
-1. **Plan.** Type a goal → `start_rudder_plan_task` spawns a read-only decomposer
-   (`claude -p --output-format stream-json` / `codex exec --json`). The orchestrator
-   pane streams the transcript and flips to the **pinned DAG** the instant a
-   `RUDDER_PLAN_TASKS` block parses (`orchestrator_phase`).
-2. **Refine** (awaiting approval). Chat in the orchestrator pane → `refine_plan`
-   (resumes the planner session) → the DAG updates in place, no wipe.
-3. **Approve → launch.** Empty-Enter → `approve_planned_queue` → `run_scheduler`
-   dispatches ready nodes (todo→running), each in its own jj workspace.
-4. **Conduct.** After launch the orchestrator stays live (not a dead view): it grows
+### 14.4 Lifecycle: plan mode → decompose → approve → conduct (Path B)
+1. **Interactive plan mode (front-end).** Type a goal → `start_plan_frontend_task`
+   launches an `AgentMode::PlanFront` session: the model's REAL interactive plan mode
+   (Claude `--permission-mode plan`; Codex launched idle then driven with `/plan <goal>`,
+   both via `agent_command`). It is a raw interactive PTY in the worker pane: the user
+   converses/refines (keys forward; or type in the task pane, which `start_task_from_input`
+   forwards to the front-end PTY). The `plan_frontend_prompt` tells it to research
+   read-only, NOT implement, and restate its final plan wrapped in `<plan>…</plan>`.
+2. **Approve (`Ctrl+W a`).** `approve_frontend_plan` scrapes the proposed plan from the
+   session (`capture_frontend_plan_text`: last `<plan>` block, transcript fallback),
+   STOPS the session (it must never implement — the no-forward-approve invariant), and
+   hands the plan to phase 2. A live front-end is `frontend_run_id`; `plan_is_active()`
+   is true while it exists.
+3. **Decompose.** `start_decompose_from_plan_task` → `start_rudder_plan_task` with
+   `build_decompose_from_plan(plan)` (the read-only decomposer: `claude -p
+   --output-format stream-json` / `codex exec --json`). The orchestrator pane streams the
+   transcript and flips to the **pinned DAG** when a `RUDDER_PLAN_TASKS` block parses.
+4. **Refine + approve → launch.** Chat in the orchestrator pane → `refine_plan` revises
+   the DAG in place. Empty-Enter → `approve_planned_queue` → `run_scheduler` dispatches
+   ready nodes, each in its own jj workspace. (Per the product decision, the DAG is shown
+   for this one explicit approval after the plan was already approved in-pane.)
+5. **Conduct.** After launch the orchestrator stays live (not a dead view): it grows
    the DAG from completions, steers agents, and can rebase. Conductor actions are
    **autonomous (no confirm)** but **visible** (`activity_log`, rendered in the
    orchestrator pane) and **undoable** (jj op-log via `rudder undo`).
