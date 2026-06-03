@@ -1751,14 +1751,20 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
             // a static badge instead of an animated spinner that would imply it is still
             // working forever. A typed message resumes the session (planner_awaiting_input).
             if agent.status != AgentStatus::Running {
-                body.push(Line::from(vec![
-                    Span::styled(BADGE, Style::default().fg(ACCENT)),
-                    Span::raw(" "),
-                    Span::styled(
-                        "planner paused — type your answer or more detail to continue",
-                        pane_text_style(true),
-                    ),
-                ]));
+                // Make the question/answer step UNMISTAKABLE: a distinct accent callout +
+                // an explicit "answer in the task box, then Enter" instruction, instead of
+                // burying the affordance in the streamed transcript below.
+                body.push(Line::from(Span::styled(
+                    "❓ The planner is waiting for your answer",
+                    Style::default()
+                        .fg(ACCENT)
+                        .add_modifier(Modifier::BOLD),
+                )));
+                body.push(Line::from(Span::styled(
+                    "Its question is at the end of the transcript below. Type your answer in the task box and press Enter to continue planning.",
+                    pane_text_style(true),
+                )));
+                body.push(Line::default());
             } else {
                 let spinner_label = if app.rebasing {
                     "rebasing the plan…"
@@ -2338,7 +2344,9 @@ pub(crate) fn review_lines(app: &mut App, height: usize) -> Vec<Line<'static>> {
 /// the SAME string: if these drift, the pane height and mouse selection bounds
 /// disagree and clicks on valid input rows get rejected.
 pub(crate) fn task_default_hint(app: &App) -> &'static str {
-    if app.awaiting_approval {
+    if app.planner_paused_for_input {
+        "↳ the planner asked a question — type your ANSWER here and press Enter to continue planning"
+    } else if app.awaiting_approval {
         "type to refine the plan  ·  Enter (empty) to approve & launch  ·  Option-1/2/3 or ^W pane"
     } else if app.plan_is_active() {
         "type a task to add it to the running plan (shows up in the orchestrator DAG)  ·  ^W pane"

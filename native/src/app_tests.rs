@@ -4341,6 +4341,24 @@ branch refs/heads/main\n";
     }
 
     #[test]
+    fn transcript_fallback_recovers_a_plan_block_the_pty_stream_missed() {
+        // The on-disk transcript reliably carries the full final message even when the live
+        // PTY stream truncated a large RUDDER_PLAN_TASKS block. parse_transcript_final_text
+        // returns the result text, which extract_rudder_plan_tasks then parses.
+        let result_text = "Here is the plan.\\n\\nRUDDER_PLAN_TASKS_START\\n{\\\"tasks\\\":[{\\\"id\\\":\\\"n0\\\",\\\"title\\\":\\\"a\\\",\\\"prompt\\\":\\\"p\\\"}]}\\nRUDDER_PLAN_TASKS_END";
+        let line = format!(
+            r#"{{"type":"result","subtype":"success","result":"{}"}}"#,
+            result_text
+        );
+        let recovered = parse_transcript_final_text(&line).expect("final text");
+        assert!(recovered.contains("RUDDER_PLAN_TASKS_START"));
+        let tasks = extract_rudder_plan_tasks(&recovered).expect("the recovered block parses");
+        assert_eq!(tasks.len(), 1);
+        // Empty / non-JSON transcript yields None.
+        assert_eq!(parse_transcript_final_text(""), None);
+    }
+
+    #[test]
     fn completed_plan_does_not_hijack_a_new_task_into_refine() {
         // Regression guard: a SHIPPED plan leaves a Done orchestrator (with a session),
         // empty queue, and Merged workers. Without the paused flag that state looked

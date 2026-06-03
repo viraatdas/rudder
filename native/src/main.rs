@@ -4990,7 +4990,26 @@ impl App {
             }
         }
         let planner_task = run.task.clone();
-        let output = rudder_plan_output_for_run(run);
+        let backend = run.backend;
+        let session_id = run.session_id.clone();
+        let mut output = rudder_plan_output_for_run(run);
+        // FALLBACK: if the live PTY-stream reconstruction has no parseable plan block (a
+        // large RUDDER_PLAN_TASKS block + PTY ring-buffer truncation can drop it — the
+        // exact "planner paused with a plan it actually produced" failure), read the block
+        // from Claude's own on-disk session transcript, which reliably carries the full
+        // final message. Only swap when the transcript yields a parseable plan.
+        let pty_has_plan = extract_rudder_plan_tasks(&output)
+            .map(|tasks| !tasks.is_empty())
+            .unwrap_or(false);
+        if !pty_has_plan && backend == Backend::Claude {
+            if let Some(text) =
+                session_id.as_deref().and_then(|sid| claude_transcript_final_text(&self.cwd, sid))
+            {
+                if extract_rudder_plan_tasks(&text).map(|t| !t.is_empty()).unwrap_or(false) {
+                    output = text;
+                }
+            }
+        }
 
         let tasks = match extract_rudder_plan_tasks(&output) {
             Ok(tasks) => tasks,
@@ -8055,6 +8074,79 @@ fn load_followup_gen(cwd: &Path) -> HashMap<String, u8> {
         .ok()
         .and_then(|raw| serde_json::from_str::<HashMap<String, u8>>(&raw).ok())
         .unwrap_or_default()
+}
+
+/// Encode a working directory the way Claude Code names its session-transcript folder
+/// under `~/.claude/projects/` (every non-alphanumeric char -> `-`).
+fn encode_claude_project_dir(cwd: &Path) -> String {
+    cwd.to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
+/// Path to a Claude session transcript (JSONL) for `session_id` run in `cwd`. Rudder mints
+/// the session id, so it always knows where Claude streams the JSONL. Falls back to a
+/// scan-by-id when the directory encoding does not match.
+fn claude_transcript_path(cwd: &Path, session_id: &str) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    let projects = home.join(".claude").join("projects");
+    let direct = projects
+        .join(encode_claude_project_dir(cwd))
+        .join(format!("{session_id}.jsonl"));
+    if direct.is_file() {
+        return Some(direct);
+    }
+    let entries = std::fs::read_dir(&projects).ok()?;
+    for entry in entries.flatten() {
+        let candidate = entry.path().join(format!("{session_id}.jsonl"));
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// The model's FINAL response text from its on-disk Claude session transcript: the
+/// authoritative `result` text, else the last assistant text block. This is a robust
+/// fallback for the planner's RUDDER_PLAN_TASKS block when the live PTY-stream
+/// reconstruction missed it (a large block + PTY ring-buffer truncation) — the on-disk
+/// transcript reliably carries the full final message.
+fn claude_transcript_final_text(cwd: &Path, session_id: &str) -> Option<String> {
+    let path = claude_transcript_path(cwd, session_id)?;
+    let raw = std::fs::read_to_string(path).ok()?;
+    parse_transcript_final_text(&raw)
+}
+
+/// Pure parser for `claude_transcript_final_text` (testable without a file): the last
+/// `result` success text, else the last assistant text block.
+fn parse_transcript_final_text(raw: &str) -> Option<String> {
+    let mut last = String::new();
+    for line in raw.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if value.get("type").and_then(|t| t.as_str()) == Some("result")
+            && value.get("subtype").and_then(|t| t.as_str()) == Some("success")
+        {
+            if let Some(result) = value.get("result").and_then(|r| r.as_str()) {
+                last = result.to_string();
+            }
+        }
+        let message = value.get("message");
+        if message.and_then(|m| m.get("role")).and_then(|r| r.as_str()) == Some("assistant") {
+            if let Some(blocks) = message.and_then(|m| m.get("content")).and_then(|c| c.as_array()) {
+                for block in blocks {
+                    if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                        if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                            last = text.to_string();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    (!last.trim().is_empty()).then_some(last)
 }
 
 /// The approval-gate queue persisted to `.rudder/plan-queue.json` so a mid-plan restart
