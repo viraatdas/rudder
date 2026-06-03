@@ -91,6 +91,13 @@ pub struct TerminalPaneOptions {
     pub cwd: Option<PathBuf>,
     pub scrollback_lines: usize,
     pub term: String,
+    /// Render ONLY the live screen (the current vt100 grid), never accumulated
+    /// scrollback. Set for the interactive plan-mode front-end: Claude Code renders
+    /// inline (no alt-screen), so its startup welcome + redraw frames otherwise pile
+    /// up in region_scrollback and the pane shows stacked duplicate banners. The
+    /// model redraws its full visible UI each turn, so the live screen alone is the
+    /// correct view; we trade PageUp history (irrelevant here) for a clean pane.
+    pub live_screen_only: bool,
 }
 
 impl Default for TerminalPaneOptions {
@@ -100,6 +107,7 @@ impl Default for TerminalPaneOptions {
             cwd: None,
             scrollback_lines: DEFAULT_SCROLLBACK_LINES,
             term: "xterm-256color".to_string(),
+            live_screen_only: false,
         }
     }
 }
@@ -124,6 +132,7 @@ pub struct TerminalPane {
     styled_lines_cache: Option<Vec<Vec<StyledTerminalCell>>>,
     output_log: String,
     output_log_limit: usize,
+    live_screen_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -231,6 +240,7 @@ impl TerminalPane {
             styled_lines_cache: None,
             output_log: String::new(),
             output_log_limit: 200_000,
+            live_screen_only: options.live_screen_only,
         })
     }
 
@@ -319,6 +329,10 @@ impl TerminalPane {
     }
 
     pub fn visible_lines_snapshot(&self) -> Vec<String> {
+        // Plan-mode front-end: always the live screen, no scrollback (see the field doc).
+        if self.live_screen_only {
+            return self.current_visible_lines_snapshot();
+        }
         if let Some(snapshot) = self.alternate_history_snapshot() {
             return snapshot.clone();
         }
@@ -353,6 +367,10 @@ impl TerminalPane {
     }
 
     fn compute_styled_lines_snapshot(&self) -> Vec<Vec<StyledTerminalCell>> {
+        // Plan-mode front-end: always the live screen, no scrollback (see the field doc).
+        if self.live_screen_only {
+            return self.current_styled_screen_rows();
+        }
         if let Some(snapshot) = self.alternate_history_snapshot() {
             return snapshot
                 .iter()
@@ -871,6 +889,54 @@ mod tests {
         let output = pane.visible_lines_snapshot().join("\n");
         assert!(output.contains("history001"), "output was {output:?}");
         assert!(output.contains("history005"), "output was {output:?}");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn live_screen_only_renders_just_the_current_screen_no_scrollback() {
+        // Emulate Claude Code's inline redraws: print far more lines than the screen
+        // holds. A normal pane accumulates them in region_scrollback (which is what
+        // stacked the duplicate welcome banners); a live_screen_only pane shows ONLY
+        // the current screen, so the pane stays clean.
+        let command = TerminalCommand::with_args(
+            "/bin/sh",
+            [
+                "-lc",
+                "for i in $(seq 1 40); do printf 'line%02d\\r\\n' \"$i\"; done; printf 'TAIL'; sleep 1",
+            ],
+        );
+        let mut pane = TerminalPane::spawn_shell_or_command(
+            Some(command),
+            TerminalPaneOptions {
+                size: TerminalSize { rows: 5, cols: 20 },
+                scrollback_lines: 100,
+                live_screen_only: true,
+                ..Default::default()
+            },
+        )
+        .expect("spawn test pty");
+
+        for _ in 0..20 {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            pane.drain_output();
+            if pane.visible_lines_snapshot().join("\n").contains("TAIL") {
+                break;
+            }
+        }
+
+        // Only the live screen: exactly `rows` lines, no accumulated history.
+        let lines = pane.visible_lines_snapshot();
+        assert_eq!(lines.len(), 5, "live screen is exactly the row count: {lines:?}");
+        let joined = lines.join("\n");
+        assert!(joined.contains("TAIL"), "shows the latest screen: {joined:?}");
+        assert!(!joined.contains("line01"), "early lines scrolled off, not stacked: {joined:?}");
+        // Scrolling back is a no-op: there is no captured history to reveal.
+        assert_eq!(pane.scrollback(), 0);
+        pane.scrollback_by(10);
+        assert!(
+            !pane.visible_lines_snapshot().join("\n").contains("line01"),
+            "live_screen_only never exposes scrollback history"
+        );
     }
 
     #[cfg(not(windows))]

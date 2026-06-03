@@ -651,6 +651,16 @@ impl AgentRun {
     pub(crate) fn is_orchestrator(&self) -> bool {
         self.mode == AgentMode::RudderPlan
     }
+
+    /// A "pinned planner" renders in the orchestrator section at the top of the list
+    /// (above main + every status bucket), not in a status bucket. This covers BOTH
+    /// the RudderPlan orchestrator AND the interactive plan-mode front-end
+    /// (`PlanFront`) — the planning step belongs at the top, not under "in progress".
+    /// Note: only `is_orchestrator()` (RudderPlan) drives the worker-pane DAG view, so
+    /// a selected PlanFront still shows its raw interactive PTY.
+    pub(crate) fn is_pinned_planner(&self) -> bool {
+        self.is_orchestrator() || self.mode == AgentMode::PlanFront
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -3422,6 +3432,10 @@ impl App {
         let options = TerminalPaneOptions {
             size: TerminalSize::default(),
             cwd: Some(self.cwd.clone()),
+            // Claude Code renders inline (no alt-screen); without this its welcome +
+            // redraw frames stack as duplicate banners in the pane. Show only the live
+            // screen for the interactive plan-mode front-end.
+            live_screen_only: true,
             ..TerminalPaneOptions::default()
         };
         let created_at = now_stamp();
@@ -7328,7 +7342,6 @@ What to do\n\
                         run.permission_notified = false;
                         run.needs_user_input = false;
                         run.user_input_notified = false;
-                        play_completion_sound();
                     }
                     let _ = save_native_run_record(&repo_root, run);
                     any_dirty = true;
@@ -7405,26 +7418,19 @@ What to do\n\
                     .as_ref()
                     .is_some_and(|lines| terminal_needs_permission_from_lines(lines));
                 run.needs_permission = needs_permission;
+                // needs_permission / needs_user_input are surfaced visually (amber
+                // status label) but DO NOT ring: only entering review pings (see
+                // mark_run_done). Previously these rang on every detector flicker,
+                // which fired a ping whenever you selected a waiting agent.
                 if needs_permission {
-                    if !run.permission_notified {
-                        play_completion_sound();
-                    }
                     run.permission_notified = true;
                 }
-                // Intentionally do NOT reset *_notified when the flag flips
-                // back to false. The detector heuristics can flicker while the
-                // agent is streaming, and resetting here causes a fresh ping
-                // on every flicker. The notified flags stay sticky until the
-                // user actually types something (clear_selected_attention_flags
-                // handles that), at which point a real new prompt will ring
-                // again.
                 let needs_user_input = !needs_permission
                     && visible_lines
                         .as_ref()
                         .is_some_and(|lines| terminal_needs_user_input_from_lines(lines));
                 run.needs_user_input = needs_user_input;
-                if needs_user_input && !run.user_input_notified {
-                    play_completion_sound();
+                if needs_user_input {
                     run.user_input_notified = true;
                 }
                 match terminal.try_wait() {
@@ -7442,7 +7448,6 @@ What to do\n\
                             run.permission_notified = false;
                             run.needs_user_input = false;
                             run.user_input_notified = false;
-                            play_completion_sound();
                             changed = true;
                         };
                     }
@@ -7477,7 +7482,6 @@ What to do\n\
                         run.permission_notified = false;
                         run.needs_user_input = false;
                         run.user_input_notified = false;
-                        play_completion_sound();
                         changed = true;
                     }
                 }

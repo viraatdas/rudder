@@ -33,7 +33,15 @@ pub(crate) fn mark_run_done(run: &mut AgentRun) {
         run.permission_notified = false;
         run.needs_user_input = false;
         run.user_input_notified = false;
-        play_completion_sound();
+        // The ONLY ping: a task entering review. Done == the review bucket, and this
+        // branch fires exactly once per Running->Done transition (selection/repaint
+        // never reaches here), so it rings once per agent. A genuine reopen->recomplete
+        // re-enters review — "a new thing" — and rings again, which is intended.
+        // Pinned planners (orchestrator / plan-mode front-end) are excluded: their
+        // completion is a planning transition, not work awaiting your review.
+        if !run.is_pinned_planner() {
+            play_completion_sound();
+        }
     }
 }
 

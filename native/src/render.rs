@@ -402,7 +402,7 @@ fn bucket_members(agents: &[AgentRun], bucket: Bucket) -> Vec<usize> {
         .iter()
         .enumerate()
         .filter(|(_, agent)| {
-            !agent.is_main() && !agent.is_orchestrator() && status_bucket(agent) == bucket
+            !agent.is_main() && !agent.is_pinned_planner() && status_bucket(agent) == bucket
         })
         .map(|(index, _)| index)
         .collect()
@@ -412,19 +412,20 @@ fn bucket_members(agents: &[AgentRun], bucket: Bucket) -> Vec<usize> {
 /// selection marker always lands on the row j/k move to: main agents first, then
 /// each status section in `Bucket::ORDER`, nested within the section.
 pub(crate) fn sectioned_agent_order(agents: &[AgentRun]) -> Vec<usize> {
-    // Pinned orchestrators (RudderPlan) render and navigate first, above main and
-    // every status section, so j/k land on them where they are drawn.
+    // Pinned planners (the orchestrator and the plan-mode front-end) render and
+    // navigate first, above main and every status section, so j/k land on them
+    // where they are drawn.
     let mut order: Vec<usize> = agents
         .iter()
         .enumerate()
-        .filter(|(_, agent)| agent.is_orchestrator())
+        .filter(|(_, agent)| agent.is_pinned_planner())
         .map(|(index, _)| index)
         .collect();
     order.extend(
         agents
             .iter()
             .enumerate()
-            .filter(|(_, agent)| agent.is_main() && !agent.is_orchestrator())
+            .filter(|(_, agent)| agent.is_main() && !agent.is_pinned_planner())
             .map(|(index, _)| index),
     );
     for bucket in Bucket::ORDER {
@@ -899,34 +900,47 @@ fn push_orchestrator_row<'a>(
         Span::styled(truncate_chars(&label, task_width.saturating_sub(2)), label_style),
     ])));
 
-    let planning = matches!(orchestrator_phase(agent), OrchestratorPhase::Planning)
-        && agent.status == AgentStatus::Running;
-    let badge = if planning {
+    // The interactive plan-mode front-end is a pinned planner but not the DAG
+    // orchestrator: label it "plan mode" with the approve hint instead of the DAG
+    // phase summary, and spin while the model is still researching/discussing.
+    let is_front_end = agent.mode == AgentMode::PlanFront;
+    let planning = is_front_end
+        || (matches!(orchestrator_phase(agent), OrchestratorPhase::Planning)
+            && agent.status == AgentStatus::Running);
+    let badge = if planning && agent.status == AgentStatus::Running {
         app.spinner_glyph()
     } else {
         BADGE
+    };
+    let (role, phase) = if is_front_end {
+        ("plan mode", "Ctrl+W a → build the DAG".to_string())
+    } else {
+        ("orchestrator", orchestrator_phase_label(app, agent))
     };
     lines.push(ListItem::new(Line::from(vec![
         Span::raw("  "),
         Span::styled(badge, Style::default().fg(ACCENT)),
         Span::raw(" "),
-        Span::styled("orchestrator", Style::default().fg(ACCENT)),
+        Span::styled(role, Style::default().fg(ACCENT)),
         Span::raw("  "),
-        Span::styled(orchestrator_phase_label(app, agent), muted_style(focused)),
+        Span::styled(phase, muted_style(focused)),
     ])));
 }
 
 pub(crate) fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let focused = app.focus == FocusPane::Agents;
     let diff_summaries: Vec<Option<String>> = {
+        // Pinned planners (orchestrator + plan-mode front-end) run in the MAIN repo
+        // and are rendered via push_orchestrator_row (no diff line), so a diff summary
+        // there is both meaningless and never shown: skip it like main agents.
         let keys: Vec<(String, PathBuf, bool)> = app
             .agents
             .iter()
-            .map(|a| (a.id.clone(), a.cwd.clone(), a.is_main()))
+            .map(|a| (a.id.clone(), a.cwd.clone(), a.is_main() || a.is_pinned_planner()))
             .collect();
         keys.iter()
-            .map(|(id, cwd, is_main)| {
-                if *is_main {
+            .map(|(id, cwd, skip)| {
+                if *skip {
                     None
                 } else {
                     app.cached_diff_summary(id, cwd)
@@ -1022,18 +1036,18 @@ pub(crate) fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 
     let main_count = app.agents.iter().filter(|a| a.is_main()).count();
     let run_total = app.agents.iter().filter(|a| !a.is_main()).count();
-    let orchestrator_count = app.agents.iter().filter(|a| a.is_orchestrator()).count();
+    let orchestrator_count = app.agents.iter().filter(|a| a.is_pinned_planner()).count();
 
-    // Pinned orchestrators render at the very top of BOTH views: one distinct
-    // accent + diamond row per RudderPlan agent showing its phase, above main and
-    // every status section. There is normally one at a time.
+    // Pinned planners render at the very top of BOTH views: one distinct accent +
+    // diamond row per orchestrator / plan-mode front-end showing its phase, above
+    // main and every status section. There is normally one at a time.
     if orchestrator_count > 0 {
         lines.push(ListItem::new(Line::from(Span::styled(
             "orchestrator",
             header_style(focused),
         ))));
         for (index, agent) in app.agents.iter().enumerate() {
-            if agent.is_orchestrator() {
+            if agent.is_pinned_planner() {
                 push_orchestrator_row(&mut lines, app, index, agent, focused, task_width);
             }
         }
@@ -1303,10 +1317,10 @@ pub(crate) fn render_agents_nest(
     let (children, has_parent) = nest_children_by_index(&app.agents);
     let mut visited = vec![false; app.agents.len()];
 
-    // Pinned orchestrators are drawn as a dedicated row above this tree, so mark
-    // them visited to keep the nest walk (and its orphan sweep) from re-drawing them.
+    // Pinned planners are drawn as a dedicated row above this tree, so mark them
+    // visited to keep the nest walk (and its orphan sweep) from re-drawing them.
     for index in 0..app.agents.len() {
-        if app.agents[index].is_orchestrator() {
+        if app.agents[index].is_pinned_planner() {
             visited[index] = true;
         }
     }
@@ -1314,12 +1328,12 @@ pub(crate) fn render_agents_nest(
     // Roots: any node with no present parent, in display order. Main agents have no
     // deps and so are always roots, rendered first.
     let mut roots: Vec<usize> = (0..app.agents.len())
-        .filter(|index| app.agents[*index].is_main() && !app.agents[*index].is_orchestrator())
+        .filter(|index| app.agents[*index].is_main() && !app.agents[*index].is_pinned_planner())
         .collect();
     roots.extend(
         (0..app.agents.len()).filter(|index| {
             !app.agents[*index].is_main()
-                && !app.agents[*index].is_orchestrator()
+                && !app.agents[*index].is_pinned_planner()
                 && !has_parent[*index]
         }),
     );
@@ -1383,17 +1397,17 @@ pub(crate) fn nest_agent_order(agents: &[AgentRun]) -> Vec<usize> {
     let mut visited = vec![false; agents.len()];
 
     for index in 0..agents.len() {
-        if agents[index].is_orchestrator() {
+        if agents[index].is_pinned_planner() {
             order.push(index);
             visited[index] = true;
         }
     }
     let mut roots: Vec<usize> = (0..agents.len())
-        .filter(|&i| agents[i].is_main() && !agents[i].is_orchestrator())
+        .filter(|&i| agents[i].is_main() && !agents[i].is_pinned_planner())
         .collect();
     roots.extend(
         (0..agents.len())
-            .filter(|&i| !agents[i].is_main() && !agents[i].is_orchestrator() && !has_parent[i]),
+            .filter(|&i| !agents[i].is_main() && !agents[i].is_pinned_planner() && !has_parent[i]),
     );
     for &root in &roots {
         nest_order_walk(&mut order, &children, root, &mut visited);

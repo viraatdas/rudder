@@ -188,9 +188,15 @@ pub(crate) fn agent_command(
                 // Native Claude plan mode: the explicit `/plan` and the Path-B planning
                 // FRONT-END both run the real interactive plan-mode TUI (research +
                 // propose; it cannot edit until approved, and Rudder never approves it).
+                // Pre-approve the read-only research tools so planning never stops on a
+                // permission prompt (the "plan mode equivalent" of skip-permissions the
+                // user asked for): it stays in plan mode and still proposes via
+                // ExitPlanMode, which RUDDER — via Ctrl+W a — approves, never the user.
                 AgentMode::Plan | AgentMode::PlanFront => vec![
                     "--permission-mode".to_string(),
                     "plan".to_string(),
+                    "--allowedTools".to_string(),
+                    CLAUDE_DECOMPOSER_TOOLS.to_string(),
                     "--name".to_string(),
                     format!("plan:{}", short_task(task)),
                 ],

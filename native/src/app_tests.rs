@@ -1538,10 +1538,18 @@ branch refs/heads/main\n";
             .args
             .windows(2)
             .any(|window| window[0] == "--permission-mode" && window[1] == "plan"));
+        // Plan mode PRE-APPROVES the read-only research tools (so investigation runs
+        // without permission prompts) but does NOT restrict the tool set (--tools) or
+        // block tools (--disallowedTools): that restrictive profile is the decomposer's.
+        assert!(claude
+            .args
+            .windows(2)
+            .any(|window| window[0] == "--allowedTools"
+                && window[1] == "Read,Grep,Glob,LS,WebSearch,WebFetch"));
         assert!(!claude
             .args
             .windows(2)
-            .any(|window| window[0] == "--tools" || window[0] == "--allowedTools"));
+            .any(|window| window[0] == "--tools" || window[0] == "--disallowedTools"));
         assert!(!claude
             .args
             .iter()
@@ -4184,6 +4192,32 @@ branch refs/heads/main\n";
             "the front-end run is tracked"
         );
         assert!(app.plan_is_active(), "a live front-end counts as an active plan");
+    }
+
+    #[test]
+    fn plan_front_end_pins_to_orchestrator_section_not_in_progress() {
+        let mut fe = test_agent_run("fe-1", "plan goal");
+        fe.mode = AgentMode::PlanFront;
+        fe.status = AgentStatus::Running;
+        // Pinned planner -> renders in the orchestrator section at the top...
+        assert!(fe.is_pinned_planner());
+        // ...but NOT the DAG orchestrator, so its worker pane stays a raw interactive PTY.
+        assert!(!fe.is_orchestrator());
+
+        let mut worker = test_agent_run("w-1", "do work");
+        worker.status = AgentStatus::Running;
+        let agents = vec![worker, fe];
+        // The plan-mode front-end sorts above the in-progress worker.
+        let order = sectioned_agent_order(&agents);
+        assert_eq!(order.first(), Some(&1), "front-end pins to the very top");
+        // And it is excluded from the in-progress bucket (which would have read as a
+        // confusing "needs permission / 10 files changed" worker row).
+        let in_progress: Vec<usize> = order
+            .iter()
+            .copied()
+            .filter(|&i| !agents[i].is_pinned_planner() && status_bucket(&agents[i]) == Bucket::InProgress)
+            .collect();
+        assert_eq!(in_progress, vec![0], "only the real worker is in progress");
     }
 
     #[test]
