@@ -5166,6 +5166,75 @@ branch refs/heads/main\n";
     }
 
     #[test]
+    fn sectioned_order_nests_launched_worker_by_node_id() {
+        // PRODUCTION shape: a launched worker's run id != its node id, and a child's deps
+        // reference the parent's NODE id (node.deps), not its run id. Regression for the
+        // run-id/node-id keying bug: the nest must resolve by node id. The child is placed
+        // FIRST in the vec, so a working nest reorders it AFTER its parent (root-first).
+        let mut child = test_agent_run("run-bbb", "child task");
+        child.node_id = Some("n1".to_string());
+        child.deps = vec!["n0".to_string()]; // parent's NODE id, not its run id
+        let mut parent = test_agent_run("run-aaa", "parent task");
+        parent.node_id = Some("n0".to_string());
+        let mut app = App::new();
+        app.agents = vec![child, parent]; // child at index 0, parent at index 1
+
+        // With node-id resolution the parent (root) renders first, child nests under it:
+        // [1, 0]. Before the fix the dep "n0" matched no run id, so both were roots: [0, 1].
+        assert_eq!(app.visible_agent_indices(), vec![1, 0]);
+    }
+
+    #[test]
+    fn nest_view_selection_order_matches_nest_render_across_buckets() {
+        // Cross-bucket dep: a Running child depends on a Merged parent. In the default
+        // sectioned view they sort by status bucket (in-progress before done): [child,
+        // parent]. In NEST view the tree is global, so the parent is the root and the
+        // child nests under it: [parent, child]. Selection MUST follow the active view, or
+        // j/k move the cursor to a different row than the one highlighted.
+        let mut child = test_agent_run("run-c", "child");
+        child.node_id = Some("n1".to_string());
+        child.deps = vec!["n0".to_string()];
+        child.status = AgentStatus::Running;
+        let mut parent = test_agent_run("run-p", "parent");
+        parent.node_id = Some("n0".to_string());
+        parent.status = AgentStatus::Merged;
+        let mut app = App::new();
+        app.agents = vec![child, parent]; // child idx 0, parent idx 1
+
+        app.nest_view = false;
+        assert_eq!(app.visible_agent_indices(), vec![0, 1], "sectioned: by bucket");
+
+        app.nest_view = true;
+        assert_eq!(app.visible_agent_indices(), vec![1, 0], "nest: parent root, child nested");
+    }
+
+    #[test]
+    fn followup_unknown_explicit_dep_falls_back_to_soft() {
+        // A follow-up that names a hard dep NOT in the plan (e.g. a typo) must not install
+        // it as a hard dep: is_ready treats an out-of-plan dep as satisfied, so the node
+        // would launch immediately, silently losing the gate. It is soft-linked instead.
+        let mut app = App::new();
+        app.cwd = std::env::temp_dir();
+        let mut a = node_agent("n0", AgentStatus::Done);
+        a.mode = AgentMode::Execute;
+        app.agents = vec![a];
+        let note = serde_json::json!({
+            "followups": [{ "title": "wire it", "deps": ["ghost"], "scope": "in" }]
+        });
+        assert!(app.apply_worker_followups("n0", &note));
+        let node = app
+            .planned_nodes
+            .iter()
+            .find(|n| n.title == "wire it")
+            .expect("follow-up added");
+        assert!(node.deps.is_empty(), "unknown hard dep is not installed");
+        assert!(
+            node.soft_deps.contains(&"n0".to_string()),
+            "soft-linked to the finishing node instead"
+        );
+    }
+
+    #[test]
     fn sectioned_render_emits_status_headers_with_counts() {
         let mut app = App::new();
         app.focus = FocusPane::Agents;

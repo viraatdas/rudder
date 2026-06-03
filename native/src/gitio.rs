@@ -267,13 +267,34 @@ pub(crate) fn load_persisted_agents(repo_root: &Path) -> Vec<AgentRun> {
     let Ok(entries) = fs::read_dir(native_runs_dir(repo_root)) else {
         return Vec::new();
     };
-    let mut agents = entries
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
-        .filter_map(|entry| fs::read_to_string(entry.path().join("run.json")).ok())
-        .filter_map(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-        .filter_map(|record| agent_from_run_record(repo_root, record))
-        .collect::<Vec<_>>();
+    let mut agents: Vec<AgentRun> = Vec::new();
+    for entry in entries.filter_map(Result::ok) {
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let path = entry.path().join("run.json");
+        // A missing/corrupt/partial run.json used to make the agent silently vanish on
+        // reload (filter_map swallowed it). Log the path + reason so a lost agent is
+        // diagnosable; still skip it (we cannot reconstruct a malformed record).
+        let raw = match fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(_) => continue, // not a run dir (no run.json); normal, stay quiet
+        };
+        let record = match serde_json::from_str::<serde_json::Value>(&raw) {
+            Ok(record) => record,
+            Err(error) => {
+                eprintln!("rudder: skipping unreadable {}: {error}", path.display());
+                continue;
+            }
+        };
+        match agent_from_run_record(repo_root, record) {
+            Some(agent) => agents.push(agent),
+            None => eprintln!(
+                "rudder: skipping {} (run record missing required fields)",
+                path.display()
+            ),
+        }
+    }
     // Drop any TRANSIENT reconcile planner left on disk (e.g. by a crash mid-reconcile,
     // or an older build that never deleted them). They are ephemeral helpers, not the
     // pinned orchestrator: reloading one as a RudderPlan row would surface a phantom

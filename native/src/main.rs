@@ -1631,7 +1631,15 @@ impl App {
     }
 
     fn visible_agent_indices(&self) -> Vec<usize> {
-        visible_agent_indices(&self.agents)
+        // Selection order MUST match the rendered order, which differs by view: the nest
+        // view walks the dependency tree globally (crossing status buckets), while the
+        // default view nests within each status section. Using the wrong one makes j/k
+        // land on a different row than the highlighted one.
+        if self.nest_view {
+            nest_agent_order(&self.agents)
+        } else {
+            visible_agent_indices(&self.agents)
+        }
     }
 
     fn toggle_worker_view(&mut self) {
@@ -5472,6 +5480,15 @@ impl App {
             ));
             return false;
         }
+        // Every node id known to the plan (queued + launched). Used to (a) skip a batch
+        // whose finishing node is gone, and (b) validate explicit follow-up deps below.
+        let known = self.known_plan_node_ids();
+        // If the finishing node's agent was deleted while a backstop was in flight, there
+        // is nothing to attach to; skip rather than soft-link to a ghost id.
+        if !node_id.is_empty() && !known.iter().any(|id| id == node_id) {
+            self.push_activity(format!("follow-ups from {node_id} skipped (its node is gone)"));
+            return false;
+        }
         let frontier: Vec<String> = self.plan_frontier().into_iter().map(|(id, _)| id).collect();
         let mut added = 0usize;
         for f in &followups {
@@ -5528,9 +5545,24 @@ impl App {
                 model: None,
                 effort: None,
             };
-            if explicit.is_empty() {
-                // Default: a SOFT edge to the finishing node + the frontier, so the
-                // new work is aware of in-flight work but never gates/deadlocks.
+            // Explicit hard deps must reference real plan nodes. A dep absent from the
+            // plan is treated as already-satisfied by is_ready, so a typo'd id (e.g. "n_0"
+            // for "n0") would make the node launch IMMEDIATELY, silently losing the gate.
+            // Only keep explicit deps that resolve; if any are unknown, fall back to the
+            // soft-frontier edge and surface it.
+            let unknown: Vec<&str> = explicit
+                .iter()
+                .filter(|d| !known.iter().any(|k| k == *d))
+                .map(String::as_str)
+                .collect();
+            if explicit.is_empty() || !unknown.is_empty() {
+                if !unknown.is_empty() {
+                    self.push_activity(format!(
+                        "follow-up '{title}' had unknown dep(s) {unknown:?}; soft-linked instead of hard-gated"
+                    ));
+                }
+                // Default / fallback: a SOFT edge to the finishing node + the frontier, so
+                // the new work is aware of in-flight work but never gates/deadlocks.
                 let mut soft = vec![node_id.to_string()];
                 soft.extend(frontier.iter().cloned());
                 soft.retain(|id| !id.is_empty());
@@ -5538,7 +5570,7 @@ impl App {
                 soft.dedup();
                 node.soft_deps = soft;
             } else {
-                // The agent said this follow-up consumes those nodes: treat as hard.
+                // The agent said this follow-up consumes those nodes (all resolve): hard.
                 node.deps = explicit;
             }
             self.followup_gen.insert(node.id.clone(), gen + 1);
@@ -6110,6 +6142,13 @@ impl App {
 
         let run = self.agents.remove(self.selected_agent);
         let _ = remove_native_run_record(&self.cwd, &run.id);
+        // Prune the run from the ingest ledger so it does not accumulate dead ids (and so
+        // a hypothetically-reused run id is not pre-marked ingested).
+        let was_ingested = self.followups_ingested.remove(&run.id);
+        let was_pending = self.completion_summary_pending.remove(&run.id);
+        if was_ingested || was_pending {
+            self.persist_ingested_runs();
+        }
         let worktree_error = run.worktree_path.as_ref().and_then(|path| {
             let output = Command::new("git")
                 .args(["worktree", "remove", "--force"])
@@ -6454,8 +6493,12 @@ impl App {
         // ingested afresh instead of being skipped as "already handled".
         if let Some(id) = self.agents.get(index).map(|run| run.id.clone()) {
             let was_ingested = self.followups_ingested.remove(&id);
-            self.completion_summary_pending.remove(&id);
-            if was_ingested {
+            let was_pending = self.completion_summary_pending.remove(&id);
+            // Persist if EITHER set changed. If only `pending` was set (a backstop is in
+            // flight), failing to persist the clear lets a late backstop result re-add the
+            // stale id (mark_run_ingested), which would permanently skip the re-goaled
+            // worker's NEW completion, including across a restart.
+            if was_ingested || was_pending {
                 self.persist_ingested_runs();
             }
         }
@@ -6574,7 +6617,7 @@ impl App {
     /// merged set, so hard dependents stay correctly blocked.
     fn stop_agent_at(&mut self, index: usize) -> bool {
         let cwd = self.cwd.clone();
-        let label = {
+        let (label, run_id) = {
             let Some(run) = self.agents.get_mut(index) else {
                 return false;
             };
@@ -6591,8 +6634,18 @@ impl App {
             run.needs_user_input = false;
             run.user_input_notified = false;
             let _ = save_native_run_record(&cwd, run);
-            run.node_id.clone().unwrap_or_else(|| run.id.clone())
+            (
+                run.node_id.clone().unwrap_or_else(|| run.id.clone()),
+                run.id.clone(),
+            )
         };
+        // A stopped worker will not report again; prune it from the ingest ledger so it
+        // does not linger (and a re-goal later re-ingests it afresh).
+        let was_ingested = self.followups_ingested.remove(&run_id);
+        let was_pending = self.completion_summary_pending.remove(&run_id);
+        if was_ingested || was_pending {
+            self.persist_ingested_runs();
+        }
         self.push_activity(format!("stopped {label}"));
         self.mirror_graph();
         true

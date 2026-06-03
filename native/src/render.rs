@@ -271,6 +271,23 @@ pub(crate) fn status_bucket(agent: &AgentRun) -> Bucket {
 /// BOTH endpoints fall in `members` (the indices in one section). Also returns,
 /// for each member, whether it has a parent that lives OUTSIDE this section (so we
 /// render it as a section root with a dep hint rather than a connector).
+/// Map every agent's identifiers to its index, for resolving dependency edges in the
+/// agents-pane nest. Both the run id AND the plan node id are inserted, because a
+/// launched plan worker records its deps as plan NODE ids (`node.deps`) while
+/// manual/test runs reference the run id. `node_id` is inserted after the run id so it
+/// wins on the (rare) collision; deps are node ids in production.
+fn agent_id_index(agents: &[AgentRun]) -> std::collections::HashMap<&str, usize> {
+    let mut map: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::with_capacity(agents.len() * 2);
+    for (index, agent) in agents.iter().enumerate() {
+        map.insert(agent.id.as_str(), index);
+        if let Some(node_id) = agent.node_id.as_deref() {
+            map.insert(node_id, index);
+        }
+    }
+    map
+}
+
 fn section_nest(
     agents: &[AgentRun],
     members: &[usize],
@@ -281,11 +298,12 @@ fn section_nest(
 ) {
     use std::collections::{HashMap, HashSet};
     let member_set: HashSet<usize> = members.iter().copied().collect();
-    let id_to_index: HashMap<&str, usize> = agents
-        .iter()
-        .enumerate()
-        .map(|(index, agent)| (agent.id.as_str(), index))
-        .collect();
+    // Index by BOTH the run id and the plan node id. A launched plan worker carries its
+    // deps as plan NODE ids (`node.deps`), while manual/test setups reference the run id;
+    // mapping both lets a child resolve its parent either way. `node_id` is inserted last
+    // so it wins if it ever collides with a different run's id (deps are node ids in
+    // production). Without the node_id key, launched workers never nest (run id != node id).
+    let id_to_index: HashMap<&str, usize> = agent_id_index(agents);
 
     let mut children: HashMap<usize, Vec<(usize, EdgeType)>> = HashMap::new();
     let mut has_in_section_parent: HashSet<usize> = HashSet::new();
@@ -1120,11 +1138,7 @@ pub(crate) fn nest_children_by_index(
     agents: &[AgentRun],
 ) -> (std::collections::HashMap<usize, Vec<(usize, EdgeType)>>, Vec<bool>) {
     use std::collections::HashMap;
-    let id_to_index: HashMap<&str, usize> = agents
-        .iter()
-        .enumerate()
-        .map(|(index, agent)| (agent.id.as_str(), index))
-        .collect();
+    let id_to_index: HashMap<&str, usize> = agent_id_index(agents);
 
     let mut children: HashMap<usize, Vec<(usize, EdgeType)>> = HashMap::new();
     let mut has_parent = vec![false; agents.len()];
@@ -1351,6 +1365,61 @@ pub(crate) fn visible_agent_indices(agents: &[AgentRun]) -> Vec<usize> {
     // section nested by dependency. Sharing `sectioned_agent_order` guarantees the
     // selection marker lands exactly where j/k move.
     sectioned_agent_order(agents)
+}
+
+/// The navigation order for the NEST view (`g`), mirroring `render_agents_nest` exactly
+/// so j/k land on the row that is actually drawn. The sectioned order cannot be reused
+/// here because nest view walks the dependency tree globally (crossing status buckets)
+/// rather than within each section. Order: pinned orchestrators (drawn above the tree),
+/// then mains, then dependency roots, then the tree (DFS via the children map), then any
+/// cycle-trapped orphans.
+pub(crate) fn nest_agent_order(agents: &[AgentRun]) -> Vec<usize> {
+    let (children, has_parent) = nest_children_by_index(agents);
+    let mut order: Vec<usize> = Vec::new();
+    let mut visited = vec![false; agents.len()];
+
+    for index in 0..agents.len() {
+        if agents[index].is_orchestrator() {
+            order.push(index);
+            visited[index] = true;
+        }
+    }
+    let mut roots: Vec<usize> = (0..agents.len())
+        .filter(|&i| agents[i].is_main() && !agents[i].is_orchestrator())
+        .collect();
+    roots.extend(
+        (0..agents.len())
+            .filter(|&i| !agents[i].is_main() && !agents[i].is_orchestrator() && !has_parent[i]),
+    );
+    for &root in &roots {
+        nest_order_walk(&mut order, &children, root, &mut visited);
+    }
+    for index in 0..agents.len() {
+        if !visited[index] {
+            nest_order_walk(&mut order, &children, index, &mut visited);
+        }
+    }
+    order
+}
+
+fn nest_order_walk(
+    order: &mut Vec<usize>,
+    children: &std::collections::HashMap<usize, Vec<(usize, EdgeType)>>,
+    index: usize,
+    visited: &mut Vec<bool>,
+) {
+    if visited[index] {
+        return;
+    }
+    visited[index] = true;
+    order.push(index);
+    if let Some(kids) = children.get(&index) {
+        for (child, _) in kids {
+            if !visited[*child] {
+                nest_order_walk(order, children, *child, visited);
+            }
+        }
+    }
 }
 
 /// Push one task row of the orchestrator DAG tree: nest glyphs, a live-status
