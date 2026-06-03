@@ -4264,6 +4264,113 @@ branch refs/heads/main\n";
         assert!(!dp.contains("RUDDER_PLAN_TASKS_START"));
     }
 
+    fn dag_task(id: &str, title: &str, hard: &[&str]) -> RudderPlanTask {
+        RudderPlanTask {
+            id: id.to_string(),
+            title: title.to_string(),
+            prompt: title.to_string(),
+            goal: None,
+            success: None,
+            deps: hard
+                .iter()
+                .map(|on| PlanEdge {
+                    on: (*on).to_string(),
+                    edge: EdgeType::Hard,
+                    why: None,
+                })
+                .collect(),
+            backend: None,
+            model: None,
+            effort: None,
+        }
+    }
+
+    fn dag_rows(app: &App, tasks: &[RudderPlanTask]) -> Vec<String> {
+        orchestrator_dag_tree_lines(app, tasks)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn orchestrator_dag_nests_join_under_deepest_dep_with_clean_lanes() {
+        // A diamond: config -> {auth, tracks}; html standalone; app needs auth+tracks+html.
+        let app = App::new();
+        let tasks = vec![
+            dag_task("n0", "config", &[]),
+            dag_task("n1", "auth", &["n0"]),
+            dag_task("n2", "tracks", &["n0"]),
+            dag_task("n3", "html", &[]),
+            dag_task("n4", "app", &["n1", "n2", "n3"]),
+        ];
+        let rows = dag_rows(&app, &tasks);
+        for r in &rows {
+            println!("{r}");
+        }
+        assert_eq!(rows.len(), tasks.len(), "every task renders exactly once: {rows:#?}");
+
+        // Render order: roots in plan order, children depth-first under them.
+        for (row, title) in rows.iter().zip(["config", "auth", "tracks", "app", "html"]) {
+            assert!(row.contains(title), "row {row:?} should contain {title}");
+        }
+        let indent = |s: &str| s.chars().take_while(|c| *c != '●').count();
+        // Roots start at column 0 (badge first, no leading lane); children are indented.
+        assert!(rows[0].starts_with('●'), "config is a root at col 0: {:?}", rows[0]);
+        assert!(rows[4].starts_with('●'), "html is a root at col 0: {:?}", rows[4]);
+        assert!(indent(&rows[1]) > 0, "auth is nested under config: {:?}", rows[1]);
+        // Clean, consistent lanes: auth and tracks (siblings) share the same indent.
+        assert_eq!(
+            indent(&rows[1]),
+            indent(&rows[2]),
+            "auth & tracks align as siblings: {:?} vs {:?}",
+            rows[1],
+            rows[2]
+        );
+        // The join nests UNDER tracks (a deep dep) — deeper than tracks, never under the
+        // shallow parallel root html.
+        assert!(
+            indent(&rows[3]) > indent(&rows[2]),
+            "app (join) nests under its deepest dep tracks: {:?} vs {:?}",
+            rows[3],
+            rows[2]
+        );
+    }
+
+    #[test]
+    fn orchestrator_dag_draws_continuation_bar_across_deep_child() {
+        // n0 -> {n1 -> n3(leaf), n2}. n1 has a child (leaf) AND a following sibling (n2),
+        // so the leaf row must carry a vertical bar connecting n1's lane down to n2.
+        let app = App::new();
+        let tasks = vec![
+            dag_task("n0", "root", &[]),
+            dag_task("n1", "first", &["n0"]),
+            dag_task("n2", "second", &["n0"]),
+            dag_task("n3", "leaf", &["n1"]),
+        ];
+        let rows = dag_rows(&app, &tasks);
+        for r in &rows {
+            println!("{r}");
+        }
+        for (row, title) in rows.iter().zip(["root", "first", "leaf", "second"]) {
+            assert!(row.contains(title), "row {row:?} should contain {title}");
+        }
+        assert!(
+            rows[2].contains('│'),
+            "the leaf carries a continuation bar to the later sibling 'second': {:?}",
+            rows[2]
+        );
+        assert!(
+            !rows[3].contains('│'),
+            "the last sibling has no trailing bar: {:?}",
+            rows[3]
+        );
+    }
+
     #[test]
     fn parse_finalized_plan_seizes_on_exitplanmode_only() {
         // A <plan> restatement during discussion must NOT count as finalized — the model

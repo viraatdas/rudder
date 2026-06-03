@@ -1289,7 +1289,10 @@ fn nest_walk<'a>(
         .collect();
     for (position, (child_index, child_edge)) in pending.iter().enumerate() {
         let child_is_last = position + 1 == pending.len();
-        lanes.push(!child_is_last);
+        // Push THIS node's continuation (does it have a following sibling) as the ancestor
+        // lane for its descendants — not the child's own flag, which double-counted and
+        // misaligned the connectors.
+        lanes.push(!is_last);
         nest_walk(
             lines,
             app,
@@ -1471,11 +1474,43 @@ fn push_orchestrator_task_row<'a>(
 #[allow(clippy::too_many_arguments)]
 /// Build the orchestrator DAG tree structure. Nesting follows HARD edges only:
 /// soft edges are advisory "context" that never gate launch, so soft-linked tasks
-/// run in parallel and must NOT be drawn as a sequential chain. Each node nests
-/// under its LATEST hard prerequisite (max index) so an integrator renders below
-/// its inputs; a node with no hard parent is a top-level (parallel) root. Returns
+/// run in parallel and must NOT be drawn as a sequential chain. A node nests under its
+/// DEEPEST hard prerequisite (longest hard chain, ties by index) so an integrator
+/// renders below its real inputs; a node with no hard parent is a top-level (parallel)
+/// root. Returns
 /// the children adjacency and which nodes have a hard parent. Pure, so the nesting
 /// is unit-testable.
+/// Longest hard-dependency chain depth for task `index` over the FULL hard-edge graph
+/// (memoized, cycle-safe). A node with no hard prereqs is depth 0. Used so a JOIN nests
+/// under its DEEPEST prerequisite rather than under whichever has the largest id.
+fn hard_chain_depth(
+    index: usize,
+    tasks: &[RudderPlanTask],
+    id_to_index: &std::collections::HashMap<&str, usize>,
+    memo: &mut [Option<usize>],
+    in_progress: &mut [bool],
+) -> usize {
+    if let Some(depth) = memo[index] {
+        return depth;
+    }
+    if in_progress[index] {
+        return 0; // cycle: break the recursion
+    }
+    in_progress[index] = true;
+    let depth = tasks[index]
+        .deps
+        .iter()
+        .filter(|edge| edge.edge == EdgeType::Hard)
+        .filter_map(|edge| id_to_index.get(edge.on.as_str()).copied())
+        .filter(|&parent| parent != index)
+        .map(|parent| 1 + hard_chain_depth(parent, tasks, id_to_index, memo, in_progress))
+        .max()
+        .unwrap_or(0);
+    in_progress[index] = false;
+    memo[index] = Some(depth);
+    depth
+}
+
 pub(crate) fn orchestrator_hard_tree(
     tasks: &[RudderPlanTask],
 ) -> (
@@ -1488,16 +1523,24 @@ pub(crate) fn orchestrator_hard_tree(
         .enumerate()
         .map(|(index, task)| (task.id.as_str(), index))
         .collect();
+    let mut memo = vec![None; tasks.len()];
+    let mut in_progress = vec![false; tasks.len()];
+    let depths: Vec<usize> = (0..tasks.len())
+        .map(|i| hard_chain_depth(i, tasks, &id_to_index, &mut memo, &mut in_progress))
+        .collect();
     let mut children: HashMap<usize, Vec<(usize, EdgeType)>> = HashMap::new();
     let mut has_parent = vec![false; tasks.len()];
     for (child_index, task) in tasks.iter().enumerate() {
+        // Of all resolvable hard prerequisites, nest under the DEEPEST (longest hard
+        // chain), ties broken by index. So an integrator that depends on several units
+        // renders below its deepest input instead of under a shallow parallel root.
         let hard_parent = task
             .deps
             .iter()
             .filter(|edge| edge.edge == EdgeType::Hard)
             .filter_map(|edge| id_to_index.get(edge.on.as_str()).copied())
             .filter(|&parent_index| parent_index != child_index)
-            .max();
+            .max_by_key(|&parent_index| (depths[parent_index], parent_index));
         if let Some(parent_index) = hard_parent {
             children
                 .entry(parent_index)
@@ -1507,6 +1550,31 @@ pub(crate) fn orchestrator_hard_tree(
         }
     }
     (children, has_parent)
+}
+
+/// Build the orchestrator DAG tree rows (no status/summary lines). Roots (no resolvable
+/// hard parent) first, depth-first; any cycle-trapped node is then rendered at depth 0 so
+/// work is never hidden. Extracted so the rendered structure is unit-testable.
+pub(crate) fn orchestrator_dag_tree_lines(app: &App, tasks: &[RudderPlanTask]) -> Vec<Line<'static>> {
+    let mut dag: Vec<Line<'static>> = Vec::new();
+    let (children, has_parent) = orchestrator_hard_tree(tasks);
+    let mut visited = vec![false; tasks.len()];
+    let mut lanes: Vec<bool> = Vec::new();
+    for index in 0..tasks.len() {
+        if !has_parent[index] {
+            orchestrator_tree_walk(
+                &mut dag, app, tasks, &children, index, None, true, &mut lanes, &mut visited,
+            );
+        }
+    }
+    for index in 0..tasks.len() {
+        if !visited[index] {
+            orchestrator_tree_walk(
+                &mut dag, app, tasks, &children, index, None, true, &mut lanes, &mut visited,
+            );
+        }
+    }
+    dag
 }
 
 fn orchestrator_tree_walk<'a>(
@@ -1536,7 +1604,10 @@ fn orchestrator_tree_walk<'a>(
         .collect();
     for (position, (child_index, child_edge)) in pending.iter().enumerate() {
         let child_is_last = position + 1 == pending.len();
-        lanes.push(!child_is_last);
+        // Push THIS node's continuation (does it have a following sibling), which becomes
+        // the ancestor lane drawn to the LEFT of every descendant. (Pushing the child's
+        // own flag added a spurious extra column and misaligned the connectors.)
+        lanes.push(!is_last);
         orchestrator_tree_walk(
             lines, app, tasks, children, *child_index, Some(*child_edge), child_is_last, lanes,
             visited,
@@ -1689,28 +1760,7 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
             // PINNED top region: the DAG tree + a live status line. The tree nests
             // by HARD edges only (see orchestrator_hard_tree) so parallel soft-linked
             // tasks render as top-level roots instead of a misleading chain.
-            let mut dag: Vec<Line<'static>> = Vec::new();
-            let (children, has_parent) = orchestrator_hard_tree(&tasks);
-            let mut visited = vec![false; tasks.len()];
-            let mut lanes: Vec<bool> = Vec::new();
-            for index in 0..tasks.len() {
-                if !has_parent[index] {
-                    orchestrator_tree_walk(
-                        &mut dag, app, &tasks, &children, index, None, true, &mut lanes,
-                        &mut visited,
-                    );
-                }
-            }
-            // Any node trapped in a cycle (e.g. part of a dependency loop) has a parent
-            // and so was skipped above; render it at depth 0 so a cycle never hides work.
-            for index in 0..tasks.len() {
-                if !visited[index] {
-                    orchestrator_tree_walk(
-                        &mut dag, app, &tasks, &children, index, None, true, &mut lanes,
-                        &mut visited,
-                    );
-                }
-            }
+            let mut dag: Vec<Line<'static>> = orchestrator_dag_tree_lines(app, &tasks);
             let (mut running, mut review, mut done, mut todo) = (0usize, 0usize, 0usize, 0usize);
             for task in &tasks {
                 match orchestrator_task_status(app, &task.id) {
