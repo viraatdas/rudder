@@ -725,28 +725,67 @@ ref), and every JUDGE parent is `review`|`merged`. SOFT parents never gate.
 - Rust: `PlannedNode::is_ready` (`native/src/tasks.rs`). TS: `isReady`/`readyNodes`
   (`src/graph.ts`).
 
-### 14.4 Lifecycle: plan mode → DAG → approve → conduct (headless, Rudder-owned)
-The planner is HEADLESS and fully Rudder-owned — there is no interactive plan-mode TUI.
-An earlier "Path B" interactive front-end (`AgentMode::PlanFront`, a raw `claude
---permission-mode plan` PTY the user talked to directly) was retired: its native
-ExitPlanMode menu handed control to a single in-process agent and bypassed the fleet, and
-Rudder could only seize it through a racy transcript side-channel. The headless planner
-below makes the pane update dynamically and keeps the user talking only to Rudder.
-1. **Plan.** Type a goal → `start_rudder_plan_task` spawns the `AgentMode::RudderPlan`
-   planner (`claude -p --output-format stream-json` read-only / `codex exec --json`),
-   streamed live in the orchestrator command-center via `plan_stream` + `render_orchestrator`.
-   It researches read-only and CANNOT implement (inspection-only tools). The pinned row is
-   labeled as the model's **plan mode** ("plan mode · Claude Code · researching the plan")
-   while decomposing, then flips to the **pinned DAG** the instant a `RUDDER_PLAN_TASKS`
-   block parses (`orchestrator_phase` Planning → PlanReady).
-2. **Refine** (awaiting approval). Type in the orchestrator pane → `refine_plan` resumes
-   the planner session → the DAG updates in place, no wipe. `awaiting_approval` holds.
-3. **Approve → launch.** Empty-Enter → `approve_planned_queue` → `run_scheduler` dispatches
-   ready nodes (todo → running), each in its own jj workspace.
-4. **Conduct.** After launch the orchestrator stays live (not a dead view): it grows
-   the DAG from completions, steers agents, and can rebase. Conductor actions are
-   **autonomous (no confirm)** but **visible** (`activity_log`, rendered in the
-   orchestrator pane) and **undoable** (jj op-log via `rudder undo`).
+### 14.4 Lifecycle: plan mode → ask → DAG → approve → conduct (headless, Rudder-owned)
+The planner is HEADLESS and fully Rudder-owned: there is no interactive plan-mode TUI. The
+user only ever talks to Rudder; the planner can never go off and implement on its own.
+
+1. **Plan (research).** Type a goal → `start_rudder_plan_task` spawns the
+   `AgentMode::RudderPlan` planner (`claude -p --output-format stream-json` read-only /
+   `codex exec --json`), streamed live in the orchestrator command-center via `plan_stream`
+   + `render_orchestrator`. It researches read-only and CANNOT implement (inspection-only
+   tools). The pinned row is LABELED as the model's **plan mode** ("plan mode · Claude Code
+   · researching the plan").
+2. **Ask (default on the first turn).** The planner prompt (`rudder_plan_prompt`) tells it
+   to DEFAULT TO ASKING: unless the request is fully specified, it emits 1–4 clarifying
+   questions in a `RUDDER_QUESTIONS_START..END` block and STOPS without a DAG. On that exit
+   with no parseable plan, `evaluate_completed_plan` sets `planner_paused_for_input = true`
+   and parses the questions into `App.pending_questions` (`extract_rudder_questions`). The
+   pane shows a bold "❓ The planner needs your input" header + the questions as a NUMBERED
+   list, and the task box hint becomes "type your ANSWER here". The user's free-text answer
+   routes through `planner_awaiting_input()` → `refine_plan`, which RESUMES the same session
+   with the clarification-answer framing (`build_clarification_answer_followup`, distinct
+   from the refine framing). The planner then emits the DAG (or asks once more).
+3. **DAG ready.** The instant a `RUDDER_PLAN_TASKS` block parses, the pane flips to the
+   **pinned DAG** (`orchestrator_phase` Planning → PlanReady) and `awaiting_approval` holds.
+   CAPTURE ROBUSTNESS: if the live PTY stream truncated a large block, `evaluate_completed_plan`
+   falls back to the backend's authoritative session record (Claude's `~/.claude/projects`
+   transcript via `claude_transcript_final_text`, or Codex's `~/.codex/sessions` rollout via
+   `latest_codex_rudder_plan_output`), so a plan the model actually produced is never lost.
+4. **Refine.** Type in the orchestrator pane while awaiting approval → `refine_plan` resumes
+   the session and the DAG updates in place (no wipe).
+5. **Approve → launch.** Empty-Enter → `approve_planned_queue` → `run_scheduler` dispatches
+   ready nodes (todo → running), each in its own jj workspace. The queued plan + gate state
+   persist to `.rudder/plan-queue.json`, so a mid-plan restart resumes instead of losing it.
+6. **Conduct.** After launch the orchestrator stays live (not a dead view): it grows the
+   DAG from completions, steers agents, and can rebase. Conductor actions are **autonomous
+   (no confirm)** but **visible** (`activity_log`) and **undoable** (jj op-log).
+
+### 14.4.1 Planner product decisions (canonical — do not re-litigate without cause)
+The planner UX went through several iterations; these are the settled decisions and WHY.
+- **Headless, not an interactive TUI.** An earlier "Path B" interactive front-end
+  (`AgentMode::PlanFront`, a raw `claude --permission-mode plan` PTY the user typed into)
+  was tried (1.4.0–1.5.1) and RETIRED (1.6.0). Its native ExitPlanMode menu handed control
+  to a single in-process agent and bypassed the fleet, the user ended up talking to Claude
+  instead of Rudder, and Rudder could only seize control via a racy transcript side-channel.
+  Do NOT reintroduce an interactive plan-mode TUI.
+- **Labeled "plan mode".** The headless decomposer is presented as the model's plan mode
+  (the pinned row + header show "plan mode · Claude Code/Codex · …") because that is what it
+  is to the user: the model planning read-only. This is a deliberate product framing.
+- **Default to asking clarifying questions.** The planner asks first (step 2) rather than
+  silently assuming, including when prior context (existing files, DECISIONS.md) suggests an
+  answer. This is prompt-driven (the model judges), so it is a strong DEFAULT, not a hard
+  gate; a genuinely unambiguous request still goes straight to the DAG. If a hard always-ask
+  gate is ever wanted, it would force a question round on every plan (including trivial ones).
+- **Free-text answers, not a selectable widget.** Questions render as a numbered list and
+  the user answers in the task box with free text (e.g. "1: 6 months, 2: reuse"). Chosen over
+  forcing the headless model to invent multiple-choice options, because free text is more
+  flexible; the trade-off is it is not the arrow-select widget native plan mode shows.
+- **One Enter to launch after the DAG.** The DAG is shown for a single explicit approval
+  (empty-Enter) before the fleet runs; refining is just typing while it is shown.
+- **Authoritative-record fallback over stream-only capture.** Three capture attempts
+  (overlap splice 1.7.1, result-arm unification 1.8.0, transcript fallback 1.10.x); the
+  transcript fallback is the robust one because it reads the backend's own session log and
+  does not depend on the lossy live PTY stream.
 
 ### 14.5 Conductor capabilities (BUILT vs PLANNED)
 - **Auto-expand from completion** (BUILT). A finished worker reports via **`rudder

@@ -169,18 +169,34 @@ reused next time. Rudder refreshes model metadata from
 ## Planning (the default)
 
 Just type a task. Rudder runs the model in **plan mode** (Claude Code or Codex), streamed
-live in the orchestrator pane: it researches your repo read-only, reasons about the work,
-and lays out a DAG of worker tasks. It will not implement anything. You watch it plan,
-refine by typing (Rudder re-plans and the DAG updates in place), and when you are happy
-press `Enter` to approve. The scheduler then drains the DAG (todo → in-progress → review →
-done) as dependencies merge. The whole flow stays inside Rudder: you talk to Rudder, not to
-a separate agent, and the planner can never go off and implement on its own.
+live in the orchestrator pane. The flow stays entirely inside Rudder — you only ever talk to
+Rudder, and the planner researches read-only and can never implement on its own:
 
-After launch, typing a new task folds it into the running DAG as a new node. When a
-worker finishes, Rudder reads back what it did and what work it found remaining (and
-reconstructs that from the diff if the agent did not say), so the plan keeps growing on
-its own. Type a sweeping change (\"rewrite this in Rust instead\") and the plan re-plans
-around the work already done.
+1. **It asks first.** Unless your request is already fully specified, the planner inspects
+   the repo and then asks you a few clarifying questions, shown as a numbered prompt:
+
+   ```
+   ❓ The planner needs your input
+     1. Which time range: last 4 weeks, 6 months, or all time?
+     2. Reuse the existing module contract, or rebuild from scratch?
+
+   ↳ answer in the task box below (e.g. "1: ..., 2: ...") and press Enter
+   ```
+
+   Type your answer in the task box and press `Enter`; it continues the same planning
+   conversation with your answer. (A fully unambiguous request skips straight to the plan.)
+2. **It lays out a DAG.** When it is ready it shows the task DAG (a tree of worker tasks
+   with their dependencies). Type to refine it (Rudder re-plans, the DAG updates in place),
+   or press `Enter` on an empty input to approve and launch.
+3. **The fleet runs.** The scheduler drains the DAG (todo → in-progress → review → done) as
+   dependencies merge, each task in its own isolated worktree.
+
+After launch, typing a new task folds it into the running DAG as a new node. When a worker
+finishes, Rudder reads back what it did and what work it found remaining (reconstructing it
+from the diff if the agent did not say), so the plan keeps growing on its own. Type a
+sweeping change ("rewrite this in Rust instead") and the plan re-plans around the work
+already done. The queued plan survives a restart, so quitting mid-plan resumes where you
+left off.
 
 ## Worktrees and merging
 
