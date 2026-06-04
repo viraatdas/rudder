@@ -4995,16 +4995,21 @@ impl App {
         let mut output = rudder_plan_output_for_run(run);
         // FALLBACK: if the live PTY-stream reconstruction has no parseable plan block (a
         // large RUDDER_PLAN_TASKS block + PTY ring-buffer truncation can drop it — the
-        // exact "planner paused with a plan it actually produced" failure), read the block
-        // from Claude's own on-disk session transcript, which reliably carries the full
-        // final message. Only swap when the transcript yields a parseable plan.
+        // exact "planner paused with a plan it actually produced" failure), recover the
+        // block from the backend's OWN authoritative session record, which reliably carries
+        // the full final message: Claude's `~/.claude/projects/.../<sid>.jsonl` transcript,
+        // or Codex's `~/.codex/sessions/...` rollout. Only swap when it yields a real plan.
         let pty_has_plan = extract_rudder_plan_tasks(&output)
             .map(|tasks| !tasks.is_empty())
             .unwrap_or(false);
-        if !pty_has_plan && backend == Backend::Claude {
-            if let Some(text) =
-                session_id.as_deref().and_then(|sid| claude_transcript_final_text(&self.cwd, sid))
-            {
+        if !pty_has_plan {
+            let fallback_text = match backend {
+                Backend::Claude => session_id
+                    .as_deref()
+                    .and_then(|sid| claude_transcript_final_text(&self.cwd, sid)),
+                Backend::Codex => latest_codex_rudder_plan_output(run),
+            };
+            if let Some(text) = fallback_text {
                 if extract_rudder_plan_tasks(&text).map(|t| !t.is_empty()).unwrap_or(false) {
                     output = text;
                 }
