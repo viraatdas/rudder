@@ -32,7 +32,6 @@ import {
   mergeGitRunIntoCurrentBranch,
   processAlive,
   removeGitWorktree,
-  runHasChanges,
   syncGitRunWorktree,
 } from "./git.js";
 import {
@@ -569,7 +568,7 @@ export async function workerRun(repoRoot: string, runId: string): Promise<void> 
         data: verification as unknown as JsonValue,
       });
 
-      if (await shouldAutoSteer(current, verification)) {
+      if (shouldAutoSteer(current, verification)) {
         const waitingSince = nowIso();
         current.status = "steering";
         current.autoSteer = {
@@ -710,7 +709,7 @@ async function runBackendPass(run: RunRecord): Promise<{ run: RunRecord; exitCod
   return { run, exitCode };
 }
 
-async function shouldAutoSteer(run: RunRecord, verification: VerificationResult): Promise<boolean> {
+function shouldAutoSteer(run: RunRecord, verification: VerificationResult): boolean {
   if (run.mode === "plan") {
     return false;
   }
@@ -722,13 +721,12 @@ async function shouldAutoSteer(run: RunRecord, verification: VerificationResult)
   if (count >= max) {
     return false;
   }
-  if (verification.shouldContinue || verification.missing.length > 0) {
-    return true;
-  }
-  if (count > 0) {
-    return false;
-  }
-  return await runHasChanges(run);
+  // Steer ONLY when the local verifier flagged a real gap (no file changes, or an
+  // unmet acceptance criterion). A verified-clean pass (missing=[], !shouldContinue)
+  // has already met its bar, so re-running the model on it is pure cost + a 10s wait
+  // with nothing to fix. This used to also fire on the FIRST pass whenever the run
+  // produced any changes, which meant EVERY successful node ran the backend twice.
+  return verification.shouldContinue || verification.missing.length > 0;
 }
 
 function buildSteeringPrompt(verification: VerificationResult): string {
@@ -1265,7 +1263,7 @@ export async function reconcileNativeTerminals(repoRoot: string): Promise<void> 
         data: verification as unknown as JsonValue,
       });
 
-      if (await shouldAutoSteer(run, verification)) {
+      if (shouldAutoSteer(run, verification)) {
         const waitingSince = nowIso();
         run.status = "steering";
         run.autoSteer = {
