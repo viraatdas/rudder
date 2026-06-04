@@ -122,6 +122,10 @@ pub(crate) const SPINNER_FRAMES: [&str; 10] = [
     "\u{280B}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283C}", "\u{2834}", "\u{2826}", "\u{2827}",
     "\u{2807}", "\u{280F}",
 ];
+/// Poll ticks per visible spinner frame. The frame counter advances every tick (~33ms),
+/// which spins too fast to read; showing each glyph for this many ticks slows it to a
+/// calmer ~100ms/frame.
+pub(crate) const SPINNER_TICKS_PER_FRAME: usize = 3;
 const AGENT_PANE_HINTS: &[&str] = &[
     "j/k move",
     "Enter focus",
@@ -878,7 +882,7 @@ impl App {
 
     /// Current spinner glyph for the active animation frame.
     pub(crate) fn spinner_glyph(&self) -> &'static str {
-        SPINNER_FRAMES[self.spinner_frame % SPINNER_FRAMES.len()]
+        SPINNER_FRAMES[(self.spinner_frame / SPINNER_TICKS_PER_FRAME) % SPINNER_FRAMES.len()]
     }
 
     /// True while an orchestrator (a RudderPlan agent) is actively working: its

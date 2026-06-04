@@ -4939,11 +4939,14 @@ branch refs/heads/main\n";
     fn spinner_glyph_advances_with_frame() {
         let mut app = App::new();
         let first = app.spinner_glyph();
+        // The spinner is slowed: it holds each glyph for SPINNER_TICKS_PER_FRAME ticks, so
+        // a single tick must NOT change it, but a full frame's worth of ticks does.
         app.spinner_frame = app.spinner_frame.wrapping_add(1);
-        let second = app.spinner_glyph();
-        assert_ne!(first, second, "advancing the frame changes the spinner glyph");
-        // Wrapping back to the same frame yields the same glyph.
-        app.spinner_frame = SPINNER_FRAMES.len();
+        assert_eq!(first, app.spinner_glyph(), "one tick holds the same glyph (slowed)");
+        app.spinner_frame = SPINNER_TICKS_PER_FRAME;
+        assert_ne!(first, app.spinner_glyph(), "a full frame of ticks advances the glyph");
+        // Wrapping back to frame 0 yields the first glyph.
+        app.spinner_frame = SPINNER_FRAMES.len() * SPINNER_TICKS_PER_FRAME;
         assert_eq!(app.spinner_glyph(), SPINNER_FRAMES[0]);
     }
 
