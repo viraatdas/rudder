@@ -4341,6 +4341,17 @@ branch refs/heads/main\n";
     }
 
     #[test]
+    fn extract_rudder_questions_parses_a_numbered_block() {
+        let out = "intro\nRUDDER_QUESTIONS_START\n1. Time range: 4 weeks or 6 months?\n2. Local only, or also deploy?\nRUDDER_QUESTIONS_END\ntrailing";
+        let qs = extract_rudder_questions(out);
+        assert_eq!(qs.len(), 2);
+        assert_eq!(qs[0], "Time range: 4 weeks or 6 months?");
+        assert_eq!(qs[1], "Local only, or also deploy?");
+        // No block -> empty (so the paused panel falls back to the transcript hint).
+        assert!(extract_rudder_questions("no markers here").is_empty());
+    }
+
+    #[test]
     fn planner_prompt_asks_and_pauses_when_materially_ambiguous() {
         // The planner must be told to ASK + STOP on material ambiguity, not always emit a
         // DAG (which is why it "never asked"). And the clarification-answer framing must be

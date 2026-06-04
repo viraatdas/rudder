@@ -345,6 +345,10 @@ struct App {
     /// routed into refining the old session. Set in evaluate_completed_plan's no-DAG
     /// branches; cleared when a DAG is captured, on approval, and on a fresh plan.
     planner_paused_for_input: bool,
+    /// The planner's clarifying questions (parsed from its RUDDER_QUESTIONS block) while it
+    /// is paused for input, rendered as a clean numbered prompt in the orchestrator pane.
+    /// Set when the planner pauses; cleared on DAG-capture / approval / fresh plan.
+    pending_questions: Vec<String>,
     /// Tick counter used to run the scheduler on a coarse cadence rather than on
     /// every PTY-byte tick.
     scheduler_tick: u64,
@@ -765,6 +769,7 @@ impl App {
             auto_merge_skip: Vec::new(),
             awaiting_approval: restored_queue.awaiting_approval,
             planner_paused_for_input: false,
+            pending_questions: Vec::new(),
             scheduler_tick: 0,
             spinner_frame: 0,
             selected_agent: 0,
@@ -3431,6 +3436,7 @@ impl App {
     fn start_rudder_plan_task(&mut self, input: &str) {
         // A fresh plan supersedes any paused planner.
         self.planner_paused_for_input = false;
+        self.pending_questions.clear();
         // AT-MOST-ONE ORCHESTRATOR: a brand-new plan supersedes any prior pinned
         // planner. Retire stale orchestrator rows (and their on-disk records) before
         // pushing the new one so completed plans never stack as phantom orchestrators
@@ -5028,8 +5034,9 @@ impl App {
                 // No DAG yet: the planner likely asked a clarifying question or needs more
                 // detail. Mark it PAUSED-for-input so the next typed message RESUMES this
                 // planning conversation (NOT a leftover Done orchestrator from a shipped
-                // plan, which must start fresh).
+                // plan, which must start fresh), and capture its questions for the prompt.
                 self.planner_paused_for_input = true;
+                self.pending_questions = extract_rudder_questions(&output);
                 self.notice = Some(format!(
                     "planner is waiting ({error}) — type your answer or more detail to continue planning"
                 ));
@@ -5044,6 +5051,7 @@ impl App {
             let _ = save_native_run_record(&self.cwd, run);
             self.refining = false;
             self.planner_paused_for_input = true;
+            self.pending_questions = extract_rudder_questions(&output);
             // Same as the Err branch: keep the planner resumable so a typed answer
             // continues this conversation rather than starting a fresh planner.
             self.notice = Some(
@@ -5054,6 +5062,7 @@ impl App {
         }
         // A DAG WAS captured: this planner is no longer paused for input.
         self.planner_paused_for_input = false;
+        self.pending_questions.clear();
 
         // Queue every task as a PLANNED node. A new plan replaces any pending queue
         // (the planner is the single source of truth for the active plan).
@@ -5871,6 +5880,7 @@ impl App {
         }
         self.awaiting_approval = false;
         self.planner_paused_for_input = false;
+        self.pending_questions.clear();
         self.persist_plan_queue();
         // Record the plan approval as a cross-cutting decision so the fleet has the
         // authoritative goal + shape in DECISIONS.md from the start.

@@ -1751,18 +1751,31 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
             // a static badge instead of an animated spinner that would imply it is still
             // working forever. A typed message resumes the session (planner_awaiting_input).
             if agent.status != AgentStatus::Running {
-                // Make the question/answer step UNMISTAKABLE: a distinct accent callout +
-                // an explicit "answer in the task box, then Enter" instruction, instead of
-                // burying the affordance in the streamed transcript below.
+                // Make the question/answer step UNMISTAKABLE: a distinct accent header, the
+                // planner's questions as a clean NUMBERED list (parsed from its
+                // RUDDER_QUESTIONS block), and an explicit answer instruction — rather than
+                // burying the questions in the streamed transcript.
                 body.push(Line::from(Span::styled(
-                    "❓ The planner is waiting for your answer",
-                    Style::default()
-                        .fg(ACCENT)
-                        .add_modifier(Modifier::BOLD),
+                    "❓ The planner needs your input",
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
                 )));
+                if app.pending_questions.is_empty() {
+                    body.push(Line::from(Span::styled(
+                        "Its question is at the end of the transcript below.",
+                        pane_text_style(true),
+                    )));
+                } else {
+                    for (i, q) in app.pending_questions.iter().enumerate() {
+                        body.push(Line::from(vec![
+                            Span::styled(format!("  {}. ", i + 1), Style::default().fg(ACCENT)),
+                            Span::styled(q.clone(), pane_text_style(true)),
+                        ]));
+                    }
+                }
+                body.push(Line::default());
                 body.push(Line::from(Span::styled(
-                    "Its question is at the end of the transcript below. Type your answer in the task box and press Enter to continue planning.",
-                    pane_text_style(true),
+                    "↳ answer in the task box below (e.g. \"1: ..., 2: ...\") and press Enter to continue planning",
+                    muted_style(focused),
                 )));
                 body.push(Line::default());
             } else {
