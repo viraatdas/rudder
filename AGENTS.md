@@ -735,16 +735,20 @@ user only ever talks to Rudder; the planner can never go off and implement on it
    + `render_orchestrator`. It researches read-only and CANNOT implement (inspection-only
    tools). The pinned row is LABELED as the model's **plan mode** ("plan mode · Claude Code
    · researching the plan").
-2. **Ask (default on the first turn).** The planner prompt (`rudder_plan_prompt`) tells it
-   to DEFAULT TO ASKING: unless the request is fully specified, it emits 1–4 clarifying
-   questions in a `RUDDER_QUESTIONS_START..END` block and STOPS without a DAG. On that exit
-   with no parseable plan, `evaluate_completed_plan` sets `planner_paused_for_input = true`
-   and parses the questions into `App.pending_questions` (`extract_rudder_questions`). The
-   pane shows a bold "❓ The planner needs your input" header + the questions as a NUMBERED
-   list, and the task box hint becomes "type your ANSWER here". The user's free-text answer
-   routes through `planner_awaiting_input()` → `refine_plan`, which RESUMES the same session
-   with the clarification-answer framing (`build_clarification_answer_followup`, distinct
-   from the refine framing). The planner then emits the DAG (or asks once more).
+2. **Ask (hard gate on the first turn).** The planner prompt (`rudder_plan_prompt`) tells it
+   to ALWAYS ask 1–4 clarifying/confirmation questions in a
+   `RUDDER_QUESTIONS_START..END` block and STOP without a DAG on the first turn. Rudder also
+   enforces this in code: `planner_question_round_done` starts false for a fresh plan,
+   `maybe_detect_plan_ready` refuses streaming DAG capture before it is true, and
+   `evaluate_completed_plan` pauses instead of queuing a first-turn DAG if the model skipped
+   the question. If the model did not emit a question block, Rudder supplies a deterministic
+   fallback question via `planner_questions_or_forced`. The pane shows a bold
+   "❓ The planner needs your input" header + the questions as a NUMBERED list, and the task
+   box hint becomes "type your ANSWER here". The user's free-text answer routes through
+   `planner_awaiting_input()` → `refine_plan`, which RESUMES the same session with the
+   clarification-answer framing (`build_clarification_answer_followup`, distinct from the
+   refine framing) and sets `planner_question_round_done = true`. The planner then emits the
+   DAG (or asks once more).
 3. **DAG ready.** The instant a `RUDDER_PLAN_TASKS` block parses, the pane flips to the
    **pinned DAG** (`orchestrator_phase` Planning → PlanReady) and `awaiting_approval` holds.
    CAPTURE ROBUSTNESS: if the live PTY stream truncated a large block, `evaluate_completed_plan`
@@ -771,11 +775,11 @@ The planner UX went through several iterations; these are the settled decisions 
 - **Labeled "plan mode".** The headless decomposer is presented as the model's plan mode
   (the pinned row + header show "plan mode · Claude Code/Codex · …") because that is what it
   is to the user: the model planning read-only. This is a deliberate product framing.
-- **Default to asking clarifying questions.** The planner asks first (step 2) rather than
-  silently assuming, including when prior context (existing files, DECISIONS.md) suggests an
-  answer. This is prompt-driven (the model judges), so it is a strong DEFAULT, not a hard
-  gate; a genuinely unambiguous request still goes straight to the DAG. If a hard always-ask
-  gate is ever wanted, it would force a question round on every plan (including trivial ones).
+- **Hard first question gate.** The planner asks first (step 2) rather than silently
+  assuming, including for trivial or fully specified requests. This is no longer only
+  prompt-driven: Rudder refuses to capture the first DAG until the user has answered one
+  question round. The tradeoff is intentional: every fresh plan pauses once, but the "does it
+  ask?" behavior is deterministic.
 - **Free-text answers, not a selectable widget.** Questions render as a numbered list and
   the user answers in the task box with free text (e.g. "1: 6 months, 2: reuse"). Chosen over
   forcing the headless model to invent multiple-choice options, because free text is more

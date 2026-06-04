@@ -353,6 +353,12 @@ struct App {
     /// is paused for input, rendered as a clean numbered prompt in the orchestrator pane.
     /// Set when the planner pauses; cleared on DAG-capture / approval / fresh plan.
     pending_questions: Vec<String>,
+    /// Code-level mandatory first question gate. A fresh initial planner may not
+    /// capture a `RUDDER_PLAN_TASKS` block until the user has answered one question
+    /// round. This makes "asks first" deterministic instead of relying only on the
+    /// model prompt. Refine/rebase/reconcile paths are already later turns and do
+    /// not use this gate.
+    planner_question_round_done: bool,
     /// Tick counter used to run the scheduler on a coarse cadence rather than on
     /// every PTY-byte tick.
     scheduler_tick: u64,
@@ -774,6 +780,7 @@ impl App {
             awaiting_approval: restored_queue.awaiting_approval,
             planner_paused_for_input: false,
             pending_questions: Vec::new(),
+            planner_question_round_done: false,
             scheduler_tick: 0,
             spinner_frame: 0,
             selected_agent: 0,
@@ -944,6 +951,9 @@ impl App {
     /// `render_worker`.
     fn selected_orchestrator_dag_active(&self) -> bool {
         if self.worker_view != WorkerView::Terminal {
+            return false;
+        }
+        if self.planner_paused_for_input {
             return false;
         }
         self.agents.get(self.selected_agent).is_some_and(|run| {
@@ -3441,6 +3451,7 @@ impl App {
         // A fresh plan supersedes any paused planner.
         self.planner_paused_for_input = false;
         self.pending_questions.clear();
+        self.planner_question_round_done = false;
         // AT-MOST-ONE ORCHESTRATOR: a brand-new plan supersedes any prior pinned
         // planner. Retire stale orchestrator rows (and their on-disk records) before
         // pushing the new one so completed plans never stack as phantom orchestrators
@@ -3599,7 +3610,8 @@ impl App {
         // message is an ANSWER (continue planning), not feedback on a shown plan. Using the
         // refine framing here ("the plan you produced") would confuse the model since no
         // plan exists yet, and its "do not ask questions" would block further clarification.
-        let followup = if self.planner_paused_for_input {
+        let answering_clarification = self.planner_paused_for_input;
+        let followup = if answering_clarification {
             build_clarification_answer_followup(feedback)
         } else {
             build_refine_followup(feedback)
@@ -3644,6 +3656,9 @@ impl App {
             }
         }
         if self.relaunch_orchestrator_with(index, command, feedback) {
+            if answering_clarification {
+                self.planner_question_round_done = true;
+            }
             self.notice = Some("refining the plan with your feedback…".to_string());
         } else {
             // The planner could not be relaunched: drop back to the existing plan so
@@ -4949,6 +4964,14 @@ impl App {
         if !self.refining && (self.awaiting_approval || !self.planned_nodes.is_empty()) {
             return;
         }
+        // Mandatory first question gate: do not capture a first-turn DAG from
+        // streaming output. Let the planner process finish, then
+        // `evaluate_completed_plan` pauses for the required user answer. This
+        // prevents a model that ignored the prompt from slipping a plan through
+        // the early-capture path.
+        if !self.refining && !self.planner_question_round_done {
+            return;
+        }
         let index = self.agents.iter().position(|run| {
             run.mode == AgentMode::RudderPlan
                 && !run.reconcile_planner
@@ -5040,13 +5063,25 @@ impl App {
                 // planning conversation (NOT a leftover Done orchestrator from a shipped
                 // plan, which must start fresh), and capture its questions for the prompt.
                 self.planner_paused_for_input = true;
-                self.pending_questions = extract_rudder_questions(&output);
+                self.pending_questions = planner_questions_or_forced(&output);
                 self.notice = Some(format!(
                     "planner is waiting ({error}) — type your answer or more detail to continue planning"
                 ));
                 return;
             }
         };
+        if !self.refining && !self.planner_question_round_done {
+            run.autosteered = false;
+            let _ = save_native_run_record(&self.cwd, run);
+            self.planner_paused_for_input = true;
+            self.pending_questions = planner_questions_or_forced(&output);
+            self.notice = Some(
+                "planner needs one question round before the DAG — type your answer to continue planning"
+                    .to_string(),
+            );
+            self.dirty = true;
+            return;
+        }
         // Capture the planner's prose after the block (assumptions / open questions)
         // so the orchestrator pane can show what it assumed and invite refinement.
         let summary = extract_rudder_plan_summary(&output);
@@ -5055,7 +5090,7 @@ impl App {
             let _ = save_native_run_record(&self.cwd, run);
             self.refining = false;
             self.planner_paused_for_input = true;
-            self.pending_questions = extract_rudder_questions(&output);
+            self.pending_questions = planner_questions_or_forced(&output);
             // Same as the Err branch: keep the planner resumable so a typed answer
             // continues this conversation rather than starting a fresh planner.
             self.notice = Some(
@@ -8305,4 +8340,3 @@ fn set_private_file_mode(path: &Path) {
 
 #[cfg(not(unix))]
 fn set_private_file_mode(_path: &Path) {}
-

@@ -870,10 +870,18 @@ pub(crate) fn orchestrator_phase(agent: &AgentRun) -> OrchestratorPhase {
     }
 }
 
+fn orchestrator_phase_for_app(app: &App, agent: &AgentRun) -> OrchestratorPhase {
+    if agent.is_orchestrator() && app.planner_paused_for_input {
+        OrchestratorPhase::Planning
+    } else {
+        orchestrator_phase(agent)
+    }
+}
+
 /// Short phase label for the pinned orchestrator row: "planning" while
 /// decomposing, then "plan N · running X" once tasks are parsed and launching.
 fn orchestrator_phase_label(app: &App, agent: &AgentRun) -> String {
-    match orchestrator_phase(agent) {
+    match orchestrator_phase_for_app(app, agent) {
         OrchestratorPhase::Planning => "planning".to_string(),
         OrchestratorPhase::PlanReady(tasks) => {
             let running = tasks
@@ -918,7 +926,7 @@ fn push_orchestrator_row<'a>(
     // While the planner is still researching/decomposing, present it as the model's
     // PLAN MODE (Claude Code / Codex) so it reads as genuine plan mode; once the DAG is
     // parsed it becomes the orchestrator with its live status. Spin during planning.
-    let planning = matches!(orchestrator_phase(agent), OrchestratorPhase::Planning)
+    let planning = matches!(orchestrator_phase_for_app(app, agent), OrchestratorPhase::Planning)
         && agent.status == AgentStatus::Running;
     let badge = if planning {
         app.spinner_glyph()
@@ -1654,7 +1662,7 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
         return;
     };
 
-    let phase = orchestrator_phase(agent);
+    let phase = orchestrator_phase_for_app(app, agent);
     let phase_label = match &phase {
         OrchestratorPhase::Planning => "plan mode".to_string(),
         OrchestratorPhase::PlanReady(tasks) => format!("plan · {} tasks", tasks.len()),
@@ -3009,4 +3017,3 @@ pub(crate) fn is_cloud_agent(agent: &AgentRun) -> bool {
 }
 
 // status_color now lives in theme.rs (re-exported via the crate root).
-

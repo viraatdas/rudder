@@ -4211,6 +4211,7 @@ branch refs/heads/main\n";
         let planner = planner_with_block(&app, block);
         app.agents.push(planner);
         app.selected_agent = 0;
+        app.planner_question_round_done = true;
 
         app.evaluate_completed_plan(0);
 
@@ -4254,6 +4255,7 @@ branch refs/heads/main\n";
         let planner = planner_with_block(&app, block);
         app.agents.push(planner);
         app.selected_agent = 0;
+        app.planner_question_round_done = true;
 
         app.evaluate_completed_plan(0);
 
@@ -4277,6 +4279,32 @@ branch refs/heads/main\n";
 
     #[cfg(not(windows))]
     #[test]
+    fn first_turn_dag_is_forced_to_pause_for_question_round() {
+        let mut app = App::new();
+        app.cwd = std::env::temp_dir();
+        let block = "RUDDER_PLAN_TASKS_START\n{\"tasks\":[{\"title\":\"only\",\"prompt\":\"do the thing\",\"goal\":\"thing\",\"success\":\"done\"}]}\nRUDDER_PLAN_TASKS_END\n";
+        let planner = planner_with_block(&app, block);
+        app.agents.push(planner);
+        app.selected_agent = 0;
+
+        app.evaluate_completed_plan(0);
+
+        assert!(app.planner_paused_for_input, "the first turn must ask before DAG capture");
+        assert!(!app.awaiting_approval, "no approval gate until the answer turn emits a DAG");
+        assert!(app.planned_nodes.is_empty(), "premature DAG is not queued");
+        assert_eq!(
+            app.pending_questions,
+            forced_planner_questions(),
+            "Rudder supplies a deterministic question if the model skipped its own"
+        );
+        assert!(
+            !app.agents[0].autosteered,
+            "the refused first turn is captured once and waits for a resumed answer"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
     fn evaluate_populates_planned_nodes_without_launching() {
         let mut app = App::new();
         app.cwd = std::env::temp_dir();
@@ -4287,6 +4315,7 @@ branch refs/heads/main\n";
         let planner = planner_with_block(&app, block);
         app.agents.push(planner);
         app.selected_agent = 0;
+        app.planner_question_round_done = true;
 
         app.evaluate_completed_plan(0);
 
@@ -4353,14 +4382,14 @@ branch refs/heads/main\n";
 
     #[test]
     fn planner_prompt_asks_and_pauses_when_materially_ambiguous() {
-        // The planner must be told to ASK + STOP on material ambiguity, not always emit a
-        // DAG (which is why it "never asked"). And the clarification-answer framing must be
-        // distinct from the refine framing.
+        // The planner must be told to ASK + STOP on the first turn, not decide that a
+        // request is clear enough to skip questions. And the clarification-answer framing
+        // must be distinct from the refine framing.
         let prompt = rudder_plan_prompt("make me something");
-        assert!(prompt.contains("ASK") && prompt.contains("STOP"), "instructs ask-then-pause");
+        assert!(prompt.contains("ALWAYS ASK") && prompt.contains("STOP"), "instructs ask-then-pause");
         assert!(
-            !prompt.contains("never stop without emitting"),
-            "no longer forces a best-effort DAG every turn"
+            !prompt.contains("unless it is already completely specified"),
+            "the first-turn question round is no longer optional"
         );
         let answer = build_clarification_answer_followup("medium_term, top 5 tracks");
         assert!(answer.to_lowercase().contains("answer"), "framed as an answer, not refine");
@@ -4724,6 +4753,7 @@ branch refs/heads/main\n";
         // The discriminator is what the poll loop branches on: capture the initial
         // plan (replace) and verify the queue holds exactly its node.
         app.agents.push(initial);
+        app.planner_question_round_done = true;
         app.evaluate_completed_plan(0);
         assert_eq!(app.planned_nodes.len(), 1);
         assert_eq!(app.planned_nodes[0].id, "n0", "initial plan captured via replace path");

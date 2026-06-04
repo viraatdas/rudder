@@ -172,8 +172,8 @@ Just type a task. Rudder runs the model in **plan mode** (Claude Code or Codex),
 live in the orchestrator pane. The flow stays entirely inside Rudder — you only ever talk to
 Rudder, and the planner researches read-only and can never implement on its own:
 
-1. **It asks first.** Unless your request is already fully specified, the planner inspects
-   the repo and then asks you a few clarifying questions, shown as a numbered prompt:
+1. **It asks first.** The planner inspects the repo and then asks at least one
+   clarifying or confirmation question before the first DAG, shown as a numbered prompt:
 
    ```
    ❓ The planner needs your input
@@ -184,7 +184,8 @@ Rudder, and the planner researches read-only and can never implement on its own:
    ```
 
    Type your answer in the task box and press `Enter`; it continues the same planning
-   conversation with your answer. (A fully unambiguous request skips straight to the plan.)
+   conversation with your answer. Rudder enforces this first question round in code, so
+   even a fully specified request pauses once before the first plan.
 2. **It lays out a DAG.** When it is ready it shows the task DAG (a tree of worker tasks
    with their dependencies). Type to refine it (Rudder re-plans, the DAG updates in place),
    or press `Enter` on an empty input to approve and launch.
