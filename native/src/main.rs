@@ -3585,14 +3585,17 @@ impl App {
         // conversation (claude --resume / codex exec resume). Otherwise fall back to a
         // fresh decompose with the full context crammed into the prompt.
         let resume = session.is_some();
+        // Pick the framing: if the planner PAUSED to ask a clarifying question, the user's
+        // message is an ANSWER (continue planning), not feedback on a shown plan. Using the
+        // refine framing here ("the plan you produced") would confuse the model since no
+        // plan exists yet, and its "do not ask questions" would block further clarification.
+        let followup = if self.planner_paused_for_input {
+            build_clarification_answer_followup(feedback)
+        } else {
+            build_refine_followup(feedback)
+        };
         let command = match &session {
-            Some(sid) => rudder_plan_refine_command(
-                backend,
-                &model,
-                effort,
-                &build_refine_followup(feedback),
-                sid,
-            ),
+            Some(sid) => rudder_plan_refine_command(backend, &model, effort, &followup, sid),
             None => {
                 let original = if self.plan_request.trim().is_empty() {
                     self.planned_origin.clone()

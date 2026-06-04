@@ -4341,6 +4341,23 @@ branch refs/heads/main\n";
     }
 
     #[test]
+    fn planner_prompt_asks_and_pauses_when_materially_ambiguous() {
+        // The planner must be told to ASK + STOP on material ambiguity, not always emit a
+        // DAG (which is why it "never asked"). And the clarification-answer framing must be
+        // distinct from the refine framing.
+        let prompt = rudder_plan_prompt("make me something");
+        assert!(prompt.contains("ASK") && prompt.contains("STOP"), "instructs ask-then-pause");
+        assert!(
+            !prompt.contains("never stop without emitting"),
+            "no longer forces a best-effort DAG every turn"
+        );
+        let answer = build_clarification_answer_followup("medium_term, top 5 tracks");
+        assert!(answer.to_lowercase().contains("answer"), "framed as an answer, not refine");
+        assert!(answer.contains("RUDDER_PLAN_TASKS_START"), "asks for the DAG once answered");
+        assert!(answer.contains("medium_term, top 5 tracks"), "carries the user's answer");
+    }
+
+    #[test]
     fn transcript_fallback_recovers_a_plan_block_the_pty_stream_missed() {
         // The on-disk transcript reliably carries the full final message even when the live
         // PTY stream truncated a large RUDDER_PLAN_TASKS block. parse_transcript_final_text
