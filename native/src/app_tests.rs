@@ -1,5 +1,10 @@
     use super::*;
 
+    /// Flatten a rendered Line back into its plain text (span contents joined).
+    fn flatten_line(line: &ratatui::text::Line<'_>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
     fn count_byte_subsequence(haystack: &[u8], needle: &[u8]) -> usize {
         haystack
             .windows(needle.len())
@@ -4353,6 +4358,41 @@ branch refs/heads/main\n";
             raw.contains("RUDDER_QUESTIONS_START") && raw.contains("Tracks, artists, or both?"),
             "without strip the block is shown verbatim (live planning has no separate prompt)"
         );
+    }
+
+    #[test]
+    fn question_card_is_box_aligned_and_holds_questions_plus_answer() {
+        // The bordered "plan mode" card must keep every row exactly box-wide (or the
+        // right border tears), show each question, and render the live answer + cursor.
+        let box_w = 64usize;
+        let questions = vec![
+            "Reuse js/config.js, or rebuild from scratch?".to_string(),
+            "Real Spotify API, or mock data so it works with no setup at all today?".to_string(),
+        ];
+        let mut lines: Vec<ratatui::text::Line<'static>> = Vec::new();
+        crate::render::push_question_card(&mut lines, &questions, "1: reuse, 2: mock", 17, box_w, true);
+
+        // Alignment invariant: every rendered row is exactly box_w columns.
+        for (i, line) in lines.iter().enumerate() {
+            assert_eq!(line.width(), box_w, "row {i} is not box-aligned: {:?}", flatten_line(line));
+        }
+        let text = lines.iter().map(flatten_line).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("╭─") && text.contains("╮"), "has a top border");
+        assert!(text.contains("╰─") && text.contains("╯"), "has a bottom border");
+        assert!(text.contains("Plan mode"), "titled as plan mode");
+        assert!(text.contains("Reuse js/config.js"), "shows question 1");
+        assert!(text.contains("mock data"), "shows question 2 (wrapped)");
+        assert!(text.contains("› 1: reuse, 2: mock"), "renders the live answer field");
+        assert!(text.contains('↵') && text.contains("esc clear"), "footer shows key hints");
+    }
+
+    #[test]
+    fn question_card_falls_back_to_a_plain_list_on_narrow_panes() {
+        let mut lines: Vec<ratatui::text::Line<'static>> = Vec::new();
+        crate::render::push_question_card(&mut lines, &["only one?".to_string()], "", 0, 20, true);
+        let text = lines.iter().map(flatten_line).collect::<Vec<_>>().join("\n");
+        assert!(!text.contains('╭'), "no box on a narrow pane");
+        assert!(text.contains("The planner needs your input") && text.contains("only one?"));
     }
 
     #[cfg(not(windows))]

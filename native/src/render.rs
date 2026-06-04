@@ -1797,42 +1797,42 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
                 push_transcript_lines(&mut body, transcript, focused, strip_questions);
             }
             if paused {
-                // Make the question/answer step UNMISTAKABLE: a distinct accent header, the
-                // planner's questions as a clean NUMBERED list (parsed from its
-                // RUDDER_QUESTIONS block), and an explicit answer instruction. Anchored at
-                // the BOTTOM of the body so it stays in view (the body sticks to the
-                // bottom) instead of scrolling off above a long transcript.
+                // Render the question/answer step as a bordered "plan mode" card with the
+                // free-text answer field pulled INSIDE the box (native-plan-mode feel),
+                // anchored at the BOTTOM of the body so it stays in view (the body sticks to
+                // the bottom) instead of scrolling off above a long transcript. The answer is
+                // `worker_input_draft`; Enter submits it (refine), Esc clears it.
                 body.push(Line::default());
-                body.push(Line::from(Span::styled(
-                    "❓ The planner needs your input",
-                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                )));
                 if app.pending_questions.is_empty() {
                     body.push(Line::from(Span::styled(
+                        "❓ The planner needs your input",
+                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                    )));
+                    body.push(Line::from(Span::styled(
                         "Its question is at the end of the transcript above.",
-                        pane_text_style(true),
+                        pane_text_style(focused),
                     )));
                 } else {
-                    for (i, q) in app.pending_questions.iter().enumerate() {
-                        body.push(Line::from(vec![
-                            Span::styled(format!("  {}. ", i + 1), Style::default().fg(ACCENT)),
-                            Span::styled(q.clone(), pane_text_style(true)),
-                        ]));
-                    }
+                    push_question_card(
+                        &mut body,
+                        &app.pending_questions,
+                        &agent.worker_input_draft,
+                        agent.worker_input_cursor,
+                        inner.width as usize,
+                        focused,
+                    );
                 }
-                body.push(Line::default());
-                body.push(Line::from(Span::styled(
-                    "↳ answer in the task box below (e.g. \"1: ..., 2: ...\") and press Enter to continue planning",
-                    muted_style(focused),
-                )));
             }
+            // While paused, the answer is typed into the card's own field, so suppress the
+            // separate chat-input region to avoid a duplicated cursor below the box.
+            let input_region: &[Line<'static>] = if paused { &[] } else { &input };
             render_orchestrator_layout(
                 frame,
                 inner,
                 &header,
                 &[],
                 &body,
-                &input,
+                input_region,
                 &mut app.orch_dag_scroll,
                 true,
             );
@@ -2084,6 +2084,167 @@ fn render_orchestrator_layout(
             chunks[3],
         );
     }
+}
+
+/// A blank interior row of the plan-mode card: `│` + spaces + `│`, exactly `box_w` wide.
+fn card_blank(box_w: usize, border: Style) -> Line<'static> {
+    Line::from(vec![
+        Span::styled("│", border),
+        Span::raw(" ".repeat(box_w.saturating_sub(2))),
+        Span::styled("│", border),
+    ])
+}
+
+/// A top (`╭─ … ─╮`) or bottom (`╰─ … ─╯`) border row with an embedded label,
+/// exactly `box_w` wide. The label is truncated with `…` if it would not fit.
+fn card_border(top: bool, label: &str, box_w: usize, border: Style, label_style: Style) -> Line<'static> {
+    let (lead, corner) = if top { ("╭─ ", "╮") } else { ("╰─ ", "╯") };
+    // Reserve: lead(3) + label + trailing space(1) + dashes(>=1) + corner(1).
+    let max_label = box_w.saturating_sub(6);
+    let label_fit: String = if label.chars().count() > max_label {
+        format!("{}…", label.chars().take(max_label.saturating_sub(1)).collect::<String>())
+    } else {
+        label.to_string()
+    };
+    let used = 3 + label_fit.chars().count() + 1; // lead + label + trailing space
+    let dashes = box_w.saturating_sub(used + 1); // +1 for the corner
+    Line::from(vec![
+        Span::styled(lead, border),
+        Span::styled(label_fit, label_style),
+        Span::styled(" ", border),
+        Span::styled("─".repeat(dashes), border),
+        Span::styled(corner, border),
+    ])
+}
+
+/// Render the planner's clarifying questions as a bordered "plan mode" card with the
+/// free-text answer field pulled INSIDE the box, for a native-plan-mode feel. `draft`
+/// + `cursor` are the live `worker_input_draft`/`worker_input_cursor`: Enter submits
+/// the answer (refine), Esc clears it. All width math is char-count based, which
+/// matches how ratatui renders this (ASCII-ish) content, so the borders stay aligned.
+pub(crate) fn push_question_card(
+    body: &mut Vec<Line<'static>>,
+    questions: &[String],
+    draft: &str,
+    cursor: usize,
+    width: usize,
+    focused: bool,
+) {
+    let border = Style::default().fg(ACCENT);
+    let accent = Style::default().fg(ACCENT);
+    let text = pane_text_style(focused);
+    let box_w = width.max(1);
+
+    // Narrow-pane fallback: a plain numbered list (a box would wrap and break).
+    if box_w < 30 {
+        body.push(Line::from(Span::styled(
+            "❓ The planner needs your input",
+            accent.add_modifier(Modifier::BOLD),
+        )));
+        for (i, q) in questions.iter().enumerate() {
+            body.push(Line::from(vec![
+                Span::styled(format!("  {}. ", i + 1), accent),
+                Span::styled(q.clone(), text),
+            ]));
+        }
+        body.push(Line::from(Span::styled(
+            "↳ type your answer below and press Enter",
+            muted_style(focused),
+        )));
+        return;
+    }
+
+    let content_w = box_w - 4; // "│ " (2) + content + " │" (2)
+
+    body.push(card_border(true, "◆ Plan mode · a few quick questions", box_w, border, accent.add_modifier(Modifier::BOLD)));
+    body.push(card_blank(box_w, border));
+
+    // Numbered, wrapped questions. The number label is a fixed 3-col gutter so wrapped
+    // continuation lines hang-indent under the text.
+    let label_w = 3usize;
+    let q_avail = content_w.saturating_sub(label_w);
+    for (i, q) in questions.iter().enumerate() {
+        for (li, seg) in wrap_text(q, q_avail as u16).iter().enumerate() {
+            let label = if li == 0 {
+                format!("{:<width$}", i + 1, width = label_w)
+            } else {
+                " ".repeat(label_w)
+            };
+            let pad = content_w.saturating_sub(label_w + seg.chars().count());
+            body.push(Line::from(vec![
+                Span::styled("│ ", border),
+                Span::styled(label, accent),
+                Span::styled(seg.clone(), text),
+                Span::raw(" ".repeat(pad)),
+                Span::styled(" │", border),
+            ]));
+        }
+    }
+
+    body.push(card_blank(box_w, border));
+
+    // The answer field, inside the box: "› " + the live draft with a block cursor.
+    let inner_avail = content_w.saturating_sub(2); // after the "› " prompt
+    let cursor_style = text.add_modifier(Modifier::REVERSED);
+    let mut spans: Vec<Span<'static>> = vec![Span::styled("│ ", border), Span::styled("› ", accent)];
+    let mut used = 2usize; // "› "
+    let chars: Vec<char> = draft.chars().collect();
+    if chars.is_empty() {
+        if focused {
+            spans.push(Span::styled(" ", cursor_style));
+            used += 1;
+            let ph: String = "type your answer, e.g. 1: reuse, 2: mock"
+                .chars()
+                .take(inner_avail.saturating_sub(1))
+                .collect();
+            used += ph.chars().count();
+            spans.push(Span::styled(ph, muted_style(focused)));
+        } else {
+            let ph: String = "type to answer".chars().take(inner_avail).collect();
+            used += ph.chars().count();
+            spans.push(Span::styled(ph, muted_style(focused)));
+        }
+    } else if !focused {
+        let shown: String = chars.iter().take(inner_avail).collect();
+        used += shown.chars().count();
+        spans.push(Span::styled(shown, text));
+    } else if chars.len() + 1 <= inner_avail {
+        // Whole draft fits: render before / cursor cell / after so mid-line editing shows.
+        let cur = cursor.min(chars.len());
+        let before: String = chars[..cur].iter().collect();
+        let after: String = if cur < chars.len() { chars[cur + 1..].iter().collect() } else { String::new() };
+        used += before.chars().count();
+        spans.push(Span::styled(before, text));
+        let cell = chars.get(cur).map(|c| c.to_string()).unwrap_or_else(|| " ".to_string());
+        used += 1;
+        spans.push(Span::styled(cell, cursor_style));
+        used += after.chars().count();
+        spans.push(Span::styled(after, text));
+    } else {
+        // Overflow: tail-anchor with a leading ellipsis and an end cursor.
+        let tail: String = chars
+            .iter()
+            .skip(chars.len().saturating_sub(inner_avail.saturating_sub(2)))
+            .collect();
+        used += 1;
+        spans.push(Span::styled("…".to_string(), muted_style(focused)));
+        used += tail.chars().count();
+        spans.push(Span::styled(tail, text));
+        used += 1;
+        spans.push(Span::styled(" ", cursor_style));
+    }
+    let pad = content_w.saturating_sub(used);
+    spans.push(Span::raw(" ".repeat(pad)));
+    spans.push(Span::styled(" │", border));
+    body.push(Line::from(spans));
+
+    body.push(card_border(
+        false,
+        "↵ continue  ·  esc clear  ·  or just describe what you want",
+        box_w,
+        border,
+        muted_style(focused),
+    ));
 }
 
 /// Render a planner transcript (reasoning/tool/text/user turns) into `out`, with
