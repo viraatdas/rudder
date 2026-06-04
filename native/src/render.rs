@@ -1758,18 +1758,58 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
             // clarifying question or needs more detail), show a terminal PAUSED state with
             // a static badge instead of an animated spinner that would imply it is still
             // working forever. A typed message resumes the session (planner_awaiting_input).
-            if agent.status != AgentStatus::Running {
+            let paused = agent.status != AgentStatus::Running;
+            if !paused {
+                let spinner_label = if app.rebasing {
+                    "rebasing the plan…"
+                } else if app.refining {
+                    "refining the plan…"
+                } else {
+                    "decomposing the task…"
+                };
+                body.push(Line::from(vec![
+                    Span::styled(app.spinner_glyph(), Style::default().fg(ACCENT)),
+                    Span::raw(" "),
+                    Span::styled(spinner_label, pane_text_style(true)),
+                ]));
+                body.push(Line::default());
+            }
+            // The planner's reasoning + the files it inspected, then (when paused) the
+            // prose that leads into the questions. The RUDDER_QUESTIONS block is stripped
+            // here because it is re-rendered as a clean numbered prompt just below, so the
+            // reading order is: inspection → "what shapes the build" → the questions.
+            let empty: &[PlanEntry] = &[];
+            let transcript = agent
+                .plan_stream
+                .as_ref()
+                .map(|stream| stream.transcript())
+                .unwrap_or(empty);
+            if transcript.is_empty() {
+                body.push(Line::from(Span::styled(
+                    "starting the planner…",
+                    muted_style(focused),
+                )));
+            } else {
+                // Only strip the questions block when we actually re-render it as a
+                // separate prompt below; otherwise (no parsed questions) leave it in the
+                // transcript so the "its question is above" pointer is truthful.
+                let strip_questions = paused && !app.pending_questions.is_empty();
+                push_transcript_lines(&mut body, transcript, focused, strip_questions);
+            }
+            if paused {
                 // Make the question/answer step UNMISTAKABLE: a distinct accent header, the
                 // planner's questions as a clean NUMBERED list (parsed from its
-                // RUDDER_QUESTIONS block), and an explicit answer instruction — rather than
-                // burying the questions in the streamed transcript.
+                // RUDDER_QUESTIONS block), and an explicit answer instruction. Anchored at
+                // the BOTTOM of the body so it stays in view (the body sticks to the
+                // bottom) instead of scrolling off above a long transcript.
+                body.push(Line::default());
                 body.push(Line::from(Span::styled(
                     "❓ The planner needs your input",
                     Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
                 )));
                 if app.pending_questions.is_empty() {
                     body.push(Line::from(Span::styled(
-                        "Its question is at the end of the transcript below.",
+                        "Its question is at the end of the transcript above.",
                         pane_text_style(true),
                     )));
                 } else {
@@ -1785,35 +1825,6 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
                     "↳ answer in the task box below (e.g. \"1: ..., 2: ...\") and press Enter to continue planning",
                     muted_style(focused),
                 )));
-                body.push(Line::default());
-            } else {
-                let spinner_label = if app.rebasing {
-                    "rebasing the plan…"
-                } else if app.refining {
-                    "refining the plan…"
-                } else {
-                    "decomposing the task…"
-                };
-                body.push(Line::from(vec![
-                    Span::styled(app.spinner_glyph(), Style::default().fg(ACCENT)),
-                    Span::raw(" "),
-                    Span::styled(spinner_label, pane_text_style(true)),
-                ]));
-            }
-            body.push(Line::default());
-            let empty: &[PlanEntry] = &[];
-            let transcript = agent
-                .plan_stream
-                .as_ref()
-                .map(|stream| stream.transcript())
-                .unwrap_or(empty);
-            if transcript.is_empty() {
-                body.push(Line::from(Span::styled(
-                    "starting the planner…",
-                    muted_style(focused),
-                )));
-            } else {
-                push_transcript_lines(&mut body, transcript, focused);
             }
             render_orchestrator_layout(
                 frame,
@@ -2077,7 +2088,18 @@ fn render_orchestrator_layout(
 
 /// Render a planner transcript (reasoning/tool/text/user turns) into `out`, with
 /// dim italic thinking, muted tool/system lines, and accented user turns.
-fn push_transcript_lines(out: &mut Vec<Line<'static>>, transcript: &[PlanEntry], focused: bool) {
+pub(crate) fn push_transcript_lines(
+    out: &mut Vec<Line<'static>>,
+    transcript: &[PlanEntry],
+    focused: bool,
+    strip_questions: bool,
+) {
+    // When the planner has paused for input, the RUDDER_QUESTIONS block is rendered
+    // separately as a clean numbered prompt, so showing it again here (raw markers
+    // and all) is noisy duplication. Skip the block — including its START/END marker
+    // lines — wherever it appears in the streamed text. `skipping` persists across
+    // entries because streamed deltas can split the block over several Text entries.
+    let mut skipping = false;
     for entry in transcript {
         let (prefix, style) = match entry.kind {
             PlanEntryKind::Thinking => ("· ", muted_style(focused).add_modifier(Modifier::ITALIC)),
@@ -2091,6 +2113,23 @@ fn push_transcript_lines(out: &mut Vec<Line<'static>>, transcript: &[PlanEntry],
         };
         let mut first = true;
         for sub in entry.text.split('\n') {
+            if strip_questions {
+                let marker = sub.trim();
+                if marker == "RUDDER_QUESTIONS_START" {
+                    skipping = true;
+                    first = false;
+                    continue;
+                }
+                if marker == "RUDDER_QUESTIONS_END" {
+                    skipping = false;
+                    first = false;
+                    continue;
+                }
+                if skipping {
+                    first = false;
+                    continue;
+                }
+            }
             let content = if first {
                 format!("{prefix}{}", sub.trim_end())
             } else {

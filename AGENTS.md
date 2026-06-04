@@ -742,9 +742,13 @@ user only ever talks to Rudder; the planner can never go off and implement on it
    `maybe_detect_plan_ready` refuses streaming DAG capture before it is true, and
    `evaluate_completed_plan` pauses instead of queuing a first-turn DAG if the model skipped
    the question. If the model did not emit a question block, Rudder supplies a deterministic
-   fallback question via `planner_questions_or_forced`. The pane shows a bold
-   "❓ The planner needs your input" header + the questions as a NUMBERED list, and the task
-   box hint becomes "type your ANSWER here". The user's free-text answer routes through
+   fallback question via `planner_questions_or_forced`. The pane renders the planner's
+   inspection transcript first, then a bold "❓ The planner needs your input" header + the
+   questions as a NUMBERED list anchored at the BOTTOM of the body (the body sticks to the
+   bottom, so the questions stay in view above a long transcript instead of scrolling off).
+   The raw `RUDDER_QUESTIONS_START..END` block is stripped from that transcript
+   (`push_transcript_lines(strip_questions)`) so the questions are not shown twice. The user's
+   free-text answer routes through
    `planner_awaiting_input()` → `refine_plan`, which RESUMES the same session with the
    clarification-answer framing (`build_clarification_answer_followup`, distinct from the
    refine framing) and sets `planner_question_round_done = true`. The planner then emits the

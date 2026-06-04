@@ -4303,6 +4303,58 @@ branch refs/heads/main\n";
         );
     }
 
+    #[test]
+    fn paused_planner_transcript_strips_the_duplicate_questions_block() {
+        // When the planner pauses for input, the questions are re-rendered as a clean
+        // numbered prompt, so the streamed RUDDER_QUESTIONS block (markers + the same
+        // questions) must NOT also appear in the transcript below it. The inspection
+        // prose around it stays.
+        let transcript = vec![
+            PlanEntry {
+                kind: PlanEntryKind::Tool,
+                text: "Reading js/config.js".to_string(),
+            },
+            PlanEntry {
+                kind: PlanEntryKind::Text,
+                text: "I inspected the repo.\nA few things shape the build:\nRUDDER_QUESTIONS_START\nTracks, artists, or both?\nReuse js/config.js?\nRUDDER_QUESTIONS_END".to_string(),
+            },
+        ];
+        let flatten = |lines: &[ratatui::text::Line<'static>]| -> String {
+            lines
+                .iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let mut stripped = Vec::new();
+        crate::render::push_transcript_lines(&mut stripped, &transcript, false, true);
+        let stripped = flatten(&stripped);
+        assert!(!stripped.contains("RUDDER_QUESTIONS_START"), "marker is hidden");
+        assert!(!stripped.contains("RUDDER_QUESTIONS_END"), "marker is hidden");
+        assert!(!stripped.contains("Tracks, artists, or both?"), "question is not duplicated");
+        assert!(!stripped.contains("Reuse js/config.js?"), "question is not duplicated");
+        assert!(stripped.contains("I inspected the repo."), "inspection prose is kept");
+        assert!(
+            stripped.contains("A few things shape the build:"),
+            "the lead-in into the questions is kept (it now sits right above them)"
+        );
+        assert!(stripped.contains("Reading js/config.js"), "tool steps are kept");
+
+        let mut raw = Vec::new();
+        crate::render::push_transcript_lines(&mut raw, &transcript, false, false);
+        let raw = flatten(&raw);
+        assert!(
+            raw.contains("RUDDER_QUESTIONS_START") && raw.contains("Tracks, artists, or both?"),
+            "without strip the block is shown verbatim (live planning has no separate prompt)"
+        );
+    }
+
     #[cfg(not(windows))]
     #[test]
     fn evaluate_populates_planned_nodes_without_launching() {
