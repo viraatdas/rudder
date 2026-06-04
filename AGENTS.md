@@ -565,6 +565,16 @@ From `package.json`:
 
 `tests/` are integration tests that import from `dist/` (so build first):
 `rebase-first.test.mjs` exercises merge/rebase/sync via `git.ts` + `state.ts`.
+`e2e-orchestrator.test.mjs` is the WHOLE-WORKFLOW test: it drives the real
+`rudder plan` + `rudder board` CLIs against a throwaway git+jj repo and verifies the
+DAG drains end-to-end (schedule → isolated jj workspace → worker → verify → jj merge →
+unblock dependents), covering both a hard-edge (serialized) and a parallel/fan-in DAG.
+It is deterministic via TEST-ONLY env hooks baked into the production code:
+`RUDDER_FAKE_MODEL_OUTPUT` (planner returns a canned plan block, see `callTextModel`),
+`RUDDER_FAKE_BACKEND=1` (each worker applies `[[FAKE_FILE:..]]` edits from the node prompt
+and exits 0, see `getBackend`/`fakeBackend`), and `RUDDER_AUTO_STEER_DELAY_MS` (shrinks the
+post-pass steering wait). No auth or real model needed. Note: the `cloud/` subproject has its
+own build — `cloud-relay`/`slack` tests need `npm --prefix cloud run build` first.
 
 Always, before shipping a source change:
 1. `npm run check` (or `npm run build`),
@@ -887,6 +897,18 @@ Manual by default (`m`/`M`); a hard-dep child launches only once its parent reac
 conflict spawns the AI resolver (`start_conflict_resolution_agent` →
 `finalize_merge_resolvers`, jj-worded prompt). Undo via `rudder undo` (op-log). See
 section 5 / `src/jj.ts` for the run-level merge plumbing.
+
+**Serialization invariant (`withSchedulerLock`, `src/scheduler.ts`).** The daemon fires
+`scheduleTick` (1s interval), `onRunTransition` (per-run `fs.watch`), and the board's
+manual approve/merge endpoints — all in ONE process as un-awaited `void` calls. Every op
+that reads then advances `integrationChangeId` MUST go through `withSchedulerLock(repoRoot, …)`,
+which chains them onto a per-repo promise so they run one-at-a-time. Without it, two nodes
+reaching `review` in the same instant get merged concurrently against the SAME integration
+head, producing two sibling merges; the second `updateGraph` clobbers `integrationChangeId`
+and one node is marked `merged` while its diff is orphaned off the trunk (silent data loss).
+The public entry points lock; internal recursion uses the unlocked `*Core` variants to avoid
+self-deadlock (the lock is NOT reentrant). This bug is invisible to unit tests and only
+shows under near-simultaneous completions — it is covered by `tests/e2e-orchestrator.test.mjs`.
 
 ### 14.8 Caps
 `MAX_PLAN_TASKS = 100` (per-plan parse cap AND the auto-expand backstop; overflow is

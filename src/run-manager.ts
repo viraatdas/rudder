@@ -61,7 +61,10 @@ import {
 import { createAgentPane, killPane, normalizeTmuxDashboardLayout, paneExitStatus, respawnPane, selectPane } from "./tmux.js";
 import { taskDisplayLabel } from "./task-summary.js";
 
-const AUTO_STEER_DELAY_MS = 10_000;
+// The pause before an automatic steering pass. Overridable via
+// RUDDER_AUTO_STEER_DELAY_MS so the end-to-end test can drain a DAG quickly
+// instead of waiting 10s per node; defaults to 10s for real runs.
+const AUTO_STEER_DELAY_MS = Number(process.env.RUDDER_AUTO_STEER_DELAY_MS) || 10_000;
 
 function missingBackendError(backend: BackendId, healthMessage: string): MissingToolError {
   return new MissingToolError(backend, healthMessage);

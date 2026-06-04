@@ -11,7 +11,7 @@ import { mergeJjRunIntoCurrentWorkspace } from "../jj.js";
 import { hardParents, readGraph, softParents, updateGraph } from "../graph.js";
 import { stopRun } from "../run-manager.js";
 import type { RudderBus } from "../bus.js";
-import { mergeNodeIntoIntegration, reconcileInjection } from "../scheduler.js";
+import { mergeNodeIntoIntegration, reconcileInjection, withSchedulerLock } from "../scheduler.js";
 import { nowIso } from "../util.js";
 import type {
   BoardColumn,
@@ -265,7 +265,9 @@ async function handleProjectApi(
       if (!target) {
         return { ok: false as const };
       }
-      await mergeNodeIntoIntegration(project.repoRoot, target, bus);
+      // Serialize against the auto-scheduler's ticks/transitions so a manual
+      // approve never merges against a stale integration head.
+      await withSchedulerLock(project.repoRoot, () => mergeNodeIntoIntegration(project.repoRoot, target!, bus));
       return { ok: true as const, nodeId: target.id };
     });
     if (!result.ok) {
@@ -285,7 +287,9 @@ async function handleProjectApi(
       const graph = await readGraph(project.repoRoot);
       const node = graph.nodes[id] ?? Object.values(graph.nodes).find((candidate) => candidate.runId === id);
       if (node) {
-        await inRepo(project.repoRoot, () => mergeNodeIntoIntegration(project.repoRoot, node, bus));
+        await inRepo(project.repoRoot, () =>
+          withSchedulerLock(project.repoRoot, () => mergeNodeIntoIntegration(project.repoRoot, node, bus)),
+        );
         const fresh = await readGraph(project.repoRoot);
         const refreshed = fresh.nodes[node.id];
         // A graph node that did not merge (blocked) signals a conflict to the UI.

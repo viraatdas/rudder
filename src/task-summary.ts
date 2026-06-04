@@ -391,6 +391,19 @@ export async function callTextModel(params: {
   maxTokens?: number;
   timeoutMs?: number;
 }): Promise<string> {
+  // TEST-ONLY deterministic hook: when RUDDER_FAKE_MODEL_OUTPUT is set, return it
+  // verbatim (or, if it begins with "@", the contents of that file) instead of
+  // calling any real model. This lets the end-to-end orchestrator test drive the
+  // real planner code path (planTask -> parsePlanBlock -> scaffoldPlan) with a
+  // canned RUDDER_PLAN_TASKS block, so a run is repeatable and needs no auth.
+  const fake = process.env.RUDDER_FAKE_MODEL_OUTPUT;
+  if (fake !== undefined && fake !== "") {
+    if (fake.startsWith("@")) {
+      const { readFile } = await import("node:fs/promises");
+      return await readFile(fake.slice(1), "utf8");
+    }
+    return fake;
+  }
   const maxTokens = params.maxTokens ?? 2048;
   const timeoutMs = params.timeoutMs ?? 60000;
   const apiKey = await resolveAnthropicApiKey();

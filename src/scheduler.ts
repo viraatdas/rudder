@@ -592,13 +592,44 @@ export async function deliverSoftDiff(repoRoot: string, edge: GraphEdge, bus: Ru
   });
 }
 
+// Per-repo serialization for every scheduler operation that reads then advances
+// the integration trunk. The daemon fires scheduleTick (1s interval) AND
+// onRunTransition (per-run fs.watch) AND the board's manual merge endpoints, all
+// in ONE process as un-awaited `void` calls. Without this lock, two nodes that
+// reach review at nearly the same instant get merged concurrently: both read the
+// SAME integrationChangeId, produce two SIBLING merges off it, and the second
+// updateGraph clobbers integrationChangeId — so one node is marked "merged" while
+// its work is orphaned off the trunk (silent data loss). Chaining every op per
+// repo onto a single promise makes merges read the integration head the previous
+// op just advanced. In-process is sufficient: the daemon is the sole scheduler.
+const schedulerChains = new Map<string, Promise<unknown>>();
+
+export function withSchedulerLock<T>(repoRoot: string, fn: () => Promise<T>): Promise<T> {
+  const prev = schedulerChains.get(repoRoot) ?? Promise.resolve();
+  // Run fn after the previous op settles (success OR failure), so one rejected op
+  // never wedges the chain. The caller still sees fn's own result/rejection.
+  const result = prev.then(fn, fn);
+  schedulerChains.set(
+    repoRoot,
+    result.catch(() => undefined),
+  );
+  return result;
+}
+
 /**
  * One scheduler tick. Recompute each scheduled node's status from its run.json,
  * read orchestrator config, hold if at capacity or over budget, else launch the
  * selectable ready nodes and deliver undelivered soft diffs. A node that just
  * reached completed (review) auto-merges when reviewGate==="auto".
+ *
+ * Public entry point: serialized against all other scheduler ops for this repo.
+ * Internal callers that already hold the lock use `scheduleTickCore` directly.
  */
-export async function scheduleTick(repoRoot: string, bus: RudderBus): Promise<void> {
+export function scheduleTick(repoRoot: string, bus: RudderBus): Promise<void> {
+  return withSchedulerLock(repoRoot, () => scheduleTickCore(repoRoot, bus));
+}
+
+async function scheduleTickCore(repoRoot: string, bus: RudderBus): Promise<void> {
   const config = await loadConfig();
   const orchestrator = config.orchestrator ?? { maxParallel: 1000, reviewGate: "manual" as const };
   const maxParallel = orchestrator.maxParallel ?? 1000;
@@ -741,7 +772,11 @@ export async function scheduleTick(repoRoot: string, bus: RudderBus): Promise<vo
  * status: completed -> review (auto-merge if configured); failed/cancelled ->
  * node.failed + propagate blocked to hard dependents. Then ticks the scheduler.
  */
-export async function onRunTransition(repoRoot: string, runId: string, bus: RudderBus): Promise<void> {
+export function onRunTransition(repoRoot: string, runId: string, bus: RudderBus): Promise<void> {
+  return withSchedulerLock(repoRoot, () => onRunTransitionCore(repoRoot, runId, bus));
+}
+
+async function onRunTransitionCore(repoRoot: string, runId: string, bus: RudderBus): Promise<void> {
   const run = await loadRunRecord(repoRoot, runId).catch(() => null);
 
   // A resolver run finishing is handled specially: it owns no graph node of its
@@ -755,14 +790,14 @@ export async function onRunTransition(repoRoot: string, runId: string, bus: Rudd
   const node = Object.values(graph.nodes).find((candidate) => candidate.runId === runId);
   if (!node) {
     // Not a graph-managed run (e.g. an ad-hoc TUI run); just tick.
-    await scheduleTick(repoRoot, bus);
+    await scheduleTickCore(repoRoot, bus);
     return;
   }
 
   // If this node is held blocked with a resolver in flight, the resolver (not
   // the original completed run) drives it. Ignore the original run's transition.
   if (node.status === "blocked" && node.resolverRunId) {
-    await scheduleTick(repoRoot, bus);
+    await scheduleTickCore(repoRoot, bus);
     return;
   }
 
@@ -816,7 +851,7 @@ export async function onRunTransition(repoRoot: string, runId: string, bus: Rudd
     await renderLiveRudderMd(repoRoot).catch(() => undefined);
   }
 
-  await scheduleTick(repoRoot, bus);
+  await scheduleTickCore(repoRoot, bus);
 }
 
 /**
@@ -860,7 +895,7 @@ async function onResolverTransition(
       data: { conflictedFiles: remaining, mergeChangeId },
     });
     await renderLiveRudderMd(repoRoot).catch(() => undefined);
-    await scheduleTick(repoRoot, bus);
+    await scheduleTickCore(repoRoot, bus);
     return;
   }
 
@@ -901,7 +936,7 @@ async function onResolverTransition(
   bus.publish({ ts: nowIso(), runId: node?.runId ?? originalNodeId, nodeId: originalNodeId, type: "node.merged" });
 
   await renderLiveRudderMd(repoRoot).catch(() => undefined);
-  await scheduleTick(repoRoot, bus);
+  await scheduleTickCore(repoRoot, bus);
 }
 
 /**
@@ -910,7 +945,15 @@ async function onResolverTransition(
  * appended. Adds the node (status "planned", source "injection") + inferred
  * edges, scaffolds its empty jj change, publishes plan.reconciled, then ticks.
  */
-export async function reconcileInjection(
+export function reconcileInjection(
+  repoRoot: string,
+  input: { prompt: string; title?: string; backend?: TaskNode["backend"]; model?: string; effort?: TaskNode["effort"] },
+  bus: RudderBus,
+): Promise<{ nodeId: string }> {
+  return withSchedulerLock(repoRoot, () => reconcileInjectionCore(repoRoot, input, bus));
+}
+
+async function reconcileInjectionCore(
   repoRoot: string,
   input: { prompt: string; title?: string; backend?: TaskNode["backend"]; model?: string; effort?: TaskNode["effort"] },
   bus: RudderBus,
@@ -1009,6 +1052,6 @@ export async function reconcileInjection(
   bus.publish({ ts: nowIso(), runId: nodeId, nodeId, type: "node.created" });
 
   await renderLiveRudderMd(repoRoot).catch(() => undefined);
-  await scheduleTick(repoRoot, bus);
+  await scheduleTickCore(repoRoot, bus);
   return { nodeId };
 }

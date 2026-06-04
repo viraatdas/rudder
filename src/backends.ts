@@ -19,6 +19,14 @@ import {
 } from "./util.js";
 
 export function getBackend(id: BackendId): BackendAdapter {
+  // TEST-ONLY deterministic hook: when RUDDER_FAKE_BACKEND=1, every backend is a
+  // scripted fake that applies file edits encoded in the node prompt and exits 0,
+  // with no real model call or auth. This lets the end-to-end orchestrator test
+  // drive the REAL pipeline (schedule -> isolated jj workspace -> worker -> verify
+  // -> jj merge -> unblock dependents) repeatably. See `fakeBackend`.
+  if (process.env.RUDDER_FAKE_BACKEND === "1") {
+    return fakeBackend(id);
+  }
   if (id === "claude") {
     return claudeBackend();
   }
@@ -26,6 +34,70 @@ export function getBackend(id: BackendId): BackendAdapter {
     return codexBackend();
   }
   return acpxBackend();
+}
+
+/**
+ * TEST-ONLY backend. It reads `[[FAKE_FILE:relpath]]…[[/FAKE_FILE]]` blocks from
+ * the node prompt (`run.task`, which is stable across auto-steer passes) and
+ * writes each into the run's isolated workspace, then emits a `backend.output`
+ * line that mentions verification so the local verifier is satisfied. Parsing
+ * `run.task` (not the per-turn prompt) keeps the second auto-steer pass writing
+ * the same files idempotently.
+ */
+function fakeBackend(id: BackendId): BackendAdapter {
+  return {
+    id,
+    async verify() {
+      return { ok: true, message: "fake backend (RUDDER_FAKE_BACKEND=1)" };
+    },
+    async run(request, emit) {
+      const fsp = await import("node:fs/promises");
+      const path = await import("node:path");
+      // Mirror spawnAndStream's bookkeeping so downstream readers (and the e2e
+      // test's ordering assertions) see the same run.process timing shape.
+      request.run.process = {
+        ...(request.run.process ?? {}),
+        startedAt: nowIso(),
+      };
+      request.run.status = "running";
+      await saveRunRecord(request.run);
+      const root = request.run.worktree?.path ?? request.run.repoRoot;
+      const source = request.run.task ?? request.prompt ?? "";
+      const blocks = [...source.matchAll(/\[\[FAKE_FILE:(.+?)\]\]\n([\s\S]*?)\n\[\[\/FAKE_FILE\]\]/g)];
+      const written: string[] = [];
+      for (const match of blocks) {
+        const rel = (match[1] ?? "").trim();
+        const content = match[2] ?? "";
+        if (!rel) {
+          continue;
+        }
+        const dest = path.resolve(root, rel);
+        // Stay inside the workspace: a directive must never escape via `..`.
+        if (!dest.startsWith(path.resolve(root))) {
+          continue;
+        }
+        await fsp.mkdir(path.dirname(dest), { recursive: true });
+        await fsp.writeFile(dest, content.endsWith("\n") ? content : `${content}\n`, "utf8");
+        written.push(rel);
+      }
+      await emit({
+        ts: nowIso(),
+        runId: request.run.id,
+        type: "backend.output",
+        message: written.length
+          ? `fake backend wrote ${written.join(", ")} and ran the verification checks (tests pass)\n`
+          : "fake backend made no file changes; verification check ran\n",
+      });
+      request.run.process = {
+        ...(request.run.process ?? {}),
+        endedAt: nowIso(),
+        exitCode: 0,
+        signal: null,
+      };
+      await saveRunRecord(request.run);
+      return 0;
+    },
+  };
 }
 
 function claudeBackend(): BackendAdapter {
