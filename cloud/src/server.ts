@@ -11,6 +11,14 @@ import { GetObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import type { Duplex } from "node:stream";
 import { WebSocket, WebSocketServer } from "ws";
+import {
+  formatOutputForSlack,
+  parseSlackCommand,
+  postSlackMessage,
+  slackConfigFromEnv,
+  SLACK_HELP_TEXT,
+  verifySlackSignature,
+} from "./slack.js";
 
 type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 
@@ -48,6 +56,7 @@ type Sail = {
   machineState?: string;
   snapshotKey?: string;
   lastHeartbeatAt?: string;
+  slackThreadTs?: string;
   createdAt: string;
   updatedAt: string;
   bootstrapCommand?: string;
@@ -109,6 +118,10 @@ const adminEmails = new Set((process.env.RUDDER_ADMIN_EMAILS || "viraat.laldas@g
 const deviceLogins = new Map<string, DeviceLogin>();
 const githubBrowserLogins = new Map<string, GithubBrowserLogin>();
 const s3 = new S3Client({ region: awsRegion });
+const slack = slackConfigFromEnv();
+// Slack message events are delivered at-least-once; dedupe by event_id so a
+// retry doesn't double-inject into an instance.
+const seenSlackEvents = new Set<string>();
 
 await fs.mkdir(dataDir, { recursive: true });
 await restoreDatabaseFromS3();
@@ -211,6 +224,7 @@ database.exec(`
 ensureColumn("rudder_sails", "worker_token_hash", "text");
 ensureColumn("rudder_sails", "last_heartbeat_at", "text");
 ensureColumn("rudder_sails", "runtime", "text");
+ensureColumn("rudder_sails", "slack_thread_ts", "text");
 ensureColumn("rudder_workspaces", "region", "text");
 ensureColumn("rudder_workspaces", "snapshot_fingerprint", "text");
 ensureColumn("rudder_workspaces", "volume_id", "text");
@@ -257,6 +271,13 @@ const updateWorkerToken = database.prepare(`
       updated_at = @updatedAt
   where id = @id and account_id = @accountId
 `);
+const updateSailSlackThread = database.prepare(
+  "update rudder_sails set slack_thread_ts = @threadTs, updated_at = @updatedAt where id = @id",
+);
+const findSailBySlackThread = database.prepare("select * from rudder_sails where slack_thread_ts = ?");
+const listRunningSails = database.prepare(
+  "select * from rudder_sails where status in ('queued','running','paused') order by updated_at desc limit 100",
+);
 const insertWorkspace = database.prepare(`
   insert into rudder_workspaces (
     id, account_id, workspace_key, repo_name, status, machine_id, machine_state,
@@ -411,6 +432,10 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === "POST" && url.pathname === "/api/admin/workspace/gc") {
       await handleAdminWorkspaceGc(req, res, url);
+      return;
+    }
+    if (req.method === "POST" && url.pathname === "/api/slack/events") {
+      await handleSlackEvents(req, res);
       return;
     }
     if (url.pathname.startsWith("/api/rudder/sail")) {
@@ -694,6 +719,40 @@ function broadcastStatus(channel: Channel, state: string): void {
       client.send(payload);
     }
   }
+}
+
+// Inject text into a live worker's PTY exactly as a `cloud attach` client would.
+// The worker supervisor treats binary frames as raw keystrokes, so we send the
+// UTF-8 bytes (plus a carriage return to submit) on the worker socket. Returns
+// false when no worker is currently connected for that instance.
+function sendInputToChannel(kind: ChannelKind, id: string, text: string, submit = true): boolean {
+  const channel = channelMap(kind).get(id);
+  const worker = channel?.worker;
+  if (!channel || !worker || worker.readyState !== WebSocket.OPEN) {
+    return false;
+  }
+  const payload = submit ? `${text}\r` : text;
+  worker.send(Buffer.from(payload, "utf8"), { binary: true });
+  if (kind === "workspace") {
+    touchWorkspaceActivity(id);
+  }
+  return true;
+}
+
+// Read the most recent raw output (with ANSI) buffered for an instance. The
+// replay buffer only exists while the worker is connected, so this returns ""
+// for paused/dead instances.
+function readChannelOutput(kind: ChannelKind, id: string): string {
+  const channel = channelMap(kind).get(id);
+  if (!channel || channel.buffer.length === 0) {
+    return "";
+  }
+  return Buffer.concat(channel.buffer).toString("utf8");
+}
+
+function instanceHasLiveWorker(kind: ChannelKind, id: string): boolean {
+  const worker = channelMap(kind).get(id)?.worker;
+  return Boolean(worker && worker.readyState === WebSocket.OPEN);
 }
 
 function touchWorkspaceActivity(workspaceId: string): void {
@@ -1639,6 +1698,40 @@ async function handleSailApi(req: IncomingMessage, res: ServerResponse, url: URL
     sendJson(res, 200, next);
     return;
   }
+  const inputMatch = url.pathname.match(/^\/api\/rudder\/sail\/([^/]+)\/input$/);
+  if (req.method === "POST" && inputMatch) {
+    const sail = getAccountSail(inputMatch[1], authContext.accountId);
+    if (!sail) {
+      sendJson(res, 404, { error: "sail not found" });
+      return;
+    }
+    const body = await readJsonBody(req);
+    const text = stringField(body, "text");
+    if (typeof text !== "string" || text.length === 0) {
+      sendJson(res, 400, { error: "text is required" });
+      return;
+    }
+    const submit = body && typeof body === "object" && !Array.isArray(body) && body.submit === false ? false : true;
+    const delivered = sendInputToChannel("sail", sail.id, text, submit);
+    sendJson(res, delivered ? 200 : 409, delivered
+      ? { delivered: true }
+      : { delivered: false, error: "instance is not connected" });
+    return;
+  }
+  const outputMatch = url.pathname.match(/^\/api\/rudder\/sail\/([^/]+)\/output$/);
+  if (req.method === "GET" && outputMatch) {
+    const sail = getAccountSail(outputMatch[1], authContext.accountId);
+    if (!sail) {
+      sendJson(res, 404, { error: "sail not found" });
+      return;
+    }
+    sendJson(res, 200, {
+      id: sail.id,
+      connected: instanceHasLiveWorker("sail", sail.id),
+      output: readChannelOutput("sail", sail.id),
+    });
+    return;
+  }
   const match = url.pathname.match(/^\/api\/rudder\/sail\/([^/]+)\/(pause|resume|onload|stop)$/);
   if (req.method === "POST" && match) {
     const sail = getAccountSail(match[1], authContext.accountId);
@@ -1739,6 +1832,10 @@ async function createSail(accountId: string, body: Json, preferredId?: string): 
     createdAt: now,
     updatedAt: now,
   });
+
+  // Announce the new instance into the shared Slack channel so it is talk-able
+  // from there. Fire-and-forget: a Slack hiccup must never fail a launch.
+  void announceSailToSlack(id, task, repoName, runtime);
 
   if (runtime === "byo-vm") {
     const sail = getAccountSail(id, accountId) ?? {
@@ -2047,6 +2144,7 @@ async function handleWorkerHeartbeat(req: IncomingMessage, res: ServerResponse, 
       ? "failed"
       : "running";
   const now = new Date().toISOString();
+  const previousStatus = String(sailRow.status);
   updateHeartbeat.run({
     id: sailId,
     status,
@@ -2054,6 +2152,17 @@ async function handleWorkerHeartbeat(req: IncomingMessage, res: ServerResponse, 
     lastHeartbeatAt: now,
     updatedAt: now,
   });
+  // On the transition into a terminal state, post the final result + a tail of
+  // output into the instance's Slack thread.
+  if ((status === "completed" || status === "failed") && previousStatus !== status) {
+    const threadTs = optionalString(sailRow.slack_thread_ts);
+    const icon = status === "completed" ? "✅" : "❌";
+    const tail = readChannelOutput("sail", sailId);
+    void postToSlack(
+      `${icon} *${sailId}* ${status}.${tail ? `\n${formatOutputForSlack(tail)}` : ""}`,
+      threadTs,
+    );
+  }
   sendJson(res, 200, { ok: true, status });
 }
 
@@ -2672,6 +2781,213 @@ async function githubUser(token: string): Promise<{ id: number | string; login: 
   return { id, login, email };
 }
 
+// --------------------------------------------------------------------------
+// Slack: the shared channel is the "main panel" for every cloud instance.
+// --------------------------------------------------------------------------
+
+async function postToSlack(text: string, threadTs?: string): Promise<string | undefined> {
+  if (!slack.enabled) {
+    return undefined;
+  }
+  const result = await postSlackMessage({
+    botToken: slack.botToken,
+    channel: slack.channel,
+    text,
+    threadTs,
+  });
+  if (!result.ok) {
+    console.warn(`slack post failed: ${result.error}`);
+    return undefined;
+  }
+  return result.ts;
+}
+
+// Open a thread for a freshly launched instance and remember its root ts so
+// later replies route back to this instance.
+async function announceSailToSlack(
+  id: string,
+  task: string | undefined,
+  repoName: string | undefined,
+  runtime: SailRuntime,
+): Promise<void> {
+  if (!slack.enabled) {
+    return;
+  }
+  const lines = [
+    `🚀 *${id}* launched on ${runtime === "fly" ? "Fly" : "your VM"}.`,
+    repoName ? `repo: \`${repoName}\`` : "",
+    task ? `> ${task}` : "",
+    "_Reply in this thread to talk to the agent._",
+  ].filter(Boolean);
+  const ts = await postToSlack(lines.join("\n"));
+  if (ts) {
+    updateSailSlackThread.run({ id, threadTs: ts, updatedAt: new Date().toISOString() });
+  }
+}
+
+// After injecting input, the agent needs a moment to react. Read the output
+// tail a few seconds later and post it back into the instance's thread.
+function scheduleOutputEcho(sailId: string, threadTs: string | undefined, delayMs = 4500): void {
+  setTimeout(() => {
+    const tail = readChannelOutput("sail", sailId);
+    if (tail.trim()) {
+      void postToSlack(formatOutputForSlack(tail), threadTs);
+    }
+  }, delayMs).unref();
+}
+
+async function readRawBody(req: IncomingMessage): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+async function handleSlackEvents(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const raw = await readRawBody(req);
+  if (slack.signingSecret) {
+    const ok = verifySlackSignature({
+      signingSecret: slack.signingSecret,
+      timestamp: req.headers["x-slack-request-timestamp"] as string | undefined,
+      signature: req.headers["x-slack-signature"] as string | undefined,
+      rawBody: raw,
+    });
+    if (!ok) {
+      sendJson(res, 401, { error: "bad signature" });
+      return;
+    }
+  }
+  let body: Record<string, unknown>;
+  try {
+    body = JSON.parse(raw) as Record<string, unknown>;
+  } catch {
+    sendJson(res, 400, { error: "invalid json" });
+    return;
+  }
+
+  if (body.type === "url_verification") {
+    sendJson(res, 200, { challenge: typeof body.challenge === "string" ? body.challenge : "" });
+    return;
+  }
+
+  // Slack expects a 200 within 3s; do the real work afterwards.
+  sendJson(res, 200, { ok: true });
+
+  if (body.type !== "event_callback" || !slack.enabled) {
+    return;
+  }
+  const eventId = typeof body.event_id === "string" ? body.event_id : "";
+  if (eventId) {
+    if (seenSlackEvents.has(eventId)) {
+      return;
+    }
+    seenSlackEvents.add(eventId);
+    if (seenSlackEvents.size > 2000) {
+      seenSlackEvents.clear();
+    }
+  }
+  const event = body.event as Record<string, unknown> | undefined;
+  if (!event) {
+    return;
+  }
+  processSlackEvent(event).catch((error) => {
+    console.error("slack event error", error);
+  });
+}
+
+async function processSlackEvent(event: Record<string, unknown>): Promise<void> {
+  const type = String(event.type || "");
+  // Ignore anything the bot itself posted, and edits/joins/etc.
+  if (event.bot_id || event.subtype) {
+    return;
+  }
+  if (type !== "app_mention" && type !== "message") {
+    return;
+  }
+  const text = typeof event.text === "string" ? event.text : "";
+  const ts = typeof event.ts === "string" ? event.ts : undefined;
+  const threadTs = typeof event.thread_ts === "string" ? event.thread_ts : undefined;
+  const inThread = Boolean(threadTs);
+
+  // Plain channel chatter is not for us — only act on @mentions and on replies
+  // inside a thread we own.
+  const threadSail = threadTs
+    ? (findSailBySlackThread.get(threadTs) as Record<string, unknown> | undefined)
+    : undefined;
+  if (type === "message" && !threadSail) {
+    return;
+  }
+
+  const command = parseSlackCommand(text, { inThread });
+  const replyThread = threadTs ?? ts;
+
+  switch (command.action) {
+    case "help":
+      await postToSlack(SLACK_HELP_TEXT, replyThread);
+      return;
+    case "list": {
+      const sails = listRunningSails.all().map(rowToSail);
+      if (sails.length === 0) {
+        await postToSlack("No running cloud instances. Start one with `rudder cloud \"<task>\"`.", replyThread);
+        return;
+      }
+      const lines = sails.map((s) => {
+        const live = instanceHasLiveWorker("sail", s.id) ? "🟢" : "⚪️";
+        return `${live} *${s.id}* — ${s.status}${s.task ? ` · ${s.task}` : ""}`;
+      });
+      await postToSlack(`*Cloud instances*\n${lines.join("\n")}`, replyThread);
+      return;
+    }
+    case "output": {
+      const tail = readChannelOutput("sail", command.id);
+      await postToSlack(
+        instanceHasLiveWorker("sail", command.id)
+          ? formatOutputForSlack(tail)
+          : `*${command.id}* is not connected.`,
+        replyThread,
+      );
+      return;
+    }
+    case "stop": {
+      const row = findSailById.get(command.id) as Record<string, unknown> | undefined;
+      if (!row) {
+        await postToSlack(`No instance \`${command.id}\`.`, replyThread);
+        return;
+      }
+      const accountId = String(row.account_id);
+      const sail = getAccountSail(command.id, accountId);
+      if (sail) {
+        await mutateSail(sail, accountId, "stop").catch(() => undefined);
+      }
+      await postToSlack(`🛑 Stopping *${command.id}*.`, replyThread);
+      return;
+    }
+    case "talk":
+    case "thread-reply": {
+      const targetId = command.action === "talk" ? command.id : String(threadSail?.id || "");
+      const message = command.message;
+      if (!targetId) {
+        await postToSlack("Which instance? Use `talk <id> <message>` or reply in an instance thread.", replyThread);
+        return;
+      }
+      if (!message) {
+        return;
+      }
+      // Route the echo into the instance's own thread when we know it.
+      const sailRow = findSailById.get(targetId) as Record<string, unknown> | undefined;
+      const ownThread = optionalString(sailRow?.slack_thread_ts) ?? replyThread;
+      const delivered = sendInputToChannel("sail", targetId, message, true);
+      if (!delivered) {
+        await postToSlack(`*${targetId}* is not connected right now.`, replyThread);
+        return;
+      }
+      scheduleOutputEcho(targetId, ownThread);
+      return;
+    }
+  }
+}
+
 function listAccountSails(accountId: string): Sail[] {
   return listSailsForAccount.all(accountId).map(rowToSail);
 }
@@ -2694,6 +3010,7 @@ function rowToSail(row: unknown): Sail {
     machineState: optionalString(value.machine_state),
     snapshotKey: optionalString(value.snapshot_key),
     lastHeartbeatAt: optionalString(value.last_heartbeat_at),
+    slackThreadTs: optionalString(value.slack_thread_ts),
     createdAt: String(value.created_at),
     updatedAt: String(value.updated_at),
   };
