@@ -4428,6 +4428,63 @@ branch refs/heads/main\n";
         assert!(script.contains("/tmp/sig/run.json") && script.contains("\"state\":\"done\""), "writes done signal");
     }
 
+    #[cfg(not(windows))]
+    #[test]
+    fn poll_loop_consumes_the_official_done_signal_for_a_live_worker() {
+        // Integration test for the CONSUMPTION half (the gap the node e2e can't reach,
+        // since it drives the daemon/process-exit path, not the native poll loop): a
+        // LIVE interactive worker (a `sleep` PTY so try_wait == Ok(None)) is flipped to
+        // Done ONLY when the official signal file appears — proving the signal, not the
+        // PTY-scrape, drives it (`sleep` has no idle chrome for the fallback to match).
+        let Some(sig) = crate::signals::signal_path("sig-worker-itest") else {
+            return; // no HOME in this env; signal path is unavailable
+        };
+        let _ = std::fs::remove_file(&sig);
+
+        let mut app = App::new();
+        app.cwd = std::env::temp_dir();
+        let command = TerminalCommand::with_args("/bin/sh", ["-lc", "sleep 30"]);
+        let pane = TerminalPane::spawn_shell_or_command(
+            Some(command),
+            TerminalPaneOptions {
+                size: TerminalSize { rows: 10, cols: 80 },
+                scrollback_lines: 100,
+                ..Default::default()
+            },
+        )
+        .expect("spawn worker pty");
+        let mut run = test_agent_run("sig-worker-itest", "do the thing");
+        run.cwd = app.cwd.clone();
+        run.terminal = Some(pane);
+        // defaults: mode Execute, status Running.
+        app.agents.push(run);
+        app.selected_agent = 0;
+
+        // No signal yet + not idle chrome -> the worker stays Running.
+        app.poll_agents();
+        assert_eq!(
+            app.agents[0].status,
+            AgentStatus::Running,
+            "without a signal (and no idle chrome on `sleep`) the worker stays running"
+        );
+
+        // The Claude Stop hook / Codex notify would write exactly this.
+        if let Some(parent) = sig.parent() {
+            std::fs::create_dir_all(parent).expect("signals dir");
+        }
+        std::fs::write(&sig, "{\"state\":\"done\"}").expect("write signal");
+
+        app.poll_agents();
+        assert_eq!(
+            app.agents[0].status,
+            AgentStatus::Done,
+            "the official done signal flips the live worker to Done"
+        );
+        assert!(!sig.exists(), "the signal is consumed (cleared) so the next turn re-fires");
+
+        let _ = std::fs::remove_file(&sig);
+    }
+
     #[test]
     fn only_interactive_worker_modes_want_signals() {
         use crate::signals::worker_wants_signals;
