@@ -46,7 +46,8 @@ plus a worker image, used only when a task is handed off to the cloud.
 │   ├── src/main.rs        the App state machine + domain types + entry/run loop
 │   ├── src/render.rs      ratatui rendering: panes, prompts, layout, styles
 │   ├── src/selection.rs   mouse->coordinate mapping, selection, clipboard, cells
-│   ├── src/detect.rs      worker-output heuristics (idle/permission/prompt)
+│   ├── src/detect.rs      worker-output heuristics (idle/permission/prompt) — FALLBACK only
+│   ├── src/signals.rs     official completion signals (Claude Stop hook / Codex notify) — PRIMARY
 │   ├── src/models.rs      model/effort tables, model picker, suggestion ranking
 │   ├── src/launch.rs      agent launch/resume command building, review-all runs
 │   ├── src/tasks.rs       prompt construction, task summaries, rudder-plan parsing
@@ -804,6 +805,28 @@ The planner UX went through several iterations; these are the settled decisions 
   (overlap splice 1.7.1, result-arm unification 1.8.0, transcript fallback 1.10.x); the
   transcript fallback is the robust one because it reads the backend's own session log and
   does not depend on the lossy live PTY stream.
+
+### 14.4b Per-agent done/idle detection: official signals, scrape as fallback (`native/src/signals.rs`)
+The native TUI runs workers as INTERACTIVE `claude`/`codex` in a PTY (they idle between
+turns instead of exiting), so "is this turn done?" can't use process-exit. The robust answer
+is each backend's OWN lifecycle signal, NOT scraping its TUI chrome:
+- **Claude Code:** a `Stop` hook (fires when the turn ends) + a `Notification` hook matched to
+  `idle_prompt` (paused for input), injected via `claude --settings <file>`.
+- **Codex:** the `notify` program (fires `agent-turn-complete`), injected via
+  `-c notify=["<script>"]` (replacing the baked `notify=[]`). Codex's newer `[hooks]` are
+  trust-gated, so unusable for a headless child; `notify` needs no trust.
+
+Both write `<rudder_home>/signals/<run_id>.json` = `{"state":"done"|"input"}`. The poll loop's
+interactive arm (`try_wait` Ok(None)) reads this as AUTHORITATIVE: `done` → `mark_run_done`
+(one-shot, cleared on consume so a later turn re-fires); `input` → `needs_user_input`. The
+`detect.rs` chrome-scrape (`terminal_looks_ready_for_input_from_lines`, idle-chrome string
+matching) is now ONLY the FALLBACK when no signal exists (older CLI versions / hooks off), so
+the change is strictly additive — worst case is today's behaviour. `augment_worker_command`
+wires this at the worker spawn sites (Execute/Main/ReviewAll/restart); headless planner modes
+(`-p` / `codex exec`) keep process-exit. Both hooks are validated live against the real CLIs
+(claude 2.x `Stop`, codex `agent-turn-complete`). The daemon/DAG path (`src/backends.ts`)
+already used official signals: `claude -p --output-format stream-json` and `codex exec --json`
+(`turn.completed`) + process exit.
 
 ### 14.5 Conductor capabilities (BUILT vs PLANNED)
 - **Auto-expand from completion** (BUILT). A finished worker reports via **`rudder

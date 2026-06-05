@@ -4395,6 +4395,50 @@ branch refs/heads/main\n";
         assert!(text.contains("The planner needs your input") && text.contains("only one?"));
     }
 
+    #[test]
+    fn signal_state_parses_done_input_and_rejects_garbage() {
+        use crate::signals::{parse_signal_state, SignalState};
+        assert_eq!(parse_signal_state(r#"{"state":"done"}"#), Some(SignalState::Done));
+        assert_eq!(parse_signal_state(" {\"state\":\"input\"}\n"), Some(SignalState::Input));
+        assert_eq!(parse_signal_state(r#"{"state":"weird"}"#), None);
+        assert_eq!(parse_signal_state("not json"), None);
+        assert_eq!(parse_signal_state("{}"), None);
+    }
+
+    #[test]
+    fn claude_settings_wire_stop_and_idle_hooks_to_the_signal_file() {
+        use std::path::Path;
+        let json = crate::signals::claude_settings_json(Path::new("/tmp/sig/run.json"));
+        // Round-trips as valid JSON with the official hook shape.
+        let v: serde_json::Value = serde_json::from_str(&json).expect("valid settings json");
+        assert!(v["hooks"]["Stop"].is_array(), "has a Stop hook");
+        assert_eq!(v["hooks"]["Notification"][0]["matcher"], "idle_prompt", "idle Notification hook");
+        let stop_cmd = v["hooks"]["Stop"][0]["hooks"][0]["command"].as_str().unwrap();
+        assert!(stop_cmd.contains("/tmp/sig/run.json") && stop_cmd.contains("\"state\":\"done\""), "Stop writes done");
+        let note_cmd = v["hooks"]["Notification"][0]["hooks"][0]["command"].as_str().unwrap();
+        assert!(note_cmd.contains("\"state\":\"input\""), "idle writes input");
+    }
+
+    #[test]
+    fn codex_notify_script_writes_done_on_turn_complete() {
+        use std::path::Path;
+        let script = crate::signals::codex_notify_script(Path::new("/tmp/sig/run.json"));
+        assert!(script.starts_with("#!/bin/sh"), "is a shell script");
+        assert!(script.contains("agent-turn-complete"), "matches the turn-end event");
+        assert!(script.contains("/tmp/sig/run.json") && script.contains("\"state\":\"done\""), "writes done signal");
+    }
+
+    #[test]
+    fn only_interactive_worker_modes_want_signals() {
+        use crate::signals::worker_wants_signals;
+        for mode in [AgentMode::Execute, AgentMode::Main, AgentMode::ReviewAll] {
+            assert!(worker_wants_signals(Backend::Claude, mode), "{mode:?} is an interactive worker");
+        }
+        for mode in [AgentMode::Plan, AgentMode::RudderPlan] {
+            assert!(!worker_wants_signals(Backend::Codex, mode), "{mode:?} is headless (process-exit)");
+        }
+    }
+
     #[cfg(not(windows))]
     #[test]
     fn evaluate_populates_planned_nodes_without_launching() {

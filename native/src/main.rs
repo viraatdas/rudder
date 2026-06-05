@@ -63,6 +63,8 @@ use crate::detect::*;
 mod theme;
 use crate::theme::*;
 mod plan_stream;
+
+mod signals;
 use crate::plan_stream::*;
 
 const TICK_RATE: Duration = Duration::from_millis(33);
@@ -1805,7 +1807,7 @@ impl App {
         let premerge = premerge_review_all_sources(&worktree.path, &sources);
         let prompt = review_all_prompt(&target_ref, &worktree, &sources, &premerge);
         let session_id = mint_session_id_for(Backend::Codex);
-        let command = agent_command(
+        let mut command = agent_command(
             Backend::Codex,
             REVIEW_ALL_MODEL,
             Some(REVIEW_ALL_EFFORT),
@@ -1813,6 +1815,7 @@ impl App {
             AgentMode::ReviewAll,
             session_id.as_deref(),
         );
+        signals::augment_worker_command(&mut command, Backend::Codex, AgentMode::ReviewAll, &worktree.id);
         let options = TerminalPaneOptions {
             size: TerminalSize::default(),
             cwd: Some(worktree.path.clone()),
@@ -3267,6 +3270,11 @@ impl App {
             let done_file = worker_done_file(&worktree.path, id);
             command = command.with_env("RUDDER_DONE_FILE", done_file.to_string_lossy().to_string());
         }
+        // Official completion signal: wire the backend's own Stop hook (Claude) /
+        // notify (Codex) so it deterministically reports turn-end, instead of
+        // relying on the PTY-scrape heuristics. Keyed by the run id the poll loop
+        // reads. See signals.rs.
+        signals::augment_worker_command(&mut command, backend, AgentMode::Execute, &worktree.id);
         let options = TerminalPaneOptions {
             size: TerminalSize::default(),
             cwd: Some(worktree.path.clone()),
@@ -4194,13 +4202,19 @@ impl App {
                     .or_else(|| mint_session_id_for(run.backend)),
             )
         };
-        let command = agent_command(
+        let mut command = agent_command(
             backend,
             &model,
             effort,
             &bootstrap,
             AgentMode::Main,
             session_id.as_deref(),
+        );
+        signals::augment_worker_command(
+            &mut command,
+            backend,
+            AgentMode::Main,
+            &self.agents[main_index].id.clone(),
         );
         let cwd = self.cwd.clone();
         let options = TerminalPaneOptions {
@@ -4267,7 +4281,7 @@ impl App {
 
         let prompt = run.task.clone();
         let session_id = mint_session_id_for(run.backend);
-        let command = agent_command(
+        let mut command = agent_command(
             run.backend,
             &run.model,
             run.effort,
@@ -4275,6 +4289,7 @@ impl App {
             run.mode,
             session_id.as_deref(),
         );
+        signals::augment_worker_command(&mut command, run.backend, run.mode, &run.id);
         let options = TerminalPaneOptions {
             size: run.terminal_size.unwrap_or_default(),
             cwd: Some(run.cwd.clone()),
@@ -7627,32 +7642,57 @@ What to do\n\
                     }
                     Ok(None) => {
                         // The process is still alive (interactive agents do not exit
-                        // when a turn ends). Declare completion once it has looked
-                        // ready-for-input continuously for READY_GRACE. Tracking the
-                        // ready window (not output-silence) is what makes this robust
-                        // against a TUI that repaints while idle.
+                        // when a turn ends).
                         //
-                        // EXCEPT a headless planner (RudderPlan runs `claude -p` / `codex
-                        // exec`): its stdout is raw JSONL, not interactive idle-chrome, so
-                        // this heuristic does not apply and could falsely mark it Done while
-                        // it is still streaming — clearing autosteered and making a
-                        // later-printed plan unrecoverable. Its completion is driven solely
-                        // by process exit (try_wait Ok(Some)) and streaming plan detection.
-                        let ready = !run.is_orchestrator()
-                            && visible_lines.as_ref().is_some_and(|lines| {
-                                terminal_looks_ready_for_input_from_lines(run.backend, lines)
-                            });
-                        if ready {
-                            let since = *run.ready_since.get_or_insert_with(Instant::now);
-                            if since.elapsed() >= READY_GRACE {
+                        // AUTHORITATIVE: the backend's own completion signal (Claude `Stop`
+                        // hook / Codex `notify`, wired in signals.rs). When present it is
+                        // deterministic — no PTY-scrape guessing — so it wins. A "done"
+                        // signal is one-shot (cleared on consume) so a later turn of the
+                        // same live agent re-fires cleanly; an "input" signal marks the
+                        // waiting state. The scrape below is the FALLBACK for older CLI
+                        // versions or when hooks are unavailable.
+                        let signal = (!run.is_orchestrator())
+                            .then(|| signals::read_signal(&run.id))
+                            .flatten();
+                        match signal {
+                            Some(signals::SignalState::Done) => {
+                                signals::clear_signal(&run.id);
                                 run.ready_since = None;
                                 mark_run_done(run);
                                 changed = true;
                             }
-                        } else if visible_lines.is_some() {
-                            // We could read the screen and it is NOT idle (busy or a
-                            // prompt/permission): reset the window.
-                            run.ready_since = None;
+                            Some(signals::SignalState::Input) => {
+                                run.ready_since = None;
+                                if !run.needs_user_input {
+                                    run.needs_user_input = true;
+                                    run.user_input_notified = true;
+                                    changed = true;
+                                }
+                            }
+                            None => {
+                                // FALLBACK: declare completion once the screen has looked
+                                // ready-for-input continuously for READY_GRACE. Tracking the
+                                // ready window (not output-silence) makes this robust against
+                                // a TUI that repaints while idle. Headless planners
+                                // (RudderPlan) are excluded: their stdout is raw JSONL, not
+                                // idle-chrome, and complete via process exit only.
+                                let ready = !run.is_orchestrator()
+                                    && visible_lines.as_ref().is_some_and(|lines| {
+                                        terminal_looks_ready_for_input_from_lines(run.backend, lines)
+                                    });
+                                if ready {
+                                    let since = *run.ready_since.get_or_insert_with(Instant::now);
+                                    if since.elapsed() >= READY_GRACE {
+                                        run.ready_since = None;
+                                        mark_run_done(run);
+                                        changed = true;
+                                    }
+                                } else if visible_lines.is_some() {
+                                    // Screen is readable and NOT idle (busy or a
+                                    // prompt/permission): reset the window.
+                                    run.ready_since = None;
+                                }
+                            }
                         }
                     }
                     Err(error) => {
