@@ -568,9 +568,9 @@ From `package.json`:
   (`render::render`) to a `TestBackend` and returns the screen as text, so tests assert
   on what the USER SEES. `write_fake_bin` + `RUDDER_CLAUDE_BIN`/`RUDDER_CODEX_BIN`
   (`launch.rs` `claude_program()`/`codex_program()`) inject a fake backend: a planner
-  fake emits a canned plan-mode stream (ExitPlanMode plan with a RUDDER_PLAN_TASKS
-  block) so the full planner→capture→DAG→render path runs deterministically; a worker
-  fake writes files + exits (process-exit completion). `env_guard()` serializes tests
+  fake emits a canned decomposer stream (a `result` event whose text streams the
+  RUDDER_PLAN_TASKS block) so the full planner→parse→DAG→render path runs
+  deterministically; a worker fake writes files + exits (process-exit completion). `env_guard()` serializes tests
   that mutate the process-global `RUDDER_*_BIN`. Pattern: build `App`, point a fake bin,
   `start_rudder_plan_task` / feed keys, loop `poll_agents()`, then `render_screen` +
   assert. See `tui_harness_drives_planner_to_dag_and_renders_it` and

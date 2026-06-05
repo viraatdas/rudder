@@ -1780,10 +1780,10 @@ branch refs/heads/main\n";
             .iter()
             .any(|arg| arg.contains("Plan this task before implementation")));
 
-        // The Claude orchestrator (RudderPlan) now runs REAL plan mode headlessly so it
-        // emits the official ExitPlanMode signal: --permission-mode plan (read-only by
-        // construction), reads auto-approved, and the prompt instructs it to embed the
-        // RUDDER_PLAN_TASKS block and call ExitPlanMode. No --tools/--disallowedTools.
+        // The Claude orchestrator (RudderPlan) is a read-only DECOMPOSER that STREAMS its
+        // reasoning + the DAG as assistant text: --permission-mode default, read-only tool
+        // allowlist, edit/write/bash blocked, headless -p stream-json. (Real plan mode was
+        // tried in 1.16.0 and reverted — slower + hid the plan in the plan file.)
         let orchestrator_claude = agent_command(
             Backend::Claude,
             "sonnet",
@@ -1796,26 +1796,29 @@ branch refs/heads/main\n";
             orchestrator_claude
                 .args
                 .windows(2)
+                .any(|window| window[0] == "--permission-mode" && window[1] == "default"),
+            "orchestrator runs the read-only decomposer (permission-mode default), not plan mode"
+        );
+        assert!(
+            !orchestrator_claude
+                .args
+                .windows(2)
                 .any(|window| window[0] == "--permission-mode" && window[1] == "plan"),
-            "orchestrator runs real plan mode (for the ExitPlanMode signal)"
+            "orchestrator is NOT Claude plan mode (reverted in 1.17.x: slow + hid the plan)"
         );
         assert!(
             orchestrator_claude
                 .args
                 .windows(2)
                 .any(|window| window[0] == "--allowedTools" && window[1].contains("Read")),
-            "orchestrator auto-approves read-only inspection tools"
+            "orchestrator allows read-only inspection tools"
         );
         assert!(
-            !orchestrator_claude
+            orchestrator_claude
                 .args
                 .windows(2)
-                .any(|window| window[0] == "--tools" || window[0] == "--disallowedTools"),
-            "no restrictive tool lists (they would block the plan-file Write / ExitPlanMode)"
-        );
-        assert!(
-            orchestrator_claude.args.iter().any(|arg| arg.contains("ExitPlanMode")),
-            "the prompt instructs the planner to present its plan via ExitPlanMode"
+                .any(|window| window[0] == "--disallowedTools" && window[1].contains("Edit")),
+            "orchestrator blocks edit/write tools"
         );
         assert!(
             orchestrator_claude.args.iter().any(|arg| arg == "-p"),
@@ -4607,20 +4610,21 @@ branch refs/heads/main\n";
             std::process::Command::new("git").arg("init").arg("-q").current_dir(&repo).status().is_ok()
         );
 
-        // The fake `claude` emits a canned plan-mode stream: system init, an assistant
-        // ExitPlanMode tool_use whose input.plan contains the DAG, then result, then exits.
+        // The fake `claude` emits the headless decomposer stream: system init, then a
+        // result event whose text STREAMS the reasoning + the RUDDER_PLAN_TASKS block as
+        // assistant text (how the real read-only decomposer presents the DAG), then exits.
         let dag = r#"{"tasks":[{"id":"n0","title":"impl-mathutils","prompt":"add add()","goal":"add add","success":"defines add","deps":[]},{"id":"n1","title":"test-mathutils","prompt":"pytest","goal":"add a test","success":"imports add","deps":[{"on":"n0","type":"hard","why":"the test imports add()"}]}]}"#;
-        let plan = format!("# Plan\n\nHere is the DAG.\n\nRUDDER_PLAN_TASKS_START\n{dag}\nRUDDER_PLAN_TASKS_END\n\nThis split is safe.");
-        let assistant = serde_json::json!({
-            "type": "assistant",
-            "message": {"content": [{"type": "tool_use", "name": "ExitPlanMode", "input": {"plan": plan, "planFilePath": "/tmp/p.md"}}]}
+        let plan = format!("Here is the DAG.\nRUDDER_PLAN_TASKS_START\n{dag}\nRUDDER_PLAN_TASKS_END\nThis split is safe.");
+        let result = serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "result": plan,
         })
         .to_string();
         let stream = format!(
-            "{}\n{}\n{}\n",
+            "{}\n{}\n",
             r#"{"type":"system","subtype":"init","session_id":"fake-planner"}"#,
-            assistant,
-            r#"{"type":"result","subtype":"success","result":"plan ready"}"#
+            result
         );
         let stream_file = repo.join("planner-stream.jsonl");
         fs::write(&stream_file, &stream).expect("write stream");
