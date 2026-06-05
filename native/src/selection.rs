@@ -80,8 +80,7 @@ pub(crate) fn task_visible_input_start(app: &App, area: Rect, input_lines: &[Str
 }
 
 pub(crate) fn task_visible_input_count(app: &App, area: Rect, input_line_count: usize) -> usize {
-    // Use the SAME hint render_task/task_pane_height wrap, or the pane height and
-    // these mouse-selection bounds disagree and valid clicks get rejected.
+    // Keep legacy task-selection math aligned with task_pane_height.
     let default_hint = crate::render::task_default_hint(app);
     let hint = app.notice.as_deref().unwrap_or(default_hint);
     let hint_line_count = wrap_text(hint, task_inner_width(area)).len().max(1);
@@ -359,4 +358,3 @@ pub(crate) fn map_vt100_color(color: vt100::Color) -> Option<Color> {
         vt100::Color::Rgb(red, green, blue) => Some(Color::Rgb(red, green, blue)),
     }
 }
-

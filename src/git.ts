@@ -128,15 +128,27 @@ export function processAlive(pid: number | undefined): boolean {
 
 export async function activeRunsForCheckout(repoRoot: string, checkoutPath: string): Promise<RunRecord[]> {
   const runs = await listRuns(repoRoot);
-  return runs.filter((run) => {
+  const active: RunRecord[] = [];
+  for (const run of runs) {
     if (!["created", "running", "verifying"].includes(run.status)) {
-      return false;
+      continue;
     }
-    if (path.resolve(run.worktree.path) !== path.resolve(checkoutPath)) {
-      return false;
+    if (!(await sameFilesystemPath(run.worktree.path, checkoutPath))) {
+      continue;
     }
-    return processAlive(run.process?.pid);
-  });
+    if (processAlive(run.process?.pid)) {
+      active.push(run);
+    }
+  }
+  return active;
+}
+
+async function sameFilesystemPath(left: string, right: string): Promise<boolean> {
+  const normalize = async (value: string) => {
+    const resolved = path.resolve(value);
+    return await fsp.realpath(resolved).catch(() => resolved);
+  };
+  return (await normalize(left)) === (await normalize(right));
 }
 
 export async function conflictedFiles(repoRoot: string): Promise<string[]> {

@@ -10,17 +10,6 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
     // terminal background, and bare text inherits the ink fg.
     frame.render_widget(Block::default().style(app_style()), area);
 
-    let task_height = task_pane_height(app, area.width);
-
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(8),
-            Constraint::Length(1),
-            Constraint::Length(task_height),
-        ])
-        .split(area);
-
     let main = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -28,18 +17,17 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
             Constraint::Length(1),
             Constraint::Min(42),
         ])
-        .split(rows[0]);
+        .split(area);
 
     app.agents_area = Some(main[0]);
     app.worker_area = Some(main[2]);
-    app.task_area = Some(rows[2]);
+    app.worker_terminal_area = Some(main[2]);
+    app.orchestrator_dag_area = None;
+    app.task_area = None;
 
     render_agents(frame, main[0], app);
     render_gutter(frame, main[1], Gutter::Vertical);
     render_worker(frame, main[2], app);
-    render_gutter(frame, rows[1], Gutter::Horizontal);
-    render_task(frame, rows[2], app);
-    render_suggestions(frame, rows[2], app);
     render_cloud_prompt(frame, area, app);
     render_merge_prompt(frame, area, app);
     render_mouse_debug(frame, area, app);
@@ -698,10 +686,10 @@ fn render_planned_section<'a>(
         Span::styled(format!(" {}", nodes.len()), muted_style(focused)),
     ])));
     // APPROVAL GATE hint: while the plan awaits approval nothing has launched yet;
-    // the user refines it (type into the task pane) or approves (Enter).
+    // the orchestrator refines it or emits RUDDER_APPROVE_PLAN.
     if awaiting_approval {
         lines.push(ListItem::new(Line::from(Span::styled(
-            "  type to refine  ·  Enter approve",
+            "  awaiting orchestrator approval",
             Style::default().fg(ACCENT),
         ))));
     }
@@ -2306,28 +2294,38 @@ pub(crate) fn push_transcript_lines(
 }
 
 pub(crate) fn render_worker(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
-    let inner = block_inner(area);
-    let terminal_size = TerminalSize::new(inner.height.max(1), inner.width.max(1)).ok();
     let focused = app.focus == FocusPane::Worker;
 
-    // The selected orchestrator gets the custom DAG command-center view ONLY once
-    // its plan is ready. While it is still planning, show its raw PTY so the live
-    // plan-mode session (clarifying questions, selection menus, approval) renders
-    // cleanly through the terminal emulator and fills the pane. A custom extracted
-    // -lines view mangled spacing, leaked OSC escape sequences, and broke menu
-    // navigation. The diff/review view always uses the normal terminal path.
     let selected_is_orchestrator = app
         .agents
         .get(app.selected_agent)
         .is_some_and(|run| run.is_orchestrator());
-    // The orchestrator ALWAYS gets the custom command-center view: a live streaming
-    // transcript while planning (its raw PTY is now JSON events, not human text), and
-    // the DAG tree once a plan is ready. Both phases are rendered by render_orchestrator.
     if app.worker_view == WorkerView::Terminal && selected_is_orchestrator {
-        render_orchestrator(frame, area, app);
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(35), Constraint::Length(1), Constraint::Min(8)])
+            .split(area);
+        app.orchestrator_dag_area = Some(chunks[0]);
+        app.worker_terminal_area = Some(chunks[2]);
+        render_orchestrator_dag_pane(frame, chunks[0], app);
+        render_gutter(frame, chunks[1], Gutter::Horizontal);
+        render_worker_terminal(frame, chunks[2], app, focused, selected_is_orchestrator);
         return;
     }
 
+    app.worker_terminal_area = Some(area);
+    render_worker_terminal(frame, area, app, focused, selected_is_orchestrator);
+}
+
+fn render_worker_terminal(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &mut App,
+    focused: bool,
+    selected_is_orchestrator: bool,
+) {
+    let inner = block_inner(area);
+    let terminal_size = TerminalSize::new(inner.height.max(1), inner.width.max(1)).ok();
     if let Some(size) = terminal_size {
         if let Some(run) = app.agents.get_mut(app.selected_agent) {
             if app.worker_view == WorkerView::Terminal && run.terminal_size != Some(size) {
@@ -2379,6 +2377,73 @@ pub(crate) fn render_worker(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     }
 }
 
+pub(crate) fn render_orchestrator_dag_pane(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    let focused = app.focus == FocusPane::Worker;
+    let mut lines = orchestrator_dag_pane_lines(app);
+    let inner = block_inner(area);
+    let visible = inner.height as usize;
+    let max_scroll = orchestrator_dag_max_scroll(lines.len(), visible);
+    app.orch_dag_scroll = app.orch_dag_scroll.min(max_scroll);
+    if app.orch_dag_scroll > 0 {
+        lines = lines
+            .into_iter()
+            .skip(app.orch_dag_scroll)
+            .collect::<Vec<_>>();
+    }
+    if lines.len() > visible {
+        lines.truncate(visible);
+    }
+    app.orch_visible_rows = lines.iter().map(line_plain_text).collect();
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(app_style())
+            .block(pane_block("dag", focused, app.nav_mode))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn orchestrator_dag_pane_lines(app: &App) -> Vec<Line<'static>> {
+    let Some(agent) = app.agents.get(app.selected_agent) else {
+        return vec![Line::from(Span::styled(
+            "No orchestrator selected.",
+            muted_style(true),
+        ))];
+    };
+    let mut tasks = extract_rudder_plan_tasks(&rudder_plan_output_for_run(agent))
+        .unwrap_or_default();
+    for node in &app.planned_nodes {
+        if !tasks.iter().any(|task| task.id == node.id) {
+            tasks.push(node.to_task());
+        }
+    }
+    if tasks.is_empty() {
+        return vec![
+            Line::from(Span::styled(
+                "Waiting for the orchestrator to write a RUDDER_PLAN_TASKS block.",
+                muted_style(true),
+            )),
+            Line::from(Span::styled(
+                "The Claude Code pane below can edit RUDDER.md or print the block directly.",
+                muted_style(true),
+            )),
+        ];
+    }
+    let mut lines = orchestrator_dag_tree_lines(app, &tasks);
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled("No DAG nodes.", muted_style(true))));
+    }
+    lines
+}
+
+fn line_plain_text(line: &Line<'_>) -> String {
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<Vec<_>>()
+        .join("")
+}
+
 pub(crate) fn set_worker_cursor(frame: &mut Frame<'_>, inner: Rect, app: &App) {
     let Some(run) = app.agents.get(app.selected_agent) else {
         return;
@@ -2424,7 +2489,7 @@ pub(crate) fn worker_lines(app: &mut App, height: usize, width: usize) -> Vec<Li
             Line::from(Span::styled("No worker is running yet.", muted_style(true))),
             Line::from(""),
             Line::from(Span::styled(
-                "Enter a task below to start Claude Code or Codex in this pane.",
+                "Select the orchestrator or start a main agent to open a terminal here.",
                 pane_text_style(true),
             )),
         ];
@@ -2560,10 +2625,8 @@ pub(crate) fn review_lines(app: &mut App, height: usize) -> Vec<Line<'static>> {
     lines
 }
 
-/// The default task-pane hint shown when there is no transient notice. Centralised
-/// so render_task, task_pane_height, and selection's height/hit-test calc all wrap
-/// the SAME string: if these drift, the pane height and mouse selection bounds
-/// disagree and clicks on valid input rows get rejected.
+/// Legacy task-input hint retained for text-edit and selection tests. The task
+/// pane is no longer rendered.
 pub(crate) fn task_default_hint(app: &App) -> &'static str {
     if app.planner_paused_for_input {
         "↳ the planner asked a question — type your ANSWER here and press Enter to continue planning"
@@ -2573,104 +2636,6 @@ pub(crate) fn task_default_hint(app: &App) -> &'static str {
         "type a task to add it to the running plan (shows up in the orchestrator DAG)  ·  ^W pane"
     } else {
         "Enter to plan + run  ·  Up/Down history  ·  Option-1/2/3 or ^W pane"
-    }
-}
-
-pub(crate) fn render_task(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let focused = app.focus == FocusPane::Task;
-    let default_hint = task_default_hint(app);
-    let hint = app.notice.as_deref().unwrap_or(default_hint);
-    let inner_width = area.width.saturating_sub(2).max(1);
-    let input_lines = task_input_lines(&app.task_input, app.task_cursor, inner_width);
-    let (cursor_line, cursor_column) =
-        task_cursor_position(&app.task_input, app.task_cursor, inner_width);
-    let wrapped_hint = wrap_text(hint, inner_width);
-    let hint_line_count = wrapped_hint.len().max(1);
-    let available_lines = area.height.saturating_sub(2).max(1) as usize;
-    let max_input_lines = available_lines.saturating_sub(hint_line_count).max(1);
-    let input_start = if input_lines.len() > max_input_lines {
-        cursor_line.saturating_sub(max_input_lines.saturating_sub(1))
-    } else {
-        0
-    };
-    let input_start = input_start.min(input_lines.len().saturating_sub(1));
-    let task_selection = if app.task_input.is_empty() {
-        None
-    } else {
-        app.task_selection
-            .map(normalize_selection)
-            .filter(|selection| !selection_is_empty(*selection))
-    };
-    let mut lines = input_lines
-        .iter()
-        .skip(input_start)
-        .take(max_input_lines)
-        .enumerate()
-        .map(|(offset, line)| {
-            let display = if app.task_input.is_empty() {
-                if app.awaiting_approval {
-                    "Type to refine the plan, or press Enter to approve"
-                } else {
-                    "Type a task to plan and run"
-                }
-            } else {
-                line.as_str()
-            };
-            let style = if app.task_input.is_empty() {
-                muted_style(focused)
-            } else {
-                pane_text_style(focused)
-            };
-            let row = input_start + offset;
-            styled_plain_line(
-                display,
-                style,
-                selection_for_row(task_selection, row).filter(|_| !app.task_input.is_empty()),
-            )
-        })
-        .collect::<Vec<_>>();
-
-    if app.notice.is_some() {
-        for line in wrapped_hint {
-            lines.push(Line::from(Span::styled(line, muted_style(focused))));
-        }
-    } else {
-        let first_hint = wrapped_hint.first().cloned().unwrap_or_default();
-        lines.push(Line::from(vec![
-            Span::styled(first_hint, muted_style(focused)),
-            Span::raw("  "),
-            Span::styled(
-                if app.awaiting_approval { "refine" } else { "run" },
-                accent_style(focused),
-            ),
-            Span::raw("  "),
-            Span::styled(app.backend.as_str(), accent_style(focused)),
-            Span::raw(" "),
-            Span::styled(app.model.as_str(), model_style(focused)),
-            Span::styled(
-                format!("({})", effort_label(app.effort)),
-                model_style(focused),
-            ),
-        ]));
-        for line in wrapped_hint.into_iter().skip(1) {
-            lines.push(Line::from(Span::styled(line, muted_style(focused))));
-        }
-    }
-
-    let paragraph =
-        Paragraph::new(lines)
-            .style(app_style())
-            .block(pane_block("task", focused, app.nav_mode));
-
-    frame.render_widget(paragraph, area);
-
-    if app.focus == FocusPane::Task {
-        let visible_cursor_line = cursor_line.saturating_sub(input_start);
-        let x = area.x + 1 + cursor_column as u16;
-        let y = area.y + 1 + visible_cursor_line as u16;
-        if x < area.right().saturating_sub(1) && y < area.bottom().saturating_sub(1) {
-            frame.set_cursor_position((x, y));
-        }
     }
 }
 
@@ -2686,69 +2651,6 @@ pub(crate) fn task_pane_height(app: &App, width: u16) -> u16 {
         .saturating_add(input_lines)
         .saturating_add(hint_lines)
         .clamp(4, 10)
-}
-
-pub(crate) fn render_suggestions(frame: &mut Frame<'_>, task_area: Rect, app: &App) {
-    let suggestions = suggestions_for(app);
-    if suggestions.is_empty() {
-        return;
-    }
-
-    let visible_count = suggestions.len().min(8);
-    let height = (visible_count as u16).saturating_add(2);
-    if task_area.y < height {
-        return;
-    }
-    let area = Rect {
-        x: task_area.x,
-        y: task_area.y - height,
-        width: task_area.width,
-        height,
-    };
-
-    let selected_index = app.picker_index.min(suggestions.len().saturating_sub(1));
-    let offset = selected_index.saturating_sub(visible_count.saturating_sub(1));
-    let items = suggestions
-        .iter()
-        .skip(offset)
-        .take(visible_count)
-        .enumerate()
-        .map(|(index, suggestion)| {
-            let selected = index + offset == selected_index;
-            let marker = if selected { "> " } else { "  " };
-            let style = if selected {
-                accent_style(true)
-            } else {
-                app_style()
-            };
-            ListItem::new(Line::from(vec![
-                Span::styled(marker, style),
-                Span::styled(suggestion.label.clone(), style),
-                Span::raw("  "),
-                Span::styled(suggestion.detail.clone(), muted_style(true)),
-            ]))
-        })
-        .collect::<Vec<_>>();
-
-    let title = if app.task_input.starts_with("/model") {
-        " model "
-    } else {
-        " commands "
-    };
-    let list = List::new(items).style(app_style()).block(
-        Block::default()
-            .title(title)
-            .borders(Borders::ALL)
-            .border_style(
-                Style::default()
-                    .fg(FOCUS_COLOR)
-                    ,
-            )
-            .style(app_style()),
-    );
-
-    frame.render_widget(Clear, area);
-    frame.render_widget(list, area);
 }
 
 pub(crate) fn render_merge_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {

@@ -68,6 +68,138 @@ pub(crate) fn plan_prompt(task: &str) -> String {
     )
 }
 
+pub(crate) fn orchestrator_system_prompt() -> String {
+    [
+        "You are Rudder's interactive orchestration agent running inside Claude Code.",
+        "Your job is to talk with the user, inspect the repository, maintain the task DAG, and command Rudder by printing exact marker lines.",
+        "Workers still own implementation. You may edit RUDDER.md to maintain the DAG and orchestration notes, but do not implement product code yourself unless the user explicitly asks you to act as a worker.",
+        "Read .rudder/orchestrator-skills/*.md for the available Rudder skills. Skill examples use a _TEMPLATE suffix so Rudder does not execute them when displayed; remove _TEMPLATE before printing a marker. Print marker lines on their own line and do not wrap them in markdown.",
+        "When a task DAG is ready, either write it to RUDDER.md or print it in a RUDDER_PLAN_TASKS_START..RUDDER_PLAN_TASKS_END block. Rudder will show the DAG above this terminal and wait for RUDDER_APPROVE_PLAN before launching workers.",
+        "You may use Read, Grep, Glob, LS, WebSearch, WebFetch, Bash, Edit, and Write. Use Edit/Write only for RUDDER.md or your orchestration skill files unless the user explicitly changes your role.",
+    ]
+    .join("\n\n")
+}
+
+pub(crate) fn rudder_orchestrator_prompt(task: &str) -> String {
+    let task = strip_rudder_prompt_wrappers(task);
+    let base = [
+        "Start as Rudder's orchestrator for this checkout.",
+        "First read RUDDER.md if it exists and skim .rudder/orchestrator-skills/.",
+        "If the user has not given a concrete task yet, briefly state that you are ready and wait for their request.",
+        "For a concrete task, ask concise clarifying questions when needed. Once clear, produce a DAG using the RUDDER_PLAN_TASKS markers and then wait for approval.",
+    ]
+    .join("\n");
+    if task.trim().is_empty() {
+        base
+    } else {
+        format!("{base}\n\nUser request:\n{task}")
+    }
+}
+
+pub(crate) fn ensure_orchestrator_skill_bundle(repo_root: &Path) -> Result<()> {
+    let dir = repo_root.join(".rudder").join("orchestrator-skills");
+    fs::create_dir_all(&dir)?;
+    let skills = [
+        (
+            "approve-plan.md",
+            r#"# Approve Plan
+
+When the user approves the DAG, print the marker below after removing `_TEMPLATE`:
+
+RUDDER_APPROVE_PLAN_TEMPLATE
+
+Rudder then launches every ready worker node.
+"#,
+        ),
+        (
+            "dag-file.md",
+            r#"# Edit The DAG File
+
+Use Edit or Write on `RUDDER.md` when you need to maintain the live DAG or orchestration notes.
+
+The machine-readable plan block must use these markers without the `_TEMPLATE` suffix:
+
+RUDDER_PLAN_TASKS_START_TEMPLATE
+{"tasks":[{"id":"n0","title":"short title","prompt":"worker prompt","goal":"one-line goal","success":"done when","deps":[]}]}
+RUDDER_PLAN_TASKS_END_TEMPLATE
+
+Rudder reloads `RUDDER.md` automatically and updates the DAG pane.
+"#,
+        ),
+        (
+            "model.md",
+            r#"# Set Model
+
+To change the dashboard default model, print the marker below after removing `_TEMPLATE`:
+
+RUDDER_MODEL_TEMPLATE claude|codex <model> [effort]
+
+Effort is optional and may be low, medium, high, xhigh, or max.
+"#,
+        ),
+        (
+            "main-agent.md",
+            r#"# Main Agent
+
+To start or focus a main-checkout agent, print the marker below after removing `_TEMPLATE`:
+
+RUDDER_MAIN_TEMPLATE
+
+To start it with an initial prompt, print the marker below after removing `_TEMPLATE`:
+
+RUDDER_MAIN_TEMPLATE <prompt>
+"#,
+        ),
+        (
+            "goal.md",
+            r#"# Forward Goal
+
+To forward a /goal command to the currently selected worker agent, print the marker below after removing `_TEMPLATE`:
+
+RUDDER_GOAL_TEMPLATE <goal text>
+"#,
+        ),
+        (
+            "review-merge.md",
+            r#"# Review And Merge Commands
+
+To open an aggregate review agent, print the marker below after removing `_TEMPLATE`:
+
+RUDDER_REVIEW_ALL_TEMPLATE
+
+To request merge-all for completed work, print the marker below after removing `_TEMPLATE`:
+
+RUDDER_MERGE_ALL_TEMPLATE
+
+To toggle clean-node auto-merge, print the marker below after removing `_TEMPLATE`:
+
+RUDDER_AUTOMERGE_TEMPLATE
+
+You can force a state with `RUDDER_AUTOMERGE_TEMPLATE on` or `RUDDER_AUTOMERGE_TEMPLATE off`, again removing `_TEMPLATE` before printing.
+"#,
+        ),
+        (
+            "usage-cloud.md",
+            r#"# Usage And Cloud
+
+To show session token/cost usage, print the marker below after removing `_TEMPLATE`:
+
+RUDDER_USAGE_TEMPLATE
+
+To run a Rudder Cloud command, print the marker below after removing `_TEMPLATE`:
+
+RUDDER_CLOUD_TEMPLATE <cloud subcommand args>
+
+Examples after removing `_TEMPLATE`: `RUDDER_CLOUD list`, `RUDDER_CLOUD sail`, `RUDDER_CLOUD workspace`.
+"#,
+        ),
+    ];
+    for (name, content) in skills {
+        fs::write(dir.join(name), content)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn rudder_plan_prompt(task: &str) -> String {
     let task = strip_rudder_prompt_wrappers(task);
     [
@@ -350,8 +482,7 @@ pub(crate) fn rudder_plan_output_for_run(run: &AgentRun) -> String {
 /// a real worker agent (a Claude/Codex process), so an unbounded or hallucinated
 /// block could spawn hundreds of processes. 100 is far above any legitimate single
 /// plan, and a plan that exceeds it is surfaced (never silently truncated). Add
-/// more work incrementally by typing into the task pane (reconcile) rather than one
-/// giant block.
+/// more work incrementally through the orchestrator rather than one giant block.
 pub(crate) const MAX_PLAN_TASKS: usize = 100;
 
 /// Extract the planner's clarifying questions from a `RUDDER_QUESTIONS_START..END` block

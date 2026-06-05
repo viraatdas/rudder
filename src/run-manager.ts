@@ -7,6 +7,7 @@ import { ensureRudderCodexBinary } from "./codex-binary.js";
 import { getBackend } from "./backends.js";
 import { nativeAgentCommand } from "./native-agents.js";
 import { buildPlanPrompt, PLAN_MODE_CONTRACT } from "./plan-mode.js";
+import { mergeGeneratedRudderMd } from "./rudder-md.js";
 import {
   createRunRecord,
   agentContextPath,
@@ -789,7 +790,9 @@ async function writeRudderContextFiles(repoRoot: string, activeRuns: RunRecord[]
   for (const workspace of workspaces) {
     await ensureRudderExcluded(workspace);
     await ensureDir(path.dirname(agentContextPath(workspace)));
-    await fsp.writeFile(agentContextPath(workspace), content, "utf8");
+    const filePath = agentContextPath(workspace);
+    const existing = await fsp.readFile(filePath, "utf8").catch(() => "");
+    await fsp.writeFile(filePath, mergeGeneratedRudderMd(existing, content), "utf8");
   }
 }
 

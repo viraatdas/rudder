@@ -71,6 +71,109 @@
     }
 
     #[test]
+    fn latest_rudder_plan_block_uses_the_newest_complete_block() {
+        let first = "RUDDER_PLAN_TASKS_START\n{\"tasks\":[{\"id\":\"old\",\"title\":\"old\",\"prompt\":\"p\"}]}\nRUDDER_PLAN_TASKS_END";
+        let second = "RUDDER_PLAN_TASKS_START\n{\"tasks\":[{\"id\":\"new\",\"title\":\"new\",\"prompt\":\"p\"}]}\nRUDDER_PLAN_TASKS_END";
+        let text = format!("{first}\nnoise\n{second}\ntrailing");
+        let block = latest_rudder_plan_block(&text).expect("latest block");
+        assert!(block.contains("\"id\":\"new\""));
+        assert!(!block.contains("\"id\":\"old\""));
+
+        let template = "RUDDER_PLAN_TASKS_START_TEMPLATE\n{\"tasks\":[{\"id\":\"fake\",\"title\":\"fake\",\"prompt\":\"p\"}]}\nRUDDER_PLAN_TASKS_END_TEMPLATE";
+        assert!(latest_rudder_plan_block(template).is_none(), "template markers are ignored");
+        assert!(is_plan_marker_line("RUDDER_MODEL_TEMPLATE claude sonnet"));
+    }
+
+    #[test]
+    fn generated_rudder_md_merge_preserves_orchestrator_suffix() {
+        let existing = "<!-- RUDDER_GENERATED_START -->\nold generated\n<!-- RUDDER_GENERATED_END -->\n\n## Orchestrator notes\n- keep this";
+        let merged = merge_generated_rudder_md(existing, "new generated\n");
+        assert!(merged.contains("new generated"));
+        assert!(!merged.contains("old generated"));
+        assert!(merged.contains("## Orchestrator notes\n- keep this"));
+    }
+
+    #[test]
+    fn orchestrator_marker_scan_dedupes_by_occurrence_not_text() {
+        let mut seen = Vec::new();
+        let markers = scan_orchestrator_marker_lines(
+            "orch",
+            100,
+            "RUDDER_APPROVE_PLAN\nnoise\nRUDDER_APPROVE_PLAN\n",
+            &mut seen,
+        );
+        assert_eq!(
+            markers,
+            vec![
+                "RUDDER_APPROVE_PLAN".to_string(),
+                "RUDDER_APPROVE_PLAN".to_string()
+            ],
+            "identical commands at different offsets are both delivered"
+        );
+
+        let duplicate = scan_orchestrator_marker_lines(
+            "orch",
+            100,
+            "RUDDER_APPROVE_PLAN\nnoise\nRUDDER_APPROVE_PLAN\n",
+            &mut seen,
+        );
+        assert!(duplicate.is_empty(), "the same occurrence is still deduped");
+
+        let later = scan_orchestrator_marker_lines(
+            "orch",
+            10_000,
+            "RUDDER_APPROVE_PLAN\n",
+            &mut seen,
+        );
+        assert_eq!(
+            later,
+            vec!["RUDDER_APPROVE_PLAN".to_string()],
+            "a later repeated marker is a new occurrence"
+        );
+    }
+
+    #[test]
+    fn orchestrator_plan_text_capture_updates_the_approval_queue_once() {
+        let mut app = App::new();
+        app.cwd = std::env::temp_dir();
+        let mut orch = test_agent_run("orch", "orchestrate");
+        orch.mode = AgentMode::RudderPlan;
+        app.agents.push(orch);
+        let text = "RUDDER_PLAN_TASKS_START\n{\"tasks\":[{\"id\":\"n0\",\"title\":\"a\",\"prompt\":\"p\",\"goal\":\"g\",\"success\":\"s\"}]}\nRUDDER_PLAN_TASKS_END";
+
+        app.maybe_apply_orchestrator_plan_text(text, "test");
+
+        assert!(app.awaiting_approval);
+        assert_eq!(app.planned_nodes.len(), 1);
+        assert_eq!(app.planned_nodes[0].id, "n0");
+        let hash_after_first = app.last_rudder_md_plan_hash;
+
+        app.maybe_apply_orchestrator_plan_text(text, "test");
+        assert_eq!(app.planned_nodes.len(), 1, "same block is deduped");
+        assert_eq!(app.last_rudder_md_plan_hash, hash_after_first);
+    }
+
+    #[test]
+    fn rudder_md_plan_matching_existing_nodes_is_not_requeued() {
+        let mut app = App::new();
+        app.cwd = std::env::temp_dir();
+        let mut existing = test_agent_run("worker", "old node");
+        existing.node_id = Some("n0".to_string());
+        existing.status = AgentStatus::Merged;
+        app.agents.push(existing);
+        let text = "RUDDER_PLAN_TASKS_START\n{\"tasks\":[{\"id\":\"n0\",\"title\":\"a\",\"prompt\":\"p\",\"goal\":\"g\",\"success\":\"s\"}]}\nRUDDER_PLAN_TASKS_END";
+
+        app.maybe_apply_orchestrator_plan_text(text, "RUDDER.md");
+
+        assert!(!app.awaiting_approval, "old RUDDER.md block is not gated again");
+        assert!(app.planned_nodes.is_empty(), "no duplicate worker is queued");
+        assert!(
+            app.last_rudder_md_plan_hash.is_none(),
+            "a stale file block does not suppress a future live PTY occurrence"
+        );
+    }
+
+    #[test]
     fn bare_string_dep_becomes_a_soft_edge() {
         // A dep given as a bare string "n0" (not {on,type}) must be a soft edge (TS parity),
         // not silently dropped.
@@ -1733,10 +1836,10 @@ branch refs/heads/main\n";
             .iter()
             .any(|arg| arg.contains("Plan this task before implementation")));
 
-        // The Claude orchestrator (RudderPlan) now runs REAL plan mode headlessly so it
-        // emits the official ExitPlanMode signal: --permission-mode plan (read-only by
-        // construction), reads auto-approved, and the prompt instructs it to embed the
-        // RUDDER_PLAN_TASKS block and call ExitPlanMode. No --tools/--disallowedTools.
+        // The Claude orchestrator (RudderPlan) is a real interactive Claude Code PTY.
+        // It runs in default permission mode with the read/search tools pre-approved.
+        // Write tools remain available through Claude's normal approval prompts; they
+        // must not be auto-approved for the main checkout.
         let orchestrator_claude = agent_command(
             Backend::Claude,
             "sonnet",
@@ -1749,41 +1852,46 @@ branch refs/heads/main\n";
             orchestrator_claude
                 .args
                 .windows(2)
-                .any(|window| window[0] == "--permission-mode" && window[1] == "plan"),
-            "orchestrator runs real plan mode (for the ExitPlanMode signal)"
+                .any(|window| window[0] == "--permission-mode" && window[1] == "default"),
+            "orchestrator runs as an interactive Claude Code PTY"
         );
-        assert!(
-            orchestrator_claude
-                .args
-                .windows(2)
-                .any(|window| window[0] == "--allowedTools" && window[1].contains("Read")),
-            "orchestrator auto-approves read-only inspection tools"
-        );
+        let allowed_tools = orchestrator_claude
+            .args
+            .windows(2)
+            .find_map(|window| (window[0] == "--allowedTools").then_some(window[1].as_str()))
+            .expect("orchestrator passes an allowedTools list");
+        assert!(allowed_tools.contains("Read"), "read tools are auto-approved");
+        for tool in ["Bash", "Edit", "Write", "MultiEdit"] {
+            assert!(
+                !allowed_tools.split(',').any(|allowed| allowed == tool),
+                "{tool} must not be auto-approved for the orchestrator"
+            );
+        }
         assert!(
             !orchestrator_claude
                 .args
                 .windows(2)
                 .any(|window| window[0] == "--tools" || window[0] == "--disallowedTools"),
-            "no restrictive tool lists (they would block the plan-file Write / ExitPlanMode)"
-        );
-        assert!(
-            orchestrator_claude.args.iter().any(|arg| arg.contains("ExitPlanMode")),
-            "the prompt instructs the planner to present its plan via ExitPlanMode"
-        );
-        assert!(
-            orchestrator_claude.args.iter().any(|arg| arg == "-p"),
-            "orchestrator runs non-interactively (claude -p), not the interactive TUI"
+            "no restrictive tool lists"
         );
         assert!(
             orchestrator_claude
                 .args
                 .windows(2)
-                .any(|w| w[0] == "--output-format" && w[1] == "stream-json"),
-            "orchestrator streams JSON events for the live transcript"
+                .any(|window| window[0] == "--append-system-prompt"
+                    && window[1].contains("orchestrator-skills")),
+            "the orchestrator receives the skill/marker system prompt"
         );
         assert!(
-            orchestrator_claude.args.iter().any(|arg| arg == "--include-partial-messages"),
-            "orchestrator streams partial messages so text/thinking arrive incrementally"
+            !orchestrator_claude.args.iter().any(|arg| arg == "-p"),
+            "orchestrator is not the non-interactive claude -p path"
+        );
+        assert!(
+            !orchestrator_claude
+                .args
+                .windows(2)
+                .any(|w| w[0] == "--output-format" && w[1] == "stream-json"),
+            "orchestrator output is no longer NDJSON-stream parsed"
         );
 
         let rudder_plan = agent_command(
@@ -3609,9 +3717,9 @@ branch refs/heads/main\n";
         // Option+1 on a US macOS layout arrives as the bare char ¡.
         app.handle_key(KeyEvent::new(KeyCode::Char('\u{00a1}'), KeyModifiers::NONE));
         assert_eq!(app.focus, FocusPane::Agents);
-        // Option+3 = £
+        // Option+3 = £; the task pane is gone, so it falls through to Worker.
         app.handle_key(KeyEvent::new(KeyCode::Char('\u{00a3}'), KeyModifiers::NONE));
-        assert_eq!(app.focus, FocusPane::Task);
+        assert_eq!(app.focus, FocusPane::Worker);
     }
 
     #[test]
@@ -4000,7 +4108,7 @@ branch refs/heads/main\n";
     fn event_dispatch_handles_paste_and_ctrl_c() {
         let mut app = App::new();
         assert!(!handle_event(&mut app, Event::Paste("hello".to_string())));
-        assert_eq!(app.task_input, "hello");
+        assert_eq!(app.task_input, "");
         assert!(handle_event(
             &mut app,
             Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
@@ -4142,7 +4250,7 @@ branch refs/heads/main\n";
 
     #[test]
     fn d_key_does_not_discard_plan_queue() {
-        // The plan is refined by typing into the task pane, never discarded with `d`.
+        // The plan is refined by the orchestrator, never discarded with `d`.
         let mut app = App::new();
         app.cwd = std::env::temp_dir();
         app.planned_nodes = vec![test_planned_node("n0", &[])];
@@ -5045,7 +5153,7 @@ branch refs/heads/main\n";
         app.awaiting_approval = true;
 
         // d on the orchestrator must NOT throw the plan away: the plan is refined by
-        // typing into the task pane and approved with Enter. The gate stays open.
+        // the orchestrator and approved via RUDDER_APPROVE_PLAN. The gate stays open.
         app.handle_agents_key(KeyEvent::from(KeyCode::Char('d')));
         assert_eq!(app.planned_nodes.len(), 2, "d does not discard the plan");
         assert!(app.awaiting_approval, "the approval gate stays open");
@@ -5748,12 +5856,8 @@ branch refs/heads/main\n";
         app.cycle_focus(true);
         assert_eq!(app.focus, FocusPane::Worker);
         app.cycle_focus(true);
-        assert_eq!(app.focus, FocusPane::Task);
-        app.cycle_focus(true);
         assert_eq!(app.focus, FocusPane::Agents);
 
-        app.cycle_focus(false);
-        assert_eq!(app.focus, FocusPane::Task);
         app.cycle_focus(false);
         assert_eq!(app.focus, FocusPane::Worker);
     }
@@ -5771,7 +5875,7 @@ branch refs/heads/main\n";
 
         // A second Tab (no fresh Ctrl+W) keeps cycling because the leader re-armed.
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()));
-        assert_eq!(app.focus, FocusPane::Task, "Ctrl+W Tab Tab cycles twice");
+        assert_eq!(app.focus, FocusPane::Agents, "Ctrl+W Tab Tab cycles twice");
         assert!(app.leader_pending, "leader still armed after second Tab");
     }
 
@@ -5781,7 +5885,7 @@ branch refs/heads/main\n";
         app.focus = FocusPane::Agents;
         app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
         app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
-        assert_eq!(app.focus, FocusPane::Task, "Ctrl+W BackTab cycles backward");
+        assert_eq!(app.focus, FocusPane::Worker, "Ctrl+W BackTab cycles backward");
         assert!(app.leader_pending, "leader re-arms after BackTab");
     }
 
@@ -6415,6 +6519,20 @@ branch refs/heads/main\n";
         );
 
         let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn startup_guard_does_not_treat_stale_orchestrator_as_live() {
+        let mut app = App::new();
+        let mut stale = planner_run("orch-stale", false);
+        stale.status = AgentStatus::Done;
+        stale.terminal = None;
+        app.agents.push(stale);
+
+        assert!(
+            !app.has_live_orchestrator(),
+            "a persisted completed planner without a PTY must not block startup"
+        );
     }
 
     #[test]
