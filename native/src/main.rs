@@ -4632,11 +4632,13 @@ impl App {
             ));
             return;
         };
-        let trimmed_rest = rest.trim();
-        let payload = if trimmed_rest.is_empty() {
+        // Cap the argument for /goal so a long/pasted objective never trips the backend's
+        // "Goal condition is limited to 4000 characters" rejection; other commands pass through.
+        let arg = slash_command_arg(command, rest);
+        let payload = if arg.is_empty() {
             format!("{command}\r")
         } else {
-            format!("{command} {trimmed_rest}\r")
+            format!("{command} {arg}\r")
         };
         if let Err(error) = terminal.write_input(payload.as_bytes()) {
             self.notice = Some(format!("{command}: {error}"));

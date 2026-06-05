@@ -963,6 +963,21 @@ pub(crate) fn cap_goal_line(text: String) -> String {
     format!("{}…", truncated.trim_end())
 }
 
+/// The argument to forward for a slash command typed in the task bar. For `/goal` the
+/// backend rejects an argument longer than 4000 chars ("Goal condition is limited to
+/// 4000 characters"), so collapse the objective onto a SINGLE line (the slash command
+/// only reads up to the first newline anyway) and cap it under MAX_GOAL_LINE_CHARS — a
+/// long or pasted goal then never bounces; the full detail can ride in a normal
+/// follow-up message. Every other slash command passes its trimmed argument through.
+pub(crate) fn slash_command_arg(command: &str, rest: &str) -> String {
+    let trimmed = rest.trim();
+    if command == "/goal" {
+        cap_goal_line(trimmed.split_whitespace().collect::<Vec<_>>().join(" "))
+    } else {
+        trimmed.to_string()
+    }
+}
+
 fn goal_objective(task: &RudderPlanTask) -> String {
     if let Some(goal) = task.goal.as_deref().map(str::trim).filter(|g| !g.is_empty()) {
         return cap_goal_line(one_line(goal));

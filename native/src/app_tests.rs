@@ -109,6 +109,24 @@
     }
 
     #[test]
+    fn manual_goal_slash_command_is_capped() {
+        // The OTHER 4000-char source the user hit ("got 4760"): a /goal typed/pasted in
+        // the task bar was forwarded VERBATIM to the agent. slash_command_arg caps it.
+        let long = "a".repeat(4760);
+        let arg = slash_command_arg("/goal", &long);
+        assert!(
+            arg.chars().count() <= MAX_GOAL_LINE_CHARS,
+            "/goal arg capped under the backend limit: was {}",
+            arg.chars().count()
+        );
+        // Multi-line paste collapses to a single line (the slash command reads one line).
+        let multi = slash_command_arg("/goal", "make\nthe\nsite  pretty");
+        assert_eq!(multi, "make the site pretty");
+        // Non-goal commands pass their trimmed argument through unchanged.
+        assert_eq!(slash_command_arg("/model", "  opus  "), "opus");
+    }
+
+    #[test]
     fn duplicate_task_ids_are_accepted_not_rejected_as_a_cycle() {
         // assert_no_hard_cycle previously compared visited against tasks.len(), so duplicate
         // ids (which dedupe in the maps) falsely looked like a cycle and rejected the plan.
