@@ -9,6 +9,23 @@ import { renderContract } from "../dist/brain.js";
 // leads with `/goal <objective>` then `Done when: <success>` then the body.
 // ---------------------------------------------------------------------------
 
+test("formatGoalPrompt caps the /goal + Done-when lines under the backend's 4000-char limit", () => {
+  // Regression: a planner node with a long goal/success used to emit a `/goal`
+  // line over 4000 chars, which the backend rejects ("Goal condition is limited
+  // to 4000 characters (got 4808)"). Each line must be capped; the body stays full.
+  const prompt = formatGoalPrompt({
+    goal: "G".repeat(4808),
+    success: "S".repeat(4808),
+    body: "the full task detail goes here and is never truncated",
+  });
+  const lines = prompt.split("\n");
+  const goalLine = lines.find((l) => l.startsWith("/goal "));
+  const doneLine = lines.find((l) => l.startsWith("Done when: "));
+  assert.ok([...goalLine.slice("/goal ".length)].length <= 4000, "goal arg <= 4000 chars");
+  assert.ok([...doneLine.slice("Done when: ".length)].length <= 4000, "done-when <= 4000 chars");
+  assert.ok(prompt.includes("the full task detail goes here and is never truncated"), "body preserved");
+});
+
 test("formatGoalPrompt emits the /goal + Done-when block, then the body", () => {
   const prompt = formatGoalPrompt({
     goal: "implement the parser",

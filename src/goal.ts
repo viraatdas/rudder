@@ -16,15 +16,31 @@
 // Used when the planner/caller did not supply an explicit success condition.
 export const DEFAULT_SUCCESS = "the task is implemented and its own verification passes";
 
+// The backend's `/goal` slash command rejects a goal condition longer than 4000
+// characters ("Goal condition is limited to 4000 characters"). The objective and
+// the done-when each sit on their own `/goal` / `Done when:` line, so cap each
+// safely under that — the full detail still rides along in the prompt body that
+// follows. Mirrors `MAX_GOAL_LINE_CHARS` / `cap_goal_line` in native/src/tasks.rs.
+export const MAX_GOAL_LINE_CHARS = 3900;
+
+export function capGoalLine(text: string): string {
+  const chars = [...text];
+  if (chars.length <= MAX_GOAL_LINE_CHARS) {
+    return text;
+  }
+  return `${chars.slice(0, MAX_GOAL_LINE_CHARS - 1).join("").replace(/\s+$/, "")}…`;
+}
+
 /**
  * Build a launch prompt in /goal format. Leads with `/goal <objective>` (the
  * backends pick this up as a slash command), then a `Done when:` success line,
  * then the full task body. Objective and success are collapsed to a single line
- * each so the leading slash command stays intact.
+ * each AND capped under the backend's 4000-char `/goal` limit so the leading
+ * slash command is never rejected; the full detail stays in the body.
  */
 export function formatGoalPrompt(input: { goal: string; success: string; body: string }): string {
-  const goal = oneLine(input.goal) || oneLine(input.body) || "complete the task";
-  const success = oneLine(input.success) || DEFAULT_SUCCESS;
+  const goal = capGoalLine(oneLine(input.goal) || oneLine(input.body) || "complete the task");
+  const success = capGoalLine(oneLine(input.success) || DEFAULT_SUCCESS);
   const body = input.body.trim();
   const header = `/goal ${goal}\nDone when: ${success}`;
   return body ? `${header}\n\n${body}` : header;
