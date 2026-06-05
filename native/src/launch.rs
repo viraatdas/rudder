@@ -145,6 +145,9 @@ pub(crate) fn agent_command(
     let prompt = match mode {
         AgentMode::Execute => Some(execution_prompt(task)),
         AgentMode::Plan => Some(plan_prompt(task)),
+        AgentMode::RudderPlan if interactive_orchestrator() && backend == Backend::Claude => {
+            Some(rudder_orchestrator_prompt(task))
+        }
         AgentMode::RudderPlan => Some(rudder_plan_prompt(task)),
         AgentMode::ReviewAll => Some(task.to_string()),
         AgentMode::Main => {
@@ -170,6 +173,21 @@ pub(crate) fn agent_command(
                 // read-only by tool allowlist (inspection only; Edit/Write/Bash blocked),
                 // permission-mode default so reads auto-run, and STREAMS its reasoning +
                 // the RUDDER_PLAN_TASKS block as assistant text — fast and visible live.
+                // INTERACTIVE orchestrator (opt-in): a normal Claude Code PTY the user
+                // converses with, with the orchestrator system prompt. It writes its DAG to
+                // the orchestrator plan file (which Rudder renders above), so no -p/stream.
+                AgentMode::RudderPlan if interactive_orchestrator() => vec![
+                    "--permission-mode".to_string(),
+                    "default".to_string(),
+                    // Auto-approve read tools + Edit/Write (the prompt restricts writes to
+                    // the orchestrator plan file) so planning never stalls on a prompt.
+                    "--allowedTools".to_string(),
+                    "Read,Grep,Glob,LS,WebSearch,WebFetch,Bash,Edit,Write".to_string(),
+                    "--append-system-prompt".to_string(),
+                    orchestrator_system_prompt(),
+                    "--name".to_string(),
+                    "rudder-orchestrator".to_string(),
+                ],
                 AgentMode::RudderPlan => vec![
                     // Print mode: run non-interactively so Rudder parses the plan and
                     // the process exits. NOT the interactive Claude Code TUI.
@@ -304,6 +322,16 @@ pub(crate) fn codex_program() -> String {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "codex".to_string())
+}
+
+/// Opt-in (RUDDER_INTERACTIVE_ORCHESTRATOR=1): run the orchestrator as a normal
+/// INTERACTIVE Claude Code PTY the user converses with (real plan-mode feel + visible
+/// thinking), writing its DAG to the orchestrator plan file, instead of the headless
+/// `claude -p` decomposer. Off by default so the current flow is unchanged.
+pub(crate) fn interactive_orchestrator() -> bool {
+    env::var("RUDDER_INTERACTIVE_ORCHESTRATOR")
+        .map(|value| value.trim() == "1")
+        .unwrap_or(false)
 }
 
 /// The Claude executable. Overridable via RUDDER_CLAUDE_BIN so the end-to-end TUI

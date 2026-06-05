@@ -2305,6 +2305,75 @@ pub(crate) fn push_transcript_lines(
     }
 }
 
+/// Render the INTERACTIVE orchestrator (opt-in): a live DAG pane on top (from the plan
+/// the orchestrator wrote to its plan file → `planned_nodes`) and the raw interactive
+/// Claude Code PTY below, which the user converses with directly.
+pub(crate) fn render_interactive_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    let focused = app.focus == FocusPane::Worker;
+    // DAG pane on top (capped to a third, leaving room for the conversation), PTY below.
+    let dag_h = (area.height / 3).clamp(6, area.height.saturating_sub(6).max(6));
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(dag_h), Constraint::Min(1)])
+        .split(area);
+    let dag_area = chunks[0];
+    let term_area = chunks[1];
+
+    // ---- DAG pane (top) ----
+    let mut dag_lines: Vec<Line<'static>> = Vec::new();
+    if app.planned_nodes.is_empty() {
+        dag_lines.push(Line::from(Span::styled(
+            "Planning… talk to the orchestrator below.",
+            muted_style(focused),
+        )));
+        dag_lines.push(Line::from(Span::styled(
+            "It writes the task DAG to .rudder/orchestrator-plan.md; the DAG shows here.",
+            muted_style(focused),
+        )));
+    } else {
+        let tasks: Vec<RudderPlanTask> = app.planned_nodes.iter().map(|node| node.to_task()).collect();
+        dag_lines = orchestrator_dag_tree_lines(app, &tasks);
+        if app.awaiting_approval {
+            dag_lines.push(Line::from(Span::styled(
+                "chat to refine  ·  Enter to approve & launch",
+                Style::default().fg(ACCENT),
+            )));
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(dag_lines)
+            .style(app_style())
+            .block(pane_block("dag", focused, app.nav_mode))
+            .wrap(Wrap { trim: false }),
+        dag_area,
+    );
+
+    // ---- interactive PTY (bottom) ----
+    let term_inner = block_inner(term_area);
+    if let Ok(size) = TerminalSize::new(term_inner.height.max(1), term_inner.width.max(1)) {
+        if let Some(run) = app.agents.get_mut(app.selected_agent) {
+            if run.terminal_size != Some(size) {
+                if let Some(terminal) = run.terminal.as_mut() {
+                    if terminal.resize(size).is_ok() {
+                        run.terminal_size = Some(size);
+                    }
+                }
+            }
+        }
+    }
+    let lines = worker_lines(app, term_inner.height as usize, term_inner.width as usize);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(app_style())
+            .block(pane_block("orchestrator", focused, app.nav_mode))
+            .wrap(Wrap { trim: false }),
+        term_area,
+    );
+    if focused {
+        set_worker_cursor(frame, term_inner, app);
+    }
+}
+
 pub(crate) fn render_worker(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let inner = block_inner(area);
     let terminal_size = TerminalSize::new(inner.height.max(1), inner.width.max(1)).ok();
@@ -2324,7 +2393,13 @@ pub(crate) fn render_worker(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     // transcript while planning (its raw PTY is now JSON events, not human text), and
     // the DAG tree once a plan is ready. Both phases are rendered by render_orchestrator.
     if app.worker_view == WorkerView::Terminal && selected_is_orchestrator {
-        render_orchestrator(frame, area, app);
+        if interactive_orchestrator() {
+            // Opt-in: the orchestrator is a normal interactive Claude PTY the user talks
+            // to, with the DAG it wrote to its plan file rendered in a pane ABOVE it.
+            render_interactive_orchestrator(frame, area, app);
+        } else {
+            render_orchestrator(frame, area, app);
+        }
         return;
     }
 

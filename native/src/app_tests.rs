@@ -4724,6 +4724,66 @@ branch refs/heads/main\n";
         let _ = fs::remove_dir_all(&repo);
     }
 
+    #[cfg(not(windows))]
+    #[test]
+    fn tui_harness_interactive_orchestrator_captures_plan_file_and_renders_dag() {
+        // Opt-in interactive orchestrator: a (fake) interactive Claude writes the DAG to
+        // .rudder/orchestrator-plan.md; the App captures it into the approval gate and the
+        // DAG pane ABOVE the orchestrator PTY renders it. Validates the step-1 build.
+        let _env = env_guard();
+        let repo = unique_test_repo("tui-interactive-orch");
+        assert!(
+            std::process::Command::new("git").arg("init").arg("-q").current_dir(&repo).status().is_ok()
+        );
+        let dag = r#"{"tasks":[{"id":"n0","title":"impl-alpha","prompt":"do","goal":"g","success":"s","deps":[]},{"id":"n1","title":"test-alpha","prompt":"do","goal":"g","success":"s","deps":[{"on":"n0","type":"hard","why":"imports n0"}]}]}"#;
+        // The fake interactive `claude` runs in the repo cwd: write the plan file, then idle.
+        let fake = repo.join("fake-claude.sh");
+        write_fake_bin(
+            &fake,
+            &format!(
+                "#!/bin/sh\nmkdir -p .rudder\ncat > .rudder/orchestrator-plan.md <<'PLAN'\n# Plan\nRUDDER_PLAN_TASKS_START\n{dag}\nRUDDER_PLAN_TASKS_END\nPLAN\nsleep 8\n"
+            ),
+        );
+        std::env::set_var("RUDDER_INTERACTIVE_ORCHESTRATOR", "1");
+        std::env::set_var("RUDDER_CLAUDE_BIN", &fake);
+
+        let mut app = App::new();
+        app.cwd = repo.clone();
+        app.backend = Backend::Claude;
+        app.start_rudder_plan_task("build the alpha module and a test");
+
+        let mut captured = false;
+        for _ in 0..300 {
+            app.poll_agents();
+            if app.awaiting_approval && app.planned_nodes.len() == 2 {
+                captured = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+        std::env::remove_var("RUDDER_CLAUDE_BIN");
+
+        assert!(captured, "the orchestrator's plan file was captured into the approval gate");
+        assert!(
+            app.planned_nodes.iter().any(|n| n.title == "impl-alpha")
+                && app.planned_nodes.iter().any(|n| n.title == "test-alpha"),
+            "captured the DAG nodes: {:?}",
+            app.planned_nodes.iter().map(|n| &n.title).collect::<Vec<_>>()
+        );
+
+        // The interactive orchestrator pane renders the DAG above the PTY.
+        app.selected_agent = 0;
+        app.focus = FocusPane::Worker;
+        let screen = render_screen(&mut app, 120, 40);
+        std::env::remove_var("RUDDER_INTERACTIVE_ORCHESTRATOR");
+        assert!(
+            screen.contains("impl-alpha") && screen.contains("dag"),
+            "the DAG pane renders the captured plan above the orchestrator terminal:\n{screen}"
+        );
+
+        let _ = fs::remove_dir_all(&repo);
+    }
+
     #[test]
     fn only_interactive_worker_modes_want_signals() {
         use crate::signals::worker_wants_signals;

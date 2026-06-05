@@ -817,6 +817,17 @@ The planner UX went through several iterations; these are the settled decisions 
   (overlap splice 1.7.1, result-arm unification 1.8.0, transcript fallback 1.10.x); the
   transcript fallback is the robust one because it reads the backend's own session log and
   does not depend on the lossy live PTY stream.
+- **Opt-in INTERACTIVE orchestrator (1.18.0, `RUDDER_INTERACTIVE_ORCHESTRATOR=1`, step 1 of
+  PR #17/issue #16).** Off by default. When on, the Claude orchestrator is a normal
+  interactive Claude Code PTY you converse with (real plan-mode feel + visible thinking,
+  `launch.rs interactive_orchestrator()`), with the orchestrator system prompt
+  (`tasks.rs orchestrator_system_prompt`). It writes the DAG to `.rudder/orchestrator-plan.md`
+  (dedicated file, not RUDDER.md); `App::maybe_capture_orchestrator_plan` reads it into
+  `planned_nodes`/`awaiting_approval`; `render_interactive_orchestrator` shows a DAG pane
+  ABOVE the live PTY; keys forward to the PTY (converse) and approval is the task bar's
+  Enter. Unlike the retired PlanFront, the CC writes a DAG file so the DAG actually builds +
+  renders. STEP 2 (not built): a skills/marker protocol + removing the task bar. Default
+  (flag off) is the headless decomposer, unchanged.
 
 ### 14.4b Per-agent done/idle detection: official signals, scrape as fallback (`native/src/signals.rs`)
 The native TUI runs workers as INTERACTIVE `claude`/`codex` in a PTY (they idle between

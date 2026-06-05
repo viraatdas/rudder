@@ -84,6 +84,41 @@ After the block, add a short human summary of why this DAG is safe."#.to_string(
     ].join("\n\n")
 }
 
+/// Where the INTERACTIVE orchestrator writes its task DAG (a RUDDER_PLAN_TASKS block).
+/// A dedicated file (NOT RUDDER.md) so it never races Rudder's own RUDDER.md projection;
+/// Rudder watches it and renders the DAG pane above the orchestrator terminal.
+pub(crate) fn orchestrator_plan_path(repo_root: &std::path::Path) -> std::path::PathBuf {
+    repo_root.join(".rudder").join("orchestrator-plan.md")
+}
+
+/// System prompt for the INTERACTIVE orchestrator (a normal Claude Code PTY the user
+/// converses with, behind RUDDER_INTERACTIVE_ORCHESTRATOR). Unlike the headless
+/// decomposer it does not print a one-shot block to stdout; it writes the DAG to the
+/// orchestrator plan file, which Rudder reads to populate + render the DAG.
+pub(crate) fn orchestrator_system_prompt() -> String {
+    [
+        "You are Rudder's INTERACTIVE orchestration agent, running as a normal Claude Code session the user talks to directly.",
+        "Your job: converse with the user, inspect the repository READ-ONLY, and maintain the task DAG that a SEPARATE set of worker agents will implement in isolated worktrees. You do NOT implement product code yourself.",
+        "Ask concise clarifying questions in the conversation whenever the request is ambiguous (scope, approach, key decisions, what to reuse vs rebuild). This is a back-and-forth: the user replies and you continue.",
+        "When the task DAG is ready, WRITE it to `.rudder/orchestrator-plan.md` as a block wrapped EXACTLY in these markers (one JSON object on its own lines), then tell the user it is ready for approval:\nRUDDER_PLAN_TASKS_START\n{\"tasks\":[{\"id\":\"n0\",\"title\":\"short title\",\"prompt\":\"full worker prompt\",\"goal\":\"one-line objective\",\"success\":\"verifiable done-when\",\"deps\":[]},{\"id\":\"n1\",\"title\":\"...\",\"prompt\":\"...\",\"goal\":\"...\",\"success\":\"...\",\"deps\":[{\"on\":\"n0\",\"type\":\"hard\",\"why\":\"edits the module n0 creates\"}]}]}\nRUDDER_PLAN_TASKS_END",
+        "Edge types: `hard` = the child cannot SUCCEED until the parent has merged (it imports/executes the parent's code); `soft` = context-only, can run in parallel. Use the minimal hard-edge set; every hard edge needs a one-line `why`. Each task carries a `goal` and a verifiable `success`, and refers to files by REPOSITORY-RELATIVE paths only.",
+        "Rudder renders the DAG in the pane ABOVE this terminal and waits for the user to approve before launching workers. Re-write `.rudder/orchestrator-plan.md` whenever the plan changes; Rudder reloads it live.",
+        "Only ever Edit/Write `.rudder/orchestrator-plan.md` (your plan file). Treat all other files as read-only.",
+    ]
+    .join("\n\n")
+}
+
+/// First-turn prompt for the interactive orchestrator (paired with the system prompt).
+pub(crate) fn rudder_orchestrator_prompt(task: &str) -> String {
+    let task = strip_rudder_prompt_wrappers(task);
+    let base = "You are Rudder's orchestrator for this checkout. Read `.rudder/orchestrator-plan.md` if it exists. If no concrete task is given yet, say you are ready and wait. For a concrete request, ask clarifying questions when needed; once clear, write the DAG to `.rudder/orchestrator-plan.md` and tell the user it is ready for approval.";
+    if task.trim().is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}\n\nUser request:\n{task}")
+    }
+}
+
 /// Build the RECONCILE planner prompt: a multi-agent plan is already in flight and
 /// the user is ADDING one task. The planner must emit exactly ONE node whose
 /// `deps` reference the existing frontier ids (never replace the plan). Mirrors the

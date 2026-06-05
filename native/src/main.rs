@@ -1306,11 +1306,13 @@ impl App {
             return false;
         }
 
-        // Orchestrator pane = a CHAT with the planner. Typing composes a follow-up;
-        // Enter with text refines the plan (resumes the planner conversation), Enter
-        // on an empty line approves & launches. We intercept before the PTY-forward
-        // path because the planner runs non-interactively (writing to it is useless).
-        if self.selected_is_orchestrator() {
+        // Orchestrator pane = a CHAT with the planner. For the HEADLESS planner (default)
+        // typing composes a follow-up: Enter-with-text refines, Enter-on-empty approves;
+        // we intercept before the PTY-forward path because writing to a -p process is
+        // useless. For the INTERACTIVE orchestrator (opt-in) the pane IS a live Claude PTY,
+        // so keys forward straight to it (you converse with it); approval/refine happen via
+        // the task bar (Enter approves when awaiting_approval).
+        if self.selected_is_orchestrator() && !interactive_orchestrator() {
             return self.handle_orchestrator_chat_key(key);
         }
 
@@ -3557,6 +3559,16 @@ impl App {
             merge_resolver: false,
         };
 
+        // INTERACTIVE orchestrator (opt-in): it never exits and presents its DAG via the
+        // plan file (not the headless stream), so it is NOT autosteered (the headless
+        // completed-plan capture must not fire). Clear any stale plan file so the prior
+        // session's DAG isn't re-captured for this fresh request.
+        if interactive_orchestrator() {
+            run.autosteered = false;
+            let _ = std::fs::create_dir_all(self.cwd.join(".rudder"));
+            let _ = std::fs::remove_file(orchestrator_plan_path(&self.cwd));
+        }
+
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
             Ok(mut terminal) => {
                 let _ = terminal.drain_output();
@@ -5005,6 +5017,51 @@ impl App {
     /// plan (d on the orchestrator), or approves (Enter) to launch. The planner run
     /// is KEPT as the pinned orchestrator that owns the plan (its worker pane
     /// renders the DAG view); we clear `autosteered` so it is captured once.
+    /// INTERACTIVE orchestrator (opt-in) capture: read the DAG the orchestrator wrote to
+    /// its plan file and present it at the approval gate, reusing the SAME
+    /// planned_nodes/awaiting_approval machinery as the headless flow. Captures the first
+    /// DAG (then `awaiting_approval` / launched workers guard against re-capturing the same
+    /// file every poll); re-planning after launch is a later step. No-op unless the flag is
+    /// set, so the headless flow is untouched by default.
+    fn maybe_capture_orchestrator_plan(&mut self) {
+        if !interactive_orchestrator() || self.refining || self.rebasing || self.awaiting_approval {
+            return;
+        }
+        // Only capture a FRESH plan: nothing pending and no workers launched yet.
+        if !self.planned_nodes.is_empty() || self.agents.iter().any(|run| run.node_id.is_some()) {
+            return;
+        }
+        let running_orchestrator = self.agents.iter().any(|run| {
+            run.mode == AgentMode::RudderPlan
+                && !run.reconcile_planner
+                && run.status == AgentStatus::Running
+        });
+        if !running_orchestrator {
+            return;
+        }
+        let Ok(text) = std::fs::read_to_string(orchestrator_plan_path(&self.cwd)) else {
+            return;
+        };
+        let tasks = match extract_rudder_plan_tasks(&text) {
+            Ok(tasks) if !tasks.is_empty() => tasks,
+            _ => return,
+        };
+        let nodes: Vec<PlannedNode> = tasks.iter().map(PlannedNode::from_task).collect();
+        let count = nodes.len();
+        self.planned_nodes = nodes;
+        if !self.plan_request.trim().is_empty() {
+            self.planned_origin = self.plan_request.clone();
+        }
+        self.plan_summary = extract_rudder_plan_summary(&text);
+        self.planner_paused_for_input = false;
+        self.awaiting_approval = true;
+        self.persist_plan_queue();
+        self.notice = Some(format!(
+            "orchestrator proposed a {count}-node plan — review the DAG above · Enter approve"
+        ));
+        self.dirty = true;
+    }
+
     fn evaluate_completed_plan(&mut self, index: usize) {
         // A REBASE in flight must NEVER reach the initial-plan REPLACE path (it would wipe
         // the running plan's todo queue and re-gate the fleet); evaluate_completed_rebase
@@ -7776,6 +7833,8 @@ What to do\n\
         // exiting, so the Done-keyed path above never fires. Capture the plan into
         // the approval gate as soon as a parseable block appears in the live output.
         self.maybe_detect_plan_ready();
+        // INTERACTIVE orchestrator (opt-in): capture the DAG it wrote to its plan file.
+        self.maybe_capture_orchestrator_plan();
 
         // Drain the planned-node queue on a coarse cadence: as plan-launched
         // agents reach Merged their node ids satisfy dependents' hard deps, so a
