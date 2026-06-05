@@ -4906,6 +4906,240 @@ branch refs/heads/main\n";
         let _ = fs::remove_dir_all(&repo);
     }
 
+    #[cfg(not(windows))]
+    #[test]
+    fn approval_stops_the_orchestrator_and_mirrors_graph() {
+        // On approval the interactive orchestrator must (1) mirror the DAG into
+        // graph.json and (2) STOP — its PTY killed + status Stopped — so the single
+        // planning agent never implements; separate workers do. Both happen inside
+        // approve_planned_queue, the choke point for every approval channel.
+        let _env = env_guard();
+        let repo = unique_test_repo("orch-stop-on-approve");
+        let worker = repo.join("fake-worker.sh");
+        write_fake_bin(&worker, FAKE_CONDUCTOR_WORKER);
+        std::env::set_var("RUDDER_CODEX_BIN", &worker);
+
+        let mut app = App::new();
+        app.interactive_orchestrator = true;
+        app.cwd = repo.clone();
+        app.backend = Backend::Codex;
+        app.planned_nodes = vec![titled_planned_node("n0", "do the thing")];
+        app.awaiting_approval = true;
+
+        // A LIVE interactive orchestrator PTY (RudderPlan, !reconcile_planner, Running).
+        let command = TerminalCommand::with_args("/bin/sh", ["-lc", "sleep 5"]);
+        let pane = TerminalPane::spawn_shell_or_command(
+            Some(command),
+            TerminalPaneOptions {
+                size: TerminalSize { rows: 10, cols: 80 },
+                scrollback_lines: 100,
+                ..Default::default()
+            },
+        )
+        .expect("spawn orchestrator pty");
+        let mut orch = test_agent_run("orch-1", "plan it");
+        orch.cwd = repo.clone();
+        orch.mode = AgentMode::RudderPlan;
+        orch.terminal = Some(pane);
+        app.agents.push(orch);
+
+        // Approve via the hardened FILE channel (marker written into the plan file).
+        fs::create_dir_all(repo.join(".rudder")).unwrap();
+        fs::write(
+            orchestrator_plan_path(&repo),
+            "# Plan\nRUDDER_PLAN_TASKS_START\n{\"tasks\":[{\"id\":\"n0\",\"title\":\"x\",\"prompt\":\"p\",\"goal\":\"g\",\"success\":\"s\",\"deps\":[]}]}\nRUDDER_PLAN_TASKS_END\n\nRUDDER_APPROVE_PLAN\n",
+        )
+        .unwrap();
+
+        app.scan_orchestrator_markers();
+
+        assert!(!app.awaiting_approval, "approval cleared the gate");
+        // graph.json was mirrored on approval (the __graph-mirror shell-out is a no-op
+        // under cfg(test), but mirror_graph still records the signature it computed,
+        // proving the DAG was generated at the approval moment).
+        assert!(
+            app.last_mirror_signature.is_some(),
+            "graph.json mirrored on approval"
+        );
+        // The orchestrator row is KEPT but STOPPED: PTY killed, status Stopped.
+        let orch_after = app
+            .agents
+            .iter()
+            .find(|run| run.id == "orch-1")
+            .expect("orchestrator row kept after approval");
+        assert_eq!(
+            orch_after.status,
+            AgentStatus::Stopped,
+            "orchestrator is stopped on approval"
+        );
+        assert!(
+            orch_after.terminal.is_none(),
+            "orchestrator PTY was killed (terminal dropped)"
+        );
+        // The plan still launched its worker (or stayed queued if the in-place jj
+        // workspace prep no-ops in this bare temp repo) — same tolerance as the
+        // sibling self-launch test.
+        assert!(
+            app.planned_nodes.is_empty() || app.agents.iter().any(|run| run.node_id.is_some()),
+            "the approved node launched a worker"
+        );
+
+        // Idempotent: re-scanning does not resurrect or re-stop anything.
+        let agents_after = app.agents.len();
+        app.scan_orchestrator_markers();
+        assert_eq!(app.agents.len(), agents_after, "no churn on re-scan");
+
+        std::env::remove_var("RUDDER_CODEX_BIN");
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn approval_does_not_stop_orchestrator_in_headless_mode() {
+        // Headless decomposer (interactive_orchestrator = false): the orchestrator
+        // exits on its own, so approval must NOT reach in and stop a RudderPlan row.
+        let _env = env_guard();
+        let repo = unique_test_repo("orch-headless-no-stop");
+        let worker = repo.join("fake-worker.sh");
+        write_fake_bin(&worker, FAKE_CONDUCTOR_WORKER);
+        std::env::set_var("RUDDER_CODEX_BIN", &worker);
+
+        let mut app = App::new();
+        app.interactive_orchestrator = false;
+        app.cwd = repo.clone();
+        app.backend = Backend::Codex;
+        app.planned_nodes = vec![titled_planned_node("n0", "do the thing")];
+        app.awaiting_approval = true;
+
+        let mut orch = test_agent_run("orch-1", "plan it");
+        orch.cwd = repo.clone();
+        orch.mode = AgentMode::RudderPlan;
+        orch.status = AgentStatus::Running;
+        app.agents.push(orch);
+
+        app.approve_planned_queue();
+
+        let orch_after = app.agents.iter().find(|run| run.id == "orch-1").unwrap();
+        assert_eq!(
+            orch_after.status,
+            AgentStatus::Running,
+            "headless approval leaves the orchestrator alone (it self-exits)"
+        );
+
+        std::env::remove_var("RUDDER_CODEX_BIN");
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn stopped_orchestrator_renders_handoff_banner() {
+        // After approval the orchestrator pane shows a hand-off banner (not a dead
+        // terminal): the DAG stays above, the bottom explains the stop + points at work.
+        let _env = env_guard();
+        let mut app = App::new();
+        app.interactive_orchestrator = true;
+
+        // A stopped orchestrator (post-approval): RudderPlan, no terminal, Stopped.
+        let mut orch = test_agent_run("orch-1", "plan the work");
+        orch.mode = AgentMode::RudderPlan;
+        orch.status = AgentStatus::Stopped;
+        orch.terminal = None;
+        app.agents.push(orch);
+        // Two workers implementing nodes (Running, with node_id).
+        for (id, node) in [("w0", "n0"), ("w1", "n1")] {
+            let mut w = test_agent_run(id, "do node");
+            w.node_id = Some(node.to_string());
+            w.status = AgentStatus::Running;
+            app.agents.push(w);
+        }
+        // A remaining queued node so the DAG pane renders the tree.
+        app.planned_nodes = vec![titled_planned_node("n2", "later task")];
+
+        app.selected_agent = 0; // the orchestrator
+        app.focus = FocusPane::Worker;
+        app.worker_view = WorkerView::Terminal;
+
+        let screen = render_screen(&mut app, 120, 40);
+        assert!(
+            screen.contains("Plan approved. Orchestrator stopped."),
+            "stopped orchestrator shows the hand-off banner\n{screen}"
+        );
+        assert!(
+            screen.contains("2 worker(s) implementing"),
+            "banner reports the running worker count\n{screen}"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn orchestrator_dag_survives_queue_drain() {
+        // REGRESSION: after approval the scheduler drains planned_nodes into running
+        // workers. The DAG pane must reconstruct the launched nodes from their agents
+        // (orchestrator_dag_tasks) instead of collapsing to the "Planning…" placeholder.
+        let _env = env_guard();
+        let mut app = App::new();
+        app.interactive_orchestrator = true;
+
+        let mut orch = test_agent_run("orch-1", "plan the work");
+        orch.mode = AgentMode::RudderPlan;
+        orch.status = AgentStatus::Stopped;
+        orch.terminal = None;
+        app.agents.push(orch);
+
+        // Two launched workers, queue fully drained (planned_nodes empty).
+        for (id, node, title) in [("w0", "n0", "alpha-node"), ("w1", "n1", "beta-node")] {
+            let mut w = test_agent_run(id, "do node");
+            w.node_id = Some(node.to_string());
+            w.task_summary = title.to_string();
+            w.status = AgentStatus::Running;
+            app.agents.push(w);
+        }
+        assert!(app.planned_nodes.is_empty(), "queue is fully drained");
+
+        app.selected_agent = 0; // the orchestrator
+        app.focus = FocusPane::Worker;
+        app.worker_view = WorkerView::Terminal;
+
+        let screen = render_screen(&mut app, 120, 40);
+        assert!(
+            !screen.contains("Planning…"),
+            "the drained queue must NOT collapse the DAG to the planning placeholder\n{screen}"
+        );
+        assert!(
+            screen.contains("alpha-node") && screen.contains("beta-node"),
+            "the DAG pane reconstructs launched nodes from their agents\n{screen}"
+        );
+    }
+
+    #[test]
+    fn orchestrator_dag_tasks_dedup_relaunched_nodes() {
+        // A node id can carry two agents (a failed launch + a re-goaled relaunch).
+        // orchestrator_dag_tasks must collapse them to ONE task so the DAG tree does
+        // not double-render the node.
+        let mut app = App::new();
+        app.interactive_orchestrator = true;
+
+        let mut failed = test_agent_run("run-old", "first try");
+        failed.node_id = Some("n0".to_string());
+        failed.task_summary = "stale-title".to_string();
+        failed.status = AgentStatus::Failed;
+        app.agents.push(failed);
+
+        let mut relaunched = test_agent_run("run-new", "second try");
+        relaunched.node_id = Some("n0".to_string());
+        relaunched.task_summary = "fresh-title".to_string();
+        relaunched.status = AgentStatus::Running;
+        app.agents.push(relaunched);
+
+        let tasks = app.orchestrator_dag_tasks();
+        assert_eq!(tasks.len(), 1, "the relaunched node collapses to one row");
+        assert_eq!(tasks[0].id, "n0");
+        assert_eq!(
+            tasks[0].title, "fresh-title",
+            "the latest agent's data wins for the collapsed node"
+        );
+    }
+
     #[test]
     fn self_launch_marker_is_inert_without_flag_or_gate() {
         // Opt OUT (headless decomposer): the scan no-ops even with a plan awaiting.

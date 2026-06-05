@@ -837,7 +837,19 @@ The planner UX went through several iterations; these are the settled decisions 
   (early-returns once `awaiting_approval` flips false). The prompt tells the orchestrator to WRITE
   the marker into the plan file (and may also print it), only after explicit user approval, never
   preemptively, quoting as `RUDDER_APPROVE_PLAN_TEMPLATE`. Task bar Enter stays as a manual
-  fallback. NOTE: `interactive_orchestrator()` is read ONCE into the `App.interactive_orchestrator`
+  fallback. **APPROVE → GRAPH.JSON → STOP (current behaviour):** on approval `approve_planned_queue`
+  (1) mirrors the full DAG into `.rudder/graph.json` (`mirror_graph`), (2) launches the worker
+  fleet (`run_scheduler`), then (3) calls `stop_orchestrator_after_approval`, which KILLS the
+  interactive orchestrator's PTY (drops the terminal → `TerminalPane::drop` → `child.kill()`) and
+  marks it `Stopped` — the single planning agent has done its job and must never start implementing;
+  separate workers do. Interactive-only (headless decomposers self-exit; reconcile-fold runs are
+  left alone). The row is KEPT (Stopped) so the plan/conversation stay navigable, and
+  `render_interactive_orchestrator` shows a hand-off banner ("Plan approved. Orchestrator stopped."
+  + live worker count) in place of the dead terminal. The DAG pane survives the scheduler draining
+  `planned_nodes` via `orchestrator_dag_tasks`, which reconstructs already-launched nodes from their
+  `node_id` agents (deduped per id, latest agent wins) so the tree stays whole with live status
+  badges from `orchestrator_task_status`. The orchestrator system prompt tells it its job ends at
+  `RUDDER_APPROVE_PLAN`. NOTE: `interactive_orchestrator()` is read ONCE into the `App.interactive_orchestrator`
   field at construction; render/poll/key read the FIELD (not the process-global env) so parallel
   tests don't race — tests set the field directly (the headless-view render helper pins it false).
   STILL PENDING: the rest of PR #17 (full marker/skill set + removing the task bar).

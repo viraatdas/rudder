@@ -6023,8 +6023,12 @@ impl App {
             return;
         }
         if self.planned_nodes.is_empty() {
+            // Degenerate approval (e.g. a rebase diffed every task away): clear the
+            // gate, and still STOP the orchestrator so the invariant "approved ->
+            // orchestrator stopped" holds even when there is nothing to launch.
             self.awaiting_approval = false;
             self.persist_plan_queue();
+            self.stop_orchestrator_after_approval();
             return;
         }
         self.awaiting_approval = false;
@@ -6053,10 +6057,61 @@ impl App {
             ),
             Some("user-approved plan; workers implement these nodes in isolated workspaces, honoring the dependency edges"),
         );
+        // GENERATE graph.json from the approved DAG — the user's "it generates the
+        // graph json" step. build_mirror_payload projects every planned node, so this
+        // persists the full approved plan at the approval moment. run_scheduler
+        // re-mirrors once workers launch so the board then tracks them as running.
+        self.mirror_graph();
         // Drain immediately so a ready node moves todo->in progress without waiting
         // a full scheduler interval (covers the trivial 1-node case visibly).
         self.run_scheduler();
+        // STOP the planning agent. The plan is approved and separate worker agents are
+        // now implementing each node, so the single interactive orchestrator has done
+        // its job and must NEVER start implementing itself. Interactive-only; the
+        // headless decomposer exits on its own.
+        self.stop_orchestrator_after_approval();
         self.dirty = true;
+    }
+
+    /// After a plan is approved and its workers launched, the interactive orchestrator
+    /// has done its job: the DAG is captured into graph.json and SEPARATE worker agents
+    /// implement each node. The single planning agent must never start implementing, so
+    /// KILL its PTY (dropping the terminal triggers `TerminalPane::drop` -> child.kill())
+    /// and mark it Stopped. The row is KEPT (Stopped) so the plan + conversation stay
+    /// navigable and the DAG pane still renders above it. No-op for the headless
+    /// decomposer (autosteered; it exits on its own) and for reconcile planners (the
+    /// short-lived fold runs that must keep running to update the plan).
+    fn stop_orchestrator_after_approval(&mut self) {
+        if !self.interactive_orchestrator {
+            return;
+        }
+        let cwd = self.cwd.clone();
+        let mut stopped = false;
+        for run in self.agents.iter_mut() {
+            if run.mode != AgentMode::RudderPlan
+                || run.reconcile_planner
+                || run.status != AgentStatus::Running
+            {
+                continue;
+            }
+            run.terminal = None;
+            run.review_terminal = None;
+            run.status = AgentStatus::Stopped;
+            run.completed_at = Some(Instant::now());
+            run.needs_permission = false;
+            run.permission_notified = false;
+            run.needs_user_input = false;
+            run.user_input_notified = false;
+            let _ = save_native_run_record(&cwd, run);
+            stopped = true;
+        }
+        if stopped {
+            self.push_activity(
+                "orchestrator stopped: plan approved, workers are implementing the DAG"
+                    .to_string(),
+            );
+            self.dirty = true;
+        }
     }
 
 
@@ -6077,6 +6132,72 @@ impl App {
             .iter()
             .filter(|run| run.node_id.is_some() && run.status == AgentStatus::Running)
             .count()
+    }
+
+    /// The WHOLE plan DAG as render tasks, surviving the scheduler draining
+    /// `planned_nodes` as it launches workers. Already-launched nodes are
+    /// reconstructed from their `node_id` agents (the same projection
+    /// `build_mirror_payload` uses); not-yet-launched nodes come from
+    /// `planned_nodes`. Without this the orchestrator DAG pane would collapse to the
+    /// "still planning" placeholder the moment the queue drains on approval. Live
+    /// per-node status badges are supplied separately by `orchestrator_task_status`,
+    /// so launched nodes carry no goal/success here.
+    pub(crate) fn orchestrator_dag_tasks(&self) -> Vec<RudderPlanTask> {
+        let mut tasks: Vec<RudderPlanTask> = Vec::new();
+        // Launched nodes first (agents are appended in launch order, which tracks the
+        // plan order), reconstructed from their carrying agents.
+        for run in &self.agents {
+            let Some(id) = run.node_id.clone() else {
+                continue;
+            };
+            let title = if run.task_summary.trim().is_empty() {
+                run.task.clone()
+            } else {
+                run.task_summary.clone()
+            };
+            let mut deps: Vec<PlanEdge> = run
+                .deps
+                .iter()
+                .map(|on| PlanEdge {
+                    on: on.clone(),
+                    edge: EdgeType::Hard,
+                    why: None,
+                })
+                .collect();
+            deps.extend(run.soft_deps.iter().map(|on| PlanEdge {
+                on: on.clone(),
+                edge: EdgeType::Soft,
+                why: None,
+            }));
+            let task = RudderPlanTask {
+                id: id.clone(),
+                title,
+                prompt: run.current_prompt.clone(),
+                goal: None,
+                success: None,
+                deps,
+                backend: Some(run.backend.as_str().to_string()),
+                model: Some(run.model.clone()),
+                effort: run.effort.map(|effort| effort.as_str().to_string()),
+            };
+            // A node id can map to MORE THAN ONE agent (a failed launch + a re-goaled
+            // relaunch). Collapse to a single row, keeping the LATEST agent's data
+            // (agents are appended in order) so the DAG never double-renders a node.
+            if let Some(existing) = tasks.iter_mut().find(|existing| existing.id == id) {
+                *existing = task;
+            } else {
+                tasks.push(task);
+            }
+        }
+        // Queued (not-yet-launched) nodes still in the scheduler's hands, skipping any
+        // id already represented by a launched agent.
+        for node in &self.planned_nodes {
+            if tasks.iter().any(|task| task.id == node.id) {
+                continue;
+            }
+            tasks.push(node.to_task());
+        }
+        tasks
     }
 
     /// Build the JSON payload that MIRRORS the current plan into graph.json. The

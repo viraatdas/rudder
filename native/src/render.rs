@@ -2320,8 +2320,12 @@ pub(crate) fn render_interactive_orchestrator(frame: &mut Frame<'_>, area: Rect,
     let term_area = chunks[1];
 
     // ---- DAG pane (top) ----
+    // Render the WHOLE plan (queued + already-launched nodes), so the tree stays
+    // intact after approval drains the queue into running workers. orchestrator_dag_tasks
+    // reconstructs launched nodes from their agents; status badges come from live runs.
     let mut dag_lines: Vec<Line<'static>> = Vec::new();
-    if app.planned_nodes.is_empty() {
+    let tasks = app.orchestrator_dag_tasks();
+    if tasks.is_empty() {
         dag_lines.push(Line::from(Span::styled(
             "Planning… talk to the orchestrator below.",
             muted_style(focused),
@@ -2331,7 +2335,6 @@ pub(crate) fn render_interactive_orchestrator(frame: &mut Frame<'_>, area: Rect,
             muted_style(focused),
         )));
     } else {
-        let tasks: Vec<RudderPlanTask> = app.planned_nodes.iter().map(|node| node.to_task()).collect();
         dag_lines = orchestrator_dag_tree_lines(app, &tasks);
         if app.awaiting_approval {
             dag_lines.push(Line::from(Span::styled(
@@ -2350,6 +2353,40 @@ pub(crate) fn render_interactive_orchestrator(frame: &mut Frame<'_>, area: Rect,
 
     // ---- interactive PTY (bottom) ----
     let term_inner = block_inner(term_area);
+    // Once the plan is approved, the orchestrator is Stopped (its PTY was killed): it
+    // has handed off to the worker fleet and must never implement itself. Show a clear
+    // hand-off banner instead of the dead terminal so the pane explains what happened
+    // and points at the work above.
+    let orchestrator_stopped = app
+        .agents
+        .get(app.selected_agent)
+        .is_some_and(|run| run.is_orchestrator() && run.status == AgentStatus::Stopped);
+    if orchestrator_stopped {
+        let working = app
+            .agents
+            .iter()
+            .filter(|run| run.node_id.is_some() && run.status == AgentStatus::Running)
+            .count();
+        let banner = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "Plan approved. Orchestrator stopped.",
+                pane_text_style(focused),
+            )),
+            Line::from(Span::styled(
+                format!("{working} worker(s) implementing the DAG above. Press ↑/↓ to watch them."),
+                muted_style(focused),
+            )),
+        ];
+        frame.render_widget(
+            Paragraph::new(banner)
+                .style(app_style())
+                .block(pane_block("orchestrator · stopped", focused, app.nav_mode))
+                .wrap(Wrap { trim: false }),
+            term_area,
+        );
+        return;
+    }
     if let Ok(size) = TerminalSize::new(term_inner.height.max(1), term_inner.width.max(1)) {
         if let Some(run) = app.agents.get_mut(app.selected_agent) {
             if run.terminal_size != Some(size) {
