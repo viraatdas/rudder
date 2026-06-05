@@ -7669,13 +7669,22 @@ What to do\n\
                                     changed = true;
                                 }
                             }
+                            None if signals::worker_has_config(&run.id, run.backend) => {
+                                // Official signals ARE wired for this worker but none has
+                                // arrived yet: the turn has not ended. WAIT for the Stop
+                                // hook / notify — do NOT let the chrome-scrape flip it to
+                                // review during a mid-turn idle lull (the premature-review
+                                // bug). Completion comes only from the signal or process exit.
+                                run.ready_since = None;
+                            }
                             None => {
-                                // FALLBACK: declare completion once the screen has looked
-                                // ready-for-input continuously for READY_GRACE. Tracking the
-                                // ready window (not output-silence) makes this robust against
-                                // a TUI that repaints while idle. Headless planners
-                                // (RudderPlan) are excluded: their stdout is raw JSONL, not
-                                // idle-chrome, and complete via process exit only.
+                                // FALLBACK (no hooks wired — older CLI version): declare
+                                // completion once the screen has looked ready-for-input
+                                // continuously for READY_GRACE. Tracking the ready window
+                                // (not output-silence) makes this robust against a TUI that
+                                // repaints while idle. Headless planners (RudderPlan) are
+                                // excluded: their stdout is raw JSONL, not idle-chrome, and
+                                // complete via process exit only.
                                 let ready = !run.is_orchestrator()
                                     && visible_lines.as_ref().is_some_and(|lines| {
                                         terminal_looks_ready_for_input_from_lines(run.backend, lines)

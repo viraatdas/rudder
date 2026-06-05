@@ -57,6 +57,22 @@ pub(crate) fn signal_path(run_id: &str) -> Option<PathBuf> {
     Some(signals_dir()?.join(format!("{run_id}.json")))
 }
 
+/// Whether official-signal hooks were wired for this run (its `--settings` /
+/// notify config file exists on disk). When true the poll loop must WAIT for the
+/// Stop hook / notify and NOT let the PTY-scrape flip the worker to review
+/// mid-turn; when false (older CLI / hooks unavailable) the scrape is the only
+/// completion source and stays active.
+pub(crate) fn worker_has_config(run_id: &str, backend: Backend) -> bool {
+    let Some(dir) = signals_dir() else {
+        return false;
+    };
+    let file = match backend {
+        Backend::Claude => dir.join(format!("{run_id}-claude.json")),
+        Backend::Codex => dir.join(format!("{run_id}-notify.sh")),
+    };
+    file.exists()
+}
+
 /// Read the latest signal a worker wrote, if any. Returns None when no signal
 /// file exists (caller falls back to the PTY-scrape heuristics).
 pub(crate) fn read_signal(run_id: &str) -> Option<SignalState> {

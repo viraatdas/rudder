@@ -4485,6 +4485,68 @@ branch refs/heads/main\n";
         let _ = std::fs::remove_file(&sig);
     }
 
+    #[cfg(not(windows))]
+    #[test]
+    fn wired_worker_waits_for_the_signal_and_ignores_idle_chrome() {
+        // The premature-review bug: with official signals wired (its hook config on
+        // disk), a mid-turn idle screen — claude's "shift+tab to cycle" footer, which
+        // the scrape treats as done — must NOT flip the worker to review past
+        // READY_GRACE. Only the Stop-hook/notify signal (or process exit) may.
+        let run_id = "sig-wait-itest";
+        let wiring = crate::signals::prepare_worker_signals(run_id, Backend::Claude);
+        let Some(settings) = wiring.claude_settings.clone() else {
+            return; // no HOME in this env
+        };
+        assert!(crate::signals::worker_has_config(run_id, Backend::Claude), "config wired");
+
+        let mut app = App::new();
+        app.cwd = std::env::temp_dir();
+        let command = TerminalCommand::with_args(
+            "/bin/sh",
+            ["-lc", "printf 'shift+tab to cycle\\r\\n'; sleep 8"],
+        );
+        let pane = TerminalPane::spawn_shell_or_command(
+            Some(command),
+            TerminalPaneOptions {
+                size: TerminalSize { rows: 10, cols: 80 },
+                scrollback_lines: 100,
+                ..Default::default()
+            },
+        )
+        .expect("spawn worker pty");
+        let mut run = test_agent_run(run_id, "do the thing");
+        run.cwd = app.cwd.clone();
+        run.terminal = Some(pane);
+        app.agents.push(run);
+        app.selected_agent = 0;
+
+        // Poll past READY_GRACE (3.2s). Without the fix the idle chrome would mark it
+        // done; with the fix the wired worker waits for the signal.
+        let deadline = Instant::now() + Duration::from_millis(4500);
+        while Instant::now() < deadline {
+            app.poll_agents();
+            assert_eq!(
+                app.agents[0].status,
+                AgentStatus::Running,
+                "a wired worker must wait for the signal, not the idle-chrome scrape"
+            );
+            std::thread::sleep(Duration::from_millis(150));
+        }
+
+        // The Stop hook fires -> writes the signal -> now it completes.
+        let sig = crate::signals::signal_path(run_id).unwrap();
+        std::fs::write(&sig, "{\"state\":\"done\"}").unwrap();
+        app.poll_agents();
+        assert_eq!(
+            app.agents[0].status,
+            AgentStatus::Done,
+            "the official done signal completes the wired worker"
+        );
+
+        let _ = std::fs::remove_file(&sig);
+        let _ = std::fs::remove_file(&settings);
+    }
+
     #[test]
     fn only_interactive_worker_modes_want_signals() {
         use crate::signals::worker_wants_signals;
