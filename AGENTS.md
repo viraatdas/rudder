@@ -817,10 +817,12 @@ The planner UX went through several iterations; these are the settled decisions 
   (overlap splice 1.7.1, result-arm unification 1.8.0, transcript fallback 1.10.x); the
   transcript fallback is the robust one because it reads the backend's own session log and
   does not depend on the lossy live PTY stream.
-- **Opt-in INTERACTIVE orchestrator (1.18.0, `RUDDER_INTERACTIVE_ORCHESTRATOR=1`, step 1 of
-  PR #17/issue #16).** Off by default. When on, the Claude orchestrator is a normal
-  interactive Claude Code PTY you converse with (real plan-mode feel + visible thinking,
-  `launch.rs interactive_orchestrator()`), with the orchestrator system prompt
+- **INTERACTIVE orchestrator — now the DEFAULT (1.20.0; PR #17/issue #16).** The Claude
+  orchestrator is a normal interactive Claude Code PTY you converse with (real plan-mode feel
+  + visible thinking, `launch.rs interactive_orchestrator()` now defaults TRUE; set
+  `RUDDER_INTERACTIVE_ORCHESTRATOR=0` to opt back into the headless `claude -p` decomposer).
+  Codex orchestrators stay headless regardless. Validated against real `claude` (it writes the
+  plan file + emits the marker). It uses the orchestrator system prompt
   (`tasks.rs orchestrator_system_prompt`). It writes the DAG to `.rudder/orchestrator-plan.md`
   (dedicated file, not RUDDER.md); `App::maybe_capture_orchestrator_plan` reads it into
   `planned_nodes`/`awaiting_approval`; `render_interactive_orchestrator` shows a DAG pane

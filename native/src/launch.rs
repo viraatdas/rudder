@@ -324,14 +324,15 @@ pub(crate) fn codex_program() -> String {
         .unwrap_or_else(|| "codex".to_string())
 }
 
-/// Opt-in (RUDDER_INTERACTIVE_ORCHESTRATOR=1): run the orchestrator as a normal
-/// INTERACTIVE Claude Code PTY the user converses with (real plan-mode feel + visible
-/// thinking), writing its DAG to the orchestrator plan file, instead of the headless
-/// `claude -p` decomposer. Off by default so the current flow is unchanged.
+/// The Claude orchestrator runs as a normal INTERACTIVE Claude Code PTY the user converses
+/// with (real plan-mode feel + visible thinking), writing its DAG to the orchestrator plan
+/// file and self-launching on the `RUDDER_APPROVE_PLAN` marker. This is now the DEFAULT
+/// ("the main plan mode"); set `RUDDER_INTERACTIVE_ORCHESTRATOR=0` to opt back into the
+/// headless `claude -p` decomposer. (Codex orchestrators stay headless regardless.)
 pub(crate) fn interactive_orchestrator() -> bool {
     env::var("RUDDER_INTERACTIVE_ORCHESTRATOR")
-        .map(|value| value.trim() == "1")
-        .unwrap_or(false)
+        .map(|value| value.trim() != "0")
+        .unwrap_or(true)
 }
 
 /// The Claude executable. Overridable via RUDDER_CLAUDE_BIN so the end-to-end TUI

@@ -1651,6 +1651,12 @@ branch refs/heads/main\n";
 
     #[test]
     fn plan_commands_use_read_only_backend_profiles() {
+        // This asserts the HEADLESS decomposer profile, which is now the opt-out path
+        // (interactive orchestrator is the default). Pin it via the env so the assertion is
+        // deterministic regardless of the process-global default; env_guard serializes it
+        // against the other orchestrator-mode tests.
+        let _env = env_guard();
+        std::env::set_var("RUDDER_INTERACTIVE_ORCHESTRATOR", "0");
         let execute_codex = agent_command(
             Backend::Codex,
             "gpt-5.5",
@@ -3186,6 +3192,8 @@ branch refs/heads/main\n";
 
     #[test]
     fn orchestrator_chat_renders_cursor_block() {
+        let _env = env_guard();
+        std::env::set_var("RUDDER_INTERACTIVE_ORCHESTRATOR", "0"); // headless orchestrator pane
         let mut app = App::new();
         app.focus = FocusPane::Worker;
         let mut orch = test_agent_run("orch", "build a feature");
@@ -4605,6 +4613,7 @@ branch refs/heads/main\n";
         // pane RENDERS it. This is the harness that exercises the 1.16.0 plan-mode capture
         // through the actual render path — no real claude, no auth, deterministic.
         let _env = env_guard();
+        std::env::set_var("RUDDER_INTERACTIVE_ORCHESTRATOR", "0"); // test the HEADLESS path
         let repo = unique_test_repo("tui-harness");
         assert!(
             std::process::Command::new("git").arg("init").arg("-q").current_dir(&repo).status().is_ok()
@@ -4676,7 +4685,9 @@ branch refs/heads/main\n";
         // End-to-end: the planner's FIRST turn asks (RUDDER_QUESTIONS, no ExitPlanMode);
         // the App pauses and the orchestrator pane renders the bordered "plan mode" card
         // with the numbered questions. Exercises the question gate + card render together.
+        // The card + question gate are the HEADLESS decomposer's UX, now the opt-out path.
         let _env = env_guard();
+        std::env::set_var("RUDDER_INTERACTIVE_ORCHESTRATOR", "0");
         let repo = unique_test_repo("tui-harness-q");
         assert!(
             std::process::Command::new("git").arg("init").arg("-q").current_dir(&repo).status().is_ok()
@@ -4861,8 +4872,8 @@ branch refs/heads/main\n";
     #[test]
     fn self_launch_marker_is_inert_without_flag_or_gate() {
         let _env = env_guard();
-        std::env::remove_var("RUDDER_INTERACTIVE_ORCHESTRATOR");
-        // Flag OFF: the scan no-ops even with a plan awaiting (headless flow untouched).
+        // Opt OUT (=0, the headless decomposer): the scan no-ops even with a plan awaiting.
+        std::env::set_var("RUDDER_INTERACTIVE_ORCHESTRATOR", "0");
         let mut app = App::new();
         app.cwd = std::env::temp_dir();
         app.planned_nodes = vec![titled_planned_node("n0", "x")];
@@ -5754,6 +5765,8 @@ branch refs/heads/main\n";
 
     #[test]
     fn orchestrator_dag_shows_reconciled_nodes_added_after_launch() {
+        let _env = env_guard();
+        std::env::set_var("RUDDER_INTERACTIVE_ORCHESTRATOR", "0"); // headless orchestrator pane
         // The orchestrator's frozen plan block has node "scaffold". The user then
         // typed a task post-launch, which appended a reconciled node to planned_nodes.
         // That node lives ONLY in planned_nodes, so it must still appear in the DAG.
@@ -5850,6 +5863,8 @@ branch refs/heads/main\n";
 
     #[test]
     fn orchestrator_pane_shows_per_node_goal_and_done_when() {
+        let _env = env_guard();
+        std::env::set_var("RUDDER_INTERACTIVE_ORCHESTRATOR", "0"); // headless orchestrator pane
         // The pane now fills with a per-node breakdown (goal + done-when + deps),
         // surfacing the plan's depth instead of leaving the space blank.
         let mut app = App::new();
@@ -5919,6 +5934,8 @@ branch refs/heads/main\n";
 
     #[test]
     fn orchestrator_prose_reads_live_summary_when_frozen_is_empty() {
+        let _env = env_guard();
+        std::env::set_var("RUDDER_INTERACTIVE_ORCHESTRATOR", "0"); // headless orchestrator pane
         // The truncation bug: app.plan_summary was captured once at exit-detection,
         // before the planner's tail drained. The prose must re-extract from the LIVE
         // plan_stream so it shows the full summary even when the frozen copy is empty.
