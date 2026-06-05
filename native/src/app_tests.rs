@@ -5,6 +5,53 @@
         line.spans.iter().map(|s| s.content.as_ref()).collect()
     }
 
+    /// TUI HARNESS: render the REAL dashboard (`render::render`) to a TestBackend and
+    /// return the screen as plain text (one row per line, cell symbols joined). This is
+    /// what lets end-to-end tests assert on what the user actually SEES, driving the
+    /// full App state machine + rendering instead of poking internal fields.
+    fn render_screen(app: &mut App, width: u16, height: u16) -> String {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| crate::render::render(frame, app))
+            .expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+        let area = buffer.area;
+        let mut out = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                if let Some(cell) = buffer.cell((x, y)) {
+                    out.push_str(cell.symbol());
+                }
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// Serializes tests that mutate PROCESS-GLOBAL env (RUDDER_CLAUDE_BIN /
+    /// RUDDER_CODEX_BIN): cargo runs tests in parallel, so without this two harness
+    /// tests would clobber each other's fake-backend path. Hold the guard for the
+    /// whole test (set env -> use -> remove).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Write `body` as an executable script at `path` (the fake `claude`/`codex` the
+    /// TUI harness injects via RUDDER_CLAUDE_BIN / RUDDER_CODEX_BIN).
+    fn write_fake_bin(path: &std::path::Path, body: &str) {
+        fs::write(path, body).expect("write fake bin");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(path, perms).unwrap();
+        }
+    }
+
     fn count_byte_subsequence(haystack: &[u8], needle: &[u8]) -> usize {
         haystack
             .windows(needle.len())
@@ -4544,6 +4591,133 @@ branch refs/heads/main\n";
 
         let _ = std::fs::remove_file(&sig);
         let _ = std::fs::remove_file(&settings);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn tui_harness_drives_planner_to_dag_and_renders_it() {
+        // FULL end-to-end through the real App: a planner task launches the (fake) Claude
+        // planner, which emits an ExitPlanMode plan carrying a RUDDER_PLAN_TASKS DAG; the
+        // App captures it (plan_stream exit_plan), builds the DAG, and the orchestrator
+        // pane RENDERS it. This is the harness that exercises the 1.16.0 plan-mode capture
+        // through the actual render path — no real claude, no auth, deterministic.
+        let _env = env_guard();
+        let repo = unique_test_repo("tui-harness");
+        assert!(
+            std::process::Command::new("git").arg("init").arg("-q").current_dir(&repo).status().is_ok()
+        );
+
+        // The fake `claude` emits a canned plan-mode stream: system init, an assistant
+        // ExitPlanMode tool_use whose input.plan contains the DAG, then result, then exits.
+        let dag = r#"{"tasks":[{"id":"n0","title":"impl-mathutils","prompt":"add add()","goal":"add add","success":"defines add","deps":[]},{"id":"n1","title":"test-mathutils","prompt":"pytest","goal":"add a test","success":"imports add","deps":[{"on":"n0","type":"hard","why":"the test imports add()"}]}]}"#;
+        let plan = format!("# Plan\n\nHere is the DAG.\n\nRUDDER_PLAN_TASKS_START\n{dag}\nRUDDER_PLAN_TASKS_END\n\nThis split is safe.");
+        let assistant = serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [{"type": "tool_use", "name": "ExitPlanMode", "input": {"plan": plan, "planFilePath": "/tmp/p.md"}}]}
+        })
+        .to_string();
+        let stream = format!(
+            "{}\n{}\n{}\n",
+            r#"{"type":"system","subtype":"init","session_id":"fake-planner"}"#,
+            assistant,
+            r#"{"type":"result","subtype":"success","result":"plan ready"}"#
+        );
+        let stream_file = repo.join("planner-stream.jsonl");
+        fs::write(&stream_file, &stream).expect("write stream");
+        let fake = repo.join("fake-claude.sh");
+        write_fake_bin(&fake, &format!("#!/bin/sh\ncat {}\nsleep 0.4\n", shell_single_quote(&stream_file.to_string_lossy())));
+        std::env::set_var("RUDDER_CLAUDE_BIN", &fake);
+
+        let mut app = App::new();
+        app.cwd = repo.clone();
+        app.backend = Backend::Claude;
+        app.start_rudder_plan_task("build mathutils.add and a test");
+        // The first-question gate is unit-tested on its own; here we drive the DAG-capture
+        // path, so mark the question round satisfied.
+        app.planner_question_round_done = true;
+
+        let mut captured = false;
+        for _ in 0..300 {
+            app.poll_agents();
+            if app.awaiting_approval || !app.planned_nodes.is_empty() {
+                captured = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+        std::env::remove_var("RUDDER_CLAUDE_BIN");
+
+        assert!(captured, "planner produced a DAG via the ExitPlanMode capture");
+        assert_eq!(app.planned_nodes.len(), 2, "both DAG nodes captured");
+        assert!(
+            app.planned_nodes.iter().any(|n| n.title == "impl-mathutils")
+                && app.planned_nodes.iter().any(|n| n.title == "test-mathutils"),
+            "captured nodes match the plan: {:?}",
+            app.planned_nodes.iter().map(|n| &n.title).collect::<Vec<_>>()
+        );
+
+        // RENDER the real dashboard and assert the DAG is on screen.
+        let screen = render_screen(&mut app, 120, 40);
+        assert!(
+            screen.contains("impl-mathutils") && screen.contains("test-mathutils"),
+            "the orchestrator pane renders the captured DAG:\n{screen}"
+        );
+
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn tui_harness_renders_the_plan_mode_card_when_the_planner_asks() {
+        // End-to-end: the planner's FIRST turn asks (RUDDER_QUESTIONS, no ExitPlanMode);
+        // the App pauses and the orchestrator pane renders the bordered "plan mode" card
+        // with the numbered questions. Exercises the question gate + card render together.
+        let _env = env_guard();
+        let repo = unique_test_repo("tui-harness-q");
+        assert!(
+            std::process::Command::new("git").arg("init").arg("-q").current_dir(&repo).status().is_ok()
+        );
+        let stream = format!(
+            "{}\n{}\n",
+            r#"{"type":"system","subtype":"init","session_id":"fake-planner-q"}"#,
+            r#"{"type":"result","subtype":"success","result":"RUDDER_QUESTIONS_START\nWhich time range: 4 weeks or all time?\nReuse the existing config module?\nRUDDER_QUESTIONS_END"}"#
+        );
+        let stream_file = repo.join("planner-q.jsonl");
+        fs::write(&stream_file, &stream).expect("write stream");
+        let fake = repo.join("fake-claude.sh");
+        write_fake_bin(&fake, &format!("#!/bin/sh\ncat {}\nsleep 0.4\n", shell_single_quote(&stream_file.to_string_lossy())));
+        std::env::set_var("RUDDER_CLAUDE_BIN", &fake);
+
+        let mut app = App::new();
+        app.cwd = repo.clone();
+        app.backend = Backend::Claude;
+        app.start_rudder_plan_task("build a spotify top tracks page");
+
+        let mut paused = false;
+        for _ in 0..300 {
+            app.poll_agents();
+            if app.planner_paused_for_input && !app.pending_questions.is_empty() {
+                paused = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+        std::env::remove_var("RUDDER_CLAUDE_BIN");
+
+        assert!(paused, "the planner's first turn paused for the question round");
+        assert!(app.planned_nodes.is_empty(), "no DAG captured on the asking turn");
+        assert_eq!(app.pending_questions.len(), 2, "both questions parsed");
+
+        // The orchestrator pane renders the plan-mode card with the questions.
+        app.selected_agent = 0;
+        app.focus = FocusPane::Worker;
+        let screen = render_screen(&mut app, 120, 40);
+        assert!(
+            screen.contains("Plan mode") && screen.contains("Which time range"),
+            "the plan-mode card renders the planner's questions:\n{screen}"
+        );
+
+        let _ = fs::remove_dir_all(&repo);
     }
 
     #[test]

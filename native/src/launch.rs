@@ -47,7 +47,7 @@ pub(crate) fn claude_resume_command(run: &AgentRun, session_id: &str) -> Termina
     }
     args.push("--resume".to_string());
     args.push(session_id.to_string());
-    TerminalCommand::with_args("claude", args).with_env("CLAUDE_CODE_NO_FLICKER", "0")
+    TerminalCommand::with_args(claude_program(), args).with_env("CLAUDE_CODE_NO_FLICKER", "0")
 }
 
 pub(crate) fn codex_resume_command(run: &AgentRun, session_id: &str) -> TerminalCommand {
@@ -115,7 +115,7 @@ pub(crate) fn rudder_plan_refine_command(
             args.push("--resume".to_string());
             args.push(session_id.to_string());
             args.push(format!("{feedback_prompt}{PLAN_MODE_EXIT_INSTRUCTION}"));
-            TerminalCommand::with_args("claude", args).with_env("CLAUDE_CODE_NO_FLICKER", "0")
+            TerminalCommand::with_args(claude_program(), args).with_env("CLAUDE_CODE_NO_FLICKER", "0")
         }
         Backend::Codex => {
             // `codex exec resume [OPTIONS] <SESSION_ID> [PROMPT]`. No --sandbox here:
@@ -233,7 +233,7 @@ pub(crate) fn agent_command(
                 }
                 args.push(prompt);
             }
-            TerminalCommand::with_args("claude", args).with_env("CLAUDE_CODE_NO_FLICKER", "0")
+            TerminalCommand::with_args(claude_program(), args).with_env("CLAUDE_CODE_NO_FLICKER", "0")
         }
         Backend::Codex => {
             // The orchestrator runs non-interactively via `codex exec` (read-only):
@@ -316,6 +316,17 @@ pub(crate) fn codex_program() -> String {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "codex".to_string())
+}
+
+/// The Claude executable. Overridable via RUDDER_CLAUDE_BIN so the end-to-end TUI
+/// harness can inject a fake `claude` (deterministic stream-json, no auth/network),
+/// mirroring RUDDER_CODEX_BIN.
+pub(crate) fn claude_program() -> String {
+    env::var("RUDDER_CLAUDE_BIN")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "claude".to_string())
 }
 
 pub(crate) fn review_all_run(

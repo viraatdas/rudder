@@ -561,8 +561,20 @@ From `package.json`:
 - `npm test` = `tsc` then `node --test tests/*.test.mjs`.
 - `npm run test:worker-scroll` = a focused subset of cargo tests for worker-pane
   scrollback behavior.
-- Native tests: `cargo test --manifest-path native/Cargo.toml` (231 tests + one
+- Native tests: `cargo test --manifest-path native/Cargo.toml` (260+ tests + one
   `#[ignore]`d live conductor harness, run with `-- --ignored --nocapture`).
+- **Native TUI harness** (`app_tests.rs`): drive the REAL `App` end-to-end with no
+  auth/network. `render_screen(app, w, h)` renders the actual dashboard
+  (`render::render`) to a `TestBackend` and returns the screen as text, so tests assert
+  on what the USER SEES. `write_fake_bin` + `RUDDER_CLAUDE_BIN`/`RUDDER_CODEX_BIN`
+  (`launch.rs` `claude_program()`/`codex_program()`) inject a fake backend: a planner
+  fake emits a canned plan-mode stream (ExitPlanMode plan with a RUDDER_PLAN_TASKS
+  block) so the full planner→capture→DAG→render path runs deterministically; a worker
+  fake writes files + exits (process-exit completion). `env_guard()` serializes tests
+  that mutate the process-global `RUDDER_*_BIN`. Pattern: build `App`, point a fake bin,
+  `start_rudder_plan_task` / feed keys, loop `poll_agents()`, then `render_screen` +
+  assert. See `tui_harness_drives_planner_to_dag_and_renders_it` and
+  `tui_harness_renders_the_plan_mode_card_when_the_planner_asks`.
 
 `tests/` are integration tests that import from `dist/` (so build first):
 `rebase-first.test.mjs` exercises merge/rebase/sync via `git.ts` + `state.ts`.

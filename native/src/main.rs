@@ -3063,7 +3063,7 @@ impl App {
                     args.push(sid.to_string());
                 }
                 args.push(prompt.to_string());
-                TerminalCommand::with_args("claude", args).with_env("CLAUDE_CODE_NO_FLICKER", "0")
+                TerminalCommand::with_args(claude_program(), args).with_env("CLAUDE_CODE_NO_FLICKER", "0")
             }
             Backend::Codex => {
                 let mut args = vec!["--no-alt-screen".to_string()];
