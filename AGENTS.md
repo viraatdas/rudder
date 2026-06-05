@@ -787,6 +787,12 @@ user only ever talks to Rudder; the planner can never go off and implement on it
 5. **Approve → launch.** Empty-Enter → `approve_planned_queue` → `run_scheduler` dispatches
    ready nodes (todo → running), each in its own jj workspace. The queued plan + gate state
    persist to `.rudder/plan-queue.json`, so a mid-plan restart resumes instead of losing it.
+   **Worker context at launch:** each worker gets its own checkout (hard-dep parents already
+   merged into its base), `RUDDER.md` (the live agent roster) + `DECISIONS.md`, and a launch
+   prompt carrying `/goal` + `Done when:`, the original request, the node prompt, and a
+   **`Depends on:` block** (`App::dependency_context`) naming each hard/soft parent by title +
+   its `rudder done` interface summary so the worker builds on prerequisites instead of
+   reimplementing them.
 6. **Conduct.** After launch the orchestrator stays live (not a dead view): it grows the
    DAG from completions, steers agents, and can rebase. Conductor actions are **autonomous
    (no confirm)** but **visible** (`activity_log`) and **undoable** (jj op-log).

@@ -288,7 +288,11 @@ impl PlannedNode {
 /// Build the worker launch prompt for a planned node. Mirrors
 /// `rudder_plan_worker_prompt` but sources fields off the queued node rather than
 /// a freshly parsed `RudderPlanTask`.
-pub(crate) fn planned_node_worker_prompt(planner_task: &str, node: &PlannedNode) -> String {
+pub(crate) fn planned_node_worker_prompt(
+    planner_task: &str,
+    node: &PlannedNode,
+    depends_on: &str,
+) -> String {
     let task = RudderPlanTask {
         id: node.id.clone(),
         title: node.title.clone(),
@@ -301,7 +305,7 @@ pub(crate) fn planned_node_worker_prompt(planner_task: &str, node: &PlannedNode)
         effort: node.effort.clone(),
     };
     // Backend is unused by the prompt builder; pass a placeholder.
-    rudder_plan_worker_prompt(planner_task, &task, Backend::Claude)
+    rudder_plan_worker_prompt(planner_task, &task, depends_on, Backend::Claude)
 }
 
 /// Kahn topological sort over the hard edges only. Returns `Err` when a cycle is
@@ -1015,10 +1019,14 @@ fn goal_success(task: &RudderPlanTask) -> String {
 pub(crate) fn rudder_plan_worker_prompt(
     planner_task: &str,
     task: &RudderPlanTask,
+    depends_on: &str,
     _backend: Backend,
 ) -> String {
+    // `depends_on` (when non-empty) is a pre-formatted "Depends on:" block built by the
+    // caller from the live DAG + each parent's `rudder done` interfaces; it sits between
+    // the worker task line and the node prompt so the worker BUILDS ON its prerequisites.
     let body = format!(
-        "This task was spawned by Rudder from a /rudder-plan coordinator.\n\nWorker node: {}\n\nOriginal request:\n{planner_task}\n\nWorker task: {}\n\n{}",
+        "This task was spawned by Rudder from a /rudder-plan coordinator.\n\nWorker node: {}\n\nOriginal request:\n{planner_task}\n\nWorker task: {}\n\n{depends_on}{}",
         task.id, task.title, task.prompt
     );
     format!(

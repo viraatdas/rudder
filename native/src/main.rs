@@ -6502,6 +6502,77 @@ impl App {
         }
     }
 
+    /// Build the "Depends on:" context block injected into a launching worker's prompt.
+    /// Lists each hard then soft parent by id + title, with its `rudder done` interface
+    /// summary when the parent has already merged (its code is in this worker's workspace
+    /// base, since the scheduler gates a node on its hard parents merging first). Empty
+    /// when the node has no deps. Orients the worker to BUILD ON its prerequisites rather
+    /// than rediscover or reimplement them.
+    fn dependency_context(&self, node: &PlannedNode) -> String {
+        let deps: Vec<(&str, bool)> = node
+            .deps
+            .iter()
+            .map(|id| (id.as_str(), true))
+            .chain(node.soft_deps.iter().map(|id| (id.as_str(), false)))
+            .collect();
+        if deps.is_empty() {
+            return String::new();
+        }
+        let mut lines: Vec<String> = Vec::new();
+        for (id, is_hard) in deps {
+            let parent = self
+                .agents
+                .iter()
+                .find(|run| run.node_id.as_deref() == Some(id));
+            let title = parent
+                .map(|run| {
+                    if run.task_summary.trim().is_empty() {
+                        run.task.clone()
+                    } else {
+                        run.task_summary.clone()
+                    }
+                })
+                .or_else(|| {
+                    self.planned_nodes
+                        .iter()
+                        .find(|n| n.id == id)
+                        .map(|n| n.title.clone())
+                })
+                .unwrap_or_else(|| id.to_string());
+            let merged = parent.is_some_and(|run| run.status == AgentStatus::Merged);
+            // The parent's own `rudder done` note (interfaces it created, else its summary),
+            // read from its workspace. Present only once the parent has reported.
+            let interface = parent.and_then(|run| {
+                let raw = std::fs::read_to_string(worker_done_file(&run.cwd, id)).ok()?;
+                let note: serde_json::Value = serde_json::from_str(&raw).ok()?;
+                ["interfaces", "summary"].iter().find_map(|key| {
+                    note.get(*key)
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(|value| preview_text(value, 240))
+                })
+            });
+            let kind = if is_hard { "hard" } else { "soft" };
+            let state = if merged {
+                "already merged into your workspace — build on it"
+            } else if is_hard {
+                "merges before your task is expected to succeed"
+            } else {
+                "may land while you work; treat as context"
+            };
+            let mut line = format!("- {id} ({kind}) {title} — {state}");
+            if let Some(interface) = interface {
+                line.push_str(&format!("\n    exposes: {interface}"));
+            }
+            lines.push(line);
+        }
+        format!(
+            "Depends on (build on these — do NOT reimplement them):\n{}\n\n",
+            lines.join("\n")
+        )
+    }
+
     fn run_scheduler(&mut self) {
         if self.planned_nodes.is_empty() {
             return;
@@ -6524,7 +6595,8 @@ impl App {
             };
             let node = self.planned_nodes.remove(position);
             let title = node.title.clone();
-            let prompt = planned_node_worker_prompt(&planner_task, &node);
+            let depends_on = self.dependency_context(&node);
+            let prompt = planned_node_worker_prompt(&planner_task, &node, &depends_on);
             self.start_execute_task_node(&prompt, Some(&title), Some(node));
             launched += 1;
         }

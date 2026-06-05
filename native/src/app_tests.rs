@@ -74,7 +74,7 @@
             model: None,
             effort: None,
         };
-        let prompt = rudder_plan_worker_prompt("original request", &task, Backend::Claude);
+        let prompt = rudder_plan_worker_prompt("original request", &task, "", Backend::Claude);
         let mut lines = prompt.lines();
         let goal_line = lines.next().unwrap();
         assert!(goal_line.starts_with("/goal "));
@@ -124,6 +124,63 @@
         assert_eq!(multi, "make the site pretty");
         // Non-goal commands pass their trimmed argument through unchanged.
         assert_eq!(slash_command_arg("/model", "  opus  "), "opus");
+    }
+
+    #[test]
+    fn dependency_context_names_parents_and_their_interfaces() {
+        // A launching worker should be told its deps by title + the parent's rudder-done
+        // interface, so it builds on merged prerequisites instead of reimplementing them.
+        let repo = unique_test_repo("dep-context");
+        let mut app = App::new();
+        app.cwd = repo.clone();
+
+        // A MERGED parent n0 that filed a rudder-done note exposing an interface.
+        let mut parent = test_agent_run("run-n0", "auth.js: Spotify PKCE flow");
+        parent.node_id = Some("n0".to_string());
+        parent.task_summary = "auth.js: Spotify PKCE flow".to_string();
+        parent.status = AgentStatus::Merged;
+        parent.cwd = repo.clone();
+        fs::create_dir_all(repo.join(".rudder").join("done")).unwrap();
+        fs::write(
+            repo.join(".rudder").join("done").join("n0.json"),
+            r#"{"summary":"built auth","interfaces":"getAccessToken(), refreshToken() in auth.js"}"#,
+        )
+        .unwrap();
+        app.agents.push(parent);
+
+        let node = PlannedNode {
+            id: "n1".to_string(),
+            title: "app.js: wire auth".to_string(),
+            prompt: "wire it".to_string(),
+            goal: None,
+            success: None,
+            deps: vec!["n0".to_string()],
+            soft_deps: vec![],
+            backend: None,
+            model: None,
+            effort: None,
+        };
+        let ctx = app.dependency_context(&node);
+        assert!(ctx.contains("Depends on"), "block header present\n{ctx}");
+        assert!(
+            ctx.contains("n0") && ctx.contains("auth.js: Spotify PKCE flow"),
+            "parent named by id + title\n{ctx}"
+        );
+        assert!(
+            ctx.contains("getAccessToken"),
+            "parent rudder-done interface included\n{ctx}"
+        );
+        assert!(ctx.contains("merged"), "merged state surfaced\n{ctx}");
+
+        // A node with no deps gets no block.
+        let mut independent = node.clone();
+        independent.deps.clear();
+        assert!(
+            app.dependency_context(&independent).is_empty(),
+            "no deps -> empty block"
+        );
+
+        let _ = fs::remove_dir_all(&repo);
     }
 
     #[test]
@@ -2151,7 +2208,7 @@ branch refs/heads/main\n";
 
         // The /goal block leads the prompt unconditionally for BOTH backends.
         for backend in [Backend::Codex, Backend::Claude] {
-            let prompt = rudder_plan_worker_prompt("build the feature", &task, backend);
+            let prompt = rudder_plan_worker_prompt("build the feature", &task, "", backend);
             assert!(
                 prompt.starts_with("/goal Complete the API without stopping until cargo test passes."),
                 "prompt must lead with /goal: {prompt}"
@@ -2177,7 +2234,7 @@ branch refs/heads/main\n";
             model: None,
             effort: None,
         };
-        let prompt = rudder_plan_worker_prompt("build it", &task, Backend::Claude);
+        let prompt = rudder_plan_worker_prompt("build it", &task, "", Backend::Claude);
         assert!(
             prompt.starts_with("/goal Implement the parser\n"),
             "derived /goal from title: {prompt}"
