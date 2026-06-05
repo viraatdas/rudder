@@ -55,6 +55,14 @@ pub(crate) struct PlanStreamState {
     parse_baseline: usize,
     /// Bytes of the latest snapshot already split into complete lines.
     consumed: usize,
+    /// The plan captured from a real plan-mode `ExitPlanMode` tool call (its
+    /// `input.plan`). AUTHORITATIVE plan text when the planner runs in
+    /// `--permission-mode plan`: it carries the RUDDER_PLAN_TASKS block even when
+    /// the plan was written to the plan file rather than streamed as assistant text.
+    /// Captured from the assistant tool_use envelope and, as an end-of-stream
+    /// backstop, the `result` event's `permission_denials` (ExitPlanMode is auto-
+    /// denied in headless `-p`). Cleared at the start of each turn.
+    exit_plan: Option<String>,
 }
 
 const MAX_TRANSCRIPT: usize = 400;
@@ -75,7 +83,14 @@ impl PlanStreamState {
             saw_streaming_text: false,
             parse_baseline: 0,
             consumed: 0,
+            exit_plan: None,
         }
+    }
+
+    /// The plan captured from a real plan-mode `ExitPlanMode` call, if any. This is
+    /// the authoritative plan text the RUDDER_PLAN_TASKS parser should prefer.
+    pub(crate) fn exit_plan(&self) -> Option<&str> {
+        self.exit_plan.as_deref()
     }
 
     pub(crate) fn session_id(&self) -> Option<&str> {
@@ -112,6 +127,9 @@ impl PlanStreamState {
         }
         self.parse_baseline = self.assistant_text.len();
         self.saw_streaming_text = false;
+        // A refine produces a NEW plan: drop the prior turn's ExitPlanMode capture so a
+        // stale plan is never re-used before the revised one arrives.
+        self.exit_plan = None;
     }
 
     /// Re-point ingest at a NEW underlying terminal (a refine relaunches a fresh PTY)
@@ -133,6 +151,7 @@ impl PlanStreamState {
             self.saw_streaming_text = false;
             self.parse_baseline = 0;
             self.consumed = 0;
+            self.exit_plan = None;
         }
         let tail = &snapshot[self.consumed..];
         if tail.is_empty() {
@@ -192,6 +211,10 @@ impl PlanStreamState {
             "stream_event" => self.claude_stream_event(value.get("event")),
             "assistant" => {
                 let message = value.get("message");
+                // The ExitPlanMode plan is captured from the FULL assistant envelope
+                // regardless of streaming (the streamed content_block_start carries only
+                // partial tool input); this is the authoritative plan-mode capture.
+                self.capture_exit_plan_from_message(message);
                 // When deltas streamed, content_block_start already pushed both the text
                 // and each tool_use; re-reading the final assistant message would DOUBLE
                 // every tool entry (and the text). Only fall back to the assembled message
@@ -205,6 +228,9 @@ impl PlanStreamState {
                 }
             }
             "result" => {
+                // End-of-stream backstop: ExitPlanMode is auto-denied in headless `-p`,
+                // so its plan is also recorded in the result's permission_denials.
+                self.capture_exit_plan_from_denials(value);
                 if value.get("subtype").and_then(Value::as_str) == Some("success") {
                     if let Some(result) = value.get("result").and_then(Value::as_str) {
                         // The `result` event carries the AUTHORITATIVE final-message text.
@@ -288,6 +314,56 @@ impl PlanStreamState {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Capture an `ExitPlanMode` plan from an assistant message's tool_use blocks.
+    fn capture_exit_plan_from_message(&mut self, message: Option<&Value>) {
+        let Some(content) = message
+            .and_then(|m| m.get("content"))
+            .and_then(Value::as_array)
+        else {
+            return;
+        };
+        for block in content {
+            if block.get("type").and_then(Value::as_str) == Some("tool_use")
+                && block.get("name").and_then(Value::as_str) == Some("ExitPlanMode")
+            {
+                if let Some(plan) = block
+                    .get("input")
+                    .and_then(|input| input.get("plan"))
+                    .and_then(Value::as_str)
+                {
+                    if !plan.trim().is_empty() {
+                        self.exit_plan = Some(plan.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Backstop: capture the `ExitPlanMode` plan from a result event's
+    /// `permission_denials` (only if not already captured from the assistant turn).
+    fn capture_exit_plan_from_denials(&mut self, value: &Value) {
+        if self.exit_plan.is_some() {
+            return;
+        }
+        let Some(denials) = value.get("permission_denials").and_then(Value::as_array) else {
+            return;
+        };
+        for denial in denials {
+            if denial.get("tool_name").and_then(Value::as_str) == Some("ExitPlanMode") {
+                if let Some(plan) = denial
+                    .get("tool_input")
+                    .and_then(|input| input.get("plan"))
+                    .and_then(Value::as_str)
+                {
+                    if !plan.trim().is_empty() {
+                        self.exit_plan = Some(plan.to_string());
+                        return;
+                    }
+                }
+            }
         }
     }
 

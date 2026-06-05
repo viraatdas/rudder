@@ -320,6 +320,13 @@ pub(crate) fn rudder_plan_output_for_run(run: &AgentRun) -> String {
     // exposes only the CURRENT turn so a stale prior block is not re-captured). Prefer
     // it whenever present; the raw/codex-session path is a pre-ingest fallback only.
     if let Some(stream) = run.plan_stream.as_ref() {
+        // OFFICIAL capture: a real plan-mode `ExitPlanMode` plan is the authoritative
+        // text — it carries the RUDDER_PLAN_TASKS block even when the plan was written
+        // to the plan file rather than streamed as assistant text. Falls back to the
+        // reconstructed assistant text (headless decomposer / older flow).
+        if let Some(plan) = stream.exit_plan() {
+            return plan.to_string();
+        }
         if stream.has_text() {
             return stream.parse_text().to_string();
         }

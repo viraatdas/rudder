@@ -1733,8 +1733,10 @@ branch refs/heads/main\n";
             .iter()
             .any(|arg| arg.contains("Plan this task before implementation")));
 
-        // The orchestrator (RudderPlan) is a read-only DECOMPOSER, not Claude plan
-        // mode: inspection-only tools, edit/write/bash blocked, no plan-mode UI.
+        // The Claude orchestrator (RudderPlan) now runs REAL plan mode headlessly so it
+        // emits the official ExitPlanMode signal: --permission-mode plan (read-only by
+        // construction), reads auto-approved, and the prompt instructs it to embed the
+        // RUDDER_PLAN_TASKS block and call ExitPlanMode. No --tools/--disallowedTools.
         let orchestrator_claude = agent_command(
             Backend::Claude,
             "sonnet",
@@ -1747,29 +1749,26 @@ branch refs/heads/main\n";
             orchestrator_claude
                 .args
                 .windows(2)
-                .any(|window| window[0] == "--permission-mode" && window[1] == "default"),
-            "orchestrator runs read-only (permission-mode default), not plan mode"
-        );
-        assert!(
-            !orchestrator_claude
-                .args
-                .windows(2)
                 .any(|window| window[0] == "--permission-mode" && window[1] == "plan"),
-            "orchestrator is not Claude plan mode"
+            "orchestrator runs real plan mode (for the ExitPlanMode signal)"
         );
         assert!(
             orchestrator_claude
                 .args
                 .windows(2)
                 .any(|window| window[0] == "--allowedTools" && window[1].contains("Read")),
-            "orchestrator allows read-only inspection tools"
+            "orchestrator auto-approves read-only inspection tools"
         );
         assert!(
-            orchestrator_claude
+            !orchestrator_claude
                 .args
                 .windows(2)
-                .any(|window| window[0] == "--disallowedTools" && window[1].contains("Edit")),
-            "orchestrator blocks edit/write tools"
+                .any(|window| window[0] == "--tools" || window[0] == "--disallowedTools"),
+            "no restrictive tool lists (they would block the plan-file Write / ExitPlanMode)"
+        );
+        assert!(
+            orchestrator_claude.args.iter().any(|arg| arg.contains("ExitPlanMode")),
+            "the prompt instructs the planner to present its plan via ExitPlanMode"
         );
         assert!(
             orchestrator_claude.args.iter().any(|arg| arg == "-p"),
@@ -5139,6 +5138,39 @@ branch refs/heads/main\n";
         let tasks = extract_rudder_plan_tasks(s.parse_text()).expect("block parses from reconstructed text");
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].id, "n0");
+    }
+
+    #[test]
+    fn plan_stream_captures_exit_plan_as_authoritative_dag_text() {
+        // Real plan mode presents the plan via ExitPlanMode: plan_stream must capture
+        // its input.plan (carrying the RUDDER_PLAN_TASKS block) as the authoritative
+        // text, even when the block never appeared in the streamed assistant text.
+        let mut s = PlanStreamState::new();
+        let plan = "# Plan\\nHere is the DAG.\\nRUDDER_PLAN_TASKS_START\\n{\\\"tasks\\\":[{\\\"id\\\":\\\"n0\\\",\\\"title\\\":\\\"impl\\\",\\\"prompt\\\":\\\"do it\\\",\\\"goal\\\":\\\"g\\\",\\\"success\\\":\\\"s\\\",\\\"deps\\\":[]}]}\\nRUDDER_PLAN_TASKS_END\\n";
+        // An assistant envelope whose only content is the ExitPlanMode tool_use.
+        let line = format!(
+            "{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"tool_use\",\"name\":\"ExitPlanMode\",\"input\":{{\"plan\":\"{plan}\",\"planFilePath\":\"/p/x.md\"}}}}]}}}}\n"
+        );
+        s.ingest(&line);
+        let captured = s.exit_plan().expect("ExitPlanMode plan captured");
+        assert!(captured.contains("RUDDER_PLAN_TASKS_START"), "plan carries the block");
+        let tasks = extract_rudder_plan_tasks(captured).expect("the captured plan's DAG parses");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, "n0");
+    }
+
+    #[test]
+    fn plan_stream_captures_exit_plan_from_result_permission_denials() {
+        // Backstop: in headless -p ExitPlanMode is auto-denied, so the plan is also in
+        // the result event's permission_denials.
+        let mut s = PlanStreamState::new();
+        let plan = "RUDDER_PLAN_TASKS_START\\n{\\\"tasks\\\":[{\\\"id\\\":\\\"n0\\\",\\\"title\\\":\\\"t\\\",\\\"prompt\\\":\\\"p\\\",\\\"goal\\\":\\\"g\\\",\\\"success\\\":\\\"s\\\",\\\"deps\\\":[]}]}\\nRUDDER_PLAN_TASKS_END";
+        let line = format!(
+            "{{\"type\":\"result\",\"subtype\":\"success\",\"permission_denials\":[{{\"tool_name\":\"ExitPlanMode\",\"tool_input\":{{\"plan\":\"{plan}\"}}}}]}}\n"
+        );
+        s.ingest(&line);
+        let captured = s.exit_plan().expect("plan captured from permission_denials");
+        assert!(extract_rudder_plan_tasks(captured).is_ok(), "the backstop plan parses");
     }
 
     #[test]

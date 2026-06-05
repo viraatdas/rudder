@@ -2,19 +2,22 @@
 //! Building agent launch/resume commands and review-all runs.
 use super::*;
 
-// The orchestrator (decomposer) runs read-only: only inspection tools are
-// available and edit/write/shell tools are blocked, so it literally cannot
-// implement - it only decomposes the task into a DAG that separate worker agents
-// run. Comma-joined for Claude's --tools/--allowedTools/--disallowedTools flags.
-const CLAUDE_DECOMPOSER_TOOLS: &str = "Read,Grep,Glob,LS,WebSearch,WebFetch";
-const CLAUDE_DECOMPOSER_DISALLOWED: &str = "Edit,Write,MultiEdit,NotebookEdit,Bash";
-// The interactive plan-mode FRONT-END pre-approves the same read tools PLUS Bash, so the
+// The Claude planner now runs in REAL `--permission-mode plan` (see agent_command /
+// rudder_plan_refine_command): plan mode is read-only by construction (no repo edits) and
+// gives us the official ExitPlanMode signal, so the old explicit decomposer tool allow/deny
+// lists are gone. Reads are auto-approved via --allowedTools below.
+// The plan-mode tool set pre-approves read tools PLUS Bash, so the
 // model can investigate (find/ls/grep/git) without permission prompts. Per the Claude CLI
 // reference, --allowedTools lists "tools that execute without prompting"; a bare tool name
 // auto-approves all its invocations. --permission-mode plan still blocks edits, so the
 // front-end stays research-only and never implements (Rudder, not the model, approves and
 // then STOPS it). Bash stays OUT of the decomposer's set (that one is strictly read-only).
 const CLAUDE_PLAN_FRONTEND_TOOLS: &str = "Read,Grep,Glob,LS,WebSearch,WebFetch,Bash";
+
+// Appended to the RudderPlan prompt for Claude (which now runs in real `--permission-mode
+// plan`). The plan is presented to the host via the ExitPlanMode tool, so the model must
+// put the machine-readable DAG inside that plan. Captured by plan_stream's exit_plan.
+const PLAN_MODE_EXIT_INSTRUCTION: &str = "\n\nYou are running in plan mode. When (and ONLY when) the DAG is ready to present, write your plan so that it CONTAINS the RUDDER_PLAN_TASKS_START..RUDDER_PLAN_TASKS_END block verbatim, then call the ExitPlanMode tool to present that plan. Do NOT call ExitPlanMode on a turn where you are still asking clarifying questions — emit the RUDDER_QUESTIONS block and stop instead.";
 
 pub(crate) fn mint_session_id_for(backend: Backend) -> Option<String> {
     match backend {
@@ -88,6 +91,8 @@ pub(crate) fn rudder_plan_refine_command(
 ) -> TerminalCommand {
     match backend {
         Backend::Claude => {
+            // Resume the same plan-mode session so the refine re-presents a revised plan
+            // via ExitPlanMode (captured the same way). Mirrors the first-turn args.
             let mut args = vec![
                 "-p".to_string(),
                 "--output-format".to_string(),
@@ -95,13 +100,9 @@ pub(crate) fn rudder_plan_refine_command(
                 "--include-partial-messages".to_string(),
                 "--verbose".to_string(),
                 "--permission-mode".to_string(),
-                "default".to_string(),
-                "--tools".to_string(),
-                CLAUDE_DECOMPOSER_TOOLS.to_string(),
+                "plan".to_string(),
                 "--allowedTools".to_string(),
-                CLAUDE_DECOMPOSER_TOOLS.to_string(),
-                "--disallowedTools".to_string(),
-                CLAUDE_DECOMPOSER_DISALLOWED.to_string(),
+                CLAUDE_PLAN_FRONTEND_TOOLS.to_string(),
             ];
             if !model.trim().is_empty() {
                 args.push("--model".to_string());
@@ -113,7 +114,7 @@ pub(crate) fn rudder_plan_refine_command(
             }
             args.push("--resume".to_string());
             args.push(session_id.to_string());
-            args.push(feedback_prompt.to_string());
+            args.push(format!("{feedback_prompt}{PLAN_MODE_EXIT_INSTRUCTION}"));
             TerminalCommand::with_args("claude", args).with_env("CLAUDE_CODE_NO_FLICKER", "0")
         }
         Backend::Codex => {
@@ -176,20 +177,23 @@ pub(crate) fn agent_command(
                     // Stream the event log as JSONL so the orchestrator pane can show
                     // the model thinking + inspecting files + writing the plan live
                     // (plain -p hides thinking, leaving a silent gap). plan_stream.rs
-                    // parses these events into a transcript and reconstructs the
-                    // assistant text the RUDDER_PLAN_TASKS parser reads.
+                    // parses these events into a transcript and reconstructs the text.
                     "--output-format".to_string(),
                     "stream-json".to_string(),
                     "--include-partial-messages".to_string(),
                     "--verbose".to_string(),
+                    // REAL plan mode: read-only by construction (plan mode blocks repo
+                    // edits), and it gives us the official `ExitPlanMode` signal — when the
+                    // plan is ready the model calls ExitPlanMode and plan_stream captures
+                    // its `input.plan` (the authoritative RUDDER_PLAN_TASKS source). In
+                    // headless -p ExitPlanMode is auto-denied, so the planner can NEVER
+                    // implement; Rudder owns the DAG and launches the separate workers.
+                    // No --tools/--disallowedTools: those would block the plan-file Write
+                    // and exclude ExitPlanMode; --allowedTools just auto-approves reads.
                     "--permission-mode".to_string(),
-                    "default".to_string(),
-                    "--tools".to_string(),
-                    CLAUDE_DECOMPOSER_TOOLS.to_string(),
+                    "plan".to_string(),
                     "--allowedTools".to_string(),
-                    CLAUDE_DECOMPOSER_TOOLS.to_string(),
-                    "--disallowedTools".to_string(),
-                    CLAUDE_DECOMPOSER_DISALLOWED.to_string(),
+                    CLAUDE_PLAN_FRONTEND_TOOLS.to_string(),
                 ],
                 // The standalone `/plan` command: a read-only Claude plan-mode session,
                 // with the research tools pre-approved so it never stops on a prompt.
@@ -218,7 +222,15 @@ pub(crate) fn agent_command(
                 args.push("--session-id".to_string());
                 args.push(sid.to_string());
             }
-            if let Some(prompt) = prompt {
+            if let Some(mut prompt) = prompt {
+                // In plan mode the planner presents its plan via the ExitPlanMode tool,
+                // so tell it to embed the RUDDER_PLAN_TASKS block in that plan and call
+                // ExitPlanMode when (and only when) the DAG is ready. The questions-first
+                // gate still applies: on the first turn it asks (RUDDER_QUESTIONS) and
+                // STOPS without ExitPlanMode (the rudder_plan_prompt already says so).
+                if mode == AgentMode::RudderPlan {
+                    prompt.push_str(PLAN_MODE_EXIT_INSTRUCTION);
+                }
                 args.push(prompt);
             }
             TerminalCommand::with_args("claude", args).with_env("CLAUDE_CODE_NO_FLICKER", "0")
