@@ -102,7 +102,8 @@ pub(crate) fn orchestrator_system_prompt() -> String {
         "Ask concise clarifying questions in the conversation whenever the request is ambiguous (scope, approach, key decisions, what to reuse vs rebuild). This is a back-and-forth: the user replies and you continue.",
         "When the task DAG is ready, WRITE it to `.rudder/orchestrator-plan.md` as a block wrapped EXACTLY in these markers (one JSON object on its own lines), then tell the user it is ready for approval:\nRUDDER_PLAN_TASKS_START\n{\"tasks\":[{\"id\":\"n0\",\"title\":\"short title\",\"prompt\":\"full worker prompt\",\"goal\":\"one-line objective\",\"success\":\"verifiable done-when\",\"deps\":[]},{\"id\":\"n1\",\"title\":\"...\",\"prompt\":\"...\",\"goal\":\"...\",\"success\":\"...\",\"deps\":[{\"on\":\"n0\",\"type\":\"hard\",\"why\":\"edits the module n0 creates\"}]}]}\nRUDDER_PLAN_TASKS_END",
         "Edge types: `hard` = the child cannot SUCCEED until the parent has merged (it imports/executes the parent's code); `soft` = context-only, can run in parallel. Use the minimal hard-edge set; every hard edge needs a one-line `why`. Each task carries a `goal` and a verifiable `success`, and refers to files by REPOSITORY-RELATIVE paths only.",
-        "Rudder renders the DAG in the pane ABOVE this terminal and waits for the user to approve before launching workers. Re-write `.rudder/orchestrator-plan.md` whenever the plan changes; Rudder reloads it live.",
+        "Rudder renders the DAG in the pane ABOVE this terminal. Re-write `.rudder/orchestrator-plan.md` whenever the plan changes; Rudder reloads it live.",
+        "APPROVAL / LAUNCH: After — and ONLY after — the user has EXPLICITLY confirmed in the conversation that the plan is good to run (e.g. \"yes\", \"go\", \"approve\", \"launch it\"), print this marker ALONE on its own line, with NO surrounding markdown, backticks, quotes, or other text, to launch the workers:\nRUDDER_APPROVE_PLAN\nNever print it preemptively, while you are still asking questions, or while you are revising the plan. When you merely need to REFER to the marker in prose, write it as RUDDER_APPROVE_PLAN_TEMPLATE so Rudder does not treat the mention as a launch trigger.",
         "Only ever Edit/Write `.rudder/orchestrator-plan.md` (your plan file). Treat all other files as read-only.",
     ]
     .join("\n\n")
@@ -111,7 +112,7 @@ pub(crate) fn orchestrator_system_prompt() -> String {
 /// First-turn prompt for the interactive orchestrator (paired with the system prompt).
 pub(crate) fn rudder_orchestrator_prompt(task: &str) -> String {
     let task = strip_rudder_prompt_wrappers(task);
-    let base = "You are Rudder's orchestrator for this checkout. Read `.rudder/orchestrator-plan.md` if it exists. If no concrete task is given yet, say you are ready and wait. For a concrete request, ask clarifying questions when needed; once clear, write the DAG to `.rudder/orchestrator-plan.md` and tell the user it is ready for approval.";
+    let base = "You are Rudder's orchestrator for this checkout. Read `.rudder/orchestrator-plan.md` if it exists. If no concrete task is given yet, say you are ready and wait. For a concrete request, ask clarifying questions when needed; once clear, write the DAG to `.rudder/orchestrator-plan.md` and ask the user to approve. Only AFTER they explicitly confirm, print RUDDER_APPROVE_PLAN on its own line to launch.";
     if task.trim().is_empty() {
         base.to_string()
     } else {

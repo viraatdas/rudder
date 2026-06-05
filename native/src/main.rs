@@ -5062,6 +5062,28 @@ impl App {
         self.dirty = true;
     }
 
+    /// INTERACTIVE orchestrator (opt-in) self-launch: the orchestrator, after the user
+    /// approves the plan IN CHAT, prints `RUDDER_APPROVE_PLAN` on its own line. Detect it in
+    /// the orchestrator PTY and approve + launch, so the user need not press Enter in the
+    /// task bar. `approve_planned_queue` is idempotent (early-returns when !awaiting_approval
+    /// and flips it false on success), so a marker re-seen on every repaint approves EXACTLY
+    /// once — no dedup ledger needed. Gated so it never fires in the default headless flow.
+    fn scan_orchestrator_markers(&mut self) {
+        if !interactive_orchestrator() || !self.awaiting_approval || self.refining || self.rebasing
+        {
+            return;
+        }
+        let approved = self
+            .agents
+            .iter()
+            .filter(|run| run.mode == AgentMode::RudderPlan && !run.reconcile_planner)
+            .filter_map(|run| run.terminal.as_ref())
+            .any(|terminal| output_has_approve_marker(terminal.output_log_snapshot()));
+        if approved {
+            self.approve_planned_queue();
+        }
+    }
+
     fn evaluate_completed_plan(&mut self, index: usize) {
         // A REBASE in flight must NEVER reach the initial-plan REPLACE path (it would wipe
         // the running plan's todo queue and re-gate the fleet); evaluate_completed_rebase
@@ -7833,8 +7855,10 @@ What to do\n\
         // exiting, so the Done-keyed path above never fires. Capture the plan into
         // the approval gate as soon as a parseable block appears in the live output.
         self.maybe_detect_plan_ready();
-        // INTERACTIVE orchestrator (opt-in): capture the DAG it wrote to its plan file.
+        // INTERACTIVE orchestrator (opt-in): capture the DAG it wrote to its plan file, then
+        // self-launch if it printed RUDDER_APPROVE_PLAN after the user approved in chat.
         self.maybe_capture_orchestrator_plan();
+        self.scan_orchestrator_markers();
 
         // Drain the planned-node queue on a coarse cadence: as plan-launched
         // agents reach Merged their node ids satisfy dependents' hard deps, so a
@@ -8343,6 +8367,19 @@ fn parse_worker_done_block(output: &str) -> Option<serde_json::Value> {
     let after = &clean[start + START.len()..];
     let end = after.find(END)?;
     serde_json::from_str(after[..end].trim()).ok()
+}
+
+/// True if any line of `output` is EXACTLY `RUDDER_APPROVE_PLAN` once ANSI escapes and
+/// markdown wrappers (backticks, bold asterisks, surrounding whitespace) are stripped. The
+/// interactive orchestrator prints this on its own line to approve + launch the plan. The
+/// exact full-line match means a mention inside prose, the plan block (`RUDDER_PLAN_TASKS_*`
+/// is a different string), or a `RUDDER_APPROVE_PLAN_TEMPLATE` reference never triggers it.
+fn output_has_approve_marker(output: &str) -> bool {
+    const MARKER: &str = "RUDDER_APPROVE_PLAN";
+    let clean = strip_ansi_for_plan(output).replace('\r', "");
+    clean.lines().any(|line| {
+        line.trim().trim_matches('`').trim_matches('*').trim() == MARKER
+    })
 }
 
 fn handle_event(app: &mut App, event: Event) -> bool {

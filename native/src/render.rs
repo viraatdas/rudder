@@ -2335,7 +2335,7 @@ pub(crate) fn render_interactive_orchestrator(frame: &mut Frame<'_>, area: Rect,
         dag_lines = orchestrator_dag_tree_lines(app, &tasks);
         if app.awaiting_approval {
             dag_lines.push(Line::from(Span::styled(
-                "chat to refine  ·  Enter to approve & launch",
+                "awaiting approval — tell the orchestrator to launch (or press Enter here)",
                 Style::default().fg(ACCENT),
             )));
         }

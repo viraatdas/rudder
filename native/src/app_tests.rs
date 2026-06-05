@@ -4785,6 +4785,103 @@ branch refs/heads/main\n";
     }
 
     #[test]
+    fn approve_marker_detection_is_exact_full_line() {
+        // Triggers only on an exact full-line RUDDER_APPROVE_PLAN (after ANSI + markdown strip).
+        assert!(output_has_approve_marker("ok launching\nRUDDER_APPROVE_PLAN\n"));
+        assert!(output_has_approve_marker("```\nRUDDER_APPROVE_PLAN\n```"));
+        assert!(output_has_approve_marker("`RUDDER_APPROVE_PLAN`"));
+        assert!(output_has_approve_marker("**RUDDER_APPROVE_PLAN**"));
+        assert!(output_has_approve_marker("\u{1b}[32mRUDDER_APPROVE_PLAN\u{1b}[0m\n"));
+        // Must NOT trigger on a mention, a quote, or the _TEMPLATE reference.
+        assert!(!output_has_approve_marker("print RUDDER_APPROVE_PLAN when the user agrees"));
+        assert!(!output_has_approve_marker("RUDDER_APPROVE_PLAN_TEMPLATE"));
+        assert!(!output_has_approve_marker("the marker is RUDDER_APPROVE_PLAN, got it"));
+        assert!(!output_has_approve_marker("RUDDER_PLAN_TASKS_START"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn interactive_orchestrator_self_launches_on_approve_marker() {
+        // After the user approves in chat, the orchestrator prints RUDDER_APPROVE_PLAN in its
+        // PTY; scan_orchestrator_markers detects it and approves+launches (no task-bar Enter).
+        let _env = env_guard();
+        let repo = unique_test_repo("orch-marker"); // non-git: worker launch runs in place
+        let worker = repo.join("fake-worker.sh");
+        write_fake_bin(&worker, FAKE_CONDUCTOR_WORKER);
+        std::env::set_var("RUDDER_INTERACTIVE_ORCHESTRATOR", "1");
+        std::env::set_var("RUDDER_CODEX_BIN", &worker);
+
+        let mut app = App::new();
+        app.cwd = repo.clone();
+        app.backend = Backend::Codex;
+        app.planned_nodes = vec![titled_planned_node("n0", "do the thing")];
+        app.awaiting_approval = true;
+
+        // An orchestrator PTY that printed the approve marker.
+        let command = TerminalCommand::with_args(
+            "/bin/sh",
+            ["-lc", "printf 'RUDDER_APPROVE_PLAN\\r\\n'; sleep 5"],
+        );
+        let mut pane = TerminalPane::spawn_shell_or_command(
+            Some(command),
+            TerminalPaneOptions { size: TerminalSize { rows: 10, cols: 80 }, scrollback_lines: 100, ..Default::default() },
+        )
+        .expect("spawn orchestrator pty");
+        for _ in 0..40 {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            pane.drain_output();
+            if pane.output_log_snapshot().contains("RUDDER_APPROVE_PLAN") {
+                break;
+            }
+        }
+        let mut orch = test_agent_run("orch-1", "plan it");
+        orch.cwd = repo.clone();
+        orch.mode = AgentMode::RudderPlan;
+        orch.terminal = Some(pane);
+        app.agents.push(orch);
+
+        app.scan_orchestrator_markers();
+        assert!(!app.awaiting_approval, "the approve marker launched the plan (gate cleared)");
+        assert!(
+            app.planned_nodes.is_empty() || app.agents.iter().any(|run| run.node_id.is_some()),
+            "the planned node was launched into a worker"
+        );
+
+        // Idempotent: re-scanning the same (still-present) marker does nothing.
+        let agents_after = app.agents.len();
+        app.scan_orchestrator_markers();
+        assert!(!app.awaiting_approval);
+        assert_eq!(app.agents.len(), agents_after, "no duplicate launch on re-scan");
+
+        std::env::remove_var("RUDDER_CODEX_BIN");
+        std::env::remove_var("RUDDER_INTERACTIVE_ORCHESTRATOR");
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn self_launch_marker_is_inert_without_flag_or_gate() {
+        let _env = env_guard();
+        std::env::remove_var("RUDDER_INTERACTIVE_ORCHESTRATOR");
+        // Flag OFF: the scan no-ops even with a plan awaiting (headless flow untouched).
+        let mut app = App::new();
+        app.cwd = std::env::temp_dir();
+        app.planned_nodes = vec![titled_planned_node("n0", "x")];
+        app.awaiting_approval = true;
+        let mut orch = test_agent_run("orch-1", "plan it");
+        orch.mode = AgentMode::RudderPlan;
+        app.agents.push(orch);
+        app.scan_orchestrator_markers();
+        assert!(app.awaiting_approval, "flag off → marker ignored, still awaiting approval");
+
+        // Flag ON but NOT awaiting approval: nothing to launch, scan no-ops.
+        std::env::set_var("RUDDER_INTERACTIVE_ORCHESTRATOR", "1");
+        app.awaiting_approval = false;
+        app.scan_orchestrator_markers();
+        assert!(!app.awaiting_approval);
+        std::env::remove_var("RUDDER_INTERACTIVE_ORCHESTRATOR");
+    }
+
+    #[test]
     fn only_interactive_worker_modes_want_signals() {
         use crate::signals::worker_wants_signals;
         for mode in [AgentMode::Execute, AgentMode::Main, AgentMode::ReviewAll] {
