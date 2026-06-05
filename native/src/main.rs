@@ -5070,6 +5070,59 @@ impl App {
         self.dirty = true;
     }
 
+    /// While the user keeps iterating the plan WITH the orchestrator before launch
+    /// (awaiting approval, nothing launched yet), the orchestrator may ADD / CHANGE /
+    /// REMOVE tasks and re-write its plan file. `maybe_capture_orchestrator_plan` only
+    /// captures the FIRST DAG (it bails once `awaiting_approval` is set), so this re-reads
+    /// the file and refreshes `planned_nodes` whenever the parsed DAG actually changed —
+    /// keeping the gate open so the user can keep refining by talking to the orchestrator.
+    /// Skips when the approval marker is present (scan_orchestrator_markers owns that), and
+    /// no-ops once any worker has launched (post-approval the orchestrator is stopped).
+    fn maybe_recapture_orchestrator_plan(&mut self) {
+        if !self.interactive_orchestrator
+            || !self.awaiting_approval
+            || self.refining
+            || self.rebasing
+        {
+            return;
+        }
+        if self.agents.iter().any(|run| run.node_id.is_some()) {
+            return;
+        }
+        let running_orchestrator = self.agents.iter().any(|run| {
+            run.mode == AgentMode::RudderPlan
+                && !run.reconcile_planner
+                && run.status == AgentStatus::Running
+        });
+        if !running_orchestrator {
+            return;
+        }
+        let Ok(text) = std::fs::read_to_string(orchestrator_plan_path(&self.cwd)) else {
+            return;
+        };
+        // The user approved in the same write: defer to scan_orchestrator_markers so the
+        // refreshed DAG is launched, not re-captured then immediately approved twice.
+        if output_has_approve_marker(&text) {
+            return;
+        }
+        let tasks = match extract_rudder_plan_tasks(&text) {
+            Ok(tasks) if !tasks.is_empty() => tasks,
+            _ => return,
+        };
+        let nodes: Vec<PlannedNode> = tasks.iter().map(PlannedNode::from_task).collect();
+        if nodes == self.planned_nodes {
+            return; // unchanged since the last capture — nothing to refresh
+        }
+        let count = nodes.len();
+        self.planned_nodes = nodes;
+        self.plan_summary = extract_rudder_plan_summary(&text);
+        self.persist_plan_queue();
+        self.notice = Some(format!(
+            "orchestrator updated the plan — now {count} node(s) · review the DAG · Enter approve"
+        ));
+        self.dirty = true;
+    }
+
     /// INTERACTIVE orchestrator (opt-in) self-launch: the orchestrator, after the user
     /// approves the plan IN CHAT, the orchestrator signals approval and Rudder launches —
     /// the user need not press Enter in the task bar.
@@ -8069,6 +8122,9 @@ What to do\n\
         // INTERACTIVE orchestrator (opt-in): capture the DAG it wrote to its plan file, then
         // self-launch if it printed RUDDER_APPROVE_PLAN after the user approved in chat.
         self.maybe_capture_orchestrator_plan();
+        // While the user keeps talking to the orchestrator before launch, it may add/change/
+        // remove tasks and re-write the plan file; reflect those edits in the DAG live.
+        self.maybe_recapture_orchestrator_plan();
         self.scan_orchestrator_markers();
 
         // Drain the planned-node queue on a coarse cadence: as plan-launched

@@ -4983,6 +4983,60 @@ branch refs/heads/main\n";
 
     #[cfg(not(windows))]
     #[test]
+    fn orchestrator_recaptures_dag_edits_before_launch() {
+        // While iterating the plan WITH the orchestrator (before launch), if it re-writes
+        // the plan file to add/change tasks, Rudder must refresh planned_nodes live —
+        // the first-capture guard otherwise freezes the DAG after the first proposal.
+        let _env = env_guard();
+        let repo = unique_test_repo("orch-recapture");
+        let mut app = App::new();
+        app.interactive_orchestrator = true;
+        app.cwd = repo.clone();
+        app.awaiting_approval = true;
+        app.planned_nodes = vec![titled_planned_node("n0", "first")];
+
+        let mut orch = test_agent_run("orch-1", "plan it");
+        orch.cwd = repo.clone();
+        orch.mode = AgentMode::RudderPlan;
+        orch.status = AgentStatus::Running;
+        app.agents.push(orch);
+
+        fs::create_dir_all(repo.join(".rudder")).unwrap();
+        // The orchestrator added a second task in response to the user.
+        fs::write(
+            orchestrator_plan_path(&repo),
+            "# Plan\nRUDDER_PLAN_TASKS_START\n{\"tasks\":[{\"id\":\"n0\",\"title\":\"first\",\"prompt\":\"p\",\"goal\":\"g\",\"success\":\"s\",\"deps\":[]},{\"id\":\"n1\",\"title\":\"second\",\"prompt\":\"p\",\"goal\":\"g\",\"success\":\"s\",\"deps\":[]}]}\nRUDDER_PLAN_TASKS_END\n",
+        )
+        .unwrap();
+
+        app.maybe_recapture_orchestrator_plan();
+        assert!(app.awaiting_approval, "the gate stays OPEN while iterating");
+        assert_eq!(app.planned_nodes.len(), 2, "the added task was recaptured live");
+        assert!(app.planned_nodes.iter().any(|n| n.id == "n1"));
+
+        // Idempotent: re-reading the same file does not churn.
+        app.maybe_recapture_orchestrator_plan();
+        assert_eq!(app.planned_nodes.len(), 2, "no churn on an unchanged file");
+
+        // When the approval marker is present, recapture defers to scan (does not apply a
+        // further edit in the same write) — n2 must NOT be folded in here.
+        fs::write(
+            orchestrator_plan_path(&repo),
+            "# Plan\nRUDDER_PLAN_TASKS_START\n{\"tasks\":[{\"id\":\"n0\",\"title\":\"first\",\"prompt\":\"p\",\"goal\":\"g\",\"success\":\"s\",\"deps\":[]},{\"id\":\"n1\",\"title\":\"second\",\"prompt\":\"p\",\"goal\":\"g\",\"success\":\"s\",\"deps\":[]},{\"id\":\"n2\",\"title\":\"third\",\"prompt\":\"p\",\"goal\":\"g\",\"success\":\"s\",\"deps\":[]}]}\nRUDDER_PLAN_TASKS_END\n\nRUDDER_APPROVE_PLAN\n",
+        )
+        .unwrap();
+        app.maybe_recapture_orchestrator_plan();
+        assert_eq!(
+            app.planned_nodes.len(),
+            2,
+            "recapture defers to scan_orchestrator_markers when the approve marker is present"
+        );
+
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
     fn approval_stops_the_orchestrator_and_mirrors_graph() {
         // On approval the interactive orchestrator must (1) mirror the DAG into
         // graph.json and (2) STOP — its PTY killed + status Stopped — so the single
