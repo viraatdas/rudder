@@ -827,15 +827,20 @@ The planner UX went through several iterations; these are the settled decisions 
   (dedicated file, not RUDDER.md); `App::maybe_capture_orchestrator_plan` reads it into
   `planned_nodes`/`awaiting_approval`; `render_interactive_orchestrator` shows a DAG pane
   ABOVE the live PTY; keys forward to the PTY (converse). Unlike the retired PlanFront, the
-  CC writes a DAG file so the DAG actually builds + renders. **SELF-LAUNCH (1.19.0):** after
-  the user approves in chat, the orchestrator prints `RUDDER_APPROVE_PLAN` on its own line;
-  `App::scan_orchestrator_markers` (poll_agents) detects it via `output_has_approve_marker`
-  (exact full-line match, ANSI + markdown stripped) and calls `approve_planned_queue()` →
-  launch — no dedup ledger needed because `approve_planned_queue` is idempotent (it
-  early-returns once `awaiting_approval` flips false). The prompt forbids emitting the marker
-  preemptively (and uses `RUDDER_APPROVE_PLAN_TEMPLATE` when quoting it). The task bar's Enter
-  stays as a manual fallback. STILL PENDING: the rest of PR #17 (full marker/skill set +
-  removing the task bar). Default (flag off) is the headless decomposer, unchanged.
+  CC writes a DAG file so the DAG actually builds + renders. **SELF-LAUNCH (hardened, 1.21.0):**
+  after the user approves in chat, the orchestrator signals approval and Rudder launches.
+  `App::scan_orchestrator_markers` (poll_agents) checks, in order: (1) PRIMARY — the orchestrator
+  WROTE a `RUDDER_APPROVE_PLAN` line INTO its plan file (a structured Write, exact content, no
+  TUI-rendering fragility); (2) FALLBACK — the marker printed in the orchestrator PTY
+  (`output_has_approve_marker`, exact full-line match after ANSI + markdown strip). Either calls
+  `approve_planned_queue()` → launch; no dedup ledger needed because that fn is idempotent
+  (early-returns once `awaiting_approval` flips false). The prompt tells the orchestrator to WRITE
+  the marker into the plan file (and may also print it), only after explicit user approval, never
+  preemptively, quoting as `RUDDER_APPROVE_PLAN_TEMPLATE`. Task bar Enter stays as a manual
+  fallback. NOTE: `interactive_orchestrator()` is read ONCE into the `App.interactive_orchestrator`
+  field at construction; render/poll/key read the FIELD (not the process-global env) so parallel
+  tests don't race — tests set the field directly (the headless-view render helper pins it false).
+  STILL PENDING: the rest of PR #17 (full marker/skill set + removing the task bar).
 
 ### 14.4b Per-agent done/idle detection: official signals, scrape as fallback (`native/src/signals.rs`)
 The native TUI runs workers as INTERACTIVE `claude`/`codex` in a PTY (they idle between

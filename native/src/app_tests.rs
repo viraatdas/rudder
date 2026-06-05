@@ -3192,8 +3192,6 @@ branch refs/heads/main\n";
 
     #[test]
     fn orchestrator_chat_renders_cursor_block() {
-        let _env = env_guard();
-        std::env::set_var("RUDDER_INTERACTIVE_ORCHESTRATOR", "0"); // headless orchestrator pane
         let mut app = App::new();
         app.focus = FocusPane::Worker;
         let mut orch = test_agent_run("orch", "build a feature");
@@ -3518,6 +3516,9 @@ branch refs/heads/main\n";
 
     #[test]
     fn resume_commands_reuse_saved_session_ids() {
+        // Builds commands via claude_program()/codex_program() (which read RUDDER_*_BIN), so
+        // serialize against the bin-injecting orchestrator/harness tests.
+        let _env = env_guard();
         let mut claude = test_agent_run("run-1", "test task");
         claude.backend = Backend::Claude;
         claude.session_id = Some("11111111-1111-4111-8111-111111111111".to_string());
@@ -4815,14 +4816,14 @@ branch refs/heads/main\n";
     fn interactive_orchestrator_self_launches_on_approve_marker() {
         // After the user approves in chat, the orchestrator prints RUDDER_APPROVE_PLAN in its
         // PTY; scan_orchestrator_markers detects it and approves+launches (no task-bar Enter).
-        let _env = env_guard();
+        let _env = env_guard(); // serializes RUDDER_CODEX_BIN
         let repo = unique_test_repo("orch-marker"); // non-git: worker launch runs in place
         let worker = repo.join("fake-worker.sh");
         write_fake_bin(&worker, FAKE_CONDUCTOR_WORKER);
-        std::env::set_var("RUDDER_INTERACTIVE_ORCHESTRATOR", "1");
         std::env::set_var("RUDDER_CODEX_BIN", &worker);
 
         let mut app = App::new();
+        app.interactive_orchestrator = true; // per-App field, no global env
         app.cwd = repo.clone();
         app.backend = Backend::Codex;
         app.planned_nodes = vec![titled_planned_node("n0", "do the thing")];
@@ -4865,16 +4866,51 @@ branch refs/heads/main\n";
         assert_eq!(app.agents.len(), agents_after, "no duplicate launch on re-scan");
 
         std::env::remove_var("RUDDER_CODEX_BIN");
-        std::env::remove_var("RUDDER_INTERACTIVE_ORCHESTRATOR");
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn interactive_orchestrator_self_launches_from_plan_file_marker() {
+        // PRIMARY (hardened) approval channel: the orchestrator writes RUDDER_APPROVE_PLAN
+        // INTO its plan file (a structured Write), and Rudder launches from the file — no
+        // PTY-scrape needed.
+        let _env = env_guard(); // serializes RUDDER_CODEX_BIN
+        let repo = unique_test_repo("orch-file-marker"); // non-git: worker launch runs in place
+        let worker = repo.join("fake-worker.sh");
+        write_fake_bin(&worker, FAKE_CONDUCTOR_WORKER);
+        std::env::set_var("RUDDER_CODEX_BIN", &worker);
+
+        let mut app = App::new();
+        app.interactive_orchestrator = true; // per-App field, no global env
+        app.cwd = repo.clone();
+        app.backend = Backend::Codex;
+        app.planned_nodes = vec![titled_planned_node("n0", "do the thing")];
+        app.awaiting_approval = true;
+
+        fs::create_dir_all(repo.join(".rudder")).unwrap();
+        fs::write(
+            orchestrator_plan_path(&repo),
+            "# Plan\nRUDDER_PLAN_TASKS_START\n{\"tasks\":[{\"id\":\"n0\",\"title\":\"x\",\"prompt\":\"p\",\"goal\":\"g\",\"success\":\"s\",\"deps\":[]}]}\nRUDDER_PLAN_TASKS_END\n\nRUDDER_APPROVE_PLAN\n",
+        )
+        .unwrap();
+
+        app.scan_orchestrator_markers();
+        assert!(!app.awaiting_approval, "the plan-file approval marker launched the plan");
+        assert!(
+            app.planned_nodes.is_empty() || app.agents.iter().any(|run| run.node_id.is_some()),
+            "the planned node launched from the file-based approval"
+        );
+
+        std::env::remove_var("RUDDER_CODEX_BIN");
         let _ = fs::remove_dir_all(&repo);
     }
 
     #[test]
     fn self_launch_marker_is_inert_without_flag_or_gate() {
-        let _env = env_guard();
-        // Opt OUT (=0, the headless decomposer): the scan no-ops even with a plan awaiting.
-        std::env::set_var("RUDDER_INTERACTIVE_ORCHESTRATOR", "0");
+        // Opt OUT (headless decomposer): the scan no-ops even with a plan awaiting.
         let mut app = App::new();
+        app.interactive_orchestrator = false; // per-App field, no global env
         app.cwd = std::env::temp_dir();
         app.planned_nodes = vec![titled_planned_node("n0", "x")];
         app.awaiting_approval = true;
@@ -4882,14 +4918,13 @@ branch refs/heads/main\n";
         orch.mode = AgentMode::RudderPlan;
         app.agents.push(orch);
         app.scan_orchestrator_markers();
-        assert!(app.awaiting_approval, "flag off → marker ignored, still awaiting approval");
+        assert!(app.awaiting_approval, "headless mode → marker ignored, still awaiting approval");
 
-        // Flag ON but NOT awaiting approval: nothing to launch, scan no-ops.
-        std::env::set_var("RUDDER_INTERACTIVE_ORCHESTRATOR", "1");
+        // Interactive ON but NOT awaiting approval: nothing to launch, scan no-ops.
+        app.interactive_orchestrator = true;
         app.awaiting_approval = false;
         app.scan_orchestrator_markers();
         assert!(!app.awaiting_approval);
-        std::env::remove_var("RUDDER_INTERACTIVE_ORCHESTRATOR");
     }
 
     #[test]
@@ -5701,6 +5736,11 @@ branch refs/heads/main\n";
     /// Render the worker pane (orchestrator view) into a TestBackend and return its
     /// flattened text.
     fn render_worker_text(app: &mut App, width: u16, height: u16) -> String {
+        // These tests assert the HEADLESS orchestrator view (render_orchestrator). The
+        // interactive orchestrator is the default now, so pin this helper to the headless
+        // renderer — interactive-orchestrator tests use render_screen instead. Per-App field,
+        // so no process-global env and no cross-test race.
+        app.interactive_orchestrator = false;
         let area = Rect::new(0, 0, width, height);
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
@@ -5765,8 +5805,6 @@ branch refs/heads/main\n";
 
     #[test]
     fn orchestrator_dag_shows_reconciled_nodes_added_after_launch() {
-        let _env = env_guard();
-        std::env::set_var("RUDDER_INTERACTIVE_ORCHESTRATOR", "0"); // headless orchestrator pane
         // The orchestrator's frozen plan block has node "scaffold". The user then
         // typed a task post-launch, which appended a reconciled node to planned_nodes.
         // That node lives ONLY in planned_nodes, so it must still appear in the DAG.
@@ -5863,8 +5901,6 @@ branch refs/heads/main\n";
 
     #[test]
     fn orchestrator_pane_shows_per_node_goal_and_done_when() {
-        let _env = env_guard();
-        std::env::set_var("RUDDER_INTERACTIVE_ORCHESTRATOR", "0"); // headless orchestrator pane
         // The pane now fills with a per-node breakdown (goal + done-when + deps),
         // surfacing the plan's depth instead of leaving the space blank.
         let mut app = App::new();
@@ -5934,8 +5970,6 @@ branch refs/heads/main\n";
 
     #[test]
     fn orchestrator_prose_reads_live_summary_when_frozen_is_empty() {
-        let _env = env_guard();
-        std::env::set_var("RUDDER_INTERACTIVE_ORCHESTRATOR", "0"); // headless orchestrator pane
         // The truncation bug: app.plan_summary was captured once at exit-detection,
         // before the planner's tail drained. The prose must re-extract from the LIVE
         // plan_stream so it shows the full summary even when the frozen copy is empty.

@@ -344,6 +344,11 @@ struct App {
     /// the orchestrator is selected. Set on streaming plan detection; cleared once
     /// the user approves (or discards the plan).
     awaiting_approval: bool,
+    /// Whether the orchestrator runs as an INTERACTIVE Claude Code PTY (the default; see
+    /// `interactive_orchestrator()`) vs the headless decomposer. Snapshotted from the env
+    /// ONCE at construction so render/poll/key paths read a per-App field instead of the
+    /// process-global env (which races across parallel tests). Tests set it directly.
+    interactive_orchestrator: bool,
     /// True ONLY while a headless planner has finished a turn WITHOUT emitting a DAG (it
     /// asked a clarifying question / needs more detail) and is waiting for the user's
     /// reply. Distinguishes a paused planner from a COMPLETED-and-shipped plan's leftover
@@ -780,6 +785,7 @@ impl App {
             auto_merge: false,
             auto_merge_skip: Vec::new(),
             awaiting_approval: restored_queue.awaiting_approval,
+            interactive_orchestrator: interactive_orchestrator(),
             planner_paused_for_input: false,
             pending_questions: Vec::new(),
             planner_question_round_done: false,
@@ -1312,7 +1318,7 @@ impl App {
         // useless. For the INTERACTIVE orchestrator (opt-in) the pane IS a live Claude PTY,
         // so keys forward straight to it (you converse with it); approval/refine happen via
         // the task bar (Enter approves when awaiting_approval).
-        if self.selected_is_orchestrator() && !interactive_orchestrator() {
+        if self.selected_is_orchestrator() && !self.interactive_orchestrator {
             return self.handle_orchestrator_chat_key(key);
         }
 
@@ -3563,7 +3569,7 @@ impl App {
         // plan file (not the headless stream), so it is NOT autosteered (the headless
         // completed-plan capture must not fire). Clear any stale plan file so the prior
         // session's DAG isn't re-captured for this fresh request.
-        if interactive_orchestrator() {
+        if self.interactive_orchestrator {
             run.autosteered = false;
             let _ = std::fs::create_dir_all(self.cwd.join(".rudder"));
             let _ = std::fs::remove_file(orchestrator_plan_path(&self.cwd));
@@ -5024,7 +5030,7 @@ impl App {
     /// file every poll); re-planning after launch is a later step. No-op unless the flag is
     /// set, so the headless flow is untouched by default.
     fn maybe_capture_orchestrator_plan(&mut self) {
-        if !interactive_orchestrator() || self.refining || self.rebasing || self.awaiting_approval {
+        if !self.interactive_orchestrator || self.refining || self.rebasing || self.awaiting_approval {
             return;
         }
         // Only capture a FRESH plan: nothing pending and no workers launched yet.
@@ -5063,23 +5069,33 @@ impl App {
     }
 
     /// INTERACTIVE orchestrator (opt-in) self-launch: the orchestrator, after the user
-    /// approves the plan IN CHAT, prints `RUDDER_APPROVE_PLAN` on its own line. Detect it in
-    /// the orchestrator PTY and approve + launch, so the user need not press Enter in the
-    /// task bar. `approve_planned_queue` is idempotent (early-returns when !awaiting_approval
-    /// and flips it false on success), so a marker re-seen on every repaint approves EXACTLY
-    /// once — no dedup ledger needed. Gated so it never fires in the default headless flow.
+    /// approves the plan IN CHAT, the orchestrator signals approval and Rudder launches —
+    /// the user need not press Enter in the task bar.
+    ///
+    /// PRIMARY (hardened) channel: the orchestrator writes a `RUDDER_APPROVE_PLAN` line INTO
+    /// its plan FILE (a structured Write, exact content — no terminal-rendering / ANSI /
+    /// markdown / partial-read fragility). FALLBACK: the marker printed in the orchestrator
+    /// PTY (the lossy channel, kept only as a backstop). `approve_planned_queue` is idempotent
+    /// (early-returns when !awaiting_approval and flips it false on success), so the signal
+    /// re-seen on every poll approves EXACTLY once. Gated off in the default headless flow.
     fn scan_orchestrator_markers(&mut self) {
-        if !interactive_orchestrator() || !self.awaiting_approval || self.refining || self.rebasing
+        if !self.interactive_orchestrator || !self.awaiting_approval || self.refining || self.rebasing
         {
             return;
         }
-        let approved = self
-            .agents
-            .iter()
-            .filter(|run| run.mode == AgentMode::RudderPlan && !run.reconcile_planner)
-            .filter_map(|run| run.terminal.as_ref())
-            .any(|terminal| output_has_approve_marker(terminal.output_log_snapshot()));
-        if approved {
+        // PRIMARY: the orchestrator wrote the approval into its plan file.
+        let file_approved = std::fs::read_to_string(orchestrator_plan_path(&self.cwd))
+            .map(|text| output_has_approve_marker(&text))
+            .unwrap_or(false);
+        // FALLBACK: the marker was printed into the orchestrator PTY.
+        let pty_approved = !file_approved
+            && self
+                .agents
+                .iter()
+                .filter(|run| run.mode == AgentMode::RudderPlan && !run.reconcile_planner)
+                .filter_map(|run| run.terminal.as_ref())
+                .any(|terminal| output_has_approve_marker(terminal.output_log_snapshot()));
+        if file_approved || pty_approved {
             self.approve_planned_queue();
         }
     }

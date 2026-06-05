@@ -2393,7 +2393,7 @@ pub(crate) fn render_worker(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     // transcript while planning (its raw PTY is now JSON events, not human text), and
     // the DAG tree once a plan is ready. Both phases are rendered by render_orchestrator.
     if app.worker_view == WorkerView::Terminal && selected_is_orchestrator {
-        if interactive_orchestrator() {
+        if app.interactive_orchestrator {
             // Opt-in: the orchestrator is a normal interactive Claude PTY the user talks
             // to, with the DAG it wrote to its plan file rendered in a pane ABOVE it.
             render_interactive_orchestrator(frame, area, app);
