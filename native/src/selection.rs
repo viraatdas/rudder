@@ -94,7 +94,11 @@ pub(crate) fn task_inner_width(area: Rect) -> u16 {
     area.width.max(1)
 }
 
-pub(crate) fn task_cursor_from_selection_point(value: &str, point: SelectionPoint, width: u16) -> usize {
+pub(crate) fn task_cursor_from_selection_point(
+    value: &str,
+    point: SelectionPoint,
+    width: u16,
+) -> usize {
     let lines = wrap_input_text(value, width);
     let mut cursor = 0;
     for (row, line) in lines.iter().enumerate() {
@@ -121,7 +125,10 @@ pub(crate) fn selection_is_empty(selection: NormalizedSelection) -> bool {
     selection.start == selection.end
 }
 
-pub(crate) fn selection_for_row(selection: Option<NormalizedSelection>, row: usize) -> Option<(usize, usize)> {
+pub(crate) fn selection_for_row(
+    selection: Option<NormalizedSelection>,
+    row: usize,
+) -> Option<(usize, usize)> {
     let selection = selection?;
     if row < selection.start.row || row > selection.end.row {
         return None;
@@ -272,7 +279,11 @@ pub(crate) fn plain_terminal_cell(contents: String) -> StyledTerminalCell {
     }
 }
 
-pub(crate) fn styled_plain_line(text: &str, style: Style, selection: Option<(usize, usize)>) -> Line<'static> {
+pub(crate) fn styled_plain_line(
+    text: &str,
+    style: Style,
+    selection: Option<(usize, usize)>,
+) -> Line<'static> {
     let Some((start, end)) = selection else {
         return Line::from(Span::styled(text.to_string(), style));
     };

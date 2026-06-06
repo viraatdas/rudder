@@ -561,8 +561,20 @@ From `package.json`:
 - `npm test` = `tsc` then `node --test tests/*.test.mjs`.
 - `npm run test:worker-scroll` = a focused subset of cargo tests for worker-pane
   scrollback behavior.
-- Native tests: `cargo test --manifest-path native/Cargo.toml` (231 tests + one
+- Native tests: `cargo test --manifest-path native/Cargo.toml` (260+ tests + one
   `#[ignore]`d live conductor harness, run with `-- --ignored --nocapture`).
+- **Native TUI harness** (`app_tests.rs`): drive the REAL `App` end-to-end with no
+  auth/network. `render_screen(app, w, h)` renders the actual dashboard
+  (`render::render`) to a `TestBackend` and returns the screen as text, so tests assert
+  on what the USER SEES. `write_fake_bin` + `RUDDER_CLAUDE_BIN`/`RUDDER_CODEX_BIN`
+  (`launch.rs` `claude_program()`/`codex_program()`) inject a fake backend: a planner
+  fake emits a canned decomposer stream (a `result` event whose text streams the
+  RUDDER_PLAN_TASKS block) so the full planner→parse→DAG→render path runs
+  deterministically; a worker fake writes files + exits (process-exit completion). `env_guard()` serializes tests
+  that mutate the process-global `RUDDER_*_BIN`. Pattern: build `App`, point a fake bin,
+  `start_rudder_plan_task` / feed keys, loop `poll_agents()`, then `render_screen` +
+  assert. See `tui_harness_drives_planner_to_dag_and_renders_it` and
+  `tui_harness_renders_the_plan_mode_card_when_the_planner_asks`.
 
 `tests/` are integration tests that import from `dist/` (so build first):
 `rebase-first.test.mjs` exercises merge/rebase/sync via `git.ts` + `state.ts`.
@@ -775,6 +787,12 @@ user only ever talks to Rudder; the planner can never go off and implement on it
 5. **Approve → launch.** Empty-Enter → `approve_planned_queue` → `run_scheduler` dispatches
    ready nodes (todo → running), each in its own jj workspace. The queued plan + gate state
    persist to `.rudder/plan-queue.json`, so a mid-plan restart resumes instead of losing it.
+   **Worker context at launch:** each worker gets its own checkout (hard-dep parents already
+   merged into its base), `RUDDER.md` (the live agent roster) + `DECISIONS.md`, and a launch
+   prompt carrying `/goal` + `Done when:`, the original request, the node prompt, and a
+   **`Depends on:` block** (`App::dependency_context`) naming each hard/soft parent by title +
+   its `rudder done` interface summary so the worker builds on prerequisites instead of
+   reimplementing them.
 6. **Conduct.** After launch the orchestrator stays live (not a dead view): it grows the
    DAG from completions, steers agents, and can rebase. Conductor actions are **autonomous
    (no confirm)** but **visible** (`activity_log`) and **undoable** (jj op-log).
@@ -805,6 +823,42 @@ The planner UX went through several iterations; these are the settled decisions 
   (overlap splice 1.7.1, result-arm unification 1.8.0, transcript fallback 1.10.x); the
   transcript fallback is the robust one because it reads the backend's own session log and
   does not depend on the lossy live PTY stream.
+- **INTERACTIVE orchestrator — now the DEFAULT (1.20.0; PR #17/issue #16).** The Claude
+  orchestrator is a normal interactive Claude Code PTY you converse with (real plan-mode feel
+  + visible thinking, `launch.rs interactive_orchestrator()` now defaults TRUE; set
+  `RUDDER_INTERACTIVE_ORCHESTRATOR=0` to opt back into the headless `claude -p` decomposer).
+  Codex orchestrators stay headless regardless. Validated against real `claude` (it writes the
+  plan file + emits the marker). It uses the orchestrator system prompt
+  (`tasks.rs orchestrator_system_prompt`). It writes the DAG to `.rudder/orchestrator-plan.md`
+  (dedicated file, not RUDDER.md); `App::maybe_capture_orchestrator_plan` reads it into
+  `planned_nodes`/`awaiting_approval`; `render_interactive_orchestrator` shows a DAG pane
+  ABOVE the live PTY; keys forward to the PTY (converse). Unlike the retired PlanFront, the
+  CC writes a DAG file so the DAG actually builds + renders. **SELF-LAUNCH (hardened, 1.21.0):**
+  after the user approves in chat, the orchestrator signals approval and Rudder launches.
+  `App::scan_orchestrator_markers` (poll_agents) checks, in order: (1) PRIMARY — the orchestrator
+  WROTE a `RUDDER_APPROVE_PLAN` line INTO its plan file (a structured Write, exact content, no
+  TUI-rendering fragility); (2) FALLBACK — the marker printed in the orchestrator PTY
+  (`output_has_approve_marker`, exact full-line match after ANSI + markdown strip). Either calls
+  `approve_planned_queue()` → launch; no dedup ledger needed because that fn is idempotent
+  (early-returns once `awaiting_approval` flips false). The prompt tells the orchestrator to WRITE
+  the marker into the plan file (and may also print it), only after explicit user approval, never
+  preemptively, quoting as `RUDDER_APPROVE_PLAN_TEMPLATE`. Task bar Enter stays as a manual
+  fallback. **APPROVE → GRAPH.JSON → STOP (current behaviour):** on approval `approve_planned_queue`
+  (1) mirrors the full DAG into `.rudder/graph.json` (`mirror_graph`), (2) launches the worker
+  fleet (`run_scheduler`), then (3) calls `stop_orchestrator_after_approval`, which KILLS the
+  interactive orchestrator's PTY (drops the terminal → `TerminalPane::drop` → `child.kill()`) and
+  marks it `Stopped` — the single planning agent has done its job and must never start implementing;
+  separate workers do. Interactive-only (headless decomposers self-exit; reconcile-fold runs are
+  left alone). The row is KEPT (Stopped) so the plan/conversation stay navigable, and
+  `render_interactive_orchestrator` shows a hand-off banner ("Plan approved. Orchestrator stopped."
+  + live worker count) in place of the dead terminal. The DAG pane survives the scheduler draining
+  `planned_nodes` via `orchestrator_dag_tasks`, which reconstructs already-launched nodes from their
+  `node_id` agents (deduped per id, latest agent wins) so the tree stays whole with live status
+  badges from `orchestrator_task_status`. The orchestrator system prompt tells it its job ends at
+  `RUDDER_APPROVE_PLAN`. NOTE: `interactive_orchestrator()` is read ONCE into the `App.interactive_orchestrator`
+  field at construction; render/poll/key read the FIELD (not the process-global env) so parallel
+  tests don't race — tests set the field directly (the headless-view render helper pins it false).
+  STILL PENDING: the rest of PR #17 (full marker/skill set + removing the task bar).
 
 ### 14.4b Per-agent done/idle detection: official signals, scrape as fallback (`native/src/signals.rs`)
 The native TUI runs workers as INTERACTIVE `claude`/`codex` in a PTY (they idle between
@@ -827,6 +881,38 @@ wires this at the worker spawn sites (Execute/Main/ReviewAll/restart); headless 
 (claude 2.x `Stop`, codex `agent-turn-complete`). The daemon/DAG path (`src/backends.ts`)
 already used official signals: `claude -p --output-format stream-json` and `codex exec --json`
 (`turn.completed`) + process exit.
+
+### 14.4c Dispatch: one-off vs plan (`AgentMode::OneOff` + the Haiku dispatcher)
+Not every typed task wants the whole DAG. A FRESH task (no active plan) routes through
+a deterministic local classifier first, then LIGHT Haiku only for ambiguous cases:
+- **`begin_dispatch`** (start_task_from_input default branch) sets `dispatch_pending` and
+  spawns `spawn_dispatch_worker` (tasks.rs). `classify_dispatch_intent_locally` handles
+  obvious one-offs (`look into ... docs`, `explain ...`, questions, quick research) and
+  obvious plans (`build`, `implement`, `refactor`, multi-step work) without a model call.
+  Ambiguous requests run `claude -p --model claude-haiku-4-5-20251001`
+  (`TASK_SUMMARY_MODEL`, via `claude_program()` so `RUDDER_CLAUDE_BIN` works in tests)
+  with a one-word classification prompt → `DispatchResult { task, intent }` over an mpsc
+  channel. The subprocess is bounded by `dispatch_classifier_timeout()`; timeout, no
+  claude, non-zero, unparseable output, or a leading `/goal` all fall back to **Plan**, the
+  established path, so dispatch never leaves `dispatch_pending` stuck. Do not remove the
+  local classifier: it prevents Claude auth/billing/network failures from routing obvious
+  one-off research to the orchestrator.
+- **`poll_dispatch_worker`** (in poll_agents) routes the result: `Plan` →
+  `start_rudder_plan_task` (the orchestrator); `OneOff` → `start_oneoff_task`.
+- **`start_oneoff_task`** spawns a single conversational **`AgentMode::OneOff`** agent in the
+  MAIN checkout (`create_oneoff_agent`, cwd = repo root, NO jj worktree, NO `node_id`), with
+  `oneoff_prompt` (no `/goal`, no `rudder done`, "edit directly; escalate to the planner if
+  it's big") + bypassPermissions tools. Keys forward to its PTY (converse). It is explicitly
+  excluded from selected merge / merge-all / review-all, and implicitly excluded from
+  auto-merge / graph-mirror / scheduler by `node_id`/Execute gates; `mark_run_done` just marks
+  it Done (no merge). It lives in its own **`Bucket::OneOff`** list section (`status_bucket`
+  returns `OneOff` for it; leads `Bucket::ORDER`).
+- **Overrides** (handle_command): `/ask <text>` forces one-off (skip classify); `/plan <text>`
+  forces the orchestrator planner (re-purposed from the retired no-op). Both skip the Haiku call.
+- Ambiguous classification uses Claude Haiku (a meta-decision) regardless of the user's
+  backend; the spawned one-off uses the user's backend. A Codex-only user without `claude`
+  still gets deterministic local routing for obvious cases, and ambiguous cases fall back
+  to Plan. `/ask` always forces a one-off.
 
 ### 14.5 Conductor capabilities (BUILT vs PLANNED)
 - **Auto-expand from completion** (BUILT). A finished worker reports via **`rudder

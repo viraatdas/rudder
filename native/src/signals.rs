@@ -103,7 +103,13 @@ pub(crate) fn parse_signal_state(body: &str) -> Option<SignalState> {
 /// command, so it stays tiny (no node/shell startup beyond `sh -c`).
 fn write_signal_command(signal: &Path, state: &str) -> String {
     let path = signal.display();
-    format!("mkdir -p '{dir}' && printf '{{\"state\":\"{state}\"}}' > '{path}'", dir = signal.parent().map(|p| p.display().to_string()).unwrap_or_default())
+    format!(
+        "mkdir -p '{dir}' && printf '{{\"state\":\"{state}\"}}' > '{path}'",
+        dir = signal
+            .parent()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default()
+    )
 }
 
 /// The `claude --settings` JSON: a `Stop` hook (turn ended) and a `Notification`
@@ -127,7 +133,10 @@ pub(crate) fn claude_settings_json(signal: &Path) -> String {
 /// act on `agent-turn-complete` (the turn-ended event), writing the done signal.
 pub(crate) fn codex_notify_script(signal: &Path) -> String {
     let path = signal.display();
-    let dir = signal.parent().map(|p| p.display().to_string()).unwrap_or_default();
+    let dir = signal
+        .parent()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
     format!(
         "#!/bin/sh\n# Rudder Codex completion signal (notify program).\ncase \"$1\" in\n  *agent-turn-complete*)\n    mkdir -p '{dir}' && printf '{{\"state\":\"done\"}}' > '{path}' ;;\nesac\n"
     )
@@ -138,7 +147,10 @@ pub(crate) fn codex_notify_script(signal: &Path) -> String {
 /// `claude -p` / `codex exec` and complete via process exit, so they are excluded.
 pub(crate) fn worker_wants_signals(backend: Backend, mode: AgentMode) -> bool {
     let _ = backend;
-    matches!(mode, AgentMode::Execute | AgentMode::Main | AgentMode::ReviewAll)
+    matches!(
+        mode,
+        AgentMode::Execute | AgentMode::Main | AgentMode::ReviewAll
+    )
 }
 
 /// Write the per-run hook config files (clearing any stale signal from a prior
@@ -159,14 +171,20 @@ pub(crate) fn prepare_worker_signals(run_id: &str, backend: Backend) -> WorkerSi
             Backend::Claude => {
                 let settings = dir.join(format!("{run_id}-claude.json"));
                 if std::fs::write(&settings, claude_settings_json(&signal)).is_ok() {
-                    return WorkerSignals { claude_settings: Some(settings), codex_notify: None };
+                    return WorkerSignals {
+                        claude_settings: Some(settings),
+                        codex_notify: None,
+                    };
                 }
             }
             Backend::Codex => {
                 let script = dir.join(format!("{run_id}-notify.sh"));
                 if std::fs::write(&script, codex_notify_script(&signal)).is_ok() {
                     set_executable(&script);
-                    return WorkerSignals { claude_settings: None, codex_notify: Some(script) };
+                    return WorkerSignals {
+                        claude_settings: None,
+                        codex_notify: Some(script),
+                    };
                 }
             }
         }
@@ -215,7 +233,11 @@ pub(crate) fn augment_worker_command(
                 // in (its preceding `-c` stays), so this works regardless of how Codex
                 // resolves duplicate `-c` keys.
                 let replacement = format!("notify=[\"{}\"]", path.display());
-                if let Some(slot) = command.args.iter_mut().find(|arg| arg.as_str() == "notify=[]") {
+                if let Some(slot) = command
+                    .args
+                    .iter_mut()
+                    .find(|arg| arg.as_str() == "notify=[]")
+                {
                     *slot = replacement;
                 } else {
                     command.args.push("-c".to_string());

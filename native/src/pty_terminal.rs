@@ -933,10 +933,20 @@ mod tests {
 
         // Only the live screen: exactly `rows` lines, no accumulated history.
         let lines = pane.visible_lines_snapshot();
-        assert_eq!(lines.len(), 5, "live screen is exactly the row count: {lines:?}");
+        assert_eq!(
+            lines.len(),
+            5,
+            "live screen is exactly the row count: {lines:?}"
+        );
         let joined = lines.join("\n");
-        assert!(joined.contains("TAIL"), "shows the latest screen: {joined:?}");
-        assert!(!joined.contains("line01"), "early lines scrolled off, not stacked: {joined:?}");
+        assert!(
+            joined.contains("TAIL"),
+            "shows the latest screen: {joined:?}"
+        );
+        assert!(
+            !joined.contains("line01"),
+            "early lines scrolled off, not stacked: {joined:?}"
+        );
         // Scrolling back is a no-op: there is no captured history to reveal.
         assert_eq!(pane.scrollback(), 0);
         pane.scrollback_by(10);
@@ -982,18 +992,15 @@ mod tests {
         }
 
         let output = pane.visible_lines_snapshot().join("\n");
-        assert!(
-            output.contains("term=lowercase"),
-            "output was {output:?}"
-        );
-        assert!(
-            output.contains("Term=mixedcase"),
-            "output was {output:?}"
-        );
+        assert!(output.contains("term=lowercase"), "output was {output:?}");
+        assert!(output.contains("Term=mixedcase"), "output was {output:?}");
         assert!(
             output.contains("TERM=xterm-256color"),
             "output was {output:?}"
         );
-        assert!(!output.contains("term=xterm-kitty"), "output was {output:?}");
+        assert!(
+            !output.contains("term=xterm-kitty"),
+            "output was {output:?}"
+        );
     }
 }

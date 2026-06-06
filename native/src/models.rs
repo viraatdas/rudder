@@ -385,7 +385,11 @@ pub(crate) fn model_suggestions_for(backend_filter: Backend, query: &str) -> Vec
     rank_suggestions(suggestions, query)
 }
 
-pub(crate) fn effort_suggestions_for(backend: Backend, model: &str, query: &str) -> Vec<Suggestion> {
+pub(crate) fn effort_suggestions_for(
+    backend: Backend,
+    model: &str,
+    query: &str,
+) -> Vec<Suggestion> {
     let suggestions = effort_options_for(backend, model)
         .into_iter()
         .map(|effort| {
@@ -567,4 +571,3 @@ pub(crate) fn backend_for_model(model: &str) -> Backend {
         Backend::Claude
     }
 }
-

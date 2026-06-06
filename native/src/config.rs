@@ -80,7 +80,11 @@ pub(crate) fn max_parallel() -> usize {
         .unwrap_or(DEFAULT_MAX_PARALLEL)
 }
 
-pub(crate) fn save_model_defaults(backend: Backend, model: &str, effort: Option<EffortLevel>) -> Result<()> {
+pub(crate) fn save_model_defaults(
+    backend: Backend,
+    model: &str,
+    effort: Option<EffortLevel>,
+) -> Result<()> {
     let path = rudder_config_path().context("could not determine Rudder config path")?;
     let mut config = load_rudder_config().unwrap_or_else(default_config_value);
     if !config.is_object() {
@@ -258,4 +262,3 @@ pub(crate) fn read_update_notice() -> Option<(String, String)> {
         .unwrap_or_else(|| "current".to_string());
     Some((current, latest))
 }
-

@@ -155,3 +155,183 @@
 - **Why:** the depth cap prevents unbounded auto-growth of the DAG
 - **By:** conductor · 1780631546038
 
+## Deferred follow-ups from deep (depth cap)
+- **What:** Auto-expansion stopped at depth cap 3; these follow-ups were NOT launched and need manual scheduling if wanted: more work
+- **Why:** the depth cap prevents unbounded auto-growth of the DAG
+- **By:** conductor · 1780632758370
+
+## Deferred follow-ups from deep (depth cap)
+- **What:** Auto-expansion stopped at depth cap 3; these follow-ups were NOT launched and need manual scheduling if wanted: more work
+- **Why:** the depth cap prevents unbounded auto-growth of the DAG
+- **By:** conductor · 1780634744788
+
+## Deferred follow-ups from deep (depth cap)
+- **What:** Auto-expansion stopped at depth cap 3; these follow-ups were NOT launched and need manual scheduling if wanted: more work
+- **Why:** the depth cap prevents unbounded auto-growth of the DAG
+- **By:** conductor · 1780638514812
+
+## Deferred follow-ups from deep (depth cap)
+- **What:** Auto-expansion stopped at depth cap 3; these follow-ups were NOT launched and need manual scheduling if wanted: more work
+- **Why:** the depth cap prevents unbounded auto-growth of the DAG
+- **By:** conductor · 1780638597306
+
+## Deferred follow-ups from deep (depth cap)
+- **What:** Auto-expansion stopped at depth cap 3; these follow-ups were NOT launched and need manual scheduling if wanted: more work
+- **Why:** the depth cap prevents unbounded auto-growth of the DAG
+- **By:** conductor · 1780641335873
+
+## Deferred follow-ups from deep (depth cap)
+- **What:** Auto-expansion stopped at depth cap 3; these follow-ups were NOT launched and need manual scheduling if wanted: more work
+- **Why:** the depth cap prevents unbounded auto-growth of the DAG
+- **By:** conductor · 1780641342017
+
+## Deferred follow-ups from deep (depth cap)
+- **What:** Auto-expansion stopped at depth cap 3; these follow-ups were NOT launched and need manual scheduling if wanted: more work
+- **Why:** the depth cap prevents unbounded auto-growth of the DAG
+- **By:** conductor · 1780648175630
+
+## Deferred follow-ups from deep (depth cap)
+- **What:** Auto-expansion stopped at depth cap 3; these follow-ups were NOT launched and need manual scheduling if wanted: more work
+- **Why:** the depth cap prevents unbounded auto-growth of the DAG
+- **By:** conductor · 1780648181497
+
+## Deferred follow-ups from deep (depth cap)
+- **What:** Auto-expansion stopped at depth cap 3; these follow-ups were NOT launched and need manual scheduling if wanted: more work
+- **Why:** the depth cap prevents unbounded auto-growth of the DAG
+- **By:** conductor · 1780648187394
+
+## Deferred follow-ups from deep (depth cap)
+- **What:** Auto-expansion stopped at depth cap 3; these follow-ups were NOT launched and need manual scheduling if wanted: more work
+- **Why:** the depth cap prevents unbounded auto-growth of the DAG
+- **By:** conductor · 1780648193282
+
+## Deferred follow-ups from deep (depth cap)
+- **What:** Auto-expansion stopped at depth cap 3; these follow-ups were NOT launched and need manual scheduling if wanted: more work
+- **Why:** the depth cap prevents unbounded auto-growth of the DAG
+- **By:** conductor · 1780648199145
+
+## Deferred follow-ups from deep (depth cap)
+- **What:** Auto-expansion stopped at depth cap 3; these follow-ups were NOT launched and need manual scheduling if wanted: more work
+- **Why:** the depth cap prevents unbounded auto-growth of the DAG
+- **By:** conductor · 1780648205082
+
+## Deferred follow-ups from deep (depth cap)
+- **What:** Auto-expansion stopped at depth cap 3; these follow-ups were NOT launched and need manual scheduling if wanted: more work
+- **Why:** the depth cap prevents unbounded auto-growth of the DAG
+- **By:** conductor · 1780648235530
+
+## Deferred follow-ups from deep (depth cap)
+- **What:** Auto-expansion stopped at depth cap 3; these follow-ups were NOT launched and need manual scheduling if wanted: more work
+- **Why:** the depth cap prevents unbounded auto-growth of the DAG
+- **By:** conductor · 1780648241778
+
+## Deferred follow-ups from deep (depth cap)
+- **What:** Auto-expansion stopped at depth cap 3; these follow-ups were NOT launched and need manual scheduling if wanted: more work
+- **Why:** the depth cap prevents unbounded auto-growth of the DAG
+- **By:** conductor · 1780648268243
+
+## Deferred follow-ups from deep (depth cap)
+- **What:** Auto-expansion stopped at depth cap 3; these follow-ups were NOT launched and need manual scheduling if wanted: more work
+- **Why:** the depth cap prevents unbounded auto-growth of the DAG
+- **By:** conductor · 1780648510683
+
+## Deferred follow-ups from deep (depth cap)
+- **What:** Auto-expansion stopped at depth cap 3; these follow-ups were NOT launched and need manual scheduling if wanted: more work
+- **Why:** the depth cap prevents unbounded auto-growth of the DAG
+- **By:** conductor · 1780648516848
+
+## Deferred follow-ups from deep (depth cap)
+- **What:** Auto-expansion stopped at depth cap 3; these follow-ups were NOT launched and need manual scheduling if wanted: more work
+- **Why:** the depth cap prevents unbounded auto-growth of the DAG
+- **By:** conductor · 1780648522916
+
+## Deferred follow-ups from deep (depth cap)
+- **What:** Auto-expansion stopped at depth cap 3; these follow-ups were NOT launched and need manual scheduling if wanted: more work
+- **Why:** the depth cap prevents unbounded auto-growth of the DAG
+- **By:** conductor · 1780649489154
+
+## Deferred follow-ups from deep (depth cap)
+- **What:** Auto-expansion stopped at depth cap 3; these follow-ups were NOT launched and need manual scheduling if wanted: more work
+- **Why:** the depth cap prevents unbounded auto-growth of the DAG
+- **By:** conductor · 1780649495116
+
+## Deferred follow-ups from deep (depth cap)
+- **What:** Auto-expansion stopped at depth cap 3; these follow-ups were NOT launched and need manual scheduling if wanted: more work
+- **Why:** the depth cap prevents unbounded auto-growth of the DAG
+- **By:** conductor · 1780649529529
+
+## Deferred follow-ups from deep (depth cap)
+- **What:** Auto-expansion stopped at depth cap 3; these follow-ups were NOT launched and need manual scheduling if wanted: more work
+- **Why:** the depth cap prevents unbounded auto-growth of the DAG
+- **By:** conductor · 1780649726185
+
+## Deferred follow-ups from deep (depth cap)
+- **What:** Auto-expansion stopped at depth cap 3; these follow-ups were NOT launched and need manual scheduling if wanted: more work
+- **Why:** the depth cap prevents unbounded auto-growth of the DAG
+- **By:** conductor · 1780649732141
+
+## Deferred follow-ups from deep (depth cap)
+- **What:** Auto-expansion stopped at depth cap 3; these follow-ups were NOT launched and need manual scheduling if wanted: more work
+- **Why:** the depth cap prevents unbounded auto-growth of the DAG
+- **By:** conductor · 1780649759068
+
+## Deferred follow-ups from deep (depth cap)
+- **What:** Auto-expansion stopped at depth cap 3; these follow-ups were NOT launched and need manual scheduling if wanted: more work
+- **Why:** the depth cap prevents unbounded auto-growth of the DAG
+- **By:** conductor · 1780649765661
+
+## Deferred follow-ups from deep (depth cap)
+- **What:** Auto-expansion stopped at depth cap 3; these follow-ups were NOT launched and need manual scheduling if wanted: more work
+- **Why:** the depth cap prevents unbounded auto-growth of the DAG
+- **By:** conductor · 1780650045081
+
+## Deferred follow-ups from deep (depth cap)
+- **What:** Auto-expansion stopped at depth cap 3; these follow-ups were NOT launched and need manual scheduling if wanted: more work
+- **Why:** the depth cap prevents unbounded auto-growth of the DAG
+- **By:** conductor · 1780650051020
+
+## Deferred follow-ups from deep (depth cap)
+- **What:** Auto-expansion stopped at depth cap 3; these follow-ups were NOT launched and need manual scheduling if wanted: more work
+- **Why:** the depth cap prevents unbounded auto-growth of the DAG
+- **By:** conductor · 1780650056916
+
+## Deferred follow-ups from deep (depth cap)
+- **What:** Auto-expansion stopped at depth cap 3; these follow-ups were NOT launched and need manual scheduling if wanted: more work
+- **Why:** the depth cap prevents unbounded auto-growth of the DAG
+- **By:** conductor · 1780650062834
+
+## Deferred follow-ups from deep (depth cap)
+- **What:** Auto-expansion stopped at depth cap 3; these follow-ups were NOT launched and need manual scheduling if wanted: more work
+- **Why:** the depth cap prevents unbounded auto-growth of the DAG
+- **By:** conductor · 1780650079006
+
+## Deferred follow-ups from deep (depth cap)
+- **What:** Auto-expansion stopped at depth cap 3; these follow-ups were NOT launched and need manual scheduling if wanted: more work
+- **Why:** the depth cap prevents unbounded auto-growth of the DAG
+- **By:** conductor · 1780650085276
+
+## Deferred follow-ups from deep (depth cap)
+- **What:** Auto-expansion stopped at depth cap 3; these follow-ups were NOT launched and need manual scheduling if wanted: more work
+- **Why:** the depth cap prevents unbounded auto-growth of the DAG
+- **By:** conductor · 1780650155669
+
+## Deferred follow-ups from deep (depth cap)
+- **What:** Auto-expansion stopped at depth cap 3; these follow-ups were NOT launched and need manual scheduling if wanted: more work
+- **Why:** the depth cap prevents unbounded auto-growth of the DAG
+- **By:** conductor · 1780650161726
+
+## Deferred follow-ups from deep (depth cap)
+- **What:** Auto-expansion stopped at depth cap 3; these follow-ups were NOT launched and need manual scheduling if wanted: more work
+- **Why:** the depth cap prevents unbounded auto-growth of the DAG
+- **By:** conductor · 1780650167778
+
+## Deferred follow-ups from deep (depth cap)
+- **What:** Auto-expansion stopped at depth cap 3; these follow-ups were NOT launched and need manual scheduling if wanted: more work
+- **Why:** the depth cap prevents unbounded auto-growth of the DAG
+- **By:** conductor · 1780650173786
+
+## Deferred follow-ups from deep (depth cap)
+- **What:** Auto-expansion stopped at depth cap 3; these follow-ups were NOT launched and need manual scheduling if wanted: more work
+- **Why:** the depth cap prevents unbounded auto-growth of the DAG
+- **By:** conductor · 1780650179762
+

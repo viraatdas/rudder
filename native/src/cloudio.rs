@@ -188,7 +188,9 @@ pub(crate) struct CloudPromptLaunch {
     pub(crate) args: Vec<String>,
 }
 
-pub(crate) fn cloud_prompt_launch(prompt: &CloudLaunchPrompt) -> Result<CloudPromptLaunch, &'static str> {
+pub(crate) fn cloud_prompt_launch(
+    prompt: &CloudLaunchPrompt,
+) -> Result<CloudPromptLaunch, &'static str> {
     match prompt.choice {
         CloudLaunchChoice::Upload => {
             let label = prompt

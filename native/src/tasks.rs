@@ -2,7 +2,6 @@
 //! Prompt construction, task-summary generation, and rudder-plan parsing.
 use super::*;
 
-
 pub(crate) fn execution_prompt(task: &str) -> String {
     let task = strip_rudder_prompt_wrappers(task);
     const CONTEXT: &str = "Rudder-specific context injected by Rudder:\n- Version control: this repo uses jj (Jujutsu), colocated with git. You are working inside your own isolated jj workspace and jj is authoritative here. Inspect your work with `jj status` and `jj diff` (NOT `git status`/`git diff`). Just edit files: do NOT manage version control yourself (no `jj commit`, `jj new`, `jj squash`, `jj describe`, `git commit`, `git add`, `git branch`, `git checkout`, or `git merge`). Rudder snapshots your working copy and integrates it for you, and raw git commit/branch commands would desync jj. `jj log` is safe if you want to see history.\n- Read RUDDER.md first if it exists. Rudder generated it to show the CURRENT PLAN (the task DAG and each node's status), the active agents, and their worktrees. DECISIONS.md holds cross-cutting decisions other agents have recorded.\n- The plan can CHANGE while you work: the user may refine the architecture, or a sibling may record a decision. Before each significant step, re-read RUDDER.md and DECISIONS.md. RUDDER.md carries a `freshness:` stamp; if it is newer than when you last read it, something changed, so re-read both. If the plan or architecture has shifted in a way that affects your task, ADAPT your implementation to the new direction instead of continuing on the old one, and append a short note to DECISIONS.md describing the adjustment. Never edit RUDDER.md; it is orchestrator-owned.\n- REQUIRED FINAL STEP — when you finish, your LAST action MUST be to run `rudder done`. This is the ONLY way the orchestrator learns what you did and what work remains; if you skip it, your results are invisible and the plan cannot advance. Pipe a JSON object: `echo '{\"summary\":\"...\",\"interfaces\":\"files/types/functions you created or assumed\",\"followups\":[{\"title\":\"...\",\"why\":\"...\",\"scope\":\"in|out\"}]}' | rudder done --node <id>` where <id> is your `Worker node:` value shown above (omit `--node` if there is none). Use `scope:\"out\"` for follow-ups outside your lane. If you have no structured note, `rudder done --node <id> \"one-line summary\"` is fine. Run it exactly once, after your work is complete. It only records a report (it does not touch jj).";
@@ -31,7 +30,11 @@ fn split_leading_goal_block(task: &str) -> (String, String) {
     for line in lines {
         if !consumed_done {
             consumed_done = true;
-            if line.trim_start().to_ascii_lowercase().starts_with("done when:") {
+            if line
+                .trim_start()
+                .to_ascii_lowercase()
+                .starts_with("done when:")
+            {
                 block.push(cap_goal_command_line(line));
                 continue;
             }
@@ -68,136 +71,15 @@ pub(crate) fn plan_prompt(task: &str) -> String {
     )
 }
 
-pub(crate) fn orchestrator_system_prompt() -> String {
-    [
-        "You are Rudder's interactive orchestration agent running inside Claude Code.",
-        "Your job is to talk with the user, inspect the repository, maintain the task DAG, and command Rudder by printing exact marker lines.",
-        "Workers still own implementation. You may edit RUDDER.md to maintain the DAG and orchestration notes, but do not implement product code yourself unless the user explicitly asks you to act as a worker.",
-        "Read .rudder/orchestrator-skills/*.md for the available Rudder skills. Skill examples use a _TEMPLATE suffix so Rudder does not execute them when displayed; remove _TEMPLATE before printing a marker. Print marker lines on their own line and do not wrap them in markdown.",
-        "When a task DAG is ready, either write it to RUDDER.md or print it in a RUDDER_PLAN_TASKS_START..RUDDER_PLAN_TASKS_END block. Rudder will show the DAG above this terminal and wait for RUDDER_APPROVE_PLAN before launching workers.",
-        "You may use Read, Grep, Glob, LS, WebSearch, WebFetch, Bash, Edit, and Write. Use Edit/Write only for RUDDER.md or your orchestration skill files unless the user explicitly changes your role.",
-    ]
-    .join("\n\n")
-}
-
-pub(crate) fn rudder_orchestrator_prompt(task: &str) -> String {
+/// Prompt for a ONE-OFF agent: a single conversational agent the user talks to in the
+/// MAIN checkout for a question or a small self-contained change — NOT a multi-step DAG.
+/// No /goal, no `rudder done`, no isolated-workspace framing: edits land in the working
+/// tree directly and the agent should escalate to the planner if the work turns out big.
+pub(crate) fn oneoff_prompt(task: &str) -> String {
     let task = strip_rudder_prompt_wrappers(task);
-    let base = [
-        "Start as Rudder's orchestrator for this checkout.",
-        "First read RUDDER.md if it exists and skim .rudder/orchestrator-skills/.",
-        "If the user has not given a concrete task yet, briefly state that you are ready and wait for their request.",
-        "For a concrete task, ask concise clarifying questions when needed. Once clear, produce a DAG using the RUDDER_PLAN_TASKS markers and then wait for approval.",
-    ]
-    .join("\n");
-    if task.trim().is_empty() {
-        base
-    } else {
-        format!("{base}\n\nUser request:\n{task}")
-    }
-}
-
-pub(crate) fn ensure_orchestrator_skill_bundle(repo_root: &Path) -> Result<()> {
-    let dir = repo_root.join(".rudder").join("orchestrator-skills");
-    fs::create_dir_all(&dir)?;
-    let skills = [
-        (
-            "approve-plan.md",
-            r#"# Approve Plan
-
-When the user approves the DAG, print the marker below after removing `_TEMPLATE`:
-
-RUDDER_APPROVE_PLAN_TEMPLATE
-
-Rudder then launches every ready worker node.
-"#,
-        ),
-        (
-            "dag-file.md",
-            r#"# Edit The DAG File
-
-Use Edit or Write on `RUDDER.md` when you need to maintain the live DAG or orchestration notes.
-
-The machine-readable plan block must use these markers without the `_TEMPLATE` suffix:
-
-RUDDER_PLAN_TASKS_START_TEMPLATE
-{"tasks":[{"id":"n0","title":"short title","prompt":"worker prompt","goal":"one-line goal","success":"done when","deps":[]}]}
-RUDDER_PLAN_TASKS_END_TEMPLATE
-
-Rudder reloads `RUDDER.md` automatically and updates the DAG pane.
-"#,
-        ),
-        (
-            "model.md",
-            r#"# Set Model
-
-To change the dashboard default model, print the marker below after removing `_TEMPLATE`:
-
-RUDDER_MODEL_TEMPLATE claude|codex <model> [effort]
-
-Effort is optional and may be low, medium, high, xhigh, or max.
-"#,
-        ),
-        (
-            "main-agent.md",
-            r#"# Main Agent
-
-To start or focus a main-checkout agent, print the marker below after removing `_TEMPLATE`:
-
-RUDDER_MAIN_TEMPLATE
-
-To start it with an initial prompt, print the marker below after removing `_TEMPLATE`:
-
-RUDDER_MAIN_TEMPLATE <prompt>
-"#,
-        ),
-        (
-            "goal.md",
-            r#"# Forward Goal
-
-To forward a /goal command to the currently selected worker agent, print the marker below after removing `_TEMPLATE`:
-
-RUDDER_GOAL_TEMPLATE <goal text>
-"#,
-        ),
-        (
-            "review-merge.md",
-            r#"# Review And Merge Commands
-
-To open an aggregate review agent, print the marker below after removing `_TEMPLATE`:
-
-RUDDER_REVIEW_ALL_TEMPLATE
-
-To request merge-all for completed work, print the marker below after removing `_TEMPLATE`:
-
-RUDDER_MERGE_ALL_TEMPLATE
-
-To toggle clean-node auto-merge, print the marker below after removing `_TEMPLATE`:
-
-RUDDER_AUTOMERGE_TEMPLATE
-
-You can force a state with `RUDDER_AUTOMERGE_TEMPLATE on` or `RUDDER_AUTOMERGE_TEMPLATE off`, again removing `_TEMPLATE` before printing.
-"#,
-        ),
-        (
-            "usage-cloud.md",
-            r#"# Usage And Cloud
-
-To show session token/cost usage, print the marker below after removing `_TEMPLATE`:
-
-RUDDER_USAGE_TEMPLATE
-
-To run a Rudder Cloud command, print the marker below after removing `_TEMPLATE`:
-
-RUDDER_CLOUD_TEMPLATE <cloud subcommand args>
-
-Examples after removing `_TEMPLATE`: `RUDDER_CLOUD list`, `RUDDER_CLOUD sail`, `RUDDER_CLOUD workspace`.
-"#,
-        ),
-    ];
-    for (name, content) in skills {
-        fs::write(dir.join(name), content)?;
-    }
-    Ok(())
+    format!(
+        "You are a Rudder one-off agent. The user wants to ASK A QUESTION or make a SMALL, self-contained change — not a multi-step project. You are running directly in the user's working checkout (NOT an isolated workspace), so any edits you make land in their working tree. Be conversational and focused: answer the question, or make the change directly and explain what you did. Do NOT run git/jj commit, branch, or merge commands — just edit files; the user manages version control. If the request turns out to be large or genuinely multi-part, say so and suggest the user let Rudder plan it as a multi-agent task instead of doing it all here.\n\n{task}"
+    )
 }
 
 pub(crate) fn rudder_plan_prompt(task: &str) -> String {
@@ -214,6 +96,42 @@ RUDDER_PLAN_TASKS_END
 
 After the block, add a short human summary of why this DAG is safe."#.to_string(),
     ].join("\n\n")
+}
+
+/// Where the INTERACTIVE orchestrator writes its task DAG (a RUDDER_PLAN_TASKS block).
+/// A dedicated file (NOT RUDDER.md) so it never races Rudder's own RUDDER.md projection;
+/// Rudder watches it and renders the DAG pane above the orchestrator terminal.
+pub(crate) fn orchestrator_plan_path(repo_root: &std::path::Path) -> std::path::PathBuf {
+    repo_root.join(".rudder").join("orchestrator-plan.md")
+}
+
+/// System prompt for the INTERACTIVE orchestrator (a normal Claude Code PTY the user
+/// converses with, behind RUDDER_INTERACTIVE_ORCHESTRATOR). Unlike the headless
+/// decomposer it does not print a one-shot block to stdout; it writes the DAG to the
+/// orchestrator plan file, which Rudder reads to populate + render the DAG.
+pub(crate) fn orchestrator_system_prompt() -> String {
+    [
+        "You are Rudder's INTERACTIVE orchestration agent, running as a normal Claude Code session the user talks to directly.",
+        "Your job: converse with the user, inspect the repository READ-ONLY, and maintain the task DAG that a SEPARATE set of worker agents will implement in isolated worktrees. You do NOT implement product code yourself.",
+        "Ask concise clarifying questions in the conversation whenever the request is ambiguous (scope, approach, key decisions, what to reuse vs rebuild). This is a back-and-forth: the user replies and you continue.",
+        "When the task DAG is ready, WRITE it to `.rudder/orchestrator-plan.md` as a block wrapped EXACTLY in these markers (one JSON object on its own lines), then tell the user it is ready for approval:\nRUDDER_PLAN_TASKS_START\n{\"tasks\":[{\"id\":\"n0\",\"title\":\"short title\",\"prompt\":\"full worker prompt\",\"goal\":\"one-line objective\",\"success\":\"verifiable done-when\",\"deps\":[]},{\"id\":\"n1\",\"title\":\"...\",\"prompt\":\"...\",\"goal\":\"...\",\"success\":\"...\",\"deps\":[{\"on\":\"n0\",\"type\":\"hard\",\"why\":\"edits the module n0 creates\"}]}]}\nRUDDER_PLAN_TASKS_END",
+        "Edge types: `hard` = the child cannot SUCCEED until the parent has merged (it imports/executes the parent's code); `soft` = context-only, can run in parallel. Use the minimal hard-edge set; every hard edge needs a one-line `why`. Each task carries a `goal` and a verifiable `success`, and refers to files by REPOSITORY-RELATIVE paths only.",
+        "Rudder renders the DAG in the pane ABOVE this terminal and reloads it LIVE from the file. The plan is a LIVING document: whenever the user asks to ADD, CHANGE, REMOVE, reorder, re-scope, or re-split tasks at ANY point before they approve, UPDATE the DAG by re-writing the FULL RUDDER_PLAN_TASKS block in `.rudder/orchestrator-plan.md` to match — keep stable `id`s for unchanged nodes, add new ones with fresh ids, drop removed ones, and fix up `deps` so the edges stay correct. Always keep the block in sync with what you and the user have agreed; never describe a plan change only in chat without also writing it to the file.",
+        "APPROVAL / LAUNCH: After — and ONLY after — the user has EXPLICITLY confirmed in the conversation that the plan is good to run (e.g. \"yes\", \"go\", \"approve\", \"launch it\"), signal Rudder to launch the workers by WRITING (Edit/Write) the line `RUDDER_APPROVE_PLAN` on its own line into `.rudder/orchestrator-plan.md`, keeping the RUDDER_PLAN_TASKS block in the file. Writing it into the plan file (a structured Write) is the reliable channel; you MAY also print the same line in the chat as a fallback. Never write/print it preemptively, while you are still asking questions, or while you are revising the plan. When you merely need to REFER to the marker in prose, write it as RUDDER_APPROVE_PLAN_TEMPLATE so Rudder does not treat the mention as a launch trigger. Once you write RUDDER_APPROVE_PLAN your job is DONE: Rudder generates the DAG (graph.json), launches the SEPARATE worker fleet, and stops this planning session. Do not implement anything or keep working after that.",
+        "Only ever Edit/Write `.rudder/orchestrator-plan.md` (your plan file). Treat all other files as read-only.",
+    ]
+    .join("\n\n")
+}
+
+/// First-turn prompt for the interactive orchestrator (paired with the system prompt).
+pub(crate) fn rudder_orchestrator_prompt(task: &str) -> String {
+    let task = strip_rudder_prompt_wrappers(task);
+    let base = "You are Rudder's orchestrator for this checkout. Read `.rudder/orchestrator-plan.md` if it exists. If no concrete task is given yet, say you are ready and wait. For a concrete request, ask clarifying questions when needed; once clear, write the DAG to `.rudder/orchestrator-plan.md` and ask the user to approve. Only AFTER they explicitly confirm, add a `RUDDER_APPROVE_PLAN` line to `.rudder/orchestrator-plan.md` (keeping the plan block) to launch.";
+    if task.trim().is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}\n\nUser request:\n{task}")
+    }
 }
 
 /// Build the RECONCILE planner prompt: a multi-agent plan is already in flight and
@@ -384,7 +302,11 @@ impl PlannedNode {
 /// Build the worker launch prompt for a planned node. Mirrors
 /// `rudder_plan_worker_prompt` but sources fields off the queued node rather than
 /// a freshly parsed `RudderPlanTask`.
-pub(crate) fn planned_node_worker_prompt(planner_task: &str, node: &PlannedNode) -> String {
+pub(crate) fn planned_node_worker_prompt(
+    planner_task: &str,
+    node: &PlannedNode,
+    depends_on: &str,
+) -> String {
     let task = RudderPlanTask {
         id: node.id.clone(),
         title: node.title.clone(),
@@ -397,7 +319,7 @@ pub(crate) fn planned_node_worker_prompt(planner_task: &str, node: &PlannedNode)
         effort: node.effort.clone(),
     };
     // Backend is unused by the prompt builder; pass a placeholder.
-    rudder_plan_worker_prompt(planner_task, &task, Backend::Claude)
+    rudder_plan_worker_prompt(planner_task, &task, depends_on, Backend::Claude)
 }
 
 /// Kahn topological sort over the hard edges only. Returns `Err` when a cycle is
@@ -482,7 +404,8 @@ pub(crate) fn rudder_plan_output_for_run(run: &AgentRun) -> String {
 /// a real worker agent (a Claude/Codex process), so an unbounded or hallucinated
 /// block could spawn hundreds of processes. 100 is far above any legitimate single
 /// plan, and a plan that exceeds it is surfaced (never silently truncated). Add
-/// more work incrementally through the orchestrator rather than one giant block.
+/// more work incrementally by typing into the task pane (reconcile) rather than one
+/// giant block.
 pub(crate) const MAX_PLAN_TASKS: usize = 100;
 
 /// Extract the planner's clarifying questions from a `RUDDER_QUESTIONS_START..END` block
@@ -805,13 +728,10 @@ pub(crate) fn diff_plan(
             continue;
         }
         // Match to a RUNNING node: id first, then normalized title (planner renamed id).
-        let run_match = running
-            .iter()
-            .find(|node| node.id == task.id)
-            .or_else(|| {
-                let nt = norm_title(&task.title);
-                running.iter().find(|node| norm_title(&node.title) == nt)
-            });
+        let run_match = running.iter().find(|node| node.id == task.id).or_else(|| {
+            let nt = norm_title(&task.title);
+            running.iter().find(|node| norm_title(&node.title) == nt)
+        });
         if let Some(node) = run_match {
             matched_running.insert(node.id.clone());
             let new_goal = task.goal.clone().unwrap_or_default();
@@ -882,9 +802,9 @@ const STRUCTURAL_MARKERS: &[&str] = &[
 /// Stopwords excluded from the title-overlap heuristic so a shared common word does not
 /// make an additive request look structural.
 const TITLE_STOPWORDS: &[&str] = &[
-    "about", "after", "again", "their", "there", "these", "those", "which", "while",
-    "would", "could", "should", "with", "from", "into", "that", "this", "then", "them",
-    "they", "have", "your", "make", "code", "task", "node", "using", "based", "where",
+    "about", "after", "again", "their", "there", "these", "those", "which", "while", "would",
+    "could", "should", "with", "from", "into", "that", "this", "then", "them", "they", "have",
+    "your", "make", "code", "task", "node", "using", "based", "where",
 ];
 
 /// Decide whether a typed message during CONDUCTING is a STRUCTURAL pivot (true → rebase
@@ -1058,8 +978,28 @@ pub(crate) fn cap_goal_line(text: String) -> String {
     format!("{}…", truncated.trim_end())
 }
 
+/// The argument to forward for a slash command typed in the task bar. For `/goal` the
+/// backend rejects an argument longer than 4000 chars ("Goal condition is limited to
+/// 4000 characters"), so collapse the objective onto a SINGLE line (the slash command
+/// only reads up to the first newline anyway) and cap it under MAX_GOAL_LINE_CHARS — a
+/// long or pasted goal then never bounces; the full detail can ride in a normal
+/// follow-up message. Every other slash command passes its trimmed argument through.
+pub(crate) fn slash_command_arg(command: &str, rest: &str) -> String {
+    let trimmed = rest.trim();
+    if command == "/goal" {
+        cap_goal_line(trimmed.split_whitespace().collect::<Vec<_>>().join(" "))
+    } else {
+        trimmed.to_string()
+    }
+}
+
 fn goal_objective(task: &RudderPlanTask) -> String {
-    if let Some(goal) = task.goal.as_deref().map(str::trim).filter(|g| !g.is_empty()) {
+    if let Some(goal) = task
+        .goal
+        .as_deref()
+        .map(str::trim)
+        .filter(|g| !g.is_empty())
+    {
         return cap_goal_line(one_line(goal));
     }
     let title = task.title.trim();
@@ -1095,10 +1035,14 @@ fn goal_success(task: &RudderPlanTask) -> String {
 pub(crate) fn rudder_plan_worker_prompt(
     planner_task: &str,
     task: &RudderPlanTask,
+    depends_on: &str,
     _backend: Backend,
 ) -> String {
+    // `depends_on` (when non-empty) is a pre-formatted "Depends on:" block built by the
+    // caller from the live DAG + each parent's `rudder done` interfaces; it sits between
+    // the worker task line and the node prompt so the worker BUILDS ON its prerequisites.
     let body = format!(
-        "This task was spawned by Rudder from a /rudder-plan coordinator.\n\nWorker node: {}\n\nOriginal request:\n{planner_task}\n\nWorker task: {}\n\n{}",
+        "This task was spawned by Rudder from a /rudder-plan coordinator.\n\nWorker node: {}\n\nOriginal request:\n{planner_task}\n\nWorker task: {}\n\n{depends_on}{}",
         task.id, task.title, task.prompt
     );
     format!(
@@ -1231,7 +1175,11 @@ pub(crate) fn summarize_task(task: &str) -> String {
     summarize_task_to(task, 56)
 }
 
-pub(crate) fn spawn_task_summary_worker(tx: mpsc::Sender<TaskSummaryResult>, run_id: String, task: String) {
+pub(crate) fn spawn_task_summary_worker(
+    tx: mpsc::Sender<TaskSummaryResult>,
+    run_id: String,
+    task: String,
+) {
     thread::spawn(move || {
         let title = generate_task_summary_title(&task);
         let _ = tx.send(TaskSummaryResult { run_id, title });
@@ -1288,6 +1236,208 @@ pub(crate) fn spawn_completion_summary_worker(
             note,
         });
     });
+}
+
+/// Off-thread Haiku classification of a fresh task into one-off vs plan. Fire-and-forget
+/// (mirrors `spawn_completion_summary_worker`): the result is sent back over `tx` and the
+/// main loop routes it in `poll_dispatch_worker`. Defaults to Plan on any failure.
+/// Only the real binary spawns this (begin_dispatch gates it out of tests, which inject
+/// results directly), so it reads as dead code under `cfg(test)`.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn spawn_dispatch_worker(tx: mpsc::Sender<DispatchResult>, task: String) {
+    thread::spawn(move || {
+        let intent = classify_dispatch_intent(&task);
+        let _ = tx.send(DispatchResult { task, intent });
+    });
+}
+
+#[cfg(test)]
+fn dispatch_classifier_timeout() -> Duration {
+    Duration::from_millis(150)
+}
+
+#[cfg(not(test))]
+fn dispatch_classifier_timeout() -> Duration {
+    Duration::from_secs(8)
+}
+
+/// The classification prompt for the dispatcher. Asks Haiku for ONE word.
+#[cfg_attr(test, allow(dead_code))]
+fn build_dispatch_prompt(task: &str) -> String {
+    format!(
+        "Classify this request for a coding assistant. Reply with EXACTLY one word, lowercase, nothing else: `oneoff` or `plan`.\n\n- `oneoff`: a question, an explanation, a quick lookup, or a SMALL self-contained change one agent can finish in a single focused session (e.g. \"what does auth.js do?\", \"fix this typo\", \"add a log line\").\n- `plan`: a substantial or multi-part build, feature, refactor, or anything that benefits from being decomposed into several tasks with dependencies (e.g. \"build a dashboard with auth and charts\").\n\nWhen unsure, answer `plan`.\n\nRequest:\n{task}"
+    )
+}
+
+/// Run the Haiku classifier. Any failure (no `claude`, non-zero exit, unparseable) falls
+/// back to Plan — the established path — so dispatch never blocks or misroutes to an
+/// uncancellable one-off. A request that already leads with `/goal` is a worker prompt,
+/// not a question: route it to the planner without spending a classification.
+#[cfg_attr(test, allow(dead_code))]
+fn classify_dispatch_intent(task: &str) -> DispatchIntent {
+    let task = task.trim();
+    if task.starts_with("/goal") {
+        return DispatchIntent::Plan;
+    }
+    if let Some(intent) = classify_dispatch_intent_locally(task) {
+        return intent;
+    }
+    let prompt = build_dispatch_prompt(task);
+    let output = run_dispatch_classifier(&prompt, dispatch_classifier_timeout());
+    match output {
+        Some(out) if out.status.success() => {
+            let text = String::from_utf8_lossy(&out.stdout).to_lowercase();
+            // Prefer the explicit one-off signal; anything else (incl. "plan") -> Plan.
+            if text.contains("oneoff") || text.contains("one-off") {
+                DispatchIntent::OneOff
+            } else {
+                DispatchIntent::Plan
+            }
+        }
+        _ => DispatchIntent::Plan,
+    }
+}
+
+/// Fast local routing for obvious cases. This keeps common task-bar asks deterministic
+/// and avoids routing simple research/questions to the planner when the Claude classifier
+/// is unavailable (auth, billing, network, timeout).
+pub(crate) fn classify_dispatch_intent_locally(task: &str) -> Option<DispatchIntent> {
+    let task = task.trim();
+    if task.is_empty() {
+        return None;
+    }
+    let lower = task.to_ascii_lowercase();
+    if lower.starts_with("/goal") {
+        return Some(DispatchIntent::Plan);
+    }
+
+    let oneoff = has_oneoff_marker(&lower);
+    if oneoff && !has_chained_plan_marker(&lower) {
+        return Some(DispatchIntent::OneOff);
+    }
+    if has_plan_marker(&lower) {
+        return Some(DispatchIntent::Plan);
+    }
+    if oneoff {
+        return Some(DispatchIntent::OneOff);
+    }
+    None
+}
+
+fn has_plan_marker(lower: &str) -> bool {
+    let patterns = [
+        "build ",
+        "implement ",
+        "create ",
+        "add ",
+        "refactor ",
+        "rewrite ",
+        "migrate ",
+        "integrate ",
+        "wire up ",
+        "set up ",
+        "setup ",
+        "ship ",
+        "make an app",
+        "make a site",
+        "end-to-end",
+        "multi-step",
+    ];
+    patterns.iter().any(|pattern| lower.contains(pattern))
+}
+
+fn has_chained_plan_marker(lower: &str) -> bool {
+    let patterns = [
+        " and build ",
+        " and implement ",
+        " and create ",
+        " and add ",
+        " and refactor ",
+        " and rewrite ",
+        " then build ",
+        " then implement ",
+        " then create ",
+        " then add ",
+        " then refactor ",
+        " to build ",
+        " to implement ",
+        " to create ",
+    ];
+    patterns.iter().any(|pattern| lower.contains(pattern))
+}
+
+fn has_oneoff_marker(lower: &str) -> bool {
+    let starts = [
+        "what ",
+        "why ",
+        "how ",
+        "where ",
+        "when ",
+        "who ",
+        "explain ",
+        "summarize ",
+        "describe ",
+        "tell me ",
+        "compare ",
+        "list ",
+        "look into ",
+        "look up ",
+        "research ",
+        "read ",
+        "review ",
+        "inspect ",
+        "investigate ",
+        "check ",
+        "find out ",
+        "search ",
+        "is ",
+        "are ",
+        "can ",
+        "could ",
+        "should ",
+    ];
+    if starts.iter().any(|prefix| lower.starts_with(prefix)) {
+        return true;
+    }
+    let contains = [
+        " docs",
+        " documentation",
+        " api docs",
+        " api documentation",
+        "what does",
+        "how does",
+    ];
+    contains.iter().any(|pattern| lower.contains(pattern))
+}
+
+#[cfg_attr(test, allow(dead_code))]
+fn run_dispatch_classifier(prompt: &str, timeout: Duration) -> Option<std::process::Output> {
+    let mut child = Command::new(claude_program())
+        .args(["-p", &prompt, "--model", TASK_SUMMARY_MODEL])
+        .env("CLAUDE_CODE_NO_FLICKER", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(None) => {}
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
 }
 
 fn generate_completion_summary(task: &str, diff: &str) -> Option<serde_json::Value> {

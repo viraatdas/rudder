@@ -287,7 +287,9 @@ impl PlanStreamState {
         let kind = event.get("type").and_then(Value::as_str).unwrap_or("");
         match kind {
             "content_block_delta" => {
-                let Some(delta) = event.get("delta") else { return };
+                let Some(delta) = event.get("delta") else {
+                    return;
+                };
                 let dtype = delta.get("type").and_then(Value::as_str).unwrap_or("");
                 if dtype == "text_delta" {
                     if let Some(text) = delta.get("text").and_then(Value::as_str) {
