@@ -151,7 +151,7 @@ async function planAndDrain(t, ws, tasks) {
   assert.ok(drained, `DAG did not drain within timeout. board log:\n${boardLog}`);
   const rudderMd = await fsp.readFile(path.join(ws.repo, "RUDDER.md"), "utf8");
   assert.match(rudderMd, /<!-- RUDDER_GENERATED_START -->/, "the board writes the live RUDDER.md generated block");
-  assert.match(rudderMd, /Rudder live context/, "RUDDER.md is the plan/status surface for workers");
+  assert.match(rudderMd, /RUDDER .* Orchestrated Run Status/, "RUDDER.md is the plan/status surface for workers");
   return { graph: drained, boardLog };
 }
 

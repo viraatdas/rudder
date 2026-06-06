@@ -4305,10 +4305,16 @@ fn ctrl_c_exits_from_every_focus_pane() {
 }
 
 #[test]
-fn event_dispatch_handles_paste_and_ctrl_c() {
+fn event_dispatch_handles_removed_task_paste_and_ctrl_c() {
     let mut app = App::new();
+    app.focus = FocusPane::Task;
     assert!(!handle_event(&mut app, Event::Paste("hello".to_string())));
-    assert_eq!(app.task_input, "hello");
+    assert_eq!(app.task_input, "");
+    assert_eq!(app.focus, FocusPane::Worker);
+    assert_eq!(
+        app.notice.as_deref(),
+        Some("task bar was removed; paste into the orchestrator pane")
+    );
     assert!(handle_event(
         &mut app,
         Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
@@ -6210,12 +6216,34 @@ fn local_dispatch_classifier_routes_obvious_oneoff_and_plan_requests() {
         Some(DispatchIntent::Plan)
     );
     assert_eq!(
+        classify_dispatch_intent_locally("build docs page"),
+        Some(DispatchIntent::Plan)
+    );
+    assert_eq!(
+        classify_dispatch_intent_locally("add documentation for Spotify auth"),
+        Some(DispatchIntent::Plan)
+    );
+    assert_eq!(
         classify_dispatch_intent_locally("look into spotify api docs and build OAuth login"),
+        Some(DispatchIntent::Plan)
+    );
+    assert_eq!(
+        classify_dispatch_intent_locally("look into Stripe docs and integrate payments"),
         Some(DispatchIntent::Plan)
     );
     assert_eq!(
         classify_dispatch_intent_locally("refactor the auth flow"),
         Some(DispatchIntent::Plan)
+    );
+    assert_eq!(
+        classify_dispatch_intent_locally("can you add Spotify login"),
+        None,
+        "polite implementation phrasing is semantic; let Haiku classify it"
+    );
+    assert_eq!(
+        classify_dispatch_intent_locally("could you build a dashboard"),
+        None,
+        "polite implementation phrasing is semantic; let Haiku classify it"
     );
 }
 

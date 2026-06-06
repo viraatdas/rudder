@@ -1267,7 +1267,7 @@ fn dispatch_classifier_timeout() -> Duration {
 #[cfg_attr(test, allow(dead_code))]
 fn build_dispatch_prompt(task: &str) -> String {
     format!(
-        "Classify this request for a coding assistant. Reply with EXACTLY one word, lowercase, nothing else: `oneoff` or `plan`.\n\n- `oneoff`: a question, an explanation, a quick lookup, or a SMALL self-contained change one agent can finish in a single focused session (e.g. \"what does auth.js do?\", \"fix this typo\", \"add a log line\").\n- `plan`: a substantial or multi-part build, feature, refactor, or anything that benefits from being decomposed into several tasks with dependencies (e.g. \"build a dashboard with auth and charts\").\n\nWhen unsure, answer `plan`.\n\nRequest:\n{task}"
+        "You are Rudder's task-bar router. Classify the user's FRESH request into exactly one lowercase word: oneoff or plan. Output the word only.\n\nRudder has two paths:\n- oneoff: start one conversational agent in the user's MAIN checkout. Use this for questions, explanations, code reading, API/docs research, investigation, summarizing findings, or a tiny self-contained edit like a typo/log line.\n- plan: start the orchestrator, which decomposes work into a DAG of isolated workers. Use this for implementing, building, adding, creating, refactoring, migrating, integrating, wiring up, setting up, shipping, tests, docs pages, UI, multi-file, multi-step, or product work.\n\nDecision rules:\n1. If the user only wants to understand, inspect, research, or get advice, choose oneoff.\n2. If the user asks Rudder to change code or produce a deliverable, choose plan unless it is clearly a tiny isolated edit.\n3. If the request combines research with implementation, choose plan (for example: \"look into the docs and implement OAuth\").\n4. Polite question phrasing does not change implementation into advice: \"can you add X\", \"could you build X\", and \"please implement X\" are plan.\n5. \"how to add/build/implement X\" asks for an explanation, so choose oneoff. \"add/build/implement X\" asks for work, so choose plan.\n6. When unsure, choose plan.\n\nRequest:\n{task}"
     )
 }
 
@@ -1288,9 +1288,9 @@ fn classify_dispatch_intent(task: &str) -> DispatchIntent {
     let output = run_dispatch_classifier(&prompt, dispatch_classifier_timeout());
     match output {
         Some(out) if out.status.success() => {
-            let text = String::from_utf8_lossy(&out.stdout).to_lowercase();
-            // Prefer the explicit one-off signal; anything else (incl. "plan") -> Plan.
-            if text.contains("oneoff") || text.contains("one-off") {
+            let text = String::from_utf8_lossy(&out.stdout).trim().to_lowercase();
+            // Strict one-token parse: anything else (incl. prose/JSON/"plan") -> Plan.
+            if text == "oneoff" || text == "one-off" {
                 DispatchIntent::OneOff
             } else {
                 DispatchIntent::Plan
@@ -1313,17 +1313,49 @@ pub(crate) fn classify_dispatch_intent_locally(task: &str) -> Option<DispatchInt
         return Some(DispatchIntent::Plan);
     }
 
-    let oneoff = has_oneoff_marker(&lower);
-    if oneoff && !has_chained_plan_marker(&lower) {
+    if has_chained_plan_marker(&lower) {
+        return Some(DispatchIntent::Plan);
+    }
+    if has_how_to_oneoff_marker(&lower) {
         return Some(DispatchIntent::OneOff);
     }
-    if has_plan_marker(&lower) {
+    if has_direct_plan_marker(&lower) {
         return Some(DispatchIntent::Plan);
+    }
+    let oneoff = has_oneoff_marker(&lower);
+    if oneoff && has_plan_marker(&lower) {
+        return None;
     }
     if oneoff {
         return Some(DispatchIntent::OneOff);
     }
     None
+}
+
+fn has_direct_plan_marker(lower: &str) -> bool {
+    let lower = lower
+        .strip_prefix("please ")
+        .or_else(|| lower.strip_prefix("pls "))
+        .unwrap_or(lower);
+    let starts = [
+        "build ",
+        "implement ",
+        "create ",
+        "add ",
+        "refactor ",
+        "rewrite ",
+        "migrate ",
+        "integrate ",
+        "wire up ",
+        "set up ",
+        "setup ",
+        "ship ",
+    ];
+    starts.iter().any(|prefix| lower.starts_with(prefix))
+        || lower.contains("make an app")
+        || lower.contains("make a site")
+        || lower.contains("end-to-end")
+        || lower.contains("multi-step")
 }
 
 fn has_plan_marker(lower: &str) -> bool {
@@ -1356,16 +1388,54 @@ fn has_chained_plan_marker(lower: &str) -> bool {
         " and add ",
         " and refactor ",
         " and rewrite ",
+        " and migrate ",
+        " and integrate ",
+        " and wire up ",
+        " and set up ",
+        " and setup ",
+        " and ship ",
         " then build ",
         " then implement ",
         " then create ",
         " then add ",
         " then refactor ",
+        " then rewrite ",
+        " then migrate ",
+        " then integrate ",
+        " then wire up ",
+        " then set up ",
+        " then setup ",
+        " then ship ",
+        " and then build ",
+        " and then implement ",
+        " and then create ",
+        " and then add ",
+        " and then refactor ",
+        " and then rewrite ",
+        " and then migrate ",
+        " and then integrate ",
+        " and then wire up ",
+        " and then set up ",
+        " and then setup ",
+        " and then ship ",
         " to build ",
         " to implement ",
         " to create ",
     ];
     patterns.iter().any(|pattern| lower.contains(pattern))
+}
+
+fn has_how_to_oneoff_marker(lower: &str) -> bool {
+    let starts = [
+        "how to ",
+        "how do i ",
+        "how should i ",
+        "explain how to ",
+        "explain how i ",
+        "tell me how to ",
+        "what is the best way to ",
+    ];
+    starts.iter().any(|prefix| lower.starts_with(prefix))
 }
 
 fn has_oneoff_marker(lower: &str) -> bool {
@@ -1394,21 +1464,11 @@ fn has_oneoff_marker(lower: &str) -> bool {
         "search ",
         "is ",
         "are ",
-        "can ",
-        "could ",
-        "should ",
     ];
     if starts.iter().any(|prefix| lower.starts_with(prefix)) {
         return true;
     }
-    let contains = [
-        " docs",
-        " documentation",
-        " api docs",
-        " api documentation",
-        "what does",
-        "how does",
-    ];
+    let contains = ["what does", "how does"];
     contains.iter().any(|pattern| lower.contains(pattern))
 }
 

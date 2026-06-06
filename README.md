@@ -45,10 +45,12 @@ rudder doctor
 rudder
 ```
 
-With no arguments, `rudder` opens the dashboard. Type a task in the bottom input
-and press `Enter`. Rudder creates a git worktree for it and starts your agent
-(Claude Code or Codex) in the worker pane. Start more tasks the same way; each
-gets its own worktree so they never step on each other.
+With no arguments, `rudder` opens the dashboard. Type in the bottom input and
+press `Enter`. Rudder dispatches the request: quick questions, docs/API research,
+and tiny self-contained changes open as a one-off agent in your main checkout;
+larger implementation work goes to the orchestrator, which plans a DAG and runs
+isolated workers. Use `/ask <text>` to force one-off or `/plan <text>` to force
+the orchestrator.
 
 You can also start a task directly from the shell:
 
@@ -144,6 +146,8 @@ consumes the resulting `RUDDER_*` control markers in `RUDDER.md`.
 | Former command | Orchestrator action |
 | --- | --- |
 | `/model` | Pick provider, then model, then effort |
+| `/ask <text>` | Force a one-off conversational agent in the main checkout |
+| `/plan <text>` | Force the orchestrator / DAG planner |
 | `/main` or `/m` | Start a new main-branch agent |
 | `/review-all` | Combine completed worktrees and start a Codex review-all agent |
 | `/merge-all` | Merge all completed worktrees |
@@ -165,11 +169,24 @@ Your last provider, model, and effort are saved in `~/.rudder/config.json` and
 reused next time. Rudder refreshes model metadata from
 `https://models.dev/api.json` and falls back to local caches when offline.
 
-## Planning (the default)
+## Dispatch and planning
 
-Talk to the orchestrator pane. Rudder runs a dedicated Claude Code orchestrator
-PTY with a DAG pane above it. The flow stays inside Rudder: the orchestrator
-researches read-only, writes the DAG to `RUDDER.md`, and separate workers do the
+Talk to the orchestrator pane. For a fresh request with no active plan, Rudder
+first routes it through a small Haiku dispatcher:
+
+- **One-off** for questions, explanations, docs/API research, repo inspection, or
+  tiny self-contained edits. This starts one conversational agent in the main
+  checkout and shows it in the `one-off` section.
+- **Plan** for building, adding, refactoring, integrating, testing, UI, docs pages,
+  or multi-step work. This starts the orchestrator. When unsure, Rudder chooses
+  the planner.
+
+The dispatcher is overrideable: ask for `/ask <text>` to skip routing and start
+one-off, or `/plan <text>` to skip routing and start the orchestrator.
+
+For planned work, Rudder runs a dedicated Claude Code orchestrator PTY with a DAG
+pane above it. The flow stays inside Rudder: the orchestrator researches
+read-only, writes the DAG to `RUDDER.md`, and separate workers do the
 implementation.
 
 1. **It asks first.** The planner inspects the repo and then asks at least one
@@ -200,11 +217,12 @@ left off.
 
 ## Worktrees and merging
 
-Every dashboard task runs in its own git worktree under `.rudder-worktrees/` inside
-your project (gitignored), so parallel agents never edit the same checkout and every
-Rudder path stays within the project boundary. Run records live under `.rudder/runs/`.
-If you quit Rudder, live workers stop but the agents stay listed the next time you open
-Rudder in that repo.
+Planned worker tasks run in their own git worktrees under `.rudder-worktrees/`
+inside your project (gitignored), so parallel DAG agents never edit the same
+checkout and every Rudder path stays within the project boundary. One-off agents
+are the exception: they intentionally run in the main checkout. Run records live
+under `.rudder/runs/`. If you quit Rudder, live workers stop but the agents stay
+listed the next time you open Rudder in that repo.
 
 - Press `m` to merge the selected completed agent back into its branch.
 - Press `M` to merge all completed agents. Rudder confirms first.

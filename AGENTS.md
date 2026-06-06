@@ -887,10 +887,12 @@ already used official signals: `claude -p --output-format stream-json` and `code
 Not every typed task wants the whole DAG. A FRESH task (no active plan) routes through
 a deterministic local classifier first, then LIGHT Haiku only for ambiguous cases:
 - **`begin_dispatch`** (start_task_from_input default branch) sets `dispatch_pending` and
-  spawns `spawn_dispatch_worker` (tasks.rs). `classify_dispatch_intent_locally` handles
-  obvious one-offs (`look into ... docs`, `explain ...`, questions, quick research) and
-  obvious plans (`build`, `implement`, `refactor`, multi-step work) without a model call.
-  Ambiguous requests run `claude -p --model claude-haiku-4-5-20251001`
+  spawns `spawn_dispatch_worker` (tasks.rs). `classify_dispatch_intent_locally` is a
+  high-confidence preflight only: it handles obvious one-offs (`look into ... docs`,
+  `explain ...`, `how to ...`) and direct imperative plans (`build`, `implement`,
+  `refactor`, multi-step work) without a model call, but defers semantic/polite phrasing
+  such as `can you add ...` to Haiku. Ambiguous requests run
+  `claude -p --model claude-haiku-4-5-20251001`
   (`TASK_SUMMARY_MODEL`, via `claude_program()` so `RUDDER_CLAUDE_BIN` works in tests)
   with a one-word classification prompt → `DispatchResult { task, intent }` over an mpsc
   channel. The subprocess is bounded by `dispatch_classifier_timeout()`; timeout, no
