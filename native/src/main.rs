@@ -795,7 +795,7 @@ impl App {
         let (dispatch_tx, dispatch_rx) = mpsc::channel();
         let branch = current_branch_at(&cwd);
         Self {
-            focus: FocusPane::Task,
+            focus: FocusPane::Worker,
             nav_mode: false,
             leader_pending: false,
             worker_view: WorkerView::Terminal,
@@ -988,6 +988,26 @@ impl App {
             .unwrap_or(false)
     }
 
+    fn selected_uses_headless_orchestrator_chat(&self) -> bool {
+        self.agents.get(self.selected_agent).is_some_and(|run| {
+            run.is_orchestrator() && !self.is_interactive_orchestrator_run(run)
+        })
+    }
+
+    fn is_interactive_orchestrator_run(&self, run: &AgentRun) -> bool {
+        self.interactive_orchestrator
+            && run.is_orchestrator()
+            && !run.reconcile_planner
+            && run.backend == Backend::Claude
+            && !run.autosteered
+    }
+
+    fn has_running_interactive_orchestrator(&self) -> bool {
+        self.agents.iter().any(|run| {
+            self.is_interactive_orchestrator_run(run) && run.status == AgentStatus::Running
+        })
+    }
+
     /// True when the worker pane is currently showing the custom orchestrator DAG
     /// command-center view (selected orchestrator, Terminal view, plan parsed)
     /// rather than the raw PTY. In that view scroll/selection target the rendered
@@ -1086,7 +1106,7 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('g') {
             self.nav_mode = !self.nav_mode;
             self.notice = Some(if self.nav_mode {
-                "nav mode: 1 agents  2 worker  3 task  v review  R review-all  M merge-all  Esc exits"
+                "nav mode: 1 agents  2 worker  v review  R review-all  M merge-all  Esc exits"
                     .to_string()
             } else {
                 "worker input restored".to_string()
@@ -1098,7 +1118,7 @@ impl App {
             self.leader_pending = true;
             self.nav_mode = false;
             self.notice = Some(
-                "Ctrl+W: Tab cycle  1/2/3 panes  v review  m merge  R review-all  M merge-all  Esc cancels"
+                "Ctrl+W: Tab cycle  1/2 panes  v review  m merge  R review-all  M merge-all  Esc cancels"
                     .to_string(),
             );
             return false;
@@ -1126,7 +1146,7 @@ impl App {
                 return false;
             }
             KeyCode::Char('3') if alt_like => {
-                self.focus = FocusPane::Task;
+                self.focus = FocusPane::Worker;
                 return false;
             }
             KeyCode::Char('v') if alt_like => {
@@ -1142,7 +1162,7 @@ impl App {
                 return false;
             }
             KeyCode::Char('\u{00a3}') => {
-                self.focus = FocusPane::Task;
+                self.focus = FocusPane::Worker;
                 return false;
             }
             KeyCode::Char('\u{221a}') => {
@@ -1155,7 +1175,10 @@ impl App {
         match self.focus {
             FocusPane::Agents => self.handle_agents_key(key),
             FocusPane::Worker => self.handle_worker_key(key),
-            FocusPane::Task => self.handle_task_key(key),
+            FocusPane::Task => {
+                self.focus = FocusPane::Worker;
+                self.handle_worker_key(key)
+            }
         }
     }
 
@@ -1176,7 +1199,7 @@ impl App {
             }
             KeyCode::Char('3') => {
                 self.delete_pending = None;
-                self.focus = FocusPane::Task;
+                self.focus = FocusPane::Worker;
             }
             KeyCode::Char('v') => self.toggle_worker_view(),
             KeyCode::Char('r') => self.start_rename_selected_agent(),
@@ -1224,7 +1247,7 @@ impl App {
             }
             KeyCode::Char('3') | KeyCode::Char('\u{00a3}') => {
                 self.delete_pending = None;
-                self.focus = FocusPane::Task;
+                self.focus = FocusPane::Worker;
             }
             KeyCode::Char('v') | KeyCode::Char('\u{221a}') => self.toggle_worker_view(),
             KeyCode::Char('r') => self.start_rename_selected_agent(),
@@ -1301,20 +1324,18 @@ impl App {
         self.dirty = true;
     }
 
-    /// Rotate pane focus: Agents -> Worker -> Task -> Agents (forward) or the
-    /// reverse. Used by the Ctrl+W leader Tab/BackTab cycle.
+    /// Rotate pane focus between Agents and Worker. Used by the Ctrl+W leader
+    /// Tab/BackTab cycle.
     fn cycle_focus(&mut self, forward: bool) {
         self.focus = if forward {
             match self.focus {
                 FocusPane::Agents => FocusPane::Worker,
-                FocusPane::Worker => FocusPane::Task,
-                FocusPane::Task => FocusPane::Agents,
+                FocusPane::Worker | FocusPane::Task => FocusPane::Agents,
             }
         } else {
             match self.focus {
-                FocusPane::Agents => FocusPane::Task,
-                FocusPane::Worker => FocusPane::Agents,
-                FocusPane::Task => FocusPane::Worker,
+                FocusPane::Agents => FocusPane::Worker,
+                FocusPane::Worker | FocusPane::Task => FocusPane::Agents,
             }
         };
     }
@@ -1348,13 +1369,12 @@ impl App {
             return false;
         }
 
-        // Orchestrator pane = a CHAT with the planner. For the HEADLESS planner (default)
+        // Orchestrator pane = a CHAT with the planner. For HEADLESS planners
         // typing composes a follow-up: Enter-with-text refines, Enter-on-empty approves;
         // we intercept before the PTY-forward path because writing to a -p process is
-        // useless. For the INTERACTIVE orchestrator (opt-in) the pane IS a live Claude PTY,
-        // so keys forward straight to it (you converse with it); approval/refine happen via
-        // the task bar (Enter approves when awaiting_approval).
-        if self.selected_is_orchestrator() && !self.interactive_orchestrator {
+        // useless. For the INTERACTIVE Claude orchestrator the pane IS a live Claude PTY,
+        // so keys forward straight to it and approval/refine happen via RUDDER.md markers.
+        if self.selected_uses_headless_orchestrator_chat() {
             return self.handle_orchestrator_chat_key(key);
         }
 
@@ -1649,18 +1669,6 @@ impl App {
                 };
                 self.selected_worker_selection_text(selection)
             }
-            FocusPane::Task => {
-                let Some(selection) = self.task_selection else {
-                    return;
-                };
-                let width = self
-                    .task_area
-                    .map(block_inner)
-                    .map(task_inner_width)
-                    .unwrap_or(80);
-                let lines = task_input_lines(&self.task_input, self.task_cursor, width);
-                selected_text_from_lines(&lines, selection)
-            }
             _ => return,
         };
 
@@ -1672,8 +1680,8 @@ impl App {
             Ok(()) => {
                 self.notice = Some(match self.focus {
                     FocusPane::Worker => "copied worker selection".to_string(),
-                    FocusPane::Task => "copied task selection".to_string(),
                     FocusPane::Agents => "copied selection".to_string(),
+                    FocusPane::Task => "copied selection".to_string(),
                 });
             }
             Err(error) => self.notice = Some(format!("copy failed: {error}")),
@@ -2190,7 +2198,7 @@ impl App {
                 self.task_cursor = 0;
                 self.picker_index = 0;
                 self.notice = Some(
-                    "Option-1/2/3 or ^W pane  Enter start/focus  wheel scrolls worker  R review all  M merge all"
+                    "Option-1/2 or ^W pane  Enter start/focus  wheel scrolls worker  R review all  M merge all"
                         .to_string(),
                 );
             }
@@ -2241,9 +2249,8 @@ impl App {
                 }
             }
             FocusPane::Task => {
-                self.reset_task_history_navigation();
-                insert_str_at_cursor(&mut self.task_input, &mut self.task_cursor, &text);
-                self.clamp_picker_index();
+                self.focus = FocusPane::Worker;
+                self.notice = Some("task bar was removed; paste into the orchestrator pane".to_string());
             }
             FocusPane::Agents => {}
         }
@@ -2358,17 +2365,6 @@ impl App {
                     return;
                 }
             }
-        }
-
-        if let Some(task_area) = self
-            .task_area
-            .filter(|area| rect_contains(*area, mouse.column, mouse.row))
-        {
-            self.worker_selection = None;
-            if self.handle_task_selection_mouse(mouse, block_inner(task_area)) {
-                return;
-            }
-            return;
         }
 
         if let Some(agents_area) = self
@@ -2493,17 +2489,6 @@ impl App {
             } else if matches!(mouse.kind, MouseEventKind::ScrollDown) {
                 self.select_next_agent();
             }
-            return;
-        }
-
-        if self
-            .task_area
-            .is_some_and(|area| rect_contains(area, mouse.column, mouse.row))
-        {
-            self.set_mouse_debug(format!(
-                "mouse {:?} @{},{} pane=task route=ignored",
-                mouse.kind, mouse.column, mouse.row
-            ));
             return;
         }
 
@@ -3508,6 +3493,18 @@ impl App {
         }
     }
 
+    fn ensure_default_orchestrator(&mut self) {
+        if !self.interactive_orchestrator
+            || self
+                .agents
+                .iter()
+                .any(|run| run.is_orchestrator() && run.status == AgentStatus::Running)
+        {
+            return;
+        }
+        self.start_rudder_plan_task("");
+    }
+
     fn start_rudder_plan_task(&mut self, input: &str) {
         // A fresh plan supersedes any paused planner.
         self.planner_paused_for_input = false;
@@ -3532,25 +3529,28 @@ impl App {
         // (each refinement layers the user's feedback on top of this, not on top of
         // the previous composite prompt).
         self.plan_request = input.to_string();
-        let model = self.model.clone();
         let backend = self.backend;
+        let interactive_planner = self.interactive_orchestrator && backend == Backend::Claude;
+        let model = self.model.clone();
         // Decomposing a task into a node DAG does not need max reasoning. Cap the
         // planner's effort so plan mode stays responsive even when the dashboard
         // default is a heavy model at high effort. The model itself is unchanged.
-        let effort = match self.effort {
+        let base_effort = self.effort;
+        let effort = match base_effort {
             Some(EffortLevel::High) | Some(EffortLevel::XHigh) | Some(EffortLevel::Max) => {
                 Some(EffortLevel::Medium)
             }
             other => other,
         };
         let session_id = mint_session_id_for(backend);
-        let command = agent_command(
+        let command = agent_command_with_orchestrator_mode(
             backend,
             &model,
             effort,
             input,
             AgentMode::RudderPlan,
             session_id.as_deref(),
+            interactive_planner,
         );
         let options = TerminalPaneOptions {
             size: TerminalSize::default(),
@@ -3610,14 +3610,18 @@ impl App {
             merge_resolver: false,
         };
 
-        // INTERACTIVE orchestrator (opt-in): it never exits and presents its DAG via the
-        // plan file (not the headless stream), so it is NOT autosteered (the headless
-        // completed-plan capture must not fire). Clear any stale plan file so the prior
-        // session's DAG isn't re-captured for this fresh request.
-        if self.interactive_orchestrator {
+        // INTERACTIVE orchestrator: it never exits and presents its DAG via RUDDER.md, so
+        // it is NOT autosteered (the headless completed-plan capture must not fire).
+        // Generate project-level Claude skills before spawn so the former task-bar
+        // actions are available inside this Claude Code session.
+        if interactive_planner {
             run.autosteered = false;
-            let _ = std::fs::create_dir_all(self.cwd.join(".rudder"));
-            let _ = std::fs::remove_file(orchestrator_plan_path(&self.cwd));
+            if let Err(error) = clear_orchestrator_plan_markers(&self.cwd) {
+                self.notice = Some(format!("orchestrator plan cleanup warning: {error}"));
+            }
+            if let Err(error) = ensure_orchestrator_skills(&self.cwd) {
+                self.notice = Some(format!("orchestrator skills warning: {error}"));
+            }
         }
 
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
@@ -4417,9 +4421,11 @@ impl App {
         if !self.selected_is_main() {
             return;
         }
-        self.replace_task_input("/model ".to_string());
-        self.focus = FocusPane::Task;
-        self.notice = Some("pick a model for main".to_string());
+        self.focus = FocusPane::Worker;
+        self.notice = Some(
+            "ask the orchestrator to change models, or write RUDDER_MODEL <provider> <model> [effort] in RUDDER.md"
+                .to_string(),
+        );
     }
 
     fn restart_selected_agent(&mut self) {
@@ -4566,7 +4572,7 @@ impl App {
             }
             Some("/help") => {
                 self.notice = Some(
-                    "Option-1/2/3 or ^W pane  Enter start/focus  type to refine the plan  /model  /main|/m  /goal  /automerge"
+                    "Option-1/2 or ^W pane  talk to the orchestrator to refine, approve, or run skills"
                         .to_string(),
                 );
                 true
@@ -5196,12 +5202,7 @@ impl App {
         if !self.planned_nodes.is_empty() || self.agents.iter().any(|run| run.node_id.is_some()) {
             return;
         }
-        let running_orchestrator = self.agents.iter().any(|run| {
-            run.mode == AgentMode::RudderPlan
-                && !run.reconcile_planner
-                && run.status == AgentStatus::Running
-        });
-        if !running_orchestrator {
+        if !self.has_running_interactive_orchestrator() {
             return;
         }
         let Ok(text) = std::fs::read_to_string(orchestrator_plan_path(&self.cwd)) else {
@@ -5246,12 +5247,7 @@ impl App {
         if self.agents.iter().any(|run| run.node_id.is_some()) {
             return;
         }
-        let running_orchestrator = self.agents.iter().any(|run| {
-            run.mode == AgentMode::RudderPlan
-                && !run.reconcile_planner
-                && run.status == AgentStatus::Running
-        });
-        if !running_orchestrator {
+        if !self.has_running_interactive_orchestrator() {
             return;
         }
         let Ok(text) = std::fs::read_to_string(orchestrator_plan_path(&self.cwd)) else {
@@ -5298,6 +5294,9 @@ impl App {
         {
             return;
         }
+        if !self.has_running_interactive_orchestrator() {
+            return;
+        }
         // PRIMARY: the orchestrator wrote the approval into its plan file.
         let file_approved = std::fs::read_to_string(orchestrator_plan_path(&self.cwd))
             .map(|text| output_has_approve_marker(&text))
@@ -5312,6 +5311,139 @@ impl App {
                 .any(|terminal| output_has_approve_marker(terminal.output_log_snapshot()));
         if file_approved || pty_approved {
             self.approve_planned_queue();
+        }
+    }
+
+    fn scan_orchestrator_skill_markers(&mut self) {
+        if !self.interactive_orchestrator || self.refining || self.rebasing {
+            return;
+        }
+        if !self.has_running_interactive_orchestrator() {
+            return;
+        }
+        let path = orchestrator_plan_path(&self.cwd);
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        let mut actions: Vec<String> = Vec::new();
+        let mut kept: Vec<&str> = Vec::new();
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if is_orchestrator_skill_marker(trimmed) {
+                actions.push(trimmed.to_string());
+            } else {
+                kept.push(line);
+            }
+        }
+        if actions.is_empty() {
+            return;
+        }
+        let mut rewritten = kept.join("\n");
+        if text.ends_with('\n') {
+            rewritten.push('\n');
+        }
+        let _ = std::fs::write(&path, rewritten);
+        for action in actions {
+            self.handle_orchestrator_skill_marker(&action);
+        }
+        self.dirty = true;
+    }
+
+    fn handle_orchestrator_skill_marker(&mut self, marker: &str) {
+        if let Some(rest) = marker.strip_prefix("RUDDER_MODEL") {
+            let rest = rest.trim();
+            if rest.is_empty() {
+                self.notice = Some("RUDDER_MODEL requires <provider> <model> [effort]".to_string());
+            } else {
+                self.handle_command(&format!("/model {rest}"));
+            }
+            return;
+        }
+        if let Some(rest) = marker.strip_prefix("RUDDER_MAIN") {
+            let rest = rest.trim();
+            if rest.is_empty() {
+                self.handle_command("/main");
+            } else {
+                self.handle_command(&format!("/main {rest}"));
+            }
+            return;
+        }
+        if let Some(rest) = marker.strip_prefix("RUDDER_GOAL") {
+            self.handle_command(&format!("/goal {}", rest.trim()));
+            return;
+        }
+        if let Some(rest) = marker.strip_prefix("RUDDER_CLOUD") {
+            let rest = rest.trim();
+            if rest.is_empty() {
+                self.handle_command("/cloud");
+            } else {
+                self.handle_command(&format!("/cloud {rest}"));
+            }
+            return;
+        }
+        if let Some(rest) = marker.strip_prefix("RUDDER_PLAN") {
+            let rest = rest.trim();
+            if rest.is_empty() {
+                self.notice = Some("RUDDER_PLAN requires a task".to_string());
+            } else {
+                self.handle_command(&format!("/plan {rest}"));
+            }
+            return;
+        }
+        if let Some(rest) = marker.strip_prefix("RUDDER_ASK") {
+            let rest = rest.trim();
+            if rest.is_empty() {
+                self.notice = Some("RUDDER_ASK requires a question or small change".to_string());
+            } else {
+                self.handle_command(&format!("/ask {rest}"));
+            }
+            return;
+        }
+        if let Some(rest) = marker.strip_prefix("RUDDER_AUTOMERGE") {
+            self.apply_automerge_marker(rest.trim());
+            return;
+        }
+        match marker {
+            "RUDDER_USAGE" => self.show_usage_summary(),
+            "RUDDER_HELP" => {
+                self.notice = Some(
+                    "skills: model, main, goal, usage, cloud/login, review-all, merge-all, automerge, edit DAG"
+                        .to_string(),
+                );
+            }
+            "RUDDER_LOGIN" => {
+                self.handle_command("/login");
+            }
+            "RUDDER_REVIEW_ALL" => {
+                self.review_all_ready();
+            }
+            "RUDDER_MERGE_ALL" => {
+                self.request_merge_all_ready();
+            }
+            _ => {}
+        }
+    }
+
+    fn apply_automerge_marker(&mut self, value: &str) {
+        let next = match value {
+            "on" | "true" | "1" => true,
+            "off" | "false" | "0" => false,
+            "toggle" | "" => !self.auto_merge,
+            _ => {
+                self.notice =
+                    Some("RUDDER_AUTOMERGE expects on, off, or toggle".to_string());
+                return;
+            }
+        };
+        self.auto_merge = next;
+        if self.auto_merge {
+            self.notice = Some(
+                "auto-merge ON: clean finished nodes merge themselves and unblock children"
+                    .to_string(),
+            );
+            self.maybe_auto_merge();
+        } else {
+            self.notice = Some("auto-merge OFF: merge finished nodes manually".to_string());
         }
     }
 
@@ -6318,6 +6450,8 @@ impl App {
         for run in self.agents.iter_mut() {
             if run.mode != AgentMode::RudderPlan
                 || run.reconcile_planner
+                || run.backend != Backend::Claude
+                || run.autosteered
                 || run.status != AgentStatus::Running
             {
                 continue;
@@ -8317,6 +8451,7 @@ What to do\n\
         // remove tasks and re-write the plan file; reflect those edits in the DAG live.
         self.maybe_recapture_orchestrator_plan();
         self.scan_orchestrator_markers();
+        self.scan_orchestrator_skill_markers();
 
         // Drain the planned-node queue on a coarse cadence: as plan-launched
         // agents reach Merged their node ids satisfy dependents' hard deps, so a
@@ -8647,6 +8782,7 @@ fn run(terminal: &mut Tui) -> Result<()> {
     let mut app = App::new();
     app.resume_migrated_agents();
     app.restore_running_agents();
+    app.ensure_default_orchestrator();
     // Reconcile graph.json with the restored in-memory state on startup so the board does
     // not show stale "planned" nodes from a previous session (and reflects the restored
     // plan queue / reloaded agents). last_mirror_signature is None here, so this runs once.
@@ -8840,11 +8976,74 @@ fn parse_worker_done_block(output: &str) -> Option<serde_json::Value> {
 /// exact full-line match means a mention inside prose, the plan block (`RUDDER_PLAN_TASKS_*`
 /// is a different string), or a `RUDDER_APPROVE_PLAN_TEMPLATE` reference never triggers it.
 fn output_has_approve_marker(output: &str) -> bool {
-    const MARKER: &str = "RUDDER_APPROVE_PLAN";
     let clean = strip_ansi_for_plan(output).replace('\r', "");
-    clean
-        .lines()
-        .any(|line| line.trim().trim_matches('`').trim_matches('*').trim() == MARKER)
+    clean.lines().any(line_is_approve_marker)
+}
+
+fn line_is_approve_marker(line: &str) -> bool {
+    line.trim().trim_matches('`').trim_matches('*').trim() == "RUDDER_APPROVE_PLAN"
+}
+
+fn clear_orchestrator_plan_markers(repo_root: &Path) -> Result<()> {
+    const START: &str = "RUDDER_PLAN_TASKS_START";
+    const END: &str = "RUDDER_PLAN_TASKS_END";
+    let path = orchestrator_plan_path(repo_root);
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Ok(());
+    };
+
+    let mut changed = false;
+    let mut in_plan_block = false;
+    let mut kept: Vec<&str> = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if in_plan_block {
+            changed = true;
+            if trimmed == END {
+                in_plan_block = false;
+            }
+            continue;
+        }
+        if trimmed == START {
+            changed = true;
+            in_plan_block = true;
+            continue;
+        }
+        if line_is_approve_marker(line) {
+            changed = true;
+            continue;
+        }
+        kept.push(line);
+    }
+
+    if !changed {
+        return Ok(());
+    }
+    let mut rewritten = kept.join("\n");
+    if text.ends_with('\n') {
+        rewritten.push('\n');
+    }
+    std::fs::write(path, rewritten.as_bytes())?;
+    Ok(())
+}
+
+fn is_orchestrator_skill_marker(line: &str) -> bool {
+    [
+        "RUDDER_MODEL",
+        "RUDDER_MAIN",
+        "RUDDER_GOAL",
+        "RUDDER_USAGE",
+        "RUDDER_HELP",
+        "RUDDER_LOGIN",
+        "RUDDER_CLOUD",
+        "RUDDER_REVIEW_ALL",
+        "RUDDER_MERGE_ALL",
+        "RUDDER_AUTOMERGE",
+        "RUDDER_PLAN",
+        "RUDDER_ASK",
+    ]
+    .iter()
+    .any(|marker| line == *marker || line.starts_with(&format!("{marker} ")))
 }
 
 fn handle_event(app: &mut App, event: Event) -> bool {

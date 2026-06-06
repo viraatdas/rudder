@@ -1754,7 +1754,11 @@ fn tab_does_not_cycle_pane_focus() {
     let mut app = App::new();
     app.focus = FocusPane::Task;
     assert!(!app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty())));
-    assert_eq!(app.focus, FocusPane::Task);
+    assert_eq!(
+        app.focus,
+        FocusPane::Worker,
+        "legacy task focus falls back to worker"
+    );
 
     app.focus = FocusPane::Agents;
     assert!(!app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)));
@@ -3848,9 +3852,9 @@ fn option_typographic_chars_focus_panes() {
     // Option+1 on a US macOS layout arrives as the bare char ¡.
     app.handle_key(KeyEvent::new(KeyCode::Char('\u{00a1}'), KeyModifiers::NONE));
     assert_eq!(app.focus, FocusPane::Agents);
-    // Option+3 = £
+    // Option+3 = £, kept as old muscle memory but now lands on worker.
     app.handle_key(KeyEvent::new(KeyCode::Char('\u{00a3}'), KeyModifiers::NONE));
-    assert_eq!(app.focus, FocusPane::Task);
+    assert_eq!(app.focus, FocusPane::Worker);
 }
 
 #[test]
@@ -5139,8 +5143,8 @@ fn tui_harness_renders_the_plan_mode_card_when_the_planner_asks() {
 #[cfg(not(windows))]
 #[test]
 fn tui_harness_interactive_orchestrator_captures_plan_file_and_renders_dag() {
-    // Opt-in interactive orchestrator: a (fake) interactive Claude writes the DAG to
-    // .rudder/orchestrator-plan.md; the App captures it into the approval gate and the
+    // Interactive orchestrator: a (fake) interactive Claude writes the DAG to
+    // RUDDER.md; the App captures it into the approval gate and the
     // DAG pane ABOVE the orchestrator PTY renders it. Validates the step-1 build.
     let _env = env_guard();
     let repo = unique_test_repo("tui-interactive-orch");
@@ -5156,7 +5160,7 @@ fn tui_harness_interactive_orchestrator_captures_plan_file_and_renders_dag() {
     write_fake_bin(
             &fake,
             &format!(
-                "#!/bin/sh\nmkdir -p .rudder\ncat > .rudder/orchestrator-plan.md <<'PLAN'\n# Plan\nRUDDER_PLAN_TASKS_START\n{dag}\nRUDDER_PLAN_TASKS_END\nPLAN\nsleep 8\n"
+                "#!/bin/sh\ncat > RUDDER.md <<'PLAN'\n# Plan\nRUDDER_PLAN_TASKS_START\n{dag}\nRUDDER_PLAN_TASKS_END\nPLAN\nsleep 8\n"
             ),
         );
     std::env::set_var("RUDDER_INTERACTIVE_ORCHESTRATOR", "1");
@@ -5201,6 +5205,215 @@ fn tui_harness_interactive_orchestrator_captures_plan_file_and_renders_dag() {
         screen.contains("impl-alpha") && screen.contains("dag"),
         "the DAG pane renders the captured plan above the orchestrator terminal:\n{screen}"
     );
+
+    let _ = fs::remove_dir_all(&repo);
+}
+
+#[test]
+fn render_screen_does_not_show_bottom_task_bar() {
+    let mut app = App::new();
+    app.focus = FocusPane::Worker;
+
+    let screen = render_screen(&mut app, 100, 30);
+
+    assert!(
+        !screen.contains("Type a task to plan and run"),
+        "the bottom task bar should not render:\n{screen}"
+    );
+}
+
+#[test]
+fn write_rudder_context_preserves_orchestrator_plan_block() {
+    let repo = unique_test_repo("rudder-md-merge-native");
+    fs::write(
+        repo.join("RUDDER.md"),
+        "# Orchestrator notes\n\nRUDDER_PLAN_TASKS_START\n{\"tasks\":[{\"id\":\"n0\",\"title\":\"keep\",\"prompt\":\"p\",\"deps\":[]}]}\nRUDDER_PLAN_TASKS_END\n",
+    )
+    .unwrap();
+
+    write_rudder_context(&repo, &[], None).expect("write RUDDER.md");
+    let text = fs::read_to_string(repo.join("RUDDER.md")).unwrap();
+
+    assert!(text.contains("<!-- RUDDER_GENERATED_START -->"));
+    assert!(text.contains("RUDDER_PLAN_TASKS_START"));
+    assert!(text.contains("\"title\":\"keep\""));
+
+    let _ = fs::remove_dir_all(&repo);
+}
+
+#[test]
+fn orchestrator_skill_markers_are_consumed_once() {
+    let repo = unique_test_repo("orch-skill-markers");
+    fs::write(
+        repo.join("RUDDER.md"),
+        "before\nRUDDER_AUTOMERGE on\nRUDDER_HELP\nafter\n",
+    )
+    .unwrap();
+
+    let mut app = App::new();
+    app.cwd = repo.clone();
+    app.interactive_orchestrator = true;
+    app.auto_merge = false;
+    let mut orch = test_agent_run("orch-1", "plan it");
+    orch.cwd = repo.clone();
+    orch.mode = AgentMode::RudderPlan;
+    orch.backend = Backend::Claude;
+    orch.autosteered = false;
+    orch.status = AgentStatus::Running;
+    app.agents.push(orch);
+
+    app.scan_orchestrator_skill_markers();
+
+    assert!(app.auto_merge, "automerge marker toggled state");
+    assert!(app
+        .notice
+        .as_deref()
+        .unwrap_or_default()
+        .contains("skills:"));
+    let text = fs::read_to_string(repo.join("RUDDER.md")).unwrap();
+    assert!(!text.contains("RUDDER_AUTOMERGE"));
+    assert!(!text.contains("RUDDER_HELP"));
+    assert!(text.contains("before") && text.contains("after"));
+
+    let _ = fs::remove_dir_all(&repo);
+}
+
+#[cfg(not(windows))]
+#[test]
+fn interactive_default_preserves_codex_planner_backend() {
+    let _env = env_guard();
+    let repo = unique_test_repo("codex-orch-backend");
+    let fake = repo.join("fake-codex.sh");
+    write_fake_bin(&fake, "#!/bin/sh\nsleep 5\n");
+    std::env::set_var("RUDDER_CODEX_BIN", &fake);
+
+    let mut app = App::new();
+    app.cwd = repo.clone();
+    app.interactive_orchestrator = true;
+    app.backend = Backend::Codex;
+    app.model = "gpt-test".to_string();
+    app.effort = Some(EffortLevel::High);
+
+    app.start_rudder_plan_task("plan with codex");
+
+    let run = app
+        .agents
+        .iter()
+        .find(|run| run.is_orchestrator())
+        .expect("orchestrator run");
+    assert_eq!(run.backend, Backend::Codex, "Codex stays selected");
+    assert_eq!(run.model, "gpt-test", "Codex model is not swapped to Claude");
+    assert!(
+        run.autosteered,
+        "Codex uses the existing headless planner capture path"
+    );
+    assert!(
+        !repo.join(".claude").join("skills").exists(),
+        "Claude-only orchestrator skills are not generated for Codex"
+    );
+
+    std::env::remove_var("RUDDER_CODEX_BIN");
+    let _ = fs::remove_dir_all(&repo);
+}
+
+#[cfg(not(windows))]
+#[test]
+fn default_orchestrator_replaces_only_stopped_rows() {
+    let _env = env_guard();
+    let repo = unique_test_repo("orch-stopped-default");
+    let fake = repo.join("fake-claude.sh");
+    write_fake_bin(&fake, "#!/bin/sh\nsleep 5\n");
+    std::env::set_var("RUDDER_CLAUDE_BIN", &fake);
+
+    let mut app = App::new();
+    app.cwd = repo.clone();
+    app.interactive_orchestrator = true;
+    app.backend = Backend::Claude;
+    app.model = "sonnet".to_string();
+    let mut old = test_agent_run("orch-old", "approved plan");
+    old.cwd = repo.clone();
+    old.mode = AgentMode::RudderPlan;
+    old.backend = Backend::Claude;
+    old.autosteered = false;
+    old.status = AgentStatus::Stopped;
+    app.agents.push(old);
+
+    app.ensure_default_orchestrator();
+
+    let orchestrators: Vec<&AgentRun> =
+        app.agents.iter().filter(|run| run.is_orchestrator()).collect();
+    assert_eq!(orchestrators.len(), 1, "stopped row was retired");
+    assert_ne!(orchestrators[0].id, "orch-old", "a fresh row was started");
+    assert_eq!(orchestrators[0].status, AgentStatus::Running);
+    assert!(
+        orchestrators[0].terminal.is_some(),
+        "fresh default orchestrator has a live PTY"
+    );
+
+    std::env::remove_var("RUDDER_CLAUDE_BIN");
+    let _ = fs::remove_dir_all(&repo);
+}
+
+#[cfg(not(windows))]
+#[test]
+fn fresh_interactive_orchestrator_clears_stale_plan_markers() {
+    let _env = env_guard();
+    let repo = unique_test_repo("orch-clear-stale-markers");
+    let fake = repo.join("fake-claude.sh");
+    write_fake_bin(&fake, "#!/bin/sh\nsleep 5\n");
+    std::env::set_var("RUDDER_CLAUDE_BIN", &fake);
+    fs::write(
+        orchestrator_plan_path(&repo),
+        "before\nRUDDER_PLAN_TASKS_START\n{\"tasks\":[{\"id\":\"old\",\"title\":\"old\",\"prompt\":\"p\",\"goal\":\"g\",\"success\":\"s\",\"deps\":[]}]}\nRUDDER_PLAN_TASKS_END\n\nRUDDER_APPROVE_PLAN\nafter\n",
+    )
+    .unwrap();
+
+    let mut app = App::new();
+    app.cwd = repo.clone();
+    app.interactive_orchestrator = true;
+    app.backend = Backend::Claude;
+    app.model = "sonnet".to_string();
+
+    app.start_rudder_plan_task("new request");
+
+    let text = fs::read_to_string(orchestrator_plan_path(&repo)).unwrap();
+    assert!(!text.contains("RUDDER_PLAN_TASKS_START"));
+    assert!(!text.contains("RUDDER_PLAN_TASKS_END"));
+    assert!(!output_has_approve_marker(&text));
+    assert!(text.contains("before") && text.contains("after"));
+
+    std::env::remove_var("RUDDER_CLAUDE_BIN");
+    let _ = fs::remove_dir_all(&repo);
+}
+
+#[test]
+fn codex_headless_planner_ignores_stale_rudder_md_plan() {
+    let repo = unique_test_repo("codex-ignore-stale-rudder-md");
+    fs::write(
+        orchestrator_plan_path(&repo),
+        "RUDDER_PLAN_TASKS_START\n{\"tasks\":[{\"id\":\"old\",\"title\":\"old\",\"prompt\":\"p\",\"goal\":\"g\",\"success\":\"s\",\"deps\":[]}]}\nRUDDER_PLAN_TASKS_END\nRUDDER_APPROVE_PLAN\n",
+    )
+    .unwrap();
+
+    let mut app = App::new();
+    app.cwd = repo.clone();
+    app.interactive_orchestrator = true;
+    let mut run = test_agent_run("codex-plan", "plan it");
+    run.cwd = repo.clone();
+    run.mode = AgentMode::RudderPlan;
+    run.backend = Backend::Codex;
+    run.autosteered = true;
+    run.status = AgentStatus::Running;
+    app.agents.push(run);
+
+    app.maybe_capture_orchestrator_plan();
+    app.scan_orchestrator_markers();
+
+    assert!(
+        !app.awaiting_approval,
+        "Codex headless planners must not capture stale RUDDER.md DAGs"
+    );
+    assert!(app.planned_nodes.is_empty());
 
     let _ = fs::remove_dir_all(&repo);
 }
@@ -5315,6 +5528,13 @@ fn interactive_orchestrator_self_launches_from_plan_file_marker() {
     app.backend = Backend::Codex;
     app.planned_nodes = vec![titled_planned_node("n0", "do the thing")];
     app.awaiting_approval = true;
+    let mut orch = test_agent_run("orch-1", "plan it");
+    orch.cwd = repo.clone();
+    orch.mode = AgentMode::RudderPlan;
+    orch.backend = Backend::Claude;
+    orch.autosteered = false;
+    orch.status = AgentStatus::Running;
+    app.agents.push(orch);
 
     fs::create_dir_all(repo.join(".rudder")).unwrap();
     fs::write(
@@ -7206,12 +7426,8 @@ fn cycle_focus_rotates_panes_both_directions() {
     app.cycle_focus(true);
     assert_eq!(app.focus, FocusPane::Worker);
     app.cycle_focus(true);
-    assert_eq!(app.focus, FocusPane::Task);
-    app.cycle_focus(true);
     assert_eq!(app.focus, FocusPane::Agents);
 
-    app.cycle_focus(false);
-    assert_eq!(app.focus, FocusPane::Task);
     app.cycle_focus(false);
     assert_eq!(app.focus, FocusPane::Worker);
 }
@@ -7229,7 +7445,7 @@ fn ctrl_w_then_tab_cycles_and_rearms() {
 
     // A second Tab (no fresh Ctrl+W) keeps cycling because the leader re-armed.
     app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()));
-    assert_eq!(app.focus, FocusPane::Task, "Ctrl+W Tab Tab cycles twice");
+    assert_eq!(app.focus, FocusPane::Agents, "Ctrl+W Tab Tab cycles twice");
     assert!(app.leader_pending, "leader still armed after second Tab");
 }
 
@@ -7239,7 +7455,7 @@ fn ctrl_w_then_backtab_cycles_backward_and_rearms() {
     app.focus = FocusPane::Agents;
     app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
     app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
-    assert_eq!(app.focus, FocusPane::Task, "Ctrl+W BackTab cycles backward");
+    assert_eq!(app.focus, FocusPane::Worker, "Ctrl+W BackTab cycles backward");
     assert!(app.leader_pending, "leader re-arms after BackTab");
 }
 

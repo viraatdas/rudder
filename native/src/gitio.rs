@@ -1361,13 +1361,71 @@ pub(crate) fn write_rudder_context(
     body.push_str(
         "\n## Version control\n\nThis repo uses jj (Jujutsu), colocated with git. Each agent works in its own jj workspace; jj is authoritative. Inspect changes with `jj status` / `jj diff`. Do not run commit/branch/merge commands yourself; Rudder snapshots and integrates your working copy.\n",
     );
-    fs::write(repo_root.join("RUDDER.md"), body.as_bytes())?;
+    write_merged_rudder_md(&repo_root.join("RUDDER.md"), &body)?;
     if let Some(worktree) = pending {
         if worktree.path_is_worktree {
-            fs::write(worktree.path.join("RUDDER.md"), body.as_bytes())?;
+            write_merged_rudder_md(&worktree.path.join("RUDDER.md"), &body)?;
         }
     }
     Ok(())
+}
+
+const RUDDER_GENERATED_START: &str = "<!-- RUDDER_GENERATED_START -->";
+const RUDDER_GENERATED_END: &str = "<!-- RUDDER_GENERATED_END -->";
+const RUDDER_PLAN_START: &str = "RUDDER_PLAN_TASKS_START";
+const RUDDER_PLAN_END: &str = "RUDDER_PLAN_TASKS_END";
+
+fn write_merged_rudder_md(path: &Path, generated: &str) -> Result<()> {
+    let existing = fs::read_to_string(path).unwrap_or_default();
+    fs::write(path, merge_generated_rudder_md(&existing, generated).as_bytes())?;
+    Ok(())
+}
+
+fn merge_generated_rudder_md(existing: &str, generated: &str) -> String {
+    let wrapped = format!(
+        "{RUDDER_GENERATED_START}\n{}\n{RUDDER_GENERATED_END}\n",
+        generated.trim_end()
+    );
+    if let Some(start) = existing.find(RUDDER_GENERATED_START) {
+        if let Some(end_marker) = existing[start..].find(RUDDER_GENERATED_END) {
+            let end = start + end_marker + RUDDER_GENERATED_END.len();
+            let prefix = existing[..start].trim_end();
+            let suffix = existing[end..].trim_start();
+            let mut parts: Vec<&str> = Vec::new();
+            if !prefix.is_empty() {
+                parts.push(prefix);
+            }
+            parts.push(wrapped.trim_end());
+            if !suffix.is_empty() {
+                parts.push(suffix);
+            }
+            return format!("{}\n", parts.join("\n\n"));
+        }
+    }
+
+    match latest_rudder_plan_block(existing) {
+        Some(plan) => format!("{wrapped}\n## Orchestrator-authored plan\n\n{plan}\n"),
+        None => wrapped,
+    }
+}
+
+fn latest_rudder_plan_block(text: &str) -> Option<String> {
+    let mut current: Option<Vec<String>> = None;
+    let mut latest: Option<String> = None;
+    for line in text.replace('\r', "").lines() {
+        let trimmed = line.trim();
+        if trimmed == RUDDER_PLAN_START {
+            current = Some(vec![RUDDER_PLAN_START.to_string()]);
+        } else if trimmed == RUDDER_PLAN_END {
+            if let Some(mut block) = current.take() {
+                block.push(RUDDER_PLAN_END.to_string());
+                latest = Some(block.join("\n"));
+            }
+        } else if let Some(block) = current.as_mut() {
+            block.push(line.to_string());
+        }
+    }
+    latest
 }
 
 pub(crate) fn ensure_gitignore_contains(repo_root: &Path, line: &str) -> Result<()> {
