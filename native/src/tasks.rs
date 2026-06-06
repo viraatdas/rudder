@@ -1275,8 +1275,12 @@ fn build_dispatch_prompt(task: &str) -> String {
 /// not a question: route it to the planner without spending a classification.
 #[cfg_attr(test, allow(dead_code))]
 fn classify_dispatch_intent(task: &str) -> DispatchIntent {
-    if task.trim_start().starts_with("/goal") {
+    let task = task.trim();
+    if task.starts_with("/goal") {
         return DispatchIntent::Plan;
+    }
+    if let Some(intent) = classify_dispatch_intent_locally(task) {
+        return intent;
     }
     let prompt = build_dispatch_prompt(task);
     let output = run_dispatch_classifier(&prompt, dispatch_classifier_timeout());
@@ -1292,6 +1296,118 @@ fn classify_dispatch_intent(task: &str) -> DispatchIntent {
         }
         _ => DispatchIntent::Plan,
     }
+}
+
+/// Fast local routing for obvious cases. This keeps common task-bar asks deterministic
+/// and avoids routing simple research/questions to the planner when the Claude classifier
+/// is unavailable (auth, billing, network, timeout).
+pub(crate) fn classify_dispatch_intent_locally(task: &str) -> Option<DispatchIntent> {
+    let task = task.trim();
+    if task.is_empty() {
+        return None;
+    }
+    let lower = task.to_ascii_lowercase();
+    if lower.starts_with("/goal") {
+        return Some(DispatchIntent::Plan);
+    }
+
+    let oneoff = has_oneoff_marker(&lower);
+    if oneoff && !has_chained_plan_marker(&lower) {
+        return Some(DispatchIntent::OneOff);
+    }
+    if has_plan_marker(&lower) {
+        return Some(DispatchIntent::Plan);
+    }
+    if oneoff {
+        return Some(DispatchIntent::OneOff);
+    }
+    None
+}
+
+fn has_plan_marker(lower: &str) -> bool {
+    let patterns = [
+        "build ",
+        "implement ",
+        "create ",
+        "add ",
+        "refactor ",
+        "rewrite ",
+        "migrate ",
+        "integrate ",
+        "wire up ",
+        "set up ",
+        "setup ",
+        "ship ",
+        "make an app",
+        "make a site",
+        "end-to-end",
+        "multi-step",
+    ];
+    patterns.iter().any(|pattern| lower.contains(pattern))
+}
+
+fn has_chained_plan_marker(lower: &str) -> bool {
+    let patterns = [
+        " and build ",
+        " and implement ",
+        " and create ",
+        " and add ",
+        " and refactor ",
+        " and rewrite ",
+        " then build ",
+        " then implement ",
+        " then create ",
+        " then add ",
+        " then refactor ",
+        " to build ",
+        " to implement ",
+        " to create ",
+    ];
+    patterns.iter().any(|pattern| lower.contains(pattern))
+}
+
+fn has_oneoff_marker(lower: &str) -> bool {
+    let starts = [
+        "what ",
+        "why ",
+        "how ",
+        "where ",
+        "when ",
+        "who ",
+        "explain ",
+        "summarize ",
+        "describe ",
+        "tell me ",
+        "compare ",
+        "list ",
+        "look into ",
+        "look up ",
+        "research ",
+        "read ",
+        "review ",
+        "inspect ",
+        "investigate ",
+        "check ",
+        "find out ",
+        "search ",
+        "is ",
+        "are ",
+        "can ",
+        "could ",
+        "should ",
+    ];
+    if starts.iter().any(|prefix| lower.starts_with(prefix)) {
+        return true;
+    }
+    let contains = [
+        " docs",
+        " documentation",
+        " api docs",
+        " api documentation",
+        "what does",
+        "how does",
+    ];
+    contains.iter().any(|pattern| lower.contains(pattern))
 }
 
 #[cfg_attr(test, allow(dead_code))]

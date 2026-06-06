@@ -3152,8 +3152,9 @@ fn auto_expand_ingests_rudder_done_block_from_worker_pty() {
         pane.output_log_snapshot()
     );
 
+    let repo = unique_test_repo("pty-done-ingest");
     let mut app = App::new();
-    app.cwd = std::env::temp_dir();
+    app.cwd = repo.clone();
     // Hold scheduling so the grown node is not actually launched (no real worker
     // spawn in a unit test); we only assert the DAG GREW.
     app.awaiting_approval = true;
@@ -3179,6 +3180,7 @@ fn auto_expand_ingests_rudder_done_block_from_worker_pty() {
     // Idempotent: a second pass over the same Done worker adds nothing.
     app.maybe_ingest_worker_followups();
     assert_eq!(app.planned_nodes.len(), 1, "ingest is once-per-worker");
+    let _ = fs::remove_dir_all(&repo);
 }
 
 #[test]
@@ -5930,7 +5932,7 @@ fn dispatch_classifier_timeout_falls_back_to_plan() {
     let (tx, rx) = mpsc::channel();
     let started = Instant::now();
 
-    spawn_dispatch_worker(tx, "what does auth.js do?".to_string());
+    spawn_dispatch_worker(tx, "parking lot telemetry".to_string());
     let result = rx
         .recv_timeout(Duration::from_secs(2))
         .expect("hung classifier is killed and dispatch returns");
@@ -5942,6 +5944,59 @@ fn dispatch_classifier_timeout_falls_back_to_plan() {
     );
     std::env::remove_var("RUDDER_CLAUDE_BIN");
     let _ = fs::remove_dir_all(&repo);
+}
+
+#[cfg(not(windows))]
+#[test]
+fn dispatch_local_oneoff_handles_docs_research_when_claude_is_unavailable() {
+    let _env = env_guard();
+    let repo = unique_test_repo("dispatch-local-docs");
+    let claude = repo.join("fake-claude.sh");
+    write_fake_bin(&claude, "#!/bin/sh\nexec sleep 5\n");
+    std::env::set_var("RUDDER_CLAUDE_BIN", &claude);
+    let (tx, rx) = mpsc::channel();
+    let started = Instant::now();
+
+    spawn_dispatch_worker(tx, "look into spotify api docs".to_string());
+    let result = rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("obvious docs research routes locally without waiting for Claude");
+
+    assert_eq!(result.intent, DispatchIntent::OneOff);
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "local one-off classification avoids the slow classifier"
+    );
+    std::env::remove_var("RUDDER_CLAUDE_BIN");
+    let _ = fs::remove_dir_all(&repo);
+}
+
+#[test]
+fn local_dispatch_classifier_routes_obvious_oneoff_and_plan_requests() {
+    assert_eq!(
+        classify_dispatch_intent_locally("look into spotify api docs"),
+        Some(DispatchIntent::OneOff)
+    );
+    assert_eq!(
+        classify_dispatch_intent_locally("explain how auth.js works"),
+        Some(DispatchIntent::OneOff)
+    );
+    assert_eq!(
+        classify_dispatch_intent_locally("explain how to add Spotify login"),
+        Some(DispatchIntent::OneOff)
+    );
+    assert_eq!(
+        classify_dispatch_intent_locally("build Spotify OAuth login with token refresh"),
+        Some(DispatchIntent::Plan)
+    );
+    assert_eq!(
+        classify_dispatch_intent_locally("look into spotify api docs and build OAuth login"),
+        Some(DispatchIntent::Plan)
+    );
+    assert_eq!(
+        classify_dispatch_intent_locally("refactor the auth flow"),
+        Some(DispatchIntent::Plan)
+    );
 }
 
 #[cfg(not(windows))]

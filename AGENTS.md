@@ -883,16 +883,20 @@ already used official signals: `claude -p --output-format stream-json` and `code
 (`turn.completed`) + process exit.
 
 ### 14.4c Dispatch: one-off vs plan (`AgentMode::OneOff` + the Haiku dispatcher)
-Not every typed task wants the whole DAG. A FRESH task (no active plan) routes through a
-LIGHT Haiku classifier before the planner:
+Not every typed task wants the whole DAG. A FRESH task (no active plan) routes through
+a deterministic local classifier first, then LIGHT Haiku only for ambiguous cases:
 - **`begin_dispatch`** (start_task_from_input default branch) sets `dispatch_pending` and
-  spawns `spawn_dispatch_worker` (tasks.rs) — a detached thread that runs
-  `claude -p --model claude-haiku-4-5-20251001` (`TASK_SUMMARY_MODEL`, via
-  `claude_program()` so `RUDDER_CLAUDE_BIN` works in tests) with a one-word classification
-  prompt → `DispatchResult { task, intent }` over an mpsc channel. The subprocess is bounded
-  by `dispatch_classifier_timeout()`; timeout, no claude, non-zero, unparseable output, or a
-  leading `/goal` all fall back to **Plan**, the established path, so dispatch never leaves
-  `dispatch_pending` stuck and never misroutes to an uncancellable one-off.
+  spawns `spawn_dispatch_worker` (tasks.rs). `classify_dispatch_intent_locally` handles
+  obvious one-offs (`look into ... docs`, `explain ...`, questions, quick research) and
+  obvious plans (`build`, `implement`, `refactor`, multi-step work) without a model call.
+  Ambiguous requests run `claude -p --model claude-haiku-4-5-20251001`
+  (`TASK_SUMMARY_MODEL`, via `claude_program()` so `RUDDER_CLAUDE_BIN` works in tests)
+  with a one-word classification prompt → `DispatchResult { task, intent }` over an mpsc
+  channel. The subprocess is bounded by `dispatch_classifier_timeout()`; timeout, no
+  claude, non-zero, unparseable output, or a leading `/goal` all fall back to **Plan**, the
+  established path, so dispatch never leaves `dispatch_pending` stuck. Do not remove the
+  local classifier: it prevents Claude auth/billing/network failures from routing obvious
+  one-off research to the orchestrator.
 - **`poll_dispatch_worker`** (in poll_agents) routes the result: `Plan` →
   `start_rudder_plan_task` (the orchestrator); `OneOff` → `start_oneoff_task`.
 - **`start_oneoff_task`** spawns a single conversational **`AgentMode::OneOff`** agent in the
@@ -905,9 +909,10 @@ LIGHT Haiku classifier before the planner:
   returns `OneOff` for it; leads `Bucket::ORDER`).
 - **Overrides** (handle_command): `/ask <text>` forces one-off (skip classify); `/plan <text>`
   forces the orchestrator planner (re-purposed from the retired no-op). Both skip the Haiku call.
-- The classifier is always Claude Haiku (a meta-decision) regardless of the user's backend;
-  the spawned one-off uses the user's backend. A Codex-only user without `claude` always gets
-  Plan from auto-dispatch but can still `/ask` to force a Codex one-off.
+- Ambiguous classification uses Claude Haiku (a meta-decision) regardless of the user's
+  backend; the spawned one-off uses the user's backend. A Codex-only user without `claude`
+  still gets deterministic local routing for obvious cases, and ambiguous cases fall back
+  to Plan. `/ask` always forces a one-off.
 
 ### 14.5 Conductor capabilities (BUILT vs PLANNED)
 - **Auto-expand from completion** (BUILT). A finished worker reports via **`rudder
