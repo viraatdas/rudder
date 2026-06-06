@@ -10,17 +10,6 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
     // terminal background, and bare text inherits the ink fg.
     frame.render_widget(Block::default().style(app_style()), area);
 
-    let task_height = task_pane_height(app, area.width);
-
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(8),
-            Constraint::Length(1),
-            Constraint::Length(task_height),
-        ])
-        .split(area);
-
     let main = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -28,18 +17,15 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
             Constraint::Length(1),
             Constraint::Min(42),
         ])
-        .split(rows[0]);
+        .split(area);
 
     app.agents_area = Some(main[0]);
     app.worker_area = Some(main[2]);
-    app.task_area = Some(rows[2]);
+    app.task_area = None;
 
     render_agents(frame, main[0], app);
     render_gutter(frame, main[1], Gutter::Vertical);
     render_worker(frame, main[2], app);
-    render_gutter(frame, rows[1], Gutter::Horizontal);
-    render_task(frame, rows[2], app);
-    render_suggestions(frame, rows[2], app);
     render_cloud_prompt(frame, area, app);
     render_merge_prompt(frame, area, app);
     render_mouse_debug(frame, area, app);
@@ -732,10 +718,10 @@ fn render_planned_section<'a>(
         Span::styled(format!(" {}", nodes.len()), muted_style(focused)),
     ])));
     // APPROVAL GATE hint: while the plan awaits approval nothing has launched yet;
-    // the user refines it (type into the task pane) or approves (Enter).
+    // the user refines it by talking to the orchestrator or approves in that chat.
     if awaiting_approval {
         lines.push(ListItem::new(Line::from(Span::styled(
-            "  type to refine  ·  Enter approve",
+            "  refine in orchestrator chat  ·  approve there to launch",
             Style::default().fg(ACCENT),
         ))));
     }
@@ -2492,14 +2478,14 @@ pub(crate) fn render_interactive_orchestrator(frame: &mut Frame<'_>, area: Rect,
             muted_style(focused),
         )));
         dag_lines.push(Line::from(Span::styled(
-            "It writes the task DAG to .rudder/orchestrator-plan.md; the DAG shows here.",
+            "It writes the task DAG to RUDDER.md; the DAG shows here.",
             muted_style(focused),
         )));
     } else {
         dag_lines = orchestrator_dag_tree_lines(app, &tasks);
         if app.awaiting_approval {
             dag_lines.push(Line::from(Span::styled(
-                "awaiting approval — tell the orchestrator to launch (or press Enter here)",
+                "awaiting approval — tell the orchestrator to launch",
                 Style::default().fg(ACCENT),
             )));
         }
@@ -2839,13 +2825,13 @@ pub(crate) fn review_lines(app: &mut App, height: usize) -> Vec<Line<'static>> {
 /// disagree and clicks on valid input rows get rejected.
 pub(crate) fn task_default_hint(app: &App) -> &'static str {
     if app.planner_paused_for_input {
-        "↳ the planner asked a question — type your ANSWER here and press Enter to continue planning"
+        "↳ the planner asked a question — answer in the orchestrator pane"
     } else if app.awaiting_approval {
-        "type to refine the plan  ·  Enter (empty) to approve & launch  ·  Option-1/2/3 or ^W pane"
+        "refine or approve in the orchestrator pane  ·  Option-1/2 or ^W pane"
     } else if app.plan_is_active() {
         "type a task to add it to the running plan (shows up in the orchestrator DAG)  ·  ^W pane"
     } else {
-        "Enter to plan + run  ·  Up/Down history  ·  Option-1/2/3 or ^W pane"
+        "talk to the orchestrator to plan + run  ·  Option-1/2 or ^W pane"
     }
 }
 

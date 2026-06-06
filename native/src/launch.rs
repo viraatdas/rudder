@@ -13,6 +13,7 @@ const CLAUDE_DECOMPOSER_DISALLOWED: &str = "Edit,Write,MultiEdit,NotebookEdit,Ba
 // The standalone /plan FRONT-END pre-approves the read tools PLUS Bash so it can investigate
 // without prompts; --permission-mode plan still blocks edits.
 const CLAUDE_PLAN_FRONTEND_TOOLS: &str = "Read,Grep,Glob,LS,WebSearch,WebFetch,Bash";
+const ORCHESTRATOR_SKILLS_DIR: &str = ".claude/skills";
 
 pub(crate) fn mint_session_id_for(backend: Backend) -> Option<String> {
     match backend {
@@ -20,6 +21,91 @@ pub(crate) fn mint_session_id_for(backend: Backend) -> Option<String> {
         Backend::Codex => None,
     }
 }
+
+pub(crate) fn ensure_orchestrator_skills(repo_root: &Path) -> Result<()> {
+    ensure_gitignore_contains(repo_root, ".claude/skills/rudder-*/")?;
+    let base = repo_root.join(ORCHESTRATOR_SKILLS_DIR);
+    fs::create_dir_all(&base)?;
+    for skill in ORCHESTRATOR_SKILLS {
+        let dir = base.join(skill.slug);
+        fs::create_dir_all(&dir)?;
+        fs::write(dir.join("SKILL.md"), skill.render().as_bytes())?;
+    }
+    Ok(())
+}
+
+struct OrchestratorSkill {
+    slug: &'static str,
+    name: &'static str,
+    description: &'static str,
+    body: &'static str,
+}
+
+impl OrchestratorSkill {
+    fn render(&self) -> String {
+        format!(
+            "---\nname: {}\ndescription: {}\n---\n\n{}\n",
+            self.name, self.description, self.body
+        )
+    }
+}
+
+const ORCHESTRATOR_SKILLS: &[OrchestratorSkill] = &[
+    OrchestratorSkill {
+        slug: "rudder-edit-dag",
+        name: "rudder-edit-dag",
+        description: "Use when maintaining Rudder's task DAG in RUDDER.md or approving the plan.",
+        body: "Edit RUDDER.md outside the generated block. Keep exactly one full RUDDER_PLAN_TASKS_START / RUDDER_PLAN_TASKS_END block containing the complete task DAG. When the user explicitly approves the plan, write RUDDER_APPROVE_PLAN on its own line in RUDDER.md while keeping the plan block.",
+    },
+    OrchestratorSkill {
+        slug: "rudder-model",
+        name: "rudder-model",
+        description: "Use when the user asks to change the default Claude or Codex model or effort.",
+        body: "Write one control line to RUDDER.md: RUDDER_MODEL <provider> <model> [effort]. Provider is claude or codex. Effort is optional and may be low, medium, high, xhigh, or max. Rudder consumes the marker and updates the dashboard defaults.",
+    },
+    OrchestratorSkill {
+        slug: "rudder-main",
+        name: "rudder-main",
+        description: "Use when the user wants a main-checkout agent instead of a DAG worker.",
+        body: "Write one control line to RUDDER.md: RUDDER_MAIN <optional prompt>. Leave the prompt empty to start the default main agent bootstrap. Rudder consumes the marker and starts a main-checkout agent.",
+    },
+    OrchestratorSkill {
+        slug: "rudder-goal",
+        name: "rudder-goal",
+        description: "Use when the user asks to set or forward a /goal to the selected agent.",
+        body: "Write one control line to RUDDER.md: RUDDER_GOAL <goal text>. Rudder consumes the marker and forwards /goal to the focused agent.",
+    },
+    OrchestratorSkill {
+        slug: "rudder-usage",
+        name: "rudder-usage",
+        description: "Use when the user asks for Rudder session token usage or cost.",
+        body: "Write RUDDER_USAGE on its own line in RUDDER.md. Rudder consumes the marker and shows the usage summary in the dashboard notice.",
+    },
+    OrchestratorSkill {
+        slug: "rudder-cloud",
+        name: "rudder-cloud",
+        description: "Use when the user asks for Rudder Cloud login, list, onload, byoc, or other cloud actions.",
+        body: "For login, write RUDDER_LOGIN on its own line in RUDDER.md. For other cloud actions, write RUDDER_CLOUD <args> on one line, for example RUDDER_CLOUD list or RUDDER_CLOUD onload. Rudder consumes the marker and starts the corresponding Rudder Cloud command pane.",
+    },
+    OrchestratorSkill {
+        slug: "rudder-review-merge",
+        name: "rudder-review-merge",
+        description: "Use when the user asks to review all work, merge all ready work, or toggle auto-merge.",
+        body: "Write exactly one control line to RUDDER.md: RUDDER_REVIEW_ALL to start a review-all agent, RUDDER_MERGE_ALL to merge all ready work, or RUDDER_AUTOMERGE on|off|toggle to control automatic clean merges.",
+    },
+    OrchestratorSkill {
+        slug: "rudder-plan-ask",
+        name: "rudder-plan-ask",
+        description: "Use when the user explicitly asks to force a DAG plan or force a one-off ask.",
+        body: "Write RUDDER_PLAN <task> to force a DAG planner for the task, or RUDDER_ASK <question or small change> to start a one-off agent in the main checkout. Rudder consumes the marker and runs the matching action.",
+    },
+    OrchestratorSkill {
+        slug: "rudder-help",
+        name: "rudder-help",
+        description: "Use when the user asks what Rudder dashboard commands or orchestrator skills are available.",
+        body: "Write RUDDER_HELP on its own line in RUDDER.md. Rudder consumes the marker and shows a short dashboard command hint.",
+    },
+];
 
 pub(crate) fn can_resume_agent(run: &AgentRun) -> bool {
     match run.backend {
@@ -147,10 +233,30 @@ pub(crate) fn agent_command(
     mode: AgentMode,
     session_id: Option<&str>,
 ) -> TerminalCommand {
+    agent_command_with_orchestrator_mode(
+        backend,
+        model,
+        effort,
+        task,
+        mode,
+        session_id,
+        interactive_orchestrator(),
+    )
+}
+
+pub(crate) fn agent_command_with_orchestrator_mode(
+    backend: Backend,
+    model: &str,
+    effort: Option<EffortLevel>,
+    task: &str,
+    mode: AgentMode,
+    session_id: Option<&str>,
+    orchestrator_interactive: bool,
+) -> TerminalCommand {
     let prompt = match mode {
         AgentMode::Execute => Some(execution_prompt(task)),
         AgentMode::Plan => Some(plan_prompt(task)),
-        AgentMode::RudderPlan if interactive_orchestrator() && backend == Backend::Claude => {
+        AgentMode::RudderPlan if orchestrator_interactive && backend == Backend::Claude => {
             Some(rudder_orchestrator_prompt(task))
         }
         AgentMode::RudderPlan => Some(rudder_plan_prompt(task)),
@@ -184,7 +290,7 @@ pub(crate) fn agent_command(
                 // INTERACTIVE orchestrator (opt-in): a normal Claude Code PTY the user
                 // converses with, with the orchestrator system prompt. It writes its DAG to
                 // the orchestrator plan file (which Rudder renders above), so no -p/stream.
-                AgentMode::RudderPlan if interactive_orchestrator() => vec![
+                AgentMode::RudderPlan if orchestrator_interactive => vec![
                     "--permission-mode".to_string(),
                     "default".to_string(),
                     // Auto-approve read tools + Edit/Write (the prompt restricts writes to

@@ -99,26 +99,28 @@ After the block, add a short human summary of why this DAG is safe."#.to_string(
 }
 
 /// Where the INTERACTIVE orchestrator writes its task DAG (a RUDDER_PLAN_TASKS block).
-/// A dedicated file (NOT RUDDER.md) so it never races Rudder's own RUDDER.md projection;
-/// Rudder watches it and renders the DAG pane above the orchestrator terminal.
+/// The generated Rudder projection is wrapped in markers, and the orchestrator owns
+/// content outside those markers. Rudder merges its generated block so this file can
+/// be both the live context surface and the orchestrator's DAG/control channel.
 pub(crate) fn orchestrator_plan_path(repo_root: &std::path::Path) -> std::path::PathBuf {
-    repo_root.join(".rudder").join("orchestrator-plan.md")
+    repo_root.join("RUDDER.md")
 }
 
 /// System prompt for the INTERACTIVE orchestrator (a normal Claude Code PTY the user
 /// converses with, behind RUDDER_INTERACTIVE_ORCHESTRATOR). Unlike the headless
-/// decomposer it does not print a one-shot block to stdout; it writes the DAG to the
-/// orchestrator plan file, which Rudder reads to populate + render the DAG.
+/// decomposer it does not print a one-shot block to stdout; it writes the DAG to
+/// RUDDER.md, which Rudder reads to populate + render the DAG.
 pub(crate) fn orchestrator_system_prompt() -> String {
     [
         "You are Rudder's INTERACTIVE orchestration agent, running as a normal Claude Code session the user talks to directly.",
         "Your job: converse with the user, inspect the repository READ-ONLY, and maintain the task DAG that a SEPARATE set of worker agents will implement in isolated worktrees. You do NOT implement product code yourself.",
         "Ask concise clarifying questions in the conversation whenever the request is ambiguous (scope, approach, key decisions, what to reuse vs rebuild). This is a back-and-forth: the user replies and you continue.",
-        "When the task DAG is ready, WRITE it to `.rudder/orchestrator-plan.md` as a block wrapped EXACTLY in these markers (one JSON object on its own lines), then tell the user it is ready for approval:\nRUDDER_PLAN_TASKS_START\n{\"tasks\":[{\"id\":\"n0\",\"title\":\"short title\",\"prompt\":\"full worker prompt\",\"goal\":\"one-line objective\",\"success\":\"verifiable done-when\",\"deps\":[]},{\"id\":\"n1\",\"title\":\"...\",\"prompt\":\"...\",\"goal\":\"...\",\"success\":\"...\",\"deps\":[{\"on\":\"n0\",\"type\":\"hard\",\"why\":\"edits the module n0 creates\"}]}]}\nRUDDER_PLAN_TASKS_END",
+        "When the task DAG is ready, WRITE it to `RUDDER.md` OUTSIDE the `<!-- RUDDER_GENERATED_START -->` / `<!-- RUDDER_GENERATED_END -->` generated block, wrapped EXACTLY in these markers (one JSON object on its own lines), then tell the user it is ready for approval:\nRUDDER_PLAN_TASKS_START\n{\"tasks\":[{\"id\":\"n0\",\"title\":\"short title\",\"prompt\":\"full worker prompt\",\"goal\":\"one-line objective\",\"success\":\"verifiable done-when\",\"deps\":[]},{\"id\":\"n1\",\"title\":\"...\",\"prompt\":\"...\",\"goal\":\"...\",\"success\":\"...\",\"deps\":[{\"on\":\"n0\",\"type\":\"hard\",\"why\":\"edits the module n0 creates\"}]}]}\nRUDDER_PLAN_TASKS_END",
         "Edge types: `hard` = the child cannot SUCCEED until the parent has merged (it imports/executes the parent's code); `soft` = context-only, can run in parallel. Use the minimal hard-edge set; every hard edge needs a one-line `why`. Each task carries a `goal` and a verifiable `success`, and refers to files by REPOSITORY-RELATIVE paths only.",
-        "Rudder renders the DAG in the pane ABOVE this terminal and reloads it LIVE from the file. The plan is a LIVING document: whenever the user asks to ADD, CHANGE, REMOVE, reorder, re-scope, or re-split tasks at ANY point before they approve, UPDATE the DAG by re-writing the FULL RUDDER_PLAN_TASKS block in `.rudder/orchestrator-plan.md` to match — keep stable `id`s for unchanged nodes, add new ones with fresh ids, drop removed ones, and fix up `deps` so the edges stay correct. Always keep the block in sync with what you and the user have agreed; never describe a plan change only in chat without also writing it to the file.",
-        "APPROVAL / LAUNCH: After — and ONLY after — the user has EXPLICITLY confirmed in the conversation that the plan is good to run (e.g. \"yes\", \"go\", \"approve\", \"launch it\"), signal Rudder to launch the workers by WRITING (Edit/Write) the line `RUDDER_APPROVE_PLAN` on its own line into `.rudder/orchestrator-plan.md`, keeping the RUDDER_PLAN_TASKS block in the file. Writing it into the plan file (a structured Write) is the reliable channel; you MAY also print the same line in the chat as a fallback. Never write/print it preemptively, while you are still asking questions, or while you are revising the plan. When you merely need to REFER to the marker in prose, write it as RUDDER_APPROVE_PLAN_TEMPLATE so Rudder does not treat the mention as a launch trigger. Once you write RUDDER_APPROVE_PLAN your job is DONE: Rudder generates the DAG (graph.json), launches the SEPARATE worker fleet, and stops this planning session. Do not implement anything or keep working after that.",
-        "Only ever Edit/Write `.rudder/orchestrator-plan.md` (your plan file). Treat all other files as read-only.",
+        "Rudder renders the DAG in the pane ABOVE this terminal and reloads it LIVE from RUDDER.md. The plan is a LIVING document: whenever the user asks to ADD, CHANGE, REMOVE, reorder, re-scope, or re-split tasks at ANY point before they approve, UPDATE the DAG by re-writing the FULL RUDDER_PLAN_TASKS block in RUDDER.md to match - keep stable `id`s for unchanged nodes, add new ones with fresh ids, drop removed ones, and fix up `deps` so the edges stay correct. Always keep the block in sync with what you and the user have agreed; never describe a plan change only in chat without also writing it to the file.",
+        "APPROVAL / LAUNCH: After - and ONLY after - the user has EXPLICITLY confirmed in the conversation that the plan is good to run (e.g. \"yes\", \"go\", \"approve\", \"launch it\"), signal Rudder to launch the workers by WRITING (Edit/Write) the line `RUDDER_APPROVE_PLAN` on its own line into RUDDER.md, keeping the RUDDER_PLAN_TASKS block in the file. Writing it into RUDDER.md (a structured Write) is the reliable channel; you MAY also print the same line in the chat as a fallback. Never write/print it preemptively, while you are still asking questions, or while you are revising the plan. When you merely need to REFER to the marker in prose, write it as RUDDER_APPROVE_PLAN_TEMPLATE so Rudder does not treat the mention as a launch trigger. Once you write RUDDER_APPROVE_PLAN your job is DONE: Rudder generates the DAG (graph.json), launches the SEPARATE worker fleet, and stops this planning session. Do not implement anything or keep working after that.",
+        "You have Rudder project skills available under `.claude/skills/rudder-*`. Use them for former task-bar actions. Those skills tell you which exact `RUDDER_*` control marker to write to RUDDER.md; Rudder consumes the marker and runs the dashboard action.",
+        "Only ever Edit/Write RUDDER.md and the generated `.claude/skills/rudder-*` SKILL.md files. Treat all other files as read-only.",
     ]
     .join("\n\n")
 }
@@ -126,7 +128,7 @@ pub(crate) fn orchestrator_system_prompt() -> String {
 /// First-turn prompt for the interactive orchestrator (paired with the system prompt).
 pub(crate) fn rudder_orchestrator_prompt(task: &str) -> String {
     let task = strip_rudder_prompt_wrappers(task);
-    let base = "You are Rudder's orchestrator for this checkout. Read `.rudder/orchestrator-plan.md` if it exists. If no concrete task is given yet, say you are ready and wait. For a concrete request, ask clarifying questions when needed; once clear, write the DAG to `.rudder/orchestrator-plan.md` and ask the user to approve. Only AFTER they explicitly confirm, add a `RUDDER_APPROVE_PLAN` line to `.rudder/orchestrator-plan.md` (keeping the plan block) to launch.";
+    let base = "You are Rudder's orchestrator for this checkout. Read RUDDER.md if it exists. If no concrete task is given yet, say you are ready and wait. For a concrete request, ask clarifying questions when needed; once clear, write the DAG to RUDDER.md outside Rudder's generated block and ask the user to approve. Only AFTER they explicitly confirm, add a `RUDDER_APPROVE_PLAN` line to RUDDER.md (keeping the plan block) to launch.";
     if task.trim().is_empty() {
         base.to_string()
     } else {

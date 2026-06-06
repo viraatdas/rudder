@@ -374,28 +374,28 @@ TUI that repaints while idle.
 Order of handling matters; the early returns gate everything else.
 - **Ctrl+C**: quit, with a confirm guard if agents are still running.
 - **Ctrl+W (leader)**: arms a one-shot leader. The *next* key runs a dashboard
-  command and disarms: `1/2/3` focus panes, `v` review, `m` merge, `R` review-all,
+  command and disarms: `1/2` focus panes, `v` review, `m` merge, `R` review-all,
   `M` merge-all, `r` rename, `j/k` move, `d` delete, `q` quit, `Esc`
   cancels. See `handle_leader_key`. This is the reliable cross-terminal way to
   drive the dashboard from inside the worker pane. Tradeoff: Ctrl+W no longer
   reaches the worker PTY as readline "delete word".
 - **Ctrl+G (nav mode)**: a *sticky* mode (toggle on/off) with the same command
   set; `Esc` exits. Predates the leader; both are kept.
-- **Option/Alt + 1/2/3 and v**: jump panes / toggle review directly. Many macOS
+- **Option/Alt + 1/2 and v**: jump panes / toggle review directly. Many macOS
   terminals (Terminal.app, default iTerm2) do not send an Alt modifier for
   Option+key, so the dashboard *also* accepts the typographic characters Option
   produces on a US layout: Option+1=`¡` (U+00A1), Option+2=`™` (U+2122),
-  Option+3=`£` (U+00A3), Option+v=`√` (U+221A). This is what makes the documented
-  "Option-1/2/3" shortcuts actually work out of the box.
+  Option+v=`√` (U+221A). Option+3/`£` now falls back to the worker pane for
+  compatibility with old muscle memory.
 - Otherwise the key is dispatched to the focused pane's handler.
 
-### Slash commands (parsed in `handle_command`)
-`/model [backend] [model] [effort]`, `/main` or `/m` (start a main-branch agent),
-`/goal` (forwarded to the focused agent), `/usage`, `/cloud [list]`, `/merge-all`,
-`/review-all`. Planning is the default paradigm now: typing a task runs the
-orchestrator, which decomposes it into a DAG you refine (type into the task pane)
-and approve (Enter). `/plan` and `/sync` are retired no-ops that print a hint;
-the `u` sync keybinding was removed.
+### Orchestrator skills
+The bottom task pane is removed. The orchestrator Claude Code PTY is the input
+surface: it edits the DAG in `RUDDER.md` and uses generated project skills
+under `.claude/skills/rudder-*` for the former slash-command actions (`model`,
+`main`, `goal`, `usage`, `cloud/login`, `review-all`, `merge-all`, `automerge`,
+`plan/ask`, and DAG editing/approval). Rudder consumes the corresponding
+one-shot `RUDDER_*` control markers from `RUDDER.md`.
 
 ### Review and merge-all
 `v` opens a review pane showing the run's `jj diff` (`ensure_review_diff`). The old
@@ -829,8 +829,8 @@ The planner UX went through several iterations; these are the settled decisions 
   `RUDDER_INTERACTIVE_ORCHESTRATOR=0` to opt back into the headless `claude -p` decomposer).
   Codex orchestrators stay headless regardless. Validated against real `claude` (it writes the
   plan file + emits the marker). It uses the orchestrator system prompt
-  (`tasks.rs orchestrator_system_prompt`). It writes the DAG to `.rudder/orchestrator-plan.md`
-  (dedicated file, not RUDDER.md); `App::maybe_capture_orchestrator_plan` reads it into
+  (`tasks.rs orchestrator_system_prompt`). It writes the DAG to `RUDDER.md`
+  outside Rudder's generated block; `App::maybe_capture_orchestrator_plan` reads it into
   `planned_nodes`/`awaiting_approval`; `render_interactive_orchestrator` shows a DAG pane
   ABOVE the live PTY; keys forward to the PTY (converse). Unlike the retired PlanFront, the
   CC writes a DAG file so the DAG actually builds + renders. **SELF-LAUNCH (hardened, 1.21.0):**
@@ -841,9 +841,8 @@ The planner UX went through several iterations; these are the settled decisions 
   (`output_has_approve_marker`, exact full-line match after ANSI + markdown strip). Either calls
   `approve_planned_queue()` → launch; no dedup ledger needed because that fn is idempotent
   (early-returns once `awaiting_approval` flips false). The prompt tells the orchestrator to WRITE
-  the marker into the plan file (and may also print it), only after explicit user approval, never
-  preemptively, quoting as `RUDDER_APPROVE_PLAN_TEMPLATE`. Task bar Enter stays as a manual
-  fallback. **APPROVE → GRAPH.JSON → STOP (current behaviour):** on approval `approve_planned_queue`
+  the marker into RUDDER.md (and may also print it), only after explicit user approval, never
+  preemptively, quoting as `RUDDER_APPROVE_PLAN_TEMPLATE`. **APPROVE → GRAPH.JSON → STOP (current behaviour):** on approval `approve_planned_queue`
   (1) mirrors the full DAG into `.rudder/graph.json` (`mirror_graph`), (2) launches the worker
   fleet (`run_scheduler`), then (3) calls `stop_orchestrator_after_approval`, which KILLS the
   interactive orchestrator's PTY (drops the terminal → `TerminalPane::drop` → `child.kill()`) and
@@ -858,7 +857,9 @@ The planner UX went through several iterations; these are the settled decisions 
   `RUDDER_APPROVE_PLAN`. NOTE: `interactive_orchestrator()` is read ONCE into the `App.interactive_orchestrator`
   field at construction; render/poll/key read the FIELD (not the process-global env) so parallel
   tests don't race — tests set the field directly (the headless-view render helper pins it false).
-  STILL PENDING: the rest of PR #17 (full marker/skill set + removing the task bar).
+  The old bottom task bar is removed; former task-bar slash actions are project Claude skills
+  generated under `.claude/skills/rudder-*`, with one-shot `RUDDER_*` control markers consumed
+  from `RUDDER.md`.
 
 ### 14.4b Per-agent done/idle detection: official signals, scrape as fallback (`native/src/signals.rs`)
 The native TUI runs workers as INTERACTIVE `claude`/`codex` in a PTY (they idle between
