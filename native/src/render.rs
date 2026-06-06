@@ -87,7 +87,12 @@ pub(crate) fn render_mouse_debug(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Style::default().fg(ACCENT_2),
         )))
         .style(app_style())
-        .block(Block::default().borders(Borders::ALL).title("mouse debug").style(app_style()))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("mouse debug")
+                .style(app_style()),
+        )
         .style(app_style())
         .wrap(Wrap { trim: false }),
         rect,
@@ -111,7 +116,16 @@ pub(crate) fn push_agent_row<'a>(
     cont_prefix: &[Span<'a>],
 ) {
     push_agent_row_with_trailing(
-        lines, app, index, agent, diff, focused, task_width, prefix, cont_prefix, &[],
+        lines,
+        app,
+        index,
+        agent,
+        diff,
+        focused,
+        task_width,
+        prefix,
+        cont_prefix,
+        &[],
     );
 }
 
@@ -152,10 +166,7 @@ pub(crate) fn push_agent_row_with_trailing<'a>(
     first.extend([
         Span::styled(marker, accent_style(focused)),
         if is_cloud_agent(agent) {
-            Span::styled(
-                "☁ ",
-                cloud_style(true, focused),
-            )
+            Span::styled("☁ ", cloud_style(true, focused))
         } else {
             Span::raw("")
         },
@@ -204,10 +215,7 @@ pub(crate) fn push_agent_row_with_trailing<'a>(
     lines.push(ListItem::new(Line::from(status_line)));
     if let Some(summary) = diff {
         let mut diff_line = cont_prefix.to_vec();
-        diff_line.extend([
-            Span::raw("  "),
-            Span::styled(summary, muted_style(focused)),
-        ]);
+        diff_line.extend([Span::raw("  "), Span::styled(summary, muted_style(focused))]);
         lines.push(ListItem::new(Line::from(diff_line)));
     }
 }
@@ -215,6 +223,7 @@ pub(crate) fn push_agent_row_with_trailing<'a>(
 /// Status section for the agents pane. Order here is the rendered/navigated order.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Bucket {
+    OneOff,
     Todo,
     InProgress,
     Review,
@@ -223,8 +232,10 @@ pub(crate) enum Bucket {
 }
 
 impl Bucket {
-    /// Sections in display order; main agents render above all of these.
-    const ORDER: [Bucket; 5] = [
+    /// Sections in display order; main agents + the orchestrator render above all of these.
+    /// One-off agents lead (they are quick, transient, and what you most recently asked for).
+    const ORDER: [Bucket; 6] = [
+        Bucket::OneOff,
         Bucket::Todo,
         Bucket::InProgress,
         Bucket::Review,
@@ -235,6 +246,7 @@ impl Bucket {
     /// Short header label (the left pane is only 34 cols wide).
     fn label(self) -> &'static str {
         match self {
+            Bucket::OneOff => "one-off",
             Bucket::Todo => "todo",
             Bucket::InProgress => "in progress",
             Bucket::Review => "review",
@@ -263,6 +275,10 @@ pub(crate) fn status_bucket(agent: &AgentRun) -> Bucket {
     // without being mislabeled "review". "review" means DONE: the agent finished a turn
     // and is awaiting your review/merge. (Previously needs_permission/needs_user_input
     // forced a running agent into Review, which read as "finished" and was confusing.)
+    // One-off conversational agents get their own leading section regardless of run status.
+    if agent.is_oneoff() {
+        return Bucket::OneOff;
+    }
     match agent.status {
         AgentStatus::Running => Bucket::InProgress,
         AgentStatus::Done => Bucket::Review,
@@ -478,7 +494,9 @@ fn section_walk_rows<'a>(
     };
 
     let own_children = children.get(&index).map(Vec::as_slice).unwrap_or(&[]);
-    let has_unvisited_children = own_children.iter().any(|(child, _)| !visited.contains(child));
+    let has_unvisited_children = own_children
+        .iter()
+        .any(|(child, _)| !visited.contains(child));
     let cont_prefix = nest_cont_prefix(lanes, has_unvisited_children, is_root);
 
     let summary = if agent.is_main() {
@@ -487,7 +505,16 @@ fn section_walk_rows<'a>(
         diff_summaries.get(index).and_then(|opt| opt.clone())
     };
     push_agent_row_with_trailing(
-        lines, app, index, agent, summary, focused, task_width, &prefix, &cont_prefix, &trailing,
+        lines,
+        app,
+        index,
+        agent,
+        summary,
+        focused,
+        task_width,
+        &prefix,
+        &cont_prefix,
+        &trailing,
     );
     prefix.clear();
 
@@ -648,7 +675,14 @@ fn planned_walk<'a>(
     let has_unvisited_children = own_children.iter().any(|(child, _)| !visited[*child]);
     let cont_prefix = nest_cont_prefix(lanes, has_unvisited_children, is_root);
 
-    push_planned_row(lines, &nodes[index], focused, task_width, &prefix, &cont_prefix);
+    push_planned_row(
+        lines,
+        &nodes[index],
+        focused,
+        task_width,
+        &prefix,
+        &cont_prefix,
+    );
 
     let pending: Vec<(usize, EdgeType)> = own_children
         .iter()
@@ -752,7 +786,15 @@ fn render_planned_section<'a>(
     for index in 0..nodes.len() {
         if !has_planned_parent[index] {
             planned_walk(
-                lines, nodes, &children, index, None, true, focused, task_width, &mut lanes,
+                lines,
+                nodes,
+                &children,
+                index,
+                None,
+                true,
+                focused,
+                task_width,
+                &mut lanes,
                 &mut visited,
             );
         }
@@ -761,7 +803,15 @@ fn render_planned_section<'a>(
     for index in 0..nodes.len() {
         if !visited[index] {
             planned_walk(
-                lines, nodes, &children, index, None, true, focused, task_width, &mut lanes,
+                lines,
+                nodes,
+                &children,
+                index,
+                None,
+                true,
+                focused,
+                task_width,
+                &mut lanes,
                 &mut visited,
             );
         }
@@ -920,19 +970,20 @@ fn push_orchestrator_row<'a>(
     lines.push(ListItem::new(Line::from(vec![
         Span::styled(marker, accent_style(focused)),
         Span::styled(format!("{ORCH_MARK} "), label_style),
-        Span::styled(truncate_chars(&label, task_width.saturating_sub(2)), label_style),
+        Span::styled(
+            truncate_chars(&label, task_width.saturating_sub(2)),
+            label_style,
+        ),
     ])));
 
     // While the planner is still researching/decomposing, present it as the model's
     // PLAN MODE (Claude Code / Codex) so it reads as genuine plan mode; once the DAG is
     // parsed it becomes the orchestrator with its live status. Spin during planning.
-    let planning = matches!(orchestrator_phase_for_app(app, agent), OrchestratorPhase::Planning)
-        && agent.status == AgentStatus::Running;
-    let badge = if planning {
-        app.spinner_glyph()
-    } else {
-        BADGE
-    };
+    let planning = matches!(
+        orchestrator_phase_for_app(app, agent),
+        OrchestratorPhase::Planning
+    ) && agent.status == AgentStatus::Running;
+    let badge = if planning { app.spinner_glyph() } else { BADGE };
     let (role, phase) = if planning {
         let backend = match agent.backend {
             Backend::Claude => "Claude Code",
@@ -961,7 +1012,13 @@ pub(crate) fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         let keys: Vec<(String, PathBuf, bool)> = app
             .agents
             .iter()
-            .map(|a| (a.id.clone(), a.cwd.clone(), a.is_main() || a.is_pinned_planner()))
+            .map(|a| {
+                (
+                    a.id.clone(),
+                    a.cwd.clone(),
+                    a.is_main() || a.is_pinned_planner(),
+                )
+            })
             .collect();
         keys.iter()
             .map(|(id, cwd, skip)| {
@@ -975,10 +1032,7 @@ pub(crate) fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     };
     let run_count = app.agents.iter().filter(|a| !a.is_main()).count();
     let mut lines = vec![
-        ListItem::new(Line::from(Span::styled(
-            "rudder",
-            pane_text_style(focused),
-        ))),
+        ListItem::new(Line::from(Span::styled("rudder", pane_text_style(focused)))),
         ListItem::new(Line::from(vec![
             Span::styled(app.cwd.display().to_string(), pane_text_style(focused)),
             Span::raw(" "),
@@ -998,10 +1052,7 @@ pub(crate) fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         lines.insert(
             lines.len() - 1,
             ListItem::new(Line::from(vec![
-                Span::styled(
-                    "\u{2191} ",
-                    accent_style(focused),
-                ),
+                Span::styled("\u{2191} ", accent_style(focused)),
                 Span::styled(
                     format!("update: {current} -> {latest}"),
                     pane_text_style(focused),
@@ -1082,7 +1133,12 @@ pub(crate) fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     if app.nest_view {
         // Alternate full-DAG view (toggled with `g`): one topological tree across
         // every agent, ignoring status sections.
-        lines.extend(render_agents_nest(app, focused, task_width, &diff_summaries));
+        lines.extend(render_agents_nest(
+            app,
+            focused,
+            task_width,
+            &diff_summaries,
+        ));
         if main_count == 0 && run_total == 0 {
             lines.push(ListItem::new(Line::from(Span::styled(
                 "no agents yet  ·  type a task or /main",
@@ -1102,7 +1158,17 @@ pub(crate) fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 if !agent.is_main() {
                     continue;
                 }
-                push_agent_row(&mut lines, app, index, agent, None, focused, task_width, &[], &[]);
+                push_agent_row(
+                    &mut lines,
+                    app,
+                    index,
+                    agent,
+                    None,
+                    focused,
+                    task_width,
+                    &[],
+                    &[],
+                );
             }
         }
 
@@ -1147,13 +1213,15 @@ pub(crate) fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     }
 
     frame.render_widget(
-        List::new(lines)
-            .style(app_style())
-            .block(pane_block(
-                if app.nest_view { "agents · nest" } else { "agents" },
-                focused,
-                app.nav_mode,
-            )),
+        List::new(lines).style(app_style()).block(pane_block(
+            if app.nest_view {
+                "agents · nest"
+            } else {
+                "agents"
+            },
+            focused,
+            app.nav_mode,
+        )),
         area,
     );
 }
@@ -1179,7 +1247,10 @@ const NEST_CORNER_SOFT: &str = "\u{2570}\u{2504}"; // "╰┄" soft, dashed feel
 /// order so the tree renders deterministically.
 pub(crate) fn nest_children_by_index(
     agents: &[AgentRun],
-) -> (std::collections::HashMap<usize, Vec<(usize, EdgeType)>>, Vec<bool>) {
+) -> (
+    std::collections::HashMap<usize, Vec<(usize, EdgeType)>>,
+    Vec<bool>,
+) {
     use std::collections::HashMap;
     let id_to_index: HashMap<&str, usize> = agent_id_index(agents);
 
@@ -1229,18 +1300,30 @@ fn nest_prefix(lanes: &[bool], is_last: bool, edge: Option<EdgeType>) -> Vec<Spa
     let mut spans = Vec::new();
     for continues in lanes {
         spans.push(Span::styled(
-            if *continues { NEST_LANE_BAR } else { NEST_LANE_BLANK },
+            if *continues {
+                NEST_LANE_BAR
+            } else {
+                NEST_LANE_BLANK
+            },
             Style::default().fg(MUTED),
         ));
     }
     if let Some(edge) = edge {
         let (glyph, style) = match edge {
             EdgeType::Hard => (
-                if is_last { NEST_CORNER_HARD } else { NEST_TEE_HARD },
+                if is_last {
+                    NEST_CORNER_HARD
+                } else {
+                    NEST_TEE_HARD
+                },
                 Style::default().fg(MUTED),
             ),
             EdgeType::Soft => (
-                if is_last { NEST_CORNER_SOFT } else { NEST_TEE_SOFT },
+                if is_last {
+                    NEST_CORNER_SOFT
+                } else {
+                    NEST_TEE_SOFT
+                },
                 Style::default().fg(FAINT).add_modifier(Modifier::DIM),
             ),
         };
@@ -1255,14 +1338,22 @@ fn nest_cont_prefix(lanes: &[bool], self_continues: bool, is_root: bool) -> Vec<
     let mut spans = Vec::new();
     for continues in lanes {
         spans.push(Span::styled(
-            if *continues { NEST_LANE_BAR } else { NEST_LANE_BLANK },
+            if *continues {
+                NEST_LANE_BAR
+            } else {
+                NEST_LANE_BLANK
+            },
             Style::default().fg(MUTED),
         ));
     }
     // The node's own subtree lane: a bar while it (or its later siblings) continue.
     if !is_root {
         spans.push(Span::styled(
-            if self_continues { NEST_LANE_BAR } else { NEST_LANE_BLANK },
+            if self_continues {
+                NEST_LANE_BAR
+            } else {
+                NEST_LANE_BLANK
+            },
             Style::default().fg(MUTED),
         ));
     } else if self_continues {
@@ -1303,7 +1394,15 @@ fn nest_walk<'a>(
         diff_summaries.get(index).and_then(|opt| opt.clone())
     };
     push_agent_row(
-        lines, app, index, agent, summary, focused, task_width, &prefix, &cont_prefix,
+        lines,
+        app,
+        index,
+        agent,
+        summary,
+        focused,
+        task_width,
+        &prefix,
+        &cont_prefix,
     );
 
     // Recurse into children that have not yet been placed in the tree.
@@ -1369,13 +1468,11 @@ pub(crate) fn render_agents_nest(
     let mut roots: Vec<usize> = (0..app.agents.len())
         .filter(|index| app.agents[*index].is_main() && !app.agents[*index].is_pinned_planner())
         .collect();
-    roots.extend(
-        (0..app.agents.len()).filter(|index| {
-            !app.agents[*index].is_main()
-                && !app.agents[*index].is_pinned_planner()
-                && !has_parent[*index]
-        }),
-    );
+    roots.extend((0..app.agents.len()).filter(|index| {
+        !app.agents[*index].is_main()
+            && !app.agents[*index].is_pinned_planner()
+            && !has_parent[*index]
+    }));
 
     let mut lanes: Vec<bool> = Vec::new();
     for &root in &roots {
@@ -1591,7 +1688,10 @@ pub(crate) fn orchestrator_hard_tree(
 /// Build the orchestrator DAG tree rows (no status/summary lines). Roots (no resolvable
 /// hard parent) first, depth-first; any cycle-trapped node is then rendered at depth 0 so
 /// work is never hidden. Extracted so the rendered structure is unit-testable.
-pub(crate) fn orchestrator_dag_tree_lines(app: &App, tasks: &[RudderPlanTask]) -> Vec<Line<'static>> {
+pub(crate) fn orchestrator_dag_tree_lines(
+    app: &App,
+    tasks: &[RudderPlanTask],
+) -> Vec<Line<'static>> {
     let mut dag: Vec<Line<'static>> = Vec::new();
     let (children, has_parent) = orchestrator_hard_tree(tasks);
     let mut visited = vec![false; tasks.len()];
@@ -1599,14 +1699,30 @@ pub(crate) fn orchestrator_dag_tree_lines(app: &App, tasks: &[RudderPlanTask]) -
     for index in 0..tasks.len() {
         if !has_parent[index] {
             orchestrator_tree_walk(
-                &mut dag, app, tasks, &children, index, None, true, &mut lanes, &mut visited,
+                &mut dag,
+                app,
+                tasks,
+                &children,
+                index,
+                None,
+                true,
+                &mut lanes,
+                &mut visited,
             );
         }
     }
     for index in 0..tasks.len() {
         if !visited[index] {
             orchestrator_tree_walk(
-                &mut dag, app, tasks, &children, index, None, true, &mut lanes, &mut visited,
+                &mut dag,
+                app,
+                tasks,
+                &children,
+                index,
+                None,
+                true,
+                &mut lanes,
+                &mut visited,
             );
         }
     }
@@ -1645,7 +1761,14 @@ fn orchestrator_tree_walk<'a>(
         // own flag added a spurious extra column and misaligned the connectors.)
         lanes.push(!is_last);
         orchestrator_tree_walk(
-            lines, app, tasks, children, *child_index, Some(*child_edge), child_is_last, lanes,
+            lines,
+            app,
+            tasks,
+            children,
+            *child_index,
+            Some(*child_edge),
+            child_is_last,
+            lanes,
             visited,
         );
         lanes.pop();
@@ -1699,10 +1822,7 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
     ];
     if app.auto_merge {
         header_spans.push(Span::styled("  ·  ", muted_style(focused)));
-        header_spans.push(Span::styled(
-            "auto-merge",
-            Style::default().fg(ACCENT),
-        ));
+        header_spans.push(Span::styled("auto-merge", Style::default().fg(ACCENT)));
     }
     let header: Vec<Line<'static>> = vec![Line::from(header_spans)];
 
@@ -1713,10 +1833,7 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
     let draft = agent.worker_input_draft.clone();
     let cursor_col = agent.worker_input_cursor;
     let input: Vec<Line<'static>> = if focused {
-        let mut spans = vec![Span::styled(
-            "› ",
-            Style::default().fg(ACCENT),
-        )];
+        let mut spans = vec![Span::styled("› ", Style::default().fg(ACCENT))];
         let cursor_style = pane_text_style(focused).add_modifier(Modifier::REVERSED);
         let chars: Vec<char> = draft.chars().collect();
         if chars.is_empty() {
@@ -1940,14 +2057,22 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
                     Span::styled(task.title.clone(), pane_text_style(focused)),
                     Span::styled(note, muted_style(focused)),
                 ]));
-                if let Some(goal) = task.goal.as_deref().map(str::trim).filter(|g| !g.is_empty()) {
+                if let Some(goal) = task
+                    .goal
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|g| !g.is_empty())
+                {
                     prose.push(Line::from(Span::styled(
                         format!("    goal: {goal}"),
                         muted_style(focused),
                     )));
                 }
-                if let Some(success) =
-                    task.success.as_deref().map(str::trim).filter(|s| !s.is_empty())
+                if let Some(success) = task
+                    .success
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
                 {
                     prose.push(Line::from(Span::styled(
                         format!("    done when: {success}"),
@@ -2034,7 +2159,10 @@ fn render_orchestrator_layout(
     };
     let header_h = rows(header);
     let input_h = rows(input);
-    let avail = inner.height.saturating_sub(header_h).saturating_sub(input_h);
+    let avail = inner
+        .height
+        .saturating_sub(header_h)
+        .saturating_sub(input_h);
     // Pin the DAG but never let it eat more than half the body area, so the prose
     // plan always has room; it shows the top of the tree if it is very tall.
     let top_h = if top.is_empty() {
@@ -2053,12 +2181,16 @@ fn render_orchestrator_layout(
         .split(inner);
 
     frame.render_widget(
-        Paragraph::new(header.to_vec()).style(app_style()).wrap(Wrap { trim: false }),
+        Paragraph::new(header.to_vec())
+            .style(app_style())
+            .wrap(Wrap { trim: false }),
         chunks[0],
     );
     if top_h > 0 {
         frame.render_widget(
-            Paragraph::new(top.to_vec()).style(app_style()).wrap(Wrap { trim: false }),
+            Paragraph::new(top.to_vec())
+                .style(app_style())
+                .wrap(Wrap { trim: false }),
             chunks[1],
         );
     }
@@ -2080,7 +2212,9 @@ fn render_orchestrator_layout(
     );
     if input_h > 0 {
         frame.render_widget(
-            Paragraph::new(input.to_vec()).style(app_style()).wrap(Wrap { trim: false }),
+            Paragraph::new(input.to_vec())
+                .style(app_style())
+                .wrap(Wrap { trim: false }),
             chunks[3],
         );
     }
@@ -2097,12 +2231,28 @@ fn card_blank(box_w: usize, border: Style) -> Line<'static> {
 
 /// A top (`╭─ … ─╮`) or bottom (`╰─ … ─╯`) border row with an embedded label,
 /// exactly `box_w` wide. The label is truncated with `…` if it would not fit.
-fn card_border(top: bool, label: &str, box_w: usize, border: Style, label_style: Style) -> Line<'static> {
-    let (lead, corner) = if top { ("╭─ ", "╮") } else { ("╰─ ", "╯") };
+fn card_border(
+    top: bool,
+    label: &str,
+    box_w: usize,
+    border: Style,
+    label_style: Style,
+) -> Line<'static> {
+    let (lead, corner) = if top {
+        ("╭─ ", "╮")
+    } else {
+        ("╰─ ", "╯")
+    };
     // Reserve: lead(3) + label + trailing space(1) + dashes(>=1) + corner(1).
     let max_label = box_w.saturating_sub(6);
     let label_fit: String = if label.chars().count() > max_label {
-        format!("{}…", label.chars().take(max_label.saturating_sub(1)).collect::<String>())
+        format!(
+            "{}…",
+            label
+                .chars()
+                .take(max_label.saturating_sub(1))
+                .collect::<String>()
+        )
     } else {
         label.to_string()
     };
@@ -2156,7 +2306,13 @@ pub(crate) fn push_question_card(
 
     let content_w = box_w - 4; // "│ " (2) + content + " │" (2)
 
-    body.push(card_border(true, "◆ Plan mode · a few quick questions", box_w, border, accent.add_modifier(Modifier::BOLD)));
+    body.push(card_border(
+        true,
+        "◆ Plan mode · a few quick questions",
+        box_w,
+        border,
+        accent.add_modifier(Modifier::BOLD),
+    ));
     body.push(card_blank(box_w, border));
 
     // Numbered, wrapped questions. The number label is a fixed 3-col gutter so wrapped
@@ -2186,7 +2342,8 @@ pub(crate) fn push_question_card(
     // The answer field, inside the box: "› " + the live draft with a block cursor.
     let inner_avail = content_w.saturating_sub(2); // after the "› " prompt
     let cursor_style = text.add_modifier(Modifier::REVERSED);
-    let mut spans: Vec<Span<'static>> = vec![Span::styled("│ ", border), Span::styled("› ", accent)];
+    let mut spans: Vec<Span<'static>> =
+        vec![Span::styled("│ ", border), Span::styled("› ", accent)];
     let mut used = 2usize; // "› "
     let chars: Vec<char> = draft.chars().collect();
     if chars.is_empty() {
@@ -2212,10 +2369,17 @@ pub(crate) fn push_question_card(
         // Whole draft fits: render before / cursor cell / after so mid-line editing shows.
         let cur = cursor.min(chars.len());
         let before: String = chars[..cur].iter().collect();
-        let after: String = if cur < chars.len() { chars[cur + 1..].iter().collect() } else { String::new() };
+        let after: String = if cur < chars.len() {
+            chars[cur + 1..].iter().collect()
+        } else {
+            String::new()
+        };
         used += before.chars().count();
         spans.push(Span::styled(before, text));
-        let cell = chars.get(cur).map(|c| c.to_string()).unwrap_or_else(|| " ".to_string());
+        let cell = chars
+            .get(cur)
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| " ".to_string());
         used += 1;
         spans.push(Span::styled(cell, cursor_style));
         used += after.chars().count();
@@ -2266,10 +2430,7 @@ pub(crate) fn push_transcript_lines(
             PlanEntryKind::Thinking => ("· ", muted_style(focused).add_modifier(Modifier::ITALIC)),
             PlanEntryKind::Tool => ("  ", muted_style(focused)),
             PlanEntryKind::System => ("", muted_style(focused)),
-            PlanEntryKind::UserTurn => (
-                "you: ",
-                Style::default().fg(ACCENT),
-            ),
+            PlanEntryKind::UserTurn => ("you: ", Style::default().fg(ACCENT)),
             PlanEntryKind::Text => ("", pane_text_style(focused)),
         };
         let mut first = true;
@@ -2752,7 +2913,11 @@ pub(crate) fn render_task(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Span::styled(first_hint, muted_style(focused)),
             Span::raw("  "),
             Span::styled(
-                if app.awaiting_approval { "refine" } else { "run" },
+                if app.awaiting_approval {
+                    "refine"
+                } else {
+                    "run"
+                },
                 accent_style(focused),
             ),
             Span::raw("  "),
@@ -2851,11 +3016,7 @@ pub(crate) fn render_suggestions(frame: &mut Frame<'_>, task_area: Rect, app: &A
         Block::default()
             .title(title)
             .borders(Borders::ALL)
-            .border_style(
-                Style::default()
-                    .fg(FOCUS_COLOR)
-                    ,
-            )
+            .border_style(Style::default().fg(FOCUS_COLOR))
             .style(app_style()),
     );
 
@@ -2864,17 +3025,20 @@ pub(crate) fn render_suggestions(frame: &mut Frame<'_>, task_area: Rect, app: &A
 }
 
 pub(crate) fn render_merge_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let (title, lines, border_color): (Span<'static>, Vec<Line<'static>>, Color) =
-        if let Some(confirm) = &app.merge_confirm {
-            let headline = match &confirm.intent {
-                MergeIntent::Selected { task, .. } => format!("Merge:  {}", short_task(task)),
-                MergeIntent::All { ids } => format!(
-                    "Merge {} completed worktree{}",
-                    ids.len(),
-                    if ids.len() == 1 { "" } else { "s" }
-                ),
-            };
-            (
+    let (title, lines, border_color): (Span<'static>, Vec<Line<'static>>, Color) = if let Some(
+        confirm,
+    ) =
+        &app.merge_confirm
+    {
+        let headline = match &confirm.intent {
+            MergeIntent::Selected { task, .. } => format!("Merge:  {}", short_task(task)),
+            MergeIntent::All { ids } => format!(
+                "Merge {} completed worktree{}",
+                ids.len(),
+                if ids.len() == 1 { "" } else { "s" }
+            ),
+        };
+        (
                 Span::styled(" Confirm merge ", Style::default().fg(ACCENT)),
                 vec![
                     Line::from(Span::styled(headline, app_style())),
@@ -2888,53 +3052,53 @@ pub(crate) fn render_merge_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) 
                 ],
                 ACCENT,
             )
-        } else if let Some(prompt) = &app.conflict_prompt {
-            let operation_label = if prompt.operation == ConflictOperation::Rebase {
-                "Rebase"
-            } else {
-                "Merge"
-            };
-            let count = prompt.conflicted_files.len();
-            let mut lines = vec![
-                Line::from(Span::styled(
-                    format!(
-                        "{operation_label} stopped on {count} conflicted file{}.",
-                        if count == 1 { "" } else { "s" }
-                    ),
-                    Style::default().fg(FAILED_COLOR),
-                )),
-                Line::from(""),
-            ];
-            if prompt.conflicted_files.is_empty() {
-                lines.push(Line::from(Span::styled(
-                    "No specific files were reported.",
-                    muted_style(true),
-                )));
-            } else {
-                for file in &prompt.conflicted_files {
-                    lines.push(Line::from(vec![
-                        Span::styled("   • ", muted_style(true)),
-                        Span::styled(file.clone(), app_style()),
-                    ]));
-                }
-            }
-            lines.push(Line::from(""));
-            lines.push(conflict_resolve_hint_line());
-            (
-                Span::styled(
-                    if prompt.operation == ConflictOperation::Rebase {
-                        " Rebase conflict "
-                    } else {
-                        " Merge conflict "
-                    },
-                    Style::default().fg(FAILED_COLOR),
-                ),
-                lines,
-                FAILED_COLOR,
-            )
+    } else if let Some(prompt) = &app.conflict_prompt {
+        let operation_label = if prompt.operation == ConflictOperation::Rebase {
+            "Rebase"
         } else {
-            return;
+            "Merge"
         };
+        let count = prompt.conflicted_files.len();
+        let mut lines = vec![
+            Line::from(Span::styled(
+                format!(
+                    "{operation_label} stopped on {count} conflicted file{}.",
+                    if count == 1 { "" } else { "s" }
+                ),
+                Style::default().fg(FAILED_COLOR),
+            )),
+            Line::from(""),
+        ];
+        if prompt.conflicted_files.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "No specific files were reported.",
+                muted_style(true),
+            )));
+        } else {
+            for file in &prompt.conflicted_files {
+                lines.push(Line::from(vec![
+                    Span::styled("   • ", muted_style(true)),
+                    Span::styled(file.clone(), app_style()),
+                ]));
+            }
+        }
+        lines.push(Line::from(""));
+        lines.push(conflict_resolve_hint_line());
+        (
+            Span::styled(
+                if prompt.operation == ConflictOperation::Rebase {
+                    " Rebase conflict "
+                } else {
+                    " Merge conflict "
+                },
+                Style::default().fg(FAILED_COLOR),
+            ),
+            lines,
+            FAILED_COLOR,
+        )
+    } else {
+        return;
+    };
 
     let modal = centered_modal(area, 76, (lines.len() as u16).saturating_add(2));
     let block = Block::default()
@@ -3004,11 +3168,7 @@ pub(crate) fn render_cloud_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) 
     let block = Block::default()
         .title(" cloud launch ")
         .borders(Borders::ALL)
-        .border_style(
-            Style::default()
-                .fg(CLOUD_COLOR)
-                ,
-        )
+        .border_style(Style::default().fg(CLOUD_COLOR))
         .style(app_style());
     frame.render_widget(Clear, modal);
     frame.render_widget(
@@ -3037,7 +3197,10 @@ pub(crate) fn conflict_resolve_hint_line() -> Line<'static> {
         Span::styled("y", accent_style(true)),
         Span::styled(" for an AI resolver  ·  ", muted_style(true)),
         Span::styled("n", accent_style(true)),
-        Span::styled(" to resolve it yourself  ·  Esc to cancel", muted_style(true)),
+        Span::styled(
+            " to resolve it yourself  ·  Esc to cancel",
+            muted_style(true),
+        ),
     ])
 }
 
@@ -3166,7 +3329,12 @@ pub(crate) fn wrap_text(value: &str, width: u16) -> Vec<String> {
     lines
 }
 
-pub(crate) fn push_wrapped_word(lines: &mut Vec<String>, current: &mut String, word: &str, max_width: usize) {
+pub(crate) fn push_wrapped_word(
+    lines: &mut Vec<String>,
+    current: &mut String,
+    word: &str,
+    max_width: usize,
+) {
     if word.chars().count() <= max_width {
         current.push_str(word);
         return;
@@ -3313,9 +3481,7 @@ pub(crate) fn agent_status_label(agent: &AgentRun) -> &'static str {
 
 pub(crate) fn agent_status_style(agent: &AgentRun) -> Style {
     if agent.needs_permission || agent.needs_user_input {
-        Style::default()
-            .fg(RUNNING_COLOR)
-            
+        Style::default().fg(RUNNING_COLOR)
     } else {
         status_style(agent.status)
     }

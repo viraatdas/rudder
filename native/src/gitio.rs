@@ -74,7 +74,9 @@ impl GraphIndex {
             let mut soft = Vec::new();
             if let Some(deps) = node.get("deps").and_then(serde_json::Value::as_array) {
                 for dep in deps {
-                    let Some(edge_id) = dep.as_str() else { continue };
+                    let Some(edge_id) = dep.as_str() else {
+                        continue;
+                    };
                     if let Some((parent, is_hard)) = resolve_edge(edge_id) {
                         if is_hard {
                             hard.push(parent);
@@ -84,13 +86,13 @@ impl GraphIndex {
                     }
                 }
             }
-            index
-                .parents_by_node
-                .insert(node_id.clone(), (hard, soft));
+            index.parents_by_node.insert(node_id.clone(), (hard, soft));
 
             if let Some(run_id) = node.get("runId").and_then(serde_json::Value::as_str) {
                 if !run_id.trim().is_empty() {
-                    index.node_by_run.insert(run_id.to_string(), node_id.clone());
+                    index
+                        .node_by_run
+                        .insert(run_id.to_string(), node_id.clone());
                 }
             }
         }
@@ -263,6 +265,28 @@ pub(crate) fn create_main_agent(
     }
 }
 
+/// Build a ONE-OFF agent: a single conversational agent that runs in the MAIN checkout
+/// (no jj worktree, no DAG node) for a question or a small self-contained change. Mirrors
+/// `create_main_agent` but with `AgentMode::OneOff` and the task seeded from the request.
+/// `status` starts Stopped/`terminal` None; `start_oneoff_task` spawns the PTY.
+pub(crate) fn create_oneoff_agent(
+    repo_root: &Path,
+    backend: Backend,
+    model: &str,
+    effort: Option<EffortLevel>,
+    prompt: &str,
+) -> AgentRun {
+    let now = now_stamp();
+    let mut run = create_main_agent(repo_root, backend, model, effort, prompt);
+    run.id = new_run_id("one-off");
+    run.created_at = now.clone();
+    run.mode = AgentMode::OneOff;
+    run.task = prompt.trim().to_string();
+    run.task_summary = summarize_task(prompt);
+    run.current_prompt = prompt.trim().to_string();
+    run
+}
+
 pub(crate) fn load_persisted_agents(repo_root: &Path) -> Vec<AgentRun> {
     let Ok(entries) = fs::read_dir(native_runs_dir(repo_root)) else {
         return Vec::new();
@@ -319,7 +343,10 @@ pub(crate) fn load_persisted_agents(repo_root: &Path) -> Vec<AgentRun> {
     agents
 }
 
-pub(crate) fn agent_from_run_record(repo_root: &Path, record: serde_json::Value) -> Option<AgentRun> {
+pub(crate) fn agent_from_run_record(
+    repo_root: &Path,
+    record: serde_json::Value,
+) -> Option<AgentRun> {
     let id = record.get("id")?.as_str()?.to_string();
     let task = record.get("task")?.as_str()?.to_string();
     let raw_task_summary = record
@@ -997,7 +1024,11 @@ pub(crate) fn git_status_command(cwd: &Path, args: &[&str]) -> Result<()> {
     });
 }
 
-pub(crate) fn rebase_worktree_onto_base(repo_root: &Path, worktree_path: &Path, base_branch: &str) -> Result<()> {
+pub(crate) fn rebase_worktree_onto_base(
+    repo_root: &Path,
+    worktree_path: &Path,
+    base_branch: &str,
+) -> Result<()> {
     let base_ref = resolve_rebase_base_ref(repo_root, base_branch)?;
     git_status_command(worktree_path, &["rebase", &base_ref])
         .with_context(|| format!("rebase onto {base_ref} failed"))
@@ -1058,7 +1089,10 @@ pub(crate) fn commit_pending_changes_for_run(run: &AgentRun) -> Result<()> {
 }
 
 #[cfg(not(test))]
-pub(crate) fn premerge_review_all_sources(cwd: &Path, sources: &[ReviewAllSource]) -> ReviewAllPremerge {
+pub(crate) fn premerge_review_all_sources(
+    cwd: &Path,
+    sources: &[ReviewAllSource],
+) -> ReviewAllPremerge {
     let mut premerge = ReviewAllPremerge::default();
     for (index, source) in sources.iter().enumerate() {
         match git_status_command(cwd, &["merge", "--no-ff", &source.branch]) {
@@ -1336,7 +1370,6 @@ pub(crate) fn write_rudder_context(
     Ok(())
 }
 
-
 pub(crate) fn ensure_gitignore_contains(repo_root: &Path, line: &str) -> Result<()> {
     let path = repo_root.join(".gitignore");
     let existing = fs::read_to_string(&path).unwrap_or_default();
@@ -1382,7 +1415,11 @@ pub(crate) fn append_conductor_decision(
     }
     let title = {
         let t = collapse(title);
-        if t.is_empty() { "decision".to_string() } else { t }
+        if t.is_empty() {
+            "decision".to_string()
+        } else {
+            t
+        }
     };
     let mut entry = format!("## {title}\n- **What:** {what}\n");
     if let Some(why) = why.map(|w| collapse(w)).filter(|w| !w.is_empty()) {

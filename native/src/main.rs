@@ -14,9 +14,9 @@ use std::{
 use anyhow::{bail, Context, Result};
 use crossterm::{
     event::{
-        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent,
-        KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEvent,
-        MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -253,6 +253,11 @@ enum AgentMode {
     RudderPlan,
     ReviewAll,
     Main,
+    /// A single conversational agent the user talks to in the MAIN checkout for a
+    /// question or a small self-contained change — NOT a DAG node. Spawned by the
+    /// Haiku dispatcher (or /ask). Structurally like Main (main checkout, no jj
+    /// worktree, bypass-permissions tools), distinct in intent + its own list section.
+    OneOff,
 }
 
 const MAIN_AGENT_ID: &str = "__main__";
@@ -268,6 +273,7 @@ impl AgentMode {
             Self::RudderPlan => "rudder-plan",
             Self::ReviewAll => "review-all",
             Self::Main => "main",
+            Self::OneOff => "one-off",
         }
     }
 
@@ -278,6 +284,7 @@ impl AgentMode {
             "rudder-plan" | "rudder_plan" | "orchestrate" => Some(Self::RudderPlan),
             "review-all" | "review_all" | "reviewall" => Some(Self::ReviewAll),
             "main" => Some(Self::Main),
+            "one-off" | "oneoff" | "ask" => Some(Self::OneOff),
             _ => None,
         }
     }
@@ -433,6 +440,11 @@ struct App {
     completion_summary_tx: mpsc::Sender<CompletionSummaryResult>,
     completion_summary_rx: mpsc::Receiver<CompletionSummaryResult>,
     completion_summary_pending: HashSet<String>,
+    /// Async Haiku dispatcher: classifies a fresh task as one-off vs plan off-thread.
+    dispatch_tx: mpsc::Sender<DispatchResult>,
+    dispatch_rx: mpsc::Receiver<DispatchResult>,
+    /// A classification is in flight (exactly one at a time); suppresses duplicate submits.
+    dispatch_pending: bool,
     last_user_activity: Instant,
     mouse_debug: bool,
     mouse_debug_last: Option<String>,
@@ -652,6 +664,21 @@ struct CompletionSummaryResult {
     note: Option<serde_json::Value>,
 }
 
+/// How the Haiku dispatcher classified a fresh task: a conversational ONE-OFF (a
+/// question or small change handled by a single agent in the main checkout) or a PLAN
+/// (decompose into a DAG via the orchestrator). Defaults to Plan on any failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DispatchIntent {
+    OneOff,
+    Plan,
+}
+
+/// Result of an async dispatch classification: the original task + its routed intent.
+struct DispatchResult {
+    task: String,
+    intent: DispatchIntent,
+}
+
 impl AgentRun {
     fn is_main(&self) -> bool {
         self.mode == AgentMode::Main || self.id == MAIN_AGENT_ID
@@ -662,6 +689,11 @@ impl AgentRun {
     /// bucket) and its worker pane shows the orchestrator DAG view.
     pub(crate) fn is_orchestrator(&self) -> bool {
         self.mode == AgentMode::RudderPlan
+    }
+
+    /// A one-off conversational agent (its own list section; not a DAG worker).
+    pub(crate) fn is_oneoff(&self) -> bool {
+        self.mode == AgentMode::OneOff
     }
 
     /// A "pinned planner" renders in the orchestrator section at the top of the list
@@ -760,6 +792,7 @@ impl App {
         let session_started_iso = load_or_init_session_started(&cwd);
         let (task_summary_tx, task_summary_rx) = mpsc::channel();
         let (completion_summary_tx, completion_summary_rx) = mpsc::channel();
+        let (dispatch_tx, dispatch_rx) = mpsc::channel();
         let branch = current_branch_at(&cwd);
         Self {
             focus: FocusPane::Task,
@@ -827,6 +860,9 @@ impl App {
             completion_summary_tx,
             completion_summary_rx,
             completion_summary_pending: HashSet::new(),
+            dispatch_tx,
+            dispatch_rx,
+            dispatch_pending: false,
             last_user_activity: Instant::now(),
             mouse_debug: env::var(MOUSE_DEBUG_ENV).is_ok_and(|value| value != "0"),
             mouse_debug_last: None,
@@ -1407,8 +1443,10 @@ impl App {
                     } else if self.awaiting_approval {
                         self.approve_planned_queue();
                     } else {
-                        self.notice =
-                            Some("type a message to refine the plan, or wait for it to finish".to_string());
+                        self.notice = Some(
+                            "type a message to refine the plan, or wait for it to finish"
+                                .to_string(),
+                        );
                     }
                 } else {
                     if let Some(run) = self.agents.get_mut(self.selected_agent) {
@@ -1740,6 +1778,7 @@ impl App {
         self.agents
             .iter()
             .filter(|run| run.status == AgentStatus::Done)
+            .filter(|run| !run.is_oneoff())
             .filter(|run| !claimed.contains(&run.id))
             .filter_map(|run| {
                 let branch = run.worktree_branch.clone()?;
@@ -1823,7 +1862,12 @@ impl App {
             AgentMode::ReviewAll,
             session_id.as_deref(),
         );
-        signals::augment_worker_command(&mut command, Backend::Codex, AgentMode::ReviewAll, &worktree.id);
+        signals::augment_worker_command(
+            &mut command,
+            Backend::Codex,
+            AgentMode::ReviewAll,
+            &worktree.id,
+        );
         let options = TerminalPaneOptions {
             size: TerminalSize::default(),
             cwd: Some(worktree.path.clone()),
@@ -2000,9 +2044,7 @@ impl App {
                 self.task_input.push('/');
                 self.task_cursor = 1;
                 self.picker_index = 0;
-                self.notice = Some(
-                    "type /model, /main|/m, /goal, /usage, or /cloud".to_string(),
-                );
+                self.notice = Some("type /model, /main|/m, /goal, /usage, or /cloud".to_string());
             }
             KeyCode::Char(ch) => {
                 self.reset_task_history_navigation();
@@ -2759,8 +2801,7 @@ impl App {
         self.orch_dag_scroll = if delta > 0 {
             self.orch_dag_scroll.saturating_sub(delta as usize)
         } else {
-            self.orch_dag_scroll
-                .saturating_add(delta.unsigned_abs())
+            self.orch_dag_scroll.saturating_add(delta.unsigned_abs())
         };
         self.set_mouse_debug(format!(
             "mouse {:?} @{},{} pane=orchestrator-dag delta={} before={} after={}",
@@ -2928,12 +2969,12 @@ impl App {
             return;
         }
 
-        // Default first task (no active plan): launch the headless, Rudder-owned planner
-        // (the model in plan mode, streamed live in the orchestrator pane). Rudder fully
-        // controls it — it researches read-only, the pane updates dynamically, and it
-        // emits the task DAG which flows through the approval gate to the fleet. No
-        // interactive TUI to hand control to a single in-process agent.
-        self.start_rudder_plan_task(&input);
+        // Default first task (no active plan): a light Haiku dispatcher decides whether
+        // this is a ONE-OFF (a question or small change → a single conversational agent in
+        // the main checkout) or a PLAN (decompose into a DAG via the orchestrator). It runs
+        // off-thread; poll_dispatch_worker routes the result. `/ask` and `/plan` (handled in
+        // handle_command above) force either path without classifying.
+        self.begin_dispatch(&input);
     }
 
     /// True when a planner ran and EXITED without producing a DAG (it asked a clarifying
@@ -2949,7 +2990,10 @@ impl App {
         if !self.planner_paused_for_input {
             return false;
         }
-        if self.awaiting_approval || self.refining || self.rebasing || !self.planned_nodes.is_empty()
+        if self.awaiting_approval
+            || self.refining
+            || self.rebasing
+            || !self.planned_nodes.is_empty()
         {
             return false;
         }
@@ -3071,7 +3115,8 @@ impl App {
                     args.push(sid.to_string());
                 }
                 args.push(prompt.to_string());
-                TerminalCommand::with_args(claude_program(), args).with_env("CLAUDE_CODE_NO_FLICKER", "0")
+                TerminalCommand::with_args(claude_program(), args)
+                    .with_env("CLAUDE_CODE_NO_FLICKER", "0")
             }
             Backend::Codex => {
                 let mut args = vec!["--no-alt-screen".to_string()];
@@ -3690,7 +3735,8 @@ impl App {
             // The planner could not be relaunched: drop back to the existing plan so
             // the user is not stuck (they can still approve it or try again).
             self.refining = false;
-            self.notice = Some("could not relaunch the planner; the current plan still stands".to_string());
+            self.notice =
+                Some("could not relaunch the planner; the current plan still stands".to_string());
         }
     }
 
@@ -4278,6 +4324,95 @@ impl App {
         }
     }
 
+    /// Kick off the async Haiku dispatch for a fresh task: a light classifier decides
+    /// one-off vs plan off-thread so the UI never stalls. `poll_dispatch_worker` routes
+    /// the result. Duplicate submits while one is in flight are ignored. In tests the
+    /// classifier shells a real `claude`, so tests drive `start_oneoff_task` /
+    /// `poll_dispatch_worker` directly instead of going through here.
+    fn begin_dispatch(&mut self, input: &str) {
+        let input = input.trim();
+        if input.is_empty() {
+            return;
+        }
+        if self.dispatch_pending {
+            self.notice = Some("still deciding how to handle the last request…".to_string());
+            return;
+        }
+        self.dispatch_pending = true;
+        self.notice = Some("dispatching… deciding one-off vs plan".to_string());
+        // Tests drive routing deterministically by injecting a DispatchResult + calling
+        // poll_dispatch_worker; only real runs shell the Haiku classifier off-thread.
+        #[cfg(not(test))]
+        spawn_dispatch_worker(self.dispatch_tx.clone(), input.to_string());
+        self.dirty = true;
+    }
+
+    /// Drain finished dispatch classifications and route each: a one-off spawns a single
+    /// conversational agent in the main checkout; a plan goes to the orchestrator planner.
+    fn poll_dispatch_worker(&mut self) {
+        while let Ok(result) = self.dispatch_rx.try_recv() {
+            self.dispatch_pending = false;
+            match result.intent {
+                DispatchIntent::OneOff => self.start_oneoff_task(&result.task),
+                DispatchIntent::Plan => self.start_rudder_plan_task(&result.task),
+            }
+        }
+    }
+
+    /// Spawn a ONE-OFF agent: a single conversational agent in the MAIN checkout (no jj
+    /// worktree, no DAG node) that the user talks to for a question or a small change. It
+    /// can edit the working tree directly. Selected + focused so the user can converse
+    /// immediately (keys forward to its PTY via the normal worker path).
+    fn start_oneoff_task(&mut self, input: &str) {
+        let input = input.trim();
+        if input.is_empty() {
+            return;
+        }
+        let backend = self.backend;
+        let model = self.model.clone();
+        let effort = self.effort;
+        let session_id = mint_session_id_for(backend);
+        let mut run = create_oneoff_agent(&self.cwd, backend, &model, effort, input);
+        let run_id = run.id.clone();
+        let mut command = agent_command(
+            backend,
+            &model,
+            effort,
+            input,
+            AgentMode::OneOff,
+            session_id.as_deref(),
+        );
+        signals::augment_worker_command(&mut command, backend, AgentMode::OneOff, &run_id);
+        let options = TerminalPaneOptions {
+            size: run.terminal_size.unwrap_or_default(),
+            cwd: Some(self.cwd.clone()),
+            ..TerminalPaneOptions::default()
+        };
+        match TerminalPane::spawn_shell_or_command(Some(command), options) {
+            Ok(mut terminal) => {
+                let _ = terminal.drain_output();
+                run.terminal = Some(terminal);
+                run.status = AgentStatus::Running;
+                run.session_id = session_id;
+                run.last_output_at = Instant::now();
+                self.notice = Some(
+                    "one-off agent — talk to it; it edits the main checkout directly".to_string(),
+                );
+            }
+            Err(error) => {
+                run.status = AgentStatus::Failed;
+                run.last_error = Some(error.to_string());
+                self.notice = Some(format!("one-off launch failed: {error}"));
+            }
+        }
+        let _ = save_native_run_record(&self.cwd, &run);
+        self.agents.push(run);
+        self.selected_agent = self.agents.len().saturating_sub(1);
+        self.focus = FocusPane::Worker;
+        self.worker_view = WorkerView::Terminal;
+        self.dirty = true;
+    }
+
     fn open_main_model_switcher(&mut self) {
         if !self.selected_is_main() {
             return;
@@ -4404,13 +4539,29 @@ impl App {
                 true
             }
             Some("/plan") => {
-                // Planning is the default paradigm now: just type a task and the
-                // orchestrator plans it, then you refine before approving. The old
-                // standalone /plan read-only mode is retired.
-                self.notice = Some(
-                    "planning is the default — just type your task; the orchestrator plans it and you refine before approving"
-                        .to_string(),
-                );
+                // Override: force the orchestrator/DAG planner, skipping Haiku dispatch.
+                let rest = command_rest(input, "/plan").trim();
+                if rest.is_empty() {
+                    self.notice = Some(
+                        "usage: /plan <task> — forces the DAG planner (skip one-off dispatch); or just type a task to let Rudder decide"
+                            .to_string(),
+                    );
+                } else {
+                    self.start_rudder_plan_task(rest);
+                }
+                true
+            }
+            Some("/ask") => {
+                // Override: force a one-off conversational agent, skipping Haiku dispatch.
+                let rest = command_rest(input, "/ask").trim();
+                if rest.is_empty() {
+                    self.notice = Some(
+                        "usage: /ask <question or small change> — one-off agent in the main checkout, no DAG"
+                            .to_string(),
+                    );
+                } else {
+                    self.start_oneoff_task(rest);
+                }
                 true
             }
             Some("/help") => {
@@ -4464,7 +4615,7 @@ impl App {
                 true
             }
             Some("/goal") => {
-                let raw = input.trim_start_matches("/goal");
+                let raw = command_rest(input, "/goal");
                 self.forward_slash_command_to_focused_agent("/goal", raw);
                 true
             }
@@ -4485,16 +4636,18 @@ impl App {
                     );
                     self.maybe_auto_merge();
                 } else {
-                    self.notice =
-                        Some("auto-merge OFF: merge finished nodes yourself with m / M".to_string());
+                    self.notice = Some(
+                        "auto-merge OFF: merge finished nodes yourself with m / M".to_string(),
+                    );
                 }
                 true
             }
             Some("/sync") => {
                 // Retired: jj keeps node workspaces current automatically, so manual
                 // worktree sync no longer fits the orchestrator paradigm.
-                self.notice =
-                    Some("sync is retired; jj keeps node workspaces current automatically".to_string());
+                self.notice = Some(
+                    "sync is retired; jj keeps node workspaces current automatically".to_string(),
+                );
                 true
             }
             Some("/review-all") => {
@@ -5032,7 +5185,11 @@ impl App {
     /// file every poll); re-planning after launch is a later step. No-op unless the flag is
     /// set, so the headless flow is untouched by default.
     fn maybe_capture_orchestrator_plan(&mut self) {
-        if !self.interactive_orchestrator || self.refining || self.rebasing || self.awaiting_approval {
+        if !self.interactive_orchestrator
+            || self.refining
+            || self.rebasing
+            || self.awaiting_approval
+        {
             return;
         }
         // Only capture a FRESH plan: nothing pending and no workers launched yet.
@@ -5134,7 +5291,10 @@ impl App {
     /// (early-returns when !awaiting_approval and flips it false on success), so the signal
     /// re-seen on every poll approves EXACTLY once. Gated off in the default headless flow.
     fn scan_orchestrator_markers(&mut self) {
-        if !self.interactive_orchestrator || !self.awaiting_approval || self.refining || self.rebasing
+        if !self.interactive_orchestrator
+            || !self.awaiting_approval
+            || self.refining
+            || self.rebasing
         {
             return;
         }
@@ -5211,7 +5371,10 @@ impl App {
                 Backend::Codex => latest_codex_rudder_plan_output(run),
             };
             if let Some(text) = fallback_text {
-                if extract_rudder_plan_tasks(&text).map(|t| !t.is_empty()).unwrap_or(false) {
+                if extract_rudder_plan_tasks(&text)
+                    .map(|t| !t.is_empty())
+                    .unwrap_or(false)
+                {
                     output = text;
                 }
             }
@@ -5363,18 +5526,18 @@ impl App {
             // is a no-op even if it lingers a moment before removal.
             run.autosteered = false;
             let _ = save_native_run_record(&self.cwd, run);
-            (run.task.clone(), rudder_plan_output_for_run(run), run.id.clone())
+            (
+                run.task.clone(),
+                rudder_plan_output_for_run(run),
+                run.id.clone(),
+            )
         };
 
         // The frontier the new node(s) reconcile against: existing queued nodes plus
         // not-yet-merged plan-launched agents. The reconcile planner carries no node
         // id, so it never appears in the frontier. Feeds BOTH the dep parser (so
         // cross-block deps on these ids survive) and the no-deps soft fallback.
-        let frontier: Vec<String> = self
-            .plan_frontier()
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect();
+        let frontier: Vec<String> = self.plan_frontier().into_iter().map(|(id, _)| id).collect();
 
         let tasks = match extract_rudder_plan_tasks_with_frontier(&output, &frontier) {
             Ok(tasks) => tasks,
@@ -5382,8 +5545,9 @@ impl App {
                 // Retire the transient planner even on failure, or it lingers as a
                 // second orchestrator (in-session AND, via its run.json, after restart).
                 self.retire_planner_row(&run_id);
-                self.notice =
-                    Some(format!("added task did not produce a runnable node: {error}"));
+                self.notice = Some(format!(
+                    "added task did not produce a runnable node: {error}"
+                ));
                 return;
             }
         };
@@ -5620,7 +5784,12 @@ impl App {
     /// True if a node with a title that normalizes to `title` already exists (queued
     /// or launched), so an auto-expanded follow-up does not duplicate existing work.
     fn followup_title_exists(&self, title: &str) -> bool {
-        let norm = |s: &str| s.to_ascii_lowercase().split_whitespace().collect::<Vec<_>>().join(" ");
+        let norm = |s: &str| {
+            s.to_ascii_lowercase()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
         let want = norm(title);
         if want.is_empty() {
             return true;
@@ -5784,7 +5953,13 @@ impl App {
         }
         let diff = jj_diff_text(&cwd, 16000);
         self.completion_summary_pending.insert(run_id.clone());
-        spawn_completion_summary_worker(self.completion_summary_tx.clone(), run_id, node_id, task, diff);
+        spawn_completion_summary_worker(
+            self.completion_summary_tx.clone(),
+            run_id,
+            node_id,
+            task,
+            diff,
+        );
         self.push_activity(reason);
         false
     }
@@ -5930,7 +6105,9 @@ impl App {
         // If the finishing node's agent was deleted while a backstop was in flight, there
         // is nothing to attach to; skip rather than soft-link to a ghost id.
         if !node_id.is_empty() && !known.iter().any(|id| id == node_id) {
-            self.push_activity(format!("follow-ups from {node_id} skipped (its node is gone)"));
+            self.push_activity(format!(
+                "follow-ups from {node_id} skipped (its node is gone)"
+            ));
             return false;
         }
         let frontier: Vec<String> = self.plan_frontier().into_iter().map(|(id, _)| id).collect();
@@ -6097,11 +6274,7 @@ impl App {
         } else {
             self.plan_request.clone()
         };
-        let titles: Vec<String> = self
-            .planned_nodes
-            .iter()
-            .map(|n| n.title.clone())
-            .collect();
+        let titles: Vec<String> = self.planned_nodes.iter().map(|n| n.title.clone()).collect();
         self.record_decision(
             "Plan approved",
             &format!(
@@ -6162,13 +6335,11 @@ impl App {
         }
         if stopped {
             self.push_activity(
-                "orchestrator stopped: plan approved, workers are implementing the DAG"
-                    .to_string(),
+                "orchestrator stopped: plan approved, workers are implementing the DAG".to_string(),
             );
             self.dirty = true;
         }
     }
-
 
     /// Node ids of agents that have reached Merged. These satisfy hard deps and
     /// unblock dependents on the next scheduler pass.
@@ -6470,10 +6641,8 @@ impl App {
                         agent_id: Some(id.clone()),
                     });
                     self.start_conflict_resolution_agent();
-                    let resolver_running = self
-                        .agents
-                        .iter()
-                        .any(|r| r.id == id && r.merge_resolver);
+                    let resolver_running =
+                        self.agents.iter().any(|r| r.id == id && r.merge_resolver);
                     if resolver_running {
                         self.notice = Some(format!(
                             "conflict in {} — AI resolver integrating it",
@@ -6531,7 +6700,10 @@ impl App {
                     self.mark_agent_and_review_sources_merged(index, sources);
                 }
                 finalized_any = true;
-                self.notice = Some(format!("resolved conflict and merged {}", short_task(&label)));
+                self.notice = Some(format!(
+                    "resolved conflict and merged {}",
+                    short_task(&label)
+                ));
             } else {
                 // Conflicts still remain: drop back to manual. CRUCIALLY, skip it from
                 // auto-merge — otherwise (resolver flag now cleared, status still Done) the
@@ -6740,7 +6912,6 @@ impl App {
         ids
     }
 
-
     fn selected_terminal_mut(&mut self) -> Option<&mut TerminalPane> {
         self.agents
             .get_mut(self.selected_agent)
@@ -6928,6 +7099,10 @@ impl App {
             self.notice = Some("selected agent is already merged".to_string());
             return;
         }
+        if run.is_oneoff() {
+            self.notice = Some("one-off agent: merge disabled".to_string());
+            return;
+        }
         // A run is mergeable when it has a workspace path (jj workspace for new
         // runs, git worktree for legacy runs) or a legacy git branch.
         if run.worktree_path.is_none() && run.worktree_branch.is_none() {
@@ -6976,6 +7151,7 @@ impl App {
                 run.status == AgentStatus::Done
                     && (run.worktree_path.is_some() || run.worktree_branch.is_some())
                     && !run.is_main()
+                    && !run.is_oneoff()
                     && !claimed.contains(&run.id)
             })
             .collect();
@@ -7264,8 +7440,14 @@ impl App {
                     "Continue your task: {}. New direction: {new_goal}. Your prior edits are in this workspace; run `jj diff` to see them.",
                     run.task
                 );
-                let command =
-                    agent_command(backend, &run.model, run.effort, &prompt, AgentMode::Execute, sid.as_deref());
+                let command = agent_command(
+                    backend,
+                    &run.model,
+                    run.effort,
+                    &prompt,
+                    AgentMode::Execute,
+                    sid.as_deref(),
+                );
                 (command, None, sid)
             };
             (command, deliver_after, new_session, size, cwd, label)
@@ -7328,7 +7510,11 @@ impl App {
     /// picks it up on its next turn). Returns false if there is no live terminal
     /// (the caller can fall back to re-goal-via-resume).
     fn live_inject_at(&mut self, index: usize, text: &str) -> bool {
-        let result = match self.agents.get_mut(index).and_then(|run| run.terminal.as_mut()) {
+        let result = match self
+            .agents
+            .get_mut(index)
+            .and_then(|run| run.terminal.as_mut())
+        {
             Some(terminal) => {
                 terminal.reset_scrollback();
                 terminal.write_input(format!("{text}\r").as_bytes())
@@ -7503,8 +7689,8 @@ impl App {
         let model = self.agents[index].model.clone();
         let effort = self.agents[index].effort;
         let terminal_size = self.agents[index].terminal_size.unwrap_or_default();
-        let (operation, resolver_cwd, source_branch, worktree_path) = conflict_context
-            .unwrap_or((ConflictOperation::Merge, self.cwd.clone(), None, None));
+        let (operation, resolver_cwd, source_branch, worktree_path) =
+            conflict_context.unwrap_or((ConflictOperation::Merge, self.cwd.clone(), None, None));
         let session_id = mint_session_id_for(backend);
         let command = agent_command(
             backend,
@@ -7608,7 +7794,8 @@ impl App {
     fn conflict_resolution_prompt(&self) -> Option<String> {
         let prompt = self.conflict_prompt.as_ref()?;
         let files = if prompt.conflicted_files.is_empty() {
-            "(no specific conflicted files were reported; run the status command to find them)".to_string()
+            "(no specific conflicted files were reported; run the status command to find them)"
+                .to_string()
         } else {
             prompt
                 .conflicted_files
@@ -7819,6 +8006,7 @@ What to do\n\
     fn poll_agents(&mut self) {
         self.poll_task_summary_workers();
         self.poll_completion_summary_workers();
+        self.poll_dispatch_worker();
 
         if self.last_cloud_check.elapsed() >= Duration::from_secs(2) {
             let cloud = read_cloud_summary();
@@ -8030,7 +8218,10 @@ What to do\n\
                                 // complete via process exit only.
                                 let ready = !run.is_orchestrator()
                                     && visible_lines.as_ref().is_some_and(|lines| {
-                                        terminal_looks_ready_for_input_from_lines(run.backend, lines)
+                                        terminal_looks_ready_for_input_from_lines(
+                                            run.backend,
+                                            lines,
+                                        )
                                     });
                                 if ready {
                                     let since = *run.ready_since.get_or_insert_with(Instant::now);
@@ -8323,6 +8514,10 @@ fn disable_rudder_mouse_capture(stdout: &mut impl Write) -> Result<()> {
     Ok(())
 }
 
+fn command_rest<'a>(input: &'a str, command: &str) -> &'a str {
+    input.trim_start().strip_prefix(command).unwrap_or_default()
+}
+
 fn run_mouse_test(mode: &str) -> Result<()> {
     match mode {
         "raw" => run_mouse_test_raw(),
@@ -8591,7 +8786,10 @@ fn parse_transcript_final_text(raw: &str) -> Option<String> {
         }
         let message = value.get("message");
         if message.and_then(|m| m.get("role")).and_then(|r| r.as_str()) == Some("assistant") {
-            if let Some(blocks) = message.and_then(|m| m.get("content")).and_then(|c| c.as_array()) {
+            if let Some(blocks) = message
+                .and_then(|m| m.get("content"))
+                .and_then(|c| c.as_array())
+            {
                 for block in blocks {
                     if block.get("type").and_then(|t| t.as_str()) == Some("text") {
                         if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
@@ -8644,9 +8842,9 @@ fn parse_worker_done_block(output: &str) -> Option<serde_json::Value> {
 fn output_has_approve_marker(output: &str) -> bool {
     const MARKER: &str = "RUDDER_APPROVE_PLAN";
     let clean = strip_ansi_for_plan(output).replace('\r', "");
-    clean.lines().any(|line| {
-        line.trim().trim_matches('`').trim_matches('*').trim() == MARKER
-    })
+    clean
+        .lines()
+        .any(|line| line.trim().trim_matches('`').trim_matches('*').trim() == MARKER)
 }
 
 fn handle_event(app: &mut App, event: Event) -> bool {
@@ -8738,7 +8936,6 @@ struct ModelUsage {
     cache_creation_input_tokens: u64,
     cache_read_input_tokens: u64,
 }
-
 
 #[cfg(unix)]
 fn set_private_file_mode(path: &Path) {

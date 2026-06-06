@@ -882,6 +882,33 @@ wires this at the worker spawn sites (Execute/Main/ReviewAll/restart); headless 
 already used official signals: `claude -p --output-format stream-json` and `codex exec --json`
 (`turn.completed`) + process exit.
 
+### 14.4c Dispatch: one-off vs plan (`AgentMode::OneOff` + the Haiku dispatcher)
+Not every typed task wants the whole DAG. A FRESH task (no active plan) routes through a
+LIGHT Haiku classifier before the planner:
+- **`begin_dispatch`** (start_task_from_input default branch) sets `dispatch_pending` and
+  spawns `spawn_dispatch_worker` (tasks.rs) — a detached thread that runs
+  `claude -p --model claude-haiku-4-5-20251001` (`TASK_SUMMARY_MODEL`, via
+  `claude_program()` so `RUDDER_CLAUDE_BIN` works in tests) with a one-word classification
+  prompt → `DispatchResult { task, intent }` over an mpsc channel. The subprocess is bounded
+  by `dispatch_classifier_timeout()`; timeout, no claude, non-zero, unparseable output, or a
+  leading `/goal` all fall back to **Plan**, the established path, so dispatch never leaves
+  `dispatch_pending` stuck and never misroutes to an uncancellable one-off.
+- **`poll_dispatch_worker`** (in poll_agents) routes the result: `Plan` →
+  `start_rudder_plan_task` (the orchestrator); `OneOff` → `start_oneoff_task`.
+- **`start_oneoff_task`** spawns a single conversational **`AgentMode::OneOff`** agent in the
+  MAIN checkout (`create_oneoff_agent`, cwd = repo root, NO jj worktree, NO `node_id`), with
+  `oneoff_prompt` (no `/goal`, no `rudder done`, "edit directly; escalate to the planner if
+  it's big") + bypassPermissions tools. Keys forward to its PTY (converse). It is explicitly
+  excluded from selected merge / merge-all / review-all, and implicitly excluded from
+  auto-merge / graph-mirror / scheduler by `node_id`/Execute gates; `mark_run_done` just marks
+  it Done (no merge). It lives in its own **`Bucket::OneOff`** list section (`status_bucket`
+  returns `OneOff` for it; leads `Bucket::ORDER`).
+- **Overrides** (handle_command): `/ask <text>` forces one-off (skip classify); `/plan <text>`
+  forces the orchestrator planner (re-purposed from the retired no-op). Both skip the Haiku call.
+- The classifier is always Claude Haiku (a meta-decision) regardless of the user's backend;
+  the spawned one-off uses the user's backend. A Codex-only user without `claude` always gets
+  Plan from auto-dispatch but can still `/ask` to force a Codex one-off.
+
 ### 14.5 Conductor capabilities (BUILT vs PLANNED)
 - **Auto-expand from completion** (BUILT). A finished worker reports via **`rudder
   done`**, and `maybe_ingest_worker_followups` → `ingest_worker_followups` →

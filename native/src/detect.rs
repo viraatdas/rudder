@@ -45,7 +45,10 @@ pub(crate) fn mark_run_done(run: &mut AgentRun) {
     }
 }
 
-pub(crate) fn terminal_looks_ready_for_input_from_lines(backend: Backend, lines: &[String]) -> bool {
+pub(crate) fn terminal_looks_ready_for_input_from_lines(
+    backend: Backend,
+    lines: &[String],
+) -> bool {
     if terminal_needs_permission_from_lines(lines) {
         return false;
     }
@@ -399,4 +402,3 @@ pub(crate) fn contains_word(text: &str, word: &str) -> bool {
     text.split(|ch: char| !ch.is_ascii_alphanumeric())
         .any(|part| part == word)
 }
-

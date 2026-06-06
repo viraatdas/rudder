@@ -50,7 +50,7 @@ pub(crate) fn codex_resume_command(run: &AgentRun, session_id: &str) -> Terminal
     args.push("--enable".to_string());
     args.push("goals".to_string());
     match run.mode {
-        AgentMode::Execute | AgentMode::ReviewAll | AgentMode::Main => {
+        AgentMode::Execute | AgentMode::ReviewAll | AgentMode::Main | AgentMode::OneOff => {
             args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
         }
         AgentMode::Plan | AgentMode::RudderPlan => {
@@ -115,12 +115,17 @@ pub(crate) fn rudder_plan_refine_command(
             args.push("--resume".to_string());
             args.push(session_id.to_string());
             args.push(feedback_prompt.to_string());
-            TerminalCommand::with_args(claude_program(), args).with_env("CLAUDE_CODE_NO_FLICKER", "0")
+            TerminalCommand::with_args(claude_program(), args)
+                .with_env("CLAUDE_CODE_NO_FLICKER", "0")
         }
         Backend::Codex => {
             // `codex exec resume [OPTIONS] <SESSION_ID> [PROMPT]`. No --sandbox here:
             // it inherits the read-only sandbox from the resumed session.
-            let mut args = vec!["exec".to_string(), "resume".to_string(), "--json".to_string()];
+            let mut args = vec![
+                "exec".to_string(),
+                "resume".to_string(),
+                "--json".to_string(),
+            ];
             push_codex_rudder_config_overrides(&mut args, effort);
             if !model.trim().is_empty() {
                 args.push("-m".to_string());
@@ -157,14 +162,17 @@ pub(crate) fn agent_command(
                 Some(execution_prompt(task))
             }
         }
+        AgentMode::OneOff => Some(oneoff_prompt(task)),
     };
     match backend {
         Backend::Claude => {
             let mut args = match mode {
-                AgentMode::Execute | AgentMode::ReviewAll | AgentMode::Main => vec![
-                    "--permission-mode".to_string(),
-                    "bypassPermissions".to_string(),
-                ],
+                AgentMode::Execute | AgentMode::ReviewAll | AgentMode::Main | AgentMode::OneOff => {
+                    vec![
+                        "--permission-mode".to_string(),
+                        "bypassPermissions".to_string(),
+                    ]
+                }
                 // The orchestrator is a read-only DECOMPOSER, not a Claude plan-mode
                 // session. Plan mode was tried (1.16.0) and reverted: it is SLOWER (an
                 // extra ToolSearch/ExitPlanMode round-trip + a plan-file write) and HIDES
@@ -239,7 +247,8 @@ pub(crate) fn agent_command(
             if let Some(prompt) = prompt {
                 args.push(prompt);
             }
-            TerminalCommand::with_args(claude_program(), args).with_env("CLAUDE_CODE_NO_FLICKER", "0")
+            TerminalCommand::with_args(claude_program(), args)
+                .with_env("CLAUDE_CODE_NO_FLICKER", "0")
         }
         Backend::Codex => {
             // The orchestrator runs non-interactively via `codex exec` (read-only):
@@ -269,7 +278,7 @@ pub(crate) fn agent_command(
             args.push("--enable".to_string());
             args.push("goals".to_string());
             match mode {
-                AgentMode::Execute | AgentMode::ReviewAll | AgentMode::Main => {
+                AgentMode::Execute | AgentMode::ReviewAll | AgentMode::Main | AgentMode::OneOff => {
                     args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
                 }
                 AgentMode::Plan | AgentMode::RudderPlan => {
@@ -297,7 +306,10 @@ pub(crate) fn agent_command(
     }
 }
 
-pub(crate) fn push_codex_rudder_config_overrides(args: &mut Vec<String>, effort: Option<EffortLevel>) {
+pub(crate) fn push_codex_rudder_config_overrides(
+    args: &mut Vec<String>,
+    effort: Option<EffortLevel>,
+) {
     // Rudder workers run Codex as a child process, so do not inherit desktop-app
     // notification hooks that expect the official signed app launch chain.
     args.push("-c".to_string());
