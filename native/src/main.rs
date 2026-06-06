@@ -600,6 +600,10 @@ struct AgentRun {
     last_output_at: Instant,
     completed_at: Option<Instant>,
     autosteered: bool,
+    /// True only for a Claude orchestrator launched as a live interactive PTY. Headless
+    /// planners also use `AgentMode::RudderPlan`, so this must not be inferred from
+    /// `autosteered` once a plan is captured.
+    interactive_orchestrator: bool,
     needs_permission: bool,
     permission_notified: bool,
     needs_user_input: bool,
@@ -994,12 +998,11 @@ impl App {
         })
     }
 
-    fn is_interactive_orchestrator_run(&self, run: &AgentRun) -> bool {
-        self.interactive_orchestrator
-            && run.is_orchestrator()
+    pub(crate) fn is_interactive_orchestrator_run(&self, run: &AgentRun) -> bool {
+        run.is_orchestrator()
             && !run.reconcile_planner
             && run.backend == Backend::Claude
-            && !run.autosteered
+            && run.interactive_orchestrator
     }
 
     fn has_running_interactive_orchestrator(&self) -> bool {
@@ -1106,7 +1109,7 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('g') {
             self.nav_mode = !self.nav_mode;
             self.notice = Some(if self.nav_mode {
-                "nav mode: 1 agents  2 worker  v review  R review-all  M merge-all  Esc exits"
+                "nav mode: 1 agents  2 worker  3 task  v review  R review-all  M merge-all  Esc exits"
                     .to_string()
             } else {
                 "worker input restored".to_string()
@@ -1114,11 +1117,14 @@ impl App {
             return false;
         }
 
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('w') {
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && key.code == KeyCode::Char('w')
+            && (self.focus != FocusPane::Task || self.task_input.is_empty())
+        {
             self.leader_pending = true;
             self.nav_mode = false;
             self.notice = Some(
-                "Ctrl+W: Tab cycle  1/2 panes  v review  m merge  R review-all  M merge-all  Esc cancels"
+                "Ctrl+W: Tab cycle  1/2/3 panes  v review  m merge  R review-all  M merge-all  Esc cancels"
                     .to_string(),
             );
             return false;
@@ -3206,6 +3212,7 @@ impl App {
             last_output_at: Instant::now(),
             completed_at: None,
             autosteered: true,
+            interactive_orchestrator: false,
             needs_permission: false,
             permission_notified: false,
             needs_user_input: false,
@@ -3374,6 +3381,7 @@ impl App {
             last_output_at: Instant::now(),
             completed_at: None,
             autosteered: false,
+            interactive_orchestrator: false,
             needs_permission: false,
             permission_notified: false,
             needs_user_input: false,
@@ -3471,6 +3479,7 @@ impl App {
             last_output_at: Instant::now(),
             completed_at: None,
             autosteered: true,
+            interactive_orchestrator: false,
             needs_permission: false,
             permission_notified: false,
             needs_user_input: false,
@@ -3514,19 +3523,6 @@ impl App {
         if let Some(run) = self.agents.get(self.selected_agent) {
             let _ = save_native_run_record(&self.cwd, run);
         }
-    }
-
-    #[cfg(test)]
-    fn ensure_default_orchestrator(&mut self) {
-        if !self.interactive_orchestrator
-            || self
-                .agents
-                .iter()
-                .any(|run| run.is_orchestrator() && run.status == AgentStatus::Running)
-        {
-            return;
-        }
-        self.start_rudder_plan_task("");
     }
 
     fn start_rudder_plan_task(&mut self, input: &str) {
@@ -3614,6 +3610,7 @@ impl App {
             last_output_at: Instant::now(),
             completed_at: None,
             autosteered: true,
+            interactive_orchestrator: interactive_planner,
             needs_permission: false,
             permission_notified: false,
             needs_user_input: false,
@@ -3636,8 +3633,10 @@ impl App {
 
         // INTERACTIVE orchestrator: it never exits and presents its DAG via RUDDER.md, so
         // it is NOT autosteered (the headless completed-plan capture must not fire).
-        // Generate project-level Claude skills before spawn so dashboard actions are
-        // also available inside this Claude Code session.
+        // Clear stale one-shot markers before spawn so a RUDDER_* action left in
+        // RUDDER.md while no orchestrator was running cannot fire under this new,
+        // unrelated planner. Generate project-level Claude skills before spawn so
+        // dashboard actions are also available inside this Claude Code session.
         if interactive_planner {
             run.autosteered = false;
             if let Err(error) = clear_orchestrator_plan_markers(&self.cwd) {
@@ -3958,6 +3957,7 @@ impl App {
                 run.completed_at = None;
                 run.last_output_at = Instant::now();
                 run.autosteered = true;
+                run.interactive_orchestrator = false;
                 run.needs_permission = false;
                 run.permission_notified = false;
                 run.needs_user_input = false;
@@ -4462,13 +4462,17 @@ impl App {
 
         let prompt = run.task.clone();
         let session_id = mint_session_id_for(run.backend);
-        let mut command = agent_command(
+        let orchestrator_interactive = run.mode == AgentMode::RudderPlan
+            && run.backend == Backend::Claude
+            && run.interactive_orchestrator;
+        let mut command = agent_command_with_orchestrator_mode(
             run.backend,
             &run.model,
             run.effort,
             &prompt,
             run.mode,
             session_id.as_deref(),
+            orchestrator_interactive,
         );
         signals::augment_worker_command(&mut command, run.backend, run.mode, &run.id);
         let options = TerminalPaneOptions {
@@ -4485,7 +4489,10 @@ impl App {
                 run.session_id = session_id;
                 run.completed_at = None;
                 run.last_output_at = Instant::now();
-                run.autosteered = matches!(run.mode, AgentMode::Plan | AgentMode::RudderPlan);
+                run.autosteered =
+                    matches!(run.mode, AgentMode::Plan | AgentMode::RudderPlan)
+                        && !orchestrator_interactive;
+                run.interactive_orchestrator = orchestrator_interactive;
                 run.needs_permission = false;
                 run.permission_notified = false;
                 run.needs_user_input = false;
@@ -5009,6 +5016,7 @@ impl App {
             last_output_at: Instant::now(),
             completed_at: None,
             autosteered: true,
+            interactive_orchestrator: false,
             needs_permission: false,
             permission_notified: false,
             needs_user_input: false,
@@ -5206,18 +5214,13 @@ impl App {
     /// plan (d on the orchestrator), or approves (Enter) to launch. The planner run
     /// is KEPT as the pinned orchestrator that owns the plan (its worker pane
     /// renders the DAG view); we clear `autosteered` so it is captured once.
-    /// INTERACTIVE orchestrator (opt-in) capture: read the DAG the orchestrator wrote to
+    /// INTERACTIVE orchestrator capture: read the DAG the orchestrator wrote to
     /// its plan file and present it at the approval gate, reusing the SAME
-    /// planned_nodes/awaiting_approval machinery as the headless flow. Captures the first
-    /// DAG (then `awaiting_approval` / launched workers guard against re-capturing the same
-    /// file every poll); re-planning after launch is a later step. No-op unless the flag is
-    /// set, so the headless flow is untouched by default.
+    /// planned_nodes/awaiting_approval machinery as the headless flow. The per-run
+    /// `interactive_orchestrator` flag is authoritative for persisted rows; the App
+    /// env setting only chooses the mode for fresh launches.
     fn maybe_capture_orchestrator_plan(&mut self) {
-        if !self.interactive_orchestrator
-            || self.refining
-            || self.rebasing
-            || self.awaiting_approval
-        {
+        if self.refining || self.rebasing || self.awaiting_approval {
             return;
         }
         // Only capture a FRESH plan: nothing pending and no workers launched yet.
@@ -5259,11 +5262,7 @@ impl App {
     /// Skips when the approval marker is present (scan_orchestrator_markers owns that), and
     /// no-ops once any worker has launched (post-approval the orchestrator is stopped).
     fn maybe_recapture_orchestrator_plan(&mut self) {
-        if !self.interactive_orchestrator
-            || !self.awaiting_approval
-            || self.refining
-            || self.rebasing
-        {
+        if !self.awaiting_approval || self.refining || self.rebasing {
             return;
         }
         if self.agents.iter().any(|run| run.node_id.is_some()) {
@@ -5307,13 +5306,9 @@ impl App {
     /// markdown / partial-read fragility). FALLBACK: the marker printed in the orchestrator
     /// PTY (the lossy channel, kept only as a backstop). `approve_planned_queue` is idempotent
     /// (early-returns when !awaiting_approval and flips it false on success), so the signal
-    /// re-seen on every poll approves EXACTLY once. Gated off in the default headless flow.
+    /// re-seen on every poll approves EXACTLY once. Gated by the per-run interactive flag.
     fn scan_orchestrator_markers(&mut self) {
-        if !self.interactive_orchestrator
-            || !self.awaiting_approval
-            || self.refining
-            || self.rebasing
-        {
+        if !self.awaiting_approval || self.refining || self.rebasing {
             return;
         }
         if !self.has_running_interactive_orchestrator() {
@@ -5337,7 +5332,7 @@ impl App {
     }
 
     fn scan_orchestrator_skill_markers(&mut self) {
-        if !self.interactive_orchestrator || self.refining || self.rebasing {
+        if self.refining || self.rebasing {
             return;
         }
         if !self.has_running_interactive_orchestrator() {
@@ -6464,16 +6459,13 @@ impl App {
     /// decomposer (autosteered; it exits on its own) and for reconcile planners (the
     /// short-lived fold runs that must keep running to update the plan).
     fn stop_orchestrator_after_approval(&mut self) {
-        if !self.interactive_orchestrator {
-            return;
-        }
         let cwd = self.cwd.clone();
         let mut stopped = false;
         for run in self.agents.iter_mut() {
             if run.mode != AgentMode::RudderPlan
                 || run.reconcile_planner
                 || run.backend != Backend::Claude
-                || run.autosteered
+                || !run.interactive_orchestrator
                 || run.status != AgentStatus::Running
             {
                 continue;
@@ -9030,7 +9022,7 @@ fn clear_orchestrator_plan_markers(repo_root: &Path) -> Result<()> {
             in_plan_block = true;
             continue;
         }
-        if line_is_approve_marker(line) {
+        if line_is_approve_marker(line) || is_orchestrator_skill_marker(trimmed) {
             changed = true;
             continue;
         }

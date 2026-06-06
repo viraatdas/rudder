@@ -682,6 +682,13 @@ fn task_input_word_navigation_and_delete_respects_cursor() {
     assert_eq!(app.task_input, "fix the ");
     app.handle_task_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
     assert_eq!(app.task_input, "fix the");
+
+    app.task_input = "fix auth login".to_string();
+    app.task_cursor = app.task_input.chars().count();
+    app.focus = FocusPane::Task;
+    app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+    assert_eq!(app.task_input, "fix auth ");
+    assert!(!app.leader_pending, "Ctrl-W edits text in the task pane");
 }
 
 #[test]
@@ -3648,6 +3655,7 @@ fn test_agent_run(id: &str, task: &str) -> AgentRun {
         last_output_at: Instant::now(),
         completed_at: None,
         autosteered: false,
+        interactive_orchestrator: false,
         needs_permission: false,
         permission_notified: false,
         needs_user_input: false,
@@ -3736,6 +3744,69 @@ fn resume_commands_reuse_saved_session_ids() {
         .args
         .iter()
         .any(|arg| arg == "019e297b-12fe-79e2-a8f8-33ba41e5fdd4"));
+}
+
+#[cfg(not(windows))]
+#[test]
+fn restart_preserves_interactive_orchestrator_profile_from_run_record() {
+    // A persisted interactive orchestrator row is authoritative even if the current
+    // process default says future planners should be headless.
+    let _env = env_guard();
+    let repo = unique_test_repo("restart-interactive-orch");
+    let fake = repo.join("fake-claude.sh");
+    let args_file = repo.join("claude-args.txt");
+    write_fake_bin(
+        &fake,
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\nsleep 2\n",
+            shell_single_quote(&args_file.to_string_lossy())
+        ),
+    );
+    std::env::set_var("RUDDER_INTERACTIVE_ORCHESTRATOR", "0");
+    std::env::set_var("RUDDER_CLAUDE_BIN", &fake);
+
+    let mut app = App::new();
+    app.cwd = repo.clone();
+    app.interactive_orchestrator = false;
+    let mut run = test_agent_run("orch-1", "plan it");
+    run.cwd = repo.clone();
+    run.mode = AgentMode::RudderPlan;
+    run.backend = Backend::Claude;
+    run.status = AgentStatus::Stopped;
+    run.autosteered = false;
+    run.interactive_orchestrator = true;
+    run.terminal = None;
+    app.agents.push(run);
+    app.selected_agent = 0;
+
+    app.restart_selected_agent();
+    let restarted = app.agents.first().expect("restarted row");
+    assert_eq!(restarted.status, AgentStatus::Running);
+    assert!(restarted.interactive_orchestrator);
+    assert!(
+        !restarted.autosteered,
+        "interactive orchestrators must not restart as headless/autosteered planners"
+    );
+
+    for _ in 0..40 {
+        if args_file.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let args = fs::read_to_string(&args_file).expect("fake claude recorded args");
+    assert!(
+        args.contains("--append-system-prompt") && args.contains("rudder-orchestrator"),
+        "restart used the interactive orchestrator command profile, not current env:\n{args}"
+    );
+    assert!(
+        !args.lines().any(|arg| arg == "-p"),
+        "interactive restart must not use headless print-mode args:\n{args}"
+    );
+
+    std::env::remove_var("RUDDER_CLAUDE_BIN");
+    std::env::remove_var("RUDDER_INTERACTIVE_ORCHESTRATOR");
+    let _ = fs::remove_dir_all(&repo);
 }
 
 #[test]
@@ -4136,6 +4207,7 @@ fn delete_agent_requires_second_d() {
         last_output_at: Instant::now(),
         completed_at: Some(Instant::now()),
         autosteered: false,
+        interactive_orchestrator: false,
         needs_permission: false,
         permission_notified: false,
         needs_user_input: false,
@@ -5257,6 +5329,7 @@ fn orchestrator_skill_markers_are_consumed_once() {
     orch.mode = AgentMode::RudderPlan;
     orch.backend = Backend::Claude;
     orch.autosteered = false;
+    orch.interactive_orchestrator = true;
     orch.status = AgentStatus::Running;
     app.agents.push(orch);
 
@@ -5316,7 +5389,7 @@ fn interactive_default_preserves_codex_planner_backend() {
 
 #[cfg(not(windows))]
 #[test]
-fn default_orchestrator_replaces_only_stopped_rows() {
+fn fresh_plan_retires_stale_orchestrator_rows() {
     let _env = env_guard();
     let repo = unique_test_repo("orch-stopped-default");
     let fake = repo.join("fake-claude.sh");
@@ -5336,7 +5409,7 @@ fn default_orchestrator_replaces_only_stopped_rows() {
     old.status = AgentStatus::Stopped;
     app.agents.push(old);
 
-    app.ensure_default_orchestrator();
+    app.start_rudder_plan_task("new plan");
 
     let orchestrators: Vec<&AgentRun> =
         app.agents.iter().filter(|run| run.is_orchestrator()).collect();
@@ -5362,7 +5435,7 @@ fn fresh_interactive_orchestrator_clears_stale_plan_markers() {
     std::env::set_var("RUDDER_CLAUDE_BIN", &fake);
     fs::write(
         orchestrator_plan_path(&repo),
-        "before\nRUDDER_PLAN_TASKS_START\n{\"tasks\":[{\"id\":\"old\",\"title\":\"old\",\"prompt\":\"p\",\"goal\":\"g\",\"success\":\"s\",\"deps\":[]}]}\nRUDDER_PLAN_TASKS_END\n\nRUDDER_APPROVE_PLAN\nafter\n",
+        "before\nRUDDER_PLAN_TASKS_START\n{\"tasks\":[{\"id\":\"old\",\"title\":\"old\",\"prompt\":\"p\",\"goal\":\"g\",\"success\":\"s\",\"deps\":[]}]}\nRUDDER_PLAN_TASKS_END\n\nRUDDER_APPROVE_PLAN\nRUDDER_AUTOMERGE on\nRUDDER_MERGE_ALL\nafter\n",
     )
     .unwrap();
 
@@ -5378,6 +5451,8 @@ fn fresh_interactive_orchestrator_clears_stale_plan_markers() {
     assert!(!text.contains("RUDDER_PLAN_TASKS_START"));
     assert!(!text.contains("RUDDER_PLAN_TASKS_END"));
     assert!(!output_has_approve_marker(&text));
+    assert!(!text.contains("RUDDER_AUTOMERGE"));
+    assert!(!text.contains("RUDDER_MERGE_ALL"));
     assert!(text.contains("before") && text.contains("after"));
 
     std::env::remove_var("RUDDER_CLAUDE_BIN");
@@ -5481,6 +5556,8 @@ fn interactive_orchestrator_self_launches_on_approve_marker() {
     let mut orch = test_agent_run("orch-1", "plan it");
     orch.cwd = repo.clone();
     orch.mode = AgentMode::RudderPlan;
+    orch.backend = Backend::Claude;
+    orch.interactive_orchestrator = true;
     orch.terminal = Some(pane);
     app.agents.push(orch);
 
@@ -5531,6 +5608,7 @@ fn interactive_orchestrator_self_launches_from_plan_file_marker() {
     orch.mode = AgentMode::RudderPlan;
     orch.backend = Backend::Claude;
     orch.autosteered = false;
+    orch.interactive_orchestrator = true;
     orch.status = AgentStatus::Running;
     app.agents.push(orch);
 
@@ -5573,6 +5651,8 @@ fn orchestrator_recaptures_dag_edits_before_launch() {
     orch.cwd = repo.clone();
     orch.mode = AgentMode::RudderPlan;
     orch.status = AgentStatus::Running;
+    orch.backend = Backend::Claude;
+    orch.interactive_orchestrator = true;
     app.agents.push(orch);
 
     fs::create_dir_all(repo.join(".rudder")).unwrap();
@@ -5647,6 +5727,8 @@ fn approval_stops_the_orchestrator_and_mirrors_graph() {
     let mut orch = test_agent_run("orch-1", "plan it");
     orch.cwd = repo.clone();
     orch.mode = AgentMode::RudderPlan;
+    orch.backend = Backend::Claude;
+    orch.interactive_orchestrator = true;
     orch.terminal = Some(pane);
     app.agents.push(orch);
 
@@ -5750,6 +5832,8 @@ fn stopped_orchestrator_renders_handoff_banner() {
     let mut orch = test_agent_run("orch-1", "plan the work");
     orch.mode = AgentMode::RudderPlan;
     orch.status = AgentStatus::Stopped;
+    orch.backend = Backend::Claude;
+    orch.interactive_orchestrator = true;
     orch.terminal = None;
     app.agents.push(orch);
     // Two workers implementing nodes (Running, with node_id).
@@ -8111,6 +8195,73 @@ fn reconcile_planner_flag_survives_save_and_reload() {
     assert!(
         !legacy_run.reconcile_planner,
         "a record without the field loads as the real planner"
+    );
+
+    let _ = fs::remove_dir_all(&repo);
+}
+
+#[test]
+fn interactive_orchestrator_flag_survives_save_and_reload() {
+    let repo = unique_test_repo("interactive-orch-roundtrip");
+    let mut run = planner_run("orch-1", false);
+    run.backend = Backend::Claude;
+    run.autosteered = false;
+    run.interactive_orchestrator = true;
+    save_native_run_record(&repo, &run).expect("save interactive orchestrator");
+
+    let raw =
+        fs::read_to_string(native_run_dir(&repo, "orch-1").join("run.json")).expect("read run.json");
+    let value: serde_json::Value = serde_json::from_str(&raw).expect("parse run.json");
+    assert_eq!(
+        value
+            .get("interactiveOrchestrator")
+            .and_then(|value| value.as_bool()),
+        Some(true),
+        "the renderer discriminator is persisted"
+    );
+    let reloaded = agent_from_run_record(&repo, value).expect("reload run");
+    assert!(
+        reloaded.interactive_orchestrator,
+        "interactive orchestrator survives the round-trip"
+    );
+    let mut app = App::new();
+    app.cwd = repo.clone();
+    app.interactive_orchestrator = false;
+    let mut running = reloaded;
+    running.status = AgentStatus::Running;
+    app.agents.push(running);
+    assert!(
+        app.is_interactive_orchestrator_run(&app.agents[0]),
+        "the persisted row flag is authoritative even when the current launch default is headless"
+    );
+    fs::create_dir_all(repo.join(".rudder")).unwrap();
+    fs::write(
+        orchestrator_plan_path(&repo),
+        "# Plan\nRUDDER_PLAN_TASKS_START\n{\"tasks\":[{\"id\":\"n0\",\"title\":\"persisted\",\"prompt\":\"p\",\"goal\":\"g\",\"success\":\"s\",\"deps\":[]}]}\nRUDDER_PLAN_TASKS_END\n",
+    )
+    .unwrap();
+    app.maybe_capture_orchestrator_plan();
+    assert!(
+        app.awaiting_approval && app.planned_nodes.len() == 1,
+        "persisted interactive rows still capture their plan file after an env/default change"
+    );
+
+    let mut headless = planner_run("headless-1", false);
+    headless.backend = Backend::Claude;
+    headless.autosteered = true;
+    headless.interactive_orchestrator = false;
+    save_native_run_record(&repo, &headless).expect("save headless planner");
+    let raw = fs::read_to_string(native_run_dir(&repo, "headless-1").join("run.json"))
+        .expect("read headless run.json");
+    let reloaded = agent_from_run_record(
+        &repo,
+        serde_json::from_str(&raw).expect("parse headless run.json"),
+    )
+    .expect("reload headless");
+    assert!(reloaded.autosteered, "headless capture flag survives reload");
+    assert!(
+        !reloaded.interactive_orchestrator,
+        "headless planner does not reload as interactive"
     );
 
     let _ = fs::remove_dir_all(&repo);

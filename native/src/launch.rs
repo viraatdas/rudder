@@ -506,6 +506,7 @@ pub(crate) fn review_all_run(
         last_output_at: Instant::now(),
         completed_at: None,
         autosteered: false,
+        interactive_orchestrator: false,
         needs_permission: false,
         permission_notified: false,
         needs_user_input: false,

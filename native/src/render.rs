@@ -732,10 +732,10 @@ fn render_planned_section<'a>(
         Span::styled(format!(" {}", nodes.len()), muted_style(focused)),
     ])));
     // APPROVAL GATE hint: while the plan awaits approval nothing has launched yet;
-    // the user refines it by talking to the orchestrator or approves in that chat.
+    // the user refines in the task pane or approves with an empty Enter.
     if awaiting_approval {
         lines.push(ListItem::new(Line::from(Span::styled(
-            "  refine in orchestrator chat  ·  approve there to launch",
+            "  type below to refine  ·  empty Enter approves",
             Style::default().fg(ACCENT),
         ))));
     }
@@ -1993,7 +1993,7 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
             )));
             if app.awaiting_approval {
                 dag.push(Line::from(Span::styled(
-                    "chat to refine  ·  Enter to approve & launch",
+                    "type below to refine  ·  Enter to approve & launch",
                     Style::default().fg(ACCENT),
                 )));
             }
@@ -2499,7 +2499,7 @@ pub(crate) fn render_interactive_orchestrator(frame: &mut Frame<'_>, area: Rect,
         dag_lines = orchestrator_dag_tree_lines(app, &tasks);
         if app.awaiting_approval {
             dag_lines.push(Line::from(Span::styled(
-                "awaiting approval — tell the orchestrator to launch",
+                "awaiting approval — press empty Enter in the task pane to launch",
                 Style::default().fg(ACCENT),
             )));
         }

@@ -244,6 +244,7 @@ pub(crate) fn create_main_agent(
         last_output_at: Instant::now(),
         completed_at: None,
         autosteered: false,
+        interactive_orchestrator: false,
         needs_permission: false,
         permission_notified: false,
         needs_user_input: false,
@@ -477,6 +478,30 @@ pub(crate) fn agent_from_run_record(
         }
     }
 
+    let autosteered = record
+        .get("autoSteer")
+        .and_then(|value| value.get("count"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
+        > 0;
+    let reconcile_planner = record
+        .get("reconcilePlanner")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let interactive_orchestrator = record
+        .get("interactiveOrchestrator")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or_else(|| {
+            // Back-compat for records written before `interactiveOrchestrator` existed:
+            // interactive Claude orchestrators were non-autosteered and stayed running
+            // (or stopped after approval). Headless planners generally complete/exit.
+            mode == AgentMode::RudderPlan
+                && backend == Backend::Claude
+                && !reconcile_planner
+                && !autosteered
+                && matches!(status, AgentStatus::Running | AgentStatus::Stopped)
+        });
+
     Some(AgentRun {
         id,
         created_at,
@@ -503,7 +528,8 @@ pub(crate) fn agent_from_run_record(
         review_error: None,
         last_output_at: Instant::now(),
         completed_at: None,
-        autosteered: false,
+        autosteered,
+        interactive_orchestrator,
         needs_permission: false,
         permission_notified: false,
         needs_user_input: false,
@@ -520,10 +546,7 @@ pub(crate) fn agent_from_run_record(
         // A reconcile planner is a TRANSIENT row that should never reload as a pinned
         // orchestrator. Read the persisted discriminator (absent in old records →
         // false, the real planner); load_persisted_agents filters true ones out.
-        reconcile_planner: record
-            .get("reconcilePlanner")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false),
+        reconcile_planner,
         plan_stream: None,
         last_worker_input_at: None,
         ready_since: None,
@@ -649,6 +672,7 @@ pub(crate) fn save_native_run_record(repo_root: &Path, run: &AgentRun) -> Result
         // identifiable on reload and filtered out instead of resurfacing as a second
         // orchestrator. Absent in old records → defaults to false (the real planner).
         "reconcilePlanner": run.reconcile_planner,
+        "interactiveOrchestrator": run.interactive_orchestrator,
         "task": run.task,
         "taskSummary": run.task_summary,
         "backend": run.backend.as_str(),
