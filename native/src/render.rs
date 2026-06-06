@@ -10,6 +10,17 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
     // terminal background, and bare text inherits the ink fg.
     frame.render_widget(Block::default().style(app_style()), area);
 
+    let task_height = task_pane_height(app, area.width);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(8),
+            Constraint::Length(1),
+            Constraint::Length(task_height),
+        ])
+        .split(area);
+
     let main = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -17,15 +28,18 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
             Constraint::Length(1),
             Constraint::Min(42),
         ])
-        .split(area);
+        .split(rows[0]);
 
     app.agents_area = Some(main[0]);
     app.worker_area = Some(main[2]);
-    app.task_area = None;
+    app.task_area = Some(rows[2]);
 
     render_agents(frame, main[0], app);
     render_gutter(frame, main[1], Gutter::Vertical);
     render_worker(frame, main[2], app);
+    render_gutter(frame, rows[1], Gutter::Horizontal);
+    render_task(frame, rows[2], app);
+    render_suggestions(frame, rows[2], app);
     render_cloud_prompt(frame, area, app);
     render_merge_prompt(frame, area, app);
     render_mouse_debug(frame, area, app);
@@ -2577,7 +2591,11 @@ pub(crate) fn render_worker(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     // transcript while planning (its raw PTY is now JSON events, not human text), and
     // the DAG tree once a plan is ready. Both phases are rendered by render_orchestrator.
     if app.worker_view == WorkerView::Terminal && selected_is_orchestrator {
-        if app.interactive_orchestrator {
+        let selected_is_interactive_orchestrator = app
+            .agents
+            .get(app.selected_agent)
+            .is_some_and(|run| app.is_interactive_orchestrator_run(run));
+        if selected_is_interactive_orchestrator {
             // Opt-in: the orchestrator is a normal interactive Claude PTY the user talks
             // to, with the DAG it wrote to its plan file rendered in a pane ABOVE it.
             render_interactive_orchestrator(frame, area, app);
@@ -2825,13 +2843,13 @@ pub(crate) fn review_lines(app: &mut App, height: usize) -> Vec<Line<'static>> {
 /// disagree and clicks on valid input rows get rejected.
 pub(crate) fn task_default_hint(app: &App) -> &'static str {
     if app.planner_paused_for_input {
-        "↳ the planner asked a question — answer in the orchestrator pane"
+        "↳ the planner asked a question — answer here or in the orchestrator pane"
     } else if app.awaiting_approval {
-        "refine or approve in the orchestrator pane  ·  Option-1/2 or ^W pane"
+        "type to refine the plan, or press Enter to approve  ·  Option-1/2/3 or ^W pane"
     } else if app.plan_is_active() {
         "type a task to add it to the running plan (shows up in the orchestrator DAG)  ·  ^W pane"
     } else {
-        "talk to the orchestrator to plan + run  ·  Option-1/2 or ^W pane"
+        "type a task to route one-off vs plan  ·  Option-1/2/3 or ^W pane"
     }
 }
 

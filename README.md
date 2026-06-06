@@ -82,6 +82,8 @@ to `~/.rudder/config.json`.
 │ agents        │ worker                                       │
 │ task list     │ live Claude Code or Codex terminal           │
 │ status/model  │ DAG-over-orchestrator, scrollback, review    │
+├───────────────┴────────────────────────────────────────────┤
+│ task input: route one-off vs plan, slash commands, refine   │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -90,8 +92,10 @@ to `~/.rudder/config.json`.
   your keystrokes go straight to the agent, so its prompts, slash commands,
   selection, and `Tab` all work normally.
 - **orchestrator** (right, when selected): a Claude Code PTY with the live DAG
-  rendered above it. Talk to it to plan, refine, approve, and run former task-bar
-  actions through Rudder skills.
+  rendered above it. For planned work, use it to inspect/refine the plan while
+  the bottom task input remains the primary place to type new requests.
+- **task** (bottom): the entry point for fresh requests, slash commands, plan
+  refinements, and approval with empty `Enter`.
 
 Mouse wheel and trackpad scroll the pane under the pointer. Over the worker or
 review pane they scroll Rudder's captured scrollback.
@@ -102,12 +106,12 @@ review pane they scroll Rudder's captured scrollback.
 
 | Key | Action |
 | --- | --- |
-| `Option-1` / `Option-2` | Focus the agents or worker pane |
+| `Option-1` / `Option-2` / `Option-3` | Focus the agents, worker, or task pane |
 | `Option-v` | Toggle the selected agent's review view |
 | `Cmd-C` | Copy the active Rudder selection |
 | `Ctrl-C` | Quit (asks to confirm if agents are still running) |
 
-`Option-1/2` work out of the box on macOS terminals, whether or not "Use Option
+`Option-1/2/3` work out of the box on macOS terminals, whether or not "Use Option
 as Meta" is enabled.
 
 **Leader: press `Ctrl-W`, then one key.** A reliable way to run a dashboard
@@ -115,7 +119,7 @@ command, even while typing inside the worker pane:
 
 | Then press | Action |
 | --- | --- |
-| `1` / `2` | Focus agents / worker |
+| `1` / `2` / `3` | Focus agents / worker / task |
 | `v` | Toggle review |
 | `m` | Merge the selected completed worktree |
 | `M` | Merge all completed worktrees |
@@ -137,13 +141,13 @@ scroll the pane.
 the worker, `m` / `M` / `R` / `r` / `d` act on the selection, `x` stops a running
 agent (keeping its worktree), and `g` toggles the nested DAG view.
 
-## Orchestrator Skills
+## Commands and Orchestrator Skills
 
-The bottom task bar has been replaced by the orchestrator Claude Code pane. Ask
-the orchestrator for these actions; Rudder exposes them as project skills and
-consumes the resulting `RUDDER_*` control markers in `RUDDER.md`.
+Type these in the bottom task input. When an interactive Claude orchestrator is
+running, Rudder also exposes matching project skills; the orchestrator can write
+`RUDDER_*` control markers in `RUDDER.md` and Rudder consumes them.
 
-| Former command | Orchestrator action |
+| Command | Action |
 | --- | --- |
 | `/model` | Pick provider, then model, then effort |
 | `/ask <text>` | Force a one-off conversational agent in the main checkout |
@@ -159,11 +163,10 @@ consumes the resulting `RUDDER_*` control markers in `RUDDER.md`.
 
 ## Models
 
-Ask the orchestrator to change models, or have it write
-`RUDDER_MODEL <provider> <model> [effort]` to `RUDDER.md`. Claude offers aliases
-like `sonnet`, `opus`, `haiku` (and the `[1m]` long-context variants); Codex
-offers `gpt-5.5`, `gpt-5.4-codex`, and other discovered models. `auto` effort
-means Rudder passes no override.
+Use `/model [provider] [model] [effort]` in the task input. Claude offers
+aliases like `sonnet`, `opus`, `haiku` (and the `[1m]` long-context variants);
+Codex offers `gpt-5.5`, `gpt-5.4-codex`, and other discovered models. `auto`
+effort means Rudder passes no override.
 
 Your last provider, model, and effort are saved in `~/.rudder/config.json` and
 reused next time. Rudder refreshes model metadata from
@@ -171,7 +174,7 @@ reused next time. Rudder refreshes model metadata from
 
 ## Dispatch and planning
 
-Talk to the orchestrator pane. For a fresh request with no active plan, Rudder
+Type a fresh request in the bottom task input. When no plan is active, Rudder
 first routes it through a small Haiku dispatcher:
 
 - **One-off** for questions, explanations, docs/API research, repo inspection, or
@@ -197,14 +200,15 @@ implementation.
      1. Which time range: last 4 weeks, 6 months, or all time?
      2. Reuse the existing module contract, or rebuild from scratch?
 
-   ↳ answer in the orchestrator pane (e.g. "1: ..., 2: ...")
+   ↳ answer in the task input (e.g. "1: ..., 2: ...")
    ```
 
-   Type your answer to the orchestrator; it continues the same planning
-   conversation with your answer.
+   Type your answer in the task input; Rudder resumes the same planning
+   conversation with your answer. The focused orchestrator pane can also accept
+   a follow-up when it is showing the planner chat.
 2. **It lays out a DAG.** When it is ready it shows the task DAG (a tree of worker tasks
-   with their dependencies) above the orchestrator terminal. Tell the orchestrator
-   to refine it, or approve/launch it in chat.
+   with their dependencies) above the orchestrator terminal. Type feedback in the
+   task input to refine it, or press empty `Enter` to approve/launch.
 3. **The fleet runs.** The scheduler drains the DAG (todo → in-progress → review → done) as
    dependencies merge, each task in its own isolated worktree.
 

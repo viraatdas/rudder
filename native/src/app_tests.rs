@@ -1754,11 +1754,7 @@ fn tab_does_not_cycle_pane_focus() {
     let mut app = App::new();
     app.focus = FocusPane::Task;
     assert!(!app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty())));
-    assert_eq!(
-        app.focus,
-        FocusPane::Worker,
-        "legacy task focus falls back to worker"
-    );
+    assert_eq!(app.focus, FocusPane::Task);
 
     app.focus = FocusPane::Agents;
     assert!(!app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)));
@@ -3852,9 +3848,9 @@ fn option_typographic_chars_focus_panes() {
     // Option+1 on a US macOS layout arrives as the bare char ¡.
     app.handle_key(KeyEvent::new(KeyCode::Char('\u{00a1}'), KeyModifiers::NONE));
     assert_eq!(app.focus, FocusPane::Agents);
-    // Option+3 = £, kept as old muscle memory but now lands on worker.
+    // Option+3 = £
     app.handle_key(KeyEvent::new(KeyCode::Char('\u{00a3}'), KeyModifiers::NONE));
-    assert_eq!(app.focus, FocusPane::Worker);
+    assert_eq!(app.focus, FocusPane::Task);
 }
 
 #[test]
@@ -4305,16 +4301,12 @@ fn ctrl_c_exits_from_every_focus_pane() {
 }
 
 #[test]
-fn event_dispatch_handles_removed_task_paste_and_ctrl_c() {
+fn event_dispatch_handles_paste_and_ctrl_c() {
     let mut app = App::new();
     app.focus = FocusPane::Task;
     assert!(!handle_event(&mut app, Event::Paste("hello".to_string())));
-    assert_eq!(app.task_input, "");
-    assert_eq!(app.focus, FocusPane::Worker);
-    assert_eq!(
-        app.notice.as_deref(),
-        Some("task bar was removed; paste into the orchestrator pane")
-    );
+    assert_eq!(app.task_input, "hello");
+    assert_eq!(app.focus, FocusPane::Task);
     assert!(handle_event(
         &mut app,
         Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
@@ -5216,15 +5208,15 @@ fn tui_harness_interactive_orchestrator_captures_plan_file_and_renders_dag() {
 }
 
 #[test]
-fn render_screen_does_not_show_bottom_task_bar() {
+fn render_screen_shows_bottom_task_bar() {
     let mut app = App::new();
-    app.focus = FocusPane::Worker;
+    app.focus = FocusPane::Task;
 
     let screen = render_screen(&mut app, 100, 30);
 
     assert!(
-        !screen.contains("Type a task to plan and run"),
-        "the bottom task bar should not render:\n{screen}"
+        screen.contains("Type a task to plan and run"),
+        "the bottom task bar should render:\n{screen}"
     );
 }
 
@@ -7454,8 +7446,12 @@ fn cycle_focus_rotates_panes_both_directions() {
     app.cycle_focus(true);
     assert_eq!(app.focus, FocusPane::Worker);
     app.cycle_focus(true);
+    assert_eq!(app.focus, FocusPane::Task);
+    app.cycle_focus(true);
     assert_eq!(app.focus, FocusPane::Agents);
 
+    app.cycle_focus(false);
+    assert_eq!(app.focus, FocusPane::Task);
     app.cycle_focus(false);
     assert_eq!(app.focus, FocusPane::Worker);
 }
@@ -7473,7 +7469,7 @@ fn ctrl_w_then_tab_cycles_and_rearms() {
 
     // A second Tab (no fresh Ctrl+W) keeps cycling because the leader re-armed.
     app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()));
-    assert_eq!(app.focus, FocusPane::Agents, "Ctrl+W Tab Tab cycles twice");
+    assert_eq!(app.focus, FocusPane::Task, "Ctrl+W Tab Tab cycles twice");
     assert!(app.leader_pending, "leader still armed after second Tab");
 }
 
@@ -7483,7 +7479,7 @@ fn ctrl_w_then_backtab_cycles_backward_and_rearms() {
     app.focus = FocusPane::Agents;
     app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
     app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
-    assert_eq!(app.focus, FocusPane::Worker, "Ctrl+W BackTab cycles backward");
+    assert_eq!(app.focus, FocusPane::Task, "Ctrl+W BackTab cycles backward");
     assert!(app.leader_pending, "leader re-arms after BackTab");
 }
 

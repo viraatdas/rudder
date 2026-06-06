@@ -795,7 +795,7 @@ impl App {
         let (dispatch_tx, dispatch_rx) = mpsc::channel();
         let branch = current_branch_at(&cwd);
         Self {
-            focus: FocusPane::Worker,
+            focus: FocusPane::Task,
             nav_mode: false,
             leader_pending: false,
             worker_view: WorkerView::Terminal,
@@ -1146,7 +1146,7 @@ impl App {
                 return false;
             }
             KeyCode::Char('3') if alt_like => {
-                self.focus = FocusPane::Worker;
+                self.focus = FocusPane::Task;
                 return false;
             }
             KeyCode::Char('v') if alt_like => {
@@ -1162,7 +1162,7 @@ impl App {
                 return false;
             }
             KeyCode::Char('\u{00a3}') => {
-                self.focus = FocusPane::Worker;
+                self.focus = FocusPane::Task;
                 return false;
             }
             KeyCode::Char('\u{221a}') => {
@@ -1175,10 +1175,7 @@ impl App {
         match self.focus {
             FocusPane::Agents => self.handle_agents_key(key),
             FocusPane::Worker => self.handle_worker_key(key),
-            FocusPane::Task => {
-                self.focus = FocusPane::Worker;
-                self.handle_worker_key(key)
-            }
+            FocusPane::Task => self.handle_task_key(key),
         }
     }
 
@@ -1199,7 +1196,7 @@ impl App {
             }
             KeyCode::Char('3') => {
                 self.delete_pending = None;
-                self.focus = FocusPane::Worker;
+                self.focus = FocusPane::Task;
             }
             KeyCode::Char('v') => self.toggle_worker_view(),
             KeyCode::Char('r') => self.start_rename_selected_agent(),
@@ -1247,7 +1244,7 @@ impl App {
             }
             KeyCode::Char('3') | KeyCode::Char('\u{00a3}') => {
                 self.delete_pending = None;
-                self.focus = FocusPane::Worker;
+                self.focus = FocusPane::Task;
             }
             KeyCode::Char('v') | KeyCode::Char('\u{221a}') => self.toggle_worker_view(),
             KeyCode::Char('r') => self.start_rename_selected_agent(),
@@ -1330,12 +1327,14 @@ impl App {
         self.focus = if forward {
             match self.focus {
                 FocusPane::Agents => FocusPane::Worker,
-                FocusPane::Worker | FocusPane::Task => FocusPane::Agents,
+                FocusPane::Worker => FocusPane::Task,
+                FocusPane::Task => FocusPane::Agents,
             }
         } else {
             match self.focus {
-                FocusPane::Agents => FocusPane::Worker,
-                FocusPane::Worker | FocusPane::Task => FocusPane::Agents,
+                FocusPane::Agents => FocusPane::Task,
+                FocusPane::Worker => FocusPane::Agents,
+                FocusPane::Task => FocusPane::Worker,
             }
         };
     }
@@ -1669,6 +1668,18 @@ impl App {
                 };
                 self.selected_worker_selection_text(selection)
             }
+            FocusPane::Task => {
+                let Some(selection) = self.task_selection else {
+                    return;
+                };
+                let width = self
+                    .task_area
+                    .map(block_inner)
+                    .map(task_inner_width)
+                    .unwrap_or(80);
+                let lines = task_input_lines(&self.task_input, self.task_cursor, width);
+                selected_text_from_lines(&lines, selection)
+            }
             _ => return,
         };
 
@@ -1681,7 +1692,7 @@ impl App {
                 self.notice = Some(match self.focus {
                     FocusPane::Worker => "copied worker selection".to_string(),
                     FocusPane::Agents => "copied selection".to_string(),
-                    FocusPane::Task => "copied selection".to_string(),
+                    FocusPane::Task => "copied task selection".to_string(),
                 });
             }
             Err(error) => self.notice = Some(format!("copy failed: {error}")),
@@ -2198,7 +2209,7 @@ impl App {
                 self.task_cursor = 0;
                 self.picker_index = 0;
                 self.notice = Some(
-                    "Option-1/2 or ^W pane  Enter start/focus  wheel scrolls worker  R review all  M merge all"
+                    "Option-1/2/3 or ^W pane  Enter start/focus  wheel scrolls worker  R review all  M merge all"
                         .to_string(),
                 );
             }
@@ -2249,8 +2260,9 @@ impl App {
                 }
             }
             FocusPane::Task => {
-                self.focus = FocusPane::Worker;
-                self.notice = Some("task bar was removed; paste into the orchestrator pane".to_string());
+                self.reset_task_history_navigation();
+                insert_str_at_cursor(&mut self.task_input, &mut self.task_cursor, &text);
+                self.clamp_picker_index();
             }
             FocusPane::Agents => {}
         }
@@ -2374,6 +2386,17 @@ impl App {
             self.worker_selection = None;
             self.task_selection = None;
             self.handle_agents_mouse(mouse, agents_area);
+            return;
+        }
+
+        if let Some(task_area) = self
+            .task_area
+            .filter(|area| rect_contains(*area, mouse.column, mouse.row))
+        {
+            self.worker_selection = None;
+            if self.handle_task_selection_mouse(mouse, block_inner(task_area)) {
+                return;
+            }
             return;
         }
 
@@ -3493,6 +3516,7 @@ impl App {
         }
     }
 
+    #[cfg(test)]
     fn ensure_default_orchestrator(&mut self) {
         if !self.interactive_orchestrator
             || self
@@ -3612,8 +3636,8 @@ impl App {
 
         // INTERACTIVE orchestrator: it never exits and presents its DAG via RUDDER.md, so
         // it is NOT autosteered (the headless completed-plan capture must not fire).
-        // Generate project-level Claude skills before spawn so the former task-bar
-        // actions are available inside this Claude Code session.
+        // Generate project-level Claude skills before spawn so dashboard actions are
+        // also available inside this Claude Code session.
         if interactive_planner {
             run.autosteered = false;
             if let Err(error) = clear_orchestrator_plan_markers(&self.cwd) {
@@ -4421,11 +4445,9 @@ impl App {
         if !self.selected_is_main() {
             return;
         }
-        self.focus = FocusPane::Worker;
-        self.notice = Some(
-            "ask the orchestrator to change models, or write RUDDER_MODEL <provider> <model> [effort] in RUDDER.md"
-                .to_string(),
-        );
+        self.replace_task_input("/model ".to_string());
+        self.focus = FocusPane::Task;
+        self.notice = Some("pick a model for main".to_string());
     }
 
     fn restart_selected_agent(&mut self) {
@@ -4572,7 +4594,7 @@ impl App {
             }
             Some("/help") => {
                 self.notice = Some(
-                    "Option-1/2 or ^W pane  talk to the orchestrator to refine, approve, or run skills"
+                    "Option-1/2/3 or ^W pane  type tasks below; worker pane chats with the selected agent"
                         .to_string(),
                 );
                 true
@@ -8782,7 +8804,6 @@ fn run(terminal: &mut Tui) -> Result<()> {
     let mut app = App::new();
     app.resume_migrated_agents();
     app.restore_running_agents();
-    app.ensure_default_orchestrator();
     // Reconcile graph.json with the restored in-memory state on startup so the board does
     // not show stale "planned" nodes from a previous session (and reflects the restored
     // plan queue / reloaded agents). last_mirror_signature is None here, so this runs once.

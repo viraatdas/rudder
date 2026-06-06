@@ -374,28 +374,28 @@ TUI that repaints while idle.
 Order of handling matters; the early returns gate everything else.
 - **Ctrl+C**: quit, with a confirm guard if agents are still running.
 - **Ctrl+W (leader)**: arms a one-shot leader. The *next* key runs a dashboard
-  command and disarms: `1/2` focus panes, `v` review, `m` merge, `R` review-all,
+  command and disarms: `1/2/3` focus panes, `v` review, `m` merge, `R` review-all,
   `M` merge-all, `r` rename, `j/k` move, `d` delete, `q` quit, `Esc`
   cancels. See `handle_leader_key`. This is the reliable cross-terminal way to
   drive the dashboard from inside the worker pane. Tradeoff: Ctrl+W no longer
   reaches the worker PTY as readline "delete word".
 - **Ctrl+G (nav mode)**: a *sticky* mode (toggle on/off) with the same command
   set; `Esc` exits. Predates the leader; both are kept.
-- **Option/Alt + 1/2 and v**: jump panes / toggle review directly. Many macOS
+- **Option/Alt + 1/2/3 and v**: jump panes / toggle review directly. Many macOS
   terminals (Terminal.app, default iTerm2) do not send an Alt modifier for
   Option+key, so the dashboard *also* accepts the typographic characters Option
   produces on a US layout: Option+1=`¡` (U+00A1), Option+2=`™` (U+2122),
-  Option+v=`√` (U+221A). Option+3/`£` now falls back to the worker pane for
-  compatibility with old muscle memory.
+  Option+3=`£` (U+00A3), Option+v=`√` (U+221A).
 - Otherwise the key is dispatched to the focused pane's handler.
 
 ### Orchestrator skills
-The bottom task pane is removed. The orchestrator Claude Code PTY is the input
-surface: it edits the DAG in `RUDDER.md` and uses generated project skills
-under `.claude/skills/rudder-*` for the former slash-command actions (`model`,
-`main`, `goal`, `usage`, `cloud/login`, `review-all`, `merge-all`, `automerge`,
-`plan/ask`, and DAG editing/approval). Rudder consumes the corresponding
-one-shot `RUDDER_*` control markers from `RUDDER.md`.
+The bottom task pane remains the primary input surface for fresh requests,
+slash commands, plan refinements, and empty-Enter approval. When the interactive
+Claude orchestrator is running, it can also edit the DAG in `RUDDER.md` and use
+generated project skills under `.claude/skills/rudder-*` for dashboard actions
+(`model`, `main`, `goal`, `usage`, `cloud/login`, `review-all`, `merge-all`,
+`automerge`, `plan/ask`, and DAG editing/approval). Rudder consumes the
+corresponding one-shot `RUDDER_*` control markers from `RUDDER.md`.
 
 ### Review and merge-all
 `v` opens a review pane showing the run's `jj diff` (`ensure_review_diff`). The old
@@ -782,8 +782,9 @@ user only ever talks to Rudder; the planner can never go off and implement on it
    falls back to the backend's authoritative session record (Claude's `~/.claude/projects`
    transcript via `claude_transcript_final_text`, or Codex's `~/.codex/sessions` rollout via
    `latest_codex_rudder_plan_output`), so a plan the model actually produced is never lost.
-4. **Refine.** Type in the orchestrator pane while awaiting approval → `refine_plan` resumes
-   the session and the DAG updates in place (no wipe).
+4. **Refine.** Type in the task pane while awaiting approval (or in the focused
+   headless orchestrator chat) → `refine_plan` resumes the session and the DAG
+   updates in place (no wipe).
 5. **Approve → launch.** Empty-Enter → `approve_planned_queue` → `run_scheduler` dispatches
    ready nodes (todo → running), each in its own jj workspace. The queued plan + gate state
    persist to `.rudder/plan-queue.json`, so a mid-plan restart resumes instead of losing it.
@@ -857,9 +858,9 @@ The planner UX went through several iterations; these are the settled decisions 
   `RUDDER_APPROVE_PLAN`. NOTE: `interactive_orchestrator()` is read ONCE into the `App.interactive_orchestrator`
   field at construction; render/poll/key read the FIELD (not the process-global env) so parallel
   tests don't race — tests set the field directly (the headless-view render helper pins it false).
-  The old bottom task bar is removed; former task-bar slash actions are project Claude skills
-  generated under `.claude/skills/rudder-*`, with one-shot `RUDDER_*` control markers consumed
-  from `RUDDER.md`.
+  The bottom task bar remains available; the interactive orchestrator skills are an additional
+  control path generated under `.claude/skills/rudder-*`, with one-shot `RUDDER_*` control
+  markers consumed from `RUDDER.md`.
 
 ### 14.4b Per-agent done/idle detection: official signals, scrape as fallback (`native/src/signals.rs`)
 The native TUI runs workers as INTERACTIVE `claude`/`codex` in a PTY (they idle between
