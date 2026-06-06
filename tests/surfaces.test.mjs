@@ -17,6 +17,7 @@ import {
 } from "../dist/surfaces.js";
 import { readdir } from "node:fs/promises";
 import { buildResolverPrompt, resolverShouldFinalize } from "../dist/scheduler.js";
+import { latestRudderPlanBlock, mergeGeneratedRudderMd } from "../dist/rudder-md.js";
 
 // ---------------------------------------------------------------------------
 // DECISIONS.md bullet parser (pure). text/owner/ts extraction.
@@ -57,6 +58,28 @@ test("parseDecisions: ignores the header and non-bullet lines", () => {
 test("parseDecisions: empty / absent content yields no entries", () => {
   assert.deepEqual(parseDecisions(""), []);
   assert.deepEqual(parseDecisions("\n\n"), []);
+});
+
+test("mergeGeneratedRudderMd preserves orchestrator content and ignores template plan markers", () => {
+  const existing = [
+    "<!-- RUDDER_GENERATED_START -->",
+    "old generated",
+    "<!-- RUDDER_GENERATED_END -->",
+    "",
+    "## Orchestrator notes",
+    "- keep",
+  ].join("\n");
+  const merged = mergeGeneratedRudderMd(existing, "new generated\n");
+  assert.match(merged, /new generated/);
+  assert.doesNotMatch(merged, /old generated/);
+  assert.match(merged, /## Orchestrator notes\n- keep/);
+
+  const template = [
+    "RUDDER_PLAN_TASKS_START_TEMPLATE",
+    "{\"tasks\":[{\"id\":\"fake\",\"title\":\"fake\",\"prompt\":\"p\"}]}",
+    "RUDDER_PLAN_TASKS_END_TEMPLATE",
+  ].join("\n");
+  assert.equal(latestRudderPlanBlock(template), null);
 });
 
 // ---------------------------------------------------------------------------

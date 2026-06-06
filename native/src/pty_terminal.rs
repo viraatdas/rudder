@@ -131,6 +131,7 @@ pub struct TerminalPane {
     ansi_state: AnsiTrackState,
     styled_lines_cache: Option<Vec<Vec<StyledTerminalCell>>>,
     output_log: String,
+    output_log_base_offset: usize,
     output_log_limit: usize,
     live_screen_only: bool,
 }
@@ -239,6 +240,7 @@ impl TerminalPane {
             ansi_state: AnsiTrackState::Ground,
             styled_lines_cache: None,
             output_log: String::new(),
+            output_log_base_offset: 0,
             output_log_limit: 200_000,
             live_screen_only: options.live_screen_only,
         })
@@ -348,6 +350,10 @@ impl TerminalPane {
 
     pub fn output_log_snapshot(&self) -> &str {
         &self.output_log
+    }
+
+    pub fn output_log_base_offset(&self) -> usize {
+        self.output_log_base_offset
     }
 
     fn current_visible_lines_snapshot(&self) -> Vec<String> {
@@ -750,6 +756,7 @@ impl TerminalPane {
                 .find(|index| *index >= overflow)
                 .unwrap_or(overflow);
             self.output_log.drain(..drain_to);
+            self.output_log_base_offset = self.output_log_base_offset.saturating_add(drain_to);
         }
     }
 }
