@@ -53,6 +53,12 @@ jobs:
 
       - run: npm ci
 
+      - name: Install + build cloud test fixtures
+        working-directory: cloud
+        run: |
+          npm ci
+          npm run build
+
       - name: Typecheck + JS tests
         run: npm test
 
