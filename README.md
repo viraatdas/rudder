@@ -23,7 +23,9 @@ npm install -g @viraatdas/rudder@latest
 rudder
 ```
 
-Upgrade with the same command. Run without a global install using
+After the global install, every user-facing `rudder` launch checks npm and
+auto-updates itself before running when a newer version is available. Set
+`RUDDER_DISABLE_AUTO_UPDATE=1` to opt out. Run without a global install using
 `npx @viraatdas/rudder@latest`.
 
 ## Requirements
@@ -325,9 +327,9 @@ rudder --no-native   # skip the native binary
 
 ## Troubleshooting
 
-- Stale behavior after an upgrade: check `rudder --version`, reinstall with
-  `npm install -g @viraatdas/rudder@latest`, and restart any running Rudder
-  dashboards so no old `rudder-native` process lingers.
+- Stale behavior after an upgrade: restart any already-running Rudder dashboards
+  so no old `rudder-native` process lingers. New `rudder` launches auto-update
+  unless `RUDDER_DISABLE_AUTO_UPDATE=1` is set.
 - Trackpad scrolling: confirm your terminal sends scroll events with
   `rudder mouse-test parsed`. Set `RUDDER_WHEEL_SCROLL_ROWS=<n>` to change the
   scroll step, or `RUDDER_MOUSE_DEBUG=1` to inspect routing.

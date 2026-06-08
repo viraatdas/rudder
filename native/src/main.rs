@@ -4352,14 +4352,21 @@ impl App {
         }
     }
 
-    /// Kick off the async Haiku dispatch for a fresh task: a light classifier decides
-    /// one-off vs plan off-thread so the UI never stalls. `poll_dispatch_worker` routes
-    /// the result. Duplicate submits while one is in flight are ignored. In tests the
-    /// classifier shells a real `claude`, so tests drive `start_oneoff_task` /
-    /// `poll_dispatch_worker` directly instead of going through here.
+    /// Route a fresh task. Obvious cases are classified locally and launched
+    /// synchronously; only ambiguous requests pay for the async Haiku classifier.
+    /// `poll_dispatch_worker` routes async results. Duplicate submits while one is in
+    /// flight are ignored. In tests the async classifier would shell a real `claude`, so
+    /// tests inject a `DispatchResult` and call `poll_dispatch_worker` directly.
     fn begin_dispatch(&mut self, input: &str) {
         let input = input.trim();
         if input.is_empty() {
+            return;
+        }
+        if let Some(intent) = classify_dispatch_intent_locally(input) {
+            match intent {
+                DispatchIntent::OneOff => self.start_oneoff_task(input),
+                DispatchIntent::Plan => self.start_rudder_plan_task(input),
+            }
             return;
         }
         if self.dispatch_pending {

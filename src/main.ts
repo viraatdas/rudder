@@ -42,7 +42,7 @@ import { runTmuxAgentPane, runTmuxTaskPane, runTmuxWorkerIdle } from "./tmux-das
 import { runInteractiveTui } from "./tui.js";
 import type { BackendId } from "./types.js";
 import { commandExists, isTty, MissingToolError, newRunId, runCommand } from "./util.js";
-import { getUpdateAvailable } from "./version-check.js";
+import { autoUpdateAndRerunIfNeeded, getUpdateAvailable } from "./version-check.js";
 import { attachTmuxSession, ensureTmuxDashboardSession, hasTmux, repoTmuxSessionName, shellCommand } from "./tmux.js";
 
 type Parsed = {
@@ -83,6 +83,9 @@ type Parsed = {
 
 export async function main(): Promise<void> {
   const parsed = parseArgs(process.argv.slice(2));
+  if (shouldAutoUpdateForCommand(parsed.command) && await autoUpdateAndRerunIfNeeded(process.argv.slice(2))) {
+    return;
+  }
   if (parsed.flags.version || parsed.command === "version") {
     const current = await packageVersion();
     console.log(current);
@@ -408,6 +411,16 @@ export async function main(): Promise<void> {
       });
     }
   }
+}
+
+function shouldAutoUpdateForCommand(command: string | undefined): boolean {
+  if (command?.startsWith("__")) {
+    return false;
+  }
+  // `rudder done` is invoked by worker agents inside a live Rudder session; updating
+  // the global package in that callback can desync the running dashboard from its
+  // worker surface.
+  return command !== "done";
 }
 
 function parseArgs(argv: string[]): Parsed {

@@ -1260,7 +1260,7 @@ fn dispatch_classifier_timeout() -> Duration {
 
 #[cfg(not(test))]
 fn dispatch_classifier_timeout() -> Duration {
-    Duration::from_secs(8)
+    Duration::from_secs(3)
 }
 
 /// The classification prompt for the dispatcher. Asks Haiku for ONE word.
@@ -1352,8 +1352,13 @@ fn has_direct_plan_marker(lower: &str) -> bool {
         "ship ",
     ];
     starts.iter().any(|prefix| lower.starts_with(prefix))
+        || lower.contains("make a website")
+        || lower.contains("make a web site")
         || lower.contains("make an app")
         || lower.contains("make a site")
+        || lower.contains("web app")
+        || lower.contains("landing page")
+        || lower.contains("website for")
         || lower.contains("end-to-end")
         || lower.contains("multi-step")
 }
@@ -1372,8 +1377,13 @@ fn has_plan_marker(lower: &str) -> bool {
         "set up ",
         "setup ",
         "ship ",
+        "make a website",
+        "make a web site",
         "make an app",
         "make a site",
+        "web app",
+        "landing page",
+        "website for",
         "end-to-end",
         "multi-step",
     ];

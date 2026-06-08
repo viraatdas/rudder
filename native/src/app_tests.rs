@@ -6126,25 +6126,47 @@ fn completed_plan_does_not_hijack_a_new_task_into_refine() {
 }
 
 #[test]
-fn no_plan_active_first_task_dispatches_then_routes_to_planner() {
+fn no_plan_active_obvious_first_task_routes_to_planner_without_dispatch_wait() {
     let mut app = App::new();
     app.cwd = std::env::temp_dir();
     // No nodes queued, no orchestrator, no live plan-launched agent.
     assert!(!app.plan_is_active(), "no plan active on a clean session");
 
-    // A fresh task now goes through the async Haiku dispatcher: nothing spawns
-    // synchronously; routing happens when the classification returns.
+    // Obvious implementation requests route locally, so the UI does not wait for Haiku
+    // just to start the planner.
     app.start_task_from_input("build the first feature");
-    assert!(app.dispatch_pending, "a fresh task begins async dispatch");
+    assert!(
+        !app.dispatch_pending,
+        "local plan routing skips async dispatch"
+    );
+
+    let spawned = app.agents.last().expect("a spawned planner");
+    assert_eq!(spawned.mode, AgentMode::RudderPlan);
+    assert!(
+        !spawned.reconcile_planner,
+        "the first task with no active plan uses the INITIAL planner (replace path)"
+    );
+}
+
+#[test]
+fn no_plan_active_ambiguous_first_task_dispatches_then_routes_to_planner() {
+    let mut app = App::new();
+    app.cwd = std::env::temp_dir();
+    assert!(!app.plan_is_active(), "no plan active on a clean session");
+
+    // Ambiguous polite phrasing still goes through the async Haiku dispatcher; routing
+    // happens when the classification returns.
+    app.start_task_from_input("can you add Spotify login");
+    assert!(app.dispatch_pending, "ambiguous task begins async dispatch");
     assert!(
         app.agents.is_empty(),
-        "nothing spawned until the classifier returns"
+        "nothing spawned until dispatch returns"
     );
 
     // Classifier decides this is a PLAN -> routes to the headless RudderPlan planner.
     app.dispatch_tx
         .send(DispatchResult {
-            task: "build the first feature".to_string(),
+            task: "can you add Spotify login".to_string(),
             intent: DispatchIntent::Plan,
         })
         .unwrap();
@@ -6289,6 +6311,10 @@ fn local_dispatch_classifier_routes_obvious_oneoff_and_plan_requests() {
     );
     assert_eq!(
         classify_dispatch_intent_locally("build Spotify OAuth login with token refresh"),
+        Some(DispatchIntent::Plan)
+    );
+    assert_eq!(
+        classify_dispatch_intent_locally("we want to make a website for this company"),
         Some(DispatchIntent::Plan)
     );
     assert_eq!(
@@ -6841,6 +6867,33 @@ fn plan_stream_reconstructs_block_across_text_deltas() {
         extract_rudder_plan_tasks(s.parse_text()).expect("block parses from reconstructed text");
     assert_eq!(tasks.len(), 1);
     assert_eq!(tasks[0].id, "n0");
+}
+
+#[test]
+fn plan_stream_rebuilds_when_consumed_offset_is_not_char_boundary() {
+    let mut s = PlanStreamState::new();
+    s.ingest("x\n");
+
+    // `s.consumed` is now 2. In this later snapshot, byte 2 sits inside the
+    // three-byte ellipsis. This can happen when PTY scrollback drains from the front
+    // and fresh output arrives before the next poll.
+    let snapshot = format!("a…\n{}", text_delta_line("after drain"));
+    s.ingest(&snapshot);
+
+    assert_eq!(s.assistant_text(), "after drain");
+}
+
+#[test]
+fn plan_stream_rebuilds_when_snapshot_shifted_at_valid_boundary() {
+    let mut s = PlanStreamState::new();
+    s.ingest("hello\n");
+
+    // The old consumed offset (6) is a valid boundary in this new snapshot, but it
+    // belongs to a different PTY buffer after front-drain. Reusing it would skip the
+    // leading JSON envelope and silently lose the text delta.
+    s.ingest(&text_delta_line("after valid-boundary drain"));
+
+    assert_eq!(s.assistant_text(), "after valid-boundary drain");
 }
 
 #[test]

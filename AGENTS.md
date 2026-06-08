@@ -127,7 +127,13 @@ process spawns, not a socket.
   `--non-interactive`, `--no-tmux`, `--no-native`, `--headless`, `--cwd`,
   `--repo`, `--run`, `--backend`, `--model`, `--tmux-session`.
 - `main()` flow:
-  - `--version`/`version`: print version, check npm for an update.
+  - Before user-facing command dispatch, `autoUpdateAndRerunIfNeeded` checks npm
+    and runs `npm install -g @viraatdas/rudder@<latest>` when this global install
+    is stale, then re-runs the original command with `RUDDER_SKIP_AUTO_UPDATE=1`.
+    Internal `__*` commands, `rudder done` worker callbacks, local source checkouts,
+    CI, npx temp installs, and `RUDDER_DISABLE_AUTO_UPDATE`/
+    `RUDDER_DISABLE_UPDATE_CHECK` skip this.
+  - `--version`/`version`: print version (after auto-update if applicable).
   - `--cwd <dir>`: chdir.
   - No command + args present: treat the args as a task and `startRun`.
   - No command + TTY: `openDashboard` (the native dashboard). This is the default

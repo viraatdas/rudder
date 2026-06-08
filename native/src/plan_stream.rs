@@ -55,6 +55,11 @@ pub(crate) struct PlanStreamState {
     parse_baseline: usize,
     /// Bytes of the latest snapshot already split into complete lines.
     consumed: usize,
+    /// Previous PTY output snapshot. `consumed` is only meaningful while the next
+    /// snapshot is a byte-for-byte append of this one; terminal scrollback can drain
+    /// from the front while remaining longer than `consumed`, so length alone is not
+    /// a safe continuity check.
+    last_snapshot: String,
     /// The plan captured from a real plan-mode `ExitPlanMode` tool call (its
     /// `input.plan`). AUTHORITATIVE plan text when the planner runs in
     /// `--permission-mode plan`: it carries the RUDDER_PLAN_TASKS block even when
@@ -83,6 +88,7 @@ impl PlanStreamState {
             saw_streaming_text: false,
             parse_baseline: 0,
             consumed: 0,
+            last_snapshot: String::new(),
             exit_plan: None,
         }
     }
@@ -138,14 +144,23 @@ impl PlanStreamState {
     /// terminal's output_log from the start. Pair with `begin_user_turn`.
     pub(crate) fn rebind_stream(&mut self) {
         self.consumed = 0;
+        self.last_snapshot.clear();
     }
 
     /// Feed the full current PTY output_log snapshot; only the bytes past the last
     /// processed line are parsed. Returns true if anything changed. Resilient to the
     /// 200KB ring draining from the front (rebuilds from the current snapshot).
     pub(crate) fn ingest(&mut self, snapshot: &str) -> bool {
-        if snapshot.len() < self.consumed {
+        let appended_to_previous =
+            self.last_snapshot.is_empty() || snapshot.starts_with(&self.last_snapshot);
+        if !appended_to_previous
+            || snapshot.len() < self.consumed
+            || !snapshot.is_char_boundary(self.consumed)
+        {
             // Front-drain or a fresh terminal: rebuild from what's still present.
+            // `consumed` is a byte offset into the previous snapshot, not a durable
+            // cursor. If the new snapshot is not an append of the previous one, the old
+            // offset could skip fresh JSON or land inside a multi-byte UTF-8 scalar.
             self.assistant_text.clear();
             self.transcript.clear();
             self.saw_streaming_text = false;
@@ -155,6 +170,7 @@ impl PlanStreamState {
         }
         let tail = &snapshot[self.consumed..];
         if tail.is_empty() {
+            self.remember_snapshot(snapshot);
             return false;
         }
         let mut offset = 0usize;
@@ -166,7 +182,13 @@ impl PlanStreamState {
             changed = true;
         }
         self.consumed += offset;
+        self.remember_snapshot(snapshot);
         changed
+    }
+
+    fn remember_snapshot(&mut self, snapshot: &str) {
+        self.last_snapshot.clear();
+        self.last_snapshot.push_str(snapshot);
     }
 
     fn ingest_line(&mut self, raw: &str) {

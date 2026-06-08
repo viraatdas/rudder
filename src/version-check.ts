@@ -1,9 +1,12 @@
+import { spawn } from "node:child_process";
+import fs from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
+const AUTO_UPDATE_TIMEOUT_MS = 1000;
 
 const moduleDir = path.dirname(fileURLToPath(import.meta.url));
 
@@ -12,7 +15,7 @@ function cachePath(): string {
   return path.join(base, "rudder", "update-check.json");
 }
 
-function compareSemver(a: string, b: string): number {
+export function compareSemver(a: string, b: string): number {
   const split = (v: string) =>
     v
       .split("-")[0]!
@@ -28,7 +31,7 @@ function compareSemver(a: string, b: string): number {
   return 0;
 }
 
-async function readPackageVersion(): Promise<string | null> {
+async function readPackageInfo(): Promise<{ root: string; version: string } | null> {
   // Try package.json relative to compiled dist/, then to source src/.
   const candidates = [
     path.join(moduleDir, "..", "package.json"),
@@ -39,13 +42,17 @@ async function readPackageVersion(): Promise<string | null> {
       const raw = await fsp.readFile(candidate, "utf8");
       const parsed = JSON.parse(raw) as { version?: unknown; name?: unknown };
       if (parsed?.name === "@viraatdas/rudder" && typeof parsed.version === "string") {
-        return parsed.version;
+        return { root: path.dirname(candidate), version: parsed.version };
       }
     } catch {
       // ignore
     }
   }
   return null;
+}
+
+async function readPackageVersion(): Promise<string | null> {
+  return (await readPackageInfo())?.version ?? null;
 }
 
 async function readCache(): Promise<{ latest: string; checkedAt: number } | null> {
@@ -71,9 +78,9 @@ async function writeCache(latest: string): Promise<void> {
   }
 }
 
-async function fetchLatest(): Promise<string | null> {
+async function fetchLatest(timeoutMs = 1500): Promise<string | null> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 1500);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const res = await fetch("https://registry.npmjs.org/@viraatdas/rudder/latest", {
       signal: controller.signal,
@@ -113,4 +120,85 @@ export async function getUpdateAvailable(): Promise<{ current: string; latest: s
   }
   if (!latest) return null;
   return compareSemver(current, latest) < 0 ? { current, latest } : null;
+}
+
+export function shouldAutoUpdateFromPackageRoot(packageRoot: string): boolean {
+  const root = path.resolve(packageRoot);
+  if (process.env.RUDDER_DISABLE_UPDATE_CHECK || process.env.RUDDER_DISABLE_AUTO_UPDATE || process.env.RUDDER_SKIP_AUTO_UPDATE) {
+    return false;
+  }
+  if (process.env.CI) {
+    return false;
+  }
+  // Do not mutate a source checkout while developing Rudder locally.
+  if (fs.existsSync(path.join(root, ".git")) || fs.existsSync(path.join(root, "src", "main.ts"))) {
+    return false;
+  }
+  // `npx @viraatdas/rudder@...` is already an ephemeral install; turning that into
+  // a global install is surprising and can fail under temp-directory permissions.
+  const normalized = root.split(path.sep).join("/");
+  if (normalized.includes("/_npx/") || normalized.includes("/.npm/_npx/")) {
+    return false;
+  }
+  return true;
+}
+
+export async function autoUpdateAndRerunIfNeeded(argv: string[]): Promise<boolean> {
+  const info = await readPackageInfo();
+  if (!info || !shouldAutoUpdateFromPackageRoot(info.root)) {
+    return false;
+  }
+  const latest = await fetchLatest(AUTO_UPDATE_TIMEOUT_MS);
+  if (!latest || compareSemver(info.version, latest) >= 0) {
+    if (latest) {
+      await writeCache(latest);
+    }
+    return false;
+  }
+
+  console.error(`rudder: updating ${info.version} -> ${latest}...`);
+  const installed = await installLatest(latest);
+  if (!installed) {
+    console.error(`rudder: auto-update failed; continuing with ${info.version}`);
+    return false;
+  }
+  await writeCache(latest);
+  console.error(`rudder: updated to ${latest}; restarting command...`);
+  process.exitCode = await rerunCurrentCommand(argv);
+  return true;
+}
+
+async function installLatest(version: string): Promise<boolean> {
+  const code = await spawnExitCode("npm", ["install", "-g", `@viraatdas/rudder@${version}`], {
+    RUDDER_SKIP_AUTO_UPDATE: "1",
+  });
+  return code === 0;
+}
+
+async function rerunCurrentCommand(argv: string[]): Promise<number> {
+  const entry = process.argv[1];
+  if (entry) {
+    const code = await spawnExitCode(process.execPath, [entry, ...argv], {
+      RUDDER_SKIP_AUTO_UPDATE: "1",
+    });
+    if (code !== 127) {
+      return code;
+    }
+  }
+  return await spawnExitCode("rudder", argv, { RUDDER_SKIP_AUTO_UPDATE: "1" });
+}
+
+async function spawnExitCode(
+  command: string,
+  args: string[],
+  envPatch: NodeJS.ProcessEnv,
+): Promise<number> {
+  return await new Promise((resolve) => {
+    const child = spawn(command, args, {
+      stdio: "inherit",
+      env: { ...process.env, ...envPatch },
+    });
+    child.on("error", () => resolve(127));
+    child.on("close", (code) => resolve(code ?? 1));
+  });
 }
