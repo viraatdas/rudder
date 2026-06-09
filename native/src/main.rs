@@ -6004,8 +6004,11 @@ impl App {
     /// AND append it durably to DECISIONS.md, so the fleet (workers re-read that file) sees
     /// the conductor's plan/steer reasoning, not just the ephemeral activity line.
     fn record_decision(&mut self, title: &str, what: &str, why: Option<&str>) {
-        self.push_activity(what.to_string());
-        append_conductor_decision(&self.cwd, title, what, why);
+        // Only surface it in the activity feed when DECISIONS.md actually took a new entry,
+        // so a deduped repeat (same decision re-hit every tick) does not spam either surface.
+        if append_conductor_decision(&self.cwd, title, what, why) {
+            self.push_activity(what.to_string());
+        }
     }
 
     /// Live plan size = queued nodes + launched-but-not-merged plan agents. The

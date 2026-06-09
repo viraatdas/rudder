@@ -1870,16 +1870,18 @@ pub(crate) fn new_run_id(task: &str) -> String {
 /// **By: conductor** footer. Best-effort; creates the file with a header when absent.
 /// Keeps the conductor's plan/steer decisions DURABLE and visible to the fleet, not only
 /// in the in-pane activity log.
+/// Returns true if a new entry was written, false if it was skipped (empty `what`, or a
+/// byte-identical title+what decision already present so this is a no-op duplicate).
 pub(crate) fn append_conductor_decision(
     repo_root: &Path,
     title: &str,
     what: &str,
     why: Option<&str>,
-) {
+) -> bool {
     let collapse = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
     let what = collapse(what);
     if what.is_empty() {
-        return;
+        return false;
     }
     let title = {
         let t = collapse(title);
@@ -1889,22 +1891,30 @@ pub(crate) fn append_conductor_decision(
             t
         }
     };
-    let mut entry = format!("## {title}\n- **What:** {what}\n");
+    // The decision's identity is its title + what (the only varying part of a repeat is the
+    // timestamp footer). Skip when that exact block already exists, so a conductor that
+    // re-hits the same state every tick — e.g. a depth-capped auto-expansion that keeps
+    // deferring the same follow-ups — does not spam DECISIONS.md with identical entries.
+    let signature = format!("## {title}\n- **What:** {what}\n");
+    let path = repo_root.join("DECISIONS.md");
+    const HEADER: &str = "# Decisions\n\nShared, agent-authored log of cross-cutting decisions the fleet must honor. The conductor records plan/steer decisions here; workers record interface contracts + adjustments. Re-read before each significant step.\n\n";
+    let existing = fs::read_to_string(&path).unwrap_or_default();
+    if existing.contains(&signature) {
+        return false;
+    }
+    let mut entry = signature;
     if let Some(why) = why.map(|w| collapse(w)).filter(|w| !w.is_empty()) {
         entry.push_str(&format!("- **Why:** {why}\n"));
     }
     entry.push_str(&format!("- **By:** conductor · {}\n\n", now_stamp()));
 
-    let path = repo_root.join("DECISIONS.md");
-    const HEADER: &str = "# Decisions\n\nShared, agent-authored log of cross-cutting decisions the fleet must honor. The conductor records plan/steer decisions here; workers record interface contracts + adjustments. Re-read before each significant step.\n\n";
-    let existing = fs::read_to_string(&path).unwrap_or_default();
     let base = if existing.is_empty() {
         HEADER.to_string()
     } else {
         existing
     };
     let prefix = if base.ends_with('\n') { "" } else { "\n" };
-    let _ = fs::write(&path, format!("{base}{prefix}{entry}"));
+    fs::write(&path, format!("{base}{prefix}{entry}")).is_ok()
 }
 
 pub(crate) fn now_stamp() -> String {

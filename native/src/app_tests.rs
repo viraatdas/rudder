@@ -455,8 +455,29 @@ fn conductor_decision_appends_parseable_entry_with_header() {
     assert!(content.contains("## Plan approved") && content.contains("## Plan at cap"));
     // Empty `what` is a no-op (never writes a blank decision).
     let before = content.len();
-    append_conductor_decision(&dir, "x", "   ", None);
+    assert!(!append_conductor_decision(&dir, "x", "   ", None));
     assert_eq!(std::fs::read_to_string(&file).unwrap().len(), before);
+
+    // Idempotent: re-recording the SAME title+what (the depth-cap spam case) is a no-op,
+    // even though a fresh entry would carry a new timestamp footer.
+    let len_before = std::fs::read_to_string(&file).unwrap().len();
+    assert!(
+        !append_conductor_decision(&dir, "Plan at cap", "deferred follow-ups", None),
+        "an identical decision is not appended again"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap().len(),
+        len_before,
+        "duplicate decision did not grow the file"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&file)
+            .unwrap()
+            .matches("## Plan at cap")
+            .count(),
+        1,
+        "the capped decision appears exactly once"
+    );
     let _ = std::fs::remove_file(&file);
 }
 
@@ -3469,6 +3490,13 @@ fn steering_guards_refuse_unsafe_targets() {
 #[test]
 fn auto_expand_respects_depth_cap() {
     let mut app = App::new();
+    // Isolate the DECISIONS.md write: record_decision now dedupes, so it must run against a
+    // clean file (not the repo's, which already carries depth-cap entries) for the first
+    // record to genuinely write and surface in the activity feed.
+    let dir = std::env::temp_dir().join(format!("rudder-depthcap-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::remove_file(dir.join("DECISIONS.md"));
+    app.cwd = dir.clone();
     app.followup_gen
         .insert("deep".to_string(), MAX_FOLLOWUP_DEPTH);
     let note = serde_json::json!({ "followups": [{ "title": "more work", "scope": "in" }] });
@@ -3478,6 +3506,7 @@ fn auto_expand_respects_depth_cap() {
     );
     assert!(app.planned_nodes.is_empty());
     assert!(app.activity_log.iter().any(|l| l.contains("depth cap")));
+    let _ = std::fs::remove_file(dir.join("DECISIONS.md"));
 }
 
 #[test]
