@@ -145,9 +145,19 @@ pub(crate) fn push_agent_row_with_trailing<'a>(
     trailing: &[Span<'a>],
 ) {
     let selected = index == app.selected_agent;
-    let marker = if selected { "> " } else { "  " };
+    // The selected row must read clearly EVEN WHEN THE PANE IS UNFOCUSED (you navigate the
+    // tree from either pane), so its marker + title use the accent color + BOLD
+    // unconditionally instead of fading to FAINT the way accent_style(false) did — that
+    // fade is why the arrow was sometimes invisible. A filled glyph reads better than ">".
+    let selected_style = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
+    let marker = if selected { "▸ " } else { "  " };
+    let marker_style = if selected {
+        selected_style
+    } else {
+        accent_style(focused)
+    };
     let task_style = if selected {
-        pane_text_style(focused)
+        selected_style
     } else {
         pane_text_style(focused)
     };
@@ -164,7 +174,7 @@ pub(crate) fn push_agent_row_with_trailing<'a>(
 
     let mut first = prefix.to_vec();
     first.extend([
-        Span::styled(marker, accent_style(focused)),
+        Span::styled(marker, marker_style),
         if is_cloud_agent(agent) {
             Span::styled("☁ ", cloud_style(true, focused))
         } else {

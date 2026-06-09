@@ -5353,6 +5353,24 @@ fn restart_reconciles_finished_merge_resolver_to_done() {
     );
 }
 
+#[cfg(not(windows))]
+#[test]
+fn selected_agent_row_renders_a_visible_marker() {
+    // The selection arrow must actually appear on screen (it used to fade to FAINT when the
+    // agents pane was unfocused, so it was sometimes invisible).
+    let mut app = App::new();
+    app.agents = vec![
+        test_agent_run("a", "first task"),
+        test_agent_run("b", "second task"),
+    ];
+    app.selected_agent = 1;
+    let screen = render_screen(&mut app, 120, 40);
+    assert!(
+        screen.contains('\u{25b8}'),
+        "the selected agent row shows the marker glyph:\n{screen}"
+    );
+}
+
 #[test]
 fn auto_merge_waits_for_an_active_resolver() {
     // Integration through the shared jj workspace is serial: a Done node must NOT be merged
