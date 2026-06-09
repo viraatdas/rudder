@@ -1230,6 +1230,176 @@ pub(crate) fn jj_unresolved_conflicts(cwd: &Path) -> Vec<String> {
         .collect()
 }
 
+/// Change ids of the working-copy commit's parents. A 2-sided merge conflict has
+/// exactly two parents (the two sides being integrated); octopus merges have more.
+pub(crate) fn jj_parent_revs(cwd: &Path) -> Vec<String> {
+    let Ok(output) = Command::new("jj")
+        .args([
+            "log",
+            "--no-graph",
+            "--no-pager",
+            "-r",
+            "@-",
+            "-T",
+            "change_id.short() ++ \"\\n\"",
+        ])
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+/// Contents of `path` at revision `rev`, or None if the file does not exist there
+/// (e.g. one side of a modify/delete conflict).
+pub(crate) fn jj_file_show(cwd: &Path, rev: &str, path: &str) -> Option<String> {
+    let output = Command::new("jj")
+        .args(["file", "show", "--no-pager", "-r", rev, path])
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Resolve the MECHANICAL conflicts in `conflicted` directly, before any LLM resolver
+/// is spawned, and return the conflicts that still remain. The mechanical cases are the
+/// ones that collide on nearly every parallel feature merge yet have an unambiguous
+/// answer: `.gitignore` (union of both sides' rules) and `package.json` (deep-union of
+/// dependencies/scripts). Regenerable lock files take the larger side. Everything else
+/// is left untouched for the LLM resolver, so the worst case is exactly today's behavior.
+///
+/// Resolutions are written into the working copy; jj records them on the next snapshot
+/// (the trailing `jj_unresolved_conflicts` call), which also yields the authoritative
+/// remaining set.
+pub(crate) fn auto_resolve_mechanical_conflicts(cwd: &Path, conflicted: &[String]) -> Vec<String> {
+    let parents = jj_parent_revs(cwd);
+    // Only 2-sided conflicts have a well-defined "both sides" to union.
+    if parents.len() != 2 || conflicted.is_empty() {
+        return conflicted.to_vec();
+    }
+    let mut resolved_any = false;
+    for path in conflicted {
+        let Some(merged) = mechanical_merge_for(cwd, path, &parents[0], &parents[1]) else {
+            continue;
+        };
+        if std::fs::write(cwd.join(path), merged).is_ok() {
+            resolved_any = true;
+        }
+    }
+    if !resolved_any {
+        return conflicted.to_vec();
+    }
+    // Snapshot + re-list: jj is the source of truth for what is still conflicted.
+    jj_unresolved_conflicts(cwd)
+}
+
+/// The mechanical resolution for one conflicted path, or None to leave it to the LLM
+/// resolver. Keyed on file name so it works at any depth in the tree.
+fn mechanical_merge_for(cwd: &Path, path: &str, left: &str, right: &str) -> Option<String> {
+    let name = std::path::Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    let lhs = jj_file_show(cwd, left, path);
+    let rhs = jj_file_show(cwd, right, path);
+    match name {
+        // .gitignore (and nested *.gitignore): append-only rule lists; union is correct.
+        ".gitignore" => Some(union_gitignore_like(
+            &lhs.unwrap_or_default(),
+            &rhs.unwrap_or_default(),
+        )),
+        // package.json: deep-union deps/devDeps/scripts; scalar ties keep the base side.
+        "package.json" => merge_package_json(&lhs?, &rhs?),
+        // Regenerable lock files: take the more complete side; the install/build rebuilds it.
+        "package-lock.json" | "pnpm-lock.yaml" | "yarn.lock" => {
+            let l = lhs.unwrap_or_default();
+            let r = rhs.unwrap_or_default();
+            Some(if r.len() > l.len() { r } else { l })
+        }
+        _ => None,
+    }
+}
+
+/// Union two `.gitignore`-style files: keep the left side's lines in order, then append
+/// any of the right side's lines not already present. Dedupes by trimmed content and
+/// collapses runs of blank lines so the result stays tidy.
+pub(crate) fn union_gitignore_like(left: &str, right: &str) -> String {
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+    for line in left.lines().chain(right.lines()) {
+        let key = line.trim();
+        if key.is_empty() {
+            if out.last().map(|l| l.trim().is_empty()).unwrap_or(true) {
+                continue; // collapse leading / consecutive blanks
+            }
+            out.push(String::new());
+        } else if seen.insert(key.to_string()) {
+            out.push(line.to_string());
+        }
+    }
+    while out.last().map(|l| l.trim().is_empty()).unwrap_or(false) {
+        out.pop();
+    }
+    let mut s = out.join("\n");
+    s.push('\n');
+    s
+}
+
+/// Deep-union two `package.json` documents: objects merge key-by-key (so dependencies,
+/// devDependencies, and scripts accumulate from both sides), arrays union preserving
+/// order, and scalar conflicts keep the left (base) side. Returns None if either side is
+/// not valid JSON, in which case the LLM resolver handles it.
+pub(crate) fn merge_package_json(left: &str, right: &str) -> Option<String> {
+    let l: serde_json::Value = serde_json::from_str(left).ok()?;
+    let r: serde_json::Value = serde_json::from_str(right).ok()?;
+    let merged = deep_merge_json(&l, &r);
+    let mut s = serde_json::to_string_pretty(&merged).ok()?;
+    s.push('\n');
+    Some(s)
+}
+
+fn deep_merge_json(left: &serde_json::Value, right: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match (left, right) {
+        (Value::Object(l), Value::Object(r)) => {
+            let mut out = l.clone();
+            for (k, rv) in r {
+                let merged = match out.get(k) {
+                    Some(lv) => deep_merge_json(lv, rv),
+                    None => rv.clone(),
+                };
+                out.insert(k.clone(), merged);
+            }
+            Value::Object(out)
+        }
+        (Value::Array(l), Value::Array(r)) => {
+            let mut out = l.clone();
+            for item in r {
+                if !out.contains(item) {
+                    out.push(item.clone());
+                }
+            }
+            Value::Array(out)
+        }
+        // Scalar (or type mismatch): keep the base/left side for determinism.
+        _ => left.clone(),
+    }
+}
+
 pub(crate) fn diff_short_summary(run: &AgentRun) -> Option<String> {
     diff_short_summary_at(&run.cwd)
 }

@@ -3984,6 +3984,40 @@ impl App {
         launched
     }
 
+    /// On startup, reconcile in-flight runs persisted as Running whose work is actually
+    /// FINISHED, so a rudder restart UNFREEZES a stuck board instead of resurrecting the
+    /// dead processes in their stuck state. The motivating case: a merge-conflict resolver
+    /// that resolved cleanly but, under an older binary, never got its completion signal
+    /// wired — so it was persisted `Running` forever and its node never merged, blocking
+    /// every child. Here, any resolver with no live PTY whose jj workspace has no unresolved
+    /// conflicts is marked Done; the next poll tick's finalize_merge_resolvers then merges it
+    /// and unblocks its children. Runs BEFORE restore_running_agents so these finished
+    /// resolvers are not pointlessly resumed as live claude sessions.
+    fn reconcile_orphaned_runs(&mut self) {
+        let mut reconciled = 0usize;
+        for run in self.agents.iter_mut() {
+            if run.terminal.is_some() || run.status != AgentStatus::Running {
+                continue;
+            }
+            // A merge resolver whose checkout is conflict-free already did its job.
+            if run.merge_resolver && jj_unresolved_conflicts(&run.cwd).is_empty() {
+                mark_run_done(run);
+                let _ = save_native_run_record(&self.cwd, run);
+                reconciled += 1;
+            }
+        }
+        if reconciled > 0 {
+            self.notice = Some(format!(
+                "reconciled {reconciled} finished merge(s) from last session"
+            ));
+            // finalize_merge_resolvers (poll loop) merges these and unblocks children; nudge
+            // the scheduler + board so the unfreeze is visible immediately on restart.
+            self.run_scheduler();
+            self.mirror_graph();
+            self.dirty = true;
+        }
+    }
+
     fn restore_running_agents(&mut self) {
         let snapshot: Vec<(usize, MigratedAgent)> = self
             .agents
@@ -4725,6 +4759,24 @@ impl App {
             }
             Some("/review-all") => {
                 self.review_all_ready();
+                true
+            }
+            Some("/fast") => {
+                // Switch the current backend to ITS OWN fast variant (claude -> haiku,
+                // codex -> gpt-5.3-codex-spark), reusing the same path the model picker
+                // uses so it persists and propagates to a selected main agent.
+                let backend = self.backend;
+                let model = fast_model_for(backend).to_string();
+                let effort = default_effort_for(backend, &model);
+                let warning = self.set_model_defaults(backend, model, effort);
+                self.notice = warning.or_else(|| {
+                    Some(format!(
+                        "fast: {} {}({})",
+                        self.backend.as_str(),
+                        self.model,
+                        effort_label(self.effort)
+                    ))
+                });
                 true
             }
             _ => false,
@@ -7877,13 +7929,26 @@ impl App {
         let (operation, resolver_cwd, source_branch, worktree_path) =
             conflict_context.unwrap_or((ConflictOperation::Merge, self.cwd.clone(), None, None));
         let session_id = mint_session_id_for(backend);
-        let command = agent_command(
+        let resolver_run_id = self.agents[index].id.clone();
+        let mut command = agent_command(
             backend,
             &model,
             effort,
             &prompt,
             AgentMode::Execute,
             session_id.as_deref(),
+        );
+        // Wire the backend's own completion signal (Claude Stop hook / Codex notify)
+        // for the resolver, exactly like every other worker spawn. WITHOUT this the
+        // resolver reuses the node's run_id whose `{run_id}-claude.json` still exists
+        // on disk, so worker_has_config() is true and the poll loop WAITS for a Stop
+        // hook that was never wired -> a cleanly-resolved resolver sits Running forever
+        // and finalize_merge_resolvers (needs status==Done) never merges it. See signals.rs.
+        signals::augment_worker_command(
+            &mut command,
+            backend,
+            AgentMode::Execute,
+            &resolver_run_id,
         );
         let options = TerminalPaneOptions {
             size: terminal_size,
@@ -8096,8 +8161,17 @@ What to do\n\
             match run_rudder_jj_command(&self.cwd, "merge", &run_id, "merge") {
                 JjCliOutcome::Ok => {}
                 JjCliOutcome::Conflict { files } => {
-                    self.pending_jj_conflict = Some(files);
-                    anyhow::bail!("jj merge created conflicts");
+                    // Before falling back to a multi-minute LLM resolver, auto-resolve the
+                    // MECHANICAL conflicts directly in jj (package.json/.gitignore union,
+                    // regenerable lock files). These collide on nearly every parallel
+                    // feature merge but have an unambiguous answer. If that clears every
+                    // conflict the merge @ is now clean and we fall through to the success
+                    // finalize below — no resolver spawned, the node merges instantly.
+                    let remaining = auto_resolve_mechanical_conflicts(&self.cwd, &files);
+                    if !remaining.is_empty() {
+                        self.pending_jj_conflict = Some(remaining);
+                        anyhow::bail!("jj merge created conflicts");
+                    }
                 }
                 JjCliOutcome::Failed { error } => anyhow::bail!(error),
             }
@@ -8832,6 +8906,10 @@ fn restore_terminal(terminal: &mut Tui) -> Result<()> {
 fn run(terminal: &mut Tui) -> Result<()> {
     let mut app = App::new();
     app.resume_migrated_agents();
+    // Unfreeze finished-but-stuck in-flight work (e.g. merge resolvers that completed under
+    // an older binary) BEFORE trying to resume anything, so a restart makes the board progress
+    // instead of resurrecting dead processes in their stuck state.
+    app.reconcile_orphaned_runs();
     app.restore_running_agents();
     // Reconcile graph.json with the restored in-memory state on startup so the board does
     // not show stale "planned" nodes from a previous session (and reflects the restored

@@ -183,27 +183,34 @@ pub(crate) fn push_agent_row_with_trailing<'a>(
         };
     let badge_style = Style::default().fg(status_style.fg.unwrap_or(MUTED));
 
-    let mut status_line = cont_prefix.to_vec();
-    status_line.extend([
+    let mode_span = if agent.is_main() {
+        Span::styled("main", accent_style(focused))
+    } else if is_cloud_agent(agent) {
+        Span::styled("cloud", accent_style(focused))
+    } else if agent.mode == AgentMode::RudderPlan {
+        Span::styled("rudder-plan", accent_style(focused))
+    } else if agent.mode == AgentMode::ReviewAll {
+        Span::styled("review-all", accent_style(focused))
+    } else if agent.mode == AgentMode::Plan {
+        Span::styled("plan", accent_style(focused))
+    } else {
+        Span::styled("run", muted_style(focused))
+    };
+
+    // The status head (badge + status + mode) always fits; the model tail
+    // (backend + model + effort) is what overflows the ~30-col pane and gets the
+    // model name clipped mid-word ("opus[1m]" -> "opus[1"). Keep it inline when it
+    // fits, otherwise wrap it onto its own indented line so the model shows in full.
+    let mut status_head = cont_prefix.to_vec();
+    status_head.extend([
         Span::raw("  "),
         Span::styled(BADGE, badge_style),
         Span::raw(" "),
         Span::styled(status_label, status_style),
         Span::raw("  "),
-        if agent.is_main() {
-            Span::styled("main", accent_style(focused))
-        } else if is_cloud_agent(agent) {
-            Span::styled("cloud", accent_style(focused))
-        } else if agent.mode == AgentMode::RudderPlan {
-            Span::styled("rudder-plan", accent_style(focused))
-        } else if agent.mode == AgentMode::ReviewAll {
-            Span::styled("review-all", accent_style(focused))
-        } else if agent.mode == AgentMode::Plan {
-            Span::styled("plan", accent_style(focused))
-        } else {
-            Span::styled("run", muted_style(focused))
-        },
-        Span::raw("  "),
+        mode_span,
+    ]);
+    let model_tail = vec![
         Span::styled(agent.backend.as_str().to_string(), muted_style(focused)),
         Span::raw("  "),
         Span::styled(agent.model.clone(), model_style(focused)),
@@ -211,12 +218,65 @@ pub(crate) fn push_agent_row_with_trailing<'a>(
             format!("({})", effort_label(agent.effort)),
             model_style(focused),
         ),
-    ]);
-    lines.push(ListItem::new(Line::from(status_line)));
+    ];
+    let head_width: usize = status_head.iter().map(Span::width).sum();
+    let tail_width: usize = model_tail.iter().map(Span::width).sum();
+    if head_width + 2 + tail_width <= task_width {
+        let mut status_line = status_head;
+        status_line.push(Span::raw("  "));
+        status_line.extend(model_tail);
+        lines.push(ListItem::new(Line::from(status_line)));
+    } else {
+        lines.push(ListItem::new(Line::from(status_head)));
+        let mut model_line = cont_prefix.to_vec();
+        model_line.push(Span::raw("    "));
+        model_line.extend(model_tail);
+        lines.push(ListItem::new(Line::from(model_line)));
+    }
     if let Some(summary) = diff {
         let mut diff_line = cont_prefix.to_vec();
-        diff_line.extend([Span::raw("  "), Span::styled(summary, muted_style(focused))]);
+        diff_line.extend([
+            Span::raw("  "),
+            Span::styled(compact_diff_stat(&summary), muted_style(focused)),
+        ]);
         lines.push(ListItem::new(Line::from(diff_line)));
+    }
+}
+
+/// Compress `git diff --shortstat` output ("34 files changed, 3162 insertions(+),
+/// 120 deletions(-)") into a pane-friendly "34f +3162 -120" so every count stays
+/// visible in the narrow agents pane instead of clipping mid-word. Falls back to
+/// the original string if it does not parse.
+fn compact_diff_stat(summary: &str) -> String {
+    let (mut files, mut ins, mut del) = (None, None, None);
+    for part in summary.split(',') {
+        let part = part.trim();
+        let Some(num) = part.split_whitespace().next() else {
+            continue;
+        };
+        if part.contains("file") {
+            files = Some(num);
+        } else if part.contains("insertion") {
+            ins = Some(num);
+        } else if part.contains("deletion") {
+            del = Some(num);
+        }
+    }
+    let mut out = String::new();
+    if let Some(files) = files {
+        out.push_str(&format!("{files}f"));
+    }
+    if let Some(ins) = ins {
+        out.push_str(&format!(" +{ins}"));
+    }
+    if let Some(del) = del {
+        out.push_str(&format!(" -{del}"));
+    }
+    let out = out.trim();
+    if out.is_empty() {
+        summary.to_string()
+    } else {
+        out.to_string()
     }
 }
 
@@ -613,39 +673,35 @@ fn render_status_section<'a>(
     true
 }
 
-/// Push one planned (not-yet-launched) node row into the Todo section: a label
-/// line with the node title and a status line with a Todo-colored badge reading
-/// "todo". `prefix`/`cont_prefix` carry the nest glyphs (empty for a root).
+/// Push one planned (not-yet-launched) node row into the Todo section: a single
+/// line carrying the Todo-colored badge and the node title. The "todo"/"planned"
+/// status text is omitted on purpose — the section is already titled "todo", so
+/// repeating it per row is noise. `prefix` carries the nest glyphs (empty for a
+/// root); `_cont_prefix` is unused now that there is no second line to bridge.
 fn push_planned_row<'a>(
     lines: &mut Vec<ListItem<'a>>,
     node: &PlannedNode,
     focused: bool,
     task_width: usize,
     prefix: &[Span<'a>],
-    cont_prefix: &[Span<'a>],
+    _cont_prefix: &[Span<'a>],
 ) {
     let label = if node.title.trim().is_empty() {
         summarize_task(&node.prompt)
     } else {
         node.title.clone()
     };
-    let mut first = prefix.to_vec();
-    first.extend([
-        Span::raw("  "),
-        Span::styled(truncate_chars(&label, task_width), pane_text_style(focused)),
-    ]);
-    lines.push(ListItem::new(Line::from(first)));
-
-    let mut status_line = cont_prefix.to_vec();
-    status_line.extend([
+    let mut line = prefix.to_vec();
+    line.extend([
         Span::raw("  "),
         Span::styled(BADGE, Style::default().fg(ST_PLANNED)),
         Span::raw(" "),
-        Span::styled("todo", Style::default().fg(ST_PLANNED)),
-        Span::raw("  "),
-        Span::styled("planned", muted_style(focused)),
+        Span::styled(
+            truncate_chars(&label, task_width.saturating_sub(2)),
+            pane_text_style(focused),
+        ),
     ]);
-    lines.push(ListItem::new(Line::from(status_line)));
+    lines.push(ListItem::new(Line::from(line)));
 }
 
 /// Walk the planned-node forest depth-first, nesting a node under a parent that is

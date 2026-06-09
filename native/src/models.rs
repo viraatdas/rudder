@@ -9,6 +9,16 @@ pub(crate) fn default_model_for(backend: Backend) -> &'static str {
     }
 }
 
+/// Each backend's own "fast" model, used by the `/fast` command. Claude's fast
+/// tier is haiku; Codex's is the spark coding model. Mirrors the "fast" rows in
+/// `fallback_model_rows`.
+pub(crate) fn fast_model_for(backend: Backend) -> &'static str {
+    match backend {
+        Backend::Claude => "haiku",
+        Backend::Codex => "gpt-5.3-codex-spark",
+    }
+}
+
 pub(crate) fn default_effort_for(backend: Backend, model: &str) -> Option<EffortLevel> {
     let options = effort_options_for(backend, model);
     if options.contains(&Some(EffortLevel::XHigh)) {
@@ -251,6 +261,12 @@ pub(crate) fn command_suggestions() -> Vec<Suggestion> {
             label: "/model".to_string(),
             detail: "pick Claude or Codex model".to_string(),
             action: SuggestionAction::Insert("/model ".to_string()),
+        },
+        Suggestion {
+            label: "/fast".to_string(),
+            detail: "switch this backend to its fast model (claude haiku / codex spark)"
+                .to_string(),
+            action: SuggestionAction::RunCommand("/fast".to_string()),
         },
         Suggestion {
             label: "/main".to_string(),

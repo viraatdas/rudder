@@ -1,5 +1,48 @@
 use super::*;
 
+#[test]
+fn union_gitignore_merges_both_sides_without_duplicates() {
+    let left = "node_modules/\n.env\n*.db\n";
+    let right = "node_modules/\n.next/\n*.db\n.vercel\n";
+    let merged = union_gitignore_like(left, right);
+    // Every rule from both sides is present exactly once.
+    for rule in ["node_modules/", ".env", "*.db", ".next/", ".vercel"] {
+        assert_eq!(
+            merged.matches(&format!("{rule}\n")).count(),
+            1,
+            "{rule} appears exactly once in:\n{merged}"
+        );
+    }
+    // Left side's order is preserved, right's new rules appended after.
+    let next_pos = merged.find(".next/").unwrap();
+    let env_pos = merged.find(".env").unwrap();
+    assert!(env_pos < next_pos, "left rules precede right-only rules");
+}
+
+#[test]
+fn merge_package_json_unions_deps_and_scripts() {
+    let left = r#"{"name":"app","version":"1.0.0","scripts":{"dev":"next dev"},"dependencies":{"next":"15"}}"#;
+    let right = r#"{"name":"app","version":"2.0.0","scripts":{"db:seed":"tsx seed.ts"},"dependencies":{"@libsql/client":"0.14"}}"#;
+    let merged = merge_package_json(left, right).expect("valid merge");
+    let value: serde_json::Value = serde_json::from_str(&merged).expect("merged is valid json");
+    // Scripts and dependencies from BOTH sides survive.
+    assert!(value["scripts"]["dev"].is_string(), "kept left script");
+    assert!(value["scripts"]["db:seed"].is_string(), "kept right script");
+    assert!(value["dependencies"]["next"].is_string(), "kept left dep");
+    assert!(
+        value["dependencies"]["@libsql/client"].is_string(),
+        "kept right dep"
+    );
+    // Scalar conflict (version) deterministically keeps the base/left side.
+    assert_eq!(value["version"], "1.0.0", "scalar tie keeps left side");
+}
+
+#[test]
+fn merge_package_json_bails_on_invalid_json() {
+    // A non-JSON side must fall back to the LLM resolver (None), never corrupt the file.
+    assert!(merge_package_json("{not json", "{}").is_none());
+}
+
 /// Flatten a rendered Line back into its plain text (span contents joined).
 fn flatten_line(line: &ratatui::text::Line<'_>) -> String {
     line.spans.iter().map(|s| s.content.as_ref()).collect()
@@ -3917,6 +3960,12 @@ fn restart_preserves_interactive_orchestrator_profile_from_run_record() {
     app.selected_agent = 0;
 
     app.restart_selected_agent();
+    // The env vars were only needed while restart_selected_agent built+spawned the
+    // command; the fake child is already running. Remove them NOW so a flaky assert
+    // below (e.g. the timing-sensitive args_file wait) can't leak RUDDER_CLAUDE_BIN
+    // into the next env-guarded test and cascade a second failure.
+    std::env::remove_var("RUDDER_CLAUDE_BIN");
+    std::env::remove_var("RUDDER_INTERACTIVE_ORCHESTRATOR");
     let restarted = app.agents.first().expect("restarted row");
     assert_eq!(restarted.status, AgentStatus::Running);
     assert!(restarted.interactive_orchestrator);
@@ -3925,7 +3974,10 @@ fn restart_preserves_interactive_orchestrator_profile_from_run_record() {
         "interactive orchestrators must not restart as headless/autosteered planners"
     );
 
-    for _ in 0..40 {
+    // Generous wait: under parallel test load the fake child's spawn + first write
+    // can lag well past 1s, so poll up to ~5s before giving up (this is the flaky
+    // assertion that used to fail and cascade an env leak into the next test).
+    for _ in 0..200 {
         if args_file.exists() {
             break;
         }
@@ -3941,8 +3993,6 @@ fn restart_preserves_interactive_orchestrator_profile_from_run_record() {
         "interactive restart must not use headless print-mode args:\n{args}"
     );
 
-    std::env::remove_var("RUDDER_CLAUDE_BIN");
-    std::env::remove_var("RUDDER_INTERACTIVE_ORCHESTRATOR");
     let _ = fs::remove_dir_all(&repo);
 }
 
@@ -5180,6 +5230,98 @@ fn wired_worker_waits_for_the_signal_and_ignores_idle_chrome() {
 
     let _ = std::fs::remove_file(&sig);
     let _ = std::fs::remove_file(&settings);
+}
+
+#[cfg(not(windows))]
+#[test]
+fn merge_conflict_resolver_spawn_wires_its_completion_signal() {
+    // Regression: a merge-conflict resolver reuses the failing node's row (same
+    // run_id). The node's original launch left `{run_id}-claude.json` on disk, so
+    // worker_has_config() is true -> the poll loop WAITS for a Stop hook. If the
+    // resolver spawn does not RE-wire that hook, the hook never fires, the resolver
+    // sits Running forever even after it resolves cleanly, and finalize_merge_resolvers
+    // (which needs status==Done) never merges the node. So the spawn MUST wire signals.
+    let _env = env_guard();
+    if crate::signals::signals_dir().is_none() {
+        return; // no HOME/RUDDER_HOME in this env
+    }
+    let run_id = "resolver-signal-itest";
+    // Start from a clean slate: no config on disk for this run id.
+    let config = crate::signals::signals_dir()
+        .unwrap()
+        .join(format!("{run_id}-claude.json"));
+    let _ = std::fs::remove_file(&config);
+
+    let repo = unique_test_repo("resolver-signal");
+    let fake = repo.join("fake-claude.sh");
+    write_fake_bin(&fake, "#!/bin/sh\nsleep 5\n");
+    std::env::set_var("RUDDER_CLAUDE_BIN", &fake);
+
+    let mut app = App::new();
+    app.cwd = repo.clone();
+    app.backend = Backend::Claude;
+    let mut run = test_agent_run(run_id, "build auth");
+    run.cwd = repo.clone();
+    app.agents.push(run);
+    app.selected_agent = 0;
+    app.conflict_prompt = Some(MergeConflictPrompt {
+        operation: ConflictOperation::Merge,
+        task: "build auth".to_string(),
+        conflicted_files: vec!["src/auth.rs".to_string()],
+        error: "conflict".to_string(),
+        repo_root: repo.clone(),
+        target_branch: None,
+        source_branch: None,
+        worktree_path: None,
+        agent_id: Some(run_id.to_string()),
+    });
+
+    app.start_conflict_resolution_agent();
+
+    // Capture results, THEN clean up process-global state, THEN assert — so a failing
+    // assert can never leak RUDDER_CLAUDE_BIN into the next env-guarded test.
+    let is_resolver = app.agents[0].merge_resolver;
+    let has_config = crate::signals::worker_has_config(run_id, Backend::Claude);
+    if let Some(run) = app.agents.get_mut(0) {
+        run.terminal = None; // kill the fake PTY
+    }
+    std::env::remove_var("RUDDER_CLAUDE_BIN");
+    let _ = std::fs::remove_file(&config);
+
+    assert!(
+        is_resolver,
+        "the reused row is flagged as a merge resolver so finalize can pick it up"
+    );
+    assert!(
+        has_config,
+        "the resolver spawn must wire the backend completion signal, or it sits Running forever"
+    );
+}
+
+#[test]
+fn restart_reconciles_finished_merge_resolver_to_done() {
+    // The frozen-board case: under an older binary a merge resolver resolved cleanly but
+    // was persisted `Running` forever (its completion signal was never wired), so its node
+    // never merged and its children stayed blocked. On the next rudder start,
+    // reconcile_orphaned_runs must flip such a resolver (no live PTY, conflict-free
+    // workspace) to Done so finalize_merge_resolvers merges it and unblocks the plan.
+    let mut app = App::new();
+    app.cwd = std::env::temp_dir();
+    let mut run = test_agent_run("stuck-resolver", "Resolve merge conflicts: build auth");
+    run.cwd = std::env::temp_dir(); // a non-jj dir reports zero conflicts
+    run.status = AgentStatus::Running;
+    run.merge_resolver = true;
+    run.node_id = Some("n2".to_string());
+    run.terminal = None;
+    app.agents.push(run);
+
+    app.reconcile_orphaned_runs();
+
+    assert_eq!(
+        app.agents[0].status,
+        AgentStatus::Done,
+        "a finished merge resolver with no live PTY and a clean workspace is reconciled to Done"
+    );
 }
 
 #[cfg(not(windows))]
