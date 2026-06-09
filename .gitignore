@@ -9,4 +9,5 @@ npm-debug.log*
 .DS_Store
 RUDDER.md
 RUDDER_SHARED.md
+DECISIONS.md
 *.tgz

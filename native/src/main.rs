@@ -751,8 +751,27 @@ struct CliSelection {
     model: Option<String>,
 }
 
+/// A unique temp dir for an App built in a test, so test state (DECISIONS.md, .rudder/,
+/// RUDDER.md, graph.json) never lands in the real working repo and tests never share a
+/// file. The atomic counter makes each `App::new()` in the same test process distinct.
+#[cfg(test)]
+fn test_default_cwd() -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("rudder-test-cwd-{}-{n}", std::process::id()))
+}
+
 impl App {
     fn new() -> Self {
+        // In tests, default to a UNIQUE temp dir, never the real repo: App methods write
+        // real files (DECISIONS.md, .rudder/, RUDDER.md, graph.json) keyed on cwd, so a test
+        // that forgets to override app.cwd would otherwise pollute the working repo (this is
+        // exactly how the repo's DECISIONS.md accumulated dozens of stray depth-cap entries).
+        // The per-instance counter keeps tests from sharing a temp file and cross-contaminating.
+        #[cfg(test)]
+        let cwd = test_default_cwd();
+        #[cfg(not(test))]
         let cwd = std::env::current_dir()
             .map(|path| dashboard_root(&path))
             .unwrap_or_else(|_| PathBuf::from("."));
@@ -6845,6 +6864,19 @@ impl App {
         // shift a RUNNING node into the MERGED zone mid-diff and the build-forward apply
         // would compute its zones against a moving target. Resume once the rebase lands.
         if self.rebasing {
+            return;
+        }
+        // Serialize integration through the shared jj workspace: while a merge-conflict
+        // resolver is mid-flight it is resolving a conflict IN self.cwd, and starting another
+        // merge there would stack a new merge change on top of the in-progress resolution —
+        // shifting @ under the resolver and making finalize_merge_resolvers mis-read whose
+        // conflicts remain. Workers run in parallel, but integration is one-at-a-time. Resume
+        // when the resolver lands (finalize_merge_resolvers clears its resolver state).
+        if self
+            .agents
+            .iter()
+            .any(|run| run.merge_resolver && run.status == AgentStatus::Running)
+        {
             return;
         }
         let mut merged_any = false;

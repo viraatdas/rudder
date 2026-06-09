@@ -5353,6 +5353,32 @@ fn restart_reconciles_finished_merge_resolver_to_done() {
     );
 }
 
+#[test]
+fn auto_merge_waits_for_an_active_resolver() {
+    // Integration through the shared jj workspace is serial: a Done node must NOT be merged
+    // while a merge-conflict resolver is mid-flight in the same workspace, or the new merge
+    // would stack on top of the in-progress resolution and corrupt both. The guard returns
+    // before any merge is attempted (so this is deterministic — no `rudder merge` subprocess).
+    let mut app = App::new();
+    app.auto_merge = true;
+    let mut ready = test_agent_run("ready", "feature");
+    ready.node_id = Some("n1".to_string());
+    ready.status = AgentStatus::Done;
+    let mut resolver = test_agent_run("resolving", "Resolve merge conflicts: foundation");
+    resolver.node_id = Some("n0".to_string());
+    resolver.status = AgentStatus::Running;
+    resolver.merge_resolver = true;
+    app.agents = vec![ready, resolver];
+
+    app.maybe_auto_merge();
+
+    assert_eq!(
+        app.agents[0].status,
+        AgentStatus::Done,
+        "the ready node stays unmerged while a resolver integrates in the shared workspace"
+    );
+}
+
 #[cfg(not(windows))]
 #[test]
 fn tui_harness_drives_planner_to_dag_and_renders_it() {
