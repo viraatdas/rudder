@@ -32,6 +32,12 @@ pub(crate) fn graph_json_path(repo_root: &Path) -> PathBuf {
     repo_root.join(".rudder").join("graph.json")
 }
 
+pub(crate) const RUDDER_SHARED_CONTEXT_FILE: &str = "RUDDER_SHARED.md";
+
+pub(crate) fn shared_context_path(repo_root: &Path) -> PathBuf {
+    repo_root.join(RUDDER_SHARED_CONTEXT_FILE)
+}
+
 /// A parsed, query-friendly view of `.rudder/graph.json`. The daemon (TS side)
 /// owns writing this file; the TUI only reads it. The index lets us answer "what
 /// are this run's hard/soft parent node ids" without re-walking JSON per agent.
@@ -1348,6 +1354,7 @@ pub(crate) fn write_rudder_context(
     pending: Option<&WorktreeInfo>,
 ) -> Result<()> {
     ensure_gitignore_contains(repo_root, "RUDDER.md")?;
+    ensure_gitignore_contains(repo_root, RUDDER_SHARED_CONTEXT_FILE)?;
     // Worktrees now live INSIDE the project at <repo>/.rudder-worktrees; ignore them in the
     // USER's repo (only Rudder's own repo previously listed it), or each worker's checkout
     // would show up as untracked files in the parent and could be committed/cleaned.
@@ -1365,7 +1372,7 @@ pub(crate) fn write_rudder_context(
         body.push_str(&format!(
             "- {}: {} [{} {}] cwd={}{}\n",
             agent.id,
-            agent.task,
+            preview_text(&agent.task, 140),
             agent.backend.as_str(),
             agent.model,
             agent.cwd.display(),
@@ -1380,7 +1387,7 @@ pub(crate) fn write_rudder_context(
         ));
     }
     body.push_str(
-        "\nRead this file before making changes so you know what other Rudder agents are doing.\n",
+        "\nRead this file before making changes so you know what other Rudder agents are doing. If RUDDER_SHARED.md exists beside it, read that too; it is Rudder's gitignored file for user-shared credentials, API tokens, private URLs, and other local context that must survive model compaction.\n",
     );
     body.push_str(
         "\n## Version control\n\nThis repo uses jj (Jujutsu), colocated with git. Each agent works in its own jj workspace; jj is authoritative. Inspect changes with `jj status` / `jj diff`. Do not run commit/branch/merge commands yourself; Rudder snapshots and integrates your working copy.\n",
@@ -1391,8 +1398,214 @@ pub(crate) fn write_rudder_context(
             write_merged_rudder_md(&worktree.path.join("RUDDER.md"), &body)?;
         }
     }
+    sync_shared_context_surfaces(repo_root, agents, pending)?;
     Ok(())
 }
+
+pub(crate) fn sync_shared_context_surfaces(
+    repo_root: &Path,
+    agents: &[AgentRun],
+    pending: Option<&WorktreeInfo>,
+) -> Result<()> {
+    ensure_gitignore_contains(repo_root, RUDDER_SHARED_CONTEXT_FILE)?;
+    let source = shared_context_path(repo_root);
+    if !source.exists() {
+        return Ok(());
+    }
+    let content = fs::read(&source)?;
+    restrict_private_file(&source);
+
+    let mut targets: Vec<PathBuf> = agents
+        .iter()
+        .map(|agent| agent.cwd.clone())
+        .collect::<Vec<_>>();
+    if let Some(worktree) = pending.filter(|worktree| worktree.path_is_worktree) {
+        targets.push(worktree.path.clone());
+    }
+    targets.push(repo_root.to_path_buf());
+    targets.sort();
+    targets.dedup();
+
+    for workspace in targets {
+        if !workspace.exists() {
+            continue;
+        }
+        exclude_shared_context_in_workspace(&workspace);
+        let target = workspace.join(RUDDER_SHARED_CONTEXT_FILE);
+        if target == source {
+            continue;
+        }
+        if let Some(parent) = target.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        fs::write(&target, &content)?;
+        restrict_private_file(&target);
+    }
+    Ok(())
+}
+
+pub(crate) fn append_shared_context(repo_root: &Path, source: &str, text: &str) -> Result<bool> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(false);
+    }
+    ensure_gitignore_contains(repo_root, RUDDER_SHARED_CONTEXT_FILE)?;
+    let path = shared_context_path(repo_root);
+    let existing = fs::read_to_string(&path).unwrap_or_default();
+    if existing.contains(text) {
+        return Ok(false);
+    }
+    let header = "# Rudder Shared Context\n\nLocal, gitignored context the user shared with Rudder. This may include API tokens, private URLs, environment values, account ids, or other details that must be available to every agent even after model compaction. Agents should read this file when present, use the values as needed, and avoid printing secret values back unless necessary.\n\n";
+    let mut next = String::new();
+    if existing.trim().is_empty() {
+        next.push_str(header);
+    } else {
+        next.push_str(&existing);
+        if !next.ends_with('\n') {
+            next.push('\n');
+        }
+    }
+    let source = source.trim();
+    let source = if source.is_empty() {
+        "task bar"
+    } else {
+        source
+    };
+    next.push_str(&format!("## {} · {source}\n", now_stamp()));
+    for line in text.lines() {
+        next.push_str("    ");
+        next.push_str(line);
+        next.push('\n');
+    }
+    next.push('\n');
+    fs::write(&path, next)?;
+    restrict_private_file(&path);
+    Ok(true)
+}
+
+pub(crate) fn capture_shared_context_from_user_input(
+    repo_root: &Path,
+    input: &str,
+) -> Result<bool> {
+    let Some(snippet) = extract_shared_context_snippet(input) else {
+        return Ok(false);
+    };
+    append_shared_context(repo_root, "task bar", &snippet)
+}
+
+pub(crate) fn extract_shared_context_snippet(input: &str) -> Option<String> {
+    let lines = input
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && looks_like_shared_secret_line(line))
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
+    }
+}
+
+fn looks_like_shared_secret_line(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    let has_keyword = [
+        "api key",
+        "api token",
+        "access token",
+        "auth token",
+        "bearer token",
+        "bearer ",
+        "client secret",
+        "client_secret",
+        "secret key",
+        "authorization: bearer",
+        "password",
+        "_token",
+        "token=",
+        "token:",
+        "api_key",
+        "apikey",
+        "secret=",
+        "secret:",
+        "_secret",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+    if !has_keyword {
+        return false;
+    }
+    let assignmentish = lower.contains('=')
+        || lower.contains(": ")
+        || lower.contains(" is ")
+        || lower.starts_with("use ")
+        || lower.contains(" use ");
+    assignmentish && has_plausible_secret_value(line)
+}
+
+fn has_plausible_secret_value(line: &str) -> bool {
+    line.split(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | '`' | ',' | ';'))
+        .map(|part| {
+            part.trim_matches(|ch: char| {
+                matches!(ch, ':' | '=' | '[' | ']' | '(' | ')' | '{' | '}')
+            })
+        })
+        .any(|part| {
+            part.len() >= 10
+                && part.chars().any(|ch| ch.is_ascii_alphanumeric())
+                && part
+                    .chars()
+                    .any(|ch| ch.is_ascii_digit() || matches!(ch, '_' | '-' | '.' | '/'))
+        })
+}
+
+fn exclude_shared_context_in_workspace(workspace: &Path) {
+    let Ok(output) = Command::new("git")
+        .args(["rev-parse", "--git-path", "info/exclude"])
+        .current_dir(workspace)
+        .output()
+    else {
+        return;
+    };
+    if !output.status.success() {
+        return;
+    }
+    let exclude = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if exclude.is_empty() {
+        return;
+    }
+    let path = workspace.join(exclude);
+    let _ = ensure_line_in_file(&path, RUDDER_SHARED_CONTEXT_FILE);
+}
+
+fn ensure_line_in_file(path: &Path, line: &str) -> Result<()> {
+    let existing = fs::read_to_string(path).unwrap_or_default();
+    if existing
+        .lines()
+        .any(|existing_line| existing_line.trim() == line)
+    {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let prefix = if existing.is_empty() || existing.ends_with('\n') {
+        ""
+    } else {
+        "\n"
+    };
+    fs::write(path, format!("{existing}{prefix}{line}\n"))?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn restrict_private_file(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+}
+
+#[cfg(not(unix))]
+fn restrict_private_file(_path: &Path) {}
 
 const RUDDER_GENERATED_START: &str = "<!-- RUDDER_GENERATED_START -->";
 const RUDDER_GENERATED_END: &str = "<!-- RUDDER_GENERATED_END -->";
@@ -1401,7 +1614,10 @@ const RUDDER_PLAN_END: &str = "RUDDER_PLAN_TASKS_END";
 
 fn write_merged_rudder_md(path: &Path, generated: &str) -> Result<()> {
     let existing = fs::read_to_string(path).unwrap_or_default();
-    fs::write(path, merge_generated_rudder_md(&existing, generated).as_bytes())?;
+    fs::write(
+        path,
+        merge_generated_rudder_md(&existing, generated).as_bytes(),
+    )?;
     Ok(())
 }
 

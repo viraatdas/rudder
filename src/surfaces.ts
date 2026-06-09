@@ -31,6 +31,10 @@ const STATUS_BADGE: Record<TaskNode["status"], string> = {
 export const DECISIONS_HEADER =
   "# Decisions\n\nShared, agent-authored log of cross-cutting decisions the fleet must honor. The conductor records plan/rebase/steer decisions here; workers record interface contracts + adjustments. Each entry is a `##` heading with **What / Why / By** so it scans. Re-read before each significant step; jj merges concurrent edits as first-class conflicts on fan-in.";
 
+export const SHARED_CONTEXT_FILE = "RUDDER_SHARED.md";
+const SHARED_CONTEXT_HEADER =
+  "# Rudder Shared Context\n\nLocal, gitignored context the user shared with Rudder. This may include API tokens, private URLs, environment values, account ids, or other details that must be available to every agent even after model compaction. Agents should read this file when present, use the values as needed, and avoid printing secret values back unless necessary.\n\n";
+
 /** A short scannable title from free text: the first ~9 words, single line, capped. */
 function decisionTitle(text: string, max = 9): string {
   const flat = text.replace(/\s+/g, " ").trim();
@@ -77,19 +81,23 @@ async function appendDecisionsEntry(repoRoot: string, entry: string): Promise<vo
   await fsp.appendFile(target, `${prefix}${entry}`, "utf8").catch(() => undefined);
 }
 
-// The propagation contract. These three lines live in the worker system-prompt
+// The propagation contract. These rules live in the worker system-prompt
 // (brain.renderContract working rules) and are mirrored into the RUDDER.md
 // preamble so an agent reading only RUDDER.md still gets them. Kept here so the
 // two surfaces never drift. No em dashes.
 export const PROPAGATION_RULES: string[] = [
-  "Before each significant step, re-read RUDDER.md (live orchestrator status + the current plan/DAG) and DECISIONS.md (shared decisions from sibling agents); they change while you work.",
-  "RUDDER.md carries a freshness stamp. If it is newer than when you last read it, the plan or a sibling changed state - re-read both before continuing.",
+  "Before each significant step, re-read RUDDER.md (live orchestrator status + the current plan/DAG), DECISIONS.md (shared decisions from sibling agents), and RUDDER_SHARED.md when present (gitignored user-shared tokens/env/private context); they change while you work.",
+  "RUDDER.md carries a freshness stamp. If it is newer than when you last read it, the plan or a sibling changed state - re-read all shared context before continuing.",
   "If the plan or architecture has shifted in a way that affects your task (the user refined it, or a sibling recorded a conflicting decision), ADAPT your in-progress work to the new direction instead of continuing on the old plan, so the work does not stray; note the adjustment in DECISIONS.md.",
-  "Record any cross-cutting decision other agents must honor by appending a bullet to DECISIONS.md (decision, rationale, owning node id). Never edit RUDDER.md; it is orchestrator-owned.",
+  "Record any cross-cutting decision other agents must honor by appending a bullet to DECISIONS.md (decision, rationale, owning node id). Put local tokens, private URLs, env vars, and credentials in RUDDER_SHARED.md instead; never put secret values in DECISIONS.md or RUDDER.md. Never edit RUDDER.md; it is orchestrator-owned.",
 ];
 
 function decisionsPath(repoRoot: string): string {
   return path.join(repoRoot, "DECISIONS.md");
+}
+
+export function sharedContextPath(repoRoot: string): string {
+  return path.join(repoRoot, SHARED_CONTEXT_FILE);
 }
 
 /**
@@ -107,6 +115,143 @@ export async function ensureDecisionsFile(repoRoot: string): Promise<string> {
   await ensureDir(path.dirname(target));
   await fsp.writeFile(target, `${DECISIONS_HEADER}\n\n`, "utf8").catch(() => undefined);
   return target;
+}
+
+export async function appendSharedContext(
+  repoRoot: string,
+  text: string,
+  source = "cli",
+): Promise<boolean> {
+  const normalized = text.trim();
+  if (!normalized) {
+    return false;
+  }
+  await ensureLine(path.join(repoRoot, ".gitignore"), SHARED_CONTEXT_FILE);
+  const target = sharedContextPath(repoRoot);
+  const existing = await fsp.readFile(target, "utf8").catch(() => "");
+  if (existing.includes(normalized)) {
+    return false;
+  }
+  let next = "";
+  if (existing.trim()) {
+    next = existing.endsWith("\n") ? existing : `${existing}\n`;
+  } else {
+    next = SHARED_CONTEXT_HEADER;
+  }
+  next += `## ${nowIso()} · ${source.trim() || "cli"}\n`;
+  for (const line of normalized.split(/\r?\n/)) {
+    next += `    ${line}\n`;
+  }
+  next += "\n";
+  await ensureDir(path.dirname(target));
+  await fsp.writeFile(target, next, "utf8");
+  await fsp.chmod(target, 0o600).catch(() => undefined);
+  return true;
+}
+
+export async function captureSharedContextFromInput(repoRoot: string, input: string): Promise<boolean> {
+  const snippet = extractSharedContextSnippet(input);
+  if (!snippet) {
+    return false;
+  }
+  return appendSharedContext(repoRoot, snippet, "task input");
+}
+
+export function extractSharedContextSnippet(input: string): string | null {
+  const lines = input
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line && looksLikeSharedSecretLine(line));
+  return lines.length ? lines.join("\n") : null;
+}
+
+export function redactSharedSecretValues(value: string): string {
+  return value
+    .split(/\s+/)
+    .filter(Boolean)
+    .map(redactSecretToken)
+    .join(" ");
+}
+
+function redactSecretToken(raw: string): string {
+  const trimmed = raw.replace(/^[`"'([{]+|[`"',;)\]}]+$/g, "");
+  const eq = trimmed.indexOf("=");
+  if (eq > 0) {
+    const key = trimmed.slice(0, eq);
+    const secret = trimmed.slice(eq + 1);
+    if (looksLikeSecretKey(key) && (looksLikeSecretValue(secret) || looksLikePlausibleSecretValue(secret))) {
+      return raw.replace(secret, "[redacted]");
+    }
+  }
+  if (looksLikeSecretValue(trimmed)) {
+    return raw.replace(trimmed, "[redacted]");
+  }
+  return raw;
+}
+
+function looksLikeSecretKey(key: string): boolean {
+  return /token|api_key|apikey|secret|password/i.test(key);
+}
+
+function looksLikeSecretValue(value: string): boolean {
+  const lower = value.toLowerCase();
+  const hasSecretPrefix =
+    lower.includes("api_") ||
+    lower.startsWith("sk-") ||
+    lower.startsWith("xox") ||
+    lower.startsWith("ghp_") ||
+    lower.startsWith("gho_") ||
+    lower.startsWith("github_pat_");
+  const longMixed =
+    value.length >= 24 &&
+    /[A-Za-z]/.test(value) &&
+    /[0-9_.-]/.test(value);
+  return hasSecretPrefix || longMixed;
+}
+
+function looksLikePlausibleSecretValue(value: string): boolean {
+  return (
+    value.length >= 10 &&
+    /[A-Za-z0-9]/.test(value) &&
+    /[0-9_.\-/]/.test(value)
+  );
+}
+
+function looksLikeSharedSecretLine(line: string): boolean {
+  const lower = line.toLowerCase();
+  const hasKeyword = /api key|api token|access token|auth token|bearer token|bearer |client secret|client_secret|secret key|authorization:\s*bearer|password|_token|token=|token:|api_key|apikey|secret=|secret:|_secret/.test(lower);
+  if (!hasKeyword) {
+    return false;
+  }
+  const assignmentish = /=|:\s|\sis\s|\buse\b/.test(lower);
+  const plausibleValue = /[A-Za-z0-9][A-Za-z0-9._/-]{9,}/.test(line);
+  return assignmentish && plausibleValue;
+}
+
+export async function syncSharedContextToWorkspaces(
+  repoRoot: string,
+  workspaces: Iterable<string>,
+): Promise<void> {
+  await ensureLine(path.join(repoRoot, ".gitignore"), SHARED_CONTEXT_FILE);
+  const source = sharedContextPath(repoRoot);
+  const content = await fsp.readFile(source).catch(() => null);
+  if (!content) {
+    return;
+  }
+  await fsp.chmod(source, 0o600).catch(() => undefined);
+  for (const workspace of new Set([repoRoot, ...workspaces])) {
+    if (!(await pathExists(workspace))) {
+      continue;
+    }
+    await ensureRudderExcluded(workspace);
+    const target = path.join(workspace, SHARED_CONTEXT_FILE);
+    if (path.resolve(target) === path.resolve(source)) {
+      continue;
+    }
+    await ensureDir(path.dirname(target));
+    await fsp.writeFile(target, content).catch(() => undefined);
+    await fsp.chmod(target, 0o600).catch(() => undefined);
+  }
 }
 
 /**
@@ -320,7 +465,7 @@ export async function renderLiveRudderMd(repoRoot: string): Promise<void> {
   lines.push(
     "",
     "## Shared decisions",
-    "Shared, cross-cutting decisions live in DECISIONS.md (agent-authored, jj-tracked). Never edit RUDDER.md.",
+    "Shared, cross-cutting decisions live in DECISIONS.md (agent-authored, jj-tracked). Gitignored user-shared tokens/env/private context lives in RUDDER_SHARED.md when present. Never edit RUDDER.md.",
     "",
   );
 
@@ -338,7 +483,7 @@ function depLabels(graph: RudderGraph, id: string): string {
 }
 
 function oneLine(value: string, max: number): string {
-  const flat = value.replace(/\s+/g, " ").replace(/\|/g, "/").trim();
+  const flat = redactSharedSecretValues(value).replace(/\s+/g, " ").replace(/\|/g, "/").trim();
   return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
 }
 
@@ -347,6 +492,7 @@ function oneLine(value: string, max: number): string {
 // snapshot's exclusion handling (run-manager.writeRudderContextFiles).
 async function writeLiveRudderMd(repoRoot: string, graph: RudderGraph, content: string): Promise<void> {
   await ensureLine(path.join(repoRoot, ".gitignore"), "RUDDER.md");
+  await ensureLine(path.join(repoRoot, ".gitignore"), SHARED_CONTEXT_FILE);
   // Worktrees live inside the project; ignore them so worker checkouts are not untracked.
   await ensureLine(path.join(repoRoot, ".gitignore"), ".rudder-worktrees/");
   const workspaces = new Set<string>([repoRoot]);
@@ -364,6 +510,7 @@ async function writeLiveRudderMd(repoRoot: string, graph: RudderGraph, content: 
       .writeFile(filePath, mergeGeneratedRudderMd(existing, content), "utf8")
       .catch(() => undefined);
   }
+  await syncSharedContextToWorkspaces(repoRoot, workspaces);
 }
 
 async function ensureRudderExcluded(workspace: string): Promise<void> {
@@ -376,6 +523,7 @@ async function ensureRudderExcluded(workspace: string): Promise<void> {
     return;
   }
   await ensureLine(path.resolve(workspace, excludePath), "RUDDER.md");
+  await ensureLine(path.resolve(workspace, excludePath), SHARED_CONTEXT_FILE);
 }
 
 async function ensureLine(filePath: string, line: string): Promise<void> {

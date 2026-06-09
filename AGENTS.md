@@ -796,7 +796,7 @@ user only ever talks to Rudder; the planner can never go off and implement on it
    persist to `.rudder/plan-queue.json`, so a mid-plan restart resumes instead of losing it.
    **Worker context at launch:** each worker gets its own checkout (hard-dep parents already
    merged into its base), `RUDDER.md` (the live agent roster) + `DECISIONS.md`, and a launch
-   prompt carrying `/goal` + `Done when:`, the original request, the node prompt, and a
+   prompt carrying `Objective:` + `Done when:`, the original request, the node prompt, and a
    **`Depends on:` block** (`App::dependency_context`) naming each hard/soft parent by title +
    its `rudder done` interface summary so the worker builds on prerequisites instead of
    reimplementing them.
@@ -1002,6 +1002,15 @@ a deterministic local classifier first, then LIGHT Haiku only for ambiguous case
   `src/board/daemon.ts`, which reads the `## ` blocks and still tolerates legacy bullets).
 - **`RUDDER.md`** — read-only, orchestrator-owned, `freshness:`-stamped projection of
   the plan/status that workers re-read (`renderLiveRudderMd`). Git-excluded.
+- **`RUDDER_SHARED.md`** — gitignored local shared context for API tokens, private URLs,
+  account ids, env vars, and setup details the user gives Rudder and expects every agent
+  to use. It is intentionally separate from `DECISIONS.md` because it may contain
+  credential values and must not enter jj/git history. Native task-bar input calls
+  `capture_shared_context_from_user_input` for obvious `*_TOKEN=...` / API-key lines,
+  `/share <text>` forces an append, and `rudder share "<text>"` does the same from the
+  CLI. `write_rudder_context` / `writeLiveRudderMd` mirror the file into active worker
+  workspaces next to `RUDDER.md`, and every worker/orchestrator prompt tells agents to
+  read it when present. Do not store secret values in `RUDDER.md` or `DECISIONS.md`.
 - **`rudder done [--node <id>] '<json>'`** — `{summary, interfaces, followups:[{title,
   why, scope}]}` from stdin or args. `parseCompletionNoteArg` (`src/surfaces.ts`)
   accepts a bare object, a fenced ```json block, and falls back to `{summary: raw}` for

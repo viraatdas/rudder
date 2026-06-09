@@ -993,9 +993,9 @@ impl App {
     }
 
     fn selected_uses_headless_orchestrator_chat(&self) -> bool {
-        self.agents.get(self.selected_agent).is_some_and(|run| {
-            run.is_orchestrator() && !self.is_interactive_orchestrator_run(run)
-        })
+        self.agents
+            .get(self.selected_agent)
+            .is_some_and(|run| run.is_orchestrator() && !self.is_interactive_orchestrator_run(run))
     }
 
     pub(crate) fn is_interactive_orchestrator_run(&self, run: &AgentRun) -> bool {
@@ -2935,6 +2935,7 @@ impl App {
     }
 
     fn start_task_from_input(&mut self, input: &str) {
+        self.capture_shared_context_from_input(input);
         if self.handle_command(&input) {
             return;
         }
@@ -2989,6 +2990,12 @@ impl App {
         // off-thread; poll_dispatch_worker routes the result. `/ask` and `/plan` (handled in
         // handle_command above) force either path without classifying.
         self.begin_dispatch(&input);
+    }
+
+    fn capture_shared_context_from_input(&mut self, input: &str) {
+        if capture_shared_context_from_user_input(&self.cwd, input).unwrap_or(false) {
+            let _ = sync_shared_context_surfaces(&self.cwd, &self.agents, None);
+        }
     }
 
     /// True when a planner ran and EXITED without producing a DAG (it asked a clarifying
@@ -3313,10 +3320,9 @@ impl App {
         let node_id = node.as_ref().map(|n| n.id.clone());
         let node_deps = node.as_ref().map(|n| n.deps.clone()).unwrap_or_default();
         let session_id = mint_session_id_for(backend);
-        // Lead the launch prompt with the canonical /goal + Done-when block so
-        // every spawned agent has a clear objective and verifiable stopping
-        // condition. Idempotent: a /rudder-plan worker prompt that already leads
-        // with /goal is left unchanged.
+        // Lead the launch prompt with the canonical Objective + Done-when block so
+        // every spawned agent has a clear objective and verifiable stopping condition.
+        // Idempotent: an already objective-formatted worker prompt is normalized and kept.
         let goal_prompt = manual_goal_prompt(input);
         let mut command = agent_command(
             backend,
@@ -4496,9 +4502,8 @@ impl App {
                 run.session_id = session_id;
                 run.completed_at = None;
                 run.last_output_at = Instant::now();
-                run.autosteered =
-                    matches!(run.mode, AgentMode::Plan | AgentMode::RudderPlan)
-                        && !orchestrator_interactive;
+                run.autosteered = matches!(run.mode, AgentMode::Plan | AgentMode::RudderPlan)
+                    && !orchestrator_interactive;
                 run.interactive_orchestrator = orchestrator_interactive;
                 run.needs_permission = false;
                 run.permission_notified = false;
@@ -4606,9 +4611,35 @@ impl App {
                 }
                 true
             }
+            Some("/share") => {
+                // Durable, gitignored local context for all Rudder agents. Use this for
+                // API tokens, private URLs, account ids, env details, and anything else
+                // the fleet must keep after model compaction.
+                let rest = command_rest(input, "/share").trim();
+                if rest.is_empty() {
+                    self.notice = Some(
+                        "usage: /share <tokens, env vars, private URLs, or other local context>"
+                            .to_string(),
+                    );
+                } else {
+                    match append_shared_context(&self.cwd, "task bar /share", rest) {
+                        Ok(_) => {
+                            let _ = sync_shared_context_surfaces(&self.cwd, &self.agents, None);
+                            self.notice = Some(
+                                "shared context saved to RUDDER_SHARED.md for all agents"
+                                    .to_string(),
+                            );
+                        }
+                        Err(error) => {
+                            self.notice = Some(format!("share failed: {error}"));
+                        }
+                    }
+                }
+                true
+            }
             Some("/help") => {
                 self.notice = Some(
-                    "Option-1/2/3 or ^W pane  type tasks below; worker pane chats with the selected agent"
+                    "Option-1/2/3 or ^W pane  type tasks below; /share saves tokens/context for all agents"
                         .to_string(),
                 );
                 true
@@ -5454,8 +5485,7 @@ impl App {
             "off" | "false" | "0" => false,
             "toggle" | "" => !self.auto_merge,
             _ => {
-                self.notice =
-                    Some("RUDDER_AUTOMERGE expects on, off, or toggle".to_string());
+                self.notice = Some("RUDDER_AUTOMERGE expects on, off, or toggle".to_string());
                 return;
             }
         };

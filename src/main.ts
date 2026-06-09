@@ -19,7 +19,7 @@ import {
 import { graphPath, mirrorPlanIntoGraph, updateGraph } from "./graph.js";
 import type { MirrorPayload } from "./graph.js";
 import { buildFanoutDag, gateDecision, planTask, scaffoldPlan } from "./planner.js";
-import { backfillLlmTaskSummaries, popUndoEntry, projectStateDir, registerProject, runsDir } from "./state.js";
+import { backfillLlmTaskSummaries, listRuns, popUndoEntry, projectStateDir, registerProject, runsDir } from "./state.js";
 import { discoverModelOptions } from "./models.js";
 import { resolveNativeBinaryPath } from "./native-binary.js";
 import {
@@ -36,7 +36,7 @@ import {
   workerRun,
 } from "./run-manager.js";
 import { runInteractiveShell } from "./repl.js";
-import { appendCompletionNote, appendDecision, parseCompletionNoteArg, RUDDER_DONE_END, RUDDER_DONE_START, writeCompletionNoteFile } from "./surfaces.js";
+import { appendCompletionNote, appendDecision, appendSharedContext, parseCompletionNoteArg, RUDDER_DONE_END, RUDDER_DONE_START, SHARED_CONTEXT_FILE, syncSharedContextToWorkspaces, writeCompletionNoteFile } from "./surfaces.js";
 import type { CompletionNote } from "./surfaces.js";
 import { runTmuxAgentPane, runTmuxTaskPane, runTmuxWorkerIdle } from "./tmux-dashboard.js";
 import { runInteractiveTui } from "./tui.js";
@@ -372,6 +372,14 @@ export async function main(): Promise<void> {
         throw new Error('Missing insight. Usage: rudder remember "the parser owns token budget"');
       }
       await runRemember(insight);
+      return;
+    }
+    case "share": {
+      const text = parsed.args.join(" ").trim();
+      if (!text) {
+        throw new Error('Missing shared context. Usage: rudder share "APIFY_TOKEN=..."');
+      }
+      await runShare(text);
       return;
     }
     case "done": {
@@ -955,6 +963,17 @@ async function runRemember(insight: string): Promise<void> {
   console.log("Remembered. Appended to DECISIONS.md (shared, jj-tracked).");
 }
 
+async function runShare(text: string): Promise<void> {
+  const repoRoot = findRepoRoot();
+  await appendSharedContext(repoRoot, text, "cli share");
+  const runs = await listRuns(repoRoot).catch(() => []);
+  await syncSharedContextToWorkspaces(
+    repoRoot,
+    runs.map((run) => run.worktree.path),
+  ).catch(() => undefined);
+  console.log(`Shared. Appended to ${SHARED_CONTEXT_FILE} (gitignored, mirrored to agents).`);
+}
+
 /** Read all of stdin when it is piped (never when interactive), with a short
  *  timeout so a worker that calls `rudder done` without piping never hangs. */
 async function readPipedStdin(timeoutMs = 3000): Promise<string> {
@@ -1104,6 +1123,7 @@ Planner:
 
 Memory:
   rudder remember "<insight>"    Append a durable cross-cutting decision to DECISIONS.md (shared, jj-tracked)
+  rudder share "<token/context>"  Append gitignored shared context to RUDDER_SHARED.md for all agents
 
 Board:
   rudder board [--port N] [--open|--no-open]   Serve the localhost board (opens browser by default)

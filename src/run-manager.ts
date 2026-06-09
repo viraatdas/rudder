@@ -60,6 +60,7 @@ import {
 } from "./util.js";
 import { createAgentPane, killPane, normalizeTmuxDashboardLayout, paneExitStatus, respawnPane, selectPane } from "./tmux.js";
 import { taskDisplayLabel } from "./task-summary.js";
+import { captureSharedContextFromInput, redactSharedSecretValues, SHARED_CONTEXT_FILE, syncSharedContextToWorkspaces } from "./surfaces.js";
 
 // The pause before an automatic steering pass. Overridable via
 // RUDDER_AUTO_STEER_DELAY_MS so the end-to-end test can drain a DAG quickly
@@ -87,6 +88,7 @@ export async function startRun(params: {
 }): Promise<RunRecord> {
   const repoRoot = findRepoRoot();
   await registerProject(repoRoot).catch(() => undefined);
+  await captureSharedContextFromInput(repoRoot, params.task).catch(() => false);
   const config = await loadConfig();
   const backend = params.backend ?? config.lastUsedBackend ?? config.defaultBackend;
   if (!commandExists(backend)) {
@@ -773,12 +775,18 @@ function formatAgentContextRun(run: RunRecord): string {
   const location = run.worktree.enabled
     ? `${workspaceKind(run)}=${shortenHome(run.worktree.path)}`
     : "current checkout";
-  const prompt = run.currentPrompt && run.currentPrompt !== run.task ? ` current="${run.currentPrompt.slice(0, 140)}"` : "";
-  return `- ${run.id}: ${run.status}, ${run.backend}, ${location}, task="${run.task.slice(0, 140)}"${prompt}`;
+  const prompt = run.currentPrompt && run.currentPrompt !== run.task ? ` current="${previewAgentContext(run.currentPrompt, 140)}"` : "";
+  return `- ${run.id}: ${run.status}, ${run.backend}, ${location}, task="${previewAgentContext(run.task, 140)}"${prompt}`;
+}
+
+function previewAgentContext(value: string, max: number): string {
+  const normalized = redactSharedSecretValues(value).replace(/\s+/g, " ").replace(/"/g, '\\"').trim();
+  return normalized.length > max ? `${normalized.slice(0, max)}...` : normalized;
 }
 
 async function writeRudderContextFiles(repoRoot: string, activeRuns: RunRecord[], content: string): Promise<void> {
   await ensureLine(path.join(repoRoot, ".gitignore"), "RUDDER.md");
+  await ensureLine(path.join(repoRoot, ".gitignore"), SHARED_CONTEXT_FILE);
   // Worktrees live INSIDE the project at <repo>/.rudder-worktrees; ignore them in the
   // user's repo so each worker checkout does not show up as untracked files (Rust parity:
   // gitio.rs write_rudder_context).
@@ -794,6 +802,7 @@ async function writeRudderContextFiles(repoRoot: string, activeRuns: RunRecord[]
     const existing = await fsp.readFile(filePath, "utf8").catch(() => "");
     await fsp.writeFile(filePath, mergeGeneratedRudderMd(existing, content), "utf8");
   }
+  await syncSharedContextToWorkspaces(repoRoot, workspaces);
 }
 
 async function ensureRudderExcluded(workspace: string): Promise<void> {
@@ -806,6 +815,7 @@ async function ensureRudderExcluded(workspace: string): Promise<void> {
     return;
   }
   await ensureLine(path.resolve(workspace, excludePath), "RUDDER.md");
+  await ensureLine(path.resolve(workspace, excludePath), SHARED_CONTEXT_FILE);
 }
 
 async function ensureLine(filePath: string, line: string): Promise<void> {

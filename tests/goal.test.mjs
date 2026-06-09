@@ -5,39 +5,53 @@ import { DEFAULT_SUCCESS, deriveGoal, deriveSuccess, extractSuccess, formatGoalP
 import { renderContract } from "../dist/brain.js";
 
 // ---------------------------------------------------------------------------
-// The canonical /goal-format convention: every spawned agent's launch prompt
-// leads with `/goal <objective>` then `Done when: <success>` then the body.
+// The canonical objective-format convention: every spawned agent's launch prompt
+// leads with `Objective: <objective>` then `Done when: <success>` then the body.
 // ---------------------------------------------------------------------------
 
-test("formatGoalPrompt caps the /goal + Done-when lines under the backend's 4000-char limit", () => {
-  // Regression: a planner node with a long goal/success used to emit a `/goal`
-  // line over 4000 chars, which the backend rejects ("Goal condition is limited
-  // to 4000 characters (got 4808)"). Each line must be capped; the body stays full.
+test("formatGoalPrompt caps the Objective + Done-when lines under the backend limit", () => {
+  // Regression: launched prompts must keep the goal/success lines under the
+  // backend's goal-condition limit; the body stays full.
   const prompt = formatGoalPrompt({
     goal: "G".repeat(4808),
     success: "S".repeat(4808),
     body: "the full task detail goes here and is never truncated",
   });
   const lines = prompt.split("\n");
-  const goalLine = lines.find((l) => l.startsWith("/goal "));
+  const goalLine = lines.find((l) => l.startsWith("Objective: "));
   const doneLine = lines.find((l) => l.startsWith("Done when: "));
-  assert.ok([...goalLine.slice("/goal ".length)].length <= 4000, "goal arg <= 4000 chars");
+  assert.ok([...goalLine.slice("Objective: ".length)].length <= 4000, "objective arg <= 4000 chars");
   assert.ok([...doneLine.slice("Done when: ".length)].length <= 4000, "done-when <= 4000 chars");
   assert.ok(prompt.includes("the full task detail goes here and is never truncated"), "body preserved");
+  assert.ok(!prompt.startsWith("/goal"), "launch prompt must not start with slash command");
+  assert.ok(!prompt.startsWith("Goal:"), "launch prompt must not start with Goal: either");
 });
 
-test("formatGoalPrompt emits the /goal + Done-when block, then the body", () => {
+test("formatGoalPrompt emits the Objective + Done-when block, then the body", () => {
   const prompt = formatGoalPrompt({
     goal: "implement the parser",
     success: "cargo test passes",
     body: "Write the parser in src/parser.rs.",
   });
-  assert.ok(prompt.startsWith("/goal implement the parser\n"));
+  assert.ok(prompt.startsWith("Objective: implement the parser\n"));
   assert.ok(prompt.includes("\nDone when: cargo test passes\n"));
   assert.ok(prompt.includes("Write the parser in src/parser.rs."));
-  // /goal must be the very first line so the backend picks it up.
-  assert.equal(prompt.split("\n")[0], "/goal implement the parser");
+  // Objective must be the very first line, without invoking a slash command/goal parser.
+  assert.equal(prompt.split("\n")[0], "Objective: implement the parser");
   assert.equal(prompt.split("\n")[1], "Done when: cargo test passes");
+});
+
+test("formatGoalPrompt keeps a very long body out of slash-command parsing", () => {
+  const prompt = formatGoalPrompt({
+    goal: "Produce the seed JSON and Apify ingestion script.",
+    success: "seed data and ingest script exist and run.",
+    body: "Build the talent seed-data layer. ".repeat(280),
+  });
+  assert.ok(prompt.length > 8000, "test prompt should match the long-body failure");
+  assert.ok(prompt.startsWith("Objective: Produce the seed JSON"));
+  assert.ok(!prompt.startsWith("/goal"));
+  assert.ok(!prompt.startsWith("Goal:"));
+  assert.ok(prompt.includes("Build the talent seed-data layer."));
 });
 
 test("formatGoalPrompt collapses multiline objective/success to single lines", () => {
@@ -46,13 +60,13 @@ test("formatGoalPrompt collapses multiline objective/success to single lines", (
     success: "tests\npass",
     body: "body",
   });
-  assert.equal(prompt.split("\n")[0], "/goal do the thing");
+  assert.equal(prompt.split("\n")[0], "Objective: do the thing");
   assert.equal(prompt.split("\n")[1], "Done when: tests pass");
 });
 
 test("formatGoalPrompt falls back to defaults when goal/success are empty", () => {
   const prompt = formatGoalPrompt({ goal: "", success: "", body: "ship it" });
-  assert.equal(prompt.split("\n")[0], "/goal ship it");
+  assert.equal(prompt.split("\n")[0], "Objective: ship it");
   assert.equal(prompt.split("\n")[1], `Done when: ${DEFAULT_SUCCESS}`);
 });
 
@@ -64,6 +78,25 @@ test("deriveGoal recovers the objective from an already /goal-formatted task", (
   assert.equal(
     deriveGoal("/goal build the cache\nDone when: it works\n\nbody"),
     "build the cache",
+  );
+  assert.equal(
+    deriveGoal("Goal: build the cache\nDone when: it works\n\nbody"),
+    "build the cache",
+  );
+  assert.equal(
+    deriveGoal("Objective: build the cache\nDone when: it works\n\nbody"),
+    "build the cache",
+  );
+  assert.equal(
+    deriveGoal("/goal\tship the cache\nDone when: it works\n\nbody"),
+    "ship the cache",
+  );
+});
+
+test("deriveGoal does not treat goal-prefixed words as the /goal command", () => {
+  assert.equal(
+    deriveGoal("/goalkeeper route should be documented"),
+    "/goalkeeper route should be documented",
   );
 });
 
@@ -78,7 +111,7 @@ test("extractSuccess reads the Done-when line, else undefined", () => {
   assert.equal(extractSuccess("no goal block here"), undefined);
 });
 
-test("renderContract leads with the /goal + Done-when header", () => {
+test("renderContract leads with the Objective + Done-when header", () => {
   const spec = {
     runId: "r1",
     task: "add a dark mode toggle",
@@ -91,7 +124,7 @@ test("renderContract leads with the /goal + Done-when header", () => {
     suggestedTests: ["npm test"],
   };
   const contract = renderContract(spec);
-  assert.equal(contract.split("\n")[0], "/goal add a dark mode toggle");
+  assert.equal(contract.split("\n")[0], "Objective: add a dark mode toggle");
   assert.equal(contract.split("\n")[1], "Done when: the toggle works and tests pass");
   // The existing body still follows the header.
   assert.ok(contract.includes("Task: add a dark mode toggle"));
@@ -112,6 +145,6 @@ test("renderContract derives goal/success when the spec omits them", () => {
     suggestedTests: [],
   };
   const contract = renderContract(spec);
-  assert.equal(contract.split("\n")[0], "/goal refactor the scheduler");
+  assert.equal(contract.split("\n")[0], "Objective: refactor the scheduler");
   assert.ok(contract.split("\n")[1].startsWith("Done when: "));
 });

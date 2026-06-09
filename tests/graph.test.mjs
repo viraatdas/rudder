@@ -229,6 +229,23 @@ test("parsePlanBlock parses goal and success and derives defaults when absent", 
   assert.equal(b.success, "the task is implemented and its own verification passes");
 });
 
+test("parsePlanBlock preflights long goal and success before storing nodes", () => {
+  const dag = parsePlanBlock(
+    block([
+      {
+        id: "a",
+        title: "seed data",
+        prompt: "write the seed data",
+        goal: "G".repeat(4800),
+        success: "S".repeat(4800),
+      },
+    ]),
+  );
+  const node = dag.nodes.find((n) => n.id === "a");
+  assert.ok(node.goal.length <= 3000, "stored goal is capped before launch");
+  assert.ok(node.success.length <= 3000, "stored success is capped before launch");
+});
+
 test("parsePlanBlock drops edges to unknown ids", () => {
   const dag = parsePlanBlock(
     block([

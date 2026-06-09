@@ -54,6 +54,13 @@ larger implementation work goes to the orchestrator, which plans a DAG and runs
 isolated workers. Use `/ask <text>` to force one-off or `/plan <text>` to force
 the orchestrator.
 
+If a task needs shared local context like API tokens, private URLs, account ids,
+or environment values, save it with `/share <text>` in the task input. Rudder
+also captures obvious token-looking lines like `APIFY_TOKEN=...` from task-bar
+messages. The text is written to `RUDDER_SHARED.md`, which is gitignored and
+mirrored into worker workspaces; all agents are explicitly told to read it when
+present.
+
 You can also start a task directly from the shell:
 
 ```bash
@@ -154,6 +161,7 @@ running, Rudder also exposes matching project skills; the orchestrator can write
 | `/model` | Pick provider, then model, then effort |
 | `/ask <text>` | Force a one-off conversational agent in the main checkout |
 | `/plan <text>` | Force the orchestrator / DAG planner |
+| `/share <text>` | Save gitignored shared context for all agents in `RUDDER_SHARED.md` |
 | `/main` or `/m` | Start a new main-branch agent |
 | `/review-all` | Combine completed worktrees and start a Codex review-all agent |
 | `/merge-all` | Merge all completed worktrees |

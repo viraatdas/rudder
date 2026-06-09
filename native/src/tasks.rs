@@ -4,19 +4,22 @@ use super::*;
 
 pub(crate) fn execution_prompt(task: &str) -> String {
     let task = strip_rudder_prompt_wrappers(task);
-    const CONTEXT: &str = "Rudder-specific context injected by Rudder:\n- Version control: this repo uses jj (Jujutsu), colocated with git. You are working inside your own isolated jj workspace and jj is authoritative here. Inspect your work with `jj status` and `jj diff` (NOT `git status`/`git diff`). Just edit files: do NOT manage version control yourself (no `jj commit`, `jj new`, `jj squash`, `jj describe`, `git commit`, `git add`, `git branch`, `git checkout`, or `git merge`). Rudder snapshots your working copy and integrates it for you, and raw git commit/branch commands would desync jj. `jj log` is safe if you want to see history.\n- Read RUDDER.md first if it exists. Rudder generated it to show the CURRENT PLAN (the task DAG and each node's status), the active agents, and their worktrees. DECISIONS.md holds cross-cutting decisions other agents have recorded.\n- The plan can CHANGE while you work: the user may refine the architecture, or a sibling may record a decision. Before each significant step, re-read RUDDER.md and DECISIONS.md. RUDDER.md carries a `freshness:` stamp; if it is newer than when you last read it, something changed, so re-read both. If the plan or architecture has shifted in a way that affects your task, ADAPT your implementation to the new direction instead of continuing on the old one, and append a short note to DECISIONS.md describing the adjustment. Never edit RUDDER.md; it is orchestrator-owned.\n- REQUIRED FINAL STEP — when you finish, your LAST action MUST be to run `rudder done`. This is the ONLY way the orchestrator learns what you did and what work remains; if you skip it, your results are invisible and the plan cannot advance. Pipe a JSON object: `echo '{\"summary\":\"...\",\"interfaces\":\"files/types/functions you created or assumed\",\"followups\":[{\"title\":\"...\",\"why\":\"...\",\"scope\":\"in|out\"}]}' | rudder done --node <id>` where <id> is your `Worker node:` value shown above (omit `--node` if there is none). Use `scope:\"out\"` for follow-ups outside your lane. If you have no structured note, `rudder done --node <id> \"one-line summary\"` is fine. Run it exactly once, after your work is complete. It only records a report (it does not touch jj).";
-    // Keep the /goal block as the very first line so the backend (Claude or
-    // Codex) picks it up as a slash command: hoist a leading `/goal ...` (and its
-    // `Done when:` line) above the injected Rudder context.
-    if task.trim_start().starts_with("/goal") {
+    const CONTEXT: &str = "Rudder-specific context injected by Rudder:\n- Version control: this repo uses jj (Jujutsu), colocated with git. You are working inside your own isolated jj workspace and jj is authoritative here. Inspect your work with `jj status` and `jj diff` (NOT `git status`/`git diff`). Just edit files: do NOT manage version control yourself (no `jj commit`, `jj new`, `jj squash`, `jj describe`, `git commit`, `git add`, `git branch`, `git checkout`, or `git merge`). Rudder snapshots your working copy and integrates it for you, and raw git commit/branch commands would desync jj. `jj log` is safe if you want to see history.\n- Read RUDDER.md first if it exists. Rudder generated it to show the CURRENT PLAN (the task DAG and each node's status), the active agents, and their worktrees. DECISIONS.md holds cross-cutting decisions other agents have recorded. If RUDDER_SHARED.md exists beside RUDDER.md, read it too: it is gitignored local context the user shared for all agents, often API tokens, credentials, private URLs, or env details that must survive model compaction.\n- The plan can CHANGE while you work: the user may refine the architecture, or a sibling may record a decision. Before each significant step, re-read RUDDER.md, DECISIONS.md, and RUDDER_SHARED.md when present. RUDDER.md carries a `freshness:` stamp; if it is newer than when you last read it, something changed, so re-read all shared context. If the plan or architecture has shifted in a way that affects your task, ADAPT your implementation to the new direction instead of continuing on the old one, and append a short note to DECISIONS.md describing the adjustment. Never edit RUDDER.md; it is orchestrator-owned.\n- REQUIRED FINAL STEP — when you finish, your LAST action MUST be to run `rudder done`. This is the ONLY way the orchestrator learns what you did and what work remains; if you skip it, your results are invisible and the plan cannot advance. Pipe a JSON object: `echo '{\"summary\":\"...\",\"interfaces\":\"files/types/functions you created or assumed\",\"followups\":[{\"title\":\"...\",\"why\":\"...\",\"scope\":\"in|out\"}]}' | rudder done --node <id>` where <id> is your `Worker node:` value shown above (omit `--node` if there is none). Use `scope:\"out\"` for follow-ups outside your lane. If you have no structured note, `rudder done --node <id> \"one-line summary\"` is fine. Run it exactly once, after your work is complete. It only records a report (it does not touch jj).";
+    // Keep the objective block as the very first lines, but do NOT launch with a
+    // leading `/goal` slash command or a literal `Goal:` header. Claude Code can route
+    // goal-looking launch text through its goal condition machinery, so a long worker
+    // brief trips "Goal condition is limited to 4000 characters" even when the actual
+    // objective is short. User-typed `/goal` forwarding is still supported elsewhere.
+    if starts_goal_prompt(task.trim_start()) {
         let (goal_block, rest) = split_leading_goal_block(&task);
         return format!("{goal_block}\n\n{CONTEXT}\n\n{rest}");
     }
     format!("{CONTEXT}\n\n{task}")
 }
 
-/// Split a /goal-formatted prompt into its leading `/goal ...` + `Done when: ...`
-/// block and the remaining body. Assumes the input leads with `/goal`.
+/// Split a goal-formatted prompt into its leading objective + `Done when: ...` block
+/// and the remaining body. Legacy inputs may lead with `/goal` or `Goal:`; normalize
+/// them to `Objective:` so process-launch prompts are never parsed as backend goals.
 fn split_leading_goal_block(task: &str) -> (String, String) {
     let task = task.trim_start();
     let mut lines = task.lines();
@@ -50,13 +53,33 @@ fn split_leading_goal_block(task: &str) -> (String, String) {
     (block.join("\n"), body)
 }
 
-/// Cap a hoisted `/goal …` / `Done when: …` line's ARGUMENT to MAX_GOAL_LINE_CHARS while
-/// keeping the slash-command / label prefix intact. A planner node prompt that LEADS with
-/// its own (uncapped) `/goal` line is otherwise passed through verbatim, which is the real
-/// source of the backend's "Goal condition is limited to 4000 characters" rejection (the
-/// `goal_objective`/`goal_success` paths are already capped to 200 by `one_line`).
+fn starts_goal_prompt(value: &str) -> bool {
+    value == "/goal"
+        || value
+            .strip_prefix("/goal")
+            .is_some_and(|rest| rest.starts_with(char::is_whitespace))
+        || value.to_ascii_lowercase().starts_with("objective:")
+        || value.to_ascii_lowercase().starts_with("goal:")
+}
+
+/// Cap a hoisted objective / `Done when: ...` line's ARGUMENT to
+/// MAX_GOAL_LINE_CHARS while keeping the label prefix intact.
 fn cap_goal_command_line(line: &str) -> String {
-    for prefix in ["/goal ", "Done when: "] {
+    if line == "/goal" {
+        return "Objective: complete the task".to_string();
+    }
+    if let Some(rest) = line.strip_prefix("/goal") {
+        if rest.starts_with(char::is_whitespace) {
+            return format!(
+                "Objective: {}",
+                cap_goal_line(rest.trim_start().to_string())
+            );
+        }
+    }
+    if let Some(arg) = line.strip_prefix("Goal: ") {
+        return format!("Objective: {}", cap_goal_line(arg.to_string()));
+    }
+    for prefix in ["Objective: ", "Done when: "] {
         if let Some(arg) = line.strip_prefix(prefix) {
             return format!("{prefix}{}", cap_goal_line(arg.to_string()));
         }
@@ -78,20 +101,20 @@ pub(crate) fn plan_prompt(task: &str) -> String {
 pub(crate) fn oneoff_prompt(task: &str) -> String {
     let task = strip_rudder_prompt_wrappers(task);
     format!(
-        "You are a Rudder one-off agent. The user wants to ASK A QUESTION or make a SMALL, self-contained change — not a multi-step project. You are running directly in the user's working checkout (NOT an isolated workspace), so any edits you make land in their working tree. Be conversational and focused: answer the question, or make the change directly and explain what you did. Do NOT run git/jj commit, branch, or merge commands — just edit files; the user manages version control. If the request turns out to be large or genuinely multi-part, say so and suggest the user let Rudder plan it as a multi-agent task instead of doing it all here.\n\n{task}"
+        "You are a Rudder one-off agent. The user wants to ASK A QUESTION or make a SMALL, self-contained change — not a multi-step project. You are running directly in the user's working checkout (NOT an isolated workspace), so any edits you make land in their working tree. Read RUDDER.md if it exists, and read RUDDER_SHARED.md if it exists; RUDDER_SHARED.md is gitignored local context the user shared for agents, often API tokens, credentials, private URLs, or env details. Be conversational and focused: answer the question, or make the change directly and explain what you did. Do NOT run git/jj commit, branch, or merge commands — just edit files; the user manages version control. If the request turns out to be large or genuinely multi-part, say so and suggest the user let Rudder plan it as a multi-agent task instead of doing it all here.\n\n{task}"
     )
 }
 
 pub(crate) fn rudder_plan_prompt(task: &str) -> String {
     let task = strip_rudder_prompt_wrappers(task);
     [
-        "You are Rudder's planning coordinator. You decompose one user request into a DAG of implementation tasks that a separate set of worker agents will implement in isolated git worktrees. You inspect the repository in READ-ONLY mode. You do NOT implement anything yourself.".to_string(),
+        "You are Rudder's planning coordinator. You decompose one user request into a DAG of implementation tasks that a separate set of worker agents will implement in isolated git worktrees. You inspect the repository in READ-ONLY mode. You do NOT implement anything yourself. Read RUDDER_SHARED.md if it exists; it is gitignored local context the user shared for all agents, often API tokens, credentials, private URLs, or env details that must be included by reference in worker tasks.".to_string(),
         format!("User request:\n{task}"),
-        "Process:\n1. Inspect the relevant files read-only to understand the work.\n2. You run TURN BY TURN, like plan mode: the user can reply and you resume with their answer, so treat this as a conversation. On your FIRST turn for a request, ALWAYS ASK 1 to 4 concise, specific clarifying questions about the things that shape the build (scope, approach, key product/technical decisions, constraints, what existing work to reuse vs rebuild) and STOP — do NOT emit a task DAG on this first turn. This is mandatory even for trivial or fully specified requests; if nothing material seems missing, ask the user to confirm that Rudder should use your judgment. Output the questions wrapped EXACTLY in these markers, ONE question per line, so they render as a clean numbered prompt:\nRUDDER_QUESTIONS_START\nWhich time range: last 4 weeks, 6 months, or all time?\nReuse the existing module contract, or rebuild from scratch?\nRUDDER_QUESTIONS_END\nThen stop. Only emit the DAG on a later turn that carries the user's answer. If that answer still leaves something materially ambiguous, ask 1 to 2 more concise questions and stop again; otherwise emit the COMPLETE task DAG. Do not ask pure trivia.\n3. Once the request is clear, decompose it into a DAG of tasks. Each task gets a short stable `id` (for example n0, n1, n2) and a `deps` array of typed edges to the task ids it depends on.\n4. Edge types: `hard` means the child's success condition CANNOT be met until the parent has merged. A task that CONSUMES another task's produced code is HARD on it: tests that import or exercise code another task writes, code that imports a module/function/type another task creates, or wiring that calls an API another task defines. The child can technically start, but it cannot SUCCEED (imports resolve, tests pass) until that code exists, so it must wait for the merge. `soft` means context-only: the parent's diff is delivered as background once it lands, but the child can succeed on its own in parallel (parallel features, doc updates, sibling modules that do not import each other). Use the MINIMAL set of hard edges: default to soft for independent work, but do NOT under-classify, if the child executes or imports the parent's code it is hard. Every hard edge needs a one-line `why`.\n5. Split into independent or softly-coupled tasks wherever the work can proceed in parallel across separate worktrees. Do NOT collapse everything into one task, and do NOT make every task independent when real ordering exists: model the ordering with hard/soft edges instead. Be THOROUGH: produce a genuinely complete decomposition (up to ~10 tasks for a substantial request), name the concrete files each task creates or edits in its `title` or `goal`, and split separable work (distinct modules, tests, docs, config) into its own task. Never pad with busywork, but do not under-decompose either.\n6. Each task must be self-contained, name the concrete files it creates or edits, and carry its own verification. Each worker runs in its OWN isolated workspace at a different filesystem path than this repository. In every `prompt`, `goal`, and `success`, refer to files by REPOSITORY-RELATIVE paths only (for example `mathutils.py`, `src/db/schema.ts`). NEVER embed an absolute filesystem path, this repository's location, or phrases like \"in the repository at <path>\" or \"cd into <path>\" — the worker is already in its workspace, and an absolute path sends the worker to the wrong directory and the task fails.\n7. Every task MUST carry both a `goal` and a `success`. `goal` is one line naming the single objective the worker should accomplish (suitable for the `/goal` slash command, without the leading slash). `success` is the verifiable DONE-WHEN condition: the commands, artifacts, or criteria that mean the task is complete. Never omit either or leave them empty.".to_string(),
+        "Process:\n1. Inspect the relevant files read-only to understand the work.\n2. You run TURN BY TURN, like plan mode: the user can reply and you resume with their answer, so treat this as a conversation. On your FIRST turn for a request, ALWAYS ASK 1 to 4 concise, specific clarifying questions about the things that shape the build (scope, approach, key product/technical decisions, constraints, what existing work to reuse vs rebuild) and STOP — do NOT emit a task DAG on this first turn. This is mandatory even for trivial or fully specified requests; if nothing material seems missing, ask the user to confirm that Rudder should use your judgment. Output the questions wrapped EXACTLY in these markers, ONE question per line, so they render as a clean numbered prompt:\nRUDDER_QUESTIONS_START\nWhich time range: last 4 weeks, 6 months, or all time?\nReuse the existing module contract, or rebuild from scratch?\nRUDDER_QUESTIONS_END\nThen stop. Only emit the DAG on a later turn that carries the user's answer. If that answer still leaves something materially ambiguous, ask 1 to 2 more concise questions and stop again; otherwise emit the COMPLETE task DAG. Do not ask pure trivia.\n3. Once the request is clear, decompose it into a DAG of tasks. Each task gets a short stable `id` (for example n0, n1, n2) and a `deps` array of typed edges to the task ids it depends on.\n4. Edge types: `hard` means the child's success condition CANNOT be met until the parent has merged. A task that CONSUMES another task's produced code is HARD on it: tests that import or exercise code another task writes, code that imports a module/function/type another task creates, or wiring that calls an API another task defines. The child can technically start, but it cannot SUCCEED (imports resolve, tests pass) until that code exists, so it must wait for the merge. `soft` means context-only: the parent's diff is delivered as background once it lands, but the child can succeed on its own in parallel (parallel features, doc updates, sibling modules that do not import each other). Use the MINIMAL set of hard edges: default to soft for independent work, but do NOT under-classify, if the child executes or imports the parent's code it is hard. Every hard edge needs a one-line `why`.\n5. Split into independent or softly-coupled tasks wherever the work can proceed in parallel across separate worktrees. Do NOT collapse everything into one task, and do NOT make every task independent when real ordering exists: model the ordering with hard/soft edges instead. Be THOROUGH: produce a genuinely complete decomposition (up to ~10 tasks for a substantial request), name the concrete files each task creates or edits in its `title` or `goal`, and split separable work (distinct modules, tests, docs, config) into its own task. Never pad with busywork, but do not under-decompose either.\n6. Each task must be self-contained, name the concrete files it creates or edits, and carry its own verification. Each worker runs in its OWN isolated workspace at a different filesystem path than this repository. In every `prompt`, `goal`, and `success`, refer to files by REPOSITORY-RELATIVE paths only (for example `mathutils.py`, `src/db/schema.ts`). NEVER embed an absolute filesystem path, this repository's location, or phrases like \"in the repository at <path>\" or \"cd into <path>\" — the worker is already in its workspace, and an absolute path sends the worker to the wrong directory and the task fails.\n7. Every task MUST carry both a `goal` and a `success`. `goal` is one line naming the single objective the worker should accomplish. `success` is the verifiable DONE-WHEN condition: the commands, artifacts, or criteria that mean the task is complete. Never omit either or leave them empty.".to_string(),
         "YOUR ROLE: You are a read-only DECOMPOSER, not an implementer. Your tools are inspection-only, so you cannot and must not edit, write, or run code. Your only deliverable is the task DAG below. Do NOT implement the work and do NOT ask to proceed: a separate set of worker agents implements each task in its own isolated workspace, and Rudder shows the user this plan for approval before launching them. When the DAG is ready, print exactly the block below as a normal assistant message and then stop.".to_string(),
         r#"Print exactly this block and no other JSON block:
 RUDDER_PLAN_TASKS_START
-{"tasks":[{"id":"n0","title":"short task title","prompt":"full implementation prompt for one worker agent","goal":"one-line objective for /goal, without the leading slash command","success":"verifiable done-when condition","deps":[]},{"id":"n1","title":"...","prompt":"...","goal":"...","success":"...","deps":[{"on":"n0","type":"hard","why":"edits the module n0 creates"}]}]}
+{"tasks":[{"id":"n0","title":"short task title","prompt":"full implementation prompt for one worker agent","goal":"one-line objective for the worker","success":"verifiable done-when condition","deps":[]},{"id":"n1","title":"...","prompt":"...","goal":"...","success":"...","deps":[{"on":"n0","type":"hard","why":"edits the module n0 creates"}]}]}
 RUDDER_PLAN_TASKS_END
 
 After the block, add a short human summary of why this DAG is safe."#.to_string(),
@@ -114,13 +137,14 @@ pub(crate) fn orchestrator_system_prompt() -> String {
     [
         "You are Rudder's INTERACTIVE orchestration agent, running as a normal Claude Code session the user talks to directly.",
         "Your job: converse with the user, inspect the repository READ-ONLY, and maintain the task DAG that a SEPARATE set of worker agents will implement in isolated worktrees. You do NOT implement product code yourself.",
+        "If RUDDER_SHARED.md exists beside RUDDER.md, read it before planning. It is Rudder's gitignored local shared-context file for API tokens, credentials, private URLs, env details, and other user-provided context that every worker may need. If the user shares any credential, token, private URL, account id, env var, or similar local setup detail in this conversation, append it exactly to RUDDER_SHARED.md so it survives model compaction and becomes visible to workers. Do not put secret values in RUDDER.md or DECISIONS.md.",
         "Ask concise clarifying questions in the conversation whenever the request is ambiguous (scope, approach, key decisions, what to reuse vs rebuild). This is a back-and-forth: the user replies and you continue.",
         "When the task DAG is ready, WRITE it to `RUDDER.md` OUTSIDE the `<!-- RUDDER_GENERATED_START -->` / `<!-- RUDDER_GENERATED_END -->` generated block, wrapped EXACTLY in these markers (one JSON object on its own lines), then tell the user it is ready for approval:\nRUDDER_PLAN_TASKS_START\n{\"tasks\":[{\"id\":\"n0\",\"title\":\"short title\",\"prompt\":\"full worker prompt\",\"goal\":\"one-line objective\",\"success\":\"verifiable done-when\",\"deps\":[]},{\"id\":\"n1\",\"title\":\"...\",\"prompt\":\"...\",\"goal\":\"...\",\"success\":\"...\",\"deps\":[{\"on\":\"n0\",\"type\":\"hard\",\"why\":\"edits the module n0 creates\"}]}]}\nRUDDER_PLAN_TASKS_END",
         "Edge types: `hard` = the child cannot SUCCEED until the parent has merged (it imports/executes the parent's code); `soft` = context-only, can run in parallel. Use the minimal hard-edge set; every hard edge needs a one-line `why`. Each task carries a `goal` and a verifiable `success`, and refers to files by REPOSITORY-RELATIVE paths only.",
         "Rudder renders the DAG in the pane ABOVE this terminal and reloads it LIVE from RUDDER.md. The plan is a LIVING document: whenever the user asks to ADD, CHANGE, REMOVE, reorder, re-scope, or re-split tasks at ANY point before they approve, UPDATE the DAG by re-writing the FULL RUDDER_PLAN_TASKS block in RUDDER.md to match - keep stable `id`s for unchanged nodes, add new ones with fresh ids, drop removed ones, and fix up `deps` so the edges stay correct. Always keep the block in sync with what you and the user have agreed; never describe a plan change only in chat without also writing it to the file.",
         "APPROVAL / LAUNCH: After - and ONLY after - the user has EXPLICITLY confirmed in the conversation that the plan is good to run (e.g. \"yes\", \"go\", \"approve\", \"launch it\"), signal Rudder to launch the workers by WRITING (Edit/Write) the line `RUDDER_APPROVE_PLAN` on its own line into RUDDER.md, keeping the RUDDER_PLAN_TASKS block in the file. Writing it into RUDDER.md (a structured Write) is the reliable channel; you MAY also print the same line in the chat as a fallback. Never write/print it preemptively, while you are still asking questions, or while you are revising the plan. When you merely need to REFER to the marker in prose, write it as RUDDER_APPROVE_PLAN_TEMPLATE so Rudder does not treat the mention as a launch trigger. Once you write RUDDER_APPROVE_PLAN your job is DONE: Rudder generates the DAG (graph.json), launches the SEPARATE worker fleet, and stops this planning session. Do not implement anything or keep working after that.",
         "You have Rudder project skills available under `.claude/skills/rudder-*`. Use them for dashboard actions when the user asks from this orchestrator session. Those skills tell you which exact `RUDDER_*` control marker to write to RUDDER.md; Rudder consumes the marker and runs the dashboard action.",
-        "Only ever Edit/Write RUDDER.md and the generated `.claude/skills/rudder-*` SKILL.md files. Treat all other files as read-only.",
+        "Only ever Edit/Write RUDDER.md, RUDDER_SHARED.md, and the generated `.claude/skills/rudder-*` SKILL.md files. Treat all other files as read-only.",
     ]
     .join("\n\n")
 }
@@ -128,7 +152,7 @@ pub(crate) fn orchestrator_system_prompt() -> String {
 /// First-turn prompt for the interactive orchestrator (paired with the system prompt).
 pub(crate) fn rudder_orchestrator_prompt(task: &str) -> String {
     let task = strip_rudder_prompt_wrappers(task);
-    let base = "You are Rudder's orchestrator for this checkout. Read RUDDER.md if it exists. If no concrete task is given yet, say you are ready and wait. For a concrete request, ask clarifying questions when needed; once clear, write the DAG to RUDDER.md outside Rudder's generated block and ask the user to approve. Only AFTER they explicitly confirm, add a `RUDDER_APPROVE_PLAN` line to RUDDER.md (keeping the plan block) to launch.";
+    let base = "You are Rudder's orchestrator for this checkout. Read RUDDER.md if it exists, and read RUDDER_SHARED.md if it exists. RUDDER_SHARED.md is gitignored local context for all agents; if the user shares tokens, credentials, private URLs, account ids, or env details in this conversation, append them there so workers can read them later. If no concrete task is given yet, say you are ready and wait. For a concrete request, ask clarifying questions when needed; once clear, write the DAG to RUDDER.md outside Rudder's generated block and ask the user to approve. Only AFTER they explicitly confirm, add a `RUDDER_APPROVE_PLAN` line to RUDDER.md (keeping the plan block) to launch.";
     if task.trim().is_empty() {
         base.to_string()
     } else {
@@ -158,7 +182,7 @@ pub(crate) fn rudder_reconcile_prompt(task: &str, frontier: &[(String, String)])
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "You are Rudder's injection coordinator. A multi-agent plan is ALREADY in flight; a separate set of worker agents is implementing its nodes in isolated git worktrees. The user is now ADDING one more task to that running plan. You inspect the repository in READ-ONLY mode. You do NOT implement anything yourself, and you do NOT re-plan or replace the existing work.\n\nExisting plan nodes (the frontier, in-flight, not yet merged):\n{existing}\n\nExisting node ids: [{existing_ids}]\n\nNew task the user is ADDING:\n{task}\n\nProcess:\n1. Inspect the relevant files read-only to understand how the new task relates to the in-flight nodes.\n2. Emit EXACTLY ONE node in the RUDDER_PLAN_TASKS block. Its `id` MUST be unique from every existing node id above. Its `deps` reference the existing frontier ids.\n3. Edge rules: add a `hard` dep only if the new task genuinely CANNOT start until that node merges (it edits that node's not-yet-merged code, or needs an interface that node defines) and justify it with a one-line `why`. Otherwise use `soft` deps for nodes the new task should be aware of, or no deps at all if the new task is fully independent. Prefer soft; a hard edge without a `why` is treated as soft.\n4. The node must be self-contained, name concrete files or modules to inspect when known, and carry both a `goal` (one-line objective for the `/goal` slash command, without the leading slash) and a verifiable `success` (the DONE-WHEN condition). Never omit either. The worker runs in its OWN isolated workspace at a different filesystem path than this repository: refer to files by REPOSITORY-RELATIVE paths only, and NEVER embed an absolute path, the repository's location, or phrases like \"in the repository at <path>\" — an absolute path sends the worker to the wrong directory and the task fails.\n\nPLAN MODE: You are running in plan mode. Do NOT call ExitPlanMode. Do NOT implement, edit, or write any files. When the node is ready, print exactly the block below as a NORMAL assistant message and then stop. Rudder reads the block directly from your output; it does not need you to exit plan mode.\n\nPrint exactly this block and no other JSON block:\nRUDDER_PLAN_TASKS_START\n{{\"tasks\":[{{\"id\":\"new\",\"title\":\"short task title\",\"prompt\":\"full implementation prompt for one worker agent\",\"goal\":\"one-line objective for /goal, without the leading slash command\",\"success\":\"verifiable done-when condition\",\"deps\":[{{\"on\":\"<existing frontier id>\",\"type\":\"soft\",\"why\":\"context the new task should be aware of\"}}]}}]}}\nRUDDER_PLAN_TASKS_END\n\nAfter the block, add a short human summary of how the added node relates to the in-flight plan."
+        "You are Rudder's injection coordinator. A multi-agent plan is ALREADY in flight; a separate set of worker agents is implementing its nodes in isolated git worktrees. The user is now ADDING one more task to that running plan. You inspect the repository in READ-ONLY mode. You do NOT implement anything yourself, and you do NOT re-plan or replace the existing work.\n\nExisting plan nodes (the frontier, in-flight, not yet merged):\n{existing}\n\nExisting node ids: [{existing_ids}]\n\nNew task the user is ADDING:\n{task}\n\nProcess:\n1. Inspect the relevant files read-only to understand how the new task relates to the in-flight nodes.\n2. Emit EXACTLY ONE node in the RUDDER_PLAN_TASKS block. Its `id` MUST be unique from every existing node id above. Its `deps` reference the existing frontier ids.\n3. Edge rules: add a `hard` dep only if the new task genuinely CANNOT start until that node merges (it edits that node's not-yet-merged code, or needs an interface that node defines) and justify it with a one-line `why`. Otherwise use `soft` deps for nodes the new task should be aware of, or no deps at all if the new task is fully independent. Prefer soft; a hard edge without a `why` is treated as soft.\n4. The node must be self-contained, name concrete files or modules to inspect when known, and carry both a `goal` (one-line objective the worker should accomplish) and a verifiable `success` (the DONE-WHEN condition). Never omit either. The worker runs in its OWN isolated workspace at a different filesystem path than this repository: refer to files by REPOSITORY-RELATIVE paths only, and NEVER embed an absolute path, the repository's location, or phrases like \"in the repository at <path>\" — an absolute path sends the worker to the wrong directory and the task fails.\n\nPLAN MODE: You are running in plan mode. Do NOT call ExitPlanMode. Do NOT implement, edit, or write any files. When the node is ready, print exactly the block below as a NORMAL assistant message and then stop. Rudder reads the block directly from your output; it does not need you to exit plan mode.\n\nPrint exactly this block and no other JSON block:\nRUDDER_PLAN_TASKS_START\n{{\"tasks\":[{{\"id\":\"new\",\"title\":\"short task title\",\"prompt\":\"full implementation prompt for one worker agent\",\"goal\":\"one-line objective for the worker\",\"success\":\"verifiable done-when condition\",\"deps\":[{{\"on\":\"<existing frontier id>\",\"type\":\"soft\",\"why\":\"context the new task should be aware of\"}}]}}]}}\nRUDDER_PLAN_TASKS_END\n\nAfter the block, add a short human summary of how the added node relates to the in-flight plan."
     )
 }
 
@@ -187,7 +211,7 @@ pub(crate) struct RudderPlanTask {
     pub(crate) id: String,
     pub(crate) title: String,
     pub(crate) prompt: String,
-    /// One-line OBJECTIVE for the `/goal` launch line. Optional in the parse for
+    /// One-line OBJECTIVE for the launch Objective line. Optional in the parse for
     /// backward compatibility; the worker prompt derives a default when absent.
     pub(crate) goal: Option<String>,
     /// Verifiable SUCCESS / DONE-WHEN condition for the launch prompt. Optional
@@ -236,6 +260,8 @@ impl PlannedNode {
     /// Build a queued node from a parsed plan task: hard-dep ids gate the launch;
     /// soft-dep ids are retained only for nesting.
     pub(crate) fn from_task(task: &RudderPlanTask) -> Self {
+        let mut task = task.clone();
+        preflight_plan_task_for_launch(&mut task);
         let deps: Vec<String> = task.hard_deps().map(ToString::to_string).collect();
         let soft_deps: Vec<String> = task
             .deps
@@ -244,16 +270,16 @@ impl PlannedNode {
             .map(|edge| edge.on.clone())
             .collect();
         Self {
-            id: task.id.clone(),
-            title: task.title.clone(),
-            prompt: task.prompt.clone(),
-            goal: task.goal.clone(),
-            success: task.success.clone(),
+            id: task.id,
+            title: task.title,
+            prompt: task.prompt,
+            goal: task.goal,
+            success: task.success,
             deps,
             soft_deps,
-            backend: task.backend.clone(),
-            model: task.model.clone(),
-            effort: task.effort.clone(),
+            backend: task.backend,
+            model: task.model,
+            effort: task.effort,
         }
     }
 
@@ -549,7 +575,7 @@ pub(crate) fn extract_rudder_plan_tasks_with_frontier(
         let id = plan_task_id(task, index);
         let deps = parse_plan_deps(task, &id, &known_ids);
 
-        out.push(RudderPlanTask {
+        let mut plan_task = RudderPlanTask {
             id,
             title: if title.is_empty() {
                 "worker task".to_string()
@@ -563,7 +589,9 @@ pub(crate) fn extract_rudder_plan_tasks_with_frontier(
             backend: plan_optional_str(task, "backend"),
             model: plan_optional_str(task, "model"),
             effort: plan_optional_str(task, "effort"),
-        });
+        };
+        preflight_plan_task_for_launch(&mut plan_task);
+        out.push(plan_task);
     }
 
     assert_no_hard_cycle(&out)?;
@@ -956,21 +984,19 @@ fn parse_plan_deps(
 pub(crate) const DEFAULT_GOAL_SUCCESS: &str =
     "the task is implemented and its own verification passes";
 
-/// Collapse a value to a single line so the leading `/goal` slash command stays
-/// intact, trimmed for prompt budget.
+/// Collapse a value to a single launch objective line, trimmed for prompt budget.
 fn one_line(value: &str) -> String {
     let joined = value.split_whitespace().collect::<Vec<_>>().join(" ");
     let trimmed = joined.trim();
     truncate_chars(trimmed, 200)
 }
 
-/// The OBJECTIVE for a task's `/goal` line: the planner-supplied `goal`, else a
+/// The OBJECTIVE for a task's launch Objective line: the planner-supplied `goal`, else a
 /// default derived from the title (or the first line of the prompt).
-/// The backend's `/goal` slash command rejects a goal condition longer than 4000
-/// characters ("Goal condition is limited to 4000 characters"). The objective and the
-/// done-when each sit on their own `/goal` / `Done when:` line, so cap each safely under
-/// that — the full detail still rides along in the prompt body that follows.
-pub(crate) const MAX_GOAL_LINE_CHARS: usize = 3900;
+/// Keep launch goal lines under the backend's slash-command limit too, because legacy
+/// prompts can still be recovered from `/goal` and users can forward `/goal` manually.
+/// The full detail still rides along in the prompt body that follows.
+pub(crate) const MAX_GOAL_LINE_CHARS: usize = 3000;
 
 pub(crate) fn cap_goal_line(text: String) -> String {
     if text.chars().count() <= MAX_GOAL_LINE_CHARS {
@@ -1029,11 +1055,18 @@ fn goal_success(task: &RudderPlanTask) -> String {
         .unwrap_or_else(|| DEFAULT_GOAL_SUCCESS.to_string())
 }
 
-/// Build a worker launch prompt in the canonical /goal format. EVERY spawned
-/// agent (Claude or Codex) leads with `/goal <objective>` then a `Done when:`
-/// line so the backend picks up the slash command and the worker always knows
-/// what done means. The full task body follows. Both backends support /goal, so
-/// the block is emitted unconditionally (not gated on the goals feature flag).
+/// Deterministic DAG preflight before approval/launch: every node gets a one-line,
+/// capped objective and done-when condition. This is deliberately local, not model
+/// driven, because character limits are mechanical and the transform is idempotent.
+pub(crate) fn preflight_plan_task_for_launch(task: &mut RudderPlanTask) {
+    task.goal = Some(goal_objective(task));
+    task.success = Some(goal_success(task));
+}
+
+/// Build a worker launch prompt in the canonical objective format. Every spawned agent
+/// leads with `Objective: <objective>` then a `Done when:` line so the worker has a
+/// clear objective and stopping condition. Do not use `/goal` or `Goal:` here:
+/// backends may parse the entire initial prompt as a goal condition.
 pub(crate) fn rudder_plan_worker_prompt(
     planner_task: &str,
     task: &RudderPlanTask,
@@ -1048,21 +1081,27 @@ pub(crate) fn rudder_plan_worker_prompt(
         task.id, task.title, task.prompt
     );
     format!(
-        "/goal {}\nDone when: {}\n\n{}",
+        "Objective: {}\nDone when: {}\n\n{}",
         goal_objective(task),
         goal_success(task),
         body
     )
 }
 
-/// Wrap a manual single-task spawn (no planner) in the canonical /goal format.
+/// Wrap a manual single-task spawn (no planner) in the canonical objective format.
 /// The objective is the task statement's first line; the success condition is
-/// the canonical default stopping condition. Idempotent: a prompt that already
-/// leads with `/goal` (e.g. a /rudder-plan worker prompt) is returned unchanged.
+/// the canonical default stopping condition. Idempotent: a prompt that already has
+/// a goal block is returned with any legacy `/goal` or `Goal:` prefix normalized to
+/// `Objective:`.
 pub(crate) fn manual_goal_prompt(task: &str) -> String {
     let trimmed = task.trim_start();
-    if trimmed.starts_with("/goal") {
-        return task.to_string();
+    if starts_goal_prompt(trimmed) {
+        let (goal_block, rest) = split_leading_goal_block(trimmed);
+        return if rest.is_empty() {
+            goal_block
+        } else {
+            format!("{goal_block}\n\n{rest}")
+        };
     }
     let objective = task
         .lines()
@@ -1072,7 +1111,7 @@ pub(crate) fn manual_goal_prompt(task: &str) -> String {
         .filter(|line| !line.is_empty())
         .map(cap_goal_line)
         .unwrap_or_else(|| "complete the task".to_string());
-    format!("/goal {objective}\nDone when: {DEFAULT_GOAL_SUCCESS}\n\n{task}")
+    format!("Objective: {objective}\nDone when: {DEFAULT_GOAL_SUCCESS}\n\n{task}")
 }
 
 pub(crate) fn rudder_plan_worker_title_from_prompt(task: &str) -> Option<String> {
@@ -1278,7 +1317,7 @@ fn build_dispatch_prompt(task: &str) -> String {
 #[cfg_attr(test, allow(dead_code))]
 fn classify_dispatch_intent(task: &str) -> DispatchIntent {
     let task = task.trim();
-    if task.starts_with("/goal") {
+    if is_goal_slash_command(task) {
         return DispatchIntent::Plan;
     }
     if let Some(intent) = classify_dispatch_intent_locally(task) {
@@ -1309,7 +1348,7 @@ pub(crate) fn classify_dispatch_intent_locally(task: &str) -> Option<DispatchInt
         return None;
     }
     let lower = task.to_ascii_lowercase();
-    if lower.starts_with("/goal") {
+    if is_goal_slash_command(&lower) {
         return Some(DispatchIntent::Plan);
     }
 
@@ -1330,6 +1369,13 @@ pub(crate) fn classify_dispatch_intent_locally(task: &str) -> Option<DispatchInt
         return Some(DispatchIntent::OneOff);
     }
     None
+}
+
+fn is_goal_slash_command(value: &str) -> bool {
+    value == "/goal"
+        || value
+            .strip_prefix("/goal")
+            .is_some_and(|rest| rest.starts_with(char::is_whitespace))
 }
 
 fn has_direct_plan_marker(lower: &str) -> bool {
@@ -1528,7 +1574,7 @@ fn generate_completion_summary(task: &str, diff: &str) -> Option<serde_json::Val
 }
 
 pub(crate) fn generate_task_summary_title(task: &str) -> Option<String> {
-    let task = normalize_task_text(task);
+    let task = normalize_task_text(&redact_secret_values(task));
     if task.is_empty() {
         return None;
     }
@@ -1586,7 +1632,7 @@ pub(crate) fn clean_task_summary_title(raw: &str) -> Option<String> {
 }
 
 pub(crate) fn summarize_task_to(task: &str, max_chars: usize) -> String {
-    let original = normalize_task_text(task);
+    let original = normalize_task_text(&redact_secret_values(task));
     if original.is_empty() {
         return "agent".to_string();
     }
@@ -1786,7 +1832,7 @@ pub(crate) fn truncate_chars(value: &str, max_chars: usize) -> String {
 }
 
 pub(crate) fn preview_text(value: &str, max_chars: usize) -> String {
-    let normalized = value
+    let normalized = redact_secret_values(value)
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
@@ -1798,4 +1844,65 @@ pub(crate) fn preview_text(value: &str, max_chars: usize) -> String {
     } else {
         preview
     }
+}
+
+pub(crate) fn redact_secret_values(value: &str) -> String {
+    value
+        .split_whitespace()
+        .map(redact_secret_token)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn redact_secret_token(raw: &str) -> String {
+    let trimmed = raw.trim_matches(|ch: char| {
+        matches!(
+            ch,
+            '"' | '\'' | '`' | ',' | ';' | ')' | '(' | '[' | ']' | '{' | '}'
+        )
+    });
+    if let Some((key, value)) = trimmed.split_once('=') {
+        if looks_like_secret_key(key)
+            && (looks_like_secret_value(value) || looks_like_plausible_secret_value(value))
+        {
+            return raw.replace(value, "[redacted]");
+        }
+    }
+    if looks_like_secret_value(trimmed) {
+        return raw.replace(trimmed, "[redacted]");
+    }
+    raw.to_string()
+}
+
+fn looks_like_secret_key(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    lower.contains("token")
+        || lower.contains("api_key")
+        || lower.contains("apikey")
+        || lower.contains("secret")
+        || lower.contains("password")
+}
+
+fn looks_like_secret_value(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    let has_secret_prefix = lower.contains("api_")
+        || lower.starts_with("sk-")
+        || lower.starts_with("xox")
+        || lower.starts_with("ghp_")
+        || lower.starts_with("gho_")
+        || lower.starts_with("github_pat_");
+    let long_mixed = value.len() >= 24
+        && value.chars().any(|ch| ch.is_ascii_alphabetic())
+        && value
+            .chars()
+            .any(|ch| ch.is_ascii_digit() || matches!(ch, '_' | '-' | '.'));
+    has_secret_prefix || long_mixed
+}
+
+fn looks_like_plausible_secret_value(value: &str) -> bool {
+    value.len() >= 10
+        && value.chars().any(|ch| ch.is_ascii_alphanumeric())
+        && value
+            .chars()
+            .any(|ch| ch.is_ascii_digit() || matches!(ch, '_' | '-' | '.' | '/'))
 }

@@ -14,7 +14,7 @@ import { loadInstructionFiles } from "./brain.js";
 import { createEmptyChange, currentJjChangeId } from "./jj.js";
 import { newEdgeId, newNodeId, updateGraph } from "./graph.js";
 import { nowIso } from "./util.js";
-import { DEFAULT_SUCCESS, deriveGoal, formatGoalPrompt } from "./goal.js";
+import { DEFAULT_SUCCESS, deriveGoal, formatGoalPrompt, normalizeGoalLine } from "./goal.js";
 
 export { loadInstructionFiles } from "./brain.js";
 
@@ -28,10 +28,10 @@ const PLAN_END = "RUDDER_PLAN_TASKS_END";
 // The dependency rules quoted into the system prompts. The same wording is the
 // contract the native tasks.rs parser enforces, so the model and both parsers
 // agree on what hard vs soft means.
-// The /goal convention quoted into the system prompts. Every spawnable task
+// The launch-goal convention quoted into the system prompts. Every spawnable task
 // MUST carry a one-line objective (goal) and a verifiable stopping condition
-// (success). Both Claude and Codex receive these as a leading `/goal` line plus
-// a `Done when:` line, so the worker always knows what done means.
+// (success). Rudder launches workers with a leading `Objective:` line plus a `Done when:`
+// line, so the worker always knows what done means without invoking a slash command.
 const GOAL_RULES = [
   "Goal rules (REQUIRED for every task):",
   "- `goal`: one line naming the single objective the worker should accomplish.",
@@ -104,12 +104,18 @@ export function parsePlanBlock(output: string): PlanDag {
     }
     const id = typeof raw.id === "string" && raw.id.trim() ? raw.id.trim() : `n${index}`;
     const title = typeof raw.title === "string" && raw.title.trim() ? raw.title.trim() : "worker task";
-    // goal + success are part of the /goal convention: REQUIRED in the system
+    // goal + success are part of the launch-goal convention: REQUIRED in the system
     // prompt, but we stay backward-compatible by deriving sane defaults when the
     // model omits them (goal = title/first line of the prompt; success = the
     // canonical stopping condition).
-    const goal = typeof raw.goal === "string" && raw.goal.trim() ? raw.goal.trim() : deriveGoal(title || prompt);
-    const success = typeof raw.success === "string" && raw.success.trim() ? raw.success.trim() : DEFAULT_SUCCESS;
+    const goal = normalizeGoalLine(
+      typeof raw.goal === "string" && raw.goal.trim() ? raw.goal : deriveGoal(title || prompt),
+      title || prompt,
+    );
+    const success = normalizeGoalLine(
+      typeof raw.success === "string" && raw.success.trim() ? raw.success : DEFAULT_SUCCESS,
+      DEFAULT_SUCCESS,
+    );
     const node: PlanNode = {
       id,
       title,
@@ -467,7 +473,7 @@ export function buildFanoutDag(task: string, n: number, opts: FanoutOptions = {}
     const id = `v${index}`;
     variantIds.push(id);
     // Each variant: objective = the task with its angle; success = its approach
-    // is implemented and its own verification passes. The /goal-format header is
+    // is implemented and its own verification passes. The objective-format header is
     // applied at scaffold time (scaffoldPlan), so the body stays raw here.
     nodes.push({
       id,
@@ -487,7 +493,7 @@ export function buildFanoutDag(task: string, n: number, opts: FanoutOptions = {}
   }
 
   // Judge: objective = pick/synthesize the best; success = the final
-  // implementation is complete and verified. The /goal-format header is applied
+  // implementation is complete and verified. The objective-format header is applied
   // at scaffold time (scaffoldPlan).
   const judgePrompt = [
     `${count} independent agents each attempted this task: ${trimmed}`,
@@ -578,13 +584,13 @@ export async function scaffoldPlan(repoRoot: string, dag: PlanDag): Promise<void
           ...(dep.why ? { why: dep.why } : {}),
         };
       }
-      const goal = node.goal ?? deriveGoal(node.title || node.prompt);
-      const success = node.success ?? DEFAULT_SUCCESS;
+      const goal = normalizeGoalLine(node.goal ?? deriveGoal(node.title || node.prompt), node.title || node.prompt);
+      const success = normalizeGoalLine(node.success ?? DEFAULT_SUCCESS, DEFAULT_SUCCESS);
       graph.nodes[nodeId] = {
         id: nodeId,
         title: node.title,
-        // Persist the launch prompt already in /goal format so every planner-
-        // produced worker leads with its objective + verifiable done-when line.
+        // Persist the launch prompt already in objective format so every planner-produced
+        // worker leads with its objective + verifiable done-when line.
         prompt: formatGoalPrompt({ goal, success, body: node.prompt }),
         goal,
         success,

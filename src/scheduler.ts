@@ -22,7 +22,7 @@ import {
   updateGraph,
 } from "./graph.js";
 import { reconcile } from "./planner.js";
-import { DEFAULT_SUCCESS, deriveGoal, formatGoalPrompt } from "./goal.js";
+import { DEFAULT_SUCCESS, deriveGoal, formatGoalPrompt, normalizeGoalLine } from "./goal.js";
 import { createRunRecord, loadConfig, loadRunRecord, runDir } from "./state.js";
 import { spawnWorker } from "./run-manager.js";
 import { ensureDecisionsFile, renderLiveRudderMd } from "./surfaces.js";
@@ -1019,12 +1019,12 @@ async function reconcileInjectionCore(
         type: dep.type,
       };
     }
-    const goal = result.node.goal ?? deriveGoal(title || input.prompt);
-    const success = result.node.success ?? DEFAULT_SUCCESS;
+    const goal = normalizeGoalLine(result.node.goal ?? deriveGoal(title || input.prompt), title || input.prompt);
+    const success = normalizeGoalLine(result.node.success ?? DEFAULT_SUCCESS, DEFAULT_SUCCESS);
     g.nodes[nodeId] = {
       id: nodeId,
       title,
-      // Reconciled (injected) nodes lead with the /goal-format header too.
+      // Reconciled (injected) nodes lead with the objective-format header too.
       prompt: formatGoalPrompt({ goal, success, body: result.node.prompt || input.prompt }),
       goal,
       success,

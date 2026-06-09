@@ -149,9 +149,19 @@ async function planAndDrain(t, ws, tasks) {
     return ns.every((n) => n.status === "merged" || n.status === "failed") ? g : null;
   }, { timeoutMs: 60_000 });
   assert.ok(drained, `DAG did not drain within timeout. board log:\n${boardLog}`);
-  const rudderMd = await fsp.readFile(path.join(ws.repo, "RUDDER.md"), "utf8");
-  assert.match(rudderMd, /<!-- RUDDER_GENERATED_START -->/, "the board writes the live RUDDER.md generated block");
-  assert.match(rudderMd, /RUDDER .* Orchestrated Run Status/, "RUDDER.md is the plan/status surface for workers");
+  const rudderPath = path.join(ws.repo, "RUDDER.md");
+  let lastRudderMd = "";
+  const rudderMd = await poll(async () => {
+    lastRudderMd = await fsp.readFile(rudderPath, "utf8").catch(() => "");
+    return /<!-- RUDDER_GENERATED_START -->/.test(lastRudderMd) &&
+      /RUDDER .* Orchestrated Run Status/.test(lastRudderMd)
+      ? lastRudderMd
+      : null;
+  }, { timeoutMs: 10_000, intervalMs: 200 });
+  assert.ok(
+    rudderMd,
+    `RUDDER.md did not receive the live generated status block. Last content:\n${lastRudderMd}\n\nboard log:\n${boardLog}`,
+  );
   return { graph: drained, boardLog };
 }
 

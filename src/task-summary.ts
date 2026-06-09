@@ -54,7 +54,7 @@ const STOP_WORDS = new Set([
 ]);
 
 export function summarizeTask(task: string, maxChars = DEFAULT_MAX_CHARS): string {
-  const original = normalizeTaskText(task);
+  const original = normalizeTaskText(redactTaskSummarySecrets(task));
   if (!original) {
     return "agent";
   }
@@ -437,7 +437,7 @@ export async function callTextModel(params: {
 }
 
 export async function llmSummarizeTask(task: string): Promise<string | null> {
-  const trimmed = normalizeTaskText(task);
+  const trimmed = normalizeTaskText(redactTaskSummarySecrets(task));
   if (!trimmed) {
     return null;
   }
@@ -464,4 +464,59 @@ export async function llmSummarizeTask(task: string): Promise<string | null> {
   // instead of a raw API key. Runs in the background relative to the dashboard
   // so the user does not feel the latency.
   return await summarizeViaClaudeCli(trimmed);
+}
+
+function redactTaskSummarySecrets(value: string): string {
+  return value
+    .split(/\s+/)
+    .filter(Boolean)
+    .map(redactSecretToken)
+    .join(" ");
+}
+
+function redactSecretToken(raw: string): string {
+  const trimmed = raw.replace(/^[`"'([{]+|[`"',;)\]}]+$/g, "");
+  const eq = trimmed.indexOf("=");
+  if (eq > 0) {
+    const key = trimmed.slice(0, eq);
+    const secret = trimmed.slice(eq + 1);
+    if (
+      looksLikeSecretKey(key) &&
+      (looksLikeSecretValue(secret) || looksLikePlausibleSecretValue(secret))
+    ) {
+      return raw.replace(secret, "[redacted]");
+    }
+  }
+  if (looksLikeSecretValue(trimmed)) {
+    return raw.replace(trimmed, "[redacted]");
+  }
+  return raw;
+}
+
+function looksLikeSecretKey(key: string): boolean {
+  return /token|api_key|apikey|secret|password/i.test(key);
+}
+
+function looksLikeSecretValue(value: string): boolean {
+  const lower = value.toLowerCase();
+  const hasSecretPrefix =
+    lower.includes("api_") ||
+    lower.startsWith("sk-") ||
+    lower.startsWith("xox") ||
+    lower.startsWith("ghp_") ||
+    lower.startsWith("gho_") ||
+    lower.startsWith("github_pat_");
+  const longMixed =
+    value.length >= 24 &&
+    /[A-Za-z]/.test(value) &&
+    /[0-9_.-]/.test(value);
+  return hasSecretPrefix || longMixed;
+}
+
+function looksLikePlausibleSecretValue(value: string): boolean {
+  return (
+    value.length >= 10 &&
+    /[A-Za-z0-9]/.test(value) &&
+    /[0-9_.\-/]/.test(value)
+  );
 }

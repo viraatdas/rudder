@@ -79,9 +79,9 @@ fn goal_line_capped_under_backend_limit() {
     let prompt = rudder_plan_worker_prompt("original request", &task, "", Backend::Claude);
     let mut lines = prompt.lines();
     let goal_line = lines.next().unwrap();
-    assert!(goal_line.starts_with("/goal "));
-    // The /goal argument must be <= 4000 chars (it was 4595).
-    let arg_len = goal_line.chars().count() - "/goal ".chars().count();
+    assert!(goal_line.starts_with("Objective: "));
+    // The objective argument must be <= 4000 chars (it was 4595).
+    let arg_len = goal_line.chars().count() - "Objective: ".chars().count();
     assert!(
         arg_len <= 4000,
         "/goal arg capped under 4000: was {arg_len}"
@@ -99,6 +99,76 @@ fn goal_line_capped_under_backend_limit() {
 }
 
 #[test]
+fn parsed_plan_tasks_are_preflighted_before_queueing() {
+    let raw = format!(
+        "RUDDER_PLAN_TASKS_START\n{{\"tasks\":[{{\"id\":\"n0\",\"title\":\"seed\",\"prompt\":\"write data\",\"goal\":\"{}\",\"success\":\"{}\",\"deps\":[]}}]}}\nRUDDER_PLAN_TASKS_END",
+        "G".repeat(4800),
+        "S".repeat(4800)
+    );
+    let tasks = extract_rudder_plan_tasks(&raw).expect("parse plan tasks");
+    let task = tasks.first().expect("one task");
+    assert!(
+        task.goal.as_deref().unwrap_or_default().chars().count() <= MAX_GOAL_LINE_CHARS,
+        "parsed goal is capped before it enters planned_nodes"
+    );
+    assert!(
+        task.success.as_deref().unwrap_or_default().chars().count() <= MAX_GOAL_LINE_CHARS,
+        "parsed success is capped before it enters planned_nodes"
+    );
+
+    let node = PlannedNode::from_task(task);
+    assert!(
+        node.goal.as_deref().unwrap_or_default().chars().count() <= MAX_GOAL_LINE_CHARS,
+        "queued goal remains capped"
+    );
+    assert!(
+        node.success.as_deref().unwrap_or_default().chars().count() <= MAX_GOAL_LINE_CHARS,
+        "queued success remains capped"
+    );
+}
+
+#[test]
+fn long_worker_body_does_not_become_a_slash_goal_condition() {
+    // Regression from a real worker launch: Claude reported
+    // "Goal condition is limited to 4000 characters (got 8685)" even though the
+    // planned node's goal/success were short. Root cause: the initial prompt began
+    // with `/goal`, and Claude treated the entire launch prompt as that command's
+    // argument. Long body detail must stay in the body, not in a slash command.
+    let task = RudderPlanTask {
+        id: "n2".to_string(),
+        title: "Seed data + Apify pipeline".to_string(),
+        prompt: format!(
+            "Build the talent seed-data layer. {}",
+            "Each record MUST follow the exact schema and write scripts/apify-ingest.ts. "
+                .repeat(120)
+        ),
+        goal: Some("Produce the seed JSON and Apify ingestion script.".to_string()),
+        success: Some("seed data and ingest script exist and run.".to_string()),
+        deps: vec![],
+        backend: None,
+        model: None,
+        effort: None,
+    };
+    let worker_prompt = rudder_plan_worker_prompt("build the CRM", &task, "", Backend::Claude);
+    assert!(
+        worker_prompt.len() > 8_000,
+        "test prompt should match the long-body failure"
+    );
+    assert!(worker_prompt.starts_with("Objective: Produce the seed JSON"));
+    assert!(!worker_prompt.starts_with("/goal"));
+    assert!(!worker_prompt.starts_with("Goal:"));
+
+    let launch_prompt = execution_prompt(&worker_prompt);
+    assert!(launch_prompt.starts_with("Objective: Produce the seed JSON"));
+    assert!(!launch_prompt.starts_with("/goal"));
+    assert!(!launch_prompt.starts_with("Goal:"));
+    assert!(
+        launch_prompt.contains("scripts/apify-ingest.ts"),
+        "full worker body is still present"
+    );
+}
+
+#[test]
 fn cap_goal_line_is_a_passthrough_when_short() {
     assert_eq!(
         cap_goal_line("short objective".to_string()),
@@ -109,17 +179,40 @@ fn cap_goal_line_is_a_passthrough_when_short() {
 #[test]
 fn execution_prompt_caps_a_long_leading_goal_line() {
     // The real 4000-char source: a planner node prompt that LEADS with its own long
-    // /goal line, hoisted by execution_prompt. The hoisted line must be capped.
+    // /goal line, hoisted by execution_prompt. The hoisted line must be capped and
+    // normalized away from a slash command so Claude does not parse the full prompt as
+    // the /goal argument.
     let task = format!(
         "/goal {}\nDone when: ok\n\nimplement the thing",
         "G".repeat(4595)
     );
     let out = execution_prompt(&task);
     let goal_line = out.lines().next().unwrap();
-    assert!(goal_line.starts_with("/goal "));
-    let arg = goal_line.chars().count() - "/goal ".chars().count();
+    assert!(goal_line.starts_with("Objective: "));
+    let arg = goal_line.chars().count() - "Objective: ".chars().count();
     assert!(arg <= 4000, "hoisted /goal arg capped: was {arg}");
     assert!(out.contains("implement the thing"), "body preserved");
+    assert!(
+        !out.starts_with("/goal"),
+        "launch prompt must not begin with a slash command"
+    );
+}
+
+#[test]
+fn execution_prompt_does_not_treat_goal_prefix_words_as_slash_goal() {
+    let out = execution_prompt("/goalkeeper route should be documented");
+    assert!(
+        !out.starts_with("Objective:"),
+        "only the real /goal command should be normalized: {out}"
+    );
+    assert!(out.contains("/goalkeeper route should be documented"));
+}
+
+#[test]
+fn execution_prompt_normalizes_legacy_goal_with_tab_separator() {
+    let out = execution_prompt("/goal\tship it\nDone when: tests pass\n\nbody");
+    assert!(out.starts_with("Objective: ship it\nDone when: tests pass"));
+    assert!(!out.starts_with("/goal"));
 }
 
 #[test]
@@ -574,8 +667,44 @@ fn execution_prompt_tells_the_worker_it_is_a_jj_runtime() {
     let prompt = execution_prompt("add a feature");
     assert!(prompt.contains("jj (Jujutsu)"), "names the VCS: {prompt}");
     assert!(prompt.contains("jj status") && prompt.contains("jj diff"));
+    assert!(
+        prompt.contains("RUDDER_SHARED.md"),
+        "workers must be told to read shared local context: {prompt}"
+    );
     // The old Hunk review integration paragraph is gone.
     assert!(!prompt.to_lowercase().contains("hunk"), "no hunk: {prompt}");
+}
+
+#[test]
+fn shared_context_extracts_secret_like_task_input_only() {
+    let input =
+        "please use APIFY_TOKEN=abc1234567 when scraping\nthen track token budget carefully";
+    let snippet = extract_shared_context_snippet(input).expect("captures token line");
+    assert!(snippet.contains("APIFY_TOKEN=abc1234567"));
+    assert!(
+        !snippet.contains("token budget"),
+        "ordinary token-budget prose should not be captured"
+    );
+}
+
+#[test]
+fn preview_text_redacts_secret_values() {
+    let preview = preview_text(
+        "apify token store this somewhere rdrtest_abc1234567890abcdef",
+        200,
+    );
+    assert!(preview.contains("[redacted]"));
+    assert!(!preview.contains("rdrtest_abc"));
+
+    let assigned = preview_text("APIFY_TOKEN=abc1234567", 200);
+    assert_eq!(assigned, "APIFY_TOKEN=[redacted]");
+
+    let short_keyed = preview_text("API_TOKEN=abc1234567", 200);
+    assert_eq!(short_keyed, "API_TOKEN=[redacted]");
+
+    let summary = summarize_task("scrape data with API_TOKEN=abc1234567");
+    assert!(summary.contains("[redacted]"));
+    assert!(!summary.contains("abc1234567"));
 }
 
 #[test]
@@ -611,9 +740,9 @@ fn jj_merge_conflict_prompt_uses_jj_not_git() {
 }
 
 #[test]
-fn manual_goal_prompt_leads_with_goal_and_done_when() {
+fn manual_goal_prompt_leads_with_objective_and_done_when() {
     let prompt = manual_goal_prompt("fix the flaky login test");
-    assert!(prompt.starts_with("/goal fix the flaky login test\n"));
+    assert!(prompt.starts_with("Objective: fix the flaky login test\n"));
     assert!(prompt.contains("Done when: the task is implemented and its own verification passes"));
     // The full task body follows the header.
     assert!(prompt.contains("fix the flaky login test"));
@@ -622,16 +751,19 @@ fn manual_goal_prompt_leads_with_goal_and_done_when() {
 #[test]
 fn manual_goal_prompt_is_idempotent_for_existing_goal_prompts() {
     let already = "/goal do the thing\nDone when: tests pass\n\nbody text";
-    assert_eq!(manual_goal_prompt(already), already);
+    assert_eq!(
+        manual_goal_prompt(already),
+        "Objective: do the thing\nDone when: tests pass\n\nbody text"
+    );
 }
 
 #[test]
 fn execution_prompt_hoists_goal_block_above_context() {
     let prompt = execution_prompt(
-        "/goal ship the parser\nDone when: cargo test passes\n\nWrite the parser.",
+        "Goal: ship the parser\nDone when: cargo test passes\n\nWrite the parser.",
     );
-    // The /goal line must be the very first line so the backend picks it up.
-    assert!(prompt.starts_with("/goal ship the parser\nDone when: cargo test passes\n"));
+    // The objective lines must be first, but not as a slash command or Goal header.
+    assert!(prompt.starts_with("Objective: ship the parser\nDone when: cargo test passes\n"));
     assert!(prompt.contains("Rudder-specific context injected by Rudder"));
     assert!(prompt.contains("Write the parser."));
 }
@@ -2067,9 +2199,10 @@ fn extracts_rudder_plan_tasks_from_marked_json_block() {
     assert_eq!(tasks[0].success.as_deref(), Some("cargo test passes"));
     assert_eq!(tasks[1].prompt, "Implement UI and test it.");
     // goal + success stay backward-compatible: a plan block that omits them
-    // still parses (with None), and the worker prompt derives defaults.
-    assert_eq!(tasks[1].goal, None);
-    assert_eq!(tasks[1].success, None);
+    // still parses, but the queue boundary preflights the node so launch can
+    // never inherit an oversized or missing goal condition.
+    assert_eq!(tasks[1].goal.as_deref(), Some("UI"));
+    assert_eq!(tasks[1].success.as_deref(), Some(DEFAULT_GOAL_SUCCESS));
 }
 
 #[test]
@@ -2252,7 +2385,7 @@ fn readiness_parity_fixture() {
 }
 
 #[test]
-fn rudder_plan_worker_prompt_always_leads_with_goal_and_done_when() {
+fn rudder_plan_worker_prompt_always_leads_with_objective_and_done_when() {
     let task = RudderPlanTask {
         id: "n0".to_string(),
         title: "API".to_string(),
@@ -2265,22 +2398,26 @@ fn rudder_plan_worker_prompt_always_leads_with_goal_and_done_when() {
         effort: None,
     };
 
-    // The /goal block leads the prompt unconditionally for BOTH backends.
+    // The objective block leads the prompt unconditionally for BOTH backends.
     for backend in [Backend::Codex, Backend::Claude] {
         let prompt = rudder_plan_worker_prompt("build the feature", &task, "", backend);
         assert!(
-            prompt.starts_with("/goal Complete the API without stopping until cargo test passes."),
-            "prompt must lead with /goal: {prompt}"
+            prompt.starts_with(
+                "Objective: Complete the API without stopping until cargo test passes."
+            ),
+            "prompt must lead with a plain objective block: {prompt}"
         );
         assert!(prompt.contains("\nDone when: cargo test passes with no failures"));
         assert!(prompt.contains("Original request:\nbuild the feature"));
         assert!(prompt.contains("Worker task: API"));
+        assert!(!prompt.starts_with("/goal"));
+        assert!(!prompt.starts_with("Goal:"));
     }
 }
 
 #[test]
 fn rudder_plan_worker_prompt_derives_goal_and_success_when_absent() {
-    // No explicit goal/success: the worker prompt still emits a /goal line
+    // No explicit goal/success: the worker prompt still emits an objective line
     // (derived from the title) and a Done-when line (the canonical default).
     let task = RudderPlanTask {
         id: "n0".to_string(),
@@ -2295,8 +2432,8 @@ fn rudder_plan_worker_prompt_derives_goal_and_success_when_absent() {
     };
     let prompt = rudder_plan_worker_prompt("build it", &task, "", Backend::Claude);
     assert!(
-        prompt.starts_with("/goal Implement the parser\n"),
-        "derived /goal from title: {prompt}"
+        prompt.starts_with("Objective: Implement the parser\n"),
+        "derived objective from title: {prompt}"
     );
     assert!(
         prompt.contains("Done when: the task is implemented and its own verification passes"),
@@ -5312,6 +5449,58 @@ fn write_rudder_context_preserves_orchestrator_plan_block() {
 }
 
 #[test]
+fn write_rudder_context_mirrors_shared_context_to_worktree() {
+    let repo = unique_test_repo("shared-context-mirror");
+    let workspace = repo.join("worker");
+    fs::create_dir_all(&workspace).unwrap();
+
+    append_shared_context(&repo, "test", "APIFY_TOKEN=abc1234567").unwrap();
+    let pending = WorktreeInfo {
+        id: "run-1".to_string(),
+        path: workspace.clone(),
+        branch: None,
+        path_is_worktree: true,
+        workspace_name: None,
+        jj_change_id: None,
+    };
+    write_rudder_context(&repo, &[], Some(&pending)).expect("write RUDDER.md");
+
+    let root_shared = fs::read_to_string(repo.join("RUDDER_SHARED.md")).unwrap();
+    let workspace_shared = fs::read_to_string(workspace.join("RUDDER_SHARED.md")).unwrap();
+    let rudder_md = fs::read_to_string(repo.join("RUDDER.md")).unwrap();
+    let gitignore = fs::read_to_string(repo.join(".gitignore")).unwrap();
+
+    assert!(root_shared.contains("APIFY_TOKEN=abc1234567"));
+    assert_eq!(workspace_shared, root_shared);
+    assert!(rudder_md.contains("RUDDER_SHARED.md"));
+    assert!(gitignore
+        .lines()
+        .any(|line| line.trim() == "RUDDER_SHARED.md"));
+
+    let _ = fs::remove_dir_all(&repo);
+}
+
+#[test]
+fn write_rudder_context_redacts_secret_values_in_agent_previews() {
+    let repo = unique_test_repo("rudder-md-redacts-agent-preview");
+    let mut agent = test_agent_run(
+        "run-secret",
+        "scrape with APIFY_TOKEN=abc1234567 and write data/seed/talent.json",
+    );
+    agent.cwd = repo.clone();
+    agent.current_prompt = "keep using APIFY_TOKEN=abc1234567 for the ingest".to_string();
+
+    write_rudder_context(&repo, &[agent], None).expect("write RUDDER.md");
+    let text = fs::read_to_string(repo.join("RUDDER.md")).unwrap();
+
+    assert!(text.contains("APIFY_TOKEN=[redacted]"));
+    assert!(!text.contains("abc1234567"));
+    assert!(!text.contains("abc1234567"));
+
+    let _ = fs::remove_dir_all(&repo);
+}
+
+#[test]
 fn orchestrator_skill_markers_are_consumed_once() {
     let repo = unique_test_repo("orch-skill-markers");
     fs::write(
@@ -5373,7 +5562,10 @@ fn interactive_default_preserves_codex_planner_backend() {
         .find(|run| run.is_orchestrator())
         .expect("orchestrator run");
     assert_eq!(run.backend, Backend::Codex, "Codex stays selected");
-    assert_eq!(run.model, "gpt-test", "Codex model is not swapped to Claude");
+    assert_eq!(
+        run.model, "gpt-test",
+        "Codex model is not swapped to Claude"
+    );
     assert!(
         run.autosteered,
         "Codex uses the existing headless planner capture path"
@@ -5411,8 +5603,11 @@ fn fresh_plan_retires_stale_orchestrator_rows() {
 
     app.start_rudder_plan_task("new plan");
 
-    let orchestrators: Vec<&AgentRun> =
-        app.agents.iter().filter(|run| run.is_orchestrator()).collect();
+    let orchestrators: Vec<&AgentRun> = app
+        .agents
+        .iter()
+        .filter(|run| run.is_orchestrator())
+        .collect();
     assert_eq!(orchestrators.len(), 1, "stopped row was retired");
     assert_ne!(orchestrators[0].id, "orch-old", "a fresh row was started");
     assert_eq!(orchestrators[0].status, AgentStatus::Running);
@@ -8262,8 +8457,8 @@ fn interactive_orchestrator_flag_survives_save_and_reload() {
     run.interactive_orchestrator = true;
     save_native_run_record(&repo, &run).expect("save interactive orchestrator");
 
-    let raw =
-        fs::read_to_string(native_run_dir(&repo, "orch-1").join("run.json")).expect("read run.json");
+    let raw = fs::read_to_string(native_run_dir(&repo, "orch-1").join("run.json"))
+        .expect("read run.json");
     let value: serde_json::Value = serde_json::from_str(&raw).expect("parse run.json");
     assert_eq!(
         value
@@ -8311,7 +8506,10 @@ fn interactive_orchestrator_flag_survives_save_and_reload() {
         serde_json::from_str(&raw).expect("parse headless run.json"),
     )
     .expect("reload headless");
-    assert!(reloaded.autosteered, "headless capture flag survives reload");
+    assert!(
+        reloaded.autosteered,
+        "headless capture flag survives reload"
+    );
     assert!(
         !reloaded.interactive_orchestrator,
         "headless planner does not reload as interactive"

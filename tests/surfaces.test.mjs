@@ -6,13 +6,18 @@ import test from "node:test";
 
 import { renderContract } from "../dist/brain.js";
 import { parseDecisions } from "../dist/board/daemon.js";
+import { summarizeTask } from "../dist/task-summary.js";
 import {
   DECISIONS_HEADER,
   PROPAGATION_RULES,
   appendCompletionNote,
   appendDecision,
+  appendSharedContext,
   ensureDecisionsFile,
+  extractSharedContextSnippet,
   parseCompletionNoteArg,
+  redactSharedSecretValues,
+  SHARED_CONTEXT_FILE,
   writeCompletionNoteFile,
 } from "../dist/surfaces.js";
 import { readdir } from "node:fs/promises";
@@ -127,6 +132,50 @@ test("appendDecision appends a parseable (owner, ts) bullet", async () => {
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test("extractSharedContextSnippet captures secret-like lines without token-budget prose", () => {
+  const snippet = extractSharedContextSnippet(
+    "use APIFY_TOKEN=abc1234567 for the scrape\nplease keep token budget low",
+  );
+  assert.match(snippet ?? "", /APIFY_TOKEN=abc1234567/);
+  assert.doesNotMatch(snippet ?? "", /token budget/);
+});
+
+test("appendSharedContext writes gitignored RUDDER_SHARED.md", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "rudder-shared-"));
+  try {
+    const wrote = await appendSharedContext(dir, "APIFY_TOKEN=abc1234567", "test");
+    assert.equal(wrote, true);
+    const content = await readFile(path.join(dir, SHARED_CONTEXT_FILE), "utf8");
+    const gitignore = await readFile(path.join(dir, ".gitignore"), "utf8");
+    assert.match(content, /APIFY_TOKEN=abc1234567/);
+    assert.match(gitignore, new RegExp(`^${SHARED_CONTEXT_FILE}$`, "m"));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("redactSharedSecretValues hides tokens in generated previews", () => {
+  const redacted = redactSharedSecretValues(
+    "apify token store this somewhere rdrtest_abc1234567890abcdef",
+  );
+  assert.match(redacted, /\[redacted\]/);
+  assert.doesNotMatch(redacted, /rdrtest_abc/);
+  assert.equal(
+    redactSharedSecretValues("APIFY_TOKEN=abc1234567"),
+    "APIFY_TOKEN=[redacted]",
+  );
+  assert.equal(
+    redactSharedSecretValues("API_TOKEN=abc1234567"),
+    "API_TOKEN=[redacted]",
+  );
+});
+
+test("summarizeTask redacts token values from local labels", () => {
+  const summary = summarizeTask("scrape data with API_TOKEN=abc1234567");
+  assert.match(summary, /\[redacted\]/);
+  assert.doesNotMatch(summary, /abc1234567/);
 });
 
 test("appendCompletionNote writes a DONE bullet with interfaces + scoped follow-ups", async () => {
@@ -266,9 +315,9 @@ test("buildResolverPrompt names both titles, the change, and the conflicted file
   assert.ok(prompt.includes("preserving BOTH intents"));
   assert.ok(prompt.includes("no remaining conflicts"));
   assert.ok(!prompt.includes("—"), "no em dashes in the prompt");
-  // The resolver agent is spawned in /goal format too: objective = resolve the
+  // The resolver agent is spawned in objective format too: objective = resolve the
   // conflict preserving both intents; success = no markers and jj resolve empty.
-  assert.equal(prompt.split("\n")[0].slice(0, 5), "/goal");
+  assert.ok(prompt.split("\n")[0].startsWith("Objective: "));
   assert.ok(prompt.split("\n")[0].includes("resolve the merge conflict"));
   assert.ok(prompt.includes("Done when: no conflict markers remain and `jj resolve --list` is empty"));
 });

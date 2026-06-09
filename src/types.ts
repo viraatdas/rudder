@@ -173,7 +173,7 @@ export type TaskNode = {
   id: string; // content hash (mergeable key): shortHash(title+createdAt+nonce)
   title: string;
   prompt: string;
-  goal?: string; // one-line OBJECTIVE for the /goal launch line
+  goal?: string; // one-line OBJECTIVE for the launch Objective line
   success?: string; // verifiable SUCCESS / DONE-WHEN condition
   backend: BackendId;
   model?: string;
@@ -217,7 +217,7 @@ export type PlanNode = {
   id: string;
   title: string;
   prompt: string;
-  goal?: string; // one-line OBJECTIVE for the /goal launch line
+  goal?: string; // one-line OBJECTIVE for the launch Objective line
   success?: string; // verifiable SUCCESS / DONE-WHEN condition
   deps: PlanEdge[];
   backend?: BackendId;
@@ -396,7 +396,7 @@ export type BackendAdapter = {
 export type SpecContract = {
   runId: string;
   task: string;
-  goal: string; // one-line OBJECTIVE for the /goal launch line
+  goal: string; // one-line OBJECTIVE for the launch Objective line
   success: string; // verifiable SUCCESS / DONE-WHEN condition
   createdAt: string;
   repo: {
