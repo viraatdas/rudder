@@ -88,6 +88,18 @@ pub(crate) fn clear_signal(run_id: &str) {
     }
 }
 
+/// Remove every per-run signal artifact (the signal file plus the Claude `--settings`
+/// / Codex notify config) when a run is deleted: nothing else ever prunes them, so
+/// `<rudder_home>/signals/` would otherwise accumulate dead runs forever. Best-effort.
+pub(crate) fn cleanup_run_signals(run_id: &str) {
+    let Some(dir) = signals_dir() else {
+        return;
+    };
+    let _ = std::fs::remove_file(dir.join(format!("{run_id}.json")));
+    let _ = std::fs::remove_file(dir.join(format!("{run_id}-claude.json")));
+    let _ = std::fs::remove_file(dir.join(format!("{run_id}-notify.sh")));
+}
+
 /// Tolerant parse of the signal JSON body into a state.
 pub(crate) fn parse_signal_state(body: &str) -> Option<SignalState> {
     let value: serde_json::Value = serde_json::from_str(body.trim()).ok()?;

@@ -2995,6 +2995,34 @@ pub(crate) fn task_default_hint(app: &App) -> &'static str {
     }
 }
 
+/// Style for the transient notice line, by severity. Errors and pending
+/// confirmations must not read like routine status: the notice is the only
+/// surface many failures have, and an all-muted line buried them. Keyed off the
+/// message text so the ~60 notice call sites need no extra state to maintain.
+pub(crate) fn notice_style(text: &str, focused: bool) -> Style {
+    const ERROR_MARKERS: &[&str] = &[
+        "failed",
+        "error",
+        "conflict",
+        "stopped",
+        "timed out",
+        "not found",
+        "not logged in",
+        "no longer exists",
+        "cannot",
+        "disabled",
+    ];
+    const CONFIRM_MARKERS: &[&str] = &["press d again", "press q / ctrl+c again", "still running"];
+    let lower = text.to_ascii_lowercase();
+    if CONFIRM_MARKERS.iter().any(|marker| lower.contains(marker)) {
+        Style::default().fg(RUNNING_COLOR)
+    } else if ERROR_MARKERS.iter().any(|marker| lower.contains(marker)) {
+        Style::default().fg(FAILED_COLOR)
+    } else {
+        muted_style(focused)
+    }
+}
+
 pub(crate) fn render_task(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let focused = app.focus == FocusPane::Task;
     let default_hint = task_default_hint(app);
@@ -3050,8 +3078,9 @@ pub(crate) fn render_task(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .collect::<Vec<_>>();
 
     if app.notice.is_some() {
+        let style = notice_style(hint, focused);
         for line in wrapped_hint {
-            lines.push(Line::from(Span::styled(line, muted_style(focused))));
+            lines.push(Line::from(Span::styled(line, style)));
         }
     } else {
         let first_hint = wrapped_hint.first().cloned().unwrap_or_default();
@@ -3184,20 +3213,28 @@ pub(crate) fn render_merge_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) 
                 if ids.len() == 1 { "" } else { "s" }
             ),
         };
+        let mut lines = vec![
+            Line::from(Span::styled(headline, app_style())),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Dependent nodes unblock once it lands. A clean merge is mechanical (no AI); on conflict you can launch an AI resolver or resolve it yourself.",
+                muted_style(true),
+            )),
+        ];
+        if let Some(detail) = &confirm.detail {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                detail.clone(),
+                Style::default().fg(RUNNING_COLOR),
+            )));
+        }
+        lines.push(Line::from(""));
+        lines.push(merge_confirm_hint_line());
         (
-                Span::styled(" Confirm merge ", Style::default().fg(ACCENT)),
-                vec![
-                    Line::from(Span::styled(headline, app_style())),
-                    Line::from(""),
-                    Line::from(Span::styled(
-                        "Dependent nodes unblock once it lands. A clean merge is mechanical (no AI); on conflict you can launch an AI resolver or resolve it yourself.",
-                        muted_style(true),
-                    )),
-                    Line::from(""),
-                    merge_confirm_hint_line(),
-                ],
-                ACCENT,
-            )
+            Span::styled(" Confirm merge ", Style::default().fg(ACCENT)),
+            lines,
+            ACCENT,
+        )
     } else if let Some(prompt) = &app.conflict_prompt {
         let operation_label = if prompt.operation == ConflictOperation::Rebase {
             "Rebase"
@@ -3221,11 +3258,20 @@ pub(crate) fn render_merge_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) 
                 muted_style(true),
             )));
         } else {
-            for file in &prompt.conflicted_files {
+            // Cap the list so a wide conflict cannot push the key hints out of
+            // the fixed-height modal.
+            const MAX_CONFLICT_ROWS: usize = 8;
+            for file in prompt.conflicted_files.iter().take(MAX_CONFLICT_ROWS) {
                 lines.push(Line::from(vec![
                     Span::styled("   • ", muted_style(true)),
                     Span::styled(file.clone(), app_style()),
                 ]));
+            }
+            if count > MAX_CONFLICT_ROWS {
+                lines.push(Line::from(Span::styled(
+                    format!("   … and {} more", count - MAX_CONFLICT_ROWS),
+                    muted_style(true),
+                )));
             }
         }
         lines.push(Line::from(""));
@@ -3301,16 +3347,19 @@ pub(crate) fn render_cloud_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) 
                 row_style(scratch_selected),
             ),
         ]),
+        Line::from(""),
+        // Keys accent-colored like every other modal hint (emphasis by color,
+        // not weight), so the available actions read at a glance.
         Line::from(vec![
-            Span::styled("Up/Down ", muted_style(true)),
-            Span::styled("choose  ", muted_style(true)),
-            Span::styled("Enter ", muted_style(true)),
-            Span::styled("start  ", muted_style(true)),
-            Span::styled("Esc ", muted_style(true)),
-            Span::styled("cancel", muted_style(true)),
+            Span::styled("Up/Down", accent_style(true)),
+            Span::styled(" choose  ·  ", muted_style(true)),
+            Span::styled("Enter", accent_style(true)),
+            Span::styled(" start  ·  ", muted_style(true)),
+            Span::styled("Esc", accent_style(true)),
+            Span::styled(" cancel", muted_style(true)),
         ]),
     ];
-    let modal = centered_modal(area, 78, 8);
+    let modal = centered_modal(area, 78, (lines.len() as u16).saturating_add(2));
     let block = Block::default()
         .title(" cloud launch ")
         .borders(Borders::ALL)

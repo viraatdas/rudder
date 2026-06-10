@@ -733,6 +733,10 @@ pub(crate) fn read_run_record_field(
     value.get(field).cloned()
 }
 
+/// Hard cap on a `rudder merge`/`rudder sync` shell-out: it runs on the UI thread, so a
+/// hung jj/node child must be killed rather than freeze the TUI forever.
+const RUDDER_JJ_CLI_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Outcome of shelling out to a `rudder merge`/`rudder sync` jj run.
 pub(crate) enum JjCliOutcome {
     Ok,
@@ -764,7 +768,10 @@ pub(crate) fn run_rudder_jj_command(
     } else {
         &[]
     };
-    let output = match Command::new(&rudder)
+    // This runs on the UI thread: never `Command::output()` (unbounded wait). A hung
+    // jj/node child would freeze the whole TUI, so spawn + poll with a deadline and
+    // kill the child if it blows through it.
+    let mut child = match Command::new(&rudder)
         .arg(command)
         .arg(run_id)
         .args(extra)
@@ -772,15 +779,63 @@ pub(crate) fn run_rudder_jj_command(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
+        .spawn()
     {
-        Ok(output) => output,
+        Ok(child) => child,
         Err(error) => {
             return JjCliOutcome::Failed {
                 error: format!("failed to run rudder {command}: {error}"),
             };
         }
     };
+    // Drain both pipes from threads so a chatty child can never fill a pipe buffer and
+    // deadlock against the wait loop (and so the readers see EOF after a kill).
+    let read_pipe = |pipe: Option<Box<dyn Read + Send>>| {
+        pipe.map(|mut pipe| {
+            thread::spawn(move || {
+                let mut buf = Vec::new();
+                let _ = pipe.read_to_end(&mut buf);
+                buf
+            })
+        })
+    };
+    let stdout_reader = read_pipe(child.stdout.take().map(|p| Box::new(p) as _));
+    let stderr_reader = read_pipe(child.stderr.take().map(|p| Box::new(p) as _));
+    let deadline = Instant::now() + RUDDER_JJ_CLI_TIMEOUT;
+    let timed_out = loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break false,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait(); // reap; closes the pipes so the readers finish
+                    break true;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return JjCliOutcome::Failed {
+                    error: format!("failed to run rudder {command}: {error}"),
+                };
+            }
+        }
+    };
+    let join = |reader: Option<thread::JoinHandle<Vec<u8>>>| {
+        reader
+            .and_then(|handle| handle.join().ok())
+            .unwrap_or_default()
+    };
+    let (cli_stdout, cli_stderr) = (join(stdout_reader), join(stderr_reader));
+    if timed_out {
+        return JjCliOutcome::Failed {
+            error: format!(
+                "rudder {command} timed out after {}s; the jj workspace may need attention",
+                RUDDER_JJ_CLI_TIMEOUT.as_secs()
+            ),
+        };
+    }
 
     let state = read_run_record_field(repo_root, run_id, state_field);
     let status = state
@@ -809,8 +864,8 @@ pub(crate) fn run_rudder_jj_command(
                 .and_then(|value| value.get("error"))
                 .and_then(serde_json::Value::as_str)
                 .map(ToOwned::to_owned);
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let stderr = String::from_utf8_lossy(&cli_stderr).trim().to_string();
+            let stdout = String::from_utf8_lossy(&cli_stdout).trim().to_string();
             let error = recorded
                 .filter(|value| !value.is_empty())
                 .or(Some(stderr).filter(|value| !value.is_empty()))

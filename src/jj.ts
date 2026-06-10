@@ -176,14 +176,10 @@ export function parseJjStatus(stdout: string): string[] {
 
 export async function jjDiff(workspacePath: string): Promise<string> {
   const status = await jjStatus(workspacePath);
-  const stat = await runCommand("jj", ["diff", "--stat"], {
-    cwd: workspacePath,
-    allowFailure: true,
-  });
-  const patch = await runCommand("jj", ["diff", "--git"], {
-    cwd: workspacePath,
-    allowFailure: true,
-  });
+  // A sibling workspace can make this one stale mid-verification; an unrecovered
+  // read returns an empty diff and the verifier flags a healthy run.
+  const stat = await jjReadInWorkspace(workspacePath, ["diff", "--stat"]);
+  const patch = await jjReadInWorkspace(workspacePath, ["diff", "--git"]);
   return [
     status.length ? `status:\n${status.join("\n")}` : "",
     stat.stdout.trim(),
@@ -317,6 +313,16 @@ export async function mergeJjRunIntoCurrentWorkspace(run: RunRecord, allowDirty 
       throw new Error("Target workspace is dirty. Squash/abandon changes or pass --allow-dirty.");
     }
   }
+  // --allow-dirty (which the TUI always passes) skips the dirty gate above, but a
+  // merge parented on a still-conflicted @ (e.g. the user declined the resolver
+  // after a previous conflicted merge) nests conflicts, so this guard is
+  // unconditional.
+  const preexistingConflicts = await jjConflictedFiles(run.repoRoot);
+  if (preexistingConflicts.length > 0) {
+    const error = `integration workspace already has unresolved conflicts (${preexistingConflicts.join(", ")}); resolve them before merging another run`;
+    await markMergeFailed(run, error);
+    throw new Error(error);
+  }
   const opIdBefore = await currentOpId(run.repoRoot);
   run.merge = {
     status: "not-started",
@@ -396,10 +402,9 @@ export async function mergeNode(params: {
 }
 
 export async function jjConflictedFiles(workspacePath: string): Promise<string[]> {
-  const result = await runCommand("jj", ["resolve", "--list"], {
-    cwd: workspacePath,
-    allowFailure: true,
-  });
+  // Stale-recovering read: a stale failure here would falsely report "no
+  // conflicts" to the merge/sync paths.
+  const result = await jjReadInWorkspace(workspacePath, ["resolve", "--list"]);
   return result.code === 0 ? parseJjConflictedFiles(result.stdout) : [];
 }
 
@@ -420,14 +425,17 @@ export function parseJjConflictedFiles(stdout: string): string[] {
 }
 
 /**
- * The id of the latest operation in the op log.
+ * The id of the latest operation in the op log. Recovers once from a stale
+ * workspace; if the id still cannot be read, warns and returns "" instead of
+ * throwing — merges must proceed, they just lose their undo waypoint.
  */
 export async function currentOpId(repoRoot: string): Promise<string> {
-  const result = await runCommand("jj", ["op", "log", "--no-graph", "-n", "1", "-T", "id.short()"], {
-    cwd: repoRoot,
-    allowFailure: true,
-  });
-  return result.code === 0 ? result.stdout.trim().split(/\s+/)[0] ?? "" : "";
+  const result = await jjReadInWorkspace(repoRoot, ["op", "log", "--no-graph", "-n", "1", "-T", "id.short()"]);
+  const opId = result.code === 0 ? result.stdout.trim().split(/\s+/)[0] ?? "" : "";
+  if (!opId) {
+    console.warn("rudder: could not capture jj op id; this merge will not be undoable via rudder undo");
+  }
+  return opId;
 }
 
 /**

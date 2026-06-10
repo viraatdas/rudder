@@ -8,6 +8,16 @@ import { PROPAGATION_RULES } from "./surfaces.js";
 import { deriveGoal, deriveSuccess, extractSuccess, formatGoalPrompt } from "./goal.js";
 
 const INSTRUCTION_FILES = ["AGENTS.md", "CLAUDE.md", "README.md"];
+const INSTRUCTION_FILE_LIMIT = 12_000;
+
+// Prompt-budget truncation must be visible: without the marker, workers
+// silently lose every rule past the limit and have no cue to read the file.
+function truncateInstructionContent(name: string, content: string): string {
+  if (content.length <= INSTRUCTION_FILE_LIMIT) {
+    return content;
+  }
+  return `${content.slice(0, INSTRUCTION_FILE_LIMIT)}\n\n[Rudder: ${name} truncated at ${INSTRUCTION_FILE_LIMIT} of ${content.length} chars; read ${name} in the workspace for the rest.]`;
+}
 
 /**
  * Read the repo instruction files (AGENTS.md / CLAUDE.md / README.md) plus a
@@ -27,7 +37,7 @@ export async function loadInstructionFiles(
     const content = await fsp.readFile(filePath, "utf8");
     instructionsFiles.push({
       path: name,
-      content: content.slice(0, 12_000),
+      content: truncateInstructionContent(name, content),
     });
   }
   const contextFile = agentContextPath(repoRoot ?? workspace);
@@ -35,7 +45,7 @@ export async function loadInstructionFiles(
     const content = await fsp.readFile(contextFile, "utf8");
     instructionsFiles.push({
       path: "RUDDER.md",
-      content: content.slice(0, 12_000),
+      content: truncateInstructionContent("RUDDER.md", content),
     });
   }
   return instructionsFiles;

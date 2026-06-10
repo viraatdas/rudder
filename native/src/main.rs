@@ -501,6 +501,10 @@ struct NormalizedSelection {
 
 struct MergeConfirmation {
     intent: MergeIntent,
+    /// Extra caution line shown in the confirm modal (e.g. "N uncommitted files
+    /// will be auto-committed"). The modal is the single surface for the prompt;
+    /// nothing about it goes through the notice line.
+    detail: Option<String>,
 }
 
 struct CloudLaunchPrompt {
@@ -791,6 +795,14 @@ impl App {
         } else {
             load_ingested_runs(&cwd)
         };
+        // Restore the conflict-skip list alongside the auto_merge toggle: with the
+        // toggle persisted but the skip list not, a restart's first tick would
+        // re-merge a known-conflicted run and re-spawn an uninvited AI resolver.
+        let auto_merge_skip = if cfg!(test) {
+            Vec::new()
+        } else {
+            load_auto_merge_skip(&cwd)
+        };
         // Restore the auto-expansion depth map so MAX_FOLLOWUP_DEPTH survives a restart.
         let followup_gen = if cfg!(test) {
             HashMap::new()
@@ -849,7 +861,7 @@ impl App {
             } else {
                 initial_auto_merge()
             },
-            auto_merge_skip: Vec::new(),
+            auto_merge_skip,
             awaiting_approval: restored_queue.awaiting_approval,
             interactive_orchestrator: interactive_orchestrator(),
             planner_paused_for_input: false,
@@ -1081,6 +1093,26 @@ impl App {
             .map(|error| format!("config warning: {error}"))
     }
 
+    /// The single quit gate: quitting with agents still running needs a second
+    /// press (Ctrl+C, q, or y) to confirm. Every quit key — Ctrl+C and the
+    /// pane-local `q`s — routes through here so none can skip the guard.
+    fn confirm_or_quit(&mut self) -> bool {
+        let running = self
+            .agents
+            .iter()
+            .filter(|a| !a.is_main() && a.terminal.is_some() && a.status == AgentStatus::Running)
+            .count();
+        if running == 0 || self.quit_confirm_pending {
+            return true;
+        }
+        self.quit_confirm_pending = true;
+        self.notice = Some(format!(
+            "{running} agent{} still running. press q / Ctrl+C again (or y) to quit; any other key cancels. Claude agents auto-resume on next rudder.",
+            if running == 1 { "" } else { "s" }
+        ));
+        false
+    }
+
     fn handle_key(&mut self, key: KeyEvent) -> bool {
         self.note_user_activity();
         if self.rename_input.is_some() {
@@ -1088,33 +1120,27 @@ impl App {
             return false;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            // Guard against accidental quit when agents are still working.
-            // First Ctrl+C asks for confirmation; second Ctrl+C (or y) quits.
-            let running = self
-                .agents
-                .iter()
-                .filter(|a| {
-                    !a.is_main() && a.terminal.is_some() && a.status == AgentStatus::Running
-                })
-                .count();
-            if running == 0 || self.quit_confirm_pending {
-                return true;
-            }
-            self.quit_confirm_pending = true;
-            self.notice = Some(format!(
-                "{running} agent{} still running. Ctrl+C again (or y) to quit; any other key to keep going. Claude agents auto-resume on next rudder.",
-                if running == 1 { "" } else { "s" }
-            ));
-            return false;
+            return self.confirm_or_quit();
         }
-        // Any other key dismisses the pending quit confirmation.
+        // Any other key dismisses the pending quit confirmation. A repeated quit
+        // key (q, like the y the notice offers) confirms; Ctrl+C re-enters
+        // confirm_or_quit above and confirms there.
         if self.quit_confirm_pending {
-            if key.code == KeyCode::Char('y') || key.code == KeyCode::Char('Y') {
+            if matches!(
+                key.code,
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Char('q')
+            ) {
                 return true;
             }
             self.quit_confirm_pending = false;
             self.notice = Some("quit cancelled".to_string());
             // fall through and let the key be handled normally
+        }
+
+        // Esc always dismisses the transient notice line (without being consumed:
+        // its pane-specific meaning, like exiting the diff view, still applies).
+        if key.code == KeyCode::Esc && self.notice.is_some() {
+            self.notice = None;
         }
 
         // One-shot leader: Ctrl+W arms it (below) and the next keypress is
@@ -1242,7 +1268,7 @@ impl App {
             KeyCode::Char('R') => self.review_all_ready(),
             KeyCode::Char('M') => self.request_merge_all_ready(),
             KeyCode::Char('d') => self.delete_selected_agent(),
-            KeyCode::Char('q') => return true,
+            KeyCode::Char('q') => return self.confirm_or_quit(),
             _ => {}
         }
         false
@@ -1290,7 +1316,7 @@ impl App {
             KeyCode::Char('R') => self.review_all_ready(),
             KeyCode::Char('M') => self.request_merge_all_ready(),
             KeyCode::Char('d') => self.delete_selected_agent(),
-            KeyCode::Char('q') => return true,
+            KeyCode::Char('q') => return self.confirm_or_quit(),
             KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 // Double Ctrl+W keeps the leader armed rather than cancelling.
                 self.leader_pending = true;
@@ -1304,7 +1330,7 @@ impl App {
 
     fn handle_agents_key(&mut self, key: KeyEvent) -> bool {
         match key.code {
-            KeyCode::Char('q') => return true,
+            KeyCode::Char('q') => return self.confirm_or_quit(),
             KeyCode::Up | KeyCode::Char('k') => self.select_previous_agent(),
             KeyCode::Down | KeyCode::Char('j') => self.select_next_agent(),
             KeyCode::Enter => {
@@ -1416,7 +1442,7 @@ impl App {
         self.worker_selection = None;
         if self.selected_terminal_mut().is_none() {
             match key.code {
-                KeyCode::Char('q') => return true,
+                KeyCode::Char('q') => return self.confirm_or_quit(),
                 _ => {}
             }
         }
@@ -1436,7 +1462,7 @@ impl App {
         if self.selected_worker_is_finished_cloud_command() {
             match key.code {
                 KeyCode::Char('r') => self.restart_selected_agent(),
-                KeyCode::Char('q') => return true,
+                KeyCode::Char('q') => return self.confirm_or_quit(),
                 _ => {
                     self.notice = Some(
                         "cloud command finished; run /cloud again or press r to rerun".to_string(),
@@ -4836,6 +4862,9 @@ impl App {
         let run = create_main_agent(&cwd, self.backend, &self.model, self.effort, trimmed_prompt);
         let run_id = run.id.clone();
         self.agents.insert(0, run);
+        // Inserting at 0 shifts every index under the rendered rows; drop the click map
+        // so a same-tick click resolves to nothing instead of a neighbor.
+        self.agent_row_map.clear();
         self.selected_agent = 0;
         if let Some(run) = self.agents.first() {
             let _ = save_native_run_record(&cwd, run);
@@ -5766,6 +5795,9 @@ impl App {
         };
         let was_watching = self.selected_agent == index;
         self.agents.remove(index);
+        // Indices shifted under the rendered rows; drop the click map so a same-tick
+        // click resolves to nothing instead of a neighbor (next render rebuilds it).
+        self.agent_row_map.clear();
         // Delete the persisted record too, or it reloads as an orphan orchestrator.
         let _ = remove_native_run_record(&self.cwd, run_id);
         if was_watching {
@@ -6296,6 +6328,26 @@ impl App {
             return;
         }
         let path = dir.join("ingestion-ledger.json");
+        let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+        if std::fs::write(&tmp, json).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+
+    /// Persist the auto-merge skip list to `.rudder/auto-merge-skip.json` (atomic). The
+    /// /automerge toggle itself is persisted (initial_auto_merge), so a skip list that
+    /// dies with the process lets a restart's first maybe_auto_merge tick re-merge a
+    /// known-conflicted run and re-spawn an AI resolver uninvited. Best-effort; bounded
+    /// by plan size.
+    fn persist_auto_merge_skip(&self) {
+        let Ok(json) = serde_json::to_string(&self.auto_merge_skip) else {
+            return;
+        };
+        let dir = self.cwd.join(".rudder");
+        if std::fs::create_dir_all(&dir).is_err() {
+            return;
+        }
+        let path = dir.join("auto-merge-skip.json");
         let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
         if std::fs::write(&tmp, json).is_ok() {
             let _ = std::fs::rename(&tmp, &path);
@@ -6949,6 +7001,7 @@ impl App {
                     } else {
                         // Resolver did not start; do not retry every tick.
                         self.auto_merge_skip.push(id);
+                        self.persist_auto_merge_skip();
                     }
                     break; // one conflict at a time
                 }
@@ -7019,6 +7072,7 @@ impl App {
                 // successful manual merge / re-goal (see merge_agent_at, regoal_agent_at).
                 if !self.auto_merge_skip.contains(&id) {
                     self.auto_merge_skip.push(id.clone());
+                    self.persist_auto_merge_skip();
                 }
                 self.notice = Some(format!(
                     "resolver left {} conflict(s) in {}; resolve and press m",
@@ -7334,16 +7388,29 @@ impl App {
         };
         if self.delete_pending.as_deref() != Some(&selected.id) {
             self.delete_pending = Some(selected.id.clone());
-            self.notice = Some(if selected.worktree_path.is_some() {
-                "press d again to delete agent and remove its worktree".to_string()
+            let label = if selected.task_summary.trim().is_empty() {
+                short_task(&selected.task)
             } else {
-                "press d again to delete agent".to_string()
+                truncate_chars(selected.task_summary.trim(), 40)
+            };
+            // Name WHAT is being deleted and spell out both outcomes; the bare
+            // "press d again" read as a generic hint and was easy to act on with
+            // the wrong row selected.
+            self.notice = Some(if selected.worktree_path.is_some() {
+                format!("delete {label} and remove its worktree? press d again to confirm · any other key cancels")
+            } else {
+                format!("delete {label}? press d again to confirm · any other key cancels")
             });
             return;
         }
 
         let run = self.agents.remove(self.selected_agent);
+        // Indices shifted under the rendered rows; drop the click map so a same-tick
+        // click resolves to nothing instead of a neighbor (next render rebuilds it).
+        self.agent_row_map.clear();
         let _ = remove_native_run_record(&self.cwd, &run.id);
+        // Drop the run's hook/signal files too, or ~/.rudder/signals grows forever.
+        signals::cleanup_run_signals(&run.id);
         // Prune the run from the ingest ledger so it does not accumulate dead ids (and so
         // a hypothetically-reused run id is not pre-marked ingested).
         let was_ingested = self.followups_ingested.remove(&run.id);
@@ -7432,21 +7499,18 @@ impl App {
                 id: run.id.clone(),
                 task: run.task.clone(),
             },
+            detail: (pending > 0).then(|| {
+                format!(
+                    "{pending} uncommitted file{plural} will be auto-committed as \"{summary}\".",
+                    plural = if pending == 1 { "" } else { "s" },
+                    summary = truncate_chars(&summary, 48),
+                )
+            }),
         });
         self.conflict_prompt = None;
-        let pending_suffix = if pending > 0 {
-            format!(
-                " ({pending} uncommitted file{plural} will be auto-committed as \"{summary}\")",
-                plural = if pending == 1 { "" } else { "s" },
-                summary = truncate_chars(&summary, 48),
-            )
-        } else {
-            String::new()
-        };
-        self.notice = Some(format!(
-            "merge {summary}? press y to confirm or n to cancel{pending_suffix}",
-            summary = truncate_chars(&summary, 48),
-        ));
+        // The modal carries the question and the keys; a parallel notice would
+        // just duplicate (and outlive) it.
+        self.notice = None;
     }
 
     fn request_merge_all_ready(&mut self) {
@@ -7482,24 +7546,22 @@ impl App {
         let ids: Vec<String> = ready_runs.iter().map(|r| r.id.clone()).collect();
         let count = ids.len();
 
+        let _ = count;
         self.delete_pending = None;
         self.merge_confirm = Some(MergeConfirmation {
             intent: MergeIntent::All { ids },
+            detail: (pending_total > 0).then(|| {
+                format!(
+                    "{pending_total} uncommitted file{p1} across {pending_runs} worktree{p2} will be auto-committed.",
+                    p1 = if pending_total == 1 { "" } else { "s" },
+                    p2 = if pending_runs == 1 { "" } else { "s" },
+                )
+            }),
         });
         self.conflict_prompt = None;
-        let pending_suffix = if pending_total > 0 {
-            format!(
-                " ({pending_total} uncommitted file{p1} across {pending_runs} worktree{p2} will be auto-committed)",
-                p1 = if pending_total == 1 { "" } else { "s" },
-                p2 = if pending_runs == 1 { "" } else { "s" },
-            )
-        } else {
-            String::new()
-        };
-        self.notice = Some(format!(
-            "merge {count} completed worktree{plural}? press y to confirm or n to cancel{pending_suffix}",
-            plural = if count == 1 { "" } else { "s" }
-        ));
+        // The modal carries the question and the keys; a parallel notice would
+        // just duplicate (and outlive) it.
+        self.notice = None;
     }
 
     fn handle_merge_prompt_key(&mut self, key: KeyEvent) -> bool {
@@ -7694,6 +7756,7 @@ impl App {
                 let id = self.agents[index].id.clone();
                 if !self.auto_merge_skip.contains(&id) {
                     self.auto_merge_skip.push(id);
+                    self.persist_auto_merge_skip();
                 }
             }
         }
@@ -7743,7 +7806,11 @@ impl App {
                 let _ = std::fs::remove_file(worker_done_file(&run_cwd, node_id));
             }
             // A re-goaled run is no longer a conflict to skip; let it auto-merge again.
+            let before = self.auto_merge_skip.len();
             self.auto_merge_skip.retain(|x| x != &id);
+            if self.auto_merge_skip.len() != before {
+                self.persist_auto_merge_skip();
+            }
         }
         let (command, deliver_after, new_session, size, cwd, node_label) = {
             let Some(run) = self.agents.get(index) else {
@@ -8318,7 +8385,11 @@ What to do\n\
         // A successful merge clears any prior conflict-skip for this run, so it can
         // auto-merge again if it ever returns to review (and does not stay permanently
         // un-auto-merged for the session).
+        let before = self.auto_merge_skip.len();
         self.auto_merge_skip.retain(|x| x != &run_id);
+        if self.auto_merge_skip.len() != before {
+            self.persist_auto_merge_skip();
+        }
         Ok(())
     }
 
@@ -9082,6 +9153,15 @@ fn load_ingested_runs(cwd: &Path) -> HashSet<String> {
         .ok()
         .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
         .map(|ids| ids.into_iter().collect())
+        .unwrap_or_default()
+}
+
+/// Load the persisted auto-merge skip list (run ids parked after a merge conflict)
+/// written by `persist_auto_merge_skip`. Missing/corrupt file => empty list.
+fn load_auto_merge_skip(cwd: &Path) -> Vec<String> {
+    std::fs::read_to_string(cwd.join(".rudder").join("auto-merge-skip.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
         .unwrap_or_default()
 }
 

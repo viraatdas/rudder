@@ -2,7 +2,7 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 
 import { projectNodeStatus, readGraph, readyNodes } from "./graph.js";
-import { mergeGeneratedRudderMd } from "./rudder-md.js";
+import { mergeGeneratedRudderMd, withRudderMdLock } from "./rudder-md.js";
 import { agentContextPath, loadRunRecord } from "./state.js";
 import type { RudderGraph, TaskNode } from "./types.js";
 import { ensureDir, nowIso, pathExists, runCommand, shortenHome } from "./util.js";
@@ -501,15 +501,20 @@ async function writeLiveRudderMd(repoRoot: string, graph: RudderGraph, content: 
       workspaces.add(node.worktree.path);
     }
   }
-  for (const workspace of workspaces) {
-    await ensureRudderExcluded(workspace);
-    await ensureDir(path.dirname(agentContextPath(workspace)));
-    const filePath = agentContextPath(workspace);
-    const existing = await fsp.readFile(filePath, "utf8").catch(() => "");
-    await fsp
-      .writeFile(filePath, mergeGeneratedRudderMd(existing, content), "utf8")
-      .catch(() => undefined);
-  }
+  // RUDDER.md has concurrent writer processes (Rust TUI, CLI invocations like
+  // `rudder done`/`rudder merge`); the lock keeps this read-modify-write from
+  // dropping their output.
+  await withRudderMdLock(repoRoot, async () => {
+    for (const workspace of workspaces) {
+      await ensureRudderExcluded(workspace);
+      await ensureDir(path.dirname(agentContextPath(workspace)));
+      const filePath = agentContextPath(workspace);
+      const existing = await fsp.readFile(filePath, "utf8").catch(() => "");
+      await fsp
+        .writeFile(filePath, mergeGeneratedRudderMd(existing, content), "utf8")
+        .catch(() => undefined);
+    }
+  });
   await syncSharedContextToWorkspaces(repoRoot, workspaces);
 }
 

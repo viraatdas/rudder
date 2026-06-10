@@ -3898,6 +3898,66 @@ fn test_agent_run_with_terminal(app: &App, terminal: TerminalPane) -> AgentRun {
 }
 
 #[test]
+fn q_confirms_before_quitting_with_running_agents() {
+    let mut app = App::new();
+    app.focus = FocusPane::Agents;
+    // No running agents: q quits immediately.
+    assert!(app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::empty())));
+
+    let command = TerminalCommand::with_args("sh", ["-c", "sleep 2"]);
+    let pane = TerminalPane::spawn_shell_or_command(
+        Some(command),
+        TerminalPaneOptions {
+            size: TerminalSize { rows: 5, cols: 20 },
+            ..Default::default()
+        },
+    )
+    .expect("spawn test pty");
+    let mut run = test_agent_run_with_terminal(&app, pane);
+    run.status = AgentStatus::Running;
+    app.agents.push(run);
+
+    // q now routes through the same guard as Ctrl+C: first press asks, second quits.
+    assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::empty())));
+    assert!(app.quit_confirm_pending);
+    assert!(app
+        .notice
+        .as_deref()
+        .unwrap_or_default()
+        .contains("still running"));
+    assert!(app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::empty())));
+}
+
+#[test]
+fn esc_dismisses_the_notice_without_being_consumed() {
+    let mut app = App::new();
+    app.focus = FocusPane::Agents;
+    app.notice = Some("auto-merge ON".to_string());
+    assert!(!app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty())));
+    assert!(app.notice.is_none());
+}
+
+#[test]
+fn notice_style_colors_errors_and_pending_confirms() {
+    assert_eq!(
+        notice_style("merge stopped: boom", true).fg,
+        Some(FAILED_COLOR)
+    );
+    assert_eq!(
+        notice_style(
+            "delete x? press d again to confirm · any other key cancels",
+            true
+        )
+        .fg,
+        Some(RUNNING_COLOR)
+    );
+    assert_eq!(
+        notice_style("auto-merged 2 nodes · dependents unblocked", true).fg,
+        muted_style(true).fg
+    );
+}
+
+#[test]
 fn merged_status_is_distinct_and_labeled() {
     assert_eq!(
         agent_status_from_record(Some("merged")),
@@ -9301,4 +9361,74 @@ fn conductor_live_run_drains_dag_with_fake_workers() {
     assert!(drained, "the whole DAG drained within the tick budget");
 
     let _ = fs::remove_dir_all(&repo);
+}
+
+#[test]
+fn auto_merge_skip_round_trips_through_persistence() {
+    // auto_merge is a persisted default, so the skip list must survive a restart with
+    // it: a fresh App that loses the list would re-merge a known-conflicted run on the
+    // first maybe_auto_merge tick and re-spawn an AI resolver uninvited.
+    let repo = unique_test_repo("automerge-skip");
+    let mut app = App::new();
+    app.cwd = repo.clone();
+    // Missing file => empty list (fresh repo, corrupt file fallback).
+    assert!(load_auto_merge_skip(&repo).is_empty());
+
+    app.auto_merge_skip.push("run-conflicted-a".to_string());
+    app.auto_merge_skip.push("run-conflicted-b".to_string());
+    app.persist_auto_merge_skip();
+    assert_eq!(
+        load_auto_merge_skip(&repo),
+        vec!["run-conflicted-a".to_string(), "run-conflicted-b".to_string()],
+        "skip list round-trips through .rudder/auto-merge-skip.json"
+    );
+
+    // A successful merge / re-goal clears an id; the persisted copy must follow.
+    app.auto_merge_skip.retain(|id| id != "run-conflicted-a");
+    app.persist_auto_merge_skip();
+    assert_eq!(
+        load_auto_merge_skip(&repo),
+        vec!["run-conflicted-b".to_string()],
+        "clearing a skip entry persists too"
+    );
+
+    let _ = fs::remove_dir_all(&repo);
+}
+
+#[test]
+fn cleanup_run_signals_removes_only_that_runs_files() {
+    // Deleting an agent must prune all three per-run signal artifacts, or
+    // ~/.rudder/signals accumulates dead runs forever. env_guard: RUDDER_HOME is
+    // process-global.
+    let _env = env_guard();
+    let home = unique_test_repo("signals-home");
+    let prior_home = std::env::var_os("RUDDER_HOME");
+    std::env::set_var("RUDDER_HOME", &home);
+
+    let dir = crate::signals::signals_dir().expect("signals dir under RUDDER_HOME");
+    fs::create_dir_all(&dir).expect("create signals dir");
+    let doomed = [
+        dir.join("run-dead.json"),
+        dir.join("run-dead-claude.json"),
+        dir.join("run-dead-notify.sh"),
+    ];
+    for path in &doomed {
+        fs::write(path, "x").expect("seed signal file");
+    }
+    let survivor = dir.join("run-live-claude.json");
+    fs::write(&survivor, "x").expect("seed survivor");
+
+    crate::signals::cleanup_run_signals("run-dead");
+
+    // Capture, restore the env, THEN assert, so a failure cannot leak RUDDER_HOME.
+    let removed = doomed.iter().all(|path| !path.exists());
+    let survivor_intact = survivor.exists();
+    match prior_home {
+        Some(value) => std::env::set_var("RUDDER_HOME", value),
+        None => std::env::remove_var("RUDDER_HOME"),
+    }
+    let _ = fs::remove_dir_all(&home);
+
+    assert!(removed, "all three per-run signal files are removed");
+    assert!(survivor_intact, "other runs' signal files are untouched");
 }
