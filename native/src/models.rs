@@ -9,13 +9,16 @@ pub(crate) fn default_model_for(backend: Backend) -> &'static str {
     }
 }
 
-/// Each backend's own "fast" model, used by the `/fast` command. Claude's fast
-/// tier is haiku; Codex's is the spark coding model. Mirrors the "fast" rows in
-/// `fallback_model_rows`.
+/// The `/fast` preset model per backend. Modeled on Claude Code's own fast mode:
+/// the FLAGSHIP model tuned for speed, never a downgrade to a small model. The
+/// claude CLI has no flag to launch with fast mode enabled (verified against
+/// `claude --help` and the settings docs; only CLAUDE_CODE_DISABLE_FAST_MODE
+/// exists), so /fast pairs the flagship with LOW effort — the closest launchable
+/// equivalent. Small/cheap tiers (haiku, spark) remain available via /model.
 pub(crate) fn fast_model_for(backend: Backend) -> &'static str {
     match backend {
-        Backend::Claude => "haiku",
-        Backend::Codex => "gpt-5.3-codex-spark",
+        Backend::Claude => "opus",
+        Backend::Codex => "gpt-5.5",
     }
 }
 
@@ -264,7 +267,7 @@ pub(crate) fn command_suggestions() -> Vec<Suggestion> {
         },
         Suggestion {
             label: "/fast".to_string(),
-            detail: "cheap fast-model preset for new agents (claude haiku / codex spark); /model switches back"
+            detail: "fast mode for new agents: flagship model at low effort (claude opus / codex gpt-5.5)"
                 .to_string(),
             action: SuggestionAction::RunCommand("/fast".to_string()),
         },

@@ -4143,7 +4143,7 @@ impl App {
         } else {
             entry.worktree_path.clone()
         };
-        let command = if !entry.session_id.is_empty() && run.backend == Backend::Claude {
+        let mut command = if !entry.session_id.is_empty() && run.backend == Backend::Claude {
             claude_resume_command(run, &entry.session_id)
         } else if !entry.session_id.is_empty() && run.backend == Backend::Codex {
             codex_resume_command(run, &entry.session_id)
@@ -4168,6 +4168,12 @@ impl App {
             run.session_id = session_id;
             cmd
         };
+        // RE-WIRE the completion hooks on resume. The per-run hook config file from
+        // the original launch persists, so worker_has_config() is true and the poll
+        // loop WAITS for the official signal — a resumed process launched without
+        // --settings / notify could never write it and would sit "running" forever.
+        // (Same trap the conflict-resolver respawn fixed in e027f32.)
+        signals::augment_worker_command(&mut command, run.backend, run.mode, &run.id);
         let options = TerminalPaneOptions {
             size: run.terminal_size.unwrap_or_default(),
             cwd: Some(cwd.clone()),
@@ -4795,16 +4801,19 @@ impl App {
                 true
             }
             Some("/fast") => {
-                // Switch the current backend to ITS OWN fast variant (claude -> haiku,
-                // codex -> gpt-5.3-codex-spark), reusing the same path the model picker
-                // uses so it persists and propagates to a selected main agent.
+                // Fast mode, modeled on Claude Code's: the FLAGSHIP model tuned for
+                // speed (claude -> opus, codex -> gpt-5.5) at LOW effort — never a
+                // downgrade to a small model. Reuses the model-picker path so it
+                // persists and propagates to a selected main agent. (The claude CLI
+                // cannot launch with its native /fast output mode pre-enabled, so
+                // low effort is the closest launchable equivalent; toggle /fast
+                // inside a focused Claude pane for the real thing.)
                 let backend = self.backend;
                 let model = fast_model_for(backend).to_string();
-                let effort = default_effort_for(backend, &model);
-                let warning = self.set_model_defaults(backend, model, effort);
+                let warning = self.set_model_defaults(backend, model, Some(EffortLevel::Low));
                 self.notice = warning.or_else(|| {
                     Some(format!(
-                        "fast preset: {} {}({}) saved as the default for NEW agents · running agents keep their model · /model switches back",
+                        "fast mode: {} {}({}) for NEW agents · running agents keep their model · /model switches back",
                         self.backend.as_str(),
                         self.model,
                         effort_label(self.effort)
@@ -7746,9 +7755,11 @@ impl App {
             let backend = run.backend;
             let size = run.terminal_size.unwrap_or_default();
             let cwd = run.cwd.clone();
+            let run_id = run.id.clone();
+            let run_mode = run.mode;
             let label = run.node_id.clone().unwrap_or_else(|| run.id.clone());
             let session = run.session_id.clone().filter(|s| !s.trim().is_empty());
-            let (command, deliver_after, new_session) = if let Some(sid) = session.as_deref() {
+            let (mut command, deliver_after, new_session) = if let Some(sid) = session.as_deref() {
                 // Resume the SAME session; the new goal arrives as the next turn.
                 let command = match backend {
                     Backend::Claude => claude_resume_command(run, sid),
@@ -7773,6 +7784,10 @@ impl App {
                 );
                 (command, None, sid)
             };
+            // RE-WIRE completion hooks for the re-goaled session: its hook config file
+            // already exists, so the poll loop waits for the official signal — a
+            // relaunch without the hooks wired would never flip back to review.
+            signals::augment_worker_command(&mut command, backend, run_mode, &run_id);
             (command, deliver_after, new_session, size, cwd, label)
         };
 

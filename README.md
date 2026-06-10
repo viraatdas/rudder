@@ -159,7 +159,7 @@ running, Rudder also exposes matching project skills; the orchestrator can write
 | Command | Action |
 | --- | --- |
 | `/model` | Pick provider, then model, then effort |
-| `/fast` | Cheap fast-model preset for new agents (Claude haiku / Codex spark); `/model` switches back |
+| `/fast` | Fast mode for new agents: flagship model at low effort (Claude opus / Codex gpt-5.5); `/model` switches back |
 | `/ask <text>` | Force a one-off conversational agent in the main checkout |
 | `/plan <text>` | Force the orchestrator / DAG planner |
 | `/share <text>` | Save gitignored shared context for all agents in `RUDDER_SHARED.md` |
