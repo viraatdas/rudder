@@ -76,18 +76,22 @@ export function rudderMdLockPath(repoRoot: string): string {
 }
 
 /**
- * Cross-process advisory lock around RUDDER.md read-modify-write. The Rust
- * TUI, CLI invocations, the daemon, and the orchestrator agent all write the
- * file; mkdir is atomic across processes so it serializes the merge and keeps
- * interleavings from dropping a freshly written DAG or control marker.
- * Best-effort by design: a lock older than 10s is treated as stale and taken
- * over, and if acquisition never succeeds the caller proceeds unlocked, so a
- * crashed holder can never deadlock or fail a writer.
+ * Generic cross-process advisory lock: mkdir is atomic across processes, so an
+ * existing lock dir means "held". Best-effort by design: a lock older than
+ * staleMs is treated as a crashed holder and taken over, and if acquisition
+ * never succeeds within waitMs the caller proceeds unlocked, so a crashed
+ * holder can never deadlock or fail a writer. NOT re-entrant: never nest two
+ * sections taking the same lock dir.
  */
-export async function withRudderMdLock<T>(repoRoot: string, fn: () => Promise<T>): Promise<T> {
-  const lockDir = rudderMdLockPath(repoRoot);
+export async function withDirLock<T>(
+  lockDir: string,
+  fn: () => Promise<T>,
+  opts?: { waitMs?: number; staleMs?: number },
+): Promise<T> {
+  const waitMs = opts?.waitMs ?? LOCK_WAIT_MS;
+  const staleMs = opts?.staleMs ?? LOCK_STALE_MS;
   let acquired = false;
-  const deadline = Date.now() + LOCK_WAIT_MS;
+  const deadline = Date.now() + waitMs;
   try {
     await fsp.mkdir(path.dirname(lockDir), { recursive: true }).catch(() => undefined);
     for (;;) {
@@ -101,7 +105,7 @@ export async function withRudderMdLock<T>(repoRoot: string, fn: () => Promise<T>
           .stat(lockDir)
           .then((st) => Date.now() - st.mtimeMs)
           .catch(() => null);
-        if (age !== null && age > LOCK_STALE_MS) {
+        if (age !== null && age > staleMs) {
           // Holder likely crashed mid-write; take the lock over.
           await fsp.rm(lockDir, { recursive: true, force: true }).catch(() => undefined);
           continue;
@@ -122,4 +126,31 @@ export async function withRudderMdLock<T>(repoRoot: string, fn: () => Promise<T>
       await fsp.rm(lockDir, { recursive: true, force: true }).catch(() => undefined);
     }
   }
+}
+
+/**
+ * Cross-process advisory lock around RUDDER.md read-modify-write. The Rust
+ * TUI (acquire_rudder_md_lock in gitio.rs takes the same lock dir), CLI
+ * invocations, the daemon, and the orchestrator agent all write the file;
+ * serializing the merge keeps interleavings from dropping a freshly written
+ * DAG or control marker.
+ */
+export async function withRudderMdLock<T>(repoRoot: string, fn: () => Promise<T>): Promise<T> {
+  return withDirLock(rudderMdLockPath(repoRoot), fn);
+}
+
+export function integrationLockPath(repoRoot: string): string {
+  return path.join(repoRoot, ".rudder", "integrate.lock");
+}
+
+/**
+ * Cross-process lock for the INTEGRATION critical section (merging a run/node
+ * into the shared workspace @). withSchedulerLock serializes only within one
+ * process; a `rudder merge` CLI invocation and a daemon tick are separate
+ * processes operating on the same jj workspace, and concurrent merges there
+ * stack merge changes on a moving @. Longer windows than the RUDDER.md lock
+ * because a merge legitimately takes seconds.
+ */
+export async function withIntegrationLock<T>(repoRoot: string, fn: () => Promise<T>): Promise<T> {
+  return withDirLock(integrationLockPath(repoRoot), fn, { waitMs: 30_000, staleMs: 120_000 });
 }

@@ -26,6 +26,7 @@ import { DEFAULT_SUCCESS, deriveGoal, formatGoalPrompt, normalizeGoalLine } from
 import { createRunRecord, loadConfig, loadRunRecord, runDir } from "./state.js";
 import { spawnWorker } from "./run-manager.js";
 import { ensureDecisionsFile, renderLiveRudderMd } from "./surfaces.js";
+import { withIntegrationLock } from "./rudder-md.js";
 import type {
   GraphEdge,
   InferredDep,
@@ -284,6 +285,13 @@ export async function launchNode(
  * + merge.conflict. The resolver-agent spawn is Phase 5; for now hold it blocked.
  */
 export async function mergeNodeIntoIntegration(repoRoot: string, node: TaskNode, bus: RudderBus): Promise<void> {
+  // Same cross-process integration lock as mergeJjRunIntoCurrentWorkspace:
+  // withSchedulerLock only serializes THIS process; a `rudder merge` CLI call
+  // racing a daemon tick would otherwise stack merges on a moving @.
+  return withIntegrationLock(repoRoot, () => mergeNodeIntoIntegrationLocked(repoRoot, node, bus));
+}
+
+async function mergeNodeIntoIntegrationLocked(repoRoot: string, node: TaskNode, bus: RudderBus): Promise<void> {
   const nodeChangeId = node.jjChangeId || (node.worktree?.path ? await currentJjChangeId(node.worktree.path) : "");
   if (!nodeChangeId) {
     bus.publish({

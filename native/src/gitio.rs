@@ -611,7 +611,11 @@ pub(crate) fn agent_status_from_record(status: Option<&str>) -> AgentStatus {
         Some("running") | Some("steering") | Some("verifying") | Some("created") => {
             AgentStatus::Running
         }
-        Some("cancelled") | Some("merge-conflict") => AgentStatus::Stopped,
+        // A conflicted merge means the WORK finished and only integration is
+        // pending: reload it as Done (review bucket, mergeable with m) rather
+        // than Stopped, which buried it in "closed" looking cancelled.
+        Some("merge-conflict") => AgentStatus::Done,
+        Some("cancelled") => AgentStatus::Stopped,
         _ => AgentStatus::Stopped,
     }
 }
@@ -1637,10 +1641,15 @@ pub(crate) fn write_rudder_context(
     body.push_str(
         "\n## Version control\n\nThis repo uses jj (Jujutsu), colocated with git. Each agent works in its own jj workspace; jj is authoritative. Inspect changes with `jj status` / `jj diff`. Do not run commit/branch/merge commands yourself; Rudder snapshots and integrates your working copy.\n",
     );
-    write_merged_rudder_md(&repo_root.join("RUDDER.md"), &body)?;
-    if let Some(worktree) = pending {
-        if worktree.path_is_worktree {
-            write_merged_rudder_md(&worktree.path.join("RUDDER.md"), &body)?;
+    {
+        // One lock per write batch at the repo root (the TS side locks the same
+        // way), covering the worktree copies too. Released on drop.
+        let _lock = acquire_rudder_md_lock(repo_root);
+        write_merged_rudder_md(&repo_root.join("RUDDER.md"), &body)?;
+        if let Some(worktree) = pending {
+            if worktree.path_is_worktree {
+                write_merged_rudder_md(&worktree.path.join("RUDDER.md"), &body)?;
+            }
         }
     }
     sync_shared_context_surfaces(repo_root, agents, pending)?;
@@ -1857,35 +1866,120 @@ const RUDDER_GENERATED_END: &str = "<!-- RUDDER_GENERATED_END -->";
 const RUDDER_PLAN_START: &str = "RUDDER_PLAN_TASKS_START";
 const RUDDER_PLAN_END: &str = "RUDDER_PLAN_TASKS_END";
 
+// Cross-process advisory lock around RUDDER.md read-modify-write, mirroring the
+// TS protocol in src/rudder-md.ts (withRudderMdLock): an atomic mkdir of
+// <repo>/.rudder/rudder-md.lock, 50ms retry up to 2s, locks older than 10s are
+// treated as a crashed holder and taken over, and acquisition failure falls
+// through to an unlocked write so a writer can never deadlock. The Rust TUI,
+// TS CLI invocations, the daemon, and the orchestrator agent all write the
+// file; this serializes the merge so interleavings cannot drop a freshly
+// written DAG or control marker.
+const RUDDER_MD_LOCK_RETRY: Duration = Duration::from_millis(50);
+const RUDDER_MD_LOCK_WAIT: Duration = Duration::from_secs(2);
+const RUDDER_MD_LOCK_STALE: Duration = Duration::from_secs(10);
+
+pub(crate) struct RudderMdLock {
+    dir: Option<PathBuf>,
+}
+
+impl Drop for RudderMdLock {
+    fn drop(&mut self) {
+        if let Some(dir) = self.dir.take() {
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+}
+
+pub(crate) fn acquire_rudder_md_lock(repo_root: &Path) -> RudderMdLock {
+    let lock = repo_root.join(".rudder").join("rudder-md.lock");
+    if let Some(parent) = lock.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let deadline = Instant::now() + RUDDER_MD_LOCK_WAIT;
+    loop {
+        if fs::create_dir(&lock).is_ok() {
+            return RudderMdLock { dir: Some(lock) };
+        }
+        let stale = fs::metadata(&lock)
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age > RUDDER_MD_LOCK_STALE);
+        if stale {
+            let _ = fs::remove_dir_all(&lock);
+            continue;
+        }
+        if Instant::now() >= deadline {
+            return RudderMdLock { dir: None };
+        }
+        std::thread::sleep(RUDDER_MD_LOCK_RETRY);
+    }
+}
+
 fn write_merged_rudder_md(path: &Path, generated: &str) -> Result<()> {
     let existing = fs::read_to_string(path).unwrap_or_default();
-    fs::write(
-        path,
-        merge_generated_rudder_md(&existing, generated).as_bytes(),
-    )?;
+    let merged = merge_generated_rudder_md(&existing, generated);
+    // Atomic temp+rename so a concurrent reader (a worker re-reading shared
+    // context mid-task) never sees a half-written file.
+    let temp = path.with_extension(format!("md.{}.tmp", std::process::id()));
+    fs::write(&temp, merged.as_bytes())?;
+    fs::rename(&temp, path)?;
     Ok(())
 }
 
-fn merge_generated_rudder_md(existing: &str, generated: &str) -> String {
+/// Remove every well-formed generated block, then any orphaned single markers a
+/// stray literal (e.g. in orchestrator prose) or torn write left behind, so the
+/// rebuilt file always carries exactly one marker pair. Mirrors
+/// stripGeneratedMarkers in src/rudder-md.ts.
+fn strip_generated_markers(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(RUDDER_GENERATED_START) {
+        out.push_str(&rest[..start]);
+        let after_start = &rest[start + RUDDER_GENERATED_START.len()..];
+        if let Some(end) = after_start.find(RUDDER_GENERATED_END) {
+            rest = &after_start[end + RUDDER_GENERATED_END.len()..];
+        } else {
+            rest = after_start;
+        }
+    }
+    out.push_str(rest);
+    out.replace(RUDDER_GENERATED_END, "")
+}
+
+pub(crate) fn merge_generated_rudder_md(existing: &str, generated: &str) -> String {
     let wrapped = format!(
         "{RUDDER_GENERATED_START}\n{}\n{RUDDER_GENERATED_END}\n",
         generated.trim_end()
     );
-    if let Some(start) = existing.find(RUDDER_GENERATED_START) {
-        if let Some(end_marker) = existing[start..].find(RUDDER_GENERATED_END) {
-            let end = start + end_marker + RUDDER_GENERATED_END.len();
-            let prefix = existing[..start].trim_end();
-            let suffix = existing[end..].trim_start();
-            let mut parts: Vec<&str> = Vec::new();
-            if !prefix.is_empty() {
-                parts.push(prefix);
-            }
-            parts.push(wrapped.trim_end());
-            if !suffix.is_empty() {
-                parts.push(suffix);
-            }
-            return format!("{}\n", parts.join("\n\n"));
+    let start_idx = existing.find(RUDDER_GENERATED_START);
+    let end_idx = existing.find(RUDDER_GENERATED_END);
+    if start_idx.is_some() || end_idx.is_some() {
+        // The fresh block goes where the first marker sat so it keeps its
+        // position relative to orchestrator content; everything before that
+        // point cannot contain markers and is preserved verbatim. Duplicate
+        // blocks and orphaned markers (prior corruption / stray literals) are
+        // collapsed instead of swallowing the orchestrator content between them.
+        let insert_at = match (start_idx, end_idx) {
+            (Some(start), Some(end)) => start.min(end),
+            (Some(start), None) => start,
+            (None, Some(end)) => end,
+            (None, None) => unreachable!(),
+        };
+        let prefix = existing[..insert_at].trim_end();
+        let suffix_owned = strip_generated_markers(&existing[insert_at..]);
+        // suffix.trim() (not trim_start) keeps repeated renders byte-identical:
+        // trailing newlines would otherwise accumulate one per merge.
+        let suffix = suffix_owned.trim();
+        let mut parts: Vec<&str> = Vec::new();
+        if !prefix.is_empty() {
+            parts.push(prefix);
         }
+        parts.push(wrapped.trim_end());
+        if !suffix.is_empty() {
+            parts.push(suffix);
+        }
+        return format!("{}\n", parts.join("\n\n"));
     }
 
     match latest_rudder_plan_block(existing) {

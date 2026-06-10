@@ -11,6 +11,7 @@ import {
   shortHash,
 } from "./util.js";
 import { saveRunRecord, worktreePath } from "./state.js";
+import { withIntegrationLock } from "./rudder-md.js";
 
 // Minimum jj version we are confident in. Older releases may lack flags we use
 // (e.g. `jj workspace add -r`); we warn rather than throw so an older jj still
@@ -299,6 +300,13 @@ function workspaceNameFor(id: string): string {
  * conflict sets merge.status="conflict" + conflictedFiles + mergeChangeId.
  */
 export async function mergeJjRunIntoCurrentWorkspace(run: RunRecord, allowDirty = false): Promise<RunRecord> {
+  // Integration is one-at-a-time ACROSS PROCESSES: a `rudder merge` CLI call
+  // and a daemon tick are separate processes sharing the same @, and a second
+  // merge starting mid-flight would stack a merge change on a moving target.
+  return withIntegrationLock(run.repoRoot, () => mergeJjRunIntoCurrentWorkspaceLocked(run, allowDirty));
+}
+
+async function mergeJjRunIntoCurrentWorkspaceLocked(run: RunRecord, allowDirty: boolean): Promise<RunRecord> {
   if (!run.worktree.workspaceName) {
     throw new Error("Run has no jj workspace name to merge.");
   }

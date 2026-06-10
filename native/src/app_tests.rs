@@ -3898,6 +3898,26 @@ fn test_agent_run_with_terminal(app: &App, terminal: TerminalPane) -> AgentRun {
 }
 
 #[test]
+fn merge_generated_rudder_md_collapses_duplicates_and_is_idempotent() {
+    // Two generated blocks (prior corruption) + a stray orphan marker collapse
+    // to exactly one fresh block; orchestrator content around them survives.
+    let existing = "intro prose\n\n<!-- RUDDER_GENERATED_START -->\nold one\n<!-- RUDDER_GENERATED_END -->\n\nplan notes\n\n<!-- RUDDER_GENERATED_START -->\nold two\n<!-- RUDDER_GENERATED_END -->\n\ntail\n<!-- RUDDER_GENERATED_END -->\n";
+    let merged = merge_generated_rudder_md(existing, "fresh body");
+    assert_eq!(merged.matches("<!-- RUDDER_GENERATED_START -->").count(), 1);
+    assert_eq!(merged.matches("<!-- RUDDER_GENERATED_END -->").count(), 1);
+    assert!(merged.contains("fresh body"));
+    assert!(merged.contains("intro prose"));
+    assert!(merged.contains("plan notes"));
+    assert!(merged.contains("tail"));
+    assert!(!merged.contains("old one"));
+    assert!(!merged.contains("old two"));
+
+    // Re-merging the same body is byte-identical (mirrors the TS guarantee), so
+    // repeated renders cannot accrete whitespace forever.
+    assert_eq!(merge_generated_rudder_md(&merged, "fresh body"), merged);
+}
+
+#[test]
 fn q_confirms_before_quitting_with_running_agents() {
     let mut app = App::new();
     app.focus = FocusPane::Agents;

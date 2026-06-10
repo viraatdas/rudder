@@ -57,6 +57,8 @@ plus a worker image, used only when a task is handed off to the cloud.
 │   ├── src/config.rs      ~/.rudder config + model defaults + update notices
 │   ├── src/textedit.rs    input editing (drafts, history, cursor/word ops)
 │   ├── src/keys.rs        key/mouse event -> terminal byte encoding
+│   ├── src/plan_stream.rs streaming planner JSONL -> live transcript + plan capture
+│   ├── src/theme.rs       color palette (paper/ink/accent + status colors)
 │   ├── src/app_tests.rs   #[cfg(test)] dashboard tests
 │   └── src/pty_terminal.rs PTY wrapper + terminal emulation/scrollback (in lib.rs)
 ├── cloud/                Rudder Cloud control plane (Node http server) + worker image
@@ -376,9 +378,33 @@ TUI that repaints while idle.
   `Down`), readline-style editing (Ctrl+A/E/U/K/W/D/H, Alt/Ctrl+Backspace word
   delete, Alt+Left/Right word nav), and slash-command completion.
 
+**Cross-referencing the panes (v2.4.0).** Plan node ids (`n0`, `n1`, …) are the
+join key everywhere: the orchestrator DAG row shows `n2 <title>`, the matching
+worker's agents-pane status line shows `run n2`, and the worker pane title shows
+`worker · n2 · <task summary>`. A finished-but-unmerged workspace run reads
+`done · needs merge` (`agent_awaits_merge`, render.rs) because a bare "done"
+misled users into thinking dependents would launch — only `Merged` unblocks.
+
+**Mouse hit-testing (v2.4.0).** Clicks resolve through `app.agent_row_map`, a
+row→agent-index map recorded from the ACTUALLY rendered frame (a thread-local
+span recorder in `render_agents`, harvested per frame). This replaced a
+hardcoded "agents start at row 12" offset that silently broke whenever the
+header grew. The map is cleared on every `agents` Vec insert/remove so a
+same-tick click can never resolve to a shifted neighbor.
+
+**Notices and prompts (v2.6.0).** The transient notice line is severity-styled
+by content (`notice_style` in render.rs: errors red, pending confirmations
+amber, routine status muted), and `Esc` dismisses it from any pane without
+consuming Esc's pane action. Merge/conflict/cloud confirmations are modals with
+accent-colored key hints; the merge modal carries the auto-commit caution
+itself (no parallel notice), the conflict modal caps its file list at 8 with an
+overflow line, and the delete confirm names the agent.
+
 ### Keybindings (the input model in `handle_key`)
 Order of handling matters; the early returns gate everything else.
-- **Ctrl+C**: quit, with a confirm guard if agents are still running.
+- **Ctrl+C / q**: quit, guarded by `confirm_or_quit` when agents are still
+  running (first press asks; a second `q`/Ctrl+C/`y` confirms). Every pane's
+  `q` routes through the same guard — `q` used to quit instantly.
 - **Ctrl+W (leader)**: arms a one-shot leader. The *next* key runs a dashboard
   command and disarms: `1/2/3` focus panes, `v` review, `m` merge, `R` review-all,
   `M` merge-all, `r` rename, `j/k` move, `d` delete, `q` quit, `Esc`
@@ -411,7 +437,7 @@ worktrees; `M` (merge-all) opens a confirmation to merge them. Review-all spins 
 dedicated agent whose task is a `/review` over the combined diff.
 
 ### Tests
-`native/src/app_tests.rs` holds the dashboard tests (231, plus one `#[ignore]`d live
+`native/src/app_tests.rs` holds the dashboard tests (320, plus one `#[ignore]`d live
 conductor harness; declared `#[cfg(test)] mod app_tests;` in `main.rs`). Includes the
 leader/Option-key coverage: `ctrl_w_leader_then_digit_focuses_pane`,
 `ctrl_w_leader_is_one_shot`, `ctrl_w_leader_escape_cancels_without_action`,
@@ -553,6 +579,15 @@ functional but less battle-tested than the local dashboard; treat it as beta.
   `fallbackModelOptions`.
 - `src/effort.ts`: `EffortLevel = low | medium | high | xhigh | max` and the
   per-backend mapping (Claude uses `effort`, Codex uses `reasoningEffort`).
+- **`/fast` (v2.5.0, decided):** the fast preset is the FLAGSHIP model at LOW
+  effort — claude `opus(low)`, codex `gpt-5.5(low)` (`fast_model_for`,
+  `native/src/models.rs`) — never a downgrade to haiku/spark. This mirrors
+  Claude Code's own fast mode (Opus with faster output, not a smaller model).
+  The claude CLI has no flag to launch with its native fast output mode
+  pre-enabled (verified against `--help` and the settings docs; only
+  `CLAUDE_CODE_DISABLE_FAST_MODE` exists), so low effort is the closest
+  launchable equivalent. The preset persists via the normal model-defaults path
+  and applies to NEW agents only. Small tiers stay reachable via `/model`.
 
 ---
 
@@ -890,6 +925,17 @@ wires this at the worker spawn sites (Execute/Main/ReviewAll/restart); headless 
 already used official signals: `claude -p --output-format stream-json` and `codex exec --json`
 (`turn.completed`) + process exit.
 
+**The wiring INVARIANT (v2.5.0, learned the hard way):** every path that (re)spawns a
+worker process MUST call `signals::augment_worker_command`. The per-run hook config file
+persists across spawns, so `worker_has_config()` stays true and the poll loop SUPPRESSES
+the scrape fallback and waits for the official signal — a relaunch that forgets the
+wiring produces a worker stuck "running" forever (until `reconcile_orphaned_runs` on
+restart). Three paths have been bitten: the conflict-resolver respawn (fixed e027f32),
+then migration-resume and re-goal (fixed 2.5.0). When adding a spawn path, wire it.
+Signal hygiene: hook writes are ATOMIC (`printf > tmp && mv`, v2.6.x) so the poll loop
+never reads a torn JSON, and `cleanup_run_signals` removes a run's three signal files on
+agent delete.
+
 ### 14.4c Dispatch: one-off vs plan (`AgentMode::OneOff` + the Haiku dispatcher)
 Not every typed task wants the whole DAG. A FRESH task (no active plan) routes through
 a deterministic local classifier first, then LIGHT Haiku only for ambiguous cases:
@@ -1026,6 +1072,29 @@ conflict spawns the AI resolver (`start_conflict_resolution_agent` →
 `finalize_merge_resolvers`, jj-worded prompt). Undo via `rudder undo` (op-log). See
 section 5 / `src/jj.ts` for the run-level merge plumbing.
 
+**Merge-state legibility + durability (v2.4.0–v2.6.x, decided):**
+- `/automerge` PERSISTS (`autoMerge` key in `~/.rudder/config.json`,
+  `initial_auto_merge`) and is always visible: the agents-pane header shows
+  `auto-merge`/`manual merge`, the orchestrator header shows `auto-merge` when on.
+  Losing the toggle on restart silently stalled mid-flight plans at merge gates.
+- A CONFLICTED merge keeps the run `Done` (review bucket, `done · needs merge`),
+  parked in `auto_merge_skip` — it is finished work awaiting integration, and the
+  old flip-to-`Stopped` buried it in "closed" looking cancelled. Same rule on
+  reload: a run.json with `status:"merge-conflict"` loads as `Done`, not Stopped
+  (`agent_status_from_record`).
+- `auto_merge_skip` PERSISTS (`.rudder/auto-merge-skip.json`) so a restart cannot
+  re-merge a known-conflicted run and respawn resolvers uninvited. Cleared per-id
+  on successful merge / re-goal; never blanket-cleared on `/automerge` toggle
+  (that re-creates the resolver-stacking loop).
+- A merge REFUSES to start when the integration workspace `@` already has
+  unresolved conflicts (`mergeJjRunIntoCurrentWorkspace` guard, unconditional even
+  under `--allow-dirty`) — merging onto a conflicted `@` nests conflicts.
+- The TUI's `rudder` CLI shell-out (`run_rudder_jj_command`) has a 120s
+  timeout with kill+reap, so a hung jj can no longer freeze the dashboard forever.
+- Mechanical conflicts (RUDDER.md/DECISIONS.md/RUDDER_SHARED.md, .gitignore
+  union, package.json deep-merge, lockfiles) auto-resolve BEFORE any LLM resolver
+  (`auto_resolve_mechanical_conflicts`).
+
 **Serialization invariant (`withSchedulerLock`, `src/scheduler.ts`).** The daemon fires
 `scheduleTick` (1s interval), `onRunTransition` (per-run `fs.watch`), and the board's
 manual approve/merge endpoints — all in ONE process as un-awaited `void` calls. Every op
@@ -1037,6 +1106,41 @@ and one node is marked `merged` while its diff is orphaned off the trunk (silent
 The public entry points lock; internal recursion uses the unlocked `*Core` variants to avoid
 self-deadlock (the lock is NOT reentrant). This bug is invisible to unit tests and only
 shows under near-simultaneous completions — it is covered by `tests/e2e-orchestrator.test.mjs`.
+
+**Cross-process integration lock (v2.6.x).** `withSchedulerLock` serializes only one
+process; a `rudder merge` CLI invocation (what the TUI shells out to) and a daemon tick
+are SEPARATE processes sharing the same `@`. Both outer merge seams —
+`mergeJjRunIntoCurrentWorkspace` (jj.ts) and `mergeNodeIntoIntegration` (scheduler.ts) —
+therefore take `.rudder/integrate.lock` (`withIntegrationLock`, src/rudder-md.ts: mkdir
+lock, 30s wait, 120s stale takeover, proceed-unlocked on timeout so a crashed holder
+never deadlocks). NOT reentrant: `mergeNode` inside those seams must never re-take it.
+
+### 14.7b Cross-process coordination and locking (the full map)
+Multiple OS processes share state: the Rust TUI, each `rudder <cmd>` CLI invocation
+(merge/done/share/…), the daemon, worker agent processes, and the orchestrator agent
+editing files directly. The rules:
+- **Atomic writes everywhere.** Every persisted JSON/state file is written temp+rename
+  (TS `writeJson` in src/util.ts — unique temp per write + in-process `withPathLock`;
+  Rust `write_config_atomically` / `save_native_run_record` / the ledger persisters;
+  signal hooks' `printf > tmp && mv`). A reader can see an OLD file, never a torn one.
+- **RUDDER.md** is read-modify-write from BOTH languages, so both take the SAME
+  advisory mkdir lock `<repo>/.rudder/rudder-md.lock` (TS `withRudderMdLock`,
+  Rust `acquire_rudder_md_lock` in gitio.rs; 50ms retry, 2s wait, 10s stale takeover,
+  proceed-unlocked on timeout). The merged write itself is temp+rename on both sides,
+  and `merge_generated_rudder_md` / `mergeGeneratedRudderMd` are PARITY
+  implementations (duplicate-block collapse, orphan-marker strip, byte-stable
+  re-render) — change one, change both, and keep their tests mirrored.
+- **Integration into `@`** takes `.rudder/integrate.lock` (above).
+- **DECISIONS.md** appends are a SINGLE `appendFile`/append call per entry
+  (O_APPEND): concurrent writers can interleave entry ORDER but cannot tear an
+  entry. Keep it that way — never split an entry across two appends.
+- **`.rudder` ledgers** (ingestion-ledger, followup-gen, auto-merge-skip, plan
+  queue) are single-writer BY ASSUMPTION: one dashboard per checkout
+  (`runPolicy.sameCheckout: "single-active"`). Two concurrent TUIs on one repo
+  would last-writer-win each other's ledgers; that is out of contract.
+- **jj** serializes its own op store; concurrent jj commands degrade to
+  recoverable "concurrent operation" states, not corruption. The locks above
+  exist to avoid stacking LOGICAL merges, not to protect jj internals.
 
 ### 14.8 Caps
 `MAX_PLAN_TASKS = 100` (per-plan parse cap AND the auto-expand backstop; overflow is

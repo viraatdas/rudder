@@ -112,11 +112,14 @@ pub(crate) fn parse_signal_state(body: &str) -> Option<SignalState> {
 
 /// POSIX-sh one-liner that writes `{"state":"<state>"}` to `signal`, creating the
 /// parent dir. Single-quoted so the path is taken literally; this runs as a hook
-/// command, so it stays tiny (no node/shell startup beyond `sh -c`).
+/// command, so it stays tiny (no node/shell startup beyond `sh -c`). Writes to a
+/// pid-suffixed temp and `mv`s into place: rename is atomic on the same
+/// filesystem, so the TUI poll loop can never read a torn half-written JSON
+/// (a bare `printf >` left exactly that window at the moment that matters most).
 fn write_signal_command(signal: &Path, state: &str) -> String {
     let path = signal.display();
     format!(
-        "mkdir -p '{dir}' && printf '{{\"state\":\"{state}\"}}' > '{path}'",
+        "mkdir -p '{dir}' && printf '{{\"state\":\"{state}\"}}' > '{path}'.$$.tmp && mv -f '{path}'.$$.tmp '{path}'",
         dir = signal
             .parent()
             .map(|p| p.display().to_string())
@@ -150,7 +153,7 @@ pub(crate) fn codex_notify_script(signal: &Path) -> String {
         .map(|p| p.display().to_string())
         .unwrap_or_default();
     format!(
-        "#!/bin/sh\n# Rudder Codex completion signal (notify program).\ncase \"$1\" in\n  *agent-turn-complete*)\n    mkdir -p '{dir}' && printf '{{\"state\":\"done\"}}' > '{path}' ;;\nesac\n"
+        "#!/bin/sh\n# Rudder Codex completion signal (notify program).\n# Temp + mv so the TUI never reads a torn half-written signal.\ncase \"$1\" in\n  *agent-turn-complete*)\n    mkdir -p '{dir}' && printf '{{\"state\":\"done\"}}' > '{path}'.$$.tmp && mv -f '{path}'.$$.tmp '{path}' ;;\nesac\n"
     )
 }
 
