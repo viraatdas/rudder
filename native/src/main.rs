@@ -99,7 +99,6 @@ const TASK_HISTORY_LIMIT: usize = 100;
 const MOUSE_DEBUG_ENV: &str = "RUDDER_MOUSE_DEBUG";
 const RUDDER_MOUSE_ENABLE_SEQUENCES: &[u8] = b"\x1b[?1003l\x1b[?1000h\x1b[?1002h\x1b[?1006h";
 const RUDDER_MOUSE_DISABLE_SEQUENCES: &[u8] = b"\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
-const AGENT_LIST_RUN_START_ROW: u16 = 12;
 const REVIEW_ALL_MODEL: &str = "gpt-5.5";
 const REVIEW_ALL_EFFORT: EffortLevel = EffortLevel::XHigh;
 const TASK_SUMMARY_MODEL: &str = "claude-haiku-4-5-20251001";
@@ -402,6 +401,10 @@ struct App {
     /// buffer each frame (so the selection is over exactly what is on screen).
     orch_selection: Option<WorkerSelection>,
     orch_visible_rows: Vec<String>,
+    /// Agents-pane row -> agent index, harvested from the LAST rendered frame
+    /// (render_agents). Mouse clicks resolve through this so hit-testing always
+    /// matches what is actually drawn (headers, hints, sections, wrapped rows).
+    agent_row_map: Vec<Option<usize>>,
     /// Conductor activity log: an append-only, bounded record of every autonomous
     /// action the orchestrator takes (auto-expanded a node, steered an agent, etc.),
     /// shown in the orchestrator pane. The "visible" half of the no-confirm bargain.
@@ -838,7 +841,14 @@ impl App {
             plan_summary: restored_queue.plan_summary,
             refining: false,
             rebasing: false,
-            auto_merge: false,
+            // Restore the persisted /automerge default (tests always start OFF so
+            // merge-gating assertions stay deterministic). Losing the toggle on
+            // restart silently stalled mid-flight plans at every merge gate.
+            auto_merge: if cfg!(test) {
+                false
+            } else {
+                initial_auto_merge()
+            },
             auto_merge_skip: Vec::new(),
             awaiting_approval: restored_queue.awaiting_approval,
             interactive_orchestrator: interactive_orchestrator(),
@@ -862,6 +872,7 @@ impl App {
             task_selection: None,
             orch_selection: None,
             orch_visible_rows: Vec::new(),
+            agent_row_map: Vec::new(),
             activity_log: Vec::new(),
             followups_ingested,
             followup_gen,
@@ -4692,7 +4703,7 @@ impl App {
             }
             Some("/help") => {
                 self.notice = Some(
-                    "Option-1/2/3 or ^W pane  type tasks below; /share saves tokens/context for all agents"
+                    "panes: Option-1/2/3 or ^W · keys: j/k select · Enter focus · v diff · m merge · M merge all · R review all · g nest · x stop · dd delete · P model — commands: /model /fast /automerge /merge-all /review-all /main /ask /plan /share /usage /goal /cloud — DAG node ids (n0, n1…) match the agent rows and the worker pane title"
                         .to_string(),
                 );
                 true
@@ -4751,6 +4762,9 @@ impl App {
             }
             Some("/automerge") => {
                 self.auto_merge = !self.auto_merge;
+                // Persist the toggle so the next session starts in the same mode; a
+                // forgotten OFF default used to stall restarted plans at merge gates.
+                let _ = save_auto_merge(self.auto_merge);
                 if self.auto_merge {
                     // Do NOT blanket-clear auto_merge_skip here: a node parked there by the
                     // conflict-resolver (resolver finished with conflicts still left) would
@@ -4758,12 +4772,12 @@ impl App {
                     // resolver every tick, the exact stacking loop the skip prevents. Skip
                     // entries are already cleared per-id on a successful merge / re-goal.
                     self.notice = Some(
-                        "auto-merge ON: clean finished nodes merge themselves and unblock children (conflicts still pause for you)".to_string(),
+                        "auto-merge ON (saved as default): clean finished nodes merge themselves and unblock children; conflicts still pause for you".to_string(),
                     );
                     self.maybe_auto_merge();
                 } else {
                     self.notice = Some(
-                        "auto-merge OFF: merge finished nodes yourself with m / M".to_string(),
+                        "auto-merge OFF (saved as default): merge finished nodes yourself with m / M".to_string(),
                     );
                 }
                 true
@@ -4790,7 +4804,7 @@ impl App {
                 let warning = self.set_model_defaults(backend, model, effort);
                 self.notice = warning.or_else(|| {
                     Some(format!(
-                        "fast: {} {}({})",
+                        "fast preset: {} {}({}) saved as the default for NEW agents · running agents keep their model · /model switches back",
                         self.backend.as_str(),
                         self.model,
                         effort_label(self.effort)
@@ -5561,6 +5575,7 @@ impl App {
             }
         };
         self.auto_merge = next;
+        let _ = save_auto_merge(self.auto_merge);
         if self.auto_merge {
             self.notice = Some(
                 "auto-merge ON: clean finished nodes merge themselves and unblock children"
@@ -6879,7 +6894,8 @@ impl App {
         {
             return;
         }
-        let mut merged_any = false;
+        let mut merged_labels: Vec<String> = Vec::new();
+        let mut conflicted = false;
         loop {
             let next = self.agents.iter().position(|run| {
                 run.node_id.is_some()
@@ -6893,7 +6909,7 @@ impl App {
             let label = self.agents[index].task_summary.clone();
             let task = self.agents[index].task.clone();
             match self.merge_agent_at(index) {
-                Ok(()) => merged_any = true,
+                Ok(()) => merged_labels.push(short_task(&label)),
                 Err(error) => {
                     // Conflict: auto-spawn the AI resolver to integrate both sides in
                     // the integration workspace. finalize_merge_resolvers flips the
@@ -6913,6 +6929,7 @@ impl App {
                         agent_id: Some(id.clone()),
                     });
                     self.start_conflict_resolution_agent();
+                    conflicted = true;
                     let resolver_running =
                         self.agents.iter().any(|r| r.id == id && r.merge_resolver);
                     if resolver_running {
@@ -6928,7 +6945,16 @@ impl App {
                 }
             }
         }
-        if merged_any {
+        if !merged_labels.is_empty() {
+            // Auto-merges used to be silent: nodes jumped from review to done with no
+            // explanation. Announce them (the conflict notice above wins when both fire,
+            // since that one still needs the user's attention).
+            if !conflicted {
+                self.notice = Some(match merged_labels.as_slice() {
+                    [only] => format!("auto-merged {only} · dependents unblocked"),
+                    many => format!("auto-merged {} nodes · dependents unblocked", many.len()),
+                });
+            }
             self.run_scheduler();
             self.mirror_graph();
             self.dirty = true;
@@ -7536,9 +7562,10 @@ impl App {
                 }
             }
             MergeIntent::All { ids } => {
+                let total = ids.len();
                 let mut merged = 0;
-                for id in ids {
-                    let Some(index) = self.agents.iter().position(|run| run.id == id) else {
+                for (position, id) in ids.iter().enumerate() {
+                    let Some(index) = self.agents.iter().position(|run| run.id == *id) else {
                         continue;
                     };
                     let task = self.agents[index].task.clone();
@@ -7546,6 +7573,11 @@ impl App {
                     let worktree_path = self.agents[index].worktree_path.clone();
                     let agent_id = Some(self.agents[index].id.clone());
                     if let Err(error) = self.merge_agent_at(index) {
+                        // Integration is serialized through the shared workspace, so a
+                        // conflict stops the batch (continuing would stack merges on a
+                        // conflicted @). Tell the user the FULL outcome — what landed,
+                        // what is paused, and what is still waiting — not just the error.
+                        let remaining = total.saturating_sub(position + 1);
                         self.handle_merge_error(
                             task,
                             error,
@@ -7554,6 +7586,16 @@ impl App {
                             worktree_path,
                             agent_id,
                         );
+                        if let Some(notice) = self.notice.take() {
+                            self.notice = Some(format!(
+                                "merged {merged}/{total} · {notice}{}",
+                                if remaining > 0 {
+                                    format!(" · {remaining} more wait in review")
+                                } else {
+                                    String::new()
+                                }
+                            ));
+                        }
                         return;
                     }
                     merged += 1;
@@ -7633,9 +7675,17 @@ impl App {
             .and_then(|id| self.agents.iter().position(|run| run.id == id))
         {
             if let Some(run) = self.agents.get_mut(index) {
-                run.status = AgentStatus::Stopped;
+                // The WORK is finished; only its integration conflicted. Keep the run
+                // Done (review bucket) so it still reads as merge-able — flipping it to
+                // Stopped buried it in "closed" looking cancelled. Park it in the
+                // auto-merge skip list so auto-merge does not re-conflict every tick;
+                // a successful merge or re-goal clears the skip.
                 run.last_error = Some(error.to_string());
                 let _ = save_native_run_record(&self.cwd, run);
+                let id = self.agents[index].id.clone();
+                if !self.auto_merge_skip.contains(&id) {
+                    self.auto_merge_skip.push(id);
+                }
             }
         }
         let operation_label = if operation == ConflictOperation::Rebase {
@@ -7644,7 +7694,8 @@ impl App {
             "merge"
         };
         self.notice = Some(format!(
-            "{operation_label} conflict in {count} file{}: press y to let AI resolve & complete the merge, or n to do it manually",
+            "{operation_label} conflict in {} ({count} file{}): press y to let AI resolve & complete the merge, or n to do it manually",
+            short_task(&self.conflict_prompt.as_ref().map(|p| p.task.clone()).unwrap_or_default()),
             if count == 1 { "" } else { "s" }
         ));
     }

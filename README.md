@@ -159,17 +159,24 @@ running, Rudder also exposes matching project skills; the orchestrator can write
 | Command | Action |
 | --- | --- |
 | `/model` | Pick provider, then model, then effort |
+| `/fast` | Cheap fast-model preset for new agents (Claude haiku / Codex spark); `/model` switches back |
 | `/ask <text>` | Force a one-off conversational agent in the main checkout |
 | `/plan <text>` | Force the orchestrator / DAG planner |
 | `/share <text>` | Save gitignored shared context for all agents in `RUDDER_SHARED.md` |
 | `/main` or `/m` | Start a new main-branch agent |
 | `/review-all` | Combine completed worktrees and start a Codex review-all agent |
 | `/merge-all` | Merge all completed worktrees |
-| `/automerge` | Toggle automatic clean merges |
+| `/automerge` | Toggle automatic clean merges (persists across sessions; shown in the agents pane header) |
 | `/login` | Browser login for Rudder Cloud |
 | `/cloud` | Onload the current workspace or start a fresh cloud worker |
 | `/cloud list` | List cloud workers |
-| `/help` | Show the short command hint |
+| `/help` | Show the keybinding + command cheat sheet |
+
+Finding a DAG task's worker: every plan node id (`n0`, `n1`, …) appears on the
+orchestrator DAG row, on the matching worker's row in the agents pane (`run n1`),
+and in the worker pane title, so the three panes cross-reference by id. A finished
+worker shows `done · needs merge` until it merges (with `m`, `M`, or auto-merge);
+only merged nodes unblock their dependents.
 
 ## Models
 

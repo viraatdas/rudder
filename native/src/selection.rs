@@ -49,22 +49,12 @@ pub(crate) fn agent_index_from_mouse(app: &App, mouse: MouseEvent, area: Rect) -
     if !rect_contains(inner, mouse.column, mouse.row) {
         return None;
     }
-
-    let mut row = mouse.row.saturating_sub(inner.y);
-    if row < AGENT_LIST_RUN_START_ROW {
-        return None;
-    }
-
-    row -= AGENT_LIST_RUN_START_ROW;
-    for (index, agent) in app.agents.iter().enumerate() {
-        let row_count = 2 + u16::from(diff_short_summary(agent).is_some());
-        if row < row_count {
-            return Some(index);
-        }
-        row = row.saturating_sub(row_count);
-    }
-
-    None
+    // Resolve through the row map render_agents recorded for the last frame, so the
+    // hit-test always matches the drawn layout. (The old path assumed agents start
+    // at a fixed header offset and occupy fixed row counts; both drifted from the
+    // renderer and clicks selected the wrong agent.)
+    let row = mouse.row.saturating_sub(inner.y) as usize;
+    app.agent_row_map.get(row).copied().flatten()
 }
 
 pub(crate) fn task_visible_input_start(app: &App, area: Rect, input_lines: &[String]) -> usize {

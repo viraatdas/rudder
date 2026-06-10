@@ -99,6 +99,22 @@ pub(crate) fn render_mouse_debug(frame: &mut Frame<'_>, area: Rect, app: &App) {
     );
 }
 
+// Row spans recorded while the agents pane renders: (first_row, end_row, agent index).
+// The TUI renders on one thread, so a thread-local recorder lets the deeply nested
+// row-push walks tag their rows without threading a collector through every helper.
+// render_agents clears it, the push helpers append, and render_agents harvests it
+// into `app.agent_row_map`, which is what mouse clicks resolve against. This replaced
+// a hardcoded "agents start at row 12" offset that silently broke whenever the pane
+// header grew and never accounted for section headers or blank separator rows.
+thread_local! {
+    static AGENT_ROW_SPANS: std::cell::RefCell<Vec<(usize, usize, usize)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn record_agent_rows(start: usize, end: usize, agent_index: usize) {
+    AGENT_ROW_SPANS.with(|spans| spans.borrow_mut().push((start, end, agent_index)));
+}
+
 /// Render one agent into the list: a task-label line, a status badge line, and an
 /// optional diff line. `prefix` is prepended to the task-label line and
 /// `cont_prefix` to the status/diff continuation lines. Both are empty in flat
@@ -144,6 +160,7 @@ pub(crate) fn push_agent_row_with_trailing<'a>(
     cont_prefix: &[Span<'a>],
     trailing: &[Span<'a>],
 ) {
+    let row_start = lines.len();
     let selected = index == app.selected_agent;
     // The selected row must read clearly EVEN WHEN THE PANE IS UNFOCUSED (you navigate the
     // tree from either pane), so its marker + title use the accent color + BOLD
@@ -203,6 +220,10 @@ pub(crate) fn push_agent_row_with_trailing<'a>(
         Span::styled("review-all", accent_style(focused))
     } else if agent.mode == AgentMode::Plan {
         Span::styled("plan", accent_style(focused))
+    } else if let Some(node_id) = agent.node_id.as_deref() {
+        // Plan workers carry their DAG node id so the row is matchable against the
+        // orchestrator pane's "n2 <title>" line at a glance.
+        Span::styled(format!("run {node_id}"), muted_style(focused))
     } else {
         Span::styled("run", muted_style(focused))
     };
@@ -251,6 +272,7 @@ pub(crate) fn push_agent_row_with_trailing<'a>(
         ]);
         lines.push(ListItem::new(Line::from(diff_line)));
     }
+    record_agent_rows(row_start, lines.len(), index);
 }
 
 /// Compress `git diff --shortstat` output ("34 files changed, 3162 insertions(+),
@@ -1019,6 +1041,7 @@ fn push_orchestrator_row<'a>(
     focused: bool,
     task_width: usize,
 ) {
+    let row_start = lines.len();
     let selected = index == app.selected_agent;
     let marker = if selected { "> " } else { "  " };
     let label = if selected && app.rename_input.is_some() {
@@ -1067,10 +1090,13 @@ fn push_orchestrator_row<'a>(
         Span::raw("  "),
         Span::styled(phase, muted_style(focused)),
     ])));
+    record_agent_rows(row_start, lines.len(), index);
 }
 
 pub(crate) fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let focused = app.focus == FocusPane::Agents;
+    // Fresh row-span recording for this frame; harvested into app.agent_row_map below.
+    AGENT_ROW_SPANS.with(|spans| spans.borrow_mut().clear());
     let diff_summaries: Vec<Option<String>> = {
         // Pinned planners (orchestrator + plan-mode front-end) run in the MAIN repo
         // and are rendered via push_orchestrator_row (no diff line), so a diff summary
@@ -1111,6 +1137,14 @@ pub(crate) fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             Span::styled("agents ", pane_text_style(focused)),
             Span::styled(run_count.to_string(), accent_style(focused)),
             Span::styled(" runs", pane_text_style(focused)),
+            // Merge mode is global state the user otherwise has to remember, so
+            // surface it here permanently (the orchestrator header shows it too).
+            Span::styled("  ·  ", muted_style(focused)),
+            if app.auto_merge {
+                Span::styled("auto-merge", accent_style(focused))
+            } else {
+                Span::styled("manual merge", muted_style(focused))
+            },
         ])),
         ListItem::new(Line::default()),
     ];
@@ -1199,12 +1233,7 @@ pub(crate) fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     if app.nest_view {
         // Alternate full-DAG view (toggled with `g`): one topological tree across
         // every agent, ignoring status sections.
-        lines.extend(render_agents_nest(
-            app,
-            focused,
-            task_width,
-            &diff_summaries,
-        ));
+        render_agents_nest_into(&mut lines, app, focused, task_width, &diff_summaries);
         if main_count == 0 && run_total == 0 {
             lines.push(ListItem::new(Line::from(Span::styled(
                 "no agents yet  ·  type a task or /main",
@@ -1277,6 +1306,19 @@ pub(crate) fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             ))));
         }
     }
+
+    // Harvest the recorded row spans into the row -> agent map mouse clicks resolve
+    // against. Built from what was ACTUALLY rendered this frame, so it stays correct
+    // however the header, hints, sections, or per-row line counts evolve.
+    let mut row_map: Vec<Option<usize>> = vec![None; lines.len()];
+    AGENT_ROW_SPANS.with(|spans| {
+        for &(start, end, agent) in spans.borrow().iter() {
+            for row in row_map.iter_mut().take(end).skip(start) {
+                *row = Some(agent);
+            }
+        }
+    });
+    app.agent_row_map = row_map;
 
     frame.render_widget(
         List::new(lines).style(app_style()).block(pane_block(
@@ -1511,6 +1553,8 @@ fn nest_walk<'a>(
     }
 }
 
+/// Test-facing wrapper that materializes the nest view as its own vec.
+#[cfg(test)]
 pub(crate) fn render_agents_nest(
     app: &App,
     focused: bool,
@@ -1518,6 +1562,20 @@ pub(crate) fn render_agents_nest(
     diff_summaries: &[Option<String>],
 ) -> Vec<ListItem<'static>> {
     let mut lines: Vec<ListItem<'static>> = Vec::new();
+    render_agents_nest_into(&mut lines, app, focused, task_width, diff_summaries);
+    lines
+}
+
+/// Nest-view body pushed onto the CALLER's row vec, so the row positions the agent
+/// row-span recorder captures are absolute agents-pane rows (mouse hit-testing
+/// resolves against them).
+fn render_agents_nest_into<'a>(
+    lines: &mut Vec<ListItem<'a>>,
+    app: &App,
+    focused: bool,
+    task_width: usize,
+    diff_summaries: &[Option<String>],
+) {
     let (children, has_parent) = nest_children_by_index(&app.agents);
     let mut visited = vec![false; app.agents.len()];
 
@@ -1543,7 +1601,7 @@ pub(crate) fn render_agents_nest(
     let mut lanes: Vec<bool> = Vec::new();
     for &root in &roots {
         nest_walk(
-            &mut lines,
+            lines,
             app,
             focused,
             task_width,
@@ -1562,7 +1620,7 @@ pub(crate) fn render_agents_nest(
     for index in 0..app.agents.len() {
         if !visited[index] {
             nest_walk(
-                &mut lines,
+                lines,
                 app,
                 focused,
                 task_width,
@@ -1576,8 +1634,6 @@ pub(crate) fn render_agents_nest(
             );
         }
     }
-
-    lines
 }
 
 pub(crate) fn visible_agent_indices(agents: &[AgentRun]) -> Vec<usize> {
@@ -1660,6 +1716,9 @@ fn push_orchestrator_task_row<'a>(
     spans.extend([
         Span::styled(BADGE, Style::default().fg(status.color())),
         Span::raw(" "),
+        // The node id is the cross-reference key: the same id shows on the worker's
+        // agents-pane row and in the worker pane title, so "n2 here" is findable there.
+        Span::styled(format!("{} ", task.id), muted_style(true)),
         Span::styled(label, pane_text_style(true)),
         Span::raw("  "),
         Span::styled(status.label(), Style::default().fg(status.color())),
@@ -2694,22 +2753,39 @@ pub(crate) fn render_worker(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         WorkerView::Terminal => worker_lines(app, inner.height as usize, inner.width as usize),
         WorkerView::Diff => review_lines(app, inner.height as usize),
     };
+    // Identify WHICH agent this pane is showing: its id (the node id for plan
+    // workers, matching the n0/n1 ids in the orchestrator DAG) plus a short task
+    // label. Without this the pane just said "worker" and the user had to infer
+    // the mapping from the agents-pane highlight.
+    let identity = app.agents.get(app.selected_agent).map(|run| {
+        let id = run.node_id.clone().unwrap_or_else(|| run.id.clone());
+        let label = if run.task_summary.trim().is_empty() {
+            summarize_task(&run.task)
+        } else {
+            run.task_summary.clone()
+        };
+        format!("{id} · {}", truncate_chars(&label, 36))
+    });
+    let title = match app.worker_view {
+        WorkerView::Terminal => {
+            let role = if selected_is_orchestrator {
+                "orchestrator"
+            } else {
+                "worker"
+            };
+            match &identity {
+                Some(identity) if !selected_is_orchestrator => format!("{role} · {identity}"),
+                _ => role.to_string(),
+            }
+        }
+        WorkerView::Diff => match &identity {
+            Some(identity) => format!("review · {identity} · Esc/v back · m merge"),
+            None => "review · Esc/v back · m merge".to_string(),
+        },
+    };
     let paragraph = Paragraph::new(lines)
         .style(app_style())
-        .block(pane_block(
-            match app.worker_view {
-                WorkerView::Terminal => {
-                    if selected_is_orchestrator {
-                        "orchestrator"
-                    } else {
-                        "worker"
-                    }
-                }
-                WorkerView::Diff => "review · Esc/v back · m merge",
-            },
-            focused,
-            app.nav_mode,
-        ))
+        .block(pane_block(&title, focused, app.nav_mode))
         .wrap(Wrap { trim: false });
 
     frame.render_widget(paragraph, area);
@@ -3285,7 +3361,7 @@ pub(crate) fn centered_modal(area: Rect, desired_width: u16, desired_height: u16
     }
 }
 
-pub(crate) fn pane_block(title: &'static str, focused: bool, nav_mode: bool) -> Block<'static> {
+pub(crate) fn pane_block(title: &str, focused: bool, nav_mode: bool) -> Block<'static> {
     let border_style = if focused {
         Style::default().fg(FOCUS_COLOR)
     } else {
@@ -3544,9 +3620,26 @@ pub(crate) fn agent_status_label(agent: &AgentRun) -> &'static str {
         "plan mode"
     } else if agent.status == AgentStatus::Merged {
         "[x] merged"
+    } else if agent.status == AgentStatus::Done && agent_awaits_merge(agent) {
+        // "done" alone read as terminal, but a workspace run is NOT integrated (and
+        // does not unblock its dependents) until it merges. Say what is missing.
+        "done · needs merge"
     } else {
         agent.status.as_str()
     }
+}
+
+/// A finished run that still has a workspace to integrate: it sits in the review
+/// bucket until merged (m / M / auto-merge), and hard-dependent nodes stay gated
+/// on it. Main, one-off, and planner runs never merge.
+pub(crate) fn agent_awaits_merge(agent: &AgentRun) -> bool {
+    agent.status == AgentStatus::Done
+        && !agent.is_main()
+        && !agent.is_oneoff()
+        && !matches!(agent.mode, AgentMode::Plan | AgentMode::RudderPlan)
+        && (agent.worktree_path.is_some()
+            || agent.worktree_branch.is_some()
+            || agent.workspace_name.is_some())
 }
 
 pub(crate) fn agent_status_style(agent: &AgentRun) -> Style {

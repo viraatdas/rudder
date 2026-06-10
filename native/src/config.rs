@@ -45,6 +45,55 @@ pub(crate) fn config_effort(config: &serde_json::Value, backend: Backend) -> Opt
     })
 }
 
+/// Whether `/automerge` is on by default for new sessions. Stored at the config
+/// root as `autoMerge` so the toggle survives a dashboard restart: losing it
+/// mid-plan silently stalls the DAG at every merge gate waiting for manual `m`.
+pub(crate) fn config_auto_merge(config: &serde_json::Value) -> Option<bool> {
+    config.get("autoMerge").and_then(serde_json::Value::as_bool)
+}
+
+pub(crate) fn initial_auto_merge() -> bool {
+    load_rudder_config()
+        .as_ref()
+        .and_then(config_auto_merge)
+        .unwrap_or(false)
+}
+
+/// Persist the `/automerge` toggle so the next session starts in the same mode.
+pub(crate) fn save_auto_merge(enabled: bool) -> Result<()> {
+    let path = rudder_config_path().context("could not determine Rudder config path")?;
+    let mut config = load_rudder_config().unwrap_or_else(default_config_value);
+    if !config.is_object() {
+        config = default_config_value();
+    }
+    ensure_config_defaults(&mut config);
+    let root = config
+        .as_object_mut()
+        .context("Rudder config root is not an object")?;
+    root.insert("autoMerge".to_string(), serde_json::Value::Bool(enabled));
+    write_config_atomically(&path, &config)
+}
+
+/// Atomic temp-file + rename write shared by every config-mutating helper, so a
+/// crash mid-write can never truncate ~/.rudder/config.json.
+fn write_config_atomically(path: &Path, config: &serde_json::Value) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let temp = path.with_extension(format!(
+        "json.{}.{}.tmp",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    ));
+    fs::write(&temp, format!("{}\n", serde_json::to_string_pretty(config)?))?;
+    fs::rename(&temp, path)?;
+    set_private_file_mode(path);
+    Ok(())
+}
+
 pub(crate) fn config_merge_strategy(config: &serde_json::Value) -> MergeStrategy {
     config
         .get("mergeStrategy")
@@ -148,24 +197,7 @@ pub(crate) fn save_model_defaults(
         }
     }
 
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let temp = path.with_extension(format!(
-        "json.{}.{}.tmp",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-    ));
-    fs::write(
-        &temp,
-        format!("{}\n", serde_json::to_string_pretty(&config)?),
-    )?;
-    fs::rename(&temp, &path)?;
-    set_private_file_mode(&path);
-    Ok(())
+    write_config_atomically(&path, &config)
 }
 
 pub(crate) fn ensure_config_defaults(config: &mut serde_json::Value) {

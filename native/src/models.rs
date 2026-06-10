@@ -264,7 +264,7 @@ pub(crate) fn command_suggestions() -> Vec<Suggestion> {
         },
         Suggestion {
             label: "/fast".to_string(),
-            detail: "switch this backend to its fast model (claude haiku / codex spark)"
+            detail: "cheap fast-model preset for new agents (claude haiku / codex spark); /model switches back"
                 .to_string(),
             action: SuggestionAction::RunCommand("/fast".to_string()),
         },

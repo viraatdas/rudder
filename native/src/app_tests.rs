@@ -3033,21 +3033,25 @@ fn click_in_agent_pane_does_not_change_focus() {
 fn click_on_agent_row_selects_that_agent() {
     let mut app = App::new();
     app.focus = FocusPane::Task;
-    app.agents_area = Some(Rect {
-        x: 0,
-        y: 0,
-        width: 34,
-        height: 20,
-    });
     app.agents.push(test_agent_run("run-1", "first task"));
     app.agents.push(test_agent_run("run-2", "second task"));
     app.selected_agent = 0;
     app.delete_pending = Some("run-1".to_string());
 
+    // Render once: mouse hit-testing resolves through the row map recorded from the
+    // actually drawn frame (replacing the old hardcoded header-offset arithmetic).
+    render_screen(&mut app, 120, 40);
+    let area = app.agents_area.expect("agents pane area recorded by render");
+    let row = app
+        .agent_row_map
+        .iter()
+        .position(|agent| *agent == Some(1))
+        .expect("second agent has a rendered row") as u16;
+
     app.handle_mouse(MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),
-        column: 2,
-        row: 15,
+        column: area.x + 2,
+        row: area.y + 1 + row,
         modifiers: KeyModifiers::empty(),
     });
 
