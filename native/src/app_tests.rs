@@ -3898,6 +3898,34 @@ fn test_agent_run_with_terminal(app: &App, terminal: TerminalPane) -> AgentRun {
 }
 
 #[test]
+fn model_picker_accepts_new_claude_families_without_a_release() {
+    // The picker must surface a brand-new model family straight from the
+    // models.dev cache; a family-name allowlist here is how claude-fable-5
+    // stayed invisible for weeks.
+    let meta = serde_json::json!({ "tool_call": true });
+    assert!(is_claude_picker_model("claude-fable-5", &meta));
+    assert!(is_claude_picker_model("claude-somenewtier-6", &meta));
+    assert!(is_claude_picker_model("claude-opus-4-8", &meta));
+    assert!(!is_claude_picker_model("claude-3-5-sonnet-20241022", &meta));
+
+    // Unknown families rank above haiku instead of scoring zero and falling
+    // off the top-8 cut; fable outranks everything.
+    assert!(score_model(Backend::Claude, "claude-fable-5") > score_model(Backend::Claude, "sonnet"));
+    assert!(
+        score_model(Backend::Claude, "claude-somenewtier-6")
+            > score_model(Backend::Claude, "haiku")
+    );
+
+    // The curated aliases include fable, and it gets the full effort ladder.
+    let rows = fallback_model_rows();
+    assert!(rows
+        .iter()
+        .any(|(backend, model, _)| *backend == Backend::Claude && *model == "fable"));
+    assert!(is_reasoning_alias(Backend::Claude, "fable[1m]"));
+    assert!(effort_options_for(Backend::Claude, "fable").contains(&Some(EffortLevel::Max)));
+}
+
+#[test]
 fn merge_generated_rudder_md_collapses_duplicates_and_is_idempotent() {
     // Two generated blocks (prior corruption) + a stray orphan marker collapse
     // to exactly one fresh block; orchestrator content around them survives.

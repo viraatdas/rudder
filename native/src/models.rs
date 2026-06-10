@@ -86,14 +86,19 @@ pub(crate) fn model_supports_reasoning(backend: Backend, model: &str) -> bool {
         return true;
     }
     cached_model_reasoning(backend, model).unwrap_or_else(|| match backend {
-        Backend::Claude => model.contains("opus") || model.contains("sonnet"),
+        Backend::Claude => {
+            model.contains("opus") || model.contains("sonnet") || model.contains("fable")
+        }
         Backend::Codex => model.starts_with("gpt-5") || model.contains("codex"),
     })
 }
 
 pub(crate) fn is_reasoning_alias(backend: Backend, model: &str) -> bool {
     match backend {
-        Backend::Claude => matches!(model, "sonnet" | "sonnet[1m]" | "opus" | "opus[1m]"),
+        Backend::Claude => matches!(
+            model,
+            "sonnet" | "sonnet[1m]" | "opus" | "opus[1m]" | "fable" | "fable[1m]"
+        ),
         Backend::Codex => model.starts_with("gpt-5") || model.contains("codex"),
     }
 }
@@ -429,6 +434,8 @@ pub(crate) fn effort_suggestions_for(
 
 pub(crate) fn fallback_model_rows() -> Vec<(Backend, &'static str, &'static str)> {
     vec![
+        (Backend::Claude, "fable", "most capable model"),
+        (Backend::Claude, "fable[1m]", "most capable · large context"),
         (Backend::Claude, "sonnet", "default strong model"),
         (Backend::Claude, "sonnet[1m]", "large context"),
         (Backend::Claude, "opus", "strongest reasoning"),
@@ -523,9 +530,12 @@ pub(crate) fn collect_provider_models(
 }
 
 pub(crate) fn is_claude_picker_model(id: &str, model: &serde_json::Value) -> bool {
+    // No family-name allowlist: a brand-new model family (fable, and whatever
+    // comes after it) must show up in the picker straight from the models.dev
+    // cache, without a Rudder release. Only legacy 3.x-generation ids are
+    // excluded.
     id.starts_with("claude-")
         && !id.contains("3-")
-        && (id.contains("sonnet") || id.contains("opus") || id.contains("haiku"))
         && model
             .get("tool_call")
             .and_then(serde_json::Value::as_bool)
@@ -548,17 +558,19 @@ pub(crate) fn is_codex_picker_model(id: &str, model: &serde_json::Value) -> bool
 pub(crate) fn score_model(backend: Backend, id: &str) -> i32 {
     match backend {
         Backend::Claude => {
-            let mut score = 0;
-            if id.contains("sonnet") {
-                score += 40;
+            if id.contains("fable") {
+                50
+            } else if id.contains("sonnet") {
+                40
+            } else if id.contains("opus") {
+                35
+            } else if id.contains("haiku") {
+                20
+            } else {
+                // Unknown family = likely a NEW tier; rank above haiku rather
+                // than scoring zero and falling off the top-8 cut.
+                30
             }
-            if id.contains("opus") {
-                score += 35;
-            }
-            if id.contains("haiku") {
-                score += 20;
-            }
-            score
         }
         Backend::Codex => {
             let mut score = 0;

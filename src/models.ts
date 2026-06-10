@@ -224,6 +224,8 @@ function isUsableTextModel(id: string, model: ModelsDevModel): boolean {
 
 function claudeCodeAliasOptions(): ModelOption[] {
   return [
+    { label: "fable", value: "fable", detail: "most capable model" },
+    { label: "fable[1m]", value: "fable[1m]", detail: "most capable · large context" },
     { label: "sonnet", value: "sonnet" },
     { label: "sonnet[1m]", value: "sonnet[1m]" },
     { label: "opus", value: "opus" },
@@ -233,10 +235,10 @@ function claudeCodeAliasOptions(): ModelOption[] {
 }
 
 function isClaudePickerModel(id: string): boolean {
-  if (id.includes("3-")) {
-    return false;
-  }
-  return /\b(sonnet|opus|haiku)\b/.test(id);
+  // No family-name allowlist: a brand-new model family (fable, and whatever
+  // comes after it) must show up in the picker without a Rudder release. Only
+  // the legacy 3.x-generation ids are excluded.
+  return !id.includes("3-");
 }
 
 function isCodexRelevantModel(id: string): boolean {
@@ -259,9 +261,13 @@ function compareModelEntries(backend: "claude" | "codex") {
 
 function scoreClaudeModel(id: string, model: ModelsDevModel): number {
   let score = 0;
-  if (id.includes("sonnet")) score += 40;
-  if (id.includes("opus")) score += 35;
-  if (id.includes("haiku")) score += 20;
+  if (id.includes("fable")) score += 50;
+  else if (id.includes("sonnet")) score += 40;
+  else if (id.includes("opus")) score += 35;
+  else if (id.includes("haiku")) score += 20;
+  // An unknown family is likely a NEW tier; rank it above haiku rather than
+  // letting it score zero and fall off the picker cut.
+  else score += 30;
   if (model.reasoning) score += 20;
   score += recencyScore(model);
   return score;
