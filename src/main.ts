@@ -229,6 +229,14 @@ export async function main(): Promise<void> {
       await runGraphMirror(parsed);
       return;
     }
+    case "__refresh-models": {
+      // Spawned detached by the native TUI when the /model picker opens on a
+      // stale models.dev cache, so a long-lived dashboard session picks up
+      // newly released models without a restart. The picker re-reads the cache
+      // file on every render, so results appear as soon as this lands.
+      await refreshModelCache();
+      return;
+    }
     case "onboard":
       await runOnboard({
         nonInteractive: parsed.flags.nonInteractive,

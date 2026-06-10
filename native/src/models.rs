@@ -349,7 +349,49 @@ pub(crate) fn command_suggestions() -> Vec<Suggestion> {
     ]
 }
 
+/// Keep the model list dynamic for LONG-LIVED sessions: the models.dev cache
+/// refreshes at dashboard launch, but a dashboard left open for days would
+/// otherwise never see a model released mid-session. Opening the /model picker
+/// on a stale cache (>24h) fires one detached `rudder __refresh-models`;
+/// `cached_models_dev_rows` re-reads the file on every render, so the picker
+/// updates live the moment the refresh lands. At most one spawn per session.
+fn maybe_refresh_models_dev_cache() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static REFRESH_STARTED: AtomicBool = AtomicBool::new(false);
+    if cfg!(test) {
+        return;
+    }
+    let Some(path) = models_dev_cache_path() else {
+        return;
+    };
+    let stale = fs::metadata(&path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .map(|age| age > Duration::from_secs(24 * 60 * 60))
+        .unwrap_or(true);
+    if !stale || REFRESH_STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let Some(rudder) = locate_rudder_cli() else {
+        return;
+    };
+    if let Ok(mut child) = Command::new(rudder)
+        .arg("__refresh-models")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        // Reap off-thread so the child never lingers as a zombie.
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
+}
+
 pub(crate) fn model_provider_or_model_suggestions(rest: &str) -> Vec<Suggestion> {
+    maybe_refresh_models_dev_cache();
     let rest = rest.trim_start();
     if rest.is_empty() {
         return provider_suggestions("");
