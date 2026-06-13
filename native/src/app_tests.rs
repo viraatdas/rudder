@@ -1,6 +1,21 @@
 use super::*;
 
 #[test]
+fn base64_encode_matches_known_vectors() {
+    // RFC 4648 test vectors — the OSC 52 clipboard payload encoder must be exact or
+    // the terminal copies garbage.
+    assert_eq!(crate::selection::base64_encode(b""), "");
+    assert_eq!(crate::selection::base64_encode(b"f"), "Zg==");
+    assert_eq!(crate::selection::base64_encode(b"fo"), "Zm8=");
+    assert_eq!(crate::selection::base64_encode(b"foo"), "Zm9v");
+    assert_eq!(crate::selection::base64_encode(b"foob"), "Zm9vYg==");
+    assert_eq!(crate::selection::base64_encode(b"fooba"), "Zm9vYmE=");
+    assert_eq!(crate::selection::base64_encode(b"foobar"), "Zm9vYmFy");
+    // Multi-byte UTF-8 round-trips through the byte encoder.
+    assert_eq!(crate::selection::base64_encode("é".as_bytes()), "w6k=");
+}
+
+#[test]
 fn union_gitignore_merges_both_sides_without_duplicates() {
     let left = "node_modules/\n.env\n*.db\n";
     let right = "node_modules/\n.next/\n*.db\n.vercel\n";

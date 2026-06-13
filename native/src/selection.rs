@@ -172,6 +172,26 @@ pub(crate) fn copy_text_to_clipboard(text: &str) -> Result<()> {
         return Ok(());
     }
 
+    // Two channels, because no single one works everywhere:
+    //
+    // 1) OSC 52 asks the TERMINAL EMULATOR to set its own clipboard. This is the only
+    //    path that reaches the machine the user is actually sitting at when Rudder runs
+    //    over SSH or in a cloud session — a local pbcopy/xclip there would target the
+    //    remote box — and it needs no external binary, so it also covers minimal Linux.
+    // 2) A local clipboard binary covers terminals that don't honor OSC 52 (notably
+    //    macOS Terminal.app) and lets the copied text paste into other native apps.
+    //
+    // Both are best-effort; succeed if either channel accepted the text.
+    let osc = emit_osc52_clipboard(text).is_ok();
+    let local = run_platform_clipboard_command(text).is_ok();
+    if osc || local {
+        Ok(())
+    } else {
+        bail!("no clipboard channel available (terminal ignored OSC 52 and no clipboard command found)")
+    }
+}
+
+fn run_platform_clipboard_command(text: &str) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
         return run_clipboard_command("pbcopy", &[], text);
@@ -196,6 +216,50 @@ pub(crate) fn copy_text_to_clipboard(text: &str) -> Result<()> {
         }
         bail!("no clipboard command found");
     }
+}
+
+/// Emit an OSC 52 clipboard sequence (`ESC ] 52 ; c ; <base64> BEL`) to the terminal.
+/// The terminal emulator copies the payload to the system clipboard. Non-printing, so
+/// it does not disturb the rendered frame; safe to write here since event handling and
+/// drawing share one thread (no interleaving with a draw).
+pub(crate) fn emit_osc52_clipboard(text: &str) -> Result<()> {
+    let encoded = base64_encode(text.as_bytes());
+    // Many terminals (and tmux) silently drop oversized OSC 52 payloads; the local
+    // clipboard command already handles large local copies, so cap and skip here.
+    if encoded.len() > 100_000 {
+        bail!("selection too large for OSC 52");
+    }
+    let seq = format!("\x1b]52;c;{encoded}\x07");
+    let mut out = std::io::stdout().lock();
+    out.write_all(seq.as_bytes())
+        .context("failed to write OSC 52 clipboard sequence")?;
+    out.flush().context("failed to flush OSC 52 clipboard sequence")?;
+    Ok(())
+}
+
+/// Minimal standard-alphabet base64 encoder (dependency-free) for OSC 52 payloads.
+pub(crate) fn base64_encode(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((n >> 18) & 63) as usize] as char);
+        out.push(TABLE[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
 }
 
 pub(crate) fn run_clipboard_command(command: &str, args: &[&str], text: &str) -> Result<()> {
