@@ -129,8 +129,11 @@ fn write_signal_command(signal: &Path, state: &str) -> String {
 
 /// The `claude --settings` JSON: a `Stop` hook (turn ended) and a `Notification`
 /// hook matched to `idle_prompt` (paused for input), each writing the signal file.
-pub(crate) fn claude_settings_json(signal: &Path) -> String {
-    serde_json::json!({
+/// When `fast_mode` is set, also carries `fastMode: true` — the SAME settings key
+/// Claude Code's own `/fast` uses — so a launched worker runs in native fast mode
+/// (Opus, accelerated output) instead of being faked with a reduced effort level.
+pub(crate) fn claude_settings_json(signal: &Path, fast_mode: bool) -> String {
+    let mut settings = serde_json::json!({
         "hooks": {
             "Stop": [{
                 "hooks": [{ "type": "command", "command": write_signal_command(signal, "done") }]
@@ -140,8 +143,13 @@ pub(crate) fn claude_settings_json(signal: &Path) -> String {
                 "hooks": [{ "type": "command", "command": write_signal_command(signal, "input") }]
             }]
         }
-    })
-    .to_string()
+    });
+    if fast_mode {
+        if let Some(obj) = settings.as_object_mut() {
+            obj.insert("fastMode".to_string(), serde_json::Value::Bool(true));
+        }
+    }
+    settings.to_string()
 }
 
 /// The Codex `notify` script: Codex calls it with the event JSON as `$1`. We only
@@ -185,7 +193,11 @@ pub(crate) fn prepare_worker_signals(run_id: &str, backend: Backend) -> WorkerSi
         match backend {
             Backend::Claude => {
                 let settings = dir.join(format!("{run_id}-claude.json"));
-                if std::fs::write(&settings, claude_settings_json(&signal)).is_ok() {
+                // Carry the persisted /fast toggle into the worker's settings (Claude
+                // fast mode is a settings flag, not a launch flag, so this is how it
+                // reaches a spawned worker).
+                let fast_mode = crate::config::fast_mode_enabled();
+                if std::fs::write(&settings, claude_settings_json(&signal, fast_mode)).is_ok() {
                     return WorkerSignals {
                         claude_settings: Some(settings),
                         codex_notify: None,

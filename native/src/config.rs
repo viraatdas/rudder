@@ -102,6 +102,37 @@ pub(crate) fn save_auto_merge(enabled: bool) -> Result<()> {
     write_config_atomically(&path, &config)
 }
 
+/// Whether Claude Code's native fast mode is on for new agents. Stored at the
+/// config root as `fastMode` (the same key Claude Code's own settings use), so it
+/// survives a restart and so we can inject it into a worker's `--settings`. Fast
+/// mode is Opus with an accelerated, higher-cost API config — identical model and
+/// reasoning, just lower latency — NOT an effort downgrade. Claude-only.
+pub(crate) fn config_fast_mode(config: &serde_json::Value) -> Option<bool> {
+    config.get("fastMode").and_then(serde_json::Value::as_bool)
+}
+
+pub(crate) fn fast_mode_enabled() -> bool {
+    load_rudder_config()
+        .as_ref()
+        .and_then(config_fast_mode)
+        .unwrap_or(false)
+}
+
+/// Persist the `/fast` toggle so new sessions and freshly-launched workers see it.
+pub(crate) fn save_fast_mode(enabled: bool) -> Result<()> {
+    let path = rudder_config_path().context("could not determine Rudder config path")?;
+    let mut config = load_config_for_write(&path);
+    if !config.is_object() {
+        config = default_config_value();
+    }
+    ensure_config_defaults(&mut config);
+    let root = config
+        .as_object_mut()
+        .context("Rudder config root is not an object")?;
+    root.insert("fastMode".to_string(), serde_json::Value::Bool(enabled));
+    write_config_atomically(&path, &config)
+}
+
 /// Atomic temp-file + rename write shared by every config-mutating helper, so a
 /// crash mid-write can never truncate ~/.rudder/config.json.
 fn write_config_atomically(path: &Path, config: &serde_json::Value) -> Result<()> {

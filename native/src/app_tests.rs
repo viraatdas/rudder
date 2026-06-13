@@ -5213,7 +5213,7 @@ fn signal_state_parses_done_input_and_rejects_garbage() {
 #[test]
 fn claude_settings_wire_stop_and_idle_hooks_to_the_signal_file() {
     use std::path::Path;
-    let json = crate::signals::claude_settings_json(Path::new("/tmp/sig/run.json"));
+    let json = crate::signals::claude_settings_json(Path::new("/tmp/sig/run.json"), false);
     // Round-trips as valid JSON with the official hook shape.
     let v: serde_json::Value = serde_json::from_str(&json).expect("valid settings json");
     assert!(v["hooks"]["Stop"].is_array(), "has a Stop hook");
@@ -5235,6 +5235,15 @@ fn claude_settings_wire_stop_and_idle_hooks_to_the_signal_file() {
         note_cmd.contains("\"state\":\"input\""),
         "idle writes input"
     );
+    // fast_mode=false carries no fastMode key; fast_mode=true sets it (Claude Code's
+    // native fast-mode settings flag, injected into a worker's --settings).
+    assert!(v.get("fastMode").is_none(), "no fastMode unless requested");
+    let fast: serde_json::Value = serde_json::from_str(&crate::signals::claude_settings_json(
+        Path::new("/tmp/sig/run.json"),
+        true,
+    ))
+    .expect("valid settings json");
+    assert_eq!(fast["fastMode"], serde_json::Value::Bool(true), "fastMode flag set");
 }
 
 #[test]

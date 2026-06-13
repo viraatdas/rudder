@@ -348,6 +348,11 @@ struct App {
     /// automatically so its children unblock and the DAG drains hands-free. Toggled
     /// by `/automerge`. Default OFF: review-before-merge stays the norm.
     auto_merge: bool,
+    /// Whether Claude Code's native fast mode is on for NEW agents (toggled by `/fast`).
+    /// Display/UX mirror of the persisted `fastMode` config flag; the authoritative
+    /// value injected into a worker's `--settings` is read from config at launch.
+    /// Claude-only — Codex has no equivalent (its `/fast` just uses low reasoning effort).
+    fast_mode: bool,
     /// Agent ids auto-merge has already hit a conflict on; skipped on later passes so
     /// it does not retry (and spam) every tick. The user resolves + merges manually.
     auto_merge_skip: Vec<String>,
@@ -848,6 +853,11 @@ impl App {
             } else {
                 initial_auto_merge()
             },
+            fast_mode: if cfg!(test) {
+                false
+            } else {
+                config::fast_mode_enabled()
+            },
             auto_merge_skip,
             awaiting_approval: restored_queue.awaiting_approval,
             interactive_orchestrator: interactive_orchestrator(),
@@ -1078,6 +1088,13 @@ impl App {
         self.backend = backend;
         self.model = model;
         self.effort = effort;
+        // Choosing a model explicitly exits fast mode (matches "/model switches back").
+        // `/fast` re-arms it AFTER calling this. Persist so a launched worker's
+        // `--settings` no longer carries `fastMode`.
+        if self.fast_mode {
+            self.fast_mode = false;
+            let _ = config::save_fast_mode(false);
+        }
         save_model_defaults(self.backend, &self.model, self.effort)
             .err()
             .map(|error| format!("config warning: {error}"))
@@ -4839,24 +4856,56 @@ impl App {
                 true
             }
             Some("/fast") => {
-                // Fast mode, modeled on Claude Code's: the FLAGSHIP model tuned for
-                // speed (claude -> opus, codex -> gpt-5.5) at LOW effort — never a
-                // downgrade to a small model. Reuses the model-picker path so it
-                // persists and propagates to a selected main agent. (The claude CLI
-                // cannot launch with its native /fast output mode pre-enabled, so
-                // low effort is the closest launchable equivalent; toggle /fast
-                // inside a focused Claude pane for the real thing.)
+                // Match what each tool ITSELF calls fast — do not invent a preset.
+                //
+                // Claude Code: fast mode is NATIVE — the `fastMode` settings flag, which
+                // runs Opus on an accelerated (higher-cost) API config. Same model, same
+                // reasoning effort, lower latency — it is NOT an effort downgrade. So we
+                // select Opus (the only family fast mode supports) WITHOUT touching effort
+                // and persist the flag; it is injected into each new worker's `--settings`
+                // (see signals::claude_settings_json). `/fast` toggles it on/off.
+                //
+                // Codex: has no native fast mode. Its only speed lever is reasoning effort,
+                // so the faithful equivalent is the flagship at LOW effort.
                 let backend = self.backend;
-                let model = fast_model_for(backend).to_string();
-                let warning = self.set_model_defaults(backend, model, Some(EffortLevel::Low));
-                self.notice = warning.or_else(|| {
-                    Some(format!(
-                        "fast mode: {} {}({}) for NEW agents · running agents keep their model · /model switches back",
-                        self.backend.as_str(),
-                        self.model,
-                        effort_label(self.effort)
-                    ))
-                });
+                match backend {
+                    Backend::Claude => {
+                        if self.fast_mode {
+                            self.fast_mode = false;
+                            let _ = config::save_fast_mode(false);
+                            self.notice = Some(format!(
+                                "fast mode OFF · {} {} keeps its effort · running agents unaffected",
+                                self.backend.as_str(),
+                                self.model
+                            ));
+                        } else {
+                            // Fast mode only runs on Opus; select it but leave effort as-is.
+                            let model = fast_model_for(backend).to_string();
+                            let warning = self.set_model_defaults(backend, model, self.effort);
+                            self.fast_mode = true;
+                            let _ = config::save_fast_mode(true);
+                            self.notice = warning.or_else(|| {
+                                Some(format!(
+                                    "fast mode ON · {} {} ({}) for NEW agents · native Opus fast mode, full reasoning · /fast again to turn off",
+                                    self.backend.as_str(),
+                                    self.model,
+                                    effort_label(self.effort)
+                                ))
+                            });
+                        }
+                    }
+                    Backend::Codex => {
+                        let model = fast_model_for(backend).to_string();
+                        let warning = self.set_model_defaults(backend, model, Some(EffortLevel::Low));
+                        self.notice = warning.or_else(|| {
+                            Some(format!(
+                                "fast mode: {} {} (low effort) for NEW agents · codex has no native fast mode, so this lowers reasoning effort · /model switches back",
+                                self.backend.as_str(),
+                                self.model
+                            ))
+                        });
+                    }
+                }
                 true
             }
             _ => false,

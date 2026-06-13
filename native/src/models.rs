@@ -9,12 +9,15 @@ pub(crate) fn default_model_for(backend: Backend) -> &'static str {
     }
 }
 
-/// The `/fast` preset model per backend. Modeled on Claude Code's own fast mode:
-/// the FLAGSHIP model tuned for speed, never a downgrade to a small model. The
-/// claude CLI has no flag to launch with fast mode enabled (verified against
-/// `claude --help` and the settings docs; only CLAUDE_CODE_DISABLE_FAST_MODE
-/// exists), so /fast pairs the flagship with LOW effort — the closest launchable
-/// equivalent. Small/cheap tiers (haiku, spark) remain available via /model.
+/// The model `/fast` selects per backend.
+///
+/// Claude: fast mode is Opus on an accelerated API config (NOT a different or
+/// smaller model, and NOT an effort change), so `/fast` selects `opus` and enables
+/// the native `fastMode` settings flag — see the `/fast` handler and
+/// `signals::claude_settings_json`. Effort is left untouched.
+///
+/// Codex: has no native fast mode, so the closest equivalent is its flagship run
+/// at low reasoning effort (the effort is applied by the `/fast` handler, not here).
 pub(crate) fn fast_model_for(backend: Backend) -> &'static str {
     match backend {
         Backend::Claude => "opus",
