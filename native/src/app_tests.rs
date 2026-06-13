@@ -3041,7 +3041,9 @@ fn click_on_agent_row_selects_that_agent() {
     // Render once: mouse hit-testing resolves through the row map recorded from the
     // actually drawn frame (replacing the old hardcoded header-offset arithmetic).
     render_screen(&mut app, 120, 40);
-    let area = app.agents_area.expect("agents pane area recorded by render");
+    let area = app
+        .agents_area
+        .expect("agents pane area recorded by render");
     let row = app
         .agent_row_map
         .iter()
@@ -3910,7 +3912,9 @@ fn model_picker_accepts_new_claude_families_without_a_release() {
 
     // Unknown families rank above haiku instead of scoring zero and falling
     // off the top-8 cut; fable outranks everything.
-    assert!(score_model(Backend::Claude, "claude-fable-5") > score_model(Backend::Claude, "sonnet"));
+    assert!(
+        score_model(Backend::Claude, "claude-fable-5") > score_model(Backend::Claude, "sonnet")
+    );
     assert!(
         score_model(Backend::Claude, "claude-somenewtier-6")
             > score_model(Backend::Claude, "haiku")
@@ -5865,6 +5869,44 @@ fn orchestrator_skill_markers_are_consumed_once() {
     let _ = fs::remove_dir_all(&repo);
 }
 
+#[test]
+fn orchestrator_control_marker_can_stop_worker() {
+    let repo = unique_test_repo("orch-stop-marker");
+    fs::write(repo.join("RUDDER.md"), "before\nRUDDER_STOP n0\nafter\n").unwrap();
+
+    let mut app = App::new();
+    app.cwd = repo.clone();
+    app.interactive_orchestrator = true;
+    let mut orch = test_agent_run("orch-1", "plan it");
+    orch.cwd = repo.clone();
+    orch.mode = AgentMode::RudderPlan;
+    orch.backend = Backend::Claude;
+    orch.autosteered = false;
+    orch.interactive_orchestrator = true;
+    orch.status = AgentStatus::Running;
+    app.agents.push(orch);
+
+    let mut worker = test_agent_run("run-1", "do node");
+    worker.cwd = repo.clone();
+    worker.node_id = Some("n0".to_string());
+    worker.status = AgentStatus::Running;
+    app.agents.push(worker);
+
+    app.scan_orchestrator_skill_markers();
+
+    let worker = app
+        .agents
+        .iter()
+        .find(|run| run.node_id.as_deref() == Some("n0"))
+        .expect("worker row");
+    assert_eq!(worker.status, AgentStatus::Stopped);
+    let text = fs::read_to_string(repo.join("RUDDER.md")).unwrap();
+    assert!(!text.contains("RUDDER_STOP"));
+    assert!(text.contains("before") && text.contains("after"));
+
+    let _ = fs::remove_dir_all(&repo);
+}
+
 #[cfg(not(windows))]
 #[test]
 fn interactive_default_preserves_codex_planner_backend() {
@@ -6217,13 +6259,13 @@ fn orchestrator_recaptures_dag_edits_before_launch() {
 
 #[cfg(not(windows))]
 #[test]
-fn approval_stops_the_orchestrator_and_mirrors_graph() {
+fn approval_keeps_the_orchestrator_live_and_mirrors_graph() {
     // On approval the interactive orchestrator must (1) mirror the DAG into
-    // graph.json and (2) STOP — its PTY killed + status Stopped — so the single
-    // planning agent never implements; separate workers do. Both happen inside
-    // approve_planned_queue, the choke point for every approval channel.
+    // graph.json, (2) launch separate workers, and (3) stay alive as the
+    // high-level conductor. It must not implement product code, but the PTY stays
+    // available for status and control markers.
     let _env = env_guard();
-    let repo = unique_test_repo("orch-stop-on-approve");
+    let repo = unique_test_repo("orch-live-on-approve");
     let worker = repo.join("fake-worker.sh");
     write_fake_bin(&worker, FAKE_CONDUCTOR_WORKER);
     std::env::set_var("RUDDER_CODEX_BIN", &worker);
@@ -6272,7 +6314,7 @@ fn approval_stops_the_orchestrator_and_mirrors_graph() {
         app.last_mirror_signature.is_some(),
         "graph.json mirrored on approval"
     );
-    // The orchestrator row is KEPT but STOPPED: PTY killed, status Stopped.
+    // The orchestrator row is KEPT and LIVE: the conductor PTY remains available.
     let orch_after = app
         .agents
         .iter()
@@ -6280,12 +6322,12 @@ fn approval_stops_the_orchestrator_and_mirrors_graph() {
         .expect("orchestrator row kept after approval");
     assert_eq!(
         orch_after.status,
-        AgentStatus::Stopped,
-        "orchestrator is stopped on approval"
+        AgentStatus::Running,
+        "orchestrator stays live on approval"
     );
     assert!(
-        orch_after.terminal.is_none(),
-        "orchestrator PTY was killed (terminal dropped)"
+        orch_after.terminal.is_some(),
+        "orchestrator PTY remains attached"
     );
     // The plan still launched its worker (or stayed queued if the in-place jj
     // workspace prep no-ops in this bare temp repo) — same tolerance as the
@@ -6301,6 +6343,65 @@ fn approval_stops_the_orchestrator_and_mirrors_graph() {
     assert_eq!(app.agents.len(), agents_after, "no churn on re-scan");
 
     std::env::remove_var("RUDDER_CODEX_BIN");
+    let _ = fs::remove_dir_all(&repo);
+}
+
+#[cfg(not(windows))]
+#[test]
+fn task_input_routes_to_live_orchestrator_after_launch() {
+    let _env = env_guard();
+    let repo = unique_test_repo("orch-task-forward");
+    let capture = repo.join("orchestrator-input.txt");
+    let script = format!(
+        "IFS= read line; printf '%s' \"$line\" > {}; sleep 5",
+        capture.display()
+    );
+    let command = TerminalCommand::with_args("/bin/sh", vec!["-lc".to_string(), script]);
+    let pane = TerminalPane::spawn_shell_or_command(
+        Some(command),
+        TerminalPaneOptions {
+            size: TerminalSize { rows: 10, cols: 80 },
+            scrollback_lines: 100,
+            ..Default::default()
+        },
+    )
+    .expect("spawn orchestrator pty");
+
+    let mut app = App::new();
+    app.cwd = repo.clone();
+    app.interactive_orchestrator = true;
+    let mut orch = test_agent_run("orch-1", "plan it");
+    orch.cwd = repo.clone();
+    orch.mode = AgentMode::RudderPlan;
+    orch.backend = Backend::Claude;
+    orch.autosteered = false;
+    orch.interactive_orchestrator = true;
+    orch.status = AgentStatus::Running;
+    orch.terminal = Some(pane);
+    app.agents.push(orch);
+
+    let mut worker = test_agent_run("run-1", "do node");
+    worker.cwd = repo.clone();
+    worker.node_id = Some("n0".to_string());
+    worker.status = AgentStatus::Running;
+    app.agents.push(worker);
+
+    app.start_task_from_input("what is happening?");
+
+    let mut captured = String::new();
+    for _ in 0..40 {
+        if let Ok(text) = fs::read_to_string(&capture) {
+            captured = text;
+            if captured.contains("what is happening?") {
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert_eq!(captured, "what is happening?");
+    assert_eq!(app.selected_agent, 0, "the conductor stays selected");
+    assert_eq!(app.notice.as_deref(), Some("sent to orchestrator"));
+
     let _ = fs::remove_dir_all(&repo);
 }
 
@@ -6344,13 +6445,14 @@ fn approval_does_not_stop_orchestrator_in_headless_mode() {
 #[cfg(not(windows))]
 #[test]
 fn stopped_orchestrator_renders_handoff_banner() {
-    // After approval the orchestrator pane shows a hand-off banner (not a dead
-    // terminal): the DAG stays above, the bottom explains the stop + points at work.
+    // Legacy/stale stopped orchestrator rows still render a hand-off banner instead
+    // of an empty terminal: the DAG stays above, the bottom explains the stopped
+    // state + points at work.
     let _env = env_guard();
     let mut app = App::new();
     app.interactive_orchestrator = true;
 
-    // A stopped orchestrator (post-approval): RudderPlan, no terminal, Stopped.
+    // A stopped orchestrator: RudderPlan, no terminal, Stopped.
     let mut orch = test_agent_run("orch-1", "plan the work");
     orch.mode = AgentMode::RudderPlan;
     orch.status = AgentStatus::Stopped;
@@ -6647,69 +6749,13 @@ fn completed_plan_does_not_hijack_a_new_task_into_refine() {
     );
 }
 
-#[test]
-fn no_plan_active_obvious_first_task_routes_to_planner_without_dispatch_wait() {
-    let mut app = App::new();
-    app.cwd = std::env::temp_dir();
-    // No nodes queued, no orchestrator, no live plan-launched agent.
-    assert!(!app.plan_is_active(), "no plan active on a clean session");
-
-    // Obvious implementation requests route locally, so the UI does not wait for Haiku
-    // just to start the planner.
-    app.start_task_from_input("build the first feature");
-    assert!(
-        !app.dispatch_pending,
-        "local plan routing skips async dispatch"
-    );
-
-    let spawned = app.agents.last().expect("a spawned planner");
-    assert_eq!(spawned.mode, AgentMode::RudderPlan);
-    assert!(
-        !spawned.reconcile_planner,
-        "the first task with no active plan uses the INITIAL planner (replace path)"
-    );
-}
-
-#[test]
-fn no_plan_active_ambiguous_first_task_dispatches_then_routes_to_planner() {
-    let mut app = App::new();
-    app.cwd = std::env::temp_dir();
-    assert!(!app.plan_is_active(), "no plan active on a clean session");
-
-    // Ambiguous polite phrasing still goes through the async Haiku dispatcher; routing
-    // happens when the classification returns.
-    app.start_task_from_input("can you add Spotify login");
-    assert!(app.dispatch_pending, "ambiguous task begins async dispatch");
-    assert!(
-        app.agents.is_empty(),
-        "nothing spawned until dispatch returns"
-    );
-
-    // Classifier decides this is a PLAN -> routes to the headless RudderPlan planner.
-    app.dispatch_tx
-        .send(DispatchResult {
-            task: "can you add Spotify login".to_string(),
-            intent: DispatchIntent::Plan,
-        })
-        .unwrap();
-    app.poll_dispatch_worker();
-
-    assert!(!app.dispatch_pending, "dispatch resolved");
-    let spawned = app.agents.last().expect("a spawned planner");
-    assert_eq!(spawned.mode, AgentMode::RudderPlan);
-    assert!(
-        !spawned.reconcile_planner,
-        "the first task with no active plan uses the INITIAL planner (replace path)"
-    );
-}
-
 #[cfg(not(windows))]
 #[test]
-fn dispatch_oneoff_spawns_conversational_agent_in_main_checkout() {
-    // A "oneoff" classification (or /ask) spawns a single OneOff agent that runs in
-    // the MAIN checkout (no jj worktree, no node_id) and lands in the one-off section.
+fn default_task_input_starts_oneoff_agent_in_main_checkout() {
+    // Plain task input starts a single OneOff agent in the MAIN checkout. It must
+    // not auto-dispatch questions like this into the DAG planner.
     let _env = env_guard();
-    let repo = unique_test_repo("oneoff-spawn");
+    let repo = unique_test_repo("default-oneoff");
     let worker = repo.join("fake-worker.sh");
     write_fake_bin(&worker, FAKE_CONDUCTOR_WORKER);
     std::env::set_var("RUDDER_CODEX_BIN", &worker);
@@ -6717,19 +6763,18 @@ fn dispatch_oneoff_spawns_conversational_agent_in_main_checkout() {
     let mut app = App::new();
     app.cwd = repo.clone();
     app.backend = Backend::Codex;
+    assert!(!app.plan_is_active(), "no plan active on a clean session");
 
-    app.dispatch_tx
-        .send(DispatchResult {
-            task: "what does auth.js do?".to_string(),
-            intent: DispatchIntent::OneOff,
-        })
-        .unwrap();
-    app.poll_dispatch_worker();
+    app.start_task_from_input("where is the Vizzy app and is it ready to be used?");
 
     let spawned = app.agents.last().expect("a one-off agent spawned");
     assert_eq!(spawned.mode, AgentMode::OneOff);
     assert!(spawned.is_oneoff());
     assert!(spawned.node_id.is_none(), "a one-off is not a DAG node");
+    assert!(
+        !spawned.reconcile_planner,
+        "plain input must not create a planner"
+    );
     assert_eq!(
         spawned.cwd, repo,
         "a one-off runs in the MAIN checkout, not a worktree"
@@ -6746,7 +6791,33 @@ fn dispatch_oneoff_spawns_conversational_agent_in_main_checkout() {
 
 #[cfg(not(windows))]
 #[test]
-fn ask_command_forces_oneoff_without_dispatch() {
+fn plan_command_starts_orchestrator_for_dag_work() {
+    let _env = env_guard();
+    let repo = unique_test_repo("plan-cmd");
+    let worker = repo.join("fake-worker.sh");
+    write_fake_bin(&worker, FAKE_CONDUCTOR_WORKER);
+    std::env::set_var("RUDDER_CODEX_BIN", &worker);
+
+    let mut app = App::new();
+    app.cwd = repo.clone();
+    app.backend = Backend::Codex;
+
+    let handled = app.handle_command("/plan build the first feature");
+    assert!(handled, "/plan is a recognized command");
+    let spawned = app.agents.last().expect("a planner spawned by /plan");
+    assert_eq!(spawned.mode, AgentMode::RudderPlan);
+    assert!(
+        !spawned.reconcile_planner,
+        "/plan starts the initial orchestrator planner"
+    );
+
+    std::env::remove_var("RUDDER_CODEX_BIN");
+    let _ = fs::remove_dir_all(&repo);
+}
+
+#[cfg(not(windows))]
+#[test]
+fn ask_command_starts_oneoff_alias() {
     let _env = env_guard();
     let repo = unique_test_repo("ask-cmd");
     let worker = repo.join("fake-worker.sh");
@@ -6759,116 +6830,11 @@ fn ask_command_forces_oneoff_without_dispatch() {
 
     let handled = app.handle_command("/ask explain the build script");
     assert!(handled, "/ask is a recognized command");
-    assert!(!app.dispatch_pending, "/ask skips the classifier");
     let spawned = app.agents.last().expect("a one-off agent spawned by /ask");
     assert_eq!(spawned.mode, AgentMode::OneOff);
 
     std::env::remove_var("RUDDER_CODEX_BIN");
     let _ = fs::remove_dir_all(&repo);
-}
-
-#[cfg(not(windows))]
-#[test]
-fn dispatch_classifier_timeout_falls_back_to_plan() {
-    let _env = env_guard();
-    let repo = unique_test_repo("dispatch-timeout");
-    let claude = repo.join("fake-claude.sh");
-    write_fake_bin(&claude, "#!/bin/sh\nexec sleep 5\n");
-    std::env::set_var("RUDDER_CLAUDE_BIN", &claude);
-    let (tx, rx) = mpsc::channel();
-    let started = Instant::now();
-
-    spawn_dispatch_worker(tx, "parking lot telemetry".to_string());
-    let result = rx
-        .recv_timeout(Duration::from_secs(2))
-        .expect("hung classifier is killed and dispatch returns");
-
-    assert_eq!(result.intent, DispatchIntent::Plan);
-    assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "dispatcher returned within the bounded timeout"
-    );
-    std::env::remove_var("RUDDER_CLAUDE_BIN");
-    let _ = fs::remove_dir_all(&repo);
-}
-
-#[cfg(not(windows))]
-#[test]
-fn dispatch_local_oneoff_handles_docs_research_when_claude_is_unavailable() {
-    let _env = env_guard();
-    let repo = unique_test_repo("dispatch-local-docs");
-    let claude = repo.join("fake-claude.sh");
-    write_fake_bin(&claude, "#!/bin/sh\nexec sleep 5\n");
-    std::env::set_var("RUDDER_CLAUDE_BIN", &claude);
-    let (tx, rx) = mpsc::channel();
-    let started = Instant::now();
-
-    spawn_dispatch_worker(tx, "look into spotify api docs".to_string());
-    let result = rx
-        .recv_timeout(Duration::from_secs(1))
-        .expect("obvious docs research routes locally without waiting for Claude");
-
-    assert_eq!(result.intent, DispatchIntent::OneOff);
-    assert!(
-        started.elapsed() < Duration::from_millis(500),
-        "local one-off classification avoids the slow classifier"
-    );
-    std::env::remove_var("RUDDER_CLAUDE_BIN");
-    let _ = fs::remove_dir_all(&repo);
-}
-
-#[test]
-fn local_dispatch_classifier_routes_obvious_oneoff_and_plan_requests() {
-    assert_eq!(
-        classify_dispatch_intent_locally("look into spotify api docs"),
-        Some(DispatchIntent::OneOff)
-    );
-    assert_eq!(
-        classify_dispatch_intent_locally("explain how auth.js works"),
-        Some(DispatchIntent::OneOff)
-    );
-    assert_eq!(
-        classify_dispatch_intent_locally("explain how to add Spotify login"),
-        Some(DispatchIntent::OneOff)
-    );
-    assert_eq!(
-        classify_dispatch_intent_locally("build Spotify OAuth login with token refresh"),
-        Some(DispatchIntent::Plan)
-    );
-    assert_eq!(
-        classify_dispatch_intent_locally("we want to make a website for this company"),
-        Some(DispatchIntent::Plan)
-    );
-    assert_eq!(
-        classify_dispatch_intent_locally("build docs page"),
-        Some(DispatchIntent::Plan)
-    );
-    assert_eq!(
-        classify_dispatch_intent_locally("add documentation for Spotify auth"),
-        Some(DispatchIntent::Plan)
-    );
-    assert_eq!(
-        classify_dispatch_intent_locally("look into spotify api docs and build OAuth login"),
-        Some(DispatchIntent::Plan)
-    );
-    assert_eq!(
-        classify_dispatch_intent_locally("look into Stripe docs and integrate payments"),
-        Some(DispatchIntent::Plan)
-    );
-    assert_eq!(
-        classify_dispatch_intent_locally("refactor the auth flow"),
-        Some(DispatchIntent::Plan)
-    );
-    assert_eq!(
-        classify_dispatch_intent_locally("can you add Spotify login"),
-        None,
-        "polite implementation phrasing is semantic; let Haiku classify it"
-    );
-    assert_eq!(
-        classify_dispatch_intent_locally("could you build a dashboard"),
-        None,
-        "polite implementation phrasing is semantic; let Haiku classify it"
-    );
 }
 
 #[cfg(not(windows))]
@@ -7781,8 +7747,8 @@ fn task_hint_invites_adding_to_running_plan_post_launch() {
     assert!(app.plan_is_active());
     let hint = task_default_hint(&app);
     assert!(
-        hint.contains("add it to the running plan"),
-        "post-launch hint invites reconcile: {hint}"
+        hint.contains("talk to the live orchestrator"),
+        "post-launch hint points at the conductor: {hint}"
     );
 }
 
@@ -9427,7 +9393,10 @@ fn auto_merge_skip_round_trips_through_persistence() {
     app.persist_auto_merge_skip();
     assert_eq!(
         load_auto_merge_skip(&repo),
-        vec!["run-conflicted-a".to_string(), "run-conflicted-b".to_string()],
+        vec![
+            "run-conflicted-a".to_string(),
+            "run-conflicted-b".to_string()
+        ],
         "skip list round-trips through .rudder/auto-merge-skip.json"
     );
 

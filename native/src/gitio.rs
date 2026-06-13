@@ -1356,6 +1356,13 @@ pub(crate) fn auto_resolve_mechanical_conflicts(cwd: &Path, conflicted: &[String
         let Some(merged) = mechanical_merge_for(cwd, path, &parents) else {
             continue;
         };
+        // NEVER snapshot a "resolution" that still carries conflict markers (e.g. a
+        // side that was itself conflicted). Doing so would commit literal
+        // <<<<<<</=======/>>>>>>> lines into history and a reader before reinstall
+        // would see a corrupt file. Leave it to the LLM resolver instead.
+        if contains_conflict_markers(&merged) {
+            continue;
+        }
         if std::fs::write(cwd.join(path), merged).is_ok() {
             resolved_any = true;
         }
@@ -1385,9 +1392,10 @@ fn mechanical_merge_for(cwd: &Path, path: &str, parents: &[String]) -> Option<St
         // the merge, and DECISIONS.md / RUDDER_SHARED.md are append logs. Take the longest
         // (most complete) side; RUDDER.md is overwritten anyway. This is the dominant cause of
         // the N-sided conflict pileups, since every worker workspace carries its own copy.
-        "RUDDER.md" | "DECISIONS.md" | "RUDDER_SHARED.md" => {
-            sides.into_iter().max_by_key(String::len)
-        }
+        "RUDDER.md" | "DECISIONS.md" | "RUDDER_SHARED.md" => sides
+            .into_iter()
+            .filter(|side| !contains_conflict_markers(side))
+            .max_by_key(String::len),
         // .gitignore (and nested *.gitignore): append-only rule lists; union all sides.
         ".gitignore" => Some(
             sides
@@ -1409,11 +1417,27 @@ fn mechanical_merge_for(cwd: &Path, path: &str, parents: &[String]) -> Option<St
             saw.then_some(acc)
         }
         // Regenerable lock files: take the most complete side; install/build rebuilds it.
-        "package-lock.json" | "pnpm-lock.yaml" | "yarn.lock" => {
-            sides.into_iter().max_by_key(String::len)
-        }
+        "package-lock.json" | "pnpm-lock.yaml" | "yarn.lock" => sides
+            .into_iter()
+            .filter(|side| !contains_conflict_markers(side))
+            .max_by_key(String::len),
         _ => None,
     }
+}
+
+/// True if `content` still carries conflict markers — either git's
+/// (`<<<<<<<` / `=======` / `>>>>>>>`) or jj's materialized form
+/// (`<<<<<<<` / `%%%%%%%` / `+++++++` / `>>>>>>>`). A mechanical "resolution"
+/// containing any of these must be rejected so it is never written back into the
+/// working copy and snapshotted as history.
+fn contains_conflict_markers(content: &str) -> bool {
+    content.lines().any(|line| {
+        line.starts_with("<<<<<<<")
+            || line.starts_with("=======")
+            || line.starts_with(">>>>>>>")
+            || line.starts_with("%%%%%%%")
+            || line.starts_with("+++++++")
+    })
 }
 
 /// Union two `.gitignore`-style files: keep the left side's lines in order, then append

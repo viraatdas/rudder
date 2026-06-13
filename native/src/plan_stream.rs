@@ -166,7 +166,12 @@ impl PlanStreamState {
             self.saw_streaming_text = false;
             self.parse_baseline = 0;
             self.consumed = 0;
-            self.exit_plan = None;
+            // NOTE: deliberately KEEP `session_id` and `exit_plan` across a front-drain.
+            // Both are set-once / latest-wins captures (not append-accumulated), so a mid-
+            // turn ring overflow that scrolls the ExitPlanMode envelope or the session-id
+            // line out of the snapshot must not drop the authoritative plan or the resumable
+            // session — re-parsing the truncated snapshot can no longer recover either.
+            // A genuine new turn clears `exit_plan` explicitly via `begin_user_turn`.
         }
         let tail = &snapshot[self.consumed..];
         if tail.is_empty() {

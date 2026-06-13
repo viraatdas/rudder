@@ -375,6 +375,7 @@
 
       .key-map,
       .type-card,
+      .leader-card,
       .command-strip {
         border: 1px solid var(--line);
         background: var(--panel);
@@ -456,6 +457,56 @@
         font-size: clamp(18px, 2.8vw, 26px);
         line-height: 1.2;
         overflow-wrap: anywhere;
+      }
+
+      .leader-card {
+        padding: 18px;
+      }
+
+      .leader-title {
+        display: block;
+        margin-bottom: 14px;
+        color: var(--ink);
+        font-size: 14px;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      .leader-grid {
+        display: grid;
+        gap: 10px;
+      }
+
+      .leader-item {
+        display: grid;
+        grid-template-columns: minmax(142px, max-content) minmax(0, 1fr);
+        gap: 14px;
+        align-items: center;
+        padding: 10px 0;
+        border-top: 1px solid var(--soft-line);
+      }
+
+      .leader-item:first-child {
+        border-top: 0;
+        padding-top: 0;
+      }
+
+      .leader-item:last-child {
+        padding-bottom: 0;
+      }
+
+      .leader-item code {
+        color: var(--cyan);
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 13px;
+        white-space: nowrap;
+      }
+
+      .leader-item span {
+        color: var(--muted);
+        font-size: 14px;
+        line-height: 1.35;
       }
 
       .cursor {
@@ -608,6 +659,11 @@
           grid-template-columns: 1fr;
           gap: 5px;
         }
+
+        .leader-item {
+          grid-template-columns: 1fr;
+          gap: 4px;
+        }
       }
 
       @media (prefers-reduced-motion: reduce) {
@@ -730,10 +786,11 @@ rudder</code>
 
         <section class="section" aria-labelledby="shortcuts-title">
           <div class="section-head" data-reveal>
-            <h2 id="shortcuts-title">Muscle memory, not mode wrestling.</h2>
+            <h2 id="shortcuts-title">Three panes, three jumps.</h2>
             <p>
-              Three fixed pane jumps. Native Tab inside Claude and Codex. A task
-              line that starts agents instead of making you manage windows.
+              Option-1, Option-2, and Option-3 always mean Agents, Worker, and
+              Task. The Worker pane still belongs to Claude or Codex, so dashboard
+              commands from there start with the Ctrl-W leader.
             </p>
           </div>
 
@@ -741,18 +798,24 @@ rudder</code>
             <div class="key-map" data-key-map>
               <div class="key-tile">
                 <span class="key">Option-1</span>
-                <strong>Agents</strong>
-                <span>Pick the run, review status, merge, or delete.</span>
+                <strong>Agents list</strong>
+                <span>
+                  Pick a run, move with j/k, then review, merge, rename, or delete.
+                </span>
               </div>
               <div class="key-tile">
                 <span class="key">Option-2</span>
-                <strong>Worker</strong>
-                <span>Type directly into Claude Code or Codex.</span>
+                <strong>Worker terminal</strong>
+                <span>
+                  Talk directly to Claude Code or Codex. Tab and prompts stay native.
+                </span>
               </div>
               <div class="key-tile">
                 <span class="key">Option-3</span>
-                <strong>Task</strong>
-                <span>Describe a goal to plan, or add a task to a running plan.</span>
+                <strong>Task box</strong>
+                <span>
+                  Start a plan, answer planner questions, or add work to a running DAG.
+                </span>
               </div>
             </div>
 
@@ -762,11 +825,34 @@ rudder</code>
                 <div class="typed-line"><span data-type-text>build a spotify top-tracks dashboard</span><span class="cursor">_</span></div>
               </div>
 
+              <div class="leader-card">
+                <span class="leader-title">From inside Worker</span>
+                <div class="leader-grid">
+                  <div class="leader-item">
+                    <code>Ctrl-W then 1/2/3</code><span>use the same pane jumps</span>
+                  </div>
+                  <div class="leader-item">
+                    <code>Ctrl-W then v</code><span>open review for the selected agent</span>
+                  </div>
+                  <div class="leader-item">
+                    <code>Ctrl-W then m</code><span>merge the selected agent</span>
+                  </div>
+                </div>
+              </div>
+
               <div class="command-strip">
-                <div class="command-chip"><code>Tab</code><span>stays inside the worker</span></div>
-                <div class="command-chip"><code>/model</code><span>switch Claude, Codex, model, effort</span></div>
-                <div class="command-chip"><code>v</code><span>open review</span></div>
-                <div class="command-chip"><code>m</code><span>merge when ready</span></div>
+                <div class="command-chip">
+                  <code>Option-v</code><span>toggle review for the selected agent</span>
+                </div>
+                <div class="command-chip">
+                  <code>Ctrl-W</code><span>one-shot dashboard leader from any pane</span>
+                </div>
+                <div class="command-chip">
+                  <code>Tab</code><span>stays inside Claude or Codex</span>
+                </div>
+                <div class="command-chip">
+                  <code>/model</code><span>switch Claude, Codex, model, effort</span>
+                </div>
               </div>
             </div>
           </div>
@@ -822,7 +908,12 @@ rudder</code>
           const target = document.querySelector("[data-type-text]");
           if (!target) return;
 
-          const phrases = ["build a spotify top-tracks dashboard", "/model codex gpt-5.5", "add a settings page", "v review  m merge"];
+          const phrases = [
+            "build a spotify top-tracks dashboard",
+            "answer the planner's questions first",
+            "/model codex gpt-5.5",
+            "add a settings page",
+          ];
           let phraseIndex = 0;
           let charIndex = 0;
           let deleting = false;

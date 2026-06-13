@@ -306,8 +306,10 @@ pub(crate) fn collect_jsonl_files(dir: &Path, out: &mut Vec<PathBuf>, depth_limi
     }
 }
 
-/// Approximate OpenAI pricing per million tokens (input, _unused_, _unused_,
-/// cached_input). Cached input tokens are billed at a discount (~10%).
+/// Approximate OpenAI pricing per million tokens as `(input, output,
+/// cache_creation, cache_read)` — the same 4-tuple contract as `model_pricing`
+/// and `claude_model_pricing`. The cost formula multiplies slot 1 by output
+/// tokens, so do NOT treat slots 1/2 as unused. Cached input is ~10% of input.
 pub(crate) fn codex_model_pricing(model: &str) -> Option<(f64, f64, f64, f64)> {
     let m = model.to_ascii_lowercase();
     if m.starts_with("gpt-5") || m.starts_with("o3") {
@@ -330,6 +332,11 @@ pub(crate) fn codex_model_pricing(model: &str) -> Option<(f64, f64, f64, f64)> {
 /// billing-grade numbers.
 pub(crate) fn claude_model_pricing(model: &str) -> Option<(f64, f64, f64, f64)> {
     let m = model.to_ascii_lowercase();
+    // Fable is the current flagship family; price it at the flagship tier so it
+    // does not silently bill at $0.00 in /usage.
+    if m.contains("fable") {
+        return Some((15.0, 75.0, 18.75, 1.50));
+    }
     if m.contains("opus") {
         return Some((15.0, 75.0, 18.75, 1.50));
     }
@@ -338,6 +345,12 @@ pub(crate) fn claude_model_pricing(model: &str) -> Option<(f64, f64, f64, f64)> 
     }
     if m.contains("haiku") {
         return Some((0.80, 4.0, 1.00, 0.08));
+    }
+    // Any other Claude family (e.g. a newly launched model id surfaced from the
+    // dynamic model list before its pricing is known): fall back to a
+    // mid-tier (sonnet) estimate rather than reporting it as free.
+    if m.contains("claude") {
+        return Some((3.0, 15.0, 3.75, 0.30));
     }
     None
 }

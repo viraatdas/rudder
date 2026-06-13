@@ -210,6 +210,11 @@ impl TerminalPane {
                                 break;
                             }
                         }
+                        // A transient interruption (e.g. EINTR from a signal) is NOT
+                        // end-of-stream: retry rather than tearing down the reader, or a
+                        // still-running agent's output would freeze and completion would
+                        // hang on the scrape fallback. Only a real EOF/error ends the loop.
+                        Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
                         Err(_) => break,
                     }
                 }
@@ -756,8 +761,42 @@ impl TerminalPane {
 
 impl Drop for TerminalPane {
     fn drop(&mut self) {
+        self.terminate_child();
+        // Join the reader thread instead of detaching it. Once the child and
+        // all of its descendants are gone the slave PTY is fully closed, so the
+        // blocking `reader.read` returns EOF/EIO and the loop exits promptly.
+        if let Some(handle) = self.reader_thread.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl TerminalPane {
+    /// Tear down the spawned agent and everything it spawned, then reap it.
+    ///
+    /// `portable-pty` runs `setsid()` in the child's `pre_exec`, so the child
+    /// is a session/process-group leader and its pgid equals its pid. Signaling
+    /// the negative pgid hits the agent *and* its descendants (tool shells, MCP
+    /// servers, `node`), which otherwise orphan and keep holding the jj/git
+    /// worktree and the slave PTY open. We must also `wait()` the direct child
+    /// or it lingers as a zombie for the lifetime of the process.
+    fn terminate_child(&mut self) {
+        #[cfg(unix)]
+        {
+            if let Some(pid) = self.child.process_id() {
+                if pid > 1 {
+                    let pgid = pid as libc::pid_t;
+                    // SAFETY: a plain kill(2) on a process-group id; no memory
+                    // is touched. Errors (group already gone) are ignored.
+                    unsafe {
+                        libc::kill(-pgid, libc::SIGTERM);
+                        libc::kill(-pgid, libc::SIGKILL);
+                    }
+                }
+            }
+        }
         let _ = self.child.kill();
-        let _ = self.reader_thread.take();
+        let _ = self.child.wait();
     }
 }
 

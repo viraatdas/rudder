@@ -120,13 +120,28 @@ pub(crate) fn looks_like_idle_chrome(backend: Backend, line: &str) -> bool {
             {
                 return true;
             }
-            // Status bar pattern: contains " · " AND a path token starting with
-            // "~/" or "/", but is NOT a busy "interrupt" line.
-            !lower.contains("interrupt")
-                && lower.contains(" \u{00b7} ")
-                && (lower.contains(" ~/") || lower.contains(" /"))
+            // Status bar pattern: "<model> <effort> ... · <cwd>". Anchored to the
+            // bar SHAPE so ordinary output containing " · " and a slash (e.g.
+            // "foo · bar /usr/lib") cannot masquerade as the idle status bar — a
+            // false "ready" there marks a working Codex agent done mid-turn.
+            looks_like_codex_status_bar(&lower)
         }
     }
+}
+
+/// True when `lower` is Codex's bottom status bar, which ends with the cwd after a
+/// trailing " · " separator. We require that final segment to be a single path-like
+/// token (starts with `~/` or `/`, no embedded spaces) so it matches the real bar
+/// and not arbitrary prose that merely contains " · " and a slash somewhere.
+fn looks_like_codex_status_bar(lower: &str) -> bool {
+    if lower.contains("interrupt") {
+        return false;
+    }
+    let Some((_, tail)) = lower.rsplit_once(" \u{00b7} ") else {
+        return false;
+    };
+    let tail = tail.trim();
+    (tail.starts_with("~/") || tail.starts_with('/')) && !tail.contains(' ')
 }
 
 pub(crate) fn terminal_needs_user_input_from_lines(lines: &[String]) -> bool {
@@ -163,18 +178,21 @@ pub(crate) fn terminal_needs_user_input_from_lines(lines: &[String]) -> bool {
         .take(3)
         .filter(|line| normalize_terminal_line(line).is_empty())
         .count();
-    if tail_blanks == 0 && lines.len() > 6 {
-        // Cursor isn't near the bottom — likely just chatty output, not a prompt.
-        // Still allow it through if the last line clearly ends in '?'.
-        if !last.trim_end().ends_with('?') {
-            // Also allow numbered menu pattern in the last 6 rows.
-            if !has_numbered_menu_pattern(&recent_rev) {
-                return false;
-            }
-        }
+    // The cursor sits at the bottom of a real prompt, so the trailing rows are
+    // blank. When they are NOT (and the pane is taller than the recent window),
+    // there is content below the last non-empty line: the agent is emitting
+    // output, not waiting. Only an explicit numbered selection menu overrides this.
+    let cursor_near_bottom = tail_blanks > 0 || lines.len() <= 6;
+    if !cursor_near_bottom && !has_numbered_menu_pattern(&recent_rev) {
+        return false;
     }
 
-    if last.trim_end().ends_with('?') {
+    // A trailing '?' is a question prompt ONLY when the cursor is idle at the
+    // bottom. Previously any line ending in '?' returned true, so ordinary
+    // mid-turn prose ("So what does this do?") spuriously flipped the worker into
+    // the amber needs-input state. Gating on `cursor_near_bottom` keeps real
+    // questions (which end at an idle prompt) while dropping rhetorical ones.
+    if cursor_near_bottom && last.trim_end().ends_with('?') {
         return true;
     }
 
@@ -349,11 +367,26 @@ pub(crate) fn looks_busy(line: &str) -> bool {
         || lower.contains("ctrl-c to interrupt")
         || lower.contains("ctrl+c to interrupt")
         || lower.contains("thinking...")
-        || lower.contains("thinking (")
         || lower.contains("working...")
-        || lower.contains("working (")
         || lower.contains("running...")
-        || lower.contains("running (")
+        // Spinner timers like "Thinking (15s)" / "Working (3s)": the marker is
+        // immediately followed by an elapsed-time DIGIT. Requiring the digit avoids
+        // matching prose such as "running (CI)" or "thinking (about X)", which would
+        // otherwise hold a genuinely-idle worker out of completion detection.
+        || busy_timer_after(&lower, "thinking (")
+        || busy_timer_after(&lower, "working (")
+        || busy_timer_after(&lower, "running (")
+}
+
+/// True when `marker` (e.g. "thinking (") appears in `lower` immediately followed
+/// by a digit — the shape of a spinner's elapsed-time readout, not free prose.
+fn busy_timer_after(lower: &str, marker: &str) -> bool {
+    lower.split(marker).skip(1).any(|rest| {
+        rest.trim_start()
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_digit())
+    })
 }
 
 pub(crate) fn looks_like_agent_prompt(backend: Backend, line: &str) -> bool {

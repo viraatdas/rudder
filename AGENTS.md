@@ -884,24 +884,24 @@ The planner UX went through several iterations; these are the settled decisions 
   `approve_planned_queue()` → launch; no dedup ledger needed because that fn is idempotent
   (early-returns once `awaiting_approval` flips false). The prompt tells the orchestrator to WRITE
   the marker into RUDDER.md (and may also print it), only after explicit user approval, never
-  preemptively, quoting as `RUDDER_APPROVE_PLAN_TEMPLATE`. **APPROVE → GRAPH.JSON → STOP (current behaviour):** on approval `approve_planned_queue`
+  preemptively, quoting as `RUDDER_APPROVE_PLAN_TEMPLATE`. **APPROVE → GRAPH.JSON → LIVE CONDUCTOR:** on approval `approve_planned_queue`
   (1) mirrors the full DAG into `.rudder/graph.json` (`mirror_graph`), (2) launches the worker
-  fleet (`run_scheduler`), then (3) calls `stop_orchestrator_after_approval`, which KILLS the
-  interactive orchestrator's PTY (drops the terminal → `TerminalPane::drop` → `child.kill()`) and
-  marks it `Stopped` — the single planning agent has done its job and must never start implementing;
-  separate workers do. Interactive-only (headless decomposers self-exit; reconcile-fold runs are
-  left alone). The row is KEPT (Stopped) so the plan/conversation stay navigable, and
-  `render_interactive_orchestrator` shows a hand-off banner ("Plan approved. Orchestrator stopped."
-  + live worker count) in place of the dead terminal. The DAG pane survives the scheduler draining
-  `planned_nodes` via `orchestrator_dag_tasks`, which reconstructs already-launched nodes from their
-  `node_id` agents (deduped per id, latest agent wins) so the tree stays whole with live status
-  badges from `orchestrator_task_status`. The orchestrator system prompt tells it its job ends at
-  `RUDDER_APPROVE_PLAN`. NOTE: `interactive_orchestrator()` is read ONCE into the `App.interactive_orchestrator`
+  fleet (`run_scheduler`), then (3) keeps the interactive orchestrator PTY alive as a high-level
+  conductor. The orchestrator still must not implement product code itself; its post-approval job is
+  to talk with the user, inspect state read-only, and write one-shot `RUDDER_*` control markers into
+  `RUDDER.md`. The task pane forwards messages to the live orchestrator while a plan is active, so
+  high-level requests route through the conductor instead of bypassing it. The DAG pane survives the
+  scheduler draining `planned_nodes` via `orchestrator_dag_tasks`, which reconstructs already-launched
+  nodes from their `node_id` agents (deduped per id, latest agent wins) so the tree stays whole with
+  live status badges from `orchestrator_task_status`. NOTE: `interactive_orchestrator()` is read ONCE into the `App.interactive_orchestrator`
   field at construction; render/poll/key read the FIELD (not the process-global env) so parallel
   tests don't race — tests set the field directly (the headless-view render helper pins it false).
   The bottom task bar remains available; the interactive orchestrator skills are an additional
   control path generated under `.claude/skills/rudder-*`, with one-shot `RUDDER_*` control
-  markers consumed from `RUDDER.md`.
+  markers consumed from `RUDDER.md`. Marker controls include add/replan (`RUDDER_ADD_TASK`,
+  `RUDDER_REPLAN`), per-worker control (`RUDDER_MERGE`, `RUDDER_STOP`, `RUDDER_REGOAL`,
+  `RUDDER_INJECT`), and broad actions (`RUDDER_REVIEW_ALL`, `RUDDER_MERGE_ALL`,
+  `RUDDER_AUTOMERGE`).
 
 ### 14.4b Per-agent done/idle detection: official signals, scrape as fallback (`native/src/signals.rs`)
 The native TUI runs workers as INTERACTIVE `claude`/`codex` in a PTY (they idle between
@@ -936,39 +936,25 @@ Signal hygiene: hook writes are ATOMIC (`printf > tmp && mv`, v2.6.x) so the pol
 never reads a torn JSON, and `cleanup_run_signals` removes a run's three signal files on
 agent delete.
 
-### 14.4c Dispatch: one-off vs plan (`AgentMode::OneOff` + the Haiku dispatcher)
-Not every typed task wants the whole DAG. A FRESH task (no active plan) routes through
-a deterministic local classifier first, then LIGHT Haiku only for ambiguous cases:
-- **`begin_dispatch`** (start_task_from_input default branch) sets `dispatch_pending` and
-  spawns `spawn_dispatch_worker` (tasks.rs). `classify_dispatch_intent_locally` is a
-  high-confidence preflight only: it handles obvious one-offs (`look into ... docs`,
-  `explain ...`, `how to ...`) and direct imperative plans (`build`, `implement`,
-  `refactor`, multi-step work) without a model call, but defers semantic/polite phrasing
-  such as `can you add ...` to Haiku. Ambiguous requests run
-  `claude -p --model claude-haiku-4-5-20251001`
-  (`TASK_SUMMARY_MODEL`, via `claude_program()` so `RUDDER_CLAUDE_BIN` works in tests)
-  with a one-word classification prompt → `DispatchResult { task, intent }` over an mpsc
-  channel. The subprocess is bounded by `dispatch_classifier_timeout()`; timeout, no
-  claude, non-zero, unparseable output, or a leading `/goal` all fall back to **Plan**, the
-  established path, so dispatch never leaves `dispatch_pending` stuck. Do not remove the
-  local classifier: it prevents Claude auth/billing/network failures from routing obvious
-  one-off research to the orchestrator.
-- **`poll_dispatch_worker`** (in poll_agents) routes the result: `Plan` →
-  `start_rudder_plan_task` (the orchestrator); `OneOff` → `start_oneoff_task`.
-- **`start_oneoff_task`** spawns a single conversational **`AgentMode::OneOff`** agent in the
-  MAIN checkout (`create_oneoff_agent`, cwd = repo root, NO jj worktree, NO `node_id`), with
-  `oneoff_prompt` (no `/goal`, no `rudder done`, "edit directly; escalate to the planner if
-  it's big") + bypassPermissions tools. Keys forward to its PTY (converse). It is explicitly
-  excluded from selected merge / merge-all / review-all, and implicitly excluded from
-  auto-merge / graph-mirror / scheduler by `node_id`/Execute gates; `mark_run_done` just marks
-  it Done (no merge). It lives in its own **`Bucket::OneOff`** list section (`status_bucket`
+### 14.4c Default task input: one-off by default, `/plan` for DAGs
+Not every typed task wants the whole DAG, and automatic routing misclassified too many
+ordinary questions. A FRESH task (no active plan) now has a deterministic contract:
+
+- **Plain task input** goes straight to `start_oneoff_task`. It spawns a single
+  conversational **`AgentMode::OneOff`** agent in the MAIN checkout (`create_oneoff_agent`,
+  cwd = repo root, NO jj worktree, NO `node_id`), with `oneoff_prompt` (no `/goal`, no
+  `rudder done`, "edit directly; escalate to the planner if it's big") +
+  bypassPermissions tools. Keys forward to its PTY (converse). It is explicitly excluded
+  from selected merge / merge-all / review-all, and implicitly excluded from auto-merge /
+  graph-mirror / scheduler by `node_id`/Execute gates; `mark_run_done` just marks it Done
+  (no merge). It lives in its own **`Bucket::OneOff`** list section (`status_bucket`
   returns `OneOff` for it; leads `Bucket::ORDER`).
-- **Overrides** (handle_command): `/ask <text>` forces one-off (skip classify); `/plan <text>`
-  forces the orchestrator planner (re-purposed from the retired no-op). Both skip the Haiku call.
-- Ambiguous classification uses Claude Haiku (a meta-decision) regardless of the user's
-  backend; the spawned one-off uses the user's backend. A Codex-only user without `claude`
-  still gets deterministic local routing for obvious cases, and ambiguous cases fall back
-  to Plan. `/ask` always forces a one-off.
+- **`/plan <text>`** is the only fresh-request path that starts the orchestrator planner
+  and DAG approval flow. Use it for multi-worker implementation work.
+- **`/ask <text>`** is kept as an explicit alias for the default one-off path.
+- The retired Haiku dispatcher (`begin_dispatch`, `spawn_dispatch_worker`,
+  `DispatchResult`) was removed from the dashboard loop so plain questions like "where is
+  the app, is it ready to use?" cannot be routed into a planner by a classifier.
 
 ### 14.5 Conductor capabilities (BUILT vs PLANNED)
 - **Auto-expand from completion** (BUILT). A finished worker reports via **`rudder
@@ -1005,9 +991,9 @@ a deterministic local classifier first, then LIGHT Haiku only for ambiguous case
   under `/automerge`. Every grow is logged to `activity_log`.
 - **Reconcile** (BUILT). Typing a task post-launch injects ONE node
   (`reconcile_injection` → `evaluate_completed_reconcile`).
-- **Steering** (BUILT: `stop_agent_at` wired to `x`; `regoal_agent_at`/`live_inject_at`
-  are the toolkit the autonomous drift-fix uses and chat routing will use):
-  re-goal-via-session-resume, live-inject, stop. (PLANNED: edge promote/demote,
+- **Steering** (BUILT: `stop_agent_at` wired to `x`; conductor markers route to
+  `merge_agent_at`, `stop_agent_at`, `regoal_agent_at`, and `live_inject_at`):
+  merge one, stop, re-goal-via-session-resume, and live-inject. (PLANNED: edge promote/demote,
   extract-shared-node, drop, reorder.)
 - **Drift detection + fix** (BUILT). `maybe_handle_drift` (poll loop, ~5s throttle)
   predicts cross-agent collisions: agents are isolated so the signal is two RUNNING

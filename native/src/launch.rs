@@ -55,7 +55,7 @@ const ORCHESTRATOR_SKILLS: &[OrchestratorSkill] = &[
         slug: "rudder-edit-dag",
         name: "rudder-edit-dag",
         description: "Use when maintaining Rudder's task DAG in RUDDER.md or approving the plan.",
-        body: "Edit RUDDER.md outside the generated block. Keep exactly one full RUDDER_PLAN_TASKS_START / RUDDER_PLAN_TASKS_END block containing the complete task DAG. When the user explicitly approves the plan, write RUDDER_APPROVE_PLAN on its own line in RUDDER.md while keeping the plan block.",
+        body: "Before approval, edit RUDDER.md outside the generated block. Keep exactly one full RUDDER_PLAN_TASKS_START / RUDDER_PLAN_TASKS_END block containing the complete task DAG. When the user explicitly approves the plan, write RUDDER_APPROVE_PLAN on its own line in RUDDER.md while keeping the plan block. After approval, do not rewrite the plan block to control running work; use RUDDER_ADD_TASK or RUDDER_REPLAN markers instead.",
     },
     OrchestratorSkill {
         slug: "rudder-model",
@@ -91,13 +91,19 @@ const ORCHESTRATOR_SKILLS: &[OrchestratorSkill] = &[
         slug: "rudder-review-merge",
         name: "rudder-review-merge",
         description: "Use when the user asks to review all work, merge all ready work, or toggle auto-merge.",
-        body: "Write exactly one control line to RUDDER.md: RUDDER_REVIEW_ALL to start a review-all agent, RUDDER_MERGE_ALL to merge all ready work, or RUDDER_AUTOMERGE on|off|toggle to control automatic clean merges.",
+        body: "Write exactly one control line to RUDDER.md: RUDDER_REVIEW_ALL to start a review-all agent, RUDDER_MERGE_ALL to ask the dashboard to merge all ready work, RUDDER_MERGE <node-or-run-id> to merge one worker, or RUDDER_AUTOMERGE on|off|toggle to control automatic clean merges.",
     },
     OrchestratorSkill {
         slug: "rudder-plan-ask",
         name: "rudder-plan-ask",
-        description: "Use when the user explicitly asks to force a DAG plan or force a one-off ask.",
-        body: "Write RUDDER_PLAN <task> to force a DAG planner for the task, or RUDDER_ASK <question or small change> to start a one-off agent in the main checkout. Rudder consumes the marker and runs the matching action.",
+        description: "Use when the user explicitly asks to force a DAG plan, add work to the running DAG, re-plan the running DAG, or force a one-off ask.",
+        body: "Write RUDDER_ADD_TASK <task> to append one new task to the running DAG, RUDDER_REPLAN <direction> to structurally revise the running DAG, RUDDER_PLAN <task> to force a fresh DAG planner, or RUDDER_ASK <question or small change> to start a one-off agent in the main checkout. Rudder consumes the marker and runs the matching action.",
+    },
+    OrchestratorSkill {
+        slug: "rudder-worker-control",
+        name: "rudder-worker-control",
+        description: "Use when the user asks to control a specific running worker process.",
+        body: "Use node ids such as n0/n1 when available; otherwise use run ids. Write exactly one control line to RUDDER.md: RUDDER_STOP <node-or-run-id> to stop a worker, RUDDER_REGOAL <node-or-run-id> <new goal> to resume/re-goal it, RUDDER_INJECT <node-or-run-id> <message> to send a note into its live terminal, or RUDDER_MERGE <node-or-run-id> to merge one completed worker. Never target the orchestrator with these markers.",
     },
     OrchestratorSkill {
         slug: "rudder-help",
@@ -410,6 +416,49 @@ pub(crate) fn agent_command_with_orchestrator_mode(
                 .with_env("CODEX_RUDDER_SCROLLBACK_SAFE", "1")
         }
     }
+}
+
+/// Resume an INTERACTIVE Claude orchestrator session as the LIVE CONDUCTOR.
+///
+/// A structural rebase (`RUDDER_REPLAN`) runs a headless re-decompose over the
+/// conductor's session, which tears down the interactive PTY the user was
+/// talking to. Once the rebase lands we re-spawn the conductor here so the
+/// conversation continues seamlessly. This mirrors the interactive-orchestrator
+/// arm of `agent_command_with_orchestrator_mode`, but `--resume`s the existing
+/// session (carrying the whole conversation plus the rebase turn) instead of
+/// minting a fresh `--session-id`, and submits a short continuation prompt.
+/// Interactive orchestration is Claude-only, so there is no Codex variant.
+pub(crate) fn rudder_orchestrator_resume_command(
+    model: &str,
+    effort: Option<EffortLevel>,
+    session_id: &str,
+    continuation: &str,
+) -> TerminalCommand {
+    let mut args = vec![
+        // No `-p`: stay in the interactive Claude Code TUI, resuming the session.
+        "--resume".to_string(),
+        session_id.to_string(),
+        "--permission-mode".to_string(),
+        "default".to_string(),
+        "--allowedTools".to_string(),
+        "Read,Grep,Glob,LS,WebSearch,WebFetch,Bash,Edit,Write".to_string(),
+        "--append-system-prompt".to_string(),
+        orchestrator_system_prompt(),
+        "--name".to_string(),
+        "rudder-orchestrator".to_string(),
+    ];
+    if !model.trim().is_empty() {
+        args.push("--model".to_string());
+        args.push(model.to_string());
+    }
+    if let Some(effort) = effort {
+        args.push("--effort".to_string());
+        args.push(effort.as_str().to_string());
+    }
+    if !continuation.trim().is_empty() {
+        args.push(continuation.to_string());
+    }
+    TerminalCommand::with_args(claude_program(), args).with_env("CLAUDE_CODE_NO_FLICKER", "0")
 }
 
 pub(crate) fn push_codex_rudder_config_overrides(

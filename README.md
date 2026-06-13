@@ -48,11 +48,10 @@ rudder
 ```
 
 With no arguments, `rudder` opens the dashboard. Type in the bottom input and
-press `Enter`. Rudder dispatches the request: quick questions, docs/API research,
-and tiny self-contained changes open as a one-off agent in your main checkout;
-larger implementation work goes to the orchestrator, which plans a DAG and runs
-isolated workers. Use `/ask <text>` to force one-off or `/plan <text>` to force
-the orchestrator.
+press `Enter` to start a one-off agent in your main checkout. This is the default
+for questions, repo inspection, docs/API research, and small direct changes. Use
+`/plan <text>` when you want the orchestrator to plan a DAG and run isolated
+workers.
 
 If a task needs shared local context like API tokens, private URLs, account ids,
 or environment values, save it with `/share <text>` in the task input. Rudder
@@ -92,7 +91,7 @@ to `~/.rudder/config.json`.
 │ task list     │ live Claude Code or Codex terminal           │
 │ status/model  │ DAG-over-orchestrator, scrollback, review    │
 ├───────────────┴────────────────────────────────────────────┤
-│ task input: route one-off vs plan, slash commands, refine   │
+│ task input: one-off agent by default, /plan for DAGs         │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -160,8 +159,8 @@ running, Rudder also exposes matching project skills; the orchestrator can write
 | --- | --- |
 | `/model` | Pick provider, then model, then effort |
 | `/fast` | Fast mode for new agents: flagship model at low effort (Claude opus / Codex gpt-5.5); `/model` switches back |
-| `/ask <text>` | Force a one-off conversational agent in the main checkout |
-| `/plan <text>` | Force the orchestrator / DAG planner |
+| `/ask <text>` | Start a one-off conversational agent in the main checkout |
+| `/plan <text>` | Start the orchestrator / DAG planner |
 | `/share <text>` | Save gitignored shared context for all agents in `RUDDER_SHARED.md` |
 | `/main` or `/m` | Start a new main-branch agent |
 | `/review-all` | Combine completed worktrees and start a Codex review-all agent |
@@ -189,20 +188,16 @@ Your last provider, model, and effort are saved in `~/.rudder/config.json` and
 reused next time. Rudder refreshes model metadata from
 `https://models.dev/api.json` and falls back to local caches when offline.
 
-## Dispatch and planning
+## One-Off and Planning
 
 Type a fresh request in the bottom task input. When no plan is active, Rudder
-first routes it through a small Haiku dispatcher:
+starts one conversational agent in the main checkout and shows it in the
+`one-off` section. This keeps ordinary questions like "where is the app?" or "is
+it ready to use?" out of the DAG planner.
 
-- **One-off** for questions, explanations, docs/API research, repo inspection, or
-  tiny self-contained edits. This starts one conversational agent in the main
-  checkout and shows it in the `one-off` section.
-- **Plan** for building, adding, refactoring, integrating, testing, UI, docs pages,
-  or multi-step work. This starts the orchestrator. When unsure, Rudder chooses
-  the planner.
-
-The dispatcher is overrideable: ask for `/ask <text>` to skip routing and start
-one-off, or `/plan <text>` to skip routing and start the orchestrator.
+Use `/plan <text>` for planned implementation work. This starts the orchestrator,
+which decomposes the work into isolated workers. `/ask <text>` is kept as an
+explicit alias for the default one-off path.
 
 For planned work, Rudder runs a dedicated Claude Code orchestrator PTY with a DAG
 pane above it. The flow stays inside Rudder: the orchestrator researches

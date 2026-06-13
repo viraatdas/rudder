@@ -253,8 +253,8 @@ enum AgentMode {
     ReviewAll,
     Main,
     /// A single conversational agent the user talks to in the MAIN checkout for a
-    /// question or a small self-contained change — NOT a DAG node. Spawned by the
-    /// Haiku dispatcher (or /ask). Structurally like Main (main checkout, no jj
+    /// question or a small self-contained change — NOT a DAG node. Spawned by
+    /// default task input (or /ask). Structurally like Main (main checkout, no jj
     /// worktree, bypass-permissions tools), distinct in intent + its own list section.
     OneOff,
 }
@@ -337,6 +337,13 @@ struct App {
     /// `evaluate_completed_plan`. Suppresses `maybe_auto_merge` while set so the zones
     /// stay stable until the diff is applied. Cleared the moment the rebase lands or fails.
     rebasing: bool,
+    /// Set alongside `rebasing` when the rebase was triggered on the LIVE INTERACTIVE
+    /// conductor (a Claude orchestrator the user is conversing with), e.g. via the
+    /// conductor's own `RUDDER_REPLAN` marker. The rebase relaunches that row as a
+    /// headless re-decompose, which tears down the interactive PTY; this flag tells the
+    /// rebase evaluator to re-spawn the interactive conductor (resuming the same session)
+    /// once the diff lands or fails, so the user never loses the conversation.
+    rebase_restore_interactive: bool,
     /// When true, a plan node that finishes cleanly (review, no conflict) is merged
     /// automatically so its children unblock and the DAG drains hands-free. Toggled
     /// by `/automerge`. Default OFF: review-before-merge stays the norm.
@@ -443,11 +450,6 @@ struct App {
     completion_summary_tx: mpsc::Sender<CompletionSummaryResult>,
     completion_summary_rx: mpsc::Receiver<CompletionSummaryResult>,
     completion_summary_pending: HashSet<String>,
-    /// Async Haiku dispatcher: classifies a fresh task as one-off vs plan off-thread.
-    dispatch_tx: mpsc::Sender<DispatchResult>,
-    dispatch_rx: mpsc::Receiver<DispatchResult>,
-    /// A classification is in flight (exactly one at a time); suppresses duplicate submits.
-    dispatch_pending: bool,
     last_user_activity: Instant,
     mouse_debug: bool,
     mouse_debug_last: Option<String>,
@@ -675,21 +677,6 @@ struct CompletionSummaryResult {
     note: Option<serde_json::Value>,
 }
 
-/// How the Haiku dispatcher classified a fresh task: a conversational ONE-OFF (a
-/// question or small change handled by a single agent in the main checkout) or a PLAN
-/// (decompose into a DAG via the orchestrator). Defaults to Plan on any failure.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DispatchIntent {
-    OneOff,
-    Plan,
-}
-
-/// Result of an async dispatch classification: the original task + its routed intent.
-struct DispatchResult {
-    task: String,
-    intent: DispatchIntent,
-}
-
 impl AgentRun {
     fn is_main(&self) -> bool {
         self.mode == AgentMode::Main || self.id == MAIN_AGENT_ID
@@ -830,7 +817,6 @@ impl App {
         let session_started_iso = load_or_init_session_started(&cwd);
         let (task_summary_tx, task_summary_rx) = mpsc::channel();
         let (completion_summary_tx, completion_summary_rx) = mpsc::channel();
-        let (dispatch_tx, dispatch_rx) = mpsc::channel();
         let branch = current_branch_at(&cwd);
         Self {
             focus: FocusPane::Task,
@@ -853,6 +839,7 @@ impl App {
             plan_summary: restored_queue.plan_summary,
             refining: false,
             rebasing: false,
+            rebase_restore_interactive: false,
             // Restore the persisted /automerge default (tests always start OFF so
             // merge-gating assertions stay deterministic). Losing the toggle on
             // restart silently stalled mid-flight plans at every merge gate.
@@ -906,9 +893,6 @@ impl App {
             completion_summary_tx,
             completion_summary_rx,
             completion_summary_pending: HashSet::new(),
-            dispatch_tx,
-            dispatch_rx,
-            dispatch_pending: false,
             last_user_activity: Instant::now(),
             mouse_debug: env::var(MOUSE_DEBUG_ENV).is_ok_and(|value| value != "0"),
             mouse_debug_last: None,
@@ -982,10 +966,10 @@ impl App {
         SPINNER_FRAMES[(self.spinner_frame / SPINNER_TICKS_PER_FRAME) % SPINNER_FRAMES.len()]
     }
 
-    /// True while an orchestrator (a RudderPlan agent) is actively working: its
-    /// planner process is Running, or a refine is in flight. While this holds the
-    /// pane shows the "decomposing…/refining…" spinner, so the render loop must
-    /// redraw on every tick to animate it.
+    /// True while an orchestrator (a RudderPlan agent) is actively decomposing:
+    /// its planner process is Running before approval, or a refine/rebase is in
+    /// flight. A post-approval interactive orchestrator is a live conductor, not
+    /// a busy planner, so it is intentionally excluded from the spinner cadence.
     ///
     /// This deliberately keys off the planner being ALIVE, NOT off whether a plan
     /// block has parsed yet. Tying it to `extract_rudder_plan_tasks(...).is_err()`
@@ -995,12 +979,18 @@ impl App {
     /// the spinner froze, only advancing a frame per input event. Running-or-refining
     /// can never diverge that way.
     pub(crate) fn has_planning_orchestrator(&self) -> bool {
+        let plan_lifecycle_started = self.awaiting_approval
+            || !self.planned_nodes.is_empty()
+            || self.agents.iter().any(|run| run.node_id.is_some());
         self.refining
             || self.rebasing
-            || self
-                .agents
-                .iter()
-                .any(|run| run.mode == AgentMode::RudderPlan && run.status == AgentStatus::Running)
+            || self.agents.iter().any(|run| {
+                run.mode == AgentMode::RudderPlan
+                    && run.status == AgentStatus::Running
+                    && (!self.is_interactive_orchestrator_run(run)
+                        || self.awaiting_approval
+                        || !plan_lifecycle_started)
+            })
     }
 
     fn cached_diff_summary(&mut self, id: &str, cwd: &Path) -> Option<String> {
@@ -2997,12 +2987,14 @@ impl App {
         }
         self.notice = None;
 
-        // REFINE (plan-mode-style discussion): while a plan is parsed but not yet
-        // approved, a typed message is feedback to the orchestrator, not a new node.
-        // Re-run the planner with the current DAG + the feedback so it REVISES the
-        // whole plan and the DAG tree updates in place. The user iterates until they
-        // approve with Enter.
+        // REFINE / CONVERSE: while a plan is parsed but not yet approved, a typed
+        // message is feedback to the orchestrator, not a new node. Interactive
+        // orchestrators are live Claude sessions, so send the text into that PTY and
+        // let it update RUDDER.md; headless planners still use the old refine path.
         if self.awaiting_approval {
+            if self.send_to_interactive_orchestrator(input) {
+                return;
+            }
             self.refine_plan(&input);
             return;
         }
@@ -3015,14 +3007,25 @@ impl App {
             return;
         }
 
-        // CONDUCTING: a plan is already active and approved. Classify the typed message.
-        // ADDITIVE (default) → fold one node into the existing DAG (reconcile), preserving
-        // the in-flight nodes. STRUCTURAL (a pivot: "instead…", "rewrite…", or a message
-        // that reshapes a majority of the plan) → re-plan the whole DAG against the live
-        // zones (rebase), building forward on merged work. The choice is logged with its
-        // reason; a misfire is cheaply reversible. The no-plan-active first task falls
-        // through to the planner.
+        // Once a DAG has launched, keep using the live orchestrator as the
+        // high-level conversation surface even after every worker has merged. That
+        // lets the user ask for a retro, status, or a follow-up without losing the
+        // conductor context.
+        if self.agents.iter().any(|run| run.node_id.is_some())
+            && self.send_to_interactive_orchestrator(input)
+        {
+            return;
+        }
+
+        // CONDUCTING: a plan is already active and approved. Prefer the live
+        // high-level orchestrator when it exists so the user can talk to the
+        // conductor and let it decide whether to inspect, explain, add work, re-plan,
+        // merge, stop, or re-goal workers through RUDDER_* markers. Headless plans
+        // fall back to the local classifier.
         if self.plan_is_active() {
+            if self.send_to_interactive_orchestrator(input) {
+                return;
+            }
             if self.classify_new_direction(&input) {
                 self.start_plan_rebase(&input);
             } else {
@@ -3040,12 +3043,54 @@ impl App {
             return;
         }
 
-        // Default first task (no active plan): a light Haiku dispatcher decides whether
-        // this is a ONE-OFF (a question or small change → a single conversational agent in
-        // the main checkout) or a PLAN (decompose into a DAG via the orchestrator). It runs
-        // off-thread; poll_dispatch_worker routes the result. `/ask` and `/plan` (handled in
-        // handle_command above) force either path without classifying.
-        self.begin_dispatch(&input);
+        // Default first task (no active plan): start a normal one-off agent in the
+        // main checkout. Planning is explicit via `/plan <task>`, so plain
+        // questions like "where is the app, is it ready?" never get routed into a
+        // multi-worker DAG by a classifier.
+        self.start_oneoff_task(input);
+    }
+
+    fn send_to_interactive_orchestrator(&mut self, input: &str) -> bool {
+        let Some(index) = self.agents.iter().position(|run| {
+            self.is_interactive_orchestrator_run(run)
+                && run.status == AgentStatus::Running
+                && run.terminal.is_some()
+        }) else {
+            return false;
+        };
+        let write_result = {
+            let Some(terminal) = self.agents[index].terminal.as_mut() else {
+                return false;
+            };
+            terminal.write_input(format!("{input}\r").as_bytes())
+        };
+        if let Err(error) = write_result {
+            self.notice = Some(format!("could not send to orchestrator: {error}"));
+            return false;
+        }
+        let now = now_stamp();
+        if let Some(run) = self.agents.get_mut(index) {
+            run.current_prompt = input.to_string();
+            run.turns.push(AgentTurn {
+                ts: now.clone(),
+                prompt: input.to_string(),
+                source: "user".to_string(),
+            });
+            run.last_user_input_at = now;
+            run.last_worker_input_at = Some(Instant::now());
+            run.last_output_at = Instant::now();
+            run.ready_since = None;
+            run.needs_permission = false;
+            run.permission_notified = false;
+            run.needs_user_input = false;
+            run.user_input_notified = false;
+            let _ = save_native_run_record(&self.cwd, run);
+        }
+        self.selected_agent = index;
+        self.delete_pending = None;
+        self.notice = Some("sent to orchestrator".to_string());
+        self.dirty = true;
+        true
     }
 
     fn capture_shared_context_from_input(&mut self, input: &str) {
@@ -3850,15 +3895,21 @@ impl App {
             self.start_rudder_plan_task(input);
             return;
         };
-        let (backend, model, effort, session) = {
+        let (backend, model, effort, session, was_interactive) = {
             let run = &self.agents[index];
             (
                 run.backend,
                 run.model.clone(),
                 run.effort,
                 run.session_id.clone().filter(|s| !s.trim().is_empty()),
+                run.interactive_orchestrator,
             )
         };
+        // Relaunching the orchestrator below replaces the live interactive PTY with a
+        // headless re-decompose. If this WAS the interactive conductor (e.g. it emitted
+        // RUDDER_REPLAN itself), remember to re-spawn it once the rebase resolves so the
+        // user keeps the conversation. Claude-only: Codex orchestrators are headless.
+        self.rebase_restore_interactive = was_interactive && backend == Backend::Claude;
         let request = build_rebase_request(
             &self.rebase_zone_merged(),
             &self.rebase_zone_running(),
@@ -3897,8 +3948,10 @@ impl App {
             self.push_activity(format!("rebasing the plan: {}", short_task(input)));
         } else {
             // Could not relaunch: drop back to the current plan so the fleet keeps
-            // running. Nothing was changed; the rebase is simply abandoned.
+            // running. Nothing was changed; the rebase is simply abandoned (the old
+            // interactive session was never replaced), so there is nothing to restore.
             self.rebasing = false;
+            self.rebase_restore_interactive = false;
             self.notice = Some(
                 "could not relaunch the planner to rebase; the current plan still stands"
                     .to_string(),
@@ -4454,48 +4507,6 @@ impl App {
         }
     }
 
-    /// Route a fresh task. Obvious cases are classified locally and launched
-    /// synchronously; only ambiguous requests pay for the async Haiku classifier.
-    /// `poll_dispatch_worker` routes async results. Duplicate submits while one is in
-    /// flight are ignored. In tests the async classifier would shell a real `claude`, so
-    /// tests inject a `DispatchResult` and call `poll_dispatch_worker` directly.
-    fn begin_dispatch(&mut self, input: &str) {
-        let input = input.trim();
-        if input.is_empty() {
-            return;
-        }
-        if let Some(intent) = classify_dispatch_intent_locally(input) {
-            match intent {
-                DispatchIntent::OneOff => self.start_oneoff_task(input),
-                DispatchIntent::Plan => self.start_rudder_plan_task(input),
-            }
-            return;
-        }
-        if self.dispatch_pending {
-            self.notice = Some("still deciding how to handle the last request…".to_string());
-            return;
-        }
-        self.dispatch_pending = true;
-        self.notice = Some("dispatching… deciding one-off vs plan".to_string());
-        // Tests drive routing deterministically by injecting a DispatchResult + calling
-        // poll_dispatch_worker; only real runs shell the Haiku classifier off-thread.
-        #[cfg(not(test))]
-        spawn_dispatch_worker(self.dispatch_tx.clone(), input.to_string());
-        self.dirty = true;
-    }
-
-    /// Drain finished dispatch classifications and route each: a one-off spawns a single
-    /// conversational agent in the main checkout; a plan goes to the orchestrator planner.
-    fn poll_dispatch_worker(&mut self) {
-        while let Ok(result) = self.dispatch_rx.try_recv() {
-            self.dispatch_pending = false;
-            match result.intent {
-                DispatchIntent::OneOff => self.start_oneoff_task(&result.task),
-                DispatchIntent::Plan => self.start_rudder_plan_task(&result.task),
-            }
-        }
-    }
-
     /// Spawn a ONE-OFF agent: a single conversational agent in the MAIN checkout (no jj
     /// worktree, no DAG node) that the user talks to for a question or a small change. It
     /// can edit the working tree directly. Selected + focused so the user can converse
@@ -4682,11 +4693,12 @@ impl App {
                 true
             }
             Some("/plan") => {
-                // Override: force the orchestrator/DAG planner, skipping Haiku dispatch.
+                // Explicitly start the orchestrator/DAG planner. Plain task input
+                // starts a one-off agent instead.
                 let rest = command_rest(input, "/plan").trim();
                 if rest.is_empty() {
                     self.notice = Some(
-                        "usage: /plan <task> — forces the DAG planner (skip one-off dispatch); or just type a task to let Rudder decide"
+                        "usage: /plan <task> — start the DAG planner/orchestrator; plain input starts a one-off agent"
                             .to_string(),
                     );
                 } else {
@@ -4695,7 +4707,7 @@ impl App {
                 true
             }
             Some("/ask") => {
-                // Override: force a one-off conversational agent, skipping Haiku dispatch.
+                // Alias for the default: force a one-off conversational agent.
                 let rest = command_rest(input, "/ask").trim();
                 if rest.is_empty() {
                     self.notice = Some(
@@ -5421,7 +5433,8 @@ impl App {
     /// the file and refreshes `planned_nodes` whenever the parsed DAG actually changed —
     /// keeping the gate open so the user can keep refining by talking to the orchestrator.
     /// Skips when the approval marker is present (scan_orchestrator_markers owns that), and
-    /// no-ops once any worker has launched (post-approval the orchestrator is stopped).
+    /// no-ops once any worker has launched (post-approval DAG changes go through conductor
+    /// control markers like RUDDER_ADD_TASK and RUDDER_REPLAN).
     fn maybe_recapture_orchestrator_plan(&mut self) {
         if !self.awaiting_approval || self.refining || self.rebasing {
             return;
@@ -5568,6 +5581,28 @@ impl App {
             }
             return;
         }
+        if let Some(rest) = marker.strip_prefix("RUDDER_ADD_TASK") {
+            let rest = rest.trim();
+            if rest.is_empty() {
+                self.notice = Some("RUDDER_ADD_TASK requires a task".to_string());
+            } else if self.plan_is_active() {
+                self.reconcile_injection(rest);
+            } else {
+                self.start_rudder_plan_task(rest);
+            }
+            return;
+        }
+        if let Some(rest) = marker.strip_prefix("RUDDER_REPLAN") {
+            let rest = rest.trim();
+            if rest.is_empty() {
+                self.notice = Some("RUDDER_REPLAN requires a direction".to_string());
+            } else if self.plan_is_active() {
+                self.start_plan_rebase(rest);
+            } else {
+                self.start_rudder_plan_task(rest);
+            }
+            return;
+        }
         if let Some(rest) = marker.strip_prefix("RUDDER_ASK") {
             let rest = rest.trim();
             if rest.is_empty() {
@@ -5581,11 +5616,43 @@ impl App {
             self.apply_automerge_marker(rest.trim());
             return;
         }
+        if let Some(rest) = marker.strip_prefix("RUDDER_MERGE ") {
+            self.merge_agent_for_marker(rest.trim());
+            return;
+        }
+        if marker == "RUDDER_MERGE" {
+            self.notice = Some("RUDDER_MERGE requires a node id or run id".to_string());
+            return;
+        }
+        if let Some(rest) = marker.strip_prefix("RUDDER_STOP ") {
+            self.stop_agent_for_marker(rest.trim());
+            return;
+        }
+        if marker == "RUDDER_STOP" {
+            self.notice = Some("RUDDER_STOP requires a node id or run id".to_string());
+            return;
+        }
+        if let Some(rest) = marker.strip_prefix("RUDDER_REGOAL ") {
+            self.regoal_agent_for_marker(rest.trim());
+            return;
+        }
+        if marker == "RUDDER_REGOAL" {
+            self.notice = Some("RUDDER_REGOAL requires <node-or-run-id> <goal>".to_string());
+            return;
+        }
+        if let Some(rest) = marker.strip_prefix("RUDDER_INJECT ") {
+            self.inject_agent_for_marker(rest.trim());
+            return;
+        }
+        if marker == "RUDDER_INJECT" {
+            self.notice = Some("RUDDER_INJECT requires <node-or-run-id> <message>".to_string());
+            return;
+        }
         match marker {
             "RUDDER_USAGE" => self.show_usage_summary(),
             "RUDDER_HELP" => {
                 self.notice = Some(
-                    "skills: model, main, goal, usage, cloud/login, review-all, merge-all, automerge, edit DAG"
+                    "skills: model, main, goal, add/replan, merge/stop/regoal/inject, usage, cloud, review-all, automerge"
                         .to_string(),
                 );
             }
@@ -5599,6 +5666,106 @@ impl App {
                 self.request_merge_all_ready();
             }
             _ => {}
+        }
+    }
+
+    fn agent_index_for_token(&self, token: &str) -> Option<usize> {
+        let token = token.trim();
+        if token.is_empty() {
+            return None;
+        }
+        self.agents
+            .iter()
+            .position(|run| run.id == token || run.node_id.as_deref() == Some(token))
+    }
+
+    fn merge_agent_for_marker(&mut self, token: &str) {
+        let Some(index) = self.agent_index_for_token(token) else {
+            self.notice = Some(format!("RUDDER_MERGE target not found: {token}"));
+            return;
+        };
+        let run = &self.agents[index];
+        if run.is_main() || run.is_oneoff() || run.is_orchestrator() {
+            self.notice = Some("RUDDER_MERGE target is not a mergeable worker".to_string());
+            return;
+        }
+        if run.status == AgentStatus::Merged {
+            self.notice = Some(format!("{token} is already merged"));
+            return;
+        }
+        if run.worktree_path.is_none() && run.worktree_branch.is_none() {
+            self.notice = Some(format!("{token} has no workspace to merge"));
+            return;
+        }
+        let task = run.task.clone();
+        let label = run.node_id.clone().unwrap_or_else(|| run.id.clone());
+        let source_branch = run.worktree_branch.clone();
+        let worktree_path = run.worktree_path.clone();
+        let agent_id = Some(run.id.clone());
+        match self.merge_agent_at(index) {
+            Ok(()) => {
+                self.push_activity(format!("merged {label}"));
+                self.run_scheduler();
+            }
+            Err(error) => {
+                self.handle_merge_error(task, error, None, source_branch, worktree_path, agent_id);
+            }
+        }
+    }
+
+    fn stop_agent_for_marker(&mut self, token: &str) {
+        let Some(index) = self.agent_index_for_token(token) else {
+            self.notice = Some(format!("RUDDER_STOP target not found: {token}"));
+            return;
+        };
+        if self
+            .agents
+            .get(index)
+            .is_some_and(|run| run.is_orchestrator())
+        {
+            self.notice = Some("RUDDER_STOP cannot stop the orchestrator".to_string());
+            return;
+        }
+        if !self.stop_agent_at(index) {
+            self.notice = Some(format!("could not stop {token}"));
+        }
+    }
+
+    fn regoal_agent_for_marker(&mut self, rest: &str) {
+        let Some((token, goal)) = split_marker_target_payload(rest) else {
+            self.notice = Some("RUDDER_REGOAL requires <node-or-run-id> <goal>".to_string());
+            return;
+        };
+        let Some(index) = self.agent_index_for_token(token) else {
+            self.notice = Some(format!("RUDDER_REGOAL target not found: {token}"));
+            return;
+        };
+        if !self.regoal_agent_at(index, goal) {
+            self.notice = Some(format!("could not re-goal {token}"));
+        }
+    }
+
+    fn inject_agent_for_marker(&mut self, rest: &str) {
+        let Some((token, message)) = split_marker_target_payload(rest) else {
+            self.notice = Some("RUDDER_INJECT requires <node-or-run-id> <message>".to_string());
+            return;
+        };
+        let Some(index) = self.agent_index_for_token(token) else {
+            self.notice = Some(format!("RUDDER_INJECT target not found: {token}"));
+            return;
+        };
+        if self
+            .agents
+            .get(index)
+            .is_some_and(|run| run.is_orchestrator())
+        {
+            self.notice = Some("RUDDER_INJECT cannot target the orchestrator".to_string());
+            return;
+        }
+        if self.live_inject_at(index, message) {
+            self.push_activity(format!("injected note into {token}"));
+        } else {
+            self.notice = Some(format!("{token} has no live terminal for injection"));
         }
     }
 
@@ -5977,6 +6144,9 @@ impl App {
                     _ => "rebase produced no runnable plan; the current plan still stands"
                         .to_string(),
                 });
+                // Even on a no-op rebase the headless re-decompose already replaced the
+                // live conductor's PTY, so restore it rather than stranding the user.
+                self.restore_interactive_conductor_after_rebase(index);
                 self.dirty = true;
                 return;
             }
@@ -6057,7 +6227,70 @@ impl App {
             "rebased plan: +{added} added · {regoaled} re-goaled · {dropped} stopped/dropped · {kept} kept"
         ));
         self.mirror_graph();
+        // The headless re-decompose replaced the live conductor's PTY; bring the
+        // interactive conductor back so the user's conversation continues.
+        self.restore_interactive_conductor_after_rebase(index);
         self.dirty = true;
+    }
+
+    /// After a structural rebase resolves, re-spawn the LIVE INTERACTIVE conductor that
+    /// `start_plan_rebase` tore down to run the headless re-decompose. No-op unless
+    /// `rebase_restore_interactive` was armed (the rebase was on an interactive Claude
+    /// conductor) and the orchestrator row carries a resumable session. We resume that
+    /// session so the conductor keeps the full conversation plus the rebase turn, and
+    /// re-mark the row interactive + not-autosteered (matching the initial spawn) so the
+    /// completion router never treats this live session's later exit as a fresh plan.
+    fn restore_interactive_conductor_after_rebase(&mut self, index: usize) {
+        if !self.rebase_restore_interactive {
+            return;
+        }
+        self.rebase_restore_interactive = false;
+        let cwd = self.cwd.clone();
+        let Some(run) = self.agents.get_mut(index) else {
+            return;
+        };
+        let Some(session) = run.session_id.clone().filter(|s| !s.trim().is_empty()) else {
+            // No resumable session: leave the (headless) row as-is rather than
+            // minting a brand-new conductor that has lost all prior context.
+            return;
+        };
+        let command = rudder_orchestrator_resume_command(
+            &run.model,
+            run.effort,
+            &session,
+            "The plan has been rebased and is now live; the workers are implementing it. \
+             Continue conducting: answer questions and steer the fleet via RUDDER_* markers.",
+        );
+        let options = TerminalPaneOptions {
+            size: run.terminal_size.unwrap_or_default(),
+            cwd: Some(run.cwd.clone()),
+            ..TerminalPaneOptions::default()
+        };
+        match TerminalPane::spawn_shell_or_command(Some(command), options) {
+            Ok(mut terminal) => {
+                let _ = terminal.drain_output();
+                run.terminal = Some(terminal);
+                run.status = AgentStatus::Running;
+                run.completed_at = None;
+                run.last_output_at = Instant::now();
+                // Interactive conductor again, and NOT autosteered (its DAG is captured
+                // from the plan file / markers, never from a headless completed-plan exit).
+                run.interactive_orchestrator = true;
+                run.autosteered = false;
+                run.needs_permission = false;
+                run.permission_notified = false;
+                run.needs_user_input = false;
+                run.user_input_notified = false;
+                run.last_error = None;
+                let _ = save_native_run_record(&cwd, run);
+                self.push_activity("conductor live again: resumed after rebase".to_string());
+            }
+            Err(error) => {
+                // Could not respawn: surface it but keep the (now headless) row so the
+                // plan still runs; the user can keep steering via the dashboard keys.
+                self.notice = Some(format!("could not resume the live conductor: {error}"));
+            }
+        }
     }
 
     /// Append a one-line entry to the conductor activity log (bounded) and surface it
@@ -6592,11 +6825,11 @@ impl App {
         }
         if self.planned_nodes.is_empty() {
             // Degenerate approval (e.g. a rebase diffed every task away): clear the
-            // gate, and still STOP the orchestrator so the invariant "approved ->
-            // orchestrator stopped" holds even when there is nothing to launch.
+            // gate. Keep the interactive orchestrator alive so the user can keep
+            // talking to the conductor even when there is nothing to launch.
             self.awaiting_approval = false;
             self.persist_plan_queue();
-            self.stop_orchestrator_after_approval();
+            self.keep_orchestrator_after_approval();
             return;
         }
         self.awaiting_approval = false;
@@ -6629,25 +6862,20 @@ impl App {
         // Drain immediately so a ready node moves todo->in progress without waiting
         // a full scheduler interval (covers the trivial 1-node case visibly).
         self.run_scheduler();
-        // STOP the planning agent. The plan is approved and separate worker agents are
-        // now implementing each node, so the single interactive orchestrator has done
-        // its job and must NEVER start implementing itself. Interactive-only; the
-        // headless decomposer exits on its own.
-        self.stop_orchestrator_after_approval();
+        // Keep the interactive orchestrator alive as the high-level conductor. It
+        // remains read-only for repository files, but can explain progress and write
+        // RUDDER_* control markers that the dashboard consumes.
+        self.keep_orchestrator_after_approval();
         self.dirty = true;
     }
 
-    /// After a plan is approved and its workers launched, the interactive orchestrator
-    /// has done its job: the DAG is captured into graph.json and SEPARATE worker agents
-    /// implement each node. The single planning agent must never start implementing, so
-    /// KILL its PTY (dropping the terminal triggers `TerminalPane::drop` -> child.kill())
-    /// and mark it Stopped. The row is KEPT (Stopped) so the plan + conversation stay
-    /// navigable and the DAG pane still renders above it. No-op for the headless
-    /// decomposer (autosteered; it exits on its own) and for reconcile planners (the
-    /// short-lived fold runs that must keep running to update the plan).
-    fn stop_orchestrator_after_approval(&mut self) {
+    /// After approval, the interactive orchestrator stops being the plan author and
+    /// becomes the live conductor. It stays in the worker pane, can answer high-level
+    /// questions, and can control the worker fleet through consumed RUDDER_* markers.
+    /// Repository implementation remains delegated to the separate worker agents.
+    fn keep_orchestrator_after_approval(&mut self) {
         let cwd = self.cwd.clone();
-        let mut stopped = false;
+        let mut kept = false;
         for run in self.agents.iter_mut() {
             if run.mode != AgentMode::RudderPlan
                 || run.reconcile_planner
@@ -6657,20 +6885,26 @@ impl App {
             {
                 continue;
             }
-            run.terminal = None;
-            run.review_terminal = None;
-            run.status = AgentStatus::Stopped;
-            run.completed_at = Some(Instant::now());
             run.needs_permission = false;
             run.permission_notified = false;
             run.needs_user_input = false;
             run.user_input_notified = false;
+            // CRITICAL: clear the autosteer flag now that the plan is approved.
+            // The completion router in `poll_agents` (and `evaluate_completed_plan`
+            // itself) only treats a Done RudderPlan run as a freshly-captured plan
+            // while `autosteered` is true. The post-approval conductor is a live
+            // session that CAN exit later (model ends its turn, `/exit`, crash);
+            // if it were still autosteered, that exit would route through
+            // `evaluate_completed_plan`, re-set `awaiting_approval`, and re-gate the
+            // already-running fleet with a bogus "plan ready" prompt. Clearing it
+            // makes a post-approval exit a no-op for plan capture.
+            run.autosteered = false;
             let _ = save_native_run_record(&cwd, run);
-            stopped = true;
+            kept = true;
         }
-        if stopped {
+        if kept {
             self.push_activity(
-                "orchestrator stopped: plan approved, workers are implementing the DAG".to_string(),
+                "orchestrator live: plan approved, workers are implementing the DAG".to_string(),
             );
             self.dirty = true;
         }
@@ -8437,7 +8671,6 @@ What to do\n\
     fn poll_agents(&mut self) {
         self.poll_task_summary_workers();
         self.poll_completion_summary_workers();
-        self.poll_dispatch_worker();
 
         if self.last_cloud_check.elapsed() >= Duration::from_secs(2) {
             let cloud = read_cloud_summary();
@@ -8950,6 +9183,18 @@ fn command_rest<'a>(input: &'a str, command: &str) -> &'a str {
     input.trim_start().strip_prefix(command).unwrap_or_default()
 }
 
+fn split_marker_target_payload(value: &str) -> Option<(&str, &str)> {
+    let value = value.trim();
+    let mut parts = value.splitn(2, char::is_whitespace);
+    let target = parts.next()?.trim();
+    let payload = parts.next()?.trim();
+    if target.is_empty() || payload.is_empty() {
+        None
+    } else {
+        Some((target, payload))
+    }
+}
+
 fn run_mouse_test(mode: &str) -> Result<()> {
     match mode {
         "raw" => run_mouse_test_raw(),
@@ -9347,7 +9592,13 @@ fn is_orchestrator_skill_marker(line: &str) -> bool {
         "RUDDER_CLOUD",
         "RUDDER_REVIEW_ALL",
         "RUDDER_MERGE_ALL",
+        "RUDDER_MERGE",
+        "RUDDER_STOP",
+        "RUDDER_REGOAL",
+        "RUDDER_INJECT",
         "RUDDER_AUTOMERGE",
+        "RUDDER_ADD_TASK",
+        "RUDDER_REPLAN",
         "RUDDER_PLAN",
         "RUDDER_ASK",
     ]

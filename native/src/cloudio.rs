@@ -75,14 +75,33 @@ pub(crate) fn cloud_workspace_label(workspace: Option<&CloudWorkspaceStatus>) ->
 
 pub(crate) fn query_cloud_workspace_status(cwd: &Path) -> Option<CloudWorkspaceStatus> {
     let rudder = locate_rudder_cli()?;
-    let output = Command::new(rudder)
+    let mut child = Command::new(rudder)
         .args(["cloud", "workspace", "status", "--json"])
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .output()
+        .spawn()
         .ok()?;
+    // Bound the wait. A slow or unreachable cloud relay would otherwise let the CLI
+    // hang forever, wedging the status-feed caller with no deadline. Poll for exit
+    // and kill the child if it overruns, treating an overrun as "status unavailable".
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(_) => return None,
+        }
+    }
+    let output = child.wait_with_output().ok()?;
     if !output.status.success() {
         return None;
     }

@@ -85,12 +85,17 @@ pub(crate) fn model_supports_reasoning(backend: Backend, model: &str) -> bool {
     if is_reasoning_alias(backend, model) {
         return true;
     }
-    cached_model_reasoning(backend, model).unwrap_or_else(|| match backend {
+    let heuristic = match backend {
         Backend::Claude => {
             model.contains("opus") || model.contains("sonnet") || model.contains("fable")
         }
         Backend::Codex => model.starts_with("gpt-5") || model.contains("codex"),
-    })
+    };
+    // OR the heuristic with the cache rather than letting the cache override it: a
+    // stale or wrong models.dev entry (`reasoning: false`) must never REMOVE the
+    // High/XHigh/Max effort options from a family we know reasons. The cache can
+    // still ADD reasoning for ids the heuristic doesn't recognize.
+    heuristic || cached_model_reasoning(backend, model).unwrap_or(false)
 }
 
 pub(crate) fn is_reasoning_alias(backend: Backend, model: &str) -> bool {
@@ -631,7 +636,10 @@ pub(crate) fn score_model(backend: Backend, id: &str) -> i32 {
 }
 
 pub(crate) fn models_dev_cache_path() -> Option<PathBuf> {
+    // Treat an EMPTY RUDDER_HOME as unset (matching `config.rs`), or the cache would
+    // resolve to a cwd-relative `models-dev.json` and split from the config it pairs with.
     std::env::var_os("RUDDER_HOME")
+        .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".rudder")))
         .map(|home| home.join("models-dev.json"))

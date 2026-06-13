@@ -8,6 +8,34 @@ pub(crate) fn load_rudder_config() -> Option<serde_json::Value> {
     serde_json::from_str(&raw).ok()
 }
 
+/// Load the config for a mutating write without ever silently discarding a
+/// user's settings.
+///
+/// `load_rudder_config` collapses both "no file" and "file present but
+/// unparseable" into `None`. If a saver treated that `None` as "start from
+/// defaults", a single transiently-corrupt file (an external editor mid-save,
+/// a partial write from an older build) would be overwritten on the next
+/// `/model` or `/automerge` toggle, wiping `backends`, `mergeStrategy`,
+/// `orchestrator.maxParallel`, etc. Here we distinguish the two cases: a
+/// present-but-unparseable file is copied aside to `config.json.corrupt` so the
+/// user can recover it, and only then do we fall back to defaults.
+fn load_config_for_write(path: &Path) -> serde_json::Value {
+    match fs::read_to_string(path) {
+        Ok(raw) => match serde_json::from_str::<serde_json::Value>(&raw) {
+            Ok(value) => value,
+            Err(_) => {
+                if !raw.trim().is_empty() {
+                    let backup = path.with_extension("json.corrupt");
+                    let _ = fs::write(&backup, &raw);
+                }
+                default_config_value()
+            }
+        },
+        // Absent (or unreadable) file: a fresh defaults document is correct.
+        Err(_) => default_config_value(),
+    }
+}
+
 pub(crate) fn config_backend(config: &serde_json::Value) -> Option<Backend> {
     config
         .get("lastUsedBackend")
@@ -62,7 +90,7 @@ pub(crate) fn initial_auto_merge() -> bool {
 /// Persist the `/automerge` toggle so the next session starts in the same mode.
 pub(crate) fn save_auto_merge(enabled: bool) -> Result<()> {
     let path = rudder_config_path().context("could not determine Rudder config path")?;
-    let mut config = load_rudder_config().unwrap_or_else(default_config_value);
+    let mut config = load_config_for_write(&path);
     if !config.is_object() {
         config = default_config_value();
     }
@@ -135,7 +163,7 @@ pub(crate) fn save_model_defaults(
     effort: Option<EffortLevel>,
 ) -> Result<()> {
     let path = rudder_config_path().context("could not determine Rudder config path")?;
-    let mut config = load_rudder_config().unwrap_or_else(default_config_value);
+    let mut config = load_config_for_write(&path);
     if !config.is_object() {
         config = default_config_value();
     }

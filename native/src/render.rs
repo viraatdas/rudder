@@ -2987,11 +2987,15 @@ pub(crate) fn task_default_hint(app: &App) -> &'static str {
     if app.planner_paused_for_input {
         "↳ the planner asked a question — answer here or in the orchestrator pane"
     } else if app.awaiting_approval {
-        "type to refine the plan, or press Enter to approve  ·  Option-1/2/3 or ^W pane"
+        "type to talk to the orchestrator, or press Enter to approve  ·  Option-1/2/3 or ^W pane"
     } else if app.plan_is_active() {
-        "type a task to add it to the running plan (shows up in the orchestrator DAG)  ·  ^W pane"
+        "type to talk to the live orchestrator; it can add, re-plan, merge, stop, or re-goal workers  ·  ^W pane"
+    } else if app.agents.iter().any(|run| run.node_id.is_some())
+        && app.has_running_interactive_orchestrator()
+    {
+        "type to talk to the live orchestrator for status, retro, or follow-up control  ·  ^W pane"
     } else {
-        "type a task to route one-off vs plan  ·  Option-1/2/3 or ^W pane"
+        "type to start a one-off agent; use /plan for a DAG  ·  Option-1/2/3 or ^W pane"
     }
 }
 
