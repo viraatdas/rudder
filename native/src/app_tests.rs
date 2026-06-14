@@ -5556,8 +5556,8 @@ fn selected_agent_row_renders_a_visible_marker() {
     app.selected_agent = 1;
     let screen = render_screen(&mut app, 120, 40);
     assert!(
-        screen.contains('\u{25b8}'),
-        "the selected agent row shows the marker glyph:\n{screen}"
+        screen.contains('\u{25b6}'),
+        "the selected agent row shows the marker glyph (big ▶ arrow):\n{screen}"
     );
 }
 

@@ -186,15 +186,25 @@ pub(crate) fn push_agent_row_with_trailing<'a>(
     // tree from either pane), so its marker + title use the accent color + BOLD
     // unconditionally instead of fading to FAINT the way accent_style(false) did — that
     // fade is why the arrow was sometimes invisible. A filled glyph reads better than ">".
-    let selected_style = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
-    let marker = if selected { "▸ " } else { "  " };
+    // A selected row must pop unmistakably from EITHER pane (you navigate the tree
+    // from both). The marker is a big, bold, slow-blinking arrow in the accent color,
+    // and the title gets a solid accent "pill" (white ink on teal) so the highlighted
+    // agent reads at a glance instead of a faint one-shade shift.
+    let selected_marker_style = Style::default()
+        .fg(ACCENT)
+        .add_modifier(Modifier::BOLD | Modifier::SLOW_BLINK);
+    let selected_label_style = Style::default()
+        .fg(PAPER)
+        .bg(ACCENT)
+        .add_modifier(Modifier::BOLD);
+    let marker = if selected { "▶ " } else { "  " };
     let marker_style = if selected {
-        selected_style
+        selected_marker_style
     } else {
         accent_style(focused)
     };
     let task_style = if selected {
-        selected_style
+        selected_label_style
     } else {
         pane_text_style(focused)
     };
@@ -1063,7 +1073,7 @@ fn push_orchestrator_row<'a>(
 ) {
     let row_start = lines.len();
     let selected = index == app.selected_agent;
-    let marker = if selected { "> " } else { "  " };
+    let marker = if selected { "▶ " } else { "  " };
     let label = if selected && app.rename_input.is_some() {
         format!("✎ {}", app.rename_input.clone().unwrap_or_default())
     } else if agent.task_summary.trim().is_empty() {
@@ -1071,13 +1081,25 @@ fn push_orchestrator_row<'a>(
     } else {
         agent.task_summary.clone()
     };
+    // Match the agent rows: a slow-blinking accent arrow + a solid accent pill on the
+    // selected title so the highlighted orchestrator reads at a glance.
+    let marker_style = if selected {
+        Style::default()
+            .fg(ACCENT)
+            .add_modifier(Modifier::BOLD | Modifier::SLOW_BLINK)
+    } else {
+        accent_style(focused)
+    };
     let label_style = if selected {
-        Style::default().fg(ACCENT)
+        Style::default()
+            .fg(PAPER)
+            .bg(ACCENT)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(ACCENT)
     };
     lines.push(ListItem::new(Line::from(vec![
-        Span::styled(marker, accent_style(focused)),
+        Span::styled(marker, marker_style),
         Span::styled(format!("{ORCH_MARK} "), label_style),
         Span::styled(
             truncate_chars(&label, task_width.saturating_sub(2)),
