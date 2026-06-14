@@ -1167,6 +1167,16 @@ pub(crate) fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             ))),
         );
     }
+    if let Some(url) = &app.board_url {
+        lines.insert(
+            lines.len() - 1,
+            ListItem::new(Line::from(vec![
+                Span::styled("\u{25b8} ", accent_style(focused)),
+                Span::styled(format!("web ui: {url}"), pane_text_style(focused)),
+                Span::styled("  (o)", muted_style(focused)),
+            ])),
+        );
+    }
     if is_cloud_worker_session() {
         // Only surface cloud status when this dashboard is actually running
         // inside a cloud worker. Showing "cloud connected" in a plain local

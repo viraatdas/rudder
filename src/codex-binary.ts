@@ -25,12 +25,21 @@ export const CODEX_RUDDER_CONFIG_ARGS = [
 ];
 
 export async function codexEnvVars(): Promise<Record<string, string>> {
-  const codex = await ensureRudderCodexBinary();
-  return {
-    RUDDER_CODEX_BIN: codex,
-    RUDDER_CODEX_VERSION: RUDDER_CODEX_RELEASE,
-    CODEX_RUDDER_SCROLLBACK_SAFE: "1",
-  };
+  try {
+    const codex = await ensureRudderCodexBinary();
+    return {
+      RUDDER_CODEX_BIN: codex,
+      RUDDER_CODEX_VERSION: RUDDER_CODEX_RELEASE,
+      CODEX_RUDDER_SCROLLBACK_SAFE: "1",
+    };
+  } catch {
+    // Codex is OPTIONAL. On a platform with no managed Rudder Codex binary (e.g. a
+    // linux/x64 cloud worker), enriching the env must not crash non-codex flows —
+    // the dashboard preflight, and claude/acpx agents. Returning no codex env lets
+    // them run; an EXPLICIT codex agent launch still hard-fails with a clear error
+    // because backends/run-manager call ensureRudderCodexBinary() directly first.
+    return {};
+  }
 }
 
 export async function codexLaunchEnv(base: NodeJS.ProcessEnv = process.env): Promise<NodeJS.ProcessEnv> {

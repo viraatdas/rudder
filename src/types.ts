@@ -511,6 +511,15 @@ export type MemoryEntry = {
   ts?: string;
 };
 
+// One line of the live narration feed (.rudder/activity.jsonl), surfaced in the
+// web board's Activity panel. `kind` distinguishes real conductor/steer events
+// from the periodic liveness heartbeat so the UI can style them differently.
+export type ActivityEntry = {
+  text: string;
+  kind: "action" | "heartbeat";
+  ts?: string;
+};
+
 export type BoardSnapshot = {
   slug: string;
   name: string;
@@ -519,4 +528,5 @@ export type BoardSnapshot = {
   edges: BoardEdge[];
   gates: PlanGate[];
   memory: MemoryEntry[];
+  activity?: ActivityEntry[];
 };

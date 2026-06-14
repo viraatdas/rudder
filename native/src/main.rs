@@ -136,6 +136,7 @@ const AGENT_PANE_HINTS: &[&str] = &[
     "R review all",
     "m merge",
     "M merge all",
+    "o web ui",
     "x stop",
     "dd delete",
     "P model",
@@ -356,6 +357,11 @@ struct App {
     /// Agent ids auto-merge has already hit a conflict on; skipped on later passes so
     /// it does not retry (and spam) every tick. The user resolves + merges manually.
     auto_merge_skip: Vec<String>,
+    /// Localhost URL of the live web board (http://127.0.0.1:PORT), passed in by the
+    /// Node parent via RUDDER_BOARD_URL when the in-process board daemon is running.
+    /// None when launched without a board. Surfaced in the agents pane + opened by
+    /// `/web` and the `o` key so users can live-monitor and steer from the browser.
+    board_url: Option<String>,
     /// While true, a plan has been parsed into `planned_nodes` but is awaiting the
     /// user's APPROVAL gate: nothing launches. Enter approves (clears this and runs
     /// the scheduler); d removes the selected node, or discards the whole plan when
@@ -443,6 +449,12 @@ struct App {
     cloud_connected: bool,
     cloud_runtime: Option<String>,
     last_cloud_check: Instant,
+    /// Throttle for the web-board steer inbox poll (.rudder/steer/*.json): checked
+    /// ~once/sec from poll_agents so a browser "steer" reaches the right agent's PTY.
+    last_steer_poll: Instant,
+    /// Throttle for the periodic activity-feed heartbeat: emits a one-line "what's
+    /// happening" status into .rudder/activity.jsonl every ~45s while work is live.
+    last_heartbeat_emit: Instant,
     cloud_workspace: Option<CloudWorkspaceStatus>,
     last_workspace_check: Option<Instant>,
     workspace_status_rx: Option<mpsc::Receiver<Option<CloudWorkspaceStatus>>>,
@@ -859,6 +871,14 @@ impl App {
                 config::fast_mode_enabled()
             },
             auto_merge_skip,
+            board_url: if cfg!(test) {
+                None
+            } else {
+                env::var("RUDDER_BOARD_URL")
+                    .ok()
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty())
+            },
             awaiting_approval: restored_queue.awaiting_approval,
             interactive_orchestrator: interactive_orchestrator(),
             planner_paused_for_input: false,
@@ -894,6 +914,8 @@ impl App {
             cloud_connected: cloud.connected,
             cloud_runtime: cloud.runtime,
             last_cloud_check: Instant::now(),
+            last_steer_poll: Instant::now(),
+            last_heartbeat_emit: Instant::now(),
             cloud_workspace: None,
             last_workspace_check: None,
             workspace_status_rx: None,
@@ -1380,6 +1402,7 @@ impl App {
                 }
             }
             KeyCode::Char('P') => self.open_main_model_switcher(),
+            KeyCode::Char('o') => self.open_web_ui(),
             _ => {}
         }
         false
@@ -4764,7 +4787,7 @@ impl App {
             }
             Some("/help") => {
                 self.notice = Some(
-                    "panes: Option-1/2/3 or ^W · keys: j/k select · Enter focus · v diff · m merge · M merge all · R review all · g nest · x stop · dd delete · P model — commands: /model /fast /automerge /merge-all /review-all /main /ask /plan /share /usage /goal /cloud — DAG node ids (n0, n1…) match the agent rows and the worker pane title"
+                    "panes: Option-1/2/3 or ^W · keys: j/k select · Enter focus · v diff · m merge · M merge all · R review all · g nest · o web ui · x stop · dd delete · P model — commands: /model /fast /automerge /merge-all /review-all /main /ask /plan /share /usage /goal /cloud /web — DAG node ids (n0, n1…) match the agent rows and the worker pane title"
                         .to_string(),
                 );
                 true
@@ -4906,6 +4929,10 @@ impl App {
                         });
                     }
                 }
+                true
+            }
+            Some("/web") | Some("/ui") | Some("/board") => {
+                self.open_web_ui();
                 true
             }
             _ => false,
@@ -6348,6 +6375,9 @@ impl App {
     fn push_activity(&mut self, msg: impl Into<String>) {
         let msg = msg.into();
         self.notice = Some(msg.clone());
+        // Mirror every conductor/steer line into the append-only narration stream the
+        // web board tails, so "what's happening" shows up live in the browser too.
+        self.append_activity_jsonl(&msg, "action");
         self.activity_log.push(msg);
         const MAX_ACTIVITY: usize = 200;
         if self.activity_log.len() > MAX_ACTIVITY {
@@ -6365,6 +6395,167 @@ impl App {
         // so a deduped repeat (same decision re-hit every tick) does not spam either surface.
         if append_conductor_decision(&self.cwd, title, what, why) {
             self.push_activity(what.to_string());
+        }
+    }
+
+    /// Append a single event line to `.rudder/activity.jsonl` — the append-only
+    /// narration stream the web board tails to show "what's happening" live. Best
+    /// effort and bounded: when the file grows past ~512KB it is rewritten to its
+    /// tail so a long session never grows it without limit. `kind` is "action" for
+    /// real conductor/steer events and "heartbeat" for the periodic liveness ping.
+    fn append_activity_jsonl(&self, text: &str, kind: &str) {
+        let dir = self.cwd.join(".rudder");
+        if std::fs::create_dir_all(&dir).is_err() {
+            return;
+        }
+        let path = dir.join("activity.jsonl");
+        if let Ok(meta) = std::fs::metadata(&path) {
+            if meta.len() > 512 * 1024 {
+                if let Ok(existing) = std::fs::read_to_string(&path) {
+                    let mut tail: Vec<&str> = existing.lines().rev().take(400).collect();
+                    tail.reverse();
+                    let trimmed = tail.join("\n");
+                    let tmp = path.with_extension(format!("jsonl.{}.tmp", std::process::id()));
+                    if std::fs::write(&tmp, format!("{trimmed}\n")).is_ok() {
+                        let _ = std::fs::rename(&tmp, &path);
+                    }
+                }
+            }
+        }
+        let line = serde_json::json!({ "ts": now_stamp(), "text": text, "kind": kind });
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            use std::io::Write as _;
+            let _ = writeln!(file, "{line}");
+        }
+    }
+
+    /// Periodic activity-feed heartbeat: ~every 45s while at least one worker is
+    /// live, append a one-line status summary to the narration stream so the web
+    /// board shows the fleet is alive even when the conductor is mid-step and
+    /// silent. Ephemeral (jsonl only) — never touches DECISIONS.md or self.notice.
+    fn maybe_emit_heartbeat(&mut self) {
+        if self.last_heartbeat_emit.elapsed() < Duration::from_secs(45) {
+            return;
+        }
+        self.last_heartbeat_emit = Instant::now();
+        let total = self
+            .agents
+            .iter()
+            .filter(|run| !run.is_orchestrator())
+            .count();
+        if total == 0 {
+            return;
+        }
+        let live = self
+            .agents
+            .iter()
+            .filter(|run| !run.is_orchestrator() && run.terminal.is_some())
+            .count();
+        let summary = if live > 0 {
+            format!("{live} of {total} worker(s) active")
+        } else {
+            format!("{total} worker(s) idle, awaiting review or merge")
+        };
+        self.append_activity_jsonl(&summary, "heartbeat");
+    }
+
+    /// Poll the web board's steer inbox (`.rudder/steer/*.json`) and deliver each
+    /// instruction into the matching agent's live PTY, then consume the file. The
+    /// board writes one JSON file per steer request: `{"taskId": "<node-or-run-id
+    /// or 'conductor'>", "instruction": "<text>"}`. This is the browser -> running
+    /// agent control path; it mirrors `inject_agent_for_marker` but the source is a
+    /// file rather than a RUDDER_INJECT PTY marker. Files are consumed before
+    /// delivery so a failed inject never re-fires on the next poll.
+    fn poll_steer_inbox(&mut self) {
+        let dir = self.cwd.join(".rudder").join("steer");
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(_) => return,
+        };
+        let mut requests: Vec<(std::path::PathBuf, String, String)> = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let parsed = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
+            let Some(value) = parsed else {
+                let _ = std::fs::remove_file(&path);
+                continue;
+            };
+            let task_id = value
+                .get("taskId")
+                .or_else(|| value.get("id"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let instruction = value
+                .get("instruction")
+                .or_else(|| value.get("text"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            requests.push((path, task_id, instruction));
+        }
+        // Stable order so multiple queued steers apply in filename (timestamp) order.
+        requests.sort_by(|a, b| a.0.cmp(&b.0));
+        for (path, task_id, instruction) in requests {
+            // Consume first: a delivery failure must not re-inject in a loop.
+            let _ = std::fs::remove_file(&path);
+            if instruction.is_empty() {
+                continue;
+            }
+            self.deliver_steer(&task_id, &instruction);
+        }
+    }
+
+    /// Route one steer instruction from the web board to its target agent (or the
+    /// live conductor) and record it in the activity feed. A blank/`conductor`/
+    /// `orchestrator` target steers the interactive orchestrator pane.
+    fn deliver_steer(&mut self, task_id: &str, instruction: &str) {
+        let conductor_target = task_id.is_empty()
+            || task_id.eq_ignore_ascii_case("conductor")
+            || task_id.eq_ignore_ascii_case("orchestrator");
+        let index = if conductor_target {
+            self.agents.iter().position(|run| run.is_orchestrator())
+        } else {
+            self.agent_index_for_token(task_id)
+        };
+        let Some(index) = index else {
+            self.push_activity(format!("steer: target not found ({task_id})"));
+            return;
+        };
+        let label = if conductor_target {
+            "conductor".to_string()
+        } else {
+            task_id.to_string()
+        };
+        if self.live_inject_at(index, instruction) {
+            self.push_activity(format!("steered {label}: {instruction}"));
+        } else {
+            self.push_activity(format!("steer: {label} has no live terminal"));
+        }
+    }
+
+    /// Open the live web board in the user's default browser (the `/web` command and
+    /// the `o` key). No-op with a notice when no board URL was provided.
+    fn open_web_ui(&mut self) {
+        match self.board_url.clone() {
+            Some(url) => match open_url_in_browser(&url) {
+                Ok(()) => self.notice = Some(format!("opening web UI: {url}")),
+                Err(err) => self.notice = Some(format!("could not open browser: {err}")),
+            },
+            None => {
+                self.notice = Some("web UI is not running for this session".to_string());
+            }
         }
     }
 
@@ -8734,6 +8925,14 @@ What to do\n\
         self.refresh_cloud_workspace_status();
         self.maybe_notify_workspace_idle();
 
+        // Browser control + narration heartbeat, throttled to ~1s so the render
+        // loop (11-33ms tick) is never stalled by the readdir/fs work.
+        if self.last_steer_poll.elapsed() >= Duration::from_secs(1) {
+            self.last_steer_poll = Instant::now();
+            self.poll_steer_inbox();
+            self.maybe_emit_heartbeat();
+        }
+
         // Only fully drain the focused agent every tick. For unfocused agents,
         // throttle drains to every 500ms so vt100 parsing + styled-cache
         // invalidation cost scales with focus rather than with agent count.
@@ -9230,6 +9429,35 @@ fn disable_rudder_mouse_capture(stdout: &mut impl Write) -> Result<()> {
 
 fn command_rest<'a>(input: &'a str, command: &str) -> &'a str {
     input.trim_start().strip_prefix(command).unwrap_or_default()
+}
+
+/// Open a URL in the user's default browser. Spawned detached with null stdio so
+/// it never blocks the render loop; success only means the opener launched.
+fn open_url_in_browser(url: &str) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut c = Command::new("open");
+        c.arg(url);
+        c
+    };
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut c = Command::new("cmd");
+        c.args(["/C", "start", "", url]);
+        c
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let mut command = {
+        let mut c = Command::new("xdg-open");
+        c.arg(url);
+        c
+    };
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|_| ())
 }
 
 fn split_marker_target_payload(value: &str) -> Option<(&str, &str)> {

@@ -21,13 +21,35 @@ RUN npm install -g \
     hunkdiff@latest \
   && npm cache clean --force
 
+# jj (Jujutsu) is Rudder's required internal VCS substrate. node:22-slim ships no
+# jj, and the postinstall auto-installer needs brew/cargo (absent here), so fetch
+# the prebuilt static musl binary for the build's target arch directly.
+ARG TARGETARCH
+RUN set -eux; \
+    case "${TARGETARCH:-amd64}" in \
+      amd64) JJ_ARCH=x86_64-unknown-linux-musl ;; \
+      arm64) JJ_ARCH=aarch64-unknown-linux-musl ;; \
+      *) echo "unsupported TARGETARCH=${TARGETARCH}"; exit 1 ;; \
+    esac; \
+    JJ_VERSION=v0.40.0; \
+    curl -fsSL "https://github.com/jj-vcs/jj/releases/download/${JJ_VERSION}/jj-${JJ_VERSION}-${JJ_ARCH}.tar.gz" -o /tmp/jj.tar.gz; \
+    mkdir -p /tmp/jjx; \
+    tar -xzf /tmp/jj.tar.gz -C /tmp/jjx; \
+    mv /tmp/jjx/jj /usr/local/bin/jj; \
+    chmod +x /usr/local/bin/jj; \
+    rm -rf /tmp/jj.tar.gz /tmp/jjx; \
+    jj --version
+
 WORKDIR /opt/rudder
+# Copy scripts BEFORE npm ci so the package's postinstall hook (scripts/postinstall.mjs)
+# resolves; RUDDER_SKIP_POSTINSTALL makes it a no-op since jj is installed above.
 COPY package.json package-lock.json ./
-RUN npm ci --omit=dev
+COPY scripts ./scripts
+RUN RUDDER_SKIP_POSTINSTALL=1 npm ci --omit=dev
 COPY dist ./dist
 COPY assets ./assets
 COPY --from=native-builder /rudder-native ./dist/native/rudder-native
-RUN chmod +x ./dist/native/rudder-native && npm link
+RUN chmod +x ./dist/native/rudder-native && RUDDER_SKIP_POSTINSTALL=1 npm link
 
 WORKDIR /opt/rudder-worker
 COPY cloud/worker/package.json ./package.json

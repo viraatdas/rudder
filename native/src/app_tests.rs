@@ -497,6 +497,56 @@ fn conductor_decision_appends_parseable_entry_with_header() {
 }
 
 #[test]
+fn push_activity_appends_parseable_jsonl_for_the_web_board() {
+    let dir = std::env::temp_dir().join(format!("rudder-activity-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::remove_file(dir.join(".rudder").join("activity.jsonl"));
+
+    let mut app = App::new();
+    app.cwd = dir.clone();
+    app.push_activity("merged n0 into trunk".to_string());
+
+    let raw = std::fs::read_to_string(dir.join(".rudder").join("activity.jsonl")).unwrap();
+    let line = raw.lines().next_back().unwrap();
+    let value: serde_json::Value = serde_json::from_str(line).unwrap();
+    assert_eq!(value["text"], "merged n0 into trunk");
+    assert_eq!(value["kind"], "action");
+    assert!(value["ts"].is_string(), "carries a timestamp: {line}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn poll_steer_inbox_consumes_files_and_records_unknown_target() {
+    let dir = std::env::temp_dir().join(format!("rudder-steer-{}", std::process::id()));
+    let steer = dir.join(".rudder").join("steer");
+    let _ = std::fs::create_dir_all(&steer);
+    let request = steer.join("1700000000000-n7.json");
+    std::fs::write(
+        &request,
+        r#"{"taskId":"n7","instruction":"focus on the failing test"}"#,
+    )
+    .unwrap();
+
+    let mut app = App::new();
+    app.cwd = dir.clone();
+    // No agent matches "n7", so the steer is consumed and a not-found line is logged
+    // rather than silently retried forever.
+    app.poll_steer_inbox();
+
+    assert!(!request.exists(), "steer request file is consumed");
+    assert!(
+        app.activity_log
+            .iter()
+            .any(|l| l.contains("steer: target not found") && l.contains("n7")),
+        "records the unroutable steer: {:?}",
+        app.activity_log
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn worktree_dir_name_leads_with_task_slug() {
     let name = worktree_dir_name(
         "1779248379804-add-dark-and-light-mode-56991",

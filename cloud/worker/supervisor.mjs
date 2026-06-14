@@ -61,9 +61,15 @@ if (Object.keys(capturedEnv).length > 0) {
 }
 
 const command = "rudder";
+// Cloud task sails run Claude Code by default: claude-code is installed in the
+// worker image and the snapshot carries its auth. Codex is NOT usable here —
+// Rudder's pinned Codex fork has no managed linux/x64 binary, so `rudder codex`
+// exits 1 on boot. Override with RUDDER_CLOUD_BACKEND only if a working codex
+// binary is provided via RUDDER_CODEX_BIN.
+const cloudBackend = (process.env.RUDDER_CLOUD_BACKEND || "claude").trim() || "claude";
 const args = isWorkspaceMode
   ? []
-  : task ? ["codex", "--worktree", task] : [];
+  : task ? [cloudBackend, "--worktree", task] : [];
 
 const term = pty.spawn(command, args, {
   name: "xterm-256color",
@@ -76,6 +82,11 @@ const term = pty.spawn(command, args, {
     TERM: "xterm-256color",
     COLORTERM: "truecolor",
     RUDDER_HEADLESS: "0",
+    // Rudder's pinned Codex fork has no linux/x64 binary, so any codex-binary
+    // resolution (e.g. when the snapshot carries codex auth) would otherwise crash
+    // even a claude run. Point it at the stock @openai/codex installed in the image
+    // so resolution always succeeds; the default backend is still claude.
+    RUDDER_CODEX_BIN: process.env.RUDDER_CODEX_BIN || "codex",
   },
 });
 

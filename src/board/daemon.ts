@@ -325,7 +325,60 @@ async function handleProjectApi(
     return;
   }
 
+  // Steer a running agent (or the conductor) from the browser. We drop a JSON
+  // instruction into the .rudder/steer/ inbox; the native TUI polls it each tick
+  // and injects the text straight into the matching agent's PTY (see
+  // poll_steer_inbox in native/src/main.rs). File-based so it works whether or
+  // not the daemon owns the scheduler (projector-only TUI sessions included).
+  const steerMatch = rest.match(/^\/tasks\/([^/]+)\/steer$/);
+  if (steerMatch && method === "POST") {
+    const id = steerMatch[1] ?? "";
+    const body = await readJsonBody(req);
+    const instruction = typeof body.instruction === "string"
+      ? body.instruction.trim()
+      : typeof body.text === "string"
+        ? body.text.trim()
+        : "";
+    if (!instruction) {
+      sendJson(res, 400, { error: "missing instruction" });
+      return;
+    }
+    await writeSteerRequest(project.repoRoot, id, instruction);
+    sendJson(res, 200, { ok: true, taskId: id });
+    return;
+  }
+  // Conductor-level steer: same inbox, target "conductor".
+  if (rest === "/steer" && method === "POST") {
+    const body = await readJsonBody(req);
+    const instruction = typeof body.instruction === "string"
+      ? body.instruction.trim()
+      : typeof body.text === "string"
+        ? body.text.trim()
+        : "";
+    if (!instruction) {
+      sendJson(res, 400, { error: "missing instruction" });
+      return;
+    }
+    await writeSteerRequest(project.repoRoot, "conductor", instruction);
+    sendJson(res, 200, { ok: true, taskId: "conductor" });
+    return;
+  }
+
   sendJson(res, 404, { error: "not found" });
+}
+
+// Write one steer request into .rudder/steer/. Filename is timestamp-prefixed so
+// the native poller applies queued steers in order; the id is sanitized so a node
+// id never escapes the inbox dir.
+async function writeSteerRequest(repoRoot: string, taskId: string, instruction: string): Promise<void> {
+  const dir = path.join(projectStateDir(repoRoot), "steer");
+  await fsp.mkdir(dir, { recursive: true });
+  const ts = Date.now();
+  const safeId = (taskId || "conductor").replace(/[^A-Za-z0-9_.-]/g, "-").slice(0, 64) || "conductor";
+  const file = path.join(dir, `${ts}-${safeId}.json`);
+  const tmp = `${file}.tmp`;
+  await fsp.writeFile(tmp, JSON.stringify({ taskId, instruction, ts: new Date(ts).toISOString() }));
+  await fsp.rename(tmp, file);
 }
 
 async function handleProjectsList(res: ServerResponse): Promise<void> {
@@ -481,6 +534,7 @@ function scheduleBroadcast(project: ProjectEntry): void {
 const lastNodes = new Map<string, Map<string, BoardNode>>();
 const lastEdges = new Map<string, Map<string, BoardEdge>>();
 const lastMemory = new Map<string, string>();
+const lastActivity = new Map<string, string>();
 
 function edgeKey(edge: BoardEdge): string {
   return `${edge.from}->${edge.to}:${edge.kind}`;
@@ -550,6 +604,12 @@ async function broadcastSnapshot(project: ProjectEntry): Promise<void> {
   if (lastMemory.get(project.slug) !== memoryKey) {
     lastMemory.set(project.slug, memoryKey);
     frames.push({ event: "memory.updated", data: { memory: snapshot.memory } });
+  }
+
+  const activityKey = JSON.stringify(snapshot.activity ?? []);
+  if (lastActivity.get(project.slug) !== activityKey) {
+    lastActivity.set(project.slug, activityKey);
+    frames.push({ event: "activity.updated", data: { activity: snapshot.activity ?? [] } });
   }
 
   if (frames.length === 0) {
@@ -730,6 +790,7 @@ async function buildSnapshot(project: ProjectEntry): Promise<BoardSnapshot> {
   }
 
   const memory = await loadMemory(project.repoRoot);
+  const activity = await loadActivity(project.repoRoot);
   return {
     slug: project.slug,
     name: project.name,
@@ -738,6 +799,7 @@ async function buildSnapshot(project: ProjectEntry): Promise<BoardSnapshot> {
     edges,
     gates: [],
     memory,
+    activity,
   };
 }
 
@@ -915,6 +977,47 @@ async function loadMemory(repoRoot: string): Promise<BoardSnapshot["memory"]> {
     return [];
   }
   return parseDecisions(raw);
+}
+
+// Activity feed: the live narration stream the native TUI appends to
+// .rudder/activity.jsonl (conductor actions, steer confirmations, periodic
+// heartbeats). We tail the last N lines so a long session stays cheap, parse
+// each JSON line, and normalize the ms timestamp to ISO for the UI.
+const ACTIVITY_TAIL = 120;
+
+export function parseActivityJsonl(raw: string): BoardSnapshot["activity"] {
+  const out: NonNullable<BoardSnapshot["activity"]> = [];
+  const lines = raw.split(/\r?\n/).filter((line) => line.trim().length > 0);
+  for (const line of lines.slice(-ACTIVITY_TAIL)) {
+    try {
+      const parsed = JSON.parse(line) as { ts?: unknown; text?: unknown; kind?: unknown };
+      const text = typeof parsed.text === "string" ? parsed.text : "";
+      if (!text) {
+        continue;
+      }
+      let ts: string | undefined;
+      if (typeof parsed.ts === "string" && parsed.ts) {
+        ts = /^\d{10,}$/.test(parsed.ts) ? new Date(Number(parsed.ts)).toISOString() : parsed.ts;
+      } else if (typeof parsed.ts === "number") {
+        ts = new Date(parsed.ts).toISOString();
+      }
+      const kind = parsed.kind === "heartbeat" ? "heartbeat" : "action";
+      out.push({ text, kind, ...(ts ? { ts } : {}) });
+    } catch {
+      // skip a malformed line; the stream is best-effort
+    }
+  }
+  return out;
+}
+
+async function loadActivity(repoRoot: string): Promise<BoardSnapshot["activity"]> {
+  let raw: string;
+  try {
+    raw = await fsp.readFile(path.join(projectStateDir(repoRoot), "activity.jsonl"), "utf8");
+  } catch {
+    return [];
+  }
+  return parseActivityJsonl(raw);
 }
 
 // ---------------------------------------------------------------------------

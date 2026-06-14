@@ -735,7 +735,12 @@ async function runNativeDashboard(): Promise<boolean> {
   try {
     const repoRoot = findRepoRoot();
     if (repoRoot) {
-      await ensureBoardRunning(repoRoot, { open: false, scheduler: false });
+      const board = await ensureBoardRunning(repoRoot, { open: false, scheduler: false });
+      // Hand the live board URL to the native child so it can surface it in the
+      // agents pane and open it via `/web` / the `o` key. This is what makes the
+      // local web UI discoverable instead of a silent background server.
+      env.RUDDER_BOARD_URL = board.url;
+      env.RUDDER_BOARD_PORT = String(board.port);
     }
   } catch (err) {
     if (isTty()) {
@@ -1109,9 +1114,13 @@ Usage:
   rudder cloud runtime [fly|byoc]
   rudder cloud vm <task>
   rudder cloud list
+  rudder cloud attach <id>
+  rudder cloud talk <id> "message"
+  rudder cloud output <id>
   rudder cloud onload [runId]
   rudder cloud logs <id>
   rudder cloud bootstrap <id>
+  rudder cloud quickstart
   rudder sail [name or task]
 Run management:
   rudder watch [run]              Attach to live output

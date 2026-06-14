@@ -1,5 +1,6 @@
 import { useEffect, useReducer, useRef, useState } from "preact/hooks";
 import {
+  type ActivityEntry,
   type BoardEdge,
   type BoardNode,
   type BoardSnapshot,
@@ -19,6 +20,7 @@ export type BoardState = {
   edges: BoardEdge[];
   gates: PlanGate[];
   memory: MemoryEntry[];
+  activity: ActivityEntry[];
   loaded: boolean;
 };
 
@@ -26,10 +28,11 @@ export type Action =
   | { type: "SNAPSHOT"; snapshot: BoardSnapshot }
   | { type: "NODE_UPSERT"; node: BoardNode }
   | { type: "NODE_REMOVE"; id: string }
-  | { type: "MEMORY"; memory: MemoryEntry[] };
+  | { type: "MEMORY"; memory: MemoryEntry[] }
+  | { type: "ACTIVITY"; activity: ActivityEntry[] };
 
 export function initialState(): BoardState {
-  return { nodes: new Map(), edges: [], gates: [], memory: [], loaded: false };
+  return { nodes: new Map(), edges: [], gates: [], memory: [], activity: [], loaded: false };
 }
 
 export function reducer(state: BoardState, action: Action): BoardState {
@@ -42,6 +45,7 @@ export function reducer(state: BoardState, action: Action): BoardState {
         edges: action.snapshot.edges ?? [],
         gates: action.snapshot.gates ?? [],
         memory: action.snapshot.memory ?? [],
+        activity: action.snapshot.activity ?? [],
         loaded: true,
       };
     }
@@ -58,6 +62,8 @@ export function reducer(state: BoardState, action: Action): BoardState {
     }
     case "MEMORY":
       return { ...state, memory: action.memory };
+    case "ACTIVITY":
+      return { ...state, activity: action.activity };
     default:
       return state;
   }
@@ -153,6 +159,17 @@ export function useBoardState(slug: string): UseBoard {
         const data = JSON.parse((e as MessageEvent).data);
         const memory: MemoryEntry[] = Array.isArray(data) ? data : data.memory ?? [];
         dispatch({ type: "MEMORY", memory });
+      } catch {
+        /* ignore */
+      }
+    });
+
+    es.addEventListener("activity.updated", (e) => {
+      if (cancelled) return;
+      try {
+        const data = JSON.parse((e as MessageEvent).data);
+        const activity: ActivityEntry[] = Array.isArray(data) ? data : data.activity ?? [];
+        dispatch({ type: "ACTIVITY", activity });
       } catch {
         /* ignore */
       }

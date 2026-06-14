@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import {
+  type ActivityEntry,
   type BoardEdge,
   type BoardNode,
   type Column,
@@ -9,6 +10,7 @@ import {
   fetchProjects,
   postCancel,
   postMerge,
+  postSteer,
   postTask,
 } from "./types";
 import { type ConnState, useBoardState } from "./store";
@@ -175,14 +177,14 @@ function SkeletonTile() {
 // BoardView — the live board for one project.
 // ---------------------------------------------------------------------------
 
-type View = "board" | "nest" | "memory";
+type View = "board" | "nest" | "activity" | "memory";
 
 const VIEW_KEY = "rudder.board.view";
 
 function loadView(): View {
   try {
     const v = localStorage.getItem(VIEW_KEY);
-    if (v === "board" || v === "nest" || v === "memory") return v;
+    if (v === "board" || v === "nest" || v === "activity" || v === "memory") return v;
   } catch {
     /* localStorage unavailable (private mode, etc.) */
   }
@@ -215,6 +217,7 @@ export function BoardView({ slug }: { slug: string }) {
         view={view}
         onView={setView}
         memoryCount={state.memory.length}
+        latestActivity={state.activity.length ? state.activity[state.activity.length - 1] : null}
       />
 
       <main class="board-main">
@@ -224,6 +227,8 @@ export function BoardView({ slug }: { slug: string }) {
           <Board nodes={nodes} onOpen={setSelected} selected={selected} />
         ) : view === "nest" ? (
           <Nest nodes={nodes} edges={state.edges} onOpen={setSelected} selected={selected} />
+        ) : view === "activity" ? (
+          <ActivityView slug={slug} activity={state.activity} />
         ) : (
           <MemoryView memory={state.memory} />
         )}
@@ -243,6 +248,7 @@ function Toolbar({
   view,
   onView,
   memoryCount,
+  latestActivity,
 }: {
   slug: string;
   name: string;
@@ -250,6 +256,7 @@ function Toolbar({
   view: View;
   onView: (v: View) => void;
   memoryCount: number;
+  latestActivity: ActivityEntry | null;
 }) {
   const [composerOpen, setComposerOpen] = useState(false);
   return (
@@ -260,6 +267,17 @@ function Toolbar({
         </a>
         <span class="brand-name">{name}</span>
         <ConnPill conn={conn} />
+        {latestActivity && view !== "activity" && (
+          <button
+            type="button"
+            class="activity-ticker mono"
+            title="Latest activity — click for the full feed"
+            onClick={() => onView("activity")}
+          >
+            <span class="pulse-dot" aria-hidden="true" />
+            <span class="activity-ticker-text">{latestActivity.text}</span>
+          </button>
+        )}
       </div>
 
       <div class="toolbar-actions">
@@ -282,6 +300,16 @@ function Toolbar({
             title="Nest / DAG view"
           >
             Nest
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={view === "activity"}
+            class={`toggle ${view === "activity" ? "toggle-on" : ""}`}
+            onClick={() => onView("activity")}
+            title="Live activity feed"
+          >
+            Activity
           </button>
           <button
             type="button"
@@ -894,6 +922,17 @@ function CardDetail({
           {action.err && <span class="action-err mono">{action.err}</span>}
         </div>
 
+        {running && (
+          <div class="drawer-steer">
+            <div class="drawer-steer-head mono">Steer this agent</div>
+            <SteerBox
+              slug={slug}
+              targetId={node.id}
+              placeholder="Send an instruction to this worker…  (⌘⏎)"
+            />
+          </div>
+        )}
+
         <div class="drawer-log">
           <div class="drawer-log-head mono">
             <span>log</span>
@@ -928,6 +967,123 @@ function LogPane({ text, error, loading }: { text: string; error: string | null;
       {text || "no output yet"}
     </pre>
   );
+}
+
+// ---------------------------------------------------------------------------
+// SteerBox — send an instruction to a running agent (or the conductor). The
+// text is delivered straight into that agent's live terminal by the native TUI.
+// ---------------------------------------------------------------------------
+
+function SteerBox({
+  slug,
+  targetId,
+  placeholder,
+}: {
+  slug: string;
+  targetId: string;
+  placeholder: string;
+}) {
+  const [text, setText] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  const submit = async () => {
+    const instruction = text.trim();
+    if (!instruction || busy) return;
+    setBusy(true);
+    setMsg(null);
+    setErr(null);
+    try {
+      await postSteer(slug, targetId, instruction);
+      setText("");
+      setMsg("sent");
+    } catch (e: any) {
+      setErr(String(e?.message ?? e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const onKeyDown = (e: KeyboardEvent) => {
+    if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+      e.preventDefault();
+      void submit();
+    }
+  };
+
+  return (
+    <div class="steer">
+      <div class="steer-row">
+        <input
+          class="steer-input mono"
+          type="text"
+          placeholder={placeholder}
+          value={text}
+          disabled={busy}
+          onInput={(e) => setText((e.target as HTMLInputElement).value)}
+          onKeyDown={onKeyDown}
+        />
+        <button
+          type="button"
+          class="btn btn-accent"
+          onClick={submit}
+          disabled={busy || !text.trim()}
+        >
+          {busy ? "…" : "Steer"}
+        </button>
+      </div>
+      {msg && <span class="action-msg mono">{msg}</span>}
+      {err && <span class="action-err mono">{err}</span>}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// ActivityView — the live narration feed plus a conductor steering box.
+// ---------------------------------------------------------------------------
+
+function ActivityView({ slug, activity }: { slug: string; activity: ActivityEntry[] }) {
+  const feedRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const el = feedRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [activity]);
+
+  return (
+    <div class="activity">
+      <div class="activity-steer">
+        <div class="activity-steer-head mono">Steer the conductor</div>
+        <SteerBox
+          slug={slug}
+          targetId="conductor"
+          placeholder="Tell the live orchestrator what to do next…  (⌘⏎)"
+        />
+      </div>
+      {activity.length === 0 ? (
+        <div class="empty">
+          <div class="empty-title">no activity yet</div>
+          <div class="empty-sub mono">the conductor narrates what it is doing here as work runs</div>
+        </div>
+      ) : (
+        <div class="activity-feed" ref={feedRef}>
+          {activity.map((entry, i) => (
+            <div class={`activity-entry activity-${entry.kind}`} key={`${entry.ts ?? ""}-${i}`}>
+              <span class="activity-dot" aria-hidden="true" />
+              <span class="activity-text">{entry.text}</span>
+              {entry.ts && <span class="activity-ts mono">{fmtTime(entry.ts)}</span>}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function fmtTime(ts: string): string {
+  const d = new Date(ts);
+  if (Number.isNaN(d.getTime())) return "";
+  return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
 
 // ---------------------------------------------------------------------------

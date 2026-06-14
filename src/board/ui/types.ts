@@ -53,6 +53,8 @@ export type PlanGate = {
 
 export type MemoryEntry = { text: string; owner?: string; ts?: string };
 
+export type ActivityEntry = { text: string; kind: "action" | "heartbeat"; ts?: string };
+
 export type BoardSnapshot = {
   slug: string;
   name: string;
@@ -61,6 +63,7 @@ export type BoardSnapshot = {
   edges: BoardEdge[];
   gates: PlanGate[];
   memory: MemoryEntry[];
+  activity: ActivityEntry[];
 };
 
 export type ProjectSummary = {
@@ -137,6 +140,21 @@ export async function postCancel(slug: string, id: string): Promise<void> {
   if (!res.ok) {
     throw new Error(`${res.status} ${res.statusText}`);
   }
+}
+
+// Steer a running agent (id) or the conductor (id = "conductor"). The instruction
+// is delivered straight into that agent's live terminal by the native TUI.
+export async function postSteer(slug: string, id: string, instruction: string): Promise<void> {
+  const target = id === "conductor"
+    ? `/api/projects/${encodeURIComponent(slug)}/steer`
+    : `/api/projects/${encodeURIComponent(slug)}/tasks/${encodeURIComponent(id)}/steer`;
+  await jsonOrThrow(
+    await fetch(target, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ instruction }),
+    })
+  );
 }
 
 export function eventsUrl(slug: string): string {
