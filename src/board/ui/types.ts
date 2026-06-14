@@ -93,6 +93,14 @@ async function jsonOrThrow<T>(res: Response): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+// Headers for a mutating request: the per-daemon token the board shell injected.
+// A custom header also forces a CORS preflight cross-origin (which the board never
+// approves), so this both authenticates same-origin calls and blocks drive-by CSRF.
+function mutationHeaders(extra?: Record<string, string>): Record<string, string> {
+  const token = (typeof window !== "undefined" && window.__RUDDER_TOKEN__) || "";
+  return { "x-rudder-token": token, ...(extra ?? {}) };
+}
+
 export async function fetchProjects(): Promise<{ projects: ProjectSummary[] }> {
   return jsonOrThrow(await fetch("/api/projects"));
 }
@@ -115,7 +123,7 @@ export async function postTask(slug: string, prompt: string): Promise<{ runId?: 
   return jsonOrThrow(
     await fetch(`/api/projects/${encodeURIComponent(slug)}/tasks`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: mutationHeaders({ "content-type": "application/json" }),
       body: JSON.stringify({ prompt }),
     })
   );
@@ -128,6 +136,7 @@ export async function postMerge(
   return jsonOrThrow(
     await fetch(`/api/projects/${encodeURIComponent(slug)}/tasks/${encodeURIComponent(id)}/merge`, {
       method: "POST",
+      headers: mutationHeaders(),
     })
   );
 }
@@ -135,7 +144,7 @@ export async function postMerge(
 export async function postCancel(slug: string, id: string): Promise<void> {
   const res = await fetch(
     `/api/projects/${encodeURIComponent(slug)}/tasks/${encodeURIComponent(id)}/cancel`,
-    { method: "POST" }
+    { method: "POST", headers: mutationHeaders() }
   );
   if (!res.ok) {
     throw new Error(`${res.status} ${res.statusText}`);
@@ -151,7 +160,7 @@ export async function postSteer(slug: string, id: string, instruction: string): 
   await jsonOrThrow(
     await fetch(target, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: mutationHeaders({ "content-type": "application/json" }),
       body: JSON.stringify({ instruction }),
     })
   );

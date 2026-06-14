@@ -1,10 +1,72 @@
 import { spawn } from "node:child_process";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import http from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+
+// Per-daemon secret. The SPA shell embeds it (only loopback callers ever receive
+// the shell — see the Host check below) and the browser echoes it back as the
+// `x-rudder-token` header on every mutating request. A custom header forces a CORS
+// preflight cross-origin (which this server never approves) and the value is
+// unguessable, so a drive-by web page cannot forge a steer/inject/merge/cancel.
+const BOARD_TOKEN = randomBytes(24).toString("hex");
+
+// Cap request bodies so an unauthenticated POST can't buffer unbounded memory.
+const MAX_BODY_BYTES = 1_000_000;
+
+/** This process's board token (exported for tests; it is regenerated each start). */
+export function getBoardToken(): string {
+  return BOARD_TOKEN;
+}
+
+/** The board binds 127.0.0.1 only, so a legitimate Host header is always loopback.
+ *  Rejecting anything else defeats DNS-rebinding: an attacker page whose hostname
+ *  resolves to 127.0.0.1 still sends its own (non-loopback) Host. */
+export function isLoopbackHost(req: IncomingMessage): boolean {
+  const host = (req.headers.host ?? "").trim().toLowerCase();
+  const name = host.replace(/:\d+$/, "");
+  return name === "127.0.0.1" || name === "localhost" || name === "[::1]" || name === "::1";
+}
+
+function isLoopbackOrigin(origin: string): boolean {
+  try {
+    const h = new URL(origin).hostname.toLowerCase();
+    return h === "127.0.0.1" || h === "localhost" || h === "::1";
+  } catch {
+    return false;
+  }
+}
+
+export function hasValidToken(req: IncomingMessage): boolean {
+  const header = req.headers["x-rudder-token"];
+  const token = Array.isArray(header) ? header[0] : header;
+  if (typeof token !== "string" || token.length !== BOARD_TOKEN.length) {
+    return false;
+  }
+  try {
+    return timingSafeEqual(Buffer.from(token), Buffer.from(BOARD_TOKEN));
+  } catch {
+    return false;
+  }
+}
+
+/** Guard every state-mutating request. Returns true (after writing a 403) when the
+ *  request must be denied: a non-loopback Origin, or a missing/invalid token. */
+function denyMutation(req: IncomingMessage, res: ServerResponse): boolean {
+  const origin = req.headers.origin;
+  if (typeof origin === "string" && origin.length > 0 && !isLoopbackOrigin(origin)) {
+    sendJson(res, 403, { error: "forbidden origin" });
+    return true;
+  }
+  if (!hasValidToken(req)) {
+    sendJson(res, 403, { error: "missing or invalid board token" });
+    return true;
+  }
+  return false;
+}
 
 import { findProjectBySlug, loadProjects, loadRunRecord, outputPath, projectStateDir, runsDir } from "../state.js";
 import { mergeJjRunIntoCurrentWorkspace } from "../jj.js";
@@ -146,6 +208,13 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, bus?: Ru
   const pathname = decodeURIComponent(url.pathname);
   const method = (req.method || "GET").toUpperCase();
 
+  // Anti-DNS-rebinding: the board is loopback-only, so reject any request whose Host
+  // is not loopback before it can read state or serve the token-bearing shell.
+  if (!isLoopbackHost(req)) {
+    sendJson(res, 403, { error: "forbidden host" });
+    return;
+  }
+
   // Static SPA bundle.
   if (method === "GET" && pathname === "/board.js") {
     await sendStatic(res, BOARD_JS_PATH, "text/javascript; charset=utf-8");
@@ -196,6 +265,12 @@ async function handleProjectApi(
   const project = await findProjectBySlug(slug);
   if (!project) {
     sendJson(res, 404, { error: `unknown project: ${slug}` });
+    return;
+  }
+
+  // Every mutating route is a POST. Require the secret token (+ loopback origin)
+  // before any of them run, so a cross-site page cannot steer/inject/merge/cancel.
+  if (method === "POST" && denyMutation(req, res)) {
     return;
   }
 
@@ -1036,7 +1111,7 @@ function renderShell(slug: string): string {
   </head>
   <body>
     <div id="app"></div>
-    <script>window.__RUDDER_SLUG__ = ${slugJson}</script>
+    <script>window.__RUDDER_SLUG__ = ${slugJson}; window.__RUDDER_TOKEN__ = ${JSON.stringify(BOARD_TOKEN)}</script>
     <script type="module" src="/board.js"></script>
   </body>
 </html>
@@ -1077,8 +1152,16 @@ function inRepo<T>(repoRoot: string, fn: () => Promise<T>): Promise<T> {
 
 async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
   const chunks: Buffer[] = [];
+  let total = 0;
   for await (const chunk of req) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    total += buf.length;
+    if (total > MAX_BODY_BYTES) {
+      // Oversized body: stop reading and treat as empty (DoS guard).
+      req.destroy();
+      return {};
+    }
+    chunks.push(buf);
   }
   if (chunks.length === 0) {
     return {};

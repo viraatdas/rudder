@@ -517,6 +517,25 @@ fn push_activity_appends_parseable_jsonl_for_the_web_board() {
 }
 
 #[test]
+fn sanitize_steer_instruction_strips_control_chars_so_no_extra_pty_lines() {
+    // A steer instruction is injected into a live agent PTY with a trailing Enter, so
+    // embedded CR/LF/ESC from an untrusted web-board payload must not survive (they
+    // would submit extra command lines or smuggle terminal escapes).
+    let dirty = "run tests\rrm -rf /\nthen leak\x1bsecret\tnow";
+    let clean = sanitize_steer_instruction(dirty);
+    assert!(
+        !clean.contains('\r') && !clean.contains('\n') && !clean.contains('\x1b'),
+        "control characters are stripped: {clean:?}"
+    );
+    assert_eq!(
+        clean, "run tests rm -rf / then leak secret now",
+        "stays one printable line with collapsed whitespace"
+    );
+    // All-control input collapses to empty (deliver_steer then drops it).
+    assert!(sanitize_steer_instruction("\r\n\t\x1b").is_empty());
+}
+
+#[test]
 fn poll_steer_inbox_consumes_files_and_records_unknown_target() {
     let dir = std::env::temp_dir().join(format!("rudder-steer-{}", std::process::id()));
     let steer = dir.join(".rudder").join("steer");

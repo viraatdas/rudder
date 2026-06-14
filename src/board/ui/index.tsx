@@ -4,6 +4,7 @@ import { BoardView, ProjectIndex } from "./components";
 declare global {
   interface Window {
     __RUDDER_SLUG__?: string;
+    __RUDDER_TOKEN__?: string;
   }
 }
 

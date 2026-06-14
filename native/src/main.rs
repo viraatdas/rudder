@@ -6534,6 +6534,13 @@ impl App {
     /// live conductor) and record it in the activity feed. A blank/`conductor`/
     /// `orchestrator` target steers the interactive orchestrator pane.
     fn deliver_steer(&mut self, task_id: &str, instruction: &str) {
+        // The web board is now token-gated, but treat steer text as untrusted in depth:
+        // strip control characters so it can't inject extra Enter keys or escape
+        // sequences into the agent PTY (live_inject_at appends one \r to submit it).
+        let instruction = sanitize_steer_instruction(instruction);
+        if instruction.is_empty() {
+            return;
+        }
         let conductor_target = task_id.is_empty()
             || task_id.eq_ignore_ascii_case("conductor")
             || task_id.eq_ignore_ascii_case("orchestrator");
@@ -6551,7 +6558,7 @@ impl App {
         } else {
             task_id.to_string()
         };
-        if self.live_inject_at(index, instruction) {
+        if self.live_inject_at(index, &instruction) {
             self.push_activity(format!("steered {label}: {instruction}"));
         } else {
             self.push_activity(format!("steer: {label} has no live terminal"));
@@ -9444,6 +9451,20 @@ fn disable_rudder_mouse_capture(stdout: &mut impl Write) -> Result<()> {
 
 fn command_rest<'a>(input: &'a str, command: &str) -> &'a str {
     input.trim_start().strip_prefix(command).unwrap_or_default()
+}
+
+/// Neutralize an untrusted steer instruction before it is injected into a live agent
+/// PTY. The text arrives from the web board (`.rudder/steer/*.json`) and is written to
+/// the terminal followed by a single Enter, so any embedded control character is a
+/// vector: CR/LF would submit extra command lines and ESC could smuggle terminal escape
+/// sequences. Replace every control char with a space and collapse runs of whitespace so
+/// the instruction stays exactly one line of printable text.
+fn sanitize_steer_instruction(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Open a URL in the user's default browser. Spawned detached with null stdio so
