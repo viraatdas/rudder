@@ -736,10 +736,11 @@ async function runNativeDashboard(): Promise<boolean> {
     const repoRoot = findRepoRoot();
     if (repoRoot) {
       const board = await ensureBoardRunning(repoRoot, { open: false, scheduler: false });
-      // Hand the live board URL to the native child so it can surface it in the
-      // agents pane and open it via `/web` / the `o` key. This is what makes the
-      // local web UI discoverable instead of a silent background server.
-      env.RUDDER_BOARD_URL = board.url;
+      // Hand the native child a deep link to THIS project's board so the `o` key /
+      // `/web` opens straight into the current project (not the all-projects index).
+      // The URL itself stays hidden in the TUI; the hotkey is the way in, and the
+      // board's "all projects" link is the way back out to other projects.
+      env.RUDDER_BOARD_URL = board.projectUrl;
       env.RUDDER_BOARD_PORT = String(board.port);
     }
   } catch (err) {

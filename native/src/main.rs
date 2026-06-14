@@ -6563,8 +6563,10 @@ impl App {
     fn open_web_ui(&mut self) {
         match self.board_url.clone() {
             Some(url) => match open_url_in_browser(&url) {
-                Ok(()) => self.notice = Some(format!("opening web UI: {url}")),
-                Err(err) => self.notice = Some(format!("could not open browser: {err}")),
+                // Keep the URL hidden on success (the hotkey is the way in); only
+                // reveal it if auto-open fails so the user can open it manually.
+                Ok(()) => self.notice = Some("opening this project's web view in your browser".to_string()),
+                Err(err) => self.notice = Some(format!("could not open browser ({err}); open {url} manually")),
             },
             None => {
                 self.notice = Some("web UI is not running for this session".to_string());

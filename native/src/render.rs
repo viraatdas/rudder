@@ -37,7 +37,7 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
     render_agents(frame, main[0], app);
     render_gutter(frame, main[1], Gutter::Vertical);
     render_worker(frame, main[2], app);
-    render_status_strip(frame, rows[1], app);
+    render_gutter(frame, rows[1], Gutter::Horizontal);
     render_task(frame, rows[2], app);
     render_suggestions(frame, rows[2], app);
     render_cloud_prompt(frame, area, app);
@@ -60,26 +60,6 @@ pub(crate) fn render_gutter(frame: &mut Frame<'_>, area: Rect, gutter: Gutter) {
 
     let lines = vec![Line::from(Span::styled(line, style)); area.height as usize];
     frame.render_widget(Paragraph::new(lines).style(app_style()), area);
-}
-
-/// The full-width strip between the panes and the task input. When a web board URL
-/// is known it shows it here (full width) so a long localhost URL is always fully
-/// visible instead of being clipped by the narrow fixed-width agents pane. Falls
-/// back to a plain blank gutter when there is no URL.
-pub(crate) fn render_status_strip(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let Some(url) = app.board_url.as_deref() else {
-        render_gutter(frame, area, Gutter::Horizontal);
-        return;
-    };
-    let spans = vec![
-        Span::styled("  \u{25b8} web ui  ", accent_style(false)),
-        Span::styled(url.to_string(), pane_text_style(false)),
-        Span::styled("   \u{00b7}  press o or /web to open", muted_style(false)),
-    ];
-    frame.render_widget(
-        Paragraph::new(Line::from(spans)).style(app_style()),
-        area,
-    );
 }
 
 pub(crate) fn render_mouse_debug(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -1209,8 +1189,9 @@ pub(crate) fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             ))),
         );
     }
-    // The board URL lives on the full-width status strip (render_status_strip) so a
-    // long localhost URL is never clipped by this fixed-width 34-col agents pane.
+    // The board URL is intentionally NOT shown in the UI; the "o web ui" hint below
+    // (and /web) opens this project's board in the browser. Keeping the URL off-screen
+    // avoids clipping it in this narrow pane and keeps the dashboard uncluttered.
     if is_cloud_worker_session() {
         // Only surface cloud status when this dashboard is actually running
         // inside a cloud worker. Showing "cloud connected" in a plain local

@@ -41,13 +41,26 @@ async function readPidFile(repoRoot: string): Promise<DaemonPidFile | null> {
 export async function ensureBoardRunning(
   repoRoot: string,
   opts?: { port?: number; open?: boolean; scheduler?: boolean },
-): Promise<{ port: number; url: string; started: boolean; handle?: BoardDaemonHandle }> {
-  await registerProject(repoRoot).catch(() => undefined);
+): Promise<{
+  port: number;
+  url: string;
+  slug: string;
+  /** Deep link to THIS repo's board (`${url}/rudder/${slug}`), or the index when the
+   * slug is unknown. The TUI opens this so `o` lands on the current project. */
+  projectUrl: string;
+  started: boolean;
+  handle?: BoardDaemonHandle;
+}> {
+  // registerProject is idempotent and returns this repo's stable slug, which we use
+  // to deep-link the browser straight to this project's board.
+  const project = await registerProject(repoRoot).catch(() => null);
+  const slug = project?.slug ?? "";
+  const projectPath = slug ? `/rudder/${slug}` : "/rudder";
 
   const existing = await readPidFile(repoRoot);
   if (existing && existing.pid !== process.pid && processAlive(existing.pid)) {
     const url = `http://127.0.0.1:${existing.port}`;
-    return { port: existing.port, url, started: false };
+    return { port: existing.port, url, slug, projectUrl: `${url}${projectPath}`, started: false };
   }
 
   const config = await loadConfig();
@@ -92,7 +105,14 @@ export async function ensureBoardRunning(
   console.log(`rudder board listening on ${handle.url}`);
   console.log(`  repo: ${shortenHome(repoRoot)}`);
 
-  return { port: handle.port, url: handle.url, started: true, handle };
+  return {
+    port: handle.port,
+    url: handle.url,
+    slug,
+    projectUrl: `${handle.url}${projectPath}`,
+    started: true,
+    handle,
+  };
 }
 
 /**

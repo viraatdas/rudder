@@ -262,8 +262,9 @@ function Toolbar({
   return (
     <header class="topbar board-topbar">
       <div class="brand">
-        <a class="brand-link" href="/rudder" title="All projects">
+        <a class="brand-link" href="/rudder" title="Back to all projects">
           <span class="brand-mark">▰</span>
+          <span class="brand-back">← all projects</span>
         </a>
         <span class="brand-name">{name}</span>
         <ConnPill conn={conn} />
