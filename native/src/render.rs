@@ -3005,7 +3005,7 @@ pub(crate) fn task_default_hint(app: &App) -> &'static str {
     {
         "type to talk to the live orchestrator for status, retro, or follow-up control  ·  ^W pane"
     } else {
-        "type to start a one-off agent; use /plan for a DAG  ·  Option-1/2/3 or ^W pane"
+        "type to hand a task to the orchestrator; /ask for a one-off  ·  Option-1/2/3 or ^W pane"
     }
 }
 

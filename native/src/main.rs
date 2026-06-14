@@ -874,10 +874,17 @@ impl App {
             board_url: if cfg!(test) {
                 None
             } else {
-                env::var("RUDDER_BOARD_URL")
-                    .ok()
-                    .map(|v| v.trim().to_string())
-                    .filter(|v| !v.is_empty())
+                // Always show a web-UI address in the TUI. Prefer the URL the Node
+                // parent passes (the real bound port); fall back to the default
+                // localhost board port so an address is visible even if the env was
+                // not set (the board normally listens on 4774 = DEFAULT_BOARD_PORT).
+                Some(
+                    env::var("RUDDER_BOARD_URL")
+                        .ok()
+                        .map(|v| v.trim().to_string())
+                        .filter(|v| !v.is_empty())
+                        .unwrap_or_else(|| "http://127.0.0.1:4774".to_string()),
+                )
             },
             awaiting_approval: restored_queue.awaiting_approval,
             interactive_orchestrator: interactive_orchestrator(),
@@ -3083,11 +3090,11 @@ impl App {
             return;
         }
 
-        // Default first task (no active plan): start a normal one-off agent in the
-        // main checkout. Planning is explicit via `/plan <task>`, so plain
-        // questions like "where is the app, is it ready?" never get routed into a
-        // multi-worker DAG by a classifier.
-        self.start_oneoff_task(input);
+        // Default first task (no active plan): hand it to the orchestrator, which
+        // plans and implements it (spawning + merging workers as needed). No local
+        // classifier decides one-off vs DAG — the orchestrator is the default, and
+        // the one-off conversational agent is the explicit escape hatch via `/ask`.
+        self.start_rudder_plan_task(input);
     }
 
     fn send_to_interactive_orchestrator(&mut self, input: &str) -> bool {
@@ -4733,12 +4740,12 @@ impl App {
                 true
             }
             Some("/plan") => {
-                // Explicitly start the orchestrator/DAG planner. Plain task input
-                // starts a one-off agent instead.
+                // Explicit alias for the default: hand the task to the orchestrator.
+                // Plain task input does the same thing now.
                 let rest = command_rest(input, "/plan").trim();
                 if rest.is_empty() {
                     self.notice = Some(
-                        "usage: /plan <task> — start the DAG planner/orchestrator; plain input starts a one-off agent"
+                        "usage: /plan <task> — same as plain input: the orchestrator plans + implements it (use /ask for a one-off)"
                             .to_string(),
                     );
                 } else {
@@ -4747,11 +4754,12 @@ impl App {
                 true
             }
             Some("/ask") => {
-                // Alias for the default: force a one-off conversational agent.
+                // The escape hatch from the orchestrator default: a one-off
+                // conversational agent in the main checkout, no DAG.
                 let rest = command_rest(input, "/ask").trim();
                 if rest.is_empty() {
                     self.notice = Some(
-                        "usage: /ask <question or small change> — one-off agent in the main checkout, no DAG"
+                        "usage: /ask <question or small change> — one-off agent in the main checkout, no DAG (plain input goes to the orchestrator)"
                             .to_string(),
                     );
                 } else {

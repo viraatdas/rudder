@@ -6825,11 +6825,12 @@ fn completed_plan_does_not_hijack_a_new_task_into_refine() {
 
 #[cfg(not(windows))]
 #[test]
-fn default_task_input_starts_oneoff_agent_in_main_checkout() {
-    // Plain task input starts a single OneOff agent in the MAIN checkout. It must
-    // not auto-dispatch questions like this into the DAG planner.
+fn default_task_input_goes_to_orchestrator() {
+    // Plain task input (no /ask) is handed to the orchestrator, which plans and
+    // implements it. There is no local one-off-vs-DAG classifier: the orchestrator
+    // is the default and /ask is the explicit one-off escape hatch.
     let _env = env_guard();
-    let repo = unique_test_repo("default-oneoff");
+    let repo = unique_test_repo("default-orch");
     let worker = repo.join("fake-worker.sh");
     write_fake_bin(&worker, FAKE_CONDUCTOR_WORKER);
     std::env::set_var("RUDDER_CODEX_BIN", &worker);
@@ -6839,24 +6840,18 @@ fn default_task_input_starts_oneoff_agent_in_main_checkout() {
     app.backend = Backend::Codex;
     assert!(!app.plan_is_active(), "no plan active on a clean session");
 
-    app.start_task_from_input("where is the Vizzy app and is it ready to be used?");
+    app.start_task_from_input("build the first feature for the app");
 
-    let spawned = app.agents.last().expect("a one-off agent spawned");
-    assert_eq!(spawned.mode, AgentMode::OneOff);
-    assert!(spawned.is_oneoff());
-    assert!(spawned.node_id.is_none(), "a one-off is not a DAG node");
+    let spawned = app.agents.last().expect("an orchestrator spawned");
+    assert_eq!(
+        spawned.mode,
+        AgentMode::RudderPlan,
+        "plain input starts the orchestrator, not a one-off"
+    );
+    assert!(!spawned.is_oneoff(), "the default is no longer a one-off");
     assert!(
         !spawned.reconcile_planner,
-        "plain input must not create a planner"
-    );
-    assert_eq!(
-        spawned.cwd, repo,
-        "a one-off runs in the MAIN checkout, not a worktree"
-    );
-    assert_eq!(
-        crate::render::status_bucket(spawned),
-        crate::render::Bucket::OneOff,
-        "a one-off lands in its own section"
+        "a fresh task starts the initial orchestrator planner"
     );
 
     std::env::remove_var("RUDDER_CODEX_BIN");
