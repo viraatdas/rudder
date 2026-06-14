@@ -397,6 +397,10 @@ struct App {
     /// the "decomposing the task..." spinner feels alive while the planner runs.
     spinner_frame: usize,
     selected_agent: usize,
+    /// Top line offset of the agents-pane list, persisted across frames so the pane
+    /// scrolls to follow the selection when there are more rows than fit on screen.
+    /// Recomputed each frame in `render_agents` from the selected row + pane height.
+    agents_scroll: usize,
     backend: Backend,
     model: String,
     effort: Option<EffortLevel>,
@@ -894,6 +898,7 @@ impl App {
             scheduler_tick: 0,
             spinner_frame: 0,
             selected_agent: 0,
+            agents_scroll: 0,
             backend: selection.backend,
             model: selection.model,
             effort: selection.effort,

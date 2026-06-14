@@ -5562,6 +5562,49 @@ fn selected_agent_row_renders_a_visible_marker() {
 }
 
 #[test]
+fn agents_pane_scrolls_to_follow_the_selection() {
+    // With more agents than fit in the pane, navigating down must scroll the pane so
+    // the selected agent stays on screen. The list used to render stateless from the
+    // top, so the bottom of the list — including the selection — was clipped off.
+    let mut app = App::new();
+    let mut agents = Vec::new();
+    for i in 0..30 {
+        agents.push(test_agent_run(&format!("n{i}"), &format!("zztask{i:02}")));
+    }
+    app.agents = agents;
+    // Seed the diff cache so render doesn't shell out to git/jj 30 times per frame.
+    for a in &app.agents {
+        app.diff_summary_cache
+            .insert(a.id.clone(), (Instant::now(), None));
+    }
+
+    // A short pane (height 24) cannot show all 30 multi-line rows at once. Selecting
+    // the LAST agent must scroll it into view and push the FIRST off the top.
+    app.selected_agent = 29;
+    let screen = render_screen(&mut app, 120, 24);
+    assert!(
+        screen.contains("zztask29"),
+        "the selected (last) agent must scroll into view:\n{screen}"
+    );
+    assert!(
+        !screen.contains("zztask00"),
+        "the first agent must scroll off the top when the last is selected:\n{screen}"
+    );
+
+    // Selecting the FIRST agent must scroll back to the top.
+    app.selected_agent = 0;
+    let screen = render_screen(&mut app, 120, 24);
+    assert!(
+        screen.contains("zztask00"),
+        "selecting the first agent scrolls back to the top:\n{screen}"
+    );
+    assert!(
+        !screen.contains("zztask29"),
+        "the last agent is off-screen when the first is selected:\n{screen}"
+    );
+}
+
+#[test]
 fn auto_merge_waits_for_an_active_resolver() {
     // Integration through the shared jj workspace is serial: a Done node must NOT be merged
     // while a merge-conflict resolver is mid-flight in the same workspace, or the new merge

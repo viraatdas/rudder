@@ -1364,7 +1364,50 @@ pub(crate) fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     });
     app.agent_row_map = row_map;
 
-    frame.render_widget(
+    // Scroll the pane to follow the selection. The list was rendered stateless before,
+    // so it always drew from the top: with more agents than fit, the selected row (and
+    // the bottom of the tree) was clipped off-screen. Compute the minimal top offset
+    // that keeps the selected agent's whole row group visible, persisted across frames.
+    let view_h = area.height.saturating_sub(2) as usize; // minus the block's top+bottom border
+    let total = lines.len();
+    let mut offset = app.agents_scroll;
+    if view_h > 0 {
+        let mut first: Option<usize> = None;
+        let mut last: Option<usize> = None;
+        for (i, m) in app.agent_row_map.iter().enumerate() {
+            if *m == Some(app.selected_agent) {
+                if first.is_none() {
+                    first = Some(i);
+                }
+                last = Some(i);
+            }
+        }
+        if let (Some(first), Some(last)) = (first, last) {
+            if last + 1 <= view_h {
+                // The whole selection fits on the first page: show from the very top so
+                // the pane header (cwd, run count, hints) stays visible.
+                offset = 0;
+            } else if first < offset {
+                // Selection is above the viewport: scroll up to reveal its top.
+                offset = first;
+            } else if last >= offset + view_h {
+                // Selection is below the viewport: scroll down to reveal its bottom.
+                offset = last + 1 - view_h;
+            }
+            // If the group alone is taller than the viewport, prefer showing its top.
+            if last + 1 - first > view_h {
+                offset = first;
+            }
+        }
+        // Never scroll past the end (which would leave dead space at the bottom).
+        offset = offset.min(total.saturating_sub(view_h));
+    } else {
+        offset = 0;
+    }
+    app.agents_scroll = offset;
+
+    let mut list_state = ratatui::widgets::ListState::default().with_offset(offset);
+    frame.render_stateful_widget(
         List::new(lines).style(app_style()).block(pane_block(
             if app.nest_view {
                 "agents · nest"
@@ -1375,6 +1418,7 @@ pub(crate) fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             app.nav_mode,
         )),
         area,
+        &mut list_state,
     );
 }
 
