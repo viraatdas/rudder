@@ -30,7 +30,10 @@ export function slackConfigFromEnv(env: NodeJS.ProcessEnv = process.env): SlackC
     botToken,
     signingSecret,
     channel,
-    enabled: Boolean(botToken),
+    // Fail closed: Slack is only "enabled" when BOTH the bot token and the signing
+    // secret are present, so inbound events are never processed without a verifiable
+    // signature (an unset signing secret used to skip verification entirely).
+    enabled: Boolean(botToken && signingSecret),
   };
 }
 

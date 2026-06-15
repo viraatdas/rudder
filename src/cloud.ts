@@ -1174,17 +1174,28 @@ function normalizeCloudUrl(raw: string | undefined): string {
   if (!value) {
     throw new Error("RUDDER_CLOUD_URL is not configured. Set it to your Rudder Cloud control plane URL.");
   }
+  let url: URL;
   try {
-    const url = new URL(value);
-    if (url.protocol !== "http:" && url.protocol !== "https:") {
-      throw new Error("bad protocol");
-    }
-    url.hash = "";
-    url.search = "";
-    return url.toString().replace(/\/$/, "");
+    url = new URL(value);
   } catch {
     throw new Error("RUDDER_CLOUD_URL must be a valid http(s) URL.");
   }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new Error("RUDDER_CLOUD_URL must be a valid http(s) URL.");
+  }
+  // The control plane hands back a shell command (bootstrapCommand) that the client
+  // can auto-run over SSH, so a plain-HTTP control plane is a MITM-to-RCE risk.
+  // Require https except for loopback dev or an explicit opt-in.
+  const isLoopback = url.hostname === "127.0.0.1" || url.hostname === "localhost" || url.hostname === "::1";
+  if (url.protocol === "http:" && !isLoopback && process.env.RUDDER_CLOUD_ALLOW_HTTP !== "1") {
+    throw new Error(
+      "Refusing a plain-HTTP RUDDER_CLOUD_URL (it can be MITM'd into running arbitrary commands). " +
+        "Use https://, or set RUDDER_CLOUD_ALLOW_HTTP=1 to override for a trusted local network.",
+    );
+  }
+  url.hash = "";
+  url.search = "";
+  return url.toString().replace(/\/$/, "");
 }
 
 async function selectedCloudRuntime(explicit?: CloudRuntime): Promise<CloudRuntime> {
@@ -1730,21 +1741,28 @@ async function printResult(result: JsonValue, options: CloudCommandOptions): Pro
       const state = await loadCloudAuth();
       const host = options.sshHost ?? state?.byocSshHost;
       console.log(`${id}${status ? ` (${status})` : ""} is ready for BYOC.`);
-      if (host && process.env.RUDDER_BYOC_AUTOSTART !== "0") {
+      // bootstrapCommand is a shell command supplied by the control plane. Auto-running
+      // it over SSH is RCE-on-your-host if the control plane is compromised or MITM'd,
+      // so autostart is OPT-IN (RUDDER_BYOC_AUTOSTART=1) and the command is always
+      // printed first so the user can review exactly what would run.
+      console.log("BYOC bootstrap command (review before running):");
+      console.log(record.bootstrapCommand);
+      if (host && process.env.RUDDER_BYOC_AUTOSTART === "1") {
         try {
+          console.log(`\nRUDDER_BYOC_AUTOSTART=1 set — running the above over SSH on ${host}...`);
           await startByocWorkerOverSsh(host, record.bootstrapCommand);
           console.log(`Started BYOC worker over SSH on ${host}.`);
           console.log(`Remote log: ssh ${host} 'tail -f ~/.rudder/byoc/worker.log'`);
         } catch (error) {
           console.log(`Could not start BYOC worker over SSH on ${host}: ${error instanceof Error ? error.message : String(error)}`);
-          console.log("Run this manually on your workstation/server:");
-          console.log(record.bootstrapCommand);
+          console.log("Run the command above manually on your workstation/server.");
         }
       } else {
-        console.log("Run this on your workstation/server:");
-        console.log(record.bootstrapCommand);
-        if (!host) {
-          console.log("\nTip: run `rudder cloud byoc <ssh-host>` to have Rudder start this over SSH next time.");
+        console.log("\nRun the command above on your workstation/server.");
+        if (host) {
+          console.log("To auto-run it over SSH next time, set RUDDER_BYOC_AUTOSTART=1.");
+        } else {
+          console.log("Tip: run `rudder cloud byoc <ssh-host>` to target an SSH host.");
         }
       }
       if (typeof record.updatedAt === "string") {

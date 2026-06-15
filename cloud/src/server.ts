@@ -115,6 +115,14 @@ const adminEmails = new Set((process.env.RUDDER_ADMIN_EMAILS || "viraat.laldas@g
   .split(",")
   .map((email) => email.trim().toLowerCase())
   .filter(Boolean));
+// Slack user IDs authorized to issue control commands (list/output/stop/talk) in the
+// shared channel. The channel is multi-tenant, so without this any channel member
+// could drive any account's cloud instances — fail closed: when unset, control
+// commands are refused and only `help` works.
+const slackAllowedUsers = new Set((process.env.RUDDER_SLACK_ALLOWED_USERS || "")
+  .split(",")
+  .map((id) => id.trim())
+  .filter(Boolean));
 const deviceLogins = new Map<string, DeviceLogin>();
 const githubBrowserLogins = new Map<string, GithubBrowserLogin>();
 const s3 = new S3Client({ region: awsRegion });
@@ -379,10 +387,14 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     if (req.method === "GET" && url.pathname === "/setup/github") {
+      // Provider-credential setup is admin-only: an unauthenticated visitor must not
+      // be able to install (or, via the callback, overwrite) the OAuth client creds.
+      await requireAdminRequest(req);
       renderGithubAppSetup(url, res);
       return;
     }
     if (req.method === "GET" && url.pathname === "/setup/github/callback") {
+      await requireAdminRequest(req);
       await handleGithubAppSetupCallback(url, res);
       return;
     }
@@ -1644,10 +1656,12 @@ async function requireAdminRequest(req: IncomingMessage): Promise<void> {
     requireAdmin(ctx);
     return;
   }
-  // Fallback: better-auth session cookie from an admin email.
+  // Fallback: better-auth session cookie from an admin email. The email must be
+  // verified — an unverified provider email must never satisfy the admin check.
   const session = await getBetterAuthSession(req);
   const email = typeof session?.user?.email === "string" ? session.user.email.toLowerCase() : undefined;
-  if (email && adminEmails.has(email)) {
+  const emailVerified = (session?.user as { emailVerified?: unknown } | undefined)?.emailVerified === true;
+  if (email && emailVerified && adminEmails.has(email)) {
     return;
   }
   throw unauthorized();
@@ -1676,13 +1690,13 @@ async function handleSailApi(req: IncomingMessage, res: ServerResponse, url: URL
     return;
   }
   if (req.method === "POST" && url.pathname === "/api/rudder/sail/launch") {
-    const body = await readJsonBody(req);
+    const body = await readJsonBody(req, MAX_SNAPSHOT_BODY_BYTES);
     const sail = await createSail(authContext.accountId, body);
     sendJson(res, 200, sail);
     return;
   }
   if (req.method === "POST" && url.pathname === "/api/rudder/sail/onload") {
-    const body = await readJsonBody(req);
+    const body = await readJsonBody(req, MAX_SNAPSHOT_BODY_BYTES);
     const sail = await createSail(authContext.accountId, body, stringField(body, "runId"));
     sendJson(res, 200, sail);
     return;
@@ -1783,7 +1797,7 @@ async function handleWorkspaceApi(req: IncomingMessage, res: ServerResponse, url
     return;
   }
   if (req.method === "POST" && url.pathname === "/api/rudder/workspace/attach") {
-    const body = await readJsonBody(req);
+    const body = await readJsonBody(req, MAX_SNAPSHOT_BODY_BYTES);
     const result = await ensureWorkspaceForAttach(authContext.accountId, body);
     sendJson(res, 200, result);
     return;
@@ -2774,11 +2788,45 @@ async function githubUser(token: string): Promise<{ id: number | string; login: 
   }
   const id = typeof parsed.id === "number" || typeof parsed.id === "string" ? parsed.id : undefined;
   const login = typeof parsed.login === "string" ? parsed.login : undefined;
-  const email = typeof parsed.email === "string" ? parsed.email : undefined;
   if (!id || !login) {
     throw unauthorized();
   }
+  // SECURITY: the public profile `email` is user-mutable and may be unverified, so it
+  // must never drive authorization (it gates admin via adminEmails). Use the
+  // GitHub-verified primary email instead; undefined when none is verified.
+  const email = await githubVerifiedPrimaryEmail(token);
   return { id, login, email };
+}
+
+async function githubVerifiedPrimaryEmail(token: string): Promise<string | undefined> {
+  try {
+    const response = await fetch("https://api.github.com/user/emails", {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: "application/vnd.github+json",
+        "User-Agent": "rudder-cloud",
+        "X-GitHub-Api-Version": "2022-11-28",
+      },
+    });
+    if (!response.ok) {
+      return undefined;
+    }
+    const list = (await response.json()) as unknown;
+    if (!Array.isArray(list)) {
+      return undefined;
+    }
+    const primary = list.find(
+      (entry): entry is { email: string } =>
+        Boolean(entry) &&
+        typeof entry === "object" &&
+        (entry as { primary?: unknown }).primary === true &&
+        (entry as { verified?: unknown }).verified === true &&
+        typeof (entry as { email?: unknown }).email === "string",
+    );
+    return primary?.email.toLowerCase();
+  } catch {
+    return undefined;
+  }
 }
 
 // --------------------------------------------------------------------------
@@ -2836,27 +2884,44 @@ function scheduleOutputEcho(sailId: string, threadTs: string | undefined, delayM
   }, delayMs).unref();
 }
 
-async function readRawBody(req: IncomingMessage): Promise<string> {
+// Default body cap for unauthenticated/early-parsed routes. Snapshots (base64
+// tarballs) are larger, so authenticated upload routes pass a bigger explicit cap.
+const DEFAULT_MAX_BODY_BYTES = 2 * 1024 * 1024;
+const MAX_SNAPSHOT_BODY_BYTES = 256 * 1024 * 1024;
+
+async function readRawBody(req: IncomingMessage, maxBytes = DEFAULT_MAX_BODY_BYTES): Promise<string> {
   const chunks: Buffer[] = [];
+  let total = 0;
   for await (const chunk of req) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    total += buf.length;
+    if (total > maxBytes) {
+      req.destroy();
+      throw payloadTooLarge();
+    }
+    chunks.push(buf);
   }
   return Buffer.concat(chunks).toString("utf8");
 }
 
 async function handleSlackEvents(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const raw = await readRawBody(req);
-  if (slack.signingSecret) {
-    const ok = verifySlackSignature({
-      signingSecret: slack.signingSecret,
-      timestamp: req.headers["x-slack-request-timestamp"] as string | undefined,
-      signature: req.headers["x-slack-signature"] as string | undefined,
-      rawBody: raw,
-    });
-    if (!ok) {
-      sendJson(res, 401, { error: "bad signature" });
-      return;
-    }
+  // Slack events are tiny; cap hard so an unauthenticated POST can't exhaust memory.
+  const raw = await readRawBody(req, 256 * 1024);
+  // Fail closed: never process an inbound Slack event without verifying its
+  // signature. An unset signing secret means Slack is misconfigured, not open.
+  if (!slack.signingSecret) {
+    sendJson(res, 401, { error: "slack not configured" });
+    return;
+  }
+  const ok = verifySlackSignature({
+    signingSecret: slack.signingSecret,
+    timestamp: req.headers["x-slack-request-timestamp"] as string | undefined,
+    signature: req.headers["x-slack-signature"] as string | undefined,
+    rawBody: raw,
+  });
+  if (!ok) {
+    sendJson(res, 401, { error: "bad signature" });
+    return;
   }
   let body: Record<string, unknown>;
   try {
@@ -2921,6 +2986,19 @@ async function processSlackEvent(event: Record<string, unknown>): Promise<void> 
 
   const command = parseSlackCommand(text, { inThread });
   const replyThread = threadTs ?? ts;
+
+  // The channel is shared across accounts, so authorize the sender before any command
+  // that reads output or controls an instance. Without an allowlist, fail closed.
+  if (command.action !== "help") {
+    const sender = typeof event.user === "string" ? event.user : "";
+    if (!sender || !slackAllowedUsers.has(sender)) {
+      await postToSlack(
+        "You're not authorized to control cloud instances from Slack. Ask an admin to add your Slack user ID to RUDDER_SLACK_ALLOWED_USERS.",
+        replyThread,
+      );
+      return;
+    }
+  }
 
   switch (command.action) {
     case "help":
@@ -3207,10 +3285,17 @@ function renderExpiredPage(res: ServerResponse, status = 400): void {
   }), status);
 }
 
-async function readJsonBody(req: IncomingMessage): Promise<Json> {
+async function readJsonBody(req: IncomingMessage, maxBytes = DEFAULT_MAX_BODY_BYTES): Promise<Json> {
   const chunks: Buffer[] = [];
+  let total = 0;
   for await (const chunk of req) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    total += buf.length;
+    if (total > maxBytes) {
+      req.destroy();
+      throw payloadTooLarge();
+    }
+    chunks.push(buf);
   }
   if (chunks.length === 0) {
     return {};
@@ -3361,6 +3446,12 @@ function badRequest(message: string): Error {
 function unauthorized(): Error {
   const error = new Error("unauthorized");
   (error as Error & { status?: number }).status = 401;
+  return error;
+}
+
+function payloadTooLarge(): Error {
+  const error = new Error("payload too large");
+  (error as Error & { status?: number }).status = 413;
   return error;
 }
 

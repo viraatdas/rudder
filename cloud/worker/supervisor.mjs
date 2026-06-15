@@ -71,23 +71,34 @@ const args = isWorkspaceMode
   ? []
   : task ? [cloudBackend, "--worktree", task] : [];
 
+// Build the agent's environment from a COPY with the control-plane secrets removed.
+// The supervisor already captured these into module-level consts at startup, so the
+// spawned coding agent never needs them — and must not see them: a steered or
+// otherwise compromised agent could read the worker bearer token / presigned snapshot
+// URL straight out of its own environment and exfiltrate them. (We mutate childEnv,
+// not process.env, so the supervisor's own WebSocket auth is unaffected.)
+const childEnv = {
+  ...process.env,
+  ...capturedEnv,
+  TERM: "xterm-256color",
+  COLORTERM: "truecolor",
+  RUDDER_HEADLESS: "0",
+  // Rudder's pinned Codex fork has no linux/x64 binary, so any codex-binary
+  // resolution (e.g. when the snapshot carries codex auth) would otherwise crash
+  // even a claude run. Point it at the stock @openai/codex installed in the image
+  // so resolution always succeeds; the default backend is still claude.
+  RUDDER_CODEX_BIN: process.env.RUDDER_CODEX_BIN || "codex",
+};
+for (const secret of ["RUDDER_WORKER_TOKEN", "RUDDER_SNAPSHOT_URL", "RUDDER_CLOUD_TOKEN"]) {
+  delete childEnv[secret];
+}
+
 const term = pty.spawn(command, args, {
   name: "xterm-256color",
   cols: 120,
   rows: 32,
   cwd,
-  env: {
-    ...process.env,
-    ...capturedEnv,
-    TERM: "xterm-256color",
-    COLORTERM: "truecolor",
-    RUDDER_HEADLESS: "0",
-    // Rudder's pinned Codex fork has no linux/x64 binary, so any codex-binary
-    // resolution (e.g. when the snapshot carries codex auth) would otherwise crash
-    // even a claude run. Point it at the stock @openai/codex installed in the image
-    // so resolution always succeeds; the default backend is still claude.
-    RUDDER_CODEX_BIN: process.env.RUDDER_CODEX_BIN || "codex",
-  },
+  env: childEnv,
 });
 
 let ws = null;
