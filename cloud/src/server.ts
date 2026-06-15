@@ -1482,13 +1482,22 @@ async function handleCliApprove(req: IncomingMessage, res: ServerResponse, url: 
     renderLoginPage(url, res);
     return;
   }
+  // Only bake the email into the (admin-trusted) rdr_ token when it is VERIFIED, so
+  // the token path shares the same invariant as requireAdminRequest's session path:
+  // an unverified email can never become an admin token. (better-auth is social-only
+  // today, but enforce it at the trust boundary rather than relying on that.)
+  const verifiedEmail =
+    typeof session.user.email === "string" &&
+    (session.user as { emailVerified?: unknown }).emailVerified === true
+      ? session.user.email
+      : undefined;
   const issued = issueRudderToken(
     String(session.user.id || `better-auth:${randomUUID()}`),
-    typeof session.user.email === "string" ? session.user.email : undefined,
+    verifiedEmail,
   );
   login.token = issued.token;
   login.accountId = issued.accountId;
-  login.email = typeof session.user.email === "string" ? session.user.email : undefined;
+  login.email = verifiedEmail;
   renderSuccessPage(res, login.email);
 }
 
