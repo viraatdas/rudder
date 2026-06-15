@@ -1905,6 +1905,42 @@ fn maps_task_mouse_selection_to_wrapped_input() {
 }
 
 #[test]
+fn task_cursor_from_selection_point_accounts_for_newlines() {
+    // Multi-line input "ab\ncd": clicking row 1 col 1 maps to source index 4 (after
+    // 'c'), not 3 — the '\n' is a real source char the old wrap-based mapping dropped,
+    // which shifted the cursor and corrupted later edits on multi-line task input.
+    let v = "ab\ncd";
+    assert_eq!(task_cursor_from_selection_point(v, SelectionPoint { row: 0, col: 0 }, 80), 0);
+    assert_eq!(task_cursor_from_selection_point(v, SelectionPoint { row: 1, col: 0 }, 80), 3);
+    assert_eq!(task_cursor_from_selection_point(v, SelectionPoint { row: 1, col: 1 }, 80), 4);
+    // Clicking past the end of row 0 clamps before the newline (end of "ab" = idx 2).
+    assert_eq!(task_cursor_from_selection_point(v, SelectionPoint { row: 0, col: 9 }, 80), 2);
+}
+
+#[test]
+fn assert_no_hard_cycle_allows_hard_dep_on_out_of_block_parent() {
+    use crate::tasks::{assert_no_hard_cycle, EdgeType, PlanEdge, RudderPlanTask};
+    let mk = |id: &str, dep: &str| RudderPlanTask {
+        id: id.to_string(),
+        title: id.to_string(),
+        prompt: "do".to_string(),
+        goal: None,
+        success: None,
+        deps: vec![PlanEdge { on: dep.to_string(), edge: EdgeType::Hard, why: Some("x".into()) }],
+        backend: None,
+        model: None,
+        effort: None,
+    };
+    // A reconcile/rebase node hard-depending on a FRONTIER id not in the task set is
+    // already satisfied and must not be flagged as a cycle (regression: it used to
+    // leave the child stuck above indegree 0 and reject the whole plan).
+    let reconcile = mk("n1", "frontier-merged-id");
+    assert!(assert_no_hard_cycle(std::slice::from_ref(&reconcile)).is_ok());
+    // A genuine 2-cycle WITHIN the set is still rejected.
+    assert!(assert_no_hard_cycle(&[mk("a", "b"), mk("b", "a")]).is_err());
+}
+
+#[test]
 fn selection_point_from_mouse_offsets_by_pane_inner_origin() {
     // Callers pass block_inner(pane) as `area`, so the point must be relative to
     // that inner origin (pane border + any header already accounted for by the

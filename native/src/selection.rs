@@ -89,14 +89,40 @@ pub(crate) fn task_cursor_from_selection_point(
     point: SelectionPoint,
     width: u16,
 ) -> usize {
-    let lines = wrap_input_text(value, width);
-    let mut cursor = 0;
-    for (row, line) in lines.iter().enumerate() {
-        let line_len = line.chars().count();
-        if row == point.row {
-            return cursor + point.col.min(line_len);
+    // Invert the SAME forward walk the renderer uses (task_cursor_position): step over
+    // the source chars tracking (line, column) — incrementing line on '\n', skipping
+    // '\r', wrapping column at max_width — and return the source index whose position
+    // reaches the clicked (row, col). The old version re-derived from wrap_input_text,
+    // which drops the '\n' chars, so the returned index was off by one per preceding
+    // newline and later edits corrupted the text on multi-line input.
+    let max_width = usize::from(width.max(1));
+    let mut line = 0usize;
+    let mut column = 0usize;
+    for (idx, ch) in value.chars().enumerate() {
+        if line == point.row && column == point.col {
+            return idx;
         }
-        cursor += line_len;
+        if line > point.row {
+            // Clicked past the end of a wrapped row: clamp to the row boundary.
+            return idx;
+        }
+        if ch == '\r' {
+            continue;
+        }
+        if ch == '\n' {
+            if line == point.row {
+                // Clicked past the end of this row: clamp before the newline.
+                return idx;
+            }
+            line += 1;
+            column = 0;
+            continue;
+        }
+        column += 1;
+        if column == max_width {
+            line += 1;
+            column = 0;
+        }
     }
     value.chars().count()
 }

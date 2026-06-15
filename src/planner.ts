@@ -96,13 +96,25 @@ export function parsePlanBlock(output: string): PlanDag {
   // First pass: build nodes, synthesizing ids n0.. for tasks without one.
   const nodes: PlanNode[] = [];
   const rawDepsById = new Map<string, PlanEdge[]>();
+  const seenIds = new Set<string>();
   tasks.slice(0, 100).forEach((entry, index) => {
     const raw = (entry ?? {}) as RawTask;
     const prompt = typeof raw.prompt === "string" ? raw.prompt.trim() : "";
     if (!prompt) {
       return;
     }
-    const id = typeof raw.id === "string" && raw.id.trim() ? raw.id.trim() : `n${index}`;
+    let id = typeof raw.id === "string" && raw.id.trim() ? raw.id.trim() : `n${index}`;
+    // Uniquify colliding ids (mirrors the native parser): two tasks sharing an id
+    // would otherwise collapse into one graph node + jj change, silently dropping a
+    // task. rawDepsById is keyed by id, so a collision must be resolved before use.
+    if (seenIds.has(id)) {
+      let suffix = 2;
+      while (seenIds.has(`${id}-${suffix}`)) {
+        suffix += 1;
+      }
+      id = `${id}-${suffix}`;
+    }
+    seenIds.add(id);
     const title = typeof raw.title === "string" && raw.title.trim() ? raw.title.trim() : "worker task";
     // goal + success are part of the launch-goal convention: REQUIRED in the system
     // prompt, but we stay backward-compatible by deriving sane defaults when the

@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { BackendId } from "./types.js";
+import { rudderHome } from "./util.js";
 
 const MODELS_DEV_URL = "https://models.dev/api.json";
 const MODELS_DEV_CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
@@ -208,7 +209,10 @@ async function writeModelsDevCache(data: ModelsDevCache): Promise<void> {
 }
 
 function modelsDevCachePath(): string {
-  return path.join(os.homedir(), ".rudder", "models-dev.json");
+  // Resolve under RUDDER_HOME (falling back to ~/.rudder) so this TS writer and the
+  // native Rust reader (models.rs models_dev_cache_path) agree on the same file when
+  // RUDDER_HOME is set — otherwise dynamic model refresh + cached reasoning break.
+  return path.join(rudderHome(), "models-dev.json");
 }
 
 function isUsableTextModel(id: string, model: ModelsDevModel): boolean {

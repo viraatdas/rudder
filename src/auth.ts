@@ -15,6 +15,7 @@ import {
   formatMissingToolMessage,
   MissingToolError,
   pathExists,
+  promptSecret,
   promptSelect,
   promptText,
   readJson,
@@ -261,7 +262,7 @@ async function configureAnthropic(
     "skip",
   );
   if (choice === "setup-token") {
-    const token = await promptText("Paste Anthropic setup-token");
+    const token = await promptSecret("Paste Anthropic setup-token");
     store.profiles["anthropic:default"] = {
       type: "token",
       provider: "anthropic",
@@ -270,7 +271,7 @@ async function configureAnthropic(
     config.backends.claude = { ...(config.backends.claude ?? {}), profileId: "anthropic:default" };
   }
   if (choice === "api-key") {
-    const key = await promptText("Paste Anthropic API key");
+    const key = await promptSecret("Paste Anthropic API key");
     store.profiles["anthropic:default"] = {
       type: "api_key",
       provider: "anthropic",
@@ -304,7 +305,9 @@ async function configureOpenAI(
     "skip",
   );
   if (choice === "codex-login") {
-    await runCommand("codex", ["login"]);
+    // codex login is interactive: inherit stdio so the user can complete the flow
+    // (the default pipes ignore stdin and capture output, hanging the login).
+    await runCommand("codex", ["login"], { inheritStdio: true });
     const codex = await readCodexCliCredential();
     if (codex?.credential) {
       store.profiles["openai-codex:default"] = codex.credential;
@@ -312,7 +315,7 @@ async function configureOpenAI(
     }
   }
   if (choice === "api-key") {
-    const key = await promptText("Paste OpenAI API key");
+    const key = await promptSecret("Paste OpenAI API key");
     store.profiles["openai:default"] = {
       type: "api_key",
       provider: "openai",

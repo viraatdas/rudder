@@ -4496,9 +4496,11 @@ impl App {
                 run.effort,
                 run.terminal_size.unwrap_or_default(),
                 bootstrap,
-                run.session_id
-                    .clone()
-                    .or_else(|| mint_session_id_for(run.backend)),
+                // Re-spawning a stopped main starts a FRESH session: the old session id
+                // was already consumed, and `claude --session-id` is a NEW-session flag
+                // (not --resume), so reusing it fails to launch. Always mint a new id,
+                // matching restart_selected_agent.
+                mint_session_id_for(run.backend),
             )
         };
         let mut command = agent_command(

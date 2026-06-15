@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import type { BackendAdapter, BackendId, RunRequest, RudderEvent, AuthProfileStore, EffortLevel } from "./types.js";
 import { CODEX_RUDDER_CONFIG_ARGS, codexLaunchEnv, ensureRudderCodexBinary } from "./codex-binary.js";
-import { loadAuthStore, saveRunRecord } from "./state.js";
+import { loadAuthStore, loadConfig, saveRunRecord } from "./state.js";
 import { normalizeEffortForBackend } from "./effort.js";
 import {
   commandExists,
@@ -256,18 +256,36 @@ function acpxCodexModel(model: string | undefined, effort: EffortLevel | undefin
 
 export async function backendEnv(provider: "anthropic" | "openai"): Promise<NodeJS.ProcessEnv> {
   const store = await loadAuthStore();
+  const config = await loadConfig().catch(() => undefined);
   const env = { ...process.env };
   if (provider === "anthropic") {
-    const profile = firstProfile(store, ["anthropic:env", "anthropic:default"]);
+    // Honor the configured/synced profile FIRST, then the common fallbacks. The
+    // synced Claude Code profile is "anthropic:claude-code" — omitting it meant the
+    // primary credential was never injected.
+    const configuredId = config?.backends?.claude?.profileId;
+    const profile = firstProfile(store, [
+      ...(configuredId ? [configuredId] : []),
+      "anthropic:claude-code",
+      "anthropic:env",
+      "anthropic:default",
+    ]);
     if (profile?.type === "api_key" && profile.key) {
       env.ANTHROPIC_API_KEY = profile.key;
     }
     if (profile?.type === "token" && profile.token) {
-      env.ANTHROPIC_OAUTH_TOKEN = profile.token;
+      // The Claude CLI reads CLAUDE_CODE_OAUTH_TOKEN for a setup-token; the previously
+      // set ANTHROPIC_OAUTH_TOKEN is not a recognized var, so the token was ignored.
+      env.CLAUDE_CODE_OAUTH_TOKEN = profile.token;
     }
   }
   if (provider === "openai") {
-    const profile = firstProfile(store, ["openai:env", "openai:default"]);
+    const configuredId = config?.backends?.codex?.profileId;
+    const profile = firstProfile(store, [
+      ...(configuredId ? [configuredId] : []),
+      "openai-codex:default",
+      "openai:env",
+      "openai:default",
+    ]);
     if (profile?.type === "api_key" && profile.key) {
       env.OPENAI_API_KEY = profile.key;
     }

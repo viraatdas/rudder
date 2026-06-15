@@ -357,15 +357,25 @@ pub(crate) fn planned_node_worker_prompt(
 /// Kahn topological sort over the hard edges only. Returns `Err` when a cycle is
 /// present so the TUI can surface it instead of deadlocking. Unknown ids are
 /// assumed already dropped by the caller.
-fn assert_no_hard_cycle(tasks: &[RudderPlanTask]) -> Result<()> {
-    use std::collections::{HashMap, VecDeque};
+pub(crate) fn assert_no_hard_cycle(tasks: &[RudderPlanTask]) -> Result<()> {
+    use std::collections::{HashMap, HashSet, VecDeque};
 
     let ids: Vec<&str> = tasks.iter().map(|task| task.id.as_str()).collect();
+    let known: HashSet<&str> = ids.iter().copied().collect();
     let mut indegree: HashMap<&str, usize> = ids.iter().map(|id| (*id, 0usize)).collect();
     // child -> list of parents it hard-depends on; edge parent -> child.
     let mut children: HashMap<&str, Vec<&str>> = HashMap::new();
     for task in tasks {
         for parent in task.hard_deps() {
+            // A hard dep on an id OUTSIDE this task set (a frontier / already-merged
+            // parent) is already satisfied and cannot form a cycle within the set.
+            // Counting it would leave the child permanently above indegree 0 (the
+            // out-of-set parent is never enqueued as a root), falsely reporting a
+            // cycle and rejecting the whole plan — this mirrors is_ready's permissive
+            // dangling-dep rule and keeps parity with the TS parser.
+            if !known.contains(parent) {
+                continue;
+            }
             children.entry(parent).or_default().push(task.id.as_str());
             *indegree.entry(task.id.as_str()).or_insert(0) += 1;
         }

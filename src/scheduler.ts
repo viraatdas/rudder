@@ -683,6 +683,21 @@ async function scheduleTickCore(repoRoot: string, bus: RudderBus): Promise<void>
     }
   }
 
+  // A failure detected by the tick must block hard dependents exactly like the
+  // edge-triggered onRunTransition path — otherwise a dependent whose parent failed
+  // (but was only noticed via the 1s tick) would still be scheduled. Compute the
+  // blocked set from the pre-update graph for every justReached "failed".
+  const blockedByFailure: string[] = [];
+  for (const { node, status } of justReached) {
+    if (status === "failed") {
+      for (const id of computeBlocked(graph, node.id)) {
+        if (!blockedByFailure.includes(id)) {
+          blockedByFailure.push(id);
+        }
+      }
+    }
+  }
+
   // Persist any projected status changes (and capture review transitions) plus
   // any freshened token counts.
   if (justReached.length || tokenUpdates.size) {
@@ -695,6 +710,13 @@ async function scheduleTickCore(repoRoot: string, bus: RudderBus): Promise<void>
             current.reviewState = current.reviewState ?? "pending";
           }
           current.updatedAt = nowIso();
+        }
+      }
+      for (const id of blockedByFailure) {
+        const target = g.nodes[id];
+        if (target && target.status !== "merged" && target.status !== "blocked") {
+          target.status = "blocked";
+          target.updatedAt = nowIso();
         }
       }
       for (const [nodeId, tokens] of tokenUpdates) {
@@ -714,6 +736,9 @@ async function scheduleTickCore(repoRoot: string, bus: RudderBus): Promise<void>
       } else if (status === "merged") {
         bus.publish({ ts: nowIso(), runId: node.runId ?? node.id, nodeId: node.id, type: "node.merged" });
       }
+    }
+    for (const id of blockedByFailure) {
+      bus.publish({ ts: nowIso(), runId: id, nodeId: id, type: "node.blocked" });
     }
     await renderLiveRudderMd(repoRoot).catch(() => undefined);
   }

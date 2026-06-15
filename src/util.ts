@@ -187,22 +187,25 @@ export function isMissingToolSpawnError(error: unknown): boolean {
 export async function runCommand(
   command: string,
   args: string[],
-  options?: { cwd?: string; allowFailure?: boolean; env?: NodeJS.ProcessEnv },
+  options?: { cwd?: string; allowFailure?: boolean; env?: NodeJS.ProcessEnv; inheritStdio?: boolean },
 ): Promise<{ stdout: string; stderr: string; code: number }> {
   return await new Promise((resolve, reject) => {
+    // inheritStdio wires the child straight to this process's terminal so an
+    // INTERACTIVE command (e.g. `codex login`) can read stdin and show its prompts;
+    // its stdout/stderr are then not captured (they go to the terminal).
     const child = spawn(command, args, {
       cwd: options?.cwd,
       env: commandEnv(options?.env),
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: options?.inheritStdio ? "inherit" : ["ignore", "pipe", "pipe"],
     });
     let stdout = "";
     let stderr = "";
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => {
+    child.stdout?.setEncoding("utf8");
+    child.stderr?.setEncoding("utf8");
+    child.stdout?.on("data", (chunk: string) => {
       stdout += chunk;
     });
-    child.stderr.on("data", (chunk: string) => {
+    child.stderr?.on("data", (chunk: string) => {
       stderr += chunk;
     });
     child.on("error", reject);

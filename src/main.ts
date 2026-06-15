@@ -732,10 +732,11 @@ async function runNativeDashboard(): Promise<boolean> {
   // event loop while the native TUI is in the foreground. Strictly non-fatal: if
   // it throws, log a notice and keep launching the TUI - the daemon must never
   // block or break the session.
+  let board: Awaited<ReturnType<typeof ensureBoardRunning>> | undefined;
   try {
     const repoRoot = findRepoRoot();
     if (repoRoot) {
-      const board = await ensureBoardRunning(repoRoot, { open: false, scheduler: false });
+      board = await ensureBoardRunning(repoRoot, { open: false, scheduler: false });
       // Hand the native child a deep link to THIS project's board so the `o` key /
       // `/web` opens straight into the current project (not the all-projects index).
       // The URL itself stays hidden in the TUI; the hotkey is the way in, and the
@@ -758,8 +759,12 @@ async function runNativeDashboard(): Promise<boolean> {
       child.on("exit", (exitCode) => resolve(exitCode));
     });
     process.exitCode = code ?? 1;
+    // The in-process board daemon keeps the event loop alive, so without closing it
+    // the CLI would hang after the foreground TUI exits. Close it before returning.
+    await board?.handle?.close().catch(() => undefined);
     return true;
   } catch {
+    await board?.handle?.close().catch(() => undefined);
     return false;
   }
 }
@@ -808,12 +813,14 @@ async function openTmuxDashboard(parsed: Parsed): Promise<void> {
     ...(parsed.flags.model ? ["--model", parsed.flags.model] : []),
   ];
   const managedCodexEnv = await codexEnvVars();
-  const withManagedCodex = (args: string[]) => shellCommand("env", [
-    `RUDDER_CODEX_BIN=${managedCodexEnv.RUDDER_CODEX_BIN}`,
-    `RUDDER_CODEX_VERSION=${managedCodexEnv.RUDDER_CODEX_VERSION}`,
-    `CODEX_RUDDER_SCROLLBACK_SAFE=${managedCodexEnv.CODEX_RUDDER_SCROLLBACK_SAFE}`,
-    ...args,
-  ]);
+  // Only inject codex env vars that are actually present. On platforms without a
+  // managed Codex binary codexEnvVars() returns {}, and interpolating the missing
+  // values would emit a literal `RUDDER_CODEX_BIN=undefined` that hard-fails Codex
+  // (and breaks the graceful optional-Codex behavior).
+  const codexEnvArgs = Object.entries(managedCodexEnv)
+    .filter(([, value]) => value != null && value !== "")
+    .map(([key, value]) => `${key}=${value}`);
+  const withManagedCodex = (args: string[]) => shellCommand("env", [...codexEnvArgs, ...args]);
   await ensureTmuxDashboardSession({
     repoRoot,
     sessionName,
