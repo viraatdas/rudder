@@ -2331,6 +2331,39 @@ fn plan_commands_use_read_only_backend_profiles() {
         .args
         .windows(2)
         .any(|window| window[0] == "-c" && window[1] == "features.computer_use=false"));
+
+    let interactive_codex = agent_command_with_orchestrator_mode(
+        Backend::Codex,
+        "gpt-5.5",
+        Some(EffortLevel::High),
+        "build the feature",
+        AgentMode::RudderPlan,
+        None,
+        true,
+    );
+    assert_eq!(
+        interactive_codex.args.first().map(String::as_str),
+        Some("--no-alt-screen"),
+        "interactive Codex orchestrator uses the TUI, not codex exec"
+    );
+    assert!(
+        !interactive_codex.args.iter().any(|arg| arg == "exec"),
+        "interactive Codex orchestrator must not use codex exec"
+    );
+    assert!(interactive_codex
+        .args
+        .windows(2)
+        .any(|window| window[0] == "--sandbox" && window[1] == "workspace-write"));
+    assert!(interactive_codex
+        .args
+        .windows(2)
+        .any(|window| window[0] == "--ask-for-approval" && window[1] == "never"));
+    assert!(interactive_codex.args.iter().any(|arg| {
+        arg.contains("normal Codex session")
+            && arg.contains("RUDDER_PLAN_TASKS_START")
+            && arg.contains("Only ever Edit/Write RUDDER.md and RUDDER_SHARED.md")
+            && !arg.contains(".claude/skills")
+    }));
 }
 
 #[test]
@@ -2427,6 +2460,50 @@ fn collects_rudder_plan_output_from_codex_session_messages() {
     let tasks = extract_rudder_plan_tasks(&output).expect("parse tasks");
     assert_eq!(tasks.len(), 1);
     assert_eq!(tasks[0].title, "UI");
+}
+
+#[test]
+fn finds_latest_codex_session_id_for_matching_cwd() {
+    let repo = unique_test_repo("codex-session-cwd");
+    let root = unique_test_repo("codex-session-root");
+    let shard = root.join("2026").join("06");
+    fs::create_dir_all(&shard).expect("create codex sessions dir");
+
+    let old = shard.join("old.jsonl");
+    fs::write(
+        &old,
+        format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"old-session\",\"cwd\":\"{}\"}}}}\n",
+            repo.display()
+        ),
+    )
+    .expect("write old session");
+
+    let other = shard.join("other.jsonl");
+    fs::write(
+        &other,
+        "{{\"type\":\"session_meta\",\"payload\":{\"id\":\"other-session\",\"cwd\":\"/tmp/not-this-repo\"}}}\n",
+    )
+    .expect("write other session");
+
+    // Ensure the target session has the newest mtime without relying on platform-specific
+    // timestamp setters.
+    std::thread::sleep(Duration::from_millis(5));
+    let newest = shard.join("newest.jsonl");
+    fs::write(
+        &newest,
+        format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"newest-session\",\"cwd\":\"{}\"}}}}\n",
+            repo.display()
+        ),
+    )
+    .expect("write newest session");
+
+    let found = latest_codex_session_id_in_dir(&root, &repo);
+
+    assert_eq!(found.as_deref(), Some("newest-session"));
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&repo);
 }
 
 #[test]
@@ -6081,7 +6158,7 @@ fn orchestrator_control_marker_can_stop_worker() {
 
 #[cfg(not(windows))]
 #[test]
-fn interactive_default_preserves_codex_planner_backend() {
+fn interactive_default_uses_codex_live_orchestrator() {
     let _env = env_guard();
     let repo = unique_test_repo("codex-orch-backend");
     let fake = repo.join("fake-codex.sh");
@@ -6108,8 +6185,12 @@ fn interactive_default_preserves_codex_planner_backend() {
         "Codex model is not swapped to Claude"
     );
     assert!(
-        run.autosteered,
-        "Codex uses the existing headless planner capture path"
+        run.interactive_orchestrator,
+        "Codex uses the live conductor path when interactive orchestration is enabled"
+    );
+    assert!(
+        !run.autosteered,
+        "Codex live conductor is not captured through the headless completed-planner path"
     );
     assert!(
         !repo.join(".claude").join("skills").exists(),
@@ -8912,7 +8993,7 @@ fn reconcile_planner_flag_survives_save_and_reload() {
 fn interactive_orchestrator_flag_survives_save_and_reload() {
     let repo = unique_test_repo("interactive-orch-roundtrip");
     let mut run = planner_run("orch-1", false);
-    run.backend = Backend::Claude;
+    run.backend = Backend::Codex;
     run.autosteered = false;
     run.interactive_orchestrator = true;
     save_native_run_record(&repo, &run).expect("save interactive orchestrator");

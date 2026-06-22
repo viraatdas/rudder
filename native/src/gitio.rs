@@ -499,10 +499,9 @@ pub(crate) fn agent_from_run_record(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or_else(|| {
             // Back-compat for records written before `interactiveOrchestrator` existed:
-            // interactive Claude orchestrators were non-autosteered and stayed running
+            // interactive orchestrators were non-autosteered and stayed running
             // (or stopped after approval). Headless planners generally complete/exit.
             mode == AgentMode::RudderPlan
-                && backend == Backend::Claude
                 && !reconcile_planner
                 && !autosteered
                 && matches!(status, AgentStatus::Running | AgentStatus::Stopped)

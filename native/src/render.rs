@@ -2662,7 +2662,7 @@ pub(crate) fn push_transcript_lines(
 
 /// Render the INTERACTIVE orchestrator (opt-in): a live DAG pane on top (from the plan
 /// the orchestrator wrote to its plan file → `planned_nodes`) and the raw interactive
-/// Claude Code PTY below, which the user converses with directly.
+/// backend PTY below, which the user converses with directly.
 pub(crate) fn render_interactive_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let focused = app.focus == FocusPane::Worker;
     // DAG pane on top (capped to a third, leaving room for the conversation), PTY below.
@@ -2790,7 +2790,7 @@ pub(crate) fn render_worker(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             .get(app.selected_agent)
             .is_some_and(|run| app.is_interactive_orchestrator_run(run));
         if selected_is_interactive_orchestrator {
-            // Opt-in: the orchestrator is a normal interactive Claude PTY the user talks
+            // Opt-in: the orchestrator is a normal interactive backend PTY the user talks
             // to, with the DAG it wrote to its plan file rendered in a pane ABOVE it.
             render_interactive_orchestrator(frame, area, app);
         } else {

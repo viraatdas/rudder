@@ -138,22 +138,32 @@ pub(crate) fn claude_resume_command(run: &AgentRun, session_id: &str) -> Termina
 }
 
 pub(crate) fn codex_resume_command(run: &AgentRun, session_id: &str) -> TerminalCommand {
-    let mut args = vec!["--no-alt-screen".to_string()];
-    args.push("--enable".to_string());
-    args.push("goals".to_string());
+    let mut args = Vec::new();
     match run.mode {
         AgentMode::Execute | AgentMode::ReviewAll | AgentMode::Main | AgentMode::OneOff => {
+            args.push("--no-alt-screen".to_string());
+            args.push("--enable".to_string());
+            args.push("goals".to_string());
             args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
+            push_codex_rudder_config_overrides(&mut args, run.effort);
+        }
+        AgentMode::RudderPlan if run.interactive_orchestrator => {
+            // A live conductor must be able to update RUDDER.md/RUDDER_SHARED.md.
+            // The prompt contract forbids product-file edits.
+            push_codex_interactive_orchestrator_args(&mut args, run.effort);
         }
         AgentMode::Plan | AgentMode::RudderPlan => {
+            args.push("--no-alt-screen".to_string());
+            args.push("--enable".to_string());
+            args.push("goals".to_string());
             args.push("--sandbox".to_string());
             args.push("read-only".to_string());
             args.push("--ask-for-approval".to_string());
             args.push("never".to_string());
             args.push("--search".to_string());
+            push_codex_rudder_config_overrides(&mut args, run.effort);
         }
     }
-    push_codex_rudder_config_overrides(&mut args, run.effort);
     if !run.model.trim().is_empty() {
         args.push("-m".to_string());
         args.push(run.model.clone());
@@ -265,6 +275,9 @@ pub(crate) fn agent_command_with_orchestrator_mode(
         AgentMode::RudderPlan if orchestrator_interactive && backend == Backend::Claude => {
             Some(rudder_orchestrator_prompt(task))
         }
+        AgentMode::RudderPlan if orchestrator_interactive && backend == Backend::Codex => {
+            Some(codex_orchestrator_prompt(task))
+        }
         AgentMode::RudderPlan => Some(rudder_plan_prompt(task)),
         AgentMode::ReviewAll => Some(task.to_string()),
         AgentMode::Main => {
@@ -363,9 +376,22 @@ pub(crate) fn agent_command_with_orchestrator_mode(
                 .with_env("CLAUDE_CODE_NO_FLICKER", "0")
         }
         Backend::Codex => {
-            // The orchestrator runs non-interactively via `codex exec` (read-only):
-            // it prints the decomposition + DAG and exits, so Rudder parses it.
-            // Other modes use the interactive codex TUI.
+            // Interactive orchestrators use the normal Codex TUI and write their plan
+            // into RUDDER.md, just like the Claude conductor. Headless helper planners
+            // still use `codex exec --json` below so Rudder can parse their output.
+            if mode == AgentMode::RudderPlan && orchestrator_interactive {
+                let mut args = Vec::new();
+                push_codex_interactive_orchestrator_args(&mut args, effort);
+                if !model.trim().is_empty() {
+                    args.push("-m".to_string());
+                    args.push(model.to_string());
+                }
+                if let Some(prompt) = prompt {
+                    args.push(prompt);
+                }
+                return TerminalCommand::with_args(codex_program(), args)
+                    .with_env("CODEX_RUDDER_SCROLLBACK_SAFE", "1");
+            }
             if mode == AgentMode::RudderPlan {
                 let mut args = vec![
                     "exec".to_string(),
@@ -418,7 +444,7 @@ pub(crate) fn agent_command_with_orchestrator_mode(
     }
 }
 
-/// Resume an INTERACTIVE Claude orchestrator session as the LIVE CONDUCTOR.
+/// Resume an INTERACTIVE orchestrator session as the LIVE CONDUCTOR.
 ///
 /// A structural rebase (`RUDDER_REPLAN`) runs a headless re-decompose over the
 /// conductor's session, which tears down the interactive PTY the user was
@@ -427,38 +453,73 @@ pub(crate) fn agent_command_with_orchestrator_mode(
 /// arm of `agent_command_with_orchestrator_mode`, but `--resume`s the existing
 /// session (carrying the whole conversation plus the rebase turn) instead of
 /// minting a fresh `--session-id`, and submits a short continuation prompt.
-/// Interactive orchestration is Claude-only, so there is no Codex variant.
 pub(crate) fn rudder_orchestrator_resume_command(
+    backend: Backend,
     model: &str,
     effort: Option<EffortLevel>,
     session_id: &str,
     continuation: &str,
 ) -> TerminalCommand {
-    let mut args = vec![
-        // No `-p`: stay in the interactive Claude Code TUI, resuming the session.
-        "--resume".to_string(),
-        session_id.to_string(),
-        "--permission-mode".to_string(),
-        "default".to_string(),
-        "--allowedTools".to_string(),
-        "Read,Grep,Glob,LS,WebSearch,WebFetch,Bash,Edit,Write".to_string(),
-        "--append-system-prompt".to_string(),
-        orchestrator_system_prompt(),
-        "--name".to_string(),
-        "rudder-orchestrator".to_string(),
-    ];
-    if !model.trim().is_empty() {
-        args.push("--model".to_string());
-        args.push(model.to_string());
+    match backend {
+        Backend::Claude => {
+            let mut args = vec![
+                // No `-p`: stay in the interactive Claude Code TUI, resuming the session.
+                "--resume".to_string(),
+                session_id.to_string(),
+                "--permission-mode".to_string(),
+                "default".to_string(),
+                "--allowedTools".to_string(),
+                "Read,Grep,Glob,LS,WebSearch,WebFetch,Bash,Edit,Write".to_string(),
+                "--append-system-prompt".to_string(),
+                orchestrator_system_prompt(),
+                "--name".to_string(),
+                "rudder-orchestrator".to_string(),
+            ];
+            if !model.trim().is_empty() {
+                args.push("--model".to_string());
+                args.push(model.to_string());
+            }
+            if let Some(effort) = effort {
+                args.push("--effort".to_string());
+                args.push(effort.as_str().to_string());
+            }
+            if !continuation.trim().is_empty() {
+                args.push(continuation.to_string());
+            }
+            TerminalCommand::with_args(claude_program(), args)
+                .with_env("CLAUDE_CODE_NO_FLICKER", "0")
+        }
+        Backend::Codex => {
+            let mut args = Vec::new();
+            push_codex_interactive_orchestrator_args(&mut args, effort);
+            if !model.trim().is_empty() {
+                args.push("-m".to_string());
+                args.push(model.to_string());
+            }
+            args.push("resume".to_string());
+            args.push(session_id.to_string());
+            if !continuation.trim().is_empty() {
+                args.push(continuation.to_string());
+            }
+            TerminalCommand::with_args(codex_program(), args)
+                .with_env("CODEX_RUDDER_SCROLLBACK_SAFE", "1")
+        }
     }
-    if let Some(effort) = effort {
-        args.push("--effort".to_string());
-        args.push(effort.as_str().to_string());
-    }
-    if !continuation.trim().is_empty() {
-        args.push(continuation.to_string());
-    }
-    TerminalCommand::with_args(claude_program(), args).with_env("CLAUDE_CODE_NO_FLICKER", "0")
+}
+
+pub(crate) fn push_codex_interactive_orchestrator_args(
+    args: &mut Vec<String>,
+    effort: Option<EffortLevel>,
+) {
+    args.push("--no-alt-screen".to_string());
+    args.push("--enable".to_string());
+    args.push("goals".to_string());
+    args.push("--sandbox".to_string());
+    args.push("workspace-write".to_string());
+    args.push("--ask-for-approval".to_string());
+    args.push("never".to_string());
+    args.push("--search".to_string());
+    push_codex_rudder_config_overrides(args, effort);
 }
 
 pub(crate) fn push_codex_rudder_config_overrides(
@@ -491,11 +552,11 @@ pub(crate) fn codex_program() -> String {
         .unwrap_or_else(|| "codex".to_string())
 }
 
-/// The Claude orchestrator runs as a normal INTERACTIVE Claude Code PTY the user converses
+/// The orchestrator runs as a normal INTERACTIVE backend PTY the user converses
 /// with (real plan-mode feel + visible thinking), writing its DAG to the orchestrator plan
 /// file and self-launching on the `RUDDER_APPROVE_PLAN` marker. This is now the DEFAULT
 /// ("the main plan mode"); set `RUDDER_INTERACTIVE_ORCHESTRATOR=0` to opt back into the
-/// headless `claude -p` decomposer. (Codex orchestrators stay headless regardless.)
+/// headless decomposer.
 pub(crate) fn interactive_orchestrator() -> bool {
     env::var("RUDDER_INTERACTIVE_ORCHESTRATOR")
         .map(|value| value.trim() != "0")

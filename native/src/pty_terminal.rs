@@ -92,7 +92,7 @@ pub struct TerminalPaneOptions {
     pub scrollback_lines: usize,
     pub term: String,
     /// Render ONLY the live screen (the current vt100 grid), never accumulated
-    /// scrollback. Set for the interactive plan-mode front-end: Claude Code renders
+    /// scrollback. Set for the interactive plan-mode front-end: agent TUIs render
     /// inline (no alt-screen), so its startup welcome + redraw frames otherwise pile
     /// up in region_scrollback and the pane shows stacked duplicate banners. The
     /// model redraws its full visible UI each turn, so the live screen alone is the

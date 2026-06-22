@@ -339,7 +339,7 @@ struct App {
     /// stay stable until the diff is applied. Cleared the moment the rebase lands or fails.
     rebasing: bool,
     /// Set alongside `rebasing` when the rebase was triggered on the LIVE INTERACTIVE
-    /// conductor (a Claude orchestrator the user is conversing with), e.g. via the
+    /// conductor (the backend PTY the user is conversing with), e.g. via the
     /// conductor's own `RUDDER_REPLAN` marker. The rebase relaunches that row as a
     /// headless re-decompose, which tears down the interactive PTY; this flag tells the
     /// rebase evaluator to re-spawn the interactive conductor (resuming the same session)
@@ -368,7 +368,7 @@ struct App {
     /// the orchestrator is selected. Set on streaming plan detection; cleared once
     /// the user approves (or discards the plan).
     awaiting_approval: bool,
-    /// Whether the orchestrator runs as an INTERACTIVE Claude Code PTY (the default; see
+    /// Whether the orchestrator runs as an INTERACTIVE backend PTY (the default; see
     /// `interactive_orchestrator()`) vs the headless decomposer. Snapshotted from the env
     /// ONCE at construction so render/poll/key paths read a per-App field instead of the
     /// process-global env (which races across parallel tests). Tests set it directly.
@@ -630,7 +630,7 @@ struct AgentRun {
     last_output_at: Instant,
     completed_at: Option<Instant>,
     autosteered: bool,
-    /// True only for a Claude orchestrator launched as a live interactive PTY. Headless
+    /// True only for an orchestrator launched as a live interactive PTY. Headless
     /// planners also use `AgentMode::RudderPlan`, so this must not be inferred from
     /// `autosteered` once a plan is captured.
     interactive_orchestrator: bool,
@@ -1075,10 +1075,7 @@ impl App {
     }
 
     pub(crate) fn is_interactive_orchestrator_run(&self, run: &AgentRun) -> bool {
-        run.is_orchestrator()
-            && !run.reconcile_planner
-            && run.backend == Backend::Claude
-            && run.interactive_orchestrator
+        run.is_orchestrator() && !run.reconcile_planner && run.interactive_orchestrator
     }
 
     fn has_running_interactive_orchestrator(&self) -> bool {
@@ -1475,7 +1472,7 @@ impl App {
         // Orchestrator pane = a CHAT with the planner. For HEADLESS planners
         // typing composes a follow-up: Enter-with-text refines, Enter-on-empty approves;
         // we intercept before the PTY-forward path because writing to a -p process is
-        // useless. For the INTERACTIVE Claude orchestrator the pane IS a live Claude PTY,
+        // useless. For the INTERACTIVE orchestrator the pane IS a live backend PTY,
         // so keys forward straight to it and approval/refine happen via RUDDER.md markers.
         if self.selected_uses_headless_orchestrator_chat() {
             return self.handle_orchestrator_chat_key(key);
@@ -3709,7 +3706,7 @@ impl App {
         // the previous composite prompt).
         self.plan_request = input.to_string();
         let backend = self.backend;
-        let interactive_planner = self.interactive_orchestrator && backend == Backend::Claude;
+        let interactive_planner = self.interactive_orchestrator;
         let model = self.model.clone();
         // Decomposing a task into a node DAG does not need max reasoning. Cap the
         // planner's effort so plan mode stays responsive even when the dashboard
@@ -3794,15 +3791,17 @@ impl App {
         // it is NOT autosteered (the headless completed-plan capture must not fire).
         // Clear stale one-shot markers before spawn so a RUDDER_* action left in
         // RUDDER.md while no orchestrator was running cannot fire under this new,
-        // unrelated planner. Generate project-level Claude skills before spawn so
-        // dashboard actions are also available inside this Claude Code session.
+        // unrelated planner. Generate project-level Claude skills before spawn when
+        // the conductor is Claude so dashboard actions are also available as skills.
         if interactive_planner {
             run.autosteered = false;
             if let Err(error) = clear_orchestrator_plan_markers(&self.cwd) {
                 self.notice = Some(format!("orchestrator plan cleanup warning: {error}"));
             }
-            if let Err(error) = ensure_orchestrator_skills(&self.cwd) {
-                self.notice = Some(format!("orchestrator skills warning: {error}"));
+            if backend == Backend::Claude {
+                if let Err(error) = ensure_orchestrator_skills(&self.cwd) {
+                    self.notice = Some(format!("orchestrator skills warning: {error}"));
+                }
             }
         }
 
@@ -3883,13 +3882,14 @@ impl App {
                 };
                 let outline = self.current_plan_outline();
                 let composite = build_refine_request(&original, &outline, feedback);
-                agent_command(
+                agent_command_with_orchestrator_mode(
                     backend,
                     &model,
                     effort,
                     &composite,
                     AgentMode::RudderPlan,
                     mint_session_id_for(backend).as_deref(),
+                    false,
                 )
             }
         };
@@ -3948,7 +3948,16 @@ impl App {
             return;
         };
         let (backend, model, effort, session, was_interactive) = {
-            let run = &self.agents[index];
+            let run = &mut self.agents[index];
+            if run.backend == Backend::Codex
+                && run.interactive_orchestrator
+                && run
+                    .session_id
+                    .as_deref()
+                    .is_none_or(|sid| sid.trim().is_empty())
+            {
+                run.session_id = latest_codex_session_id_for_cwd(&run.cwd);
+            }
             (
                 run.backend,
                 run.model.clone(),
@@ -3960,8 +3969,8 @@ impl App {
         // Relaunching the orchestrator below replaces the live interactive PTY with a
         // headless re-decompose. If this WAS the interactive conductor (e.g. it emitted
         // RUDDER_REPLAN itself), remember to re-spawn it once the rebase resolves so the
-        // user keeps the conversation. Claude-only: Codex orchestrators are headless.
-        self.rebase_restore_interactive = was_interactive && backend == Backend::Claude;
+        // user keeps the conversation.
+        self.rebase_restore_interactive = was_interactive;
         let request = build_rebase_request(
             &self.rebase_zone_merged(),
             &self.rebase_zone_running(),
@@ -3974,13 +3983,14 @@ impl App {
         let resume = session.is_some();
         let command = match &session {
             Some(sid) => rudder_plan_refine_command(backend, &model, effort, &request, sid),
-            None => agent_command(
+            None => agent_command_with_orchestrator_mode(
                 backend,
                 &model,
                 effort,
                 &request,
                 AgentMode::RudderPlan,
                 mint_session_id_for(backend).as_deref(),
+                false,
             ),
         };
         // Mark the rebase in flight BEFORE relaunch so the poll loop routes the revised
@@ -4288,13 +4298,16 @@ impl App {
                 .fresh_prompt
                 .clone()
                 .unwrap_or_else(|| run.task.clone());
-            let cmd = agent_command(
+            let orchestrator_interactive =
+                run.mode == AgentMode::RudderPlan && run.interactive_orchestrator;
+            let cmd = agent_command_with_orchestrator_mode(
                 run.backend,
                 &run.model,
                 run.effort,
                 &prompt_for_agent,
                 run.mode,
                 session_id.as_deref(),
+                orchestrator_interactive,
             );
             run.session_id = session_id;
             cmd
@@ -4636,9 +4649,8 @@ impl App {
 
         let prompt = run.task.clone();
         let session_id = mint_session_id_for(run.backend);
-        let orchestrator_interactive = run.mode == AgentMode::RudderPlan
-            && run.backend == Backend::Claude
-            && run.interactive_orchestrator;
+        let orchestrator_interactive =
+            run.mode == AgentMode::RudderPlan && run.interactive_orchestrator;
         let mut command = agent_command_with_orchestrator_mode(
             run.backend,
             &run.model,
@@ -6326,7 +6338,7 @@ impl App {
 
     /// After a structural rebase resolves, re-spawn the LIVE INTERACTIVE conductor that
     /// `start_plan_rebase` tore down to run the headless re-decompose. No-op unless
-    /// `rebase_restore_interactive` was armed (the rebase was on an interactive Claude
+    /// `rebase_restore_interactive` was armed (the rebase was on an interactive
     /// conductor) and the orchestrator row carries a resumable session. We resume that
     /// session so the conductor keeps the full conversation plus the rebase turn, and
     /// re-mark the row interactive + not-autosteered (matching the initial spawn) so the
@@ -6346,6 +6358,7 @@ impl App {
             return;
         };
         let command = rudder_orchestrator_resume_command(
+            run.backend,
             &run.model,
             run.effort,
             &session,
@@ -7143,7 +7156,6 @@ impl App {
         for run in self.agents.iter_mut() {
             if run.mode != AgentMode::RudderPlan
                 || run.reconcile_planner
-                || run.backend != Backend::Claude
                 || !run.interactive_orchestrator
                 || run.status != AgentStatus::Running
             {

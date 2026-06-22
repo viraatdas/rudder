@@ -258,9 +258,13 @@ pub(crate) fn user_home_dir() -> Option<PathBuf> {
 
 pub(crate) fn latest_codex_session_id_for_cwd(cwd: &Path) -> Option<String> {
     let root = user_home_dir()?.join(".codex").join("sessions");
+    latest_codex_session_id_in_dir(&root, cwd)
+}
+
+pub(crate) fn latest_codex_session_id_in_dir(root: &Path, cwd: &Path) -> Option<String> {
     let target = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
     let mut best: Option<(SystemTime, String)> = None;
-    visit_codex_session_dir(&root, &target, &mut best, 0);
+    visit_codex_session_dir(root, &target, &mut best, 0);
     best.map(|(_, id)| id)
 }
 
