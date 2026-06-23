@@ -5755,7 +5755,7 @@ impl App {
             "RUDDER_USAGE" => self.show_usage_summary(),
             "RUDDER_HELP" => {
                 self.notice = Some(
-                    "skills: model, main, goal, add/replan, merge/stop/regoal/inject, usage, cloud, review-all, automerge"
+                    "skills: model, main, goal, monitor, add/replan, merge/stop/regoal/inject, usage, cloud, review-all, automerge"
                         .to_string(),
                 );
             }
@@ -8977,6 +8977,7 @@ What to do\n\
         let now = Instant::now();
         let repo_root = self.cwd.clone();
         let mut any_dirty = false;
+        let mut context_dirty = false;
         let mut completed_rudder_plans = Vec::new();
         for (index, run) in self.agents.iter_mut().enumerate() {
             let mut changed = false;
@@ -9013,6 +9014,7 @@ What to do\n\
                     }
                     let _ = save_native_run_record(&repo_root, run);
                     any_dirty = true;
+                    context_dirty = true;
                 }
                 continue;
             }
@@ -9082,6 +9084,8 @@ What to do\n\
                 } else {
                     None
                 };
+                let previous_needs_permission = run.needs_permission;
+                let previous_needs_user_input = run.needs_user_input;
                 let needs_permission = visible_lines
                     .as_ref()
                     .is_some_and(|lines| terminal_needs_permission_from_lines(lines));
@@ -9100,6 +9104,11 @@ What to do\n\
                 run.needs_user_input = needs_user_input;
                 if needs_user_input {
                     run.user_input_notified = true;
+                }
+                if run.needs_permission != previous_needs_permission
+                    || run.needs_user_input != previous_needs_user_input
+                {
+                    changed = true;
                 }
                 match terminal.try_wait() {
                     Ok(Some(status)) => {
@@ -9199,10 +9208,14 @@ What to do\n\
                     }
                 }
             } else {
+                let had_waiting_state = run.needs_permission || run.needs_user_input;
                 run.needs_permission = false;
                 run.permission_notified = false;
                 run.needs_user_input = false;
                 run.user_input_notified = false;
+                if had_waiting_state {
+                    changed = true;
+                }
             }
             if changed {
                 if run.mode == AgentMode::RudderPlan
@@ -9212,6 +9225,7 @@ What to do\n\
                     completed_rudder_plans.push(index);
                 }
                 any_dirty = true;
+                context_dirty = true;
                 let _ = save_native_run_record(&repo_root, run);
             }
             if run.mode == AgentMode::RudderPlan
@@ -9331,6 +9345,10 @@ What to do\n\
                 || self.agents.iter().any(|run| run.node_id.is_some()))
         {
             self.mirror_graph();
+        }
+
+        if context_dirty {
+            let _ = write_rudder_context(&self.cwd, &self.agents, None);
         }
 
         if any_dirty {

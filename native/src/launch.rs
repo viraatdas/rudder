@@ -88,6 +88,12 @@ const ORCHESTRATOR_SKILLS: &[OrchestratorSkill] = &[
         body: "For login, write RUDDER_LOGIN on its own line in RUDDER.md. For other cloud actions, write RUDDER_CLOUD <args> on one line, for example RUDDER_CLOUD list or RUDDER_CLOUD onload. Rudder consumes the marker and starts the corresponding Rudder Cloud command pane.",
     },
     OrchestratorSkill {
+        slug: "rudder-monitor-work",
+        name: "rudder-monitor-work",
+        description: "Use when the user asks to monitor current Claude, Codex, or Rudder jobs and then take follow-up actions when they finish.",
+        body: "Read RUDDER.md's generated Global job snapshot and Active local Rudder agents sections first. If relevant jobs are still running or waiting, report a concise status grounded in those rows and keep monitoring by re-reading RUDDER.md; do not invent completion. Once the relevant workers are done, use RUDDER_REVIEW_ALL for a whole-repo review, RUDDER_MERGE_ALL or RUDDER_AUTOMERGE on for ready merges, and RUDDER_ADD_TASK or RUDDER_ASK for fixes found by review. For repo-specific final steps such as push, publish, release, or deploy, start a main-checkout/one-off worker with RUDDER_MAIN <prompt> or RUDDER_ASK <prompt> that names the exact final action. Do not run final release commands directly from the orchestrator.",
+    },
+    OrchestratorSkill {
         slug: "rudder-review-merge",
         name: "rudder-review-merge",
         description: "Use when the user asks to review all work, merge all ready work, or toggle auto-merge.",

@@ -6081,6 +6081,67 @@ fn write_rudder_context_redacts_secret_values_in_agent_previews() {
 }
 
 #[test]
+fn write_rudder_context_includes_global_job_snapshot() {
+    let repo = unique_test_repo("rudder-md-global-job-snapshot");
+    let worktree = repo.join("worker-starting");
+    fs::create_dir_all(&worktree).unwrap();
+
+    let mut running = test_agent_run("run-codex", "monitor running codex work");
+    running.cwd = repo.join("codex-worktree");
+    running.backend = Backend::Codex;
+    running.model = "gpt-5.1-codex-max".to_string();
+    running.node_id = Some("n1".to_string());
+    running.deps = vec!["n0".to_string()];
+    running.soft_deps = vec!["n2".to_string()];
+    running.needs_user_input = true;
+
+    let mut done = test_agent_run("run-claude", "finish claude worker");
+    done.cwd = repo.join("claude-worktree");
+    done.status = AgentStatus::Done;
+    done.node_id = Some("n3".to_string());
+
+    let pending = WorktreeInfo {
+        id: "pending-1".to_string(),
+        path: worktree,
+        branch: Some("feature/global-view".to_string()),
+        path_is_worktree: true,
+        workspace_name: None,
+        jj_change_id: None,
+    };
+
+    write_rudder_context(&repo, &[running, done], Some(&pending)).expect("write RUDDER.md");
+    let text = fs::read_to_string(repo.join("RUDDER.md")).unwrap();
+
+    assert!(text.contains("## Global job snapshot"));
+    assert!(text.contains(
+        "- totals: total=3 running=1 waiting=1 done=1 merged=0 failed=0 stopped=0 pending-starts=1"
+    ));
+    assert!(text.contains("- backends: claude=1 codex=1"));
+    assert!(text.contains("- ready-to-act: review-ready=1 merge-ready=1"));
+    assert!(text.contains("run-codex node=n1 mode=execute status=running waiting=user-input backend=codex model=gpt-5.1-codex-max"));
+    assert!(text.contains("deps=hard=[n0] soft=[n2]"));
+    assert!(text.contains("run-claude node=n3 mode=execute status=done backend=claude"));
+    assert!(text.contains("merge=needs-merge"));
+    assert!(text.contains("status=starting backend=pending model=pending"));
+
+    let _ = fs::remove_dir_all(&repo);
+}
+
+#[test]
+fn orchestrator_prompts_include_global_monitoring_contract() {
+    let claude_prompt = orchestrator_system_prompt();
+    assert!(claude_prompt.contains("Global job snapshot"));
+    assert!(claude_prompt.contains("wait for current Claude/Codex jobs"));
+    assert!(claude_prompt.contains("RUDDER_REVIEW_ALL"));
+    assert!(claude_prompt.contains("RUDDER_MAIN <prompt>"));
+
+    let codex_prompt = codex_orchestrator_prompt("monitor the current threads");
+    assert!(codex_prompt.contains("Global job snapshot"));
+    assert!(codex_prompt.contains("Active local Rudder agents"));
+    assert!(codex_prompt.contains("monitor the current threads"));
+}
+
+#[test]
 fn orchestrator_skill_markers_are_consumed_once() {
     let repo = unique_test_repo("orch-skill-markers");
     fs::write(
