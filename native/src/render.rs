@@ -2137,7 +2137,8 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
             // While paused, the answer is typed into the card's own field, so suppress the
             // separate chat-input region to avoid a duplicated cursor below the box.
             let input_region: &[Line<'static>] = if paused { &[] } else { &input };
-            render_orchestrator_layout(
+            let follow_bottom = app.orch_follow_bottom;
+            let max_scroll = render_orchestrator_layout(
                 frame,
                 inner,
                 &header,
@@ -2145,8 +2146,9 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
                 &body,
                 input_region,
                 &mut app.orch_dag_scroll,
-                true,
+                follow_bottom,
             );
+            app.orch_dag_max_scroll = max_scroll;
         }
         OrchestratorPhase::PlanReady(mut tasks) => {
             // Fold in nodes the user RECONCILED into the plan after launch. They live
@@ -2288,7 +2290,7 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
                     )));
                 }
             }
-            render_orchestrator_layout(
+            let max_scroll = render_orchestrator_layout(
                 frame,
                 inner,
                 &header,
@@ -2298,6 +2300,7 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
                 &mut app.orch_dag_scroll,
                 false,
             );
+            app.orch_dag_max_scroll = max_scroll;
         }
     }
 
@@ -2330,8 +2333,8 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
 
 /// Lay out the orchestrator pane inside `inner` as: header (fixed) · top/DAG
 /// (PINNED, capped) · body (SCROLLABLE) · input (pinned bottom). Only the body
-/// scrolls (via `scroll`); the DAG stays on top. `stick_bottom` pins the body to
-/// its last line (used for the live planning stream).
+/// scrolls (via `scroll`); the DAG stays on top. `follow_bottom` keeps the body
+/// pinned to its last line until the user scrolls away.
 #[allow(clippy::too_many_arguments)]
 fn render_orchestrator_layout(
     frame: &mut Frame<'_>,
@@ -2341,8 +2344,8 @@ fn render_orchestrator_layout(
     body: &[Line<'static>],
     input: &[Line<'static>],
     scroll: &mut usize,
-    stick_bottom: bool,
-) {
+    follow_bottom: bool,
+) -> usize {
     let width = inner.width.max(1) as usize;
     let rows = |lines: &[Line<'static>]| -> u16 {
         lines
@@ -2395,8 +2398,7 @@ fn render_orchestrator_layout(
         .map(|line| wrapped_row_count(line.width().max(1), width))
         .sum();
     let max_scroll = body_rows.saturating_sub(body_visible);
-    *scroll = (*scroll).min(max_scroll);
-    let effective = if stick_bottom { max_scroll } else { *scroll };
+    let effective = orchestrator_scroll_offset(scroll, max_scroll, follow_bottom);
     frame.render_widget(
         Paragraph::new(body.to_vec())
             .style(app_style())
@@ -2412,6 +2414,7 @@ fn render_orchestrator_layout(
             chunks[3],
         );
     }
+    max_scroll
 }
 
 /// A blank interior row of the plan-mode card: `│` + spaces + `│`, exactly `box_w` wide.
@@ -2663,16 +2666,19 @@ pub(crate) fn push_transcript_lines(
 /// Render the INTERACTIVE orchestrator (opt-in): a live DAG pane on top (from the plan
 /// the orchestrator wrote to its plan file → `planned_nodes`) and the raw interactive
 /// backend PTY below, which the user converses with directly.
-pub(crate) fn render_interactive_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
-    let focused = app.focus == FocusPane::Worker;
-    // DAG pane on top (capped to a third, leaving room for the conversation), PTY below.
+pub(crate) fn interactive_orchestrator_areas(area: Rect) -> (Rect, Rect) {
     let dag_h = (area.height / 3).clamp(6, area.height.saturating_sub(6).max(6));
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(dag_h), Constraint::Min(1)])
         .split(area);
-    let dag_area = chunks[0];
-    let term_area = chunks[1];
+    (chunks[0], chunks[1])
+}
+
+pub(crate) fn render_interactive_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    let focused = app.focus == FocusPane::Worker;
+    // DAG pane on top (capped to a third, leaving room for the conversation), PTY below.
+    let (dag_area, term_area) = interactive_orchestrator_areas(area);
 
     // ---- DAG pane (top) ----
     // Render the WHOLE plan (queued + already-launched nodes), so the tree stays
@@ -2698,10 +2704,19 @@ pub(crate) fn render_interactive_orchestrator(frame: &mut Frame<'_>, area: Rect,
             )));
         }
     }
+    let dag_inner = block_inner(dag_area);
+    let dag_rows: usize = dag_lines
+        .iter()
+        .map(|line| wrapped_row_count(line.width().max(1), dag_inner.width.max(1) as usize))
+        .sum();
+    let max_scroll = orchestrator_dag_max_scroll(dag_rows, dag_inner.height.max(1) as usize);
+    let scroll = orchestrator_scroll_offset(&mut app.orch_dag_scroll, max_scroll, false);
+    app.orch_dag_max_scroll = max_scroll;
     frame.render_widget(
         Paragraph::new(dag_lines)
             .style(app_style())
             .block(pane_block("dag", focused, app.nav_mode))
+            .scroll((scroll as u16, 0))
             .wrap(Wrap { trim: false }),
         dag_area,
     );
@@ -3691,6 +3706,19 @@ pub(crate) fn wrapped_row_count(line_width: usize, width: usize) -> usize {
 #[allow(dead_code)]
 pub(crate) fn orchestrator_dag_max_scroll(content_rows: usize, visible_height: usize) -> usize {
     content_rows.saturating_sub(visible_height)
+}
+
+pub(crate) fn orchestrator_scroll_offset(
+    scroll: &mut usize,
+    max_scroll: usize,
+    follow_bottom: bool,
+) -> usize {
+    if follow_bottom {
+        *scroll = max_scroll;
+    } else {
+        *scroll = (*scroll).min(max_scroll);
+    }
+    *scroll
 }
 
 pub(crate) fn mouse_scrollback_delta(mouse: MouseEvent, viewport_height: u16) -> isize {

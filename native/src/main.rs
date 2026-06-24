@@ -447,6 +447,13 @@ struct App {
     /// to read a long plan. Reset to 0 whenever the selected agent changes; clamped
     /// against the rendered line count in `render_orchestrator`.
     orch_dag_scroll: usize,
+    /// Largest scroll offset from the last rendered orchestrator DAG/transcript
+    /// viewport. Mouse wheel handling uses this to resume live bottom-following
+    /// once the user scrolls back to the end.
+    orch_dag_max_scroll: usize,
+    /// Live planning transcripts should follow the bottom until the user scrolls
+    /// up. Once they scroll back to the bottom, following resumes.
+    orch_follow_bottom: bool,
     agents_area: Option<Rect>,
     worker_area: Option<Rect>,
     task_area: Option<Rect>,
@@ -920,6 +927,8 @@ impl App {
             surfaced_overlaps: HashSet::new(),
             last_drift_scan: None,
             orch_dag_scroll: 0,
+            orch_dag_max_scroll: 0,
+            orch_follow_bottom: true,
             agents_area: None,
             worker_area: None,
             task_area: None,
@@ -1074,6 +1083,18 @@ impl App {
             .is_some_and(|run| run.is_orchestrator() && !self.is_interactive_orchestrator_run(run))
     }
 
+    fn selected_headless_orchestrator_rendered_view_active(&self) -> bool {
+        self.worker_view == WorkerView::Terminal && self.selected_uses_headless_orchestrator_chat()
+    }
+
+    fn selected_interactive_orchestrator_active(&self) -> bool {
+        self.worker_view == WorkerView::Terminal
+            && self
+                .agents
+                .get(self.selected_agent)
+                .is_some_and(|run| self.is_interactive_orchestrator_run(run))
+    }
+
     pub(crate) fn is_interactive_orchestrator_run(&self, run: &AgentRun) -> bool {
         run.is_orchestrator() && !run.reconcile_planner && run.interactive_orchestrator
     }
@@ -1090,7 +1111,7 @@ impl App {
     /// DAG lines, not the underlying planner terminal. Mirrors the dispatch in
     /// `render_worker`.
     fn selected_orchestrator_dag_active(&self) -> bool {
-        if self.worker_view != WorkerView::Terminal {
+        if !self.selected_headless_orchestrator_rendered_view_active() {
             return false;
         }
         if self.planner_paused_for_input {
@@ -1719,11 +1740,18 @@ impl App {
             // clamps it to the content height.
             KeyCode::PageUp => {
                 let page = page_scroll_rows(self.worker_area).max(1) as usize;
+                self.orch_follow_bottom = false;
                 self.orch_dag_scroll = self.orch_dag_scroll.saturating_sub(page);
             }
             KeyCode::PageDown => {
                 let page = page_scroll_rows(self.worker_area).max(1) as usize;
                 self.orch_dag_scroll = self.orch_dag_scroll.saturating_add(page);
+                if self.orch_dag_max_scroll == 0 {
+                    self.orch_follow_bottom = true;
+                } else if self.orch_dag_scroll >= self.orch_dag_max_scroll {
+                    self.orch_dag_scroll = self.orch_dag_max_scroll;
+                    self.orch_follow_bottom = true;
+                }
             }
             KeyCode::Char(ch)
                 if !key
@@ -1803,6 +1831,8 @@ impl App {
     fn select_previous_agent(&mut self) {
         self.delete_pending = None;
         self.orch_dag_scroll = 0;
+        self.orch_dag_max_scroll = 0;
+        self.orch_follow_bottom = true;
         self.orch_selection = None;
         let visible = self.visible_agent_indices();
         if visible.is_empty() {
@@ -1824,6 +1854,8 @@ impl App {
     fn select_next_agent(&mut self) {
         self.delete_pending = None;
         self.orch_dag_scroll = 0;
+        self.orch_dag_max_scroll = 0;
+        self.orch_follow_bottom = true;
         self.orch_selection = None;
         let visible = self.visible_agent_indices();
         if visible.is_empty() {
@@ -2548,6 +2580,8 @@ impl App {
         if let Some(index) = agent_index_from_mouse(self, mouse, area) {
             if index != self.selected_agent {
                 self.orch_dag_scroll = 0;
+                self.orch_dag_max_scroll = 0;
+                self.orch_follow_bottom = true;
                 self.orch_selection = None;
             }
             self.selected_agent = index;
@@ -2570,7 +2604,9 @@ impl App {
                     "mouse {:?} @{},{} focus=worker view={:?}",
                     mouse.kind, mouse.column, mouse.row, self.worker_view
                 ));
-                if self.selected_orchestrator_dag_active() {
+                if self.selected_interactive_orchestrator_active() {
+                    self.scroll_interactive_orchestrator(mouse, area);
+                } else if self.selected_headless_orchestrator_rendered_view_active() {
                     self.scroll_orchestrator_dag(mouse, inner);
                 } else if self.worker_view == WorkerView::Diff {
                     let _ = self.scroll_selected_review_or_forward(mouse, inner);
@@ -2590,7 +2626,9 @@ impl App {
                 "mouse {:?} @{},{} pane=worker view={:?}",
                 mouse.kind, mouse.column, mouse.row, self.worker_view
             ));
-            if self.selected_orchestrator_dag_active() {
+            if self.selected_interactive_orchestrator_active() {
+                self.scroll_interactive_orchestrator(mouse, area);
+            } else if self.selected_headless_orchestrator_rendered_view_active() {
                 self.scroll_orchestrator_dag(mouse, inner);
             } else if self.worker_view == WorkerView::Diff {
                 let _ = self.scroll_selected_review_or_forward(mouse, inner);
@@ -2620,6 +2658,17 @@ impl App {
             "mouse {:?} @{},{} pane=none route=ignored",
             mouse.kind, mouse.column, mouse.row
         ));
+    }
+
+    fn scroll_interactive_orchestrator(&mut self, mouse: MouseEvent, area: Rect) {
+        let (dag_area, term_area) = interactive_orchestrator_areas(area);
+        if rect_contains(dag_area, mouse.column, mouse.row) {
+            self.scroll_orchestrator_dag(mouse, block_inner(dag_area));
+            return;
+        }
+        if rect_contains(term_area, mouse.column, mouse.row) {
+            let _ = self.scroll_selected_worker_or_forward(mouse, block_inner(term_area));
+        }
     }
 
     fn set_mouse_debug(&mut self, message: String) {
@@ -2907,14 +2956,29 @@ impl App {
         self.orch_selection = None;
         let before = self.orch_dag_scroll;
         // Positive delta is ScrollUp (toward the top), which lowers the offset.
-        self.orch_dag_scroll = if delta > 0 {
-            self.orch_dag_scroll.saturating_sub(delta as usize)
+        if delta > 0 {
+            self.orch_follow_bottom = false;
+            self.orch_dag_scroll = self.orch_dag_scroll.saturating_sub(delta as usize);
         } else {
-            self.orch_dag_scroll.saturating_add(delta.unsigned_abs())
-        };
+            self.orch_dag_scroll = self.orch_dag_scroll.saturating_add(delta.unsigned_abs());
+            if self.orch_dag_max_scroll == 0 {
+                self.orch_follow_bottom = true;
+            } else if self.orch_dag_scroll >= self.orch_dag_max_scroll {
+                self.orch_dag_scroll = self.orch_dag_max_scroll;
+                self.orch_follow_bottom = true;
+            }
+        }
+        self.dirty = true;
         self.set_mouse_debug(format!(
-            "mouse {:?} @{},{} pane=orchestrator-dag delta={} before={} after={}",
-            mouse.kind, mouse.column, mouse.row, delta, before, self.orch_dag_scroll
+            "mouse {:?} @{},{} pane=orchestrator-dag delta={} before={} after={} max={} follow={}",
+            mouse.kind,
+            mouse.column,
+            mouse.row,
+            delta,
+            before,
+            self.orch_dag_scroll,
+            self.orch_dag_max_scroll,
+            self.orch_follow_bottom
         ));
     }
 

@@ -2041,6 +2041,20 @@ fn orchestrator_dag_scroll_clamp_reaches_bottom_and_no_overflow() {
 }
 
 #[test]
+fn orchestrator_scroll_offset_follows_bottom_until_user_scrolls_away() {
+    let mut scroll = 0;
+    assert_eq!(orchestrator_scroll_offset(&mut scroll, 12, true), 12);
+    assert_eq!(scroll, 12);
+
+    scroll = 4;
+    assert_eq!(orchestrator_scroll_offset(&mut scroll, 12, false), 4);
+
+    scroll = 99;
+    assert_eq!(orchestrator_scroll_offset(&mut scroll, 12, false), 12);
+    assert_eq!(scroll, 12);
+}
+
+#[test]
 fn wraps_worker_paste_as_single_bracketed_paste_payload() {
     assert_eq!(
         bracketed_paste_bytes("hello\nworld"),
@@ -8368,6 +8382,130 @@ fn orchestrator_dag_view_is_scrollable_and_disables_pty_selection() {
     assert!(
         app.worker_selection.is_none(),
         "DAG view clears any stale PTY selection"
+    );
+}
+
+#[test]
+fn planning_orchestrator_trackpad_scroll_targets_rendered_transcript() {
+    let mut app = App::new();
+    app.focus = FocusPane::Worker;
+    let mut orch = test_agent_run("orch", "plan this");
+    orch.mode = AgentMode::RudderPlan;
+    orch.status = AgentStatus::Running;
+    orch.interactive_orchestrator = false;
+    let mut stream = PlanStreamState::new();
+    stream.ingest("{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"Still decomposing the task.\"}}}\n");
+    orch.plan_stream = Some(stream);
+    app.agents = vec![orch];
+    app.selected_agent = 0;
+    app.worker_view = WorkerView::Terminal;
+
+    assert!(
+        app.selected_headless_orchestrator_rendered_view_active(),
+        "planning orchestrator is rendered, not a raw PTY"
+    );
+    assert!(
+        !app.selected_orchestrator_dag_active(),
+        "the plan is not ready yet"
+    );
+
+    let area = Rect::new(0, 0, 60, 20);
+    app.worker_area = Some(area);
+    let inner = block_inner(area);
+    app.orch_dag_scroll = 0;
+
+    app.handle_pane_scroll(MouseEvent {
+        kind: MouseEventKind::ScrollDown,
+        column: inner.x + 1,
+        row: inner.y + 1,
+        modifiers: KeyModifiers::empty(),
+    });
+
+    assert!(
+        app.orch_dag_scroll > 0,
+        "trackpad scroll over the planning transcript moves the rendered transcript offset"
+    );
+}
+
+#[cfg(not(windows))]
+#[test]
+fn interactive_orchestrator_trackpad_scroll_uses_pointer_region() {
+    let command = TerminalCommand::with_args(
+        "/bin/sh",
+        [
+            "-lc",
+            "for i in $(seq 1 60); do printf \"line $i\\r\\n\"; done; sleep 1",
+        ],
+    );
+    let mut pane = TerminalPane::spawn_shell_or_command(
+        Some(command),
+        TerminalPaneOptions {
+            size: TerminalSize { rows: 8, cols: 50 },
+            scrollback_lines: 200,
+            ..Default::default()
+        },
+    )
+    .expect("spawn orchestrator pty");
+    for _ in 0..40 {
+        std::thread::sleep(Duration::from_millis(25));
+        pane.drain_output();
+        if pane.output_log_snapshot().contains("line 60") {
+            break;
+        }
+    }
+
+    let mut app = App::new();
+    app.focus = FocusPane::Worker;
+    app.worker_view = WorkerView::Terminal;
+    app.interactive_orchestrator = true;
+    let mut orch = test_agent_run_with_terminal(&app, pane);
+    orch.id = "orch".to_string();
+    orch.mode = AgentMode::RudderPlan;
+    orch.backend = Backend::Codex;
+    orch.interactive_orchestrator = true;
+    orch.status = AgentStatus::Running;
+    app.agents = vec![orch];
+    app.selected_agent = 0;
+    app.worker_area = Some(Rect::new(0, 0, 80, 30));
+    app.orch_dag_max_scroll = 20;
+
+    let (dag_area, term_area) = interactive_orchestrator_areas(app.worker_area.unwrap());
+    let dag_inner = block_inner(dag_area);
+    app.handle_pane_scroll(MouseEvent {
+        kind: MouseEventKind::ScrollDown,
+        column: dag_inner.x + 1,
+        row: dag_inner.y + 1,
+        modifiers: KeyModifiers::empty(),
+    });
+    assert!(
+        app.orch_dag_scroll > 0,
+        "trackpad over the interactive DAG strip scrolls the DAG"
+    );
+
+    let dag_scroll = app.orch_dag_scroll;
+    let before = app
+        .selected_terminal_mut()
+        .map(|terminal| terminal.scrollback())
+        .unwrap_or(0);
+    let term_inner = block_inner(term_area);
+    app.handle_pane_scroll(MouseEvent {
+        kind: MouseEventKind::ScrollUp,
+        column: term_inner.x + 1,
+        row: term_inner.y + 1,
+        modifiers: KeyModifiers::empty(),
+    });
+    let after = app
+        .selected_terminal_mut()
+        .map(|terminal| terminal.scrollback())
+        .unwrap_or(0);
+
+    assert!(
+        after > before,
+        "trackpad over the interactive terminal scrolls terminal scrollback"
+    );
+    assert_eq!(
+        app.orch_dag_scroll, dag_scroll,
+        "terminal scroll must not mutate the DAG offset"
     );
 }
 
