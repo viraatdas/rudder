@@ -94,7 +94,7 @@ const READY_EVAL_LULL: Duration = Duration::from_millis(900);
 const READY_GRACE: Duration = Duration::from_millis(3200);
 // Dashboard colors now live in `theme.rs` (FOCUS_COLOR, INACTIVE_COLOR, ...),
 // re-exported above so call sites are unchanged.
-const DEFAULT_WHEEL_SCROLL_ROWS: u16 = 1;
+const DEFAULT_WHEEL_SCROLL_ROWS: u16 = 3;
 const TASK_HISTORY_LIMIT: usize = 100;
 const MOUSE_DEBUG_ENV: &str = "RUDDER_MOUSE_DEBUG";
 const RUDDER_MOUSE_ENABLE_SEQUENCES: &[u8] = b"\x1b[?1003l\x1b[?1000h\x1b[?1002h\x1b[?1006h";
@@ -153,6 +153,168 @@ enum FocusPane {
 enum WorkerView {
     Terminal,
     Diff,
+    PlanReview,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PlanReviewField {
+    Title,
+    Goal,
+    Success,
+    Prompt,
+    HardDeps,
+    SoftDeps,
+}
+
+impl PlanReviewField {
+    const ALL: [Self; 6] = [
+        Self::Title,
+        Self::Goal,
+        Self::Success,
+        Self::Prompt,
+        Self::HardDeps,
+        Self::SoftDeps,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Title => "title",
+            Self::Goal => "goal",
+            Self::Success => "done when",
+            Self::Prompt => "prompt",
+            Self::HardDeps => "hard deps",
+            Self::SoftDeps => "soft deps",
+        }
+    }
+
+    fn next(self) -> Self {
+        let index = Self::ALL
+            .iter()
+            .position(|field| *field == self)
+            .unwrap_or(0);
+        Self::ALL[(index + 1) % Self::ALL.len()]
+    }
+
+    fn previous(self) -> Self {
+        let index = Self::ALL
+            .iter()
+            .position(|field| *field == self)
+            .unwrap_or(0);
+        Self::ALL[(index + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+}
+
+impl Default for PlanReviewField {
+    fn default() -> Self {
+        Self::Title
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct PlanReviewDraftNode {
+    id: String,
+    title: String,
+    goal: String,
+    success: String,
+    prompt: String,
+    hard_deps: String,
+    soft_deps: String,
+    backend: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
+}
+
+impl PlanReviewDraftNode {
+    fn from_planned(node: &PlannedNode) -> Self {
+        Self {
+            id: node.id.clone(),
+            title: node.title.clone(),
+            goal: node.goal.clone().unwrap_or_default(),
+            success: node.success.clone().unwrap_or_default(),
+            prompt: node.prompt.clone(),
+            hard_deps: node.deps.join(", "),
+            soft_deps: node.soft_deps.join(", "),
+            backend: node.backend.clone(),
+            model: node.model.clone(),
+            effort: node.effort.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct PlanReviewState {
+    nodes: Vec<PlanReviewDraftNode>,
+    selected: usize,
+    field: PlanReviewField,
+    cursor: usize,
+    scroll: usize,
+    cursor_row: Option<usize>,
+    cursor_col: usize,
+    dirty: bool,
+    errors: Vec<String>,
+    warnings: Vec<String>,
+    signature: String,
+}
+
+impl PlanReviewState {
+    fn from_planned_nodes(nodes: &[PlannedNode]) -> Self {
+        let drafts: Vec<PlanReviewDraftNode> = nodes
+            .iter()
+            .map(PlanReviewDraftNode::from_planned)
+            .collect();
+        let mut state = Self {
+            nodes: drafts,
+            signature: plan_review_signature(nodes),
+            ..Self::default()
+        };
+        state.clamp_selection();
+        state.cursor = state.active_text().chars().count();
+        state
+    }
+
+    fn clamp_selection(&mut self) {
+        if self.nodes.is_empty() {
+            self.selected = 0;
+        } else if self.selected >= self.nodes.len() {
+            self.selected = self.nodes.len().saturating_sub(1);
+        }
+    }
+
+    fn active_node(&self) -> Option<&PlanReviewDraftNode> {
+        self.nodes.get(self.selected)
+    }
+
+    fn active_text(&self) -> &str {
+        let Some(node) = self.active_node() else {
+            return "";
+        };
+        match self.field {
+            PlanReviewField::Title => &node.title,
+            PlanReviewField::Goal => &node.goal,
+            PlanReviewField::Success => &node.success,
+            PlanReviewField::Prompt => &node.prompt,
+            PlanReviewField::HardDeps => &node.hard_deps,
+            PlanReviewField::SoftDeps => &node.soft_deps,
+        }
+    }
+
+    fn set_field(&mut self, field: PlanReviewField) {
+        self.field = field;
+        self.cursor = self.active_text().chars().count();
+    }
+}
+
+fn plan_review_signature(nodes: &[PlannedNode]) -> String {
+    serde_json::to_string(nodes).unwrap_or_default()
+}
+
+fn optional_nonempty(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -313,6 +475,11 @@ struct App {
     /// into live agents as their hard deps merge and parallelism slots free.
     /// Rendered in the Todo section. A new completed plan replaces the queue.
     planned_nodes: Vec<PlannedNode>,
+    /// Editable projection of `planned_nodes` while an approval-gated plan is being
+    /// reviewed in the worker pane. Draft edits are committed back to
+    /// `planned_nodes` only after validation, so an invalid dependency edit cannot
+    /// launch or persist accidentally.
+    plan_review: PlanReviewState,
     /// The original user request that produced `planned_nodes`, used to build each
     /// worker launch prompt so the worker sees the coordinating request.
     planned_origin: String,
@@ -832,6 +999,11 @@ impl App {
         } else {
             load_plan_queue(&cwd).unwrap_or_default()
         };
+        let restored_plan_review = if restored_queue.awaiting_approval {
+            PlanReviewState::from_planned_nodes(&restored_queue.planned_nodes)
+        } else {
+            PlanReviewState::default()
+        };
         // Main is no longer auto-pinned. If the user wants one, they type
         // /main from the task pane. Main records render in their own section
         // instead of being mixed into ordinary worktree agents.
@@ -862,6 +1034,7 @@ impl App {
             plan_mode: false,
             agents,
             planned_nodes: restored_queue.planned_nodes,
+            plan_review: restored_plan_review,
             planned_origin: restored_queue.planned_origin,
             plan_request: restored_queue.plan_request,
             plan_summary: restored_queue.plan_summary,
@@ -1103,6 +1276,16 @@ impl App {
         self.agents.iter().any(|run| {
             self.is_interactive_orchestrator_run(run) && run.status == AgentStatus::Running
         })
+    }
+
+    fn running_interactive_orchestrator_task(&self) -> Option<String> {
+        self.agents
+            .iter()
+            .find(|run| {
+                self.is_interactive_orchestrator_run(run) && run.status == AgentStatus::Running
+            })
+            .map(|run| run.task.clone())
+            .filter(|task| !task.trim().is_empty())
     }
 
     /// True when the worker pane is currently showing the custom orchestrator DAG
@@ -1462,6 +1645,10 @@ impl App {
     }
 
     fn handle_worker_key(&mut self, key: KeyEvent) -> bool {
+        if self.worker_view == WorkerView::PlanReview {
+            return self.handle_plan_review_key(key);
+        }
+
         if self.worker_view == WorkerView::Diff {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('v') => {
@@ -1787,15 +1974,20 @@ impl App {
     fn copy_focused_selection(&mut self) {
         let text = match self.focus {
             FocusPane::Worker if self.worker_view == WorkerView::Terminal => {
-                // The DAG view shows rendered lines, not the planner PTY; copying the
-                // PTY selection here would yield text the user cannot see.
-                if self.selected_orchestrator_dag_active() {
-                    return;
+                if self.selected_is_orchestrator() {
+                    if let Some(selection) = self.orch_selection {
+                        selected_text_from_lines(&self.orch_visible_rows, selection)
+                    } else if let Some(selection) = self.worker_selection {
+                        self.selected_worker_selection_text(selection)
+                    } else {
+                        return;
+                    }
+                } else {
+                    let Some(selection) = self.worker_selection else {
+                        return;
+                    };
+                    self.selected_worker_selection_text(selection)
                 }
-                let Some(selection) = self.worker_selection else {
-                    return;
-                };
-                self.selected_worker_selection_text(selection)
             }
             FocusPane::Task => {
                 let Some(selection) = self.task_selection else {
@@ -1892,6 +2084,17 @@ impl App {
 
     fn toggle_worker_view(&mut self) {
         self.worker_selection = None;
+        if self.awaiting_approval && self.selected_is_orchestrator() {
+            self.worker_view = match self.worker_view {
+                WorkerView::PlanReview => WorkerView::Terminal,
+                _ => {
+                    self.ensure_plan_review_state();
+                    WorkerView::PlanReview
+                }
+            };
+            self.focus = FocusPane::Worker;
+            return;
+        }
         self.worker_view = match self.worker_view {
             WorkerView::Terminal => {
                 self.ensure_review_diff();
@@ -1901,6 +2104,7 @@ impl App {
                 self.notice = None;
                 WorkerView::Terminal
             }
+            WorkerView::PlanReview => WorkerView::Terminal,
         };
         self.focus = FocusPane::Worker;
     }
@@ -2368,6 +2572,19 @@ impl App {
                             self.set_selected_review_error(error.to_string());
                         }
                     }
+                } else if self.worker_view == WorkerView::PlanReview {
+                    self.with_plan_review_text_mut(|value, cursor| {
+                        insert_str_at_cursor(value, cursor, &text);
+                    });
+                } else if self.selected_uses_headless_orchestrator_chat() {
+                    if let Some(run) = self.agents.get_mut(self.selected_agent) {
+                        insert_str_at_cursor(
+                            &mut run.worker_input_draft,
+                            &mut run.worker_input_cursor,
+                            &text,
+                        );
+                        self.dirty = true;
+                    }
                 } else if self.selected_worker_is_finished_cloud_command() {
                     self.notice = Some(
                         "cloud command finished; run /cloud again or press r to rerun".to_string(),
@@ -2492,7 +2709,13 @@ impl App {
         {
             if let Some(worker_area) = self.worker_area {
                 self.task_selection = None;
-                if self.handle_orchestrator_selection_mouse(mouse, block_inner(worker_area)) {
+                let orch_area = if self.selected_interactive_orchestrator_active() {
+                    let (dag_area, _) = interactive_orchestrator_areas(worker_area);
+                    block_inner(dag_area)
+                } else {
+                    block_inner(worker_area)
+                };
+                if self.handle_orchestrator_selection_mouse(mouse, orch_area) {
                     return;
                 }
             }
@@ -2506,7 +2729,13 @@ impl App {
         {
             if let Some(worker_area) = self.worker_area {
                 self.task_selection = None;
-                if self.handle_worker_selection_mouse(mouse, block_inner(worker_area)) {
+                let worker_inner = if self.selected_interactive_orchestrator_active() {
+                    let (_, term_area) = interactive_orchestrator_areas(worker_area);
+                    block_inner(term_area)
+                } else {
+                    block_inner(worker_area)
+                };
+                if self.handle_worker_selection_mouse(mouse, worker_inner) {
                     return;
                 }
             }
@@ -2543,6 +2772,12 @@ impl App {
         self.task_selection = None;
         let inner = block_inner(worker_area);
 
+        if self.worker_view == WorkerView::PlanReview {
+            self.worker_selection = None;
+            self.orch_selection = None;
+            return;
+        }
+
         if self.worker_view == WorkerView::Diff {
             if self.write_mouse_to_selected_review(mouse, inner) {
                 return;
@@ -2550,11 +2785,32 @@ impl App {
             return;
         }
 
-        // The orchestrator pane renders composed Lines, not the planner PTY: select
-        // over the captured visible rows instead of forwarding to / selecting the PTY.
-        if self.selected_is_orchestrator() {
+        // Headless orchestrator renders composed Lines, not a PTY: select over the
+        // captured rows. Interactive orchestrator is split: DAG selection above,
+        // normal terminal selection/input below.
+        if self.selected_uses_headless_orchestrator_chat() {
             self.worker_selection = None;
             self.handle_orchestrator_selection_mouse(mouse, inner);
+            return;
+        }
+
+        if self.selected_interactive_orchestrator_active() {
+            let (dag_area, term_area) = interactive_orchestrator_areas(worker_area);
+            if rect_contains(dag_area, mouse.column, mouse.row) {
+                self.worker_selection = None;
+                self.handle_orchestrator_selection_mouse(mouse, block_inner(dag_area));
+                return;
+            }
+            if rect_contains(term_area, mouse.column, mouse.row) {
+                self.orch_selection = None;
+                let term_inner = block_inner(term_area);
+                if self.handle_worker_selection_mouse(mouse, term_inner) {
+                    return;
+                }
+                if self.write_mouse_to_selected_worker(mouse, term_inner) {
+                    return;
+                }
+            }
             return;
         }
 
@@ -2604,7 +2860,9 @@ impl App {
                     "mouse {:?} @{},{} focus=worker view={:?}",
                     mouse.kind, mouse.column, mouse.row, self.worker_view
                 ));
-                if self.selected_interactive_orchestrator_active() {
+                if self.worker_view == WorkerView::PlanReview {
+                    self.scroll_plan_review(mouse, inner);
+                } else if self.selected_interactive_orchestrator_active() {
                     self.scroll_interactive_orchestrator(mouse, area);
                 } else if self.selected_headless_orchestrator_rendered_view_active() {
                     self.scroll_orchestrator_dag(mouse, inner);
@@ -2626,7 +2884,9 @@ impl App {
                 "mouse {:?} @{},{} pane=worker view={:?}",
                 mouse.kind, mouse.column, mouse.row, self.worker_view
             ));
-            if self.selected_interactive_orchestrator_active() {
+            if self.worker_view == WorkerView::PlanReview {
+                self.scroll_plan_review(mouse, inner);
+            } else if self.selected_interactive_orchestrator_active() {
                 self.scroll_interactive_orchestrator(mouse, area);
             } else if self.selected_headless_orchestrator_rendered_view_active() {
                 self.scroll_orchestrator_dag(mouse, inner);
@@ -2669,6 +2929,19 @@ impl App {
         if rect_contains(term_area, mouse.column, mouse.row) {
             let _ = self.scroll_selected_worker_or_forward(mouse, block_inner(term_area));
         }
+    }
+
+    fn scroll_plan_review(&mut self, mouse: MouseEvent, area: Rect) {
+        let rows = mouse_scrollback_delta(mouse, area.height);
+        if rows > 0 {
+            self.plan_review.scroll = self.plan_review.scroll.saturating_sub(rows as usize);
+        } else if rows < 0 {
+            self.plan_review.scroll = self
+                .plan_review
+                .scroll
+                .saturating_add(rows.unsigned_abs() as usize);
+        }
+        self.dirty = true;
     }
 
     fn set_mouse_debug(&mut self, message: String) {
@@ -3769,6 +4042,12 @@ impl App {
         // (each refinement layers the user's feedback on top of this, not on top of
         // the previous composite prompt).
         self.plan_request = input.to_string();
+        self.planned_origin = input.to_string();
+        self.plan_summary = None;
+        self.planned_nodes.clear();
+        self.awaiting_approval = false;
+        self.plan_review = PlanReviewState::default();
+        self.persist_plan_queue();
         let backend = self.backend;
         let interactive_planner = self.interactive_orchestrator;
         let model = self.model.clone();
@@ -5010,7 +5289,8 @@ impl App {
                     }
                     Backend::Codex => {
                         let model = fast_model_for(backend).to_string();
-                        let warning = self.set_model_defaults(backend, model, Some(EffortLevel::Low));
+                        let warning =
+                            self.set_model_defaults(backend, model, Some(EffortLevel::Low));
                         self.notice = warning.or_else(|| {
                             Some(format!(
                                 "fast mode: {} {} (low effort) for NEW agents · codex has no native fast mode, so this lowers reasoning effort · /model switches back",
@@ -5563,8 +5843,15 @@ impl App {
         if self.refining || self.rebasing || self.awaiting_approval {
             return;
         }
-        // Only capture a FRESH plan: nothing pending and no workers launched yet.
-        if !self.planned_nodes.is_empty() || self.agents.iter().any(|run| run.node_id.is_some()) {
+        // Only capture a FRESH plan: nothing pending and no live/unmerged workers.
+        // Historical merged nodes may still be in the agents list; they must not
+        // block a brand-new orchestrator plan after the previous DAG completed.
+        if !self.planned_nodes.is_empty()
+            || self
+                .agents
+                .iter()
+                .any(|run| run.node_id.is_some() && run.status != AgentStatus::Merged)
+        {
             return;
         }
         if !self.has_running_interactive_orchestrator() {
@@ -5577,18 +5864,22 @@ impl App {
             Ok(tasks) if !tasks.is_empty() => tasks,
             _ => return,
         };
-        let nodes: Vec<PlannedNode> = tasks.iter().map(PlannedNode::from_task).collect();
+        let nodes = self.planned_nodes_from_fresh_tasks(&tasks);
         let count = nodes.len();
         self.planned_nodes = nodes;
-        if !self.plan_request.trim().is_empty() {
+        if let Some(origin) = self.running_interactive_orchestrator_task() {
+            self.plan_request = origin.clone();
+            self.planned_origin = origin;
+        } else if !self.plan_request.trim().is_empty() {
             self.planned_origin = self.plan_request.clone();
         }
         self.plan_summary = extract_rudder_plan_summary(&text);
         self.planner_paused_for_input = false;
         self.awaiting_approval = true;
         self.persist_plan_queue();
+        self.open_plan_review();
         self.notice = Some(format!(
-            "orchestrator proposed a {count}-node plan — review the DAG above · Enter approve"
+            "orchestrator proposed a {count}-node plan — edit inline · Ctrl+Enter approve"
         ));
         self.dirty = true;
     }
@@ -5606,7 +5897,11 @@ impl App {
         if !self.awaiting_approval || self.refining || self.rebasing {
             return;
         }
-        if self.agents.iter().any(|run| run.node_id.is_some()) {
+        if self
+            .agents
+            .iter()
+            .any(|run| run.node_id.is_some() && run.status != AgentStatus::Merged)
+        {
             return;
         }
         if !self.has_running_interactive_orchestrator() {
@@ -5624,16 +5919,21 @@ impl App {
             Ok(tasks) if !tasks.is_empty() => tasks,
             _ => return,
         };
-        let nodes: Vec<PlannedNode> = tasks.iter().map(PlannedNode::from_task).collect();
+        let nodes = self.planned_nodes_from_fresh_tasks(&tasks);
         if nodes == self.planned_nodes {
             return; // unchanged since the last capture — nothing to refresh
         }
         let count = nodes.len();
         self.planned_nodes = nodes;
+        if let Some(origin) = self.running_interactive_orchestrator_task() {
+            self.plan_request = origin.clone();
+            self.planned_origin = origin;
+        }
         self.plan_summary = extract_rudder_plan_summary(&text);
         self.persist_plan_queue();
+        self.open_plan_review();
         self.notice = Some(format!(
-            "orchestrator updated the plan — now {count} node(s) · review the DAG · Enter approve"
+            "orchestrator updated the plan — now {count} node(s) · edit inline · Ctrl+Enter approve"
         ));
         self.dirty = true;
     }
@@ -6071,13 +6371,19 @@ impl App {
             );
             return;
         }
+        // Clear the planner's autosteer flag so it is captured once, but KEEP the
+        // run: it stays pinned at the top of the list as the orchestrator that owns
+        // the plan. Its worker pane renders the DAG tree of the parsed tasks.
+        run.autosteered = false;
+        let _ = save_native_run_record(&self.cwd, run);
+        let _ = run;
         // A DAG WAS captured: this planner is no longer paused for input.
         self.planner_paused_for_input = false;
         self.pending_questions.clear();
 
         // Queue every task as a PLANNED node. A new plan replaces any pending queue
         // (the planner is the single source of truth for the active plan).
-        let nodes: Vec<PlannedNode> = tasks.iter().map(PlannedNode::from_task).collect();
+        let nodes = self.planned_nodes_from_fresh_tasks(&tasks);
         let count = nodes.len();
         self.planned_nodes = nodes;
         // Keep planned_origin anchored to the ORIGINAL request so refine rounds (whose
@@ -6092,26 +6398,21 @@ impl App {
         // The revised plan has landed: the refine round is complete.
         self.refining = false;
 
-        // Clear the planner's autosteer flag so it is captured once, but KEEP the
-        // run: it stays pinned at the top of the list as the orchestrator that owns
-        // the plan. Its worker pane renders the DAG tree of the parsed tasks.
-        run.autosteered = false;
-        let _ = save_native_run_record(&self.cwd, run);
-
         // APPROVAL GATE: do NOT launch. Hold the plan until the user approves so
         // they can review, discuss/refine (type in the task pane), or approve it.
         self.awaiting_approval = true;
         // Persist the captured queue + gate so a restart resumes at this gate.
         self.persist_plan_queue();
+        self.open_plan_review();
         // Surface (never silently drop) when the planner emitted more tasks than the
         // runaway backstop allows.
         let emitted = rudder_plan_block_task_count(&output).unwrap_or(count);
         self.notice = Some(if emitted > MAX_PLAN_TASKS {
             format!(
-                "plan ready: {count} of {emitted} node(s) (capped at {MAX_PLAN_TASKS}; add more by typing). Type to refine · Enter approve"
+                "plan ready: {count} of {emitted} node(s) (capped at {MAX_PLAN_TASKS}). Edit inline · Ctrl+Enter approve"
             )
         } else {
-            format!("plan ready: {count} node(s). Type to refine · Enter approve")
+            format!("plan ready: {count} node(s). Edit inline · Ctrl+Enter approve")
         });
         self.dirty = true;
     }
@@ -6651,8 +6952,15 @@ impl App {
             Some(url) => match open_url_in_browser(&url) {
                 // Keep the URL hidden on success (the hotkey is the way in); only
                 // reveal it if auto-open fails so the user can open it manually.
-                Ok(()) => self.notice = Some("opening this project's web view in your browser".to_string()),
-                Err(err) => self.notice = Some(format!("could not open browser ({err}); open {url} manually")),
+                Ok(()) => {
+                    self.notice =
+                        Some("opening this project's web view in your browser".to_string())
+                }
+                Err(err) => {
+                    self.notice = Some(format!(
+                        "could not open browser ({err}); open {url} manually"
+                    ))
+                }
             },
             None => {
                 self.notice = Some("web UI is not running for this session".to_string());
@@ -6972,6 +7280,367 @@ impl App {
         }
     }
 
+    pub(crate) fn ensure_plan_review_state(&mut self) {
+        if !self.awaiting_approval {
+            return;
+        }
+        let signature = plan_review_signature(&self.planned_nodes);
+        if self.plan_review.nodes.is_empty()
+            || (!self.plan_review.dirty && self.plan_review.signature != signature)
+        {
+            self.plan_review = PlanReviewState::from_planned_nodes(&self.planned_nodes);
+        }
+    }
+
+    fn reset_plan_review_from_nodes(&mut self) {
+        self.plan_review = PlanReviewState::from_planned_nodes(&self.planned_nodes);
+    }
+
+    fn open_plan_review(&mut self) {
+        if self.planned_nodes.is_empty() {
+            return;
+        }
+        self.reset_plan_review_from_nodes();
+        if let Some(index) = self.agents.iter().position(|run| run.is_orchestrator()) {
+            self.selected_agent = index;
+        }
+        self.worker_view = WorkerView::PlanReview;
+        self.focus = FocusPane::Worker;
+        self.orch_selection = None;
+        self.worker_selection = None;
+        self.dirty = true;
+    }
+
+    fn parse_plan_review_deps(value: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for dep in value
+            .split(|ch: char| ch == ',' || ch.is_whitespace())
+            .map(str::trim)
+            .filter(|dep| !dep.is_empty())
+        {
+            if !out.iter().any(|existing| existing == dep) {
+                out.push(dep.to_string());
+            }
+        }
+        out
+    }
+
+    fn plan_review_drafts_to_nodes(
+        &self,
+    ) -> std::result::Result<(Vec<PlannedNode>, Vec<String>), Vec<String>> {
+        let mut errors = Vec::new();
+        let mut warnings = Vec::new();
+        let ids: Vec<String> = self
+            .plan_review
+            .nodes
+            .iter()
+            .map(|node| node.id.trim().to_string())
+            .collect();
+        let id_set: HashSet<String> = ids.iter().cloned().collect();
+        if ids.len() != id_set.len() {
+            errors.push("node ids must be unique".to_string());
+        }
+        let mut tasks = Vec::new();
+        for node in &self.plan_review.nodes {
+            let id = node.id.trim();
+            if id.is_empty() {
+                errors.push("node id cannot be empty".to_string());
+                continue;
+            }
+            let title = node.title.trim();
+            let prompt = node.prompt.trim();
+            if title.is_empty() {
+                errors.push(format!("{id}: title cannot be empty"));
+            }
+            if prompt.is_empty() {
+                errors.push(format!("{id}: prompt cannot be empty"));
+            }
+            let hard_deps = Self::parse_plan_review_deps(&node.hard_deps);
+            let soft_deps = Self::parse_plan_review_deps(&node.soft_deps);
+            let mut deps = Vec::new();
+            for dep in &hard_deps {
+                if dep == id {
+                    errors.push(format!("{id}: hard dep cannot reference itself"));
+                } else if !id_set.contains(dep) {
+                    errors.push(format!("{id}: unknown hard dep `{dep}`"));
+                } else {
+                    deps.push(PlanEdge {
+                        on: dep.clone(),
+                        edge: EdgeType::Hard,
+                        why: None,
+                    });
+                }
+            }
+            for dep in &soft_deps {
+                if dep == id {
+                    errors.push(format!("{id}: soft dep cannot reference itself"));
+                } else if !id_set.contains(dep) {
+                    errors.push(format!("{id}: unknown soft dep `{dep}`"));
+                } else {
+                    deps.push(PlanEdge {
+                        on: dep.clone(),
+                        edge: EdgeType::Soft,
+                        why: None,
+                    });
+                }
+            }
+            if node.goal.trim().is_empty() {
+                warnings.push(format!("{id}: goal is empty; Rudder will derive one"));
+            }
+            if node.success.trim().is_empty() {
+                warnings.push(format!("{id}: done-when is empty; Rudder will derive one"));
+            }
+            tasks.push(RudderPlanTask {
+                id: id.to_string(),
+                title: title.to_string(),
+                prompt: prompt.to_string(),
+                goal: optional_nonempty(&node.goal),
+                success: optional_nonempty(&node.success),
+                deps,
+                backend: node.backend.clone(),
+                model: node.model.clone(),
+                effort: node.effort.clone(),
+            });
+        }
+        if errors.is_empty() {
+            if let Err(error) = assert_no_hard_cycle(&tasks) {
+                errors.push(error.to_string());
+            }
+        }
+        if !errors.is_empty() {
+            return Err(errors);
+        }
+        let nodes = tasks.iter().map(PlannedNode::from_task).collect();
+        Ok((nodes, warnings))
+    }
+
+    fn commit_plan_review_edits(&mut self) -> bool {
+        let (nodes, warnings) = match self.plan_review_drafts_to_nodes() {
+            Ok(result) => result,
+            Err(errors) => {
+                self.plan_review.errors = errors;
+                self.plan_review.warnings.clear();
+                self.plan_review.dirty = true;
+                self.notice = Some("fix the plan review errors before approval".to_string());
+                self.dirty = true;
+                return false;
+            }
+        };
+        self.planned_nodes = nodes;
+        self.persist_plan_queue();
+        let tasks: Vec<RudderPlanTask> = self
+            .planned_nodes
+            .iter()
+            .map(PlannedNode::to_task)
+            .collect();
+        let block = rudder_plan_tasks_block(&tasks);
+        if let Err(error) = replace_rudder_plan_block(&self.cwd, &block) {
+            self.plan_review.errors = vec![format!("could not update RUDDER.md: {error}")];
+            self.plan_review.warnings.clear();
+            self.plan_review.dirty = true;
+            self.notice = Some("plan saved to queue but RUDDER.md update failed".to_string());
+            self.dirty = true;
+            return false;
+        }
+        self.plan_review = PlanReviewState::from_planned_nodes(&self.planned_nodes);
+        self.plan_review.warnings = warnings;
+        self.notice = Some("plan updated".to_string());
+        self.dirty = true;
+        true
+    }
+
+    fn with_plan_review_text_mut<F>(&mut self, edit: F)
+    where
+        F: FnOnce(&mut String, &mut usize),
+    {
+        let state = &mut self.plan_review;
+        let selected = state.selected;
+        let field = state.field;
+        let cursor = &mut state.cursor;
+        let Some(node) = state.nodes.get_mut(selected) else {
+            return;
+        };
+        let text = match field {
+            PlanReviewField::Title => &mut node.title,
+            PlanReviewField::Goal => &mut node.goal,
+            PlanReviewField::Success => &mut node.success,
+            PlanReviewField::Prompt => &mut node.prompt,
+            PlanReviewField::HardDeps => &mut node.hard_deps,
+            PlanReviewField::SoftDeps => &mut node.soft_deps,
+        };
+        edit(text, cursor);
+        *cursor = (*cursor).min(text.chars().count());
+        state.dirty = true;
+        state.errors.clear();
+        state.warnings.clear();
+        self.dirty = true;
+    }
+
+    fn select_plan_review_node(&mut self, delta: isize) {
+        let len = self.plan_review.nodes.len();
+        if len == 0 {
+            return;
+        }
+        let current = self.plan_review.selected as isize;
+        let next = (current + delta).clamp(0, len.saturating_sub(1) as isize) as usize;
+        self.plan_review.selected = next;
+        self.plan_review.cursor = self.plan_review.active_text().chars().count();
+        self.dirty = true;
+    }
+
+    fn handle_plan_review_key(&mut self, key: KeyEvent) -> bool {
+        self.ensure_plan_review_state();
+        match key.code {
+            KeyCode::Esc => {
+                self.worker_view = WorkerView::Terminal;
+                self.notice = Some(
+                    "plan review hidden; press v on the orchestrator to edit again".to_string(),
+                );
+            }
+            KeyCode::Enter
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::META) =>
+            {
+                if self.commit_plan_review_edits() {
+                    self.approve_planned_queue();
+                }
+            }
+            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.commit_plan_review_edits();
+            }
+            KeyCode::Tab => {
+                let field = self.plan_review.field.next();
+                self.plan_review.set_field(field);
+            }
+            KeyCode::BackTab => {
+                let field = self.plan_review.field.previous();
+                self.plan_review.set_field(field);
+            }
+            KeyCode::Up | KeyCode::Char('k')
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::META) =>
+            {
+                self.select_plan_review_node(-1);
+            }
+            KeyCode::Down | KeyCode::Char('j')
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::META) =>
+            {
+                self.select_plan_review_node(1);
+            }
+            KeyCode::PageUp => {
+                let page = page_scroll_rows(self.worker_area).max(1) as usize;
+                self.plan_review.scroll = self.plan_review.scroll.saturating_sub(page);
+            }
+            KeyCode::PageDown => {
+                let page = page_scroll_rows(self.worker_area).max(1) as usize;
+                self.plan_review.scroll = self.plan_review.scroll.saturating_add(page);
+            }
+            KeyCode::Enter if self.plan_review.field == PlanReviewField::Prompt => {
+                self.with_plan_review_text_mut(|text, cursor| {
+                    insert_char_at_cursor(text, cursor, '\n');
+                });
+            }
+            KeyCode::Enter => {
+                let field = self.plan_review.field.next();
+                self.plan_review.set_field(field);
+            }
+            KeyCode::Backspace => {
+                self.with_plan_review_text_mut(|text, cursor| {
+                    if key.modifiers.intersects(
+                        KeyModifiers::ALT
+                            | KeyModifiers::CONTROL
+                            | KeyModifiers::SUPER
+                            | KeyModifiers::META,
+                    ) {
+                        delete_previous_word_at(text, cursor);
+                    } else {
+                        delete_char_before_cursor(text, cursor);
+                    }
+                });
+            }
+            KeyCode::Delete => {
+                self.with_plan_review_text_mut(|text, cursor| {
+                    delete_char_at_cursor(text, *cursor);
+                });
+            }
+            KeyCode::Left => {
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::ALT | KeyModifiers::META)
+                {
+                    let pos = previous_word_position(
+                        self.plan_review.active_text(),
+                        self.plan_review.cursor,
+                    );
+                    self.plan_review.cursor = pos;
+                } else {
+                    self.plan_review.cursor = self.plan_review.cursor.saturating_sub(1);
+                }
+            }
+            KeyCode::Right => {
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::ALT | KeyModifiers::META)
+                {
+                    let pos =
+                        next_word_position(self.plan_review.active_text(), self.plan_review.cursor);
+                    self.plan_review.cursor = pos;
+                } else {
+                    let len = self.plan_review.active_text().chars().count();
+                    self.plan_review.cursor = (self.plan_review.cursor + 1).min(len);
+                }
+            }
+            KeyCode::Home | KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.plan_review.cursor = 0;
+            }
+            KeyCode::End | KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.plan_review.cursor = self.plan_review.active_text().chars().count();
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.with_plan_review_text_mut(|text, cursor| {
+                    text.clear();
+                    *cursor = 0;
+                });
+            }
+            KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.with_plan_review_text_mut(|text, cursor| {
+                    delete_previous_word_at(text, cursor);
+                });
+            }
+            KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.with_plan_review_text_mut(|text, cursor| {
+                    truncate_at_cursor(text, *cursor);
+                });
+            }
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.with_plan_review_text_mut(|text, cursor| {
+                    delete_char_at_cursor(text, *cursor);
+                });
+            }
+            KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.with_plan_review_text_mut(|text, cursor| {
+                    delete_char_before_cursor(text, cursor);
+                });
+            }
+            KeyCode::Char(ch)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::META) =>
+            {
+                self.with_plan_review_text_mut(|text, cursor| {
+                    insert_char_at_cursor(text, cursor, ch);
+                });
+            }
+            _ => {}
+        }
+        self.dirty = true;
+        false
+    }
+
     /// Grow the DAG from a parsed completion note: dedupe, depth- and cap-guard,
     /// infer deps, and push the in-scope follow-ups as planned nodes. Pure of any
     /// PTY/terminal access (split out of ingest_worker_followups so it is testable).
@@ -7151,6 +7820,49 @@ impl App {
         }
     }
 
+    fn planned_nodes_from_fresh_tasks(&self, tasks: &[RudderPlanTask]) -> Vec<PlannedNode> {
+        let mut taken: HashSet<String> = self
+            .agents
+            .iter()
+            .filter_map(|run| run.node_id.clone())
+            .collect();
+        taken.extend(self.planned_nodes.iter().map(|node| node.id.clone()));
+
+        let mut id_map: HashMap<String, String> = HashMap::new();
+        for task in tasks {
+            let original = task.id.trim().to_string();
+            let base = if original.is_empty() {
+                "node".to_string()
+            } else {
+                original.clone()
+            };
+            let mut candidate = base.clone();
+            let mut suffix = 2usize;
+            while taken.contains(&candidate) {
+                candidate = format!("{base}-{suffix}");
+                suffix += 1;
+            }
+            taken.insert(candidate.clone());
+            id_map.insert(original, candidate);
+        }
+
+        tasks
+            .iter()
+            .map(|task| {
+                let mut task = task.clone();
+                if let Some(id) = id_map.get(&task.id) {
+                    task.id = id.clone();
+                }
+                for edge in &mut task.deps {
+                    if let Some(id) = id_map.get(&edge.on) {
+                        edge.on = id.clone();
+                    }
+                }
+                PlannedNode::from_task(&task)
+            })
+            .collect()
+    }
+
     /// APPROVE the pending plan: clear the approval gate and drain the queue into
     /// live workers. Ready nodes (hard deps satisfied, slot free) launch on this
     /// immediate scheduler pass; the rest stay in Todo until their deps merge.
@@ -7164,12 +7876,20 @@ impl App {
             self.notice = Some("still refining — the updated plan is on its way".to_string());
             return;
         }
+        if self.plan_review.dirty && !self.commit_plan_review_edits() {
+            return;
+        }
         if self.planned_nodes.is_empty() {
             // Degenerate approval (e.g. a rebase diffed every task away): clear the
             // gate. Keep the interactive orchestrator alive so the user can keep
             // talking to the conductor even when there is nothing to launch.
             self.awaiting_approval = false;
             self.persist_plan_queue();
+            self.plan_review = PlanReviewState::default();
+            self.worker_view = WorkerView::Terminal;
+            if let Err(error) = clear_orchestrator_plan_markers(&self.cwd) {
+                self.notice = Some(format!("orchestrator marker cleanup warning: {error}"));
+            }
             self.keep_orchestrator_after_approval();
             return;
         }
@@ -7177,6 +7897,11 @@ impl App {
         self.planner_paused_for_input = false;
         self.pending_questions.clear();
         self.persist_plan_queue();
+        self.plan_review = PlanReviewState::default();
+        self.worker_view = WorkerView::Terminal;
+        if let Err(error) = clear_orchestrator_plan_markers(&self.cwd) {
+            self.notice = Some(format!("orchestrator marker cleanup warning: {error}"));
+        }
         // Record the plan approval as a cross-cutting decision so the fleet has the
         // authoritative goal + shape in DECISIONS.md from the start.
         let goal = if self.plan_request.trim().is_empty() {
@@ -9951,6 +10676,7 @@ fn clear_orchestrator_plan_markers(repo_root: &Path) -> Result<()> {
     const START: &str = "RUDDER_PLAN_TASKS_START";
     const END: &str = "RUDDER_PLAN_TASKS_END";
     let path = orchestrator_plan_path(repo_root);
+    let _lock = acquire_rudder_md_lock(repo_root);
     let Ok(text) = std::fs::read_to_string(&path) else {
         return Ok(());
     };

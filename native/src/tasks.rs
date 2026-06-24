@@ -526,6 +526,69 @@ pub(crate) fn extract_rudder_plan_tasks(output: &str) -> Result<Vec<RudderPlanTa
     extract_rudder_plan_tasks_with_frontier(output, &[])
 }
 
+pub(crate) fn rudder_plan_tasks_block(tasks: &[RudderPlanTask]) -> String {
+    let tasks_json: Vec<serde_json::Value> = tasks
+        .iter()
+        .map(|task| {
+            let deps: Vec<serde_json::Value> = task
+                .deps
+                .iter()
+                .map(|edge| {
+                    let mut dep = serde_json::Map::new();
+                    dep.insert("on".to_string(), serde_json::json!(edge.on));
+                    dep.insert(
+                        "type".to_string(),
+                        serde_json::json!(match edge.edge {
+                            EdgeType::Hard => "hard",
+                            EdgeType::Soft => "soft",
+                        }),
+                    );
+                    if let Some(why) = edge.why.as_ref().filter(|why| !why.trim().is_empty()) {
+                        dep.insert("why".to_string(), serde_json::json!(why));
+                    }
+                    serde_json::Value::Object(dep)
+                })
+                .collect();
+            let mut item = serde_json::Map::new();
+            item.insert("id".to_string(), serde_json::json!(&task.id));
+            item.insert("title".to_string(), serde_json::json!(&task.title));
+            item.insert("prompt".to_string(), serde_json::json!(&task.prompt));
+            if let Some(goal) = task.goal.as_ref().filter(|value| !value.trim().is_empty()) {
+                item.insert("goal".to_string(), serde_json::json!(goal));
+            }
+            if let Some(success) = task
+                .success
+                .as_ref()
+                .filter(|value| !value.trim().is_empty())
+            {
+                item.insert("success".to_string(), serde_json::json!(success));
+            }
+            item.insert("deps".to_string(), serde_json::Value::Array(deps));
+            if let Some(backend) = task
+                .backend
+                .as_ref()
+                .filter(|value| !value.trim().is_empty())
+            {
+                item.insert("backend".to_string(), serde_json::json!(backend));
+            }
+            if let Some(model) = task.model.as_ref().filter(|value| !value.trim().is_empty()) {
+                item.insert("model".to_string(), serde_json::json!(model));
+            }
+            if let Some(effort) = task
+                .effort
+                .as_ref()
+                .filter(|value| !value.trim().is_empty())
+            {
+                item.insert("effort".to_string(), serde_json::json!(effort));
+            }
+            serde_json::Value::Object(item)
+        })
+        .collect();
+    let json = serde_json::to_string_pretty(&serde_json::json!({ "tasks": tasks_json }))
+        .unwrap_or_else(|_| "{\"tasks\":[]}".to_string());
+    format!("RUDDER_PLAN_TASKS_START\n{json}\nRUDDER_PLAN_TASKS_END")
+}
+
 /// The number of tasks the planner actually emitted in its block, BEFORE the
 /// `MAX_PLAN_TASKS` backstop. Lets the caller tell the user when a plan was
 /// truncated instead of silently dropping tasks. None if there is no valid block.

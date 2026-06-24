@@ -2304,6 +2304,10 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
         }
     }
 
+    capture_orchestrator_visible_rows(frame, inner, app);
+}
+
+fn capture_orchestrator_visible_rows(frame: &mut Frame<'_>, inner: Rect, app: &mut App) {
     // Read the pane back from the rendered buffer as plain-text rows (post wrap +
     // scroll) so a mouse drag can select and copy exactly what is on screen — the
     // pane composes Lines, not the PTY, so this is the only faithful source for the
@@ -2720,6 +2724,7 @@ pub(crate) fn render_interactive_orchestrator(frame: &mut Frame<'_>, area: Rect,
             .wrap(Wrap { trim: false }),
         dag_area,
     );
+    capture_orchestrator_visible_rows(frame, dag_inner, app);
 
     // ---- interactive PTY (bottom) ----
     let term_inner = block_inner(term_area);
@@ -2796,6 +2801,9 @@ pub(crate) fn render_worker(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         .agents
         .get(app.selected_agent)
         .is_some_and(|run| run.is_orchestrator());
+    if app.worker_view == WorkerView::PlanReview {
+        app.ensure_plan_review_state();
+    }
     // The orchestrator ALWAYS gets the custom command-center view: a live streaming
     // transcript while planning (its raw PTY is now JSON events, not human text), and
     // the DAG tree once a plan is ready. Both phases are rendered by render_orchestrator.
@@ -2836,6 +2844,9 @@ pub(crate) fn render_worker(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let lines = match app.worker_view {
         WorkerView::Terminal => worker_lines(app, inner.height as usize, inner.width as usize),
         WorkerView::Diff => review_lines(app, inner.height as usize),
+        WorkerView::PlanReview => {
+            plan_review_lines(app, inner.height as usize, inner.width as usize)
+        }
     };
     // Identify WHICH agent this pane is showing: its id (the node id for plan
     // workers, matching the n0/n1 ids in the orchestrator DAG) plus a short task
@@ -2866,6 +2877,10 @@ pub(crate) fn render_worker(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             Some(identity) => format!("review · {identity} · Esc/v back · m merge"),
             None => "review · Esc/v back · m merge".to_string(),
         },
+        WorkerView::PlanReview => format!(
+            "plan review · {} · Ctrl+S save · Ctrl+Enter approve · Esc hide",
+            app.plan_review.field.label()
+        ),
     };
     let paragraph = Paragraph::new(lines)
         .style(app_style())
@@ -2878,8 +2893,231 @@ pub(crate) fn render_worker(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         match app.worker_view {
             WorkerView::Terminal => set_worker_cursor(frame, inner, app),
             WorkerView::Diff => set_review_cursor(frame, inner, app),
+            WorkerView::PlanReview => set_plan_review_cursor(frame, inner, app),
         }
     }
+}
+
+pub(crate) fn plan_review_lines(app: &mut App, height: usize, width: usize) -> Vec<Line<'static>> {
+    app.plan_review.cursor_row = None;
+    app.plan_review.cursor_col = 0;
+    let focused = app.focus == FocusPane::Worker;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let content_width = width.max(1);
+    if app.plan_review.nodes.is_empty() {
+        return vec![Line::from(Span::styled(
+            "No approval-gated plan is available.",
+            muted_style(focused),
+        ))];
+    }
+
+    lines.push(Line::from(vec![
+        Span::styled("Plan ready", accent_style(focused)),
+        Span::styled("  edit fields inline before launch", muted_style(focused)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("Tab", accent_style(focused)),
+        Span::styled(" field  ", muted_style(focused)),
+        Span::styled("j/k", accent_style(focused)),
+        Span::styled(" task  ", muted_style(focused)),
+        Span::styled("Ctrl+S", accent_style(focused)),
+        Span::styled(" save  ", muted_style(focused)),
+        Span::styled("Ctrl+Enter", accent_style(focused)),
+        Span::styled(" approve  ", muted_style(focused)),
+        Span::styled("Task pane text", accent_style(focused)),
+        Span::styled(" still refines with the planner", muted_style(focused)),
+    ]));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled("Tasks", muted_style(focused))));
+    for (index, node) in app.plan_review.nodes.iter().enumerate() {
+        let selected = index == app.plan_review.selected;
+        let marker = if selected { "▶ " } else { "  " };
+        let style = if selected {
+            Style::default().fg(PAPER).bg(FOCUS_COLOR)
+        } else {
+            pane_text_style(focused)
+        };
+        let dep_count = plan_review_dep_count(node);
+        let mut spans = vec![
+            Span::styled(marker, accent_style(focused)),
+            Span::styled(format!("{} ", node.id), accent_style(focused)),
+            Span::styled(
+                truncate_chars(&node.title, content_width.saturating_sub(12)),
+                style,
+            ),
+        ];
+        if dep_count > 0 {
+            spans.push(Span::styled(
+                format!("  deps {dep_count}"),
+                muted_style(focused),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+    lines.push(Line::from(""));
+
+    let selected = app.plan_review.selected;
+    if let Some(node) = app.plan_review.nodes.get(selected).cloned() {
+        lines.push(Line::from(vec![
+            Span::styled(format!("Editing {} ", node.id), accent_style(focused)),
+            Span::styled(
+                format!("({}/{})", selected + 1, app.plan_review.nodes.len()),
+                muted_style(focused),
+            ),
+        ]));
+        push_plan_review_field(
+            app,
+            &mut lines,
+            PlanReviewField::Title,
+            "title",
+            &node.title,
+            content_width,
+            focused,
+        );
+        push_plan_review_field(
+            app,
+            &mut lines,
+            PlanReviewField::Goal,
+            "goal",
+            &node.goal,
+            content_width,
+            focused,
+        );
+        push_plan_review_field(
+            app,
+            &mut lines,
+            PlanReviewField::Success,
+            "done",
+            &node.success,
+            content_width,
+            focused,
+        );
+        push_plan_review_field(
+            app,
+            &mut lines,
+            PlanReviewField::HardDeps,
+            "hard deps",
+            &node.hard_deps,
+            content_width,
+            focused,
+        );
+        push_plan_review_field(
+            app,
+            &mut lines,
+            PlanReviewField::SoftDeps,
+            "soft deps",
+            &node.soft_deps,
+            content_width,
+            focused,
+        );
+        push_plan_review_field(
+            app,
+            &mut lines,
+            PlanReviewField::Prompt,
+            "prompt",
+            &node.prompt,
+            content_width,
+            focused,
+        );
+    }
+
+    if !app.plan_review.errors.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("Errors", error_style())));
+        for error in &app.plan_review.errors {
+            lines.push(Line::from(Span::styled(
+                format!("  {error}"),
+                error_style(),
+            )));
+        }
+    }
+    if !app.plan_review.warnings.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Warnings",
+            Style::default().fg(ACCENT_2),
+        )));
+        for warning in &app.plan_review.warnings {
+            lines.push(Line::from(Span::styled(
+                format!("  {warning}"),
+                Style::default().fg(ACCENT_2),
+            )));
+        }
+    }
+
+    let max_scroll = lines.len().saturating_sub(height.max(1));
+    app.plan_review.scroll = app.plan_review.scroll.min(max_scroll);
+    lines
+        .into_iter()
+        .skip(app.plan_review.scroll)
+        .take(height.max(1))
+        .collect()
+}
+
+fn plan_review_dep_count(node: &PlanReviewDraftNode) -> usize {
+    App::parse_plan_review_deps(&node.hard_deps).len()
+        + App::parse_plan_review_deps(&node.soft_deps).len()
+}
+
+fn push_plan_review_field(
+    app: &mut App,
+    lines: &mut Vec<Line<'static>>,
+    field: PlanReviewField,
+    label: &str,
+    value: &str,
+    width: usize,
+    focused: bool,
+) {
+    let active = app.plan_review.field == field;
+    let label_text = format!("  {label}: ");
+    let label_width = label_text.chars().count();
+    let value_width = width.saturating_sub(label_width).max(1) as u16;
+    let wrapped = wrap_input_text(value, value_width);
+    if active {
+        let (cursor_line, cursor_col) =
+            task_cursor_position(value, app.plan_review.cursor, value_width);
+        app.plan_review.cursor_row = Some(lines.len() + cursor_line);
+        app.plan_review.cursor_col = label_width + cursor_col;
+    }
+    let label_style = if active {
+        accent_style(focused)
+    } else {
+        muted_style(focused)
+    };
+    let value_style = if active {
+        Style::default().fg(INK).bg(SURFACE_SEL)
+    } else {
+        pane_text_style(focused)
+    };
+    for (index, line) in wrapped.iter().enumerate() {
+        let prefix = if index == 0 {
+            label_text.clone()
+        } else {
+            " ".repeat(label_width)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(prefix, label_style),
+            Span::styled(line.clone(), value_style),
+        ]));
+    }
+}
+
+pub(crate) fn set_plan_review_cursor(frame: &mut Frame<'_>, inner: Rect, app: &App) {
+    let Some(row) = app.plan_review.cursor_row else {
+        return;
+    };
+    if row < app.plan_review.scroll {
+        return;
+    }
+    let visible_row = row - app.plan_review.scroll;
+    if visible_row >= inner.height as usize {
+        return;
+    }
+    let col = app
+        .plan_review
+        .cursor_col
+        .min(inner.width.saturating_sub(1) as usize);
+    frame.set_cursor_position((inner.x + col as u16, inner.y + visible_row as u16));
 }
 
 pub(crate) fn set_worker_cursor(frame: &mut Frame<'_>, inner: Rect, app: &App) {

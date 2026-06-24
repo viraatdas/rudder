@@ -1160,9 +1160,9 @@ fn real_pty_planner_full_summary_survives_stream_then_exit() {
 #[test]
 fn worker_wheel_scroll_rows_scale_with_viewport() {
     assert_eq!(wheel_scroll_rows(2, KeyModifiers::empty()), 1);
-    assert_eq!(wheel_scroll_rows(6, KeyModifiers::empty()), 1);
-    assert_eq!(wheel_scroll_rows(30, KeyModifiers::empty()), 1);
-    assert_eq!(wheel_scroll_rows(90, KeyModifiers::empty()), 1);
+    assert_eq!(wheel_scroll_rows(6, KeyModifiers::empty()), 3);
+    assert_eq!(wheel_scroll_rows(30, KeyModifiers::empty()), 3);
+    assert_eq!(wheel_scroll_rows(90, KeyModifiers::empty()), 3);
     assert_eq!(wheel_scroll_rows(30, KeyModifiers::CONTROL), 29);
 
     let down = MouseEvent {
@@ -1171,7 +1171,7 @@ fn worker_wheel_scroll_rows_scale_with_viewport() {
         row: 0,
         modifiers: KeyModifiers::empty(),
     };
-    assert_eq!(mouse_scrollback_delta(down, 30), -1);
+    assert_eq!(mouse_scrollback_delta(down, 30), -3);
 }
 
 #[cfg(not(windows))]
@@ -5087,6 +5087,184 @@ fn d_key_does_not_discard_plan_queue() {
 }
 
 #[test]
+fn plan_review_saves_inline_edits_and_blocks_invalid_deps() {
+    let repo = unique_test_repo("plan-review-save");
+    let mut app = App::new();
+    app.cwd = repo.clone();
+    app.agents.push(planner_run("orch-1", false));
+    app.selected_agent = 0;
+    app.awaiting_approval = true;
+    app.planned_nodes = vec![
+        test_planned_node("n0", &[]),
+        test_planned_node("n1", &["n0"]),
+    ];
+    app.open_plan_review();
+
+    app.plan_review.field = PlanReviewField::Title;
+    app.plan_review.cursor = app.plan_review.active_text().chars().count();
+    for ch in " updated".chars() {
+        app.handle_plan_review_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::empty()));
+    }
+    assert!(app.plan_review.dirty, "typing marks the plan draft dirty");
+    assert!(app.commit_plan_review_edits(), "valid inline edit saves");
+    assert_eq!(app.planned_nodes[0].title, "n0 updated");
+    let text = fs::read_to_string(orchestrator_plan_path(&repo)).expect("RUDDER.md written");
+    assert!(
+        text.contains("n0 updated") && text.contains("RUDDER_PLAN_TASKS_START"),
+        "saved edit is mirrored into RUDDER.md: {text}"
+    );
+
+    app.plan_review.nodes[0].hard_deps = "missing".to_string();
+    app.plan_review.dirty = true;
+    app.approve_planned_queue();
+    assert!(
+        app.awaiting_approval,
+        "invalid deps keep the approval gate closed"
+    );
+    assert!(
+        app.plan_review
+            .errors
+            .iter()
+            .any(|error| error.contains("unknown hard dep")),
+        "dependency validation error is shown"
+    );
+}
+
+#[test]
+fn fresh_interactive_plan_ignores_historical_merged_nodes_and_remaps_ids() {
+    let repo = unique_test_repo("fresh-plan-after-merged");
+    fs::write(
+        orchestrator_plan_path(&repo),
+        "RUDDER_PLAN_TASKS_START\n{\"tasks\":[{\"id\":\"n0\",\"title\":\"new root\",\"prompt\":\"p\",\"goal\":\"g\",\"success\":\"s\",\"deps\":[]},{\"id\":\"n1\",\"title\":\"child\",\"prompt\":\"q\",\"goal\":\"g\",\"success\":\"s\",\"deps\":[{\"on\":\"n0\",\"type\":\"hard\",\"why\":\"uses root\"}]}]}\nRUDDER_PLAN_TASKS_END\nRUDDER_APPROVE_PLAN\n",
+    )
+    .unwrap();
+    let mut app = App::new();
+    app.cwd = repo;
+    app.plan_request = "old request".to_string();
+    app.planned_origin = "old request".to_string();
+    app.agents.push(node_agent("n0", AgentStatus::Merged));
+    let mut orch = planner_run("orch-new", false);
+    orch.task = "new request".to_string();
+    orch.mode = AgentMode::RudderPlan;
+    orch.backend = Backend::Codex;
+    orch.interactive_orchestrator = true;
+    orch.autosteered = false;
+    orch.status = AgentStatus::Running;
+    app.agents.push(orch);
+
+    app.maybe_capture_orchestrator_plan();
+
+    assert!(
+        app.awaiting_approval,
+        "fresh plan captured despite old merged node"
+    );
+    assert_eq!(app.planned_origin, "new request");
+    assert_eq!(app.planned_nodes[0].id, "n0-2");
+    assert_eq!(
+        app.planned_nodes[1].deps,
+        vec!["n0-2".to_string()],
+        "intra-plan deps remap with the renamed root"
+    );
+}
+
+#[test]
+fn clear_orchestrator_plan_markers_removes_consumed_plan_and_approval() {
+    let repo = unique_test_repo("clear-markers");
+    fs::write(
+        orchestrator_plan_path(&repo),
+        "<!-- RUDDER_GENERATED_START -->\n# generated\n<!-- RUDDER_GENERATED_END -->\n\nRUDDER_PLAN_TASKS_START\n{\"tasks\":[]}\nRUDDER_PLAN_TASKS_END\nRUDDER_APPROVE_PLAN\nRUDDER_ADD_TASK extra\n",
+    )
+    .unwrap();
+
+    clear_orchestrator_plan_markers(&repo).expect("clear markers");
+    let text = fs::read_to_string(orchestrator_plan_path(&repo)).expect("read RUDDER.md");
+    assert!(text.contains("RUDDER_GENERATED_START"));
+    assert!(!text.contains("RUDDER_PLAN_TASKS_START"));
+    assert!(!text.contains("RUDDER_APPROVE_PLAN"));
+    assert!(!text.contains("RUDDER_ADD_TASK"));
+}
+
+#[test]
+fn paste_into_headless_orchestrator_updates_chat_draft() {
+    let mut app = App::new();
+    app.focus = FocusPane::Worker;
+    app.worker_view = WorkerView::Terminal;
+    let mut orch = planner_run("orch-1", false);
+    orch.interactive_orchestrator = false;
+    orch.autosteered = true;
+    app.agents.push(orch);
+    app.selected_agent = 0;
+
+    app.handle_paste("please revise\nthis plan".to_string());
+
+    assert_eq!(
+        app.agents[0].worker_input_draft, "please revise\nthis plan",
+        "paste lands in the headless orchestrator chat draft"
+    );
+}
+
+#[cfg(not(windows))]
+#[test]
+fn interactive_codex_orchestrator_mouse_selection_targets_terminal_region() {
+    let command = TerminalCommand::with_args("/bin/sh", ["-lc", "printf 'hello\\r\\n'; sleep 1"]);
+    let pane = TerminalPane::spawn_shell_or_command(
+        Some(command),
+        TerminalPaneOptions {
+            size: TerminalSize { rows: 8, cols: 50 },
+            scrollback_lines: 100,
+            ..Default::default()
+        },
+    )
+    .expect("spawn pty");
+    let mut app = App::new();
+    app.focus = FocusPane::Worker;
+    app.worker_view = WorkerView::Terminal;
+    let mut orch = test_agent_run_with_terminal(&app, pane);
+    orch.mode = AgentMode::RudderPlan;
+    orch.backend = Backend::Codex;
+    orch.interactive_orchestrator = true;
+    app.agents = vec![orch];
+    app.selected_agent = 0;
+    let area = Rect::new(0, 0, 80, 30);
+    app.worker_area = Some(area);
+    let (dag_area, term_area) = interactive_orchestrator_areas(area);
+    let term_inner = block_inner(term_area);
+
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: term_inner.x + 1,
+        row: term_inner.y + 1,
+        modifiers: KeyModifiers::empty(),
+    });
+
+    assert!(
+        app.worker_selection.is_some(),
+        "bottom Codex PTY gets terminal selection"
+    );
+    assert!(
+        app.orch_selection.is_none(),
+        "bottom Codex PTY is not treated as DAG text"
+    );
+
+    let dag_inner = block_inner(dag_area);
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: dag_inner.x + 1,
+        row: dag_inner.y + 1,
+        modifiers: KeyModifiers::empty(),
+    });
+
+    assert!(
+        app.orch_selection.is_some(),
+        "top DAG still uses rendered-plan selection"
+    );
+    assert!(
+        app.worker_selection.is_none(),
+        "top DAG clears terminal selection"
+    );
+}
+
+#[test]
 fn enter_on_agent_focuses_worker() {
     let mut app = App::new();
     let run = test_agent_run("run-1", "ordinary task");
@@ -5997,14 +6175,14 @@ fn tui_harness_interactive_orchestrator_captures_plan_file_and_renders_dag() {
             .collect::<Vec<_>>()
     );
 
-    // The interactive orchestrator pane renders the DAG above the PTY.
+    // The captured plan now pops into the inline review document.
     app.selected_agent = 0;
     app.focus = FocusPane::Worker;
     let screen = render_screen(&mut app, 120, 40);
     std::env::remove_var("RUDDER_INTERACTIVE_ORCHESTRATOR");
     assert!(
-        screen.contains("impl-alpha") && screen.contains("dag"),
-        "the DAG pane renders the captured plan above the orchestrator terminal:\n{screen}"
+        screen.contains("impl-alpha") && screen.contains("plan review"),
+        "the inline review document renders the captured plan:\n{screen}"
     );
 
     let _ = fs::remove_dir_all(&repo);

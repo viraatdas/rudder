@@ -2131,6 +2131,51 @@ fn latest_rudder_plan_block(text: &str) -> Option<String> {
     latest
 }
 
+fn strip_rudder_plan_blocks_and_approval(text: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut in_plan = false;
+    for line in text.replace('\r', "").lines() {
+        let trimmed = line.trim();
+        if trimmed == RUDDER_PLAN_START {
+            in_plan = true;
+            continue;
+        }
+        if trimmed == RUDDER_PLAN_END {
+            in_plan = false;
+            continue;
+        }
+        if in_plan || trimmed == "RUDDER_APPROVE_PLAN" {
+            continue;
+        }
+        out.push(line.to_string());
+    }
+    out.join("\n")
+}
+
+pub(crate) fn replace_rudder_plan_block(repo_root: &Path, plan_block: &str) -> Result<()> {
+    let path = repo_root.join("RUDDER.md");
+    let _lock = acquire_rudder_md_lock(repo_root);
+    let existing = fs::read_to_string(&path).unwrap_or_default();
+    let mut preserved = strip_rudder_plan_blocks_and_approval(&existing)
+        .trim_end()
+        .to_string();
+    if !preserved.is_empty() {
+        preserved.push_str("\n\n");
+    }
+    if !preserved.contains("## Orchestrator-authored plan") {
+        preserved.push_str("## Orchestrator-authored plan\n\n");
+    }
+    preserved.push_str(plan_block.trim());
+    preserved.push('\n');
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let temp = path.with_extension(format!("md.{}.tmp", std::process::id()));
+    fs::write(&temp, preserved.as_bytes())?;
+    fs::rename(&temp, path)?;
+    Ok(())
+}
+
 pub(crate) fn ensure_gitignore_contains(repo_root: &Path, line: &str) -> Result<()> {
     let path = repo_root.join(".gitignore");
     let existing = fs::read_to_string(&path).unwrap_or_default();
