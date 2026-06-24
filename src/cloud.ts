@@ -684,11 +684,25 @@ async function mutateSail(action: "onload" | "pause" | "resume" | "stop", args: 
     throw new Error(`Missing sail id. Usage: rudder sail ${action} <id>`);
   }
   const client = await cloudClient({ requireToken: true });
-  const result = await client.request<JsonValue>(`/api/rudder/sail/${encodeURIComponent(sailId)}/${action}`, {
-    method: "POST",
-    body: args.length > 1 ? { args: args.slice(1) } : {},
-  });
+  let result: JsonValue;
+  try {
+    result = await client.request<JsonValue>(`/api/rudder/sail/${encodeURIComponent(sailId)}/${action}`, {
+      method: "POST",
+      body: args.length > 1 ? { args: args.slice(1) } : {},
+    });
+  } catch (error) {
+    if (action !== "onload" && isSailNotFound(error)) {
+      await workspaceMutate(action, args, options);
+      return;
+    }
+    throw error;
+  }
   await printResult(result, options);
+}
+
+function isSailNotFound(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /sail not found/i.test(message);
 }
 
 async function talk(args: string[], options: CloudCommandOptions): Promise<void> {
@@ -1841,15 +1855,15 @@ async function workspaceCommand(args: string[], options: CloudCommandOptions): P
     await workspaceStatus(options);
     return;
   }
-  if (sub === "stop") {
-    await workspaceMutate("stop", rest, options);
+  if (sub === "stop" || sub === "pause" || sub === "resume") {
+    await workspaceMutate(sub, rest, options);
     return;
   }
   if (sub === "list" || sub === "ls") {
     await workspaceList(options);
     return;
   }
-  throw new Error("Usage: rudder cloud workspace [attach [id]|share|status|stop|list]");
+  throw new Error("Usage: rudder cloud workspace [attach [id]|share|status|pause|resume|stop|list]");
 }
 
 function computeWorkspaceKey(repoRoot: string): string {
@@ -2188,7 +2202,7 @@ function computeIdleMinutes(lastActivityAt: string | undefined): number | null {
   return Math.floor(diff / 60_000);
 }
 
-async function workspaceMutate(action: "stop", args: string[], options: CloudCommandOptions): Promise<void> {
+async function workspaceMutate(action: "pause" | "resume" | "stop", args: string[], options: CloudCommandOptions): Promise<void> {
   const id = args[0];
   if (!id) {
     throw new Error(`Usage: rudder cloud workspace ${action} <id>`);
@@ -2665,7 +2679,7 @@ Usage:
       print the copy/paste setup for the whole flow
   rudder cloud slack [manifest]
       print Slack setup (one thread per instance in the shared channel)
-  rudder cloud workspace [attach [id]|share|status [--json]|stop <id>|list]
+  rudder cloud workspace [attach [id]|share|status [--json]|pause <id>|resume <id>|stop <id>|list]
       shared cloud workspace for this repo
   rudder cloud bootstrap <id>
   rudder cloud runtime [fly|byoc]

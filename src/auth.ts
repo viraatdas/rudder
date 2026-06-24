@@ -174,13 +174,20 @@ export async function runOnboard(options?: { nonInteractive?: boolean; json?: bo
     detection.npmAcpxLatest &&
     detection.acpxVersion !== detection.npmAcpxLatest;
 
-  if (!detection.acpxCommand || acpxBehind) {
+  const skipGlobalInstall = process.env.RUDDER_DISABLE_ONBOARD_INSTALL || process.env.RUDDER_CLOUD_WORKER;
+  if ((!detection.acpxCommand || acpxBehind) && !skipGlobalInstall) {
     console.log(
       detection.acpxCommand
         ? `Updating acpx ${detection.acpxVersion} to latest ${detection.npmAcpxLatest}...`
         : "Installing acpx@latest...",
     );
     await runCommand("npm", ["install", "-g", "acpx@latest"]);
+  } else if ((!detection.acpxCommand || acpxBehind) && skipGlobalInstall) {
+    console.log(
+      detection.acpxCommand
+        ? `Skipping acpx update (${detection.acpxVersion} < ${detection.npmAcpxLatest}) in immutable runtime.`
+        : "Skipping acpx install in immutable runtime.",
+    );
   }
 
   if (detection.jjCommand) {

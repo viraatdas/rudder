@@ -19,6 +19,7 @@ const workerToken = (process.env.RUDDER_WORKER_TOKEN || "").trim();
 const snapshotUrl = (process.env.RUDDER_SNAPSHOT_URL || "").trim();
 const repoName = (process.env.RUDDER_REPO_NAME || "repo").trim() || "repo";
 const task = process.env.RUDDER_TASK || "";
+const flyMachineId = (process.env.FLY_MACHINE_ID || "").trim();
 
 const isWorkspaceMode = Boolean(workspaceId);
 const sessionId = isWorkspaceMode ? workspaceId : sailId;
@@ -83,6 +84,10 @@ const childEnv = {
   TERM: "xterm-256color",
   COLORTERM: "truecolor",
   RUDDER_HEADLESS: "0",
+  RUDDER_CLOUD_WORKER: "1",
+  RUDDER_DISABLE_AUTO_UPDATE: "1",
+  RUDDER_DISABLE_UPDATE_CHECK: "1",
+  RUDDER_DISABLE_ONBOARD_INSTALL: "1",
   // Rudder's pinned Codex fork has no linux/x64 binary, so any codex-binary
   // resolution (e.g. when the snapshot carries codex auth) would otherwise crash
   // even a claude run. Point it at the stock @openai/codex installed in the image
@@ -478,7 +483,7 @@ function reportHeartbeat() {
       "content-type": "application/json",
       authorization: `Bearer ${workerToken}`,
     },
-    body: JSON.stringify({ state: lastReportedState }),
+    body: JSON.stringify({ state: lastReportedState, machineId: flyMachineId || undefined }),
   }).catch(() => undefined);
 }
 
@@ -494,7 +499,7 @@ function reportDone(state, code) {
       "content-type": "application/json",
       authorization: `Bearer ${workerToken}`,
     },
-    body: JSON.stringify({ state, exitCode: code }),
+    body: JSON.stringify({ state, exitCode: code, machineId: flyMachineId || undefined }),
   }).catch(() => undefined);
 }
 

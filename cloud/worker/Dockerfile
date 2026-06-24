@@ -8,6 +8,11 @@ RUN cargo build --release --manifest-path native/Cargo.toml \
 
 FROM node:22-slim
 
+ENV RUDDER_CLOUD_WORKER=1 \
+    RUDDER_DISABLE_AUTO_UPDATE=1 \
+    RUDDER_DISABLE_UPDATE_CHECK=1 \
+    RUDDER_DISABLE_ONBOARD_INSTALL=1
+
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
     ca-certificates curl git openssh-client tar gzip zsh \

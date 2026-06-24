@@ -268,6 +268,7 @@ const listSailsForAccount = database.prepare(
 const updateHeartbeat = database.prepare(`
   update rudder_sails
   set status = @status,
+      machine_id = coalesce(@machineId, machine_id),
       machine_state = @machineState,
       last_heartbeat_at = @lastHeartbeatAt,
       updated_at = @updatedAt
@@ -347,6 +348,7 @@ const updateWorkspaceActivity = database.prepare(`
 const updateWorkspaceHeartbeat = database.prepare(`
   update rudder_workspaces
   set status = @status,
+      machine_id = coalesce(@machineId, machine_id),
       machine_state = @machineState,
       last_heartbeat_at = @lastHeartbeatAt,
       last_activity_at = @lastActivityAt,
@@ -2003,7 +2005,7 @@ async function createFlyMachine(params: {
   const machine = await flyRequest<FlyMachine>(`/v1/apps/${encodeURIComponent(flyAppName)}/machines`, {
     method: "POST",
     body: {
-      name: `rudder-${params.sailId}`,
+      name: flyMachineName("rudder", params.sailId),
       region: flyRegion,
       config: {
         image: flyWorkerImage,
@@ -2031,10 +2033,7 @@ async function createFlyMachine(params: {
   if (!machine.id) {
     return machine;
   }
-  return await flyRequest<FlyMachine>(
-    `/v1/apps/${encodeURIComponent(flyAppName)}/machines/${encodeURIComponent(machine.id)}/start`,
-    { method: "POST", body: {} },
-  ).catch(() => machine);
+  return await startFlyMachine(machine.id, `sail ${params.sailId}`);
 }
 
 async function mutateSail(sail: Sail, accountId: string, action: string): Promise<Sail> {
@@ -2171,6 +2170,7 @@ async function handleWorkerHeartbeat(req: IncomingMessage, res: ServerResponse, 
   updateHeartbeat.run({
     id: sailId,
     status,
+    machineId: stringField(body, "machineId") ?? null,
     machineState: state || status,
     lastHeartbeatAt: now,
     updatedAt: now,
@@ -2308,12 +2308,12 @@ async function createWorkspace(
     region: regionToUse,
     volumeId,
   });
-  const status = flyStateToWorkspaceStatus(machine.state);
+  const started = workspaceStartResult(machine.state);
   updateWorkspaceMachine.run({
     id,
-    status,
+    status: started.status,
     machineId: machine.id ?? null,
-    machineState: machine.state ?? null,
+    machineState: started.machineState,
     updatedAt: new Date().toISOString(),
   });
   const workspace = (findWorkspaceById.get(id) as Record<string, unknown> | undefined);
@@ -2322,9 +2322,9 @@ async function createWorkspace(
     accountId,
     workspaceKey,
     repoName,
-    status,
+    status: started.status,
     machineId: machine.id,
-    machineState: machine.state,
+    machineState: started.machineState,
     snapshotKey: snapshot.key,
     snapshotFingerprint: snapshotFingerprint ?? undefined,
     region: region ?? undefined,
@@ -2346,6 +2346,19 @@ async function reuseOrRestartWorkspace(
       `/v1/apps/${encodeURIComponent(flyAppName)}/machines/${encodeURIComponent(workspace.machineId)}`,
       { method: "GET" },
     ).catch(() => null);
+  }
+  if (instanceHasLiveWorker("workspace", workspace.id)) {
+    const now = new Date().toISOString();
+    updateWorkspaceMachine.run({
+      id: workspace.id,
+      status: "running",
+      machineId: workspace.machineId ?? machine?.id ?? null,
+      machineState: "running",
+      updatedAt: now,
+    });
+    updateWorkspaceActivity.run({ id: workspace.id, lastActivityAt: now, updatedAt: now });
+    const next = findWorkspaceById.get(workspace.id) as Record<string, unknown> | undefined;
+    return { ...(next ? rowToWorkspace(next) : { ...workspace, status: "running" }), isNew: false } as unknown as JsonRecord;
   }
   // Path 1: machine already running -> just attach.
   if (machine && (machine.state === "started" || machine.state === "starting")) {
@@ -2383,6 +2396,7 @@ async function reuseOrRestartWorkspace(
     && (machine.state === "stopped" || machine.state === "suspended")
     && fingerprintMatches
     && workspace.snapshotKey
+    && workspace.status !== "failed"
   ) {
     const restarted = await warmRestartWorkspaceMachine({
       machineId: machine.id,
@@ -2393,11 +2407,12 @@ async function reuseOrRestartWorkspace(
     });
     if (restarted) {
       const now = new Date().toISOString();
+      const started = workspaceStartResult(restarted.state);
       updateWorkspaceMachine.run({
         id: workspace.id,
-        status: flyStateToWorkspaceStatus(restarted.state),
+        status: started.status,
         machineId: restarted.id ?? machine.id,
-        machineState: restarted.state ?? null,
+        machineState: started.machineState,
         updatedAt: now,
       });
       updateWorkspaceActivity.run({ id: workspace.id, lastActivityAt: now, updatedAt: now });
@@ -2462,11 +2477,12 @@ async function reuseOrRestartWorkspace(
     region: regionToUse,
     volumeId: newVolumeId,
   });
+  const started = workspaceStartResult(fresh.state);
   updateWorkspaceMachine.run({
     id: workspace.id,
-    status: flyStateToWorkspaceStatus(fresh.state),
+    status: started.status,
     machineId: fresh.id ?? null,
-    machineState: fresh.state ?? null,
+    machineState: started.machineState,
     updatedAt: new Date().toISOString(),
   });
   updateWorkspaceActivity.run({ id: workspace.id, lastActivityAt: now, updatedAt: now });
@@ -2499,14 +2515,51 @@ async function warmRestartWorkspaceMachine(params: {
   // means the stale env URL is no longer a problem on warm restart.
   void params.snapshotKey;
   try {
-    return await flyRequest<FlyMachine>(
-      `/v1/apps/${encodeURIComponent(flyAppName)}/machines/${encodeURIComponent(params.machineId)}/start`,
-      { method: "POST", body: {} },
-    );
+    return await startFlyMachine(params.machineId, `workspace ${params.machineId}`);
   } catch (error) {
     console.warn(`warm restart ${params.machineId}: start failed: ${error instanceof Error ? error.message : String(error)}`);
     throw error;
   }
+}
+
+async function startFlyMachine(machineId: string, label: string): Promise<FlyMachine> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= 12; attempt += 1) {
+    try {
+      return await flyRequest<FlyMachine>(
+        `/v1/apps/${encodeURIComponent(flyAppName)}/machines/${encodeURIComponent(machineId)}/start`,
+        { method: "POST", body: {} },
+      );
+    } catch (error) {
+      lastError = error;
+      const machine = await flyRequest<FlyMachine>(
+        `/v1/apps/${encodeURIComponent(flyAppName)}/machines/${encodeURIComponent(machineId)}`,
+        { method: "GET" },
+      ).catch(() => null);
+      if (machine?.state === "started" || machine?.state === "starting") {
+        return machine;
+      }
+      if (attempt < 12) {
+        await sleep(Math.min(5000, attempt * 2000));
+      }
+    }
+  }
+  const message = lastError instanceof Error ? lastError.message : String(lastError);
+  throw new Error(`Fly start failed for ${label}: ${message}`);
+}
+
+function workspaceStartResult(state: string | undefined): { status: WorkspaceStatus; machineState: string } {
+  if (state === "failed") {
+    return { status: "failed", machineState: "failed" };
+  }
+  if (state === "started" || state === "starting" || state === "running") {
+    return { status: "running", machineState: state };
+  }
+  // Fly's start endpoint can return the pre-start machine document (`created`)
+  // even though the start request was accepted and the worker connects moments
+  // later. Treat a successful start request as running/starting so a later
+  // stale Fly response never overwrites a worker heartbeat back to queued.
+  return { status: "running", machineState: "starting" };
 }
 
 async function createFlyWorkspaceMachine(params: {
@@ -2543,7 +2596,7 @@ async function createFlyWorkspaceMachine(params: {
   const machine = await flyRequest<FlyMachine>(`/v1/apps/${encodeURIComponent(flyAppName)}/machines`, {
     method: "POST",
     body: {
-      name: `rudder-ws-${params.workspaceId}`,
+      name: flyMachineName("rudder-ws", params.workspaceId),
       region: params.region || flyRegion,
       config,
     },
@@ -2551,10 +2604,7 @@ async function createFlyWorkspaceMachine(params: {
   if (!machine.id) {
     return machine;
   }
-  return await flyRequest<FlyMachine>(
-    `/v1/apps/${encodeURIComponent(flyAppName)}/machines/${encodeURIComponent(machine.id)}/start`,
-    { method: "POST", body: {} },
-  ).catch(() => machine);
+  return await startFlyMachine(machine.id, `workspace ${params.workspaceId}`);
 }
 
 type FlyVolume = {
@@ -2574,6 +2624,18 @@ function workspaceVolumeName(workspaceId: string, suffix?: string): string {
   const tail = `_${suffix}`;
   const maxBase = 30 - tail.length;
   return `${base.slice(0, maxBase)}${tail}`;
+}
+
+function flyMachineName(prefix: string, id: string): string {
+  const suffix = randomBytes(3).toString("hex");
+  const base = `${prefix}-${id}`
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .replace(/-+/g, "-");
+  const maxBaseLength = 63 - suffix.length - 1;
+  const safeBase = (base || prefix).slice(0, maxBaseLength).replace(/-+$/g, "");
+  return `${safeBase || "rudder"}-${suffix}`;
 }
 
 async function createWorkspaceVolume(workspaceId: string, region: string): Promise<FlyVolume> {
@@ -2618,22 +2680,20 @@ async function mutateWorkspace(workspace: Workspace, action: string): Promise<Wo
       { method: "POST", body: { signal: "SIGTERM", timeout: "10s" } },
     );
   } else if (action === "resume") {
-    machine = await flyRequest<FlyMachine>(
-      `/v1/apps/${encodeURIComponent(flyAppName)}/machines/${encodeURIComponent(workspace.machineId)}/start`,
-      { method: "POST", body: {} },
-    );
+    machine = await startFlyMachine(workspace.machineId, `workspace ${workspace.id}`);
   } else {
     throw badRequest(`unsupported workspace action: ${action}`);
   }
+  const started = workspaceStartResult(machine.state);
   const status = action === "stop" || action === "pause"
     ? "stopped" as WorkspaceStatus
-    : flyStateToWorkspaceStatus(machine.state);
+    : started.status;
   const now = new Date().toISOString();
   updateWorkspaceMachine.run({
     id: workspace.id,
     status,
     machineId: workspace.machineId,
-    machineState: machine.state ?? null,
+    machineState: action === "stop" || action === "pause" ? machine.state ?? null : started.machineState,
     updatedAt: now,
   });
   const next = findWorkspaceById.get(workspace.id) as Record<string, unknown> | undefined;
@@ -2654,6 +2714,7 @@ async function handleWorkspaceHeartbeat(req: IncomingMessage, res: ServerRespons
   updateWorkspaceHeartbeat.run({
     id: workspaceId,
     status,
+    machineId: stringField(body, "machineId") ?? null,
     machineState: state || status,
     lastHeartbeatAt: now,
     lastActivityAt: now,
@@ -2776,6 +2837,10 @@ async function flyRequest<T>(pathname: string, init: { method: string; body?: Js
     throw new Error(responseErrorMessage(parsed) ?? text.trim() ?? `Fly API ${response.status}`);
   }
   return parsed as T;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function githubUser(token: string): Promise<{ id: number | string; login: string; email?: string }> {
