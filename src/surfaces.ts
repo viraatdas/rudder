@@ -90,6 +90,7 @@ export const PROPAGATION_RULES: string[] = [
   "RUDDER.md carries a freshness stamp. If it is newer than when you last read it, the plan or a sibling changed state - re-read all shared context before continuing.",
   "If the plan or architecture has shifted in a way that affects your task (the user refined it, or a sibling recorded a conflicting decision), ADAPT your in-progress work to the new direction instead of continuing on the old plan, so the work does not stray; note the adjustment in DECISIONS.md.",
   "Record any cross-cutting decision other agents must honor by appending a bullet to DECISIONS.md (decision, rationale, owning node id). Put local tokens, private URLs, env vars, and credentials in RUDDER_SHARED.md instead; never put secret values in DECISIONS.md or RUDDER.md. Never edit RUDDER.md; it is orchestrator-owned.",
+  "When the user asks to improve agent behavior, project instructions, or context quality, run `rudder context audit --json` first and use its findings as evidence before proposing or making context-file changes.",
 ];
 
 function decisionsPath(repoRoot: string): string {

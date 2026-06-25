@@ -268,7 +268,7 @@ test("writeCompletionNoteFile drops machine-readable JSON the orchestrator reads
 });
 
 // ---------------------------------------------------------------------------
-// renderContract includes the three propagation rules.
+// renderContract includes the shared propagation rules.
 // ---------------------------------------------------------------------------
 
 test("renderContract injects the propagation rules incl. the adapt-on-change rule", () => {
@@ -282,7 +282,7 @@ test("renderContract injects the propagation rules incl. the adapt-on-change rul
     suggestedTests: [],
   };
   const contract = renderContract(spec);
-  assert.equal(PROPAGATION_RULES.length, 4);
+  assert.ok(PROPAGATION_RULES.length >= 4);
   for (const rule of PROPAGATION_RULES) {
     assert.ok(contract.includes(rule), `contract is missing rule: ${rule}`);
   }

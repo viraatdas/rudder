@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { authStoreExists, runDoctor, runOnboard } from "./auth.js";
 import { codexEnvVars, codexLaunchEnv } from "./codex-binary.js";
 import { runCloudCommand } from "./cloud.js";
+import { printContextAudit } from "./context-audit.js";
 import { currentBranch, findRepoRoot } from "./git.js";
 import { ensureBoardRunning } from "./daemon.js";
 import {
@@ -411,6 +412,10 @@ export async function main(): Promise<void> {
         throw new Error('Missing task. Usage: rudder fanout "implement the cache" [--n 3]');
       }
       await runFanout(task, parsed.flags.n, parsed.flags.backend);
+      return;
+    }
+    case "context": {
+      await runContextCommand(parsed);
       return;
     }
     default: {
@@ -1103,6 +1108,16 @@ async function runFanout(task: string, n: number | undefined, backend?: BackendI
   console.log("The judge launches once every variant reaches review; variants are not merged.");
 }
 
+async function runContextCommand(parsed: Parsed): Promise<void> {
+  const sub = parsed.args[0] ?? "audit";
+  const repoRoot = findRepoRoot();
+  if (sub === "audit") {
+    await printContextAudit({ json: parsed.flags.json, repoRoot });
+    return;
+  }
+  throw new Error("Usage: rudder context [audit]");
+}
+
 function printHelp(): void {
   console.log(`rudder
 
@@ -1145,6 +1160,7 @@ Run management:
 Planner:
   rudder plan "task"             Decompose a task into a DAG, scaffold empty jj changes, write graph.json
   rudder fanout "task" [--n N]   Fan out N variant agents on one task, then a judge picks/merges the best (default N=3)
+  rudder context audit           Audit agent context files for size, duplication, secrets, and injection text
 
 Memory:
   rudder remember "<insight>"    Append a durable cross-cutting decision to DECISIONS.md (shared, jj-tracked)
