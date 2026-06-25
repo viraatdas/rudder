@@ -7826,7 +7826,6 @@ impl App {
             .iter()
             .filter_map(|run| run.node_id.clone())
             .collect();
-        taken.extend(self.planned_nodes.iter().map(|node| node.id.clone()));
 
         let mut id_map: HashMap<String, String> = HashMap::new();
         for task in tasks {

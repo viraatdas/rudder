@@ -6740,11 +6740,31 @@ fn orchestrator_recaptures_dag_edits_before_launch() {
         2,
         "the added task was recaptured live"
     );
+    assert_eq!(
+        app.planned_nodes[0].id, "n0",
+        "recapture preserves the orchestrator's stable ids"
+    );
     assert!(app.planned_nodes.iter().any(|n| n.id == "n1"));
 
-    // Idempotent: re-reading the same file does not churn.
+    app.plan_review.nodes[0].title = "local draft edit".to_string();
+    app.plan_review.dirty = true;
+
+    // Idempotent: re-reading the same file does not churn or reset an in-progress
+    // inline review draft. This used to flip n0 -> n0-2 because the current preview
+    // itself was treated as an id collision.
     app.maybe_recapture_orchestrator_plan();
-    assert_eq!(app.planned_nodes.len(), 2, "no churn on an unchanged file");
+    assert_eq!(
+        app.planned_nodes
+            .iter()
+            .map(|node| node.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["n0", "n1"],
+        "no id churn on an unchanged file"
+    );
+    assert_eq!(
+        app.plan_review.nodes[0].title, "local draft edit",
+        "unchanged recapture does not reset the inline plan preview"
+    );
 
     // When the approval marker is present, recapture defers to scan (does not apply a
     // further edit in the same write) — n2 must NOT be folded in here.
