@@ -93,7 +93,7 @@ publishing; there is nothing to commit under `dist/`.
   │                     │
   │  no args + TTY      │ subcommands (run, doctor, login, cloud, ...)
   ▼                     ▼
- native dashboard   startRun / startNativeRun / startNativePlan (run-manager.ts)
+ native dashboard   native Rust app (rudder-native)
  (rudder-native)         │  creates jj workspace (jj.ts), writes run.json (state.ts)
   │  hosts PTYs          │  spawns a detached `rudder __worker --repo --run <id>`
   │  reads run.json      ▼
@@ -126,8 +126,7 @@ process spawns, not a socket.
 - `parseArgs(argv)` builds `{ command, args[], flags{} }`. Flags include
   `--version/-v`, `--help/-h`, `--json`, `--quiet/-q`, `--detach/-d`, `--watch`,
   `--follow/-f`, `--worktree`, `--queue`, `--allow-dirty`, `--force`,
-  `--non-interactive`, `--no-tmux`, `--no-native`, `--headless`, `--cwd`,
-  `--repo`, `--run`, `--backend`, `--model`, `--tmux-session`.
+  `--non-interactive`, `--cwd`, `--repo`, `--run`, `--backend`, and `--model`.
 - `main()` flow:
   - Before user-facing command dispatch, `autoUpdateAndRerunIfNeeded` checks npm
     and runs `npm install -g @viraatdas/rudder@<latest>` when this global install
@@ -149,9 +148,6 @@ Public commands (the `switch (parsed.command)`):
 | `run <task>` | Start a run (worktree-isolated by default policy) |
 | `claude` / `codex` / `acpx [args]` | Start a run pinned to a backend |
 | `dashboard` | Open the native dashboard (default when no args + TTY) |
-| `tmux` | Open the legacy tmux dashboard |
-| `tui` / `shell` / `interactive` | Ink-based interactive TUI (`src/tui.tsx`) |
-| `legacy-shell` | Older interactive shell |
 | `restart` | Reset the local Rudder session, then open the dashboard |
 | `mouse-test` | Native mouse diagnostics |
 | `onboard` / `doctor` | Setup wizard / environment check (`src/auth.ts`) |
@@ -168,8 +164,8 @@ Internal commands (prefixed `__`, spawned by Rudder itself, not for users):
 `openDashboard` resolves the native binary via
 `src/native-binary.ts::resolveNativeBinaryPath()` which checks, in order:
 `dist/native/rudder-native`, `target/release/rudder-native`,
-`native/target/release/rudder-native`. `--no-native` falls back to the tmux or
-Ink path.
+`native/target/release/rudder-native`. There is no tmux or Ink fallback; if the
+native binary is unavailable, Rudder reports that directly.
 
 ---
 
@@ -177,7 +173,7 @@ Ink path.
 
 Implemented in `src/run-manager.ts`.
 
-1. **Start** (`startRun`, `startNativeRun`, `startNativePlan`):
+1. **Start** (`startRun`):
    - Resolve repo root (`git.ts::findRepoRoot`, git `rev-parse --show-toplevel`,
      falling back to `path.resolve(cwd)`).
    - Load config, pick backend + model + effort.
@@ -403,7 +399,7 @@ overflow line, and the delete confirm names the agent.
 ### Keybindings (the input model in `handle_key`)
 Order of handling matters; the early returns gate everything else.
 - **Ctrl+C / q**: quit, guarded by `confirm_or_quit` when agents are still
-  running (first press asks; a second `q`/Ctrl+C/`y` confirms). Every pane's
+  running (first press asks; a second `q`/Ctrl+C confirms). Every pane's
   `q` routes through the same guard — `q` used to quit instantly.
 - **Ctrl+W (leader)**: arms a one-shot leader. The *next* key runs a dashboard
   command and disarms: `1/2/3` focus panes, `v` review, `m` merge, `R` review-all,
@@ -746,7 +742,7 @@ and runs them as a fleet. This section is the map of that orchestrator.
 ### 14.2 Two schedulers, one brain (deliberate; deduped)
 - **TUI brain** (`native/src/main.rs`): owns the plan in memory (`planned_nodes` +
   `agents`), spawns each worker's PTY **in-process** (that is what renders the live
-  panes), and is the **sole dispatcher** in interactive use (`run_scheduler` →
+  panes), and is the **sole worker scheduler** in interactive use (`run_scheduler` →
   `next_node_to_launch` → `start_execute_task_node`). It MIRRORS its plan into
   `graph.json` one-way via `rudder __graph-mirror` (`mirror_graph`/`build_mirror_payload`).
 - **Daemon** (`src/scheduler.ts`): dispatches **only headless** (`rudder board`/`serve`,
@@ -936,26 +932,26 @@ Signal hygiene: hook writes are ATOMIC (`printf > tmp && mv`, v2.6.x) so the pol
 never reads a torn JSON, and `cleanup_run_signals` removes a run's three signal files on
 agent delete.
 
-### 14.4c Default task input: one-off by default, `/plan` for DAGs
-Not every typed task wants the whole DAG, and automatic routing misclassified too many
-ordinary questions. A FRESH task (no active plan) now has a deterministic contract:
+### 14.4c Default task input: orchestrator by default, `/ask` for one-off
+Automatic local routing misclassified too many ordinary requests. A FRESH task
+(no active plan) now has a deterministic contract:
 
-- **Plain task input** goes straight to `start_oneoff_task`. It spawns a single
-  conversational **`AgentMode::OneOff`** agent in the MAIN checkout (`create_oneoff_agent`,
-  cwd = repo root, NO jj worktree, NO `node_id`), with `oneoff_prompt` (no `/goal`, no
-  `rudder done`, "edit directly; escalate to the planner if it's big") +
-  bypassPermissions tools. Keys forward to its PTY (converse). It is explicitly excluded
-  from selected merge / merge-all / review-all, and implicitly excluded from auto-merge /
-  graph-mirror / scheduler by `node_id`/Execute gates; `mark_run_done` just marks it Done
-  (no merge). It lives in its own **`Bucket::OneOff`** list section (`status_bucket`
+- **Plain task input** goes to `start_rudder_plan_task`. It starts the interactive
+  orchestrator planner (`AgentMode::RudderPlan`) and lets that model decide whether
+  to answer, inspect, plan, spawn workers, merge, or ask follow-up questions through
+  Rudder's normal control markers. There is no local one-off-vs-DAG router.
+- **`/plan <text>`** is an explicit alias for the same orchestrator / DAG path.
+  Use it when you want the command line to state the intent clearly.
+- **`/ask <text>`** is the explicit escape hatch for one-off work. It calls
+  `start_oneoff_task`, spawning a single conversational **`AgentMode::OneOff`**
+  agent in the MAIN checkout (`create_oneoff_agent`, cwd = repo root, NO jj
+  worktree, NO `node_id`), with `oneoff_prompt` (no `/goal`, no `rudder done`,
+  "edit directly; escalate to the planner if it's big") + bypassPermissions tools.
+  Keys forward to its PTY. It is explicitly excluded from selected merge /
+  merge-all / review-all, and implicitly excluded from auto-merge / graph-mirror /
+  scheduler by `node_id`/Execute gates; `mark_run_done` just marks it Done (no
+  merge). It lives in its own **`Bucket::OneOff`** list section (`status_bucket`
   returns `OneOff` for it; leads `Bucket::ORDER`).
-- **`/plan <text>`** is the only fresh-request path that starts the orchestrator planner
-  and DAG approval flow. Use it for multi-worker implementation work.
-- **`/ask <text>`** is kept as an explicit alias for the default one-off path.
-- The retired Haiku dispatcher (`begin_dispatch`, `spawn_dispatch_worker`,
-  `DispatchResult`) was removed from the dashboard loop so plain questions like "where is
-  the app, is it ready to use?" cannot be routed into a planner by a classifier.
-
 ### 14.5 Conductor capabilities (BUILT vs PLANNED)
 - **Auto-expand from completion** (BUILT). A finished worker reports via **`rudder
   done`**, and `maybe_ingest_worker_followups` → `ingest_worker_followups` →
@@ -1156,8 +1152,8 @@ Recorded so future contributors do not relitigate them:
   so concurrent agents never collide live; the only real cross-agent risks are a future
   merge conflict (jj records it, the AI resolver fixes it) or interface drift (the hard
   edge is the guard).
-- **TUI-primary scheduler, daemon projector.** The Rust TUI is the sole dispatcher in
-  interactive use and hosts the PTYs in-process; the daemon runs projector-only
+- **TUI-primary scheduler, daemon projector.** The Rust TUI is the sole worker scheduler
+  in interactive use and hosts the PTYs in-process; the daemon runs projector-only
   (`scheduler:false`) while the TUI is live, so there is never a double-launch. One
   one-way, coalesced `graph.json` mirror; the TUI never reads it back.
 - **Determinism by construction.** Scheduling, merge, and lifecycle are a pure state

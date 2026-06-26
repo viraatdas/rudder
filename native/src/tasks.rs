@@ -891,9 +891,9 @@ pub(crate) fn diff_plan(
             .find(|node| node.id == task.id && !matched_running.contains(&node.id))
             .or_else(|| {
                 let nt = norm_title(&task.title);
-                running
-                    .iter()
-                    .find(|node| !matched_running.contains(&node.id) && norm_title(&node.title) == nt)
+                running.iter().find(|node| {
+                    !matched_running.contains(&node.id) && norm_title(&node.title) == nt
+                })
             });
         if let Some(node) = run_match {
             matched_running.insert(node.id.clone());

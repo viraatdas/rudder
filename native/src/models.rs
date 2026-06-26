@@ -285,6 +285,16 @@ pub(crate) fn command_suggestions() -> Vec<Suggestion> {
             action: SuggestionAction::RunCommand("/fast".to_string()),
         },
         Suggestion {
+            label: "/ask <text>".to_string(),
+            detail: "one-off agent in the main checkout, no DAG".to_string(),
+            action: SuggestionAction::Insert("/ask ".to_string()),
+        },
+        Suggestion {
+            label: "/plan <text>".to_string(),
+            detail: "orchestrator planner for DAG work (same route as plain input)".to_string(),
+            action: SuggestionAction::Insert("/plan ".to_string()),
+        },
+        Suggestion {
             label: "/main".to_string(),
             detail: "spawn a main-branch agent (uses current model)".to_string(),
             action: SuggestionAction::RunCommand("/main".to_string()),

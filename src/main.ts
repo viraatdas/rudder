@@ -3,7 +3,7 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { authStoreExists, runDoctor, runOnboard } from "./auth.js";
-import { codexEnvVars, codexLaunchEnv } from "./codex-binary.js";
+import { codexLaunchEnv } from "./codex-binary.js";
 import { runCloudCommand } from "./cloud.js";
 import { printContextAudit } from "./context-audit.js";
 import { currentBranch, findRepoRoot } from "./git.js";
@@ -36,15 +36,11 @@ import {
   watchRun,
   workerRun,
 } from "./run-manager.js";
-import { runInteractiveShell } from "./repl.js";
 import { appendCompletionNote, appendDecision, appendSharedContext, parseCompletionNoteArg, RUDDER_DONE_END, RUDDER_DONE_START, SHARED_CONTEXT_FILE, syncSharedContextToWorkspaces, writeCompletionNoteFile } from "./surfaces.js";
 import type { CompletionNote } from "./surfaces.js";
-import { runTmuxAgentPane, runTmuxTaskPane, runTmuxWorkerIdle } from "./tmux-dashboard.js";
-import { runInteractiveTui } from "./tui.js";
 import type { BackendId } from "./types.js";
 import { commandExists, isTty, MissingToolError, newRunId, runCommand } from "./util.js";
 import { autoUpdateAndRerunIfNeeded, getUpdateAvailable } from "./version-check.js";
-import { attachTmuxSession, ensureTmuxDashboardSession, hasTmux, repoTmuxSessionName, shellCommand } from "./tmux.js";
 
 type Parsed = {
   command?: string;
@@ -70,10 +66,6 @@ type Parsed = {
     base?: string;
     help?: boolean;
     version?: boolean;
-    noTmux?: boolean;
-    noNative?: boolean;
-    headless?: boolean;
-    tmuxSession?: string;
     homePaths?: string[];
     sshHost?: string;
     port?: number;
@@ -127,52 +119,8 @@ export async function main(): Promise<void> {
   }
 
   switch (parsed.command) {
-    case "__agents": {
-      const repo = parsed.flags.repo;
-      const tmuxSessionName = parsed.flags.tmuxSession;
-      if (!repo || !tmuxSessionName) {
-        throw new Error("__agents requires --repo and --tmux-session");
-      }
-      process.chdir(repo);
-      await runTmuxAgentPane({
-        tmuxSessionName,
-        backend: parsed.flags.backend,
-        model: parsed.flags.model,
-      });
-      return;
-    }
-    case "__task": {
-      const repo = parsed.flags.repo;
-      const tmuxSessionName = parsed.flags.tmuxSession;
-      if (!repo || !tmuxSessionName) {
-        throw new Error("__task requires --repo and --tmux-session");
-      }
-      process.chdir(repo);
-      await runTmuxTaskPane({
-        tmuxSessionName,
-        backend: parsed.flags.backend,
-        model: parsed.flags.model,
-      });
-      return;
-    }
-    case "__worker-idle": {
-      const repo = parsed.flags.repo;
-      const tmuxSessionName = parsed.flags.tmuxSession;
-      if (!repo || !tmuxSessionName) {
-        throw new Error("__worker-idle requires --repo and --tmux-session");
-      }
-      process.chdir(repo);
-      await runTmuxWorkerIdle({
-        tmuxSessionName,
-        backend: parsed.flags.backend,
-        model: parsed.flags.model,
-      });
-      return;
-    }
     case "tmux":
-      await maybeOnboard();
-      await openTmuxDashboard(parsed);
-      return;
+      throw new Error("The tmux dashboard has been removed. Run `rudder` or `rudder dashboard` to open the native dashboard.");
     case "dashboard":
       await maybeOnboard();
       await openDashboard(parsed);
@@ -186,33 +134,10 @@ export async function main(): Promise<void> {
       await runNativeCommand(["mouse-test", ...parsed.args]);
       return;
     case "tui":
-      await maybeOnboard();
-      await runInteractiveTui({
-        backend: parsed.flags.backend,
-        model: parsed.flags.model,
-        worktree: parsed.flags.worktree,
-        detach: parsed.flags.detach,
-      });
-      return;
     case "shell":
     case "interactive":
-      await maybeOnboard();
-      await runInteractiveTui({
-        backend: parsed.flags.backend,
-        model: parsed.flags.model,
-        worktree: parsed.flags.worktree,
-        detach: parsed.flags.detach,
-      });
-      return;
     case "legacy-shell":
-      await maybeOnboard();
-      await runInteractiveShell({
-        backend: parsed.flags.backend,
-        model: parsed.flags.model,
-        worktree: parsed.flags.worktree,
-        detach: parsed.flags.detach,
-      });
-      return;
+      throw new Error("Legacy interactive shells have been removed. Run `rudder` or `rudder dashboard` to open the native dashboard.");
     case "__worker": {
       const repo = parsed.flags.repo;
       const run = parsed.flags.run;
@@ -500,17 +425,8 @@ function parseArgs(argv: string[]): Parsed {
       parsed.flags.nonInteractive = true;
       continue;
     }
-    if (arg === "--no-tmux") {
-      parsed.flags.noTmux = true;
-      continue;
-    }
-    if (arg === "--no-native") {
-      parsed.flags.noNative = true;
-      continue;
-    }
-    if (arg === "--headless") {
-      parsed.flags.headless = true;
-      continue;
+    if (arg === "--no-tmux" || arg === "--no-native" || arg === "--headless") {
+      throw new Error(`${arg} was removed with the legacy dashboards. Run \`rudder\` for the native dashboard.`);
     }
     if (arg === "--open") {
       parsed.flags.open = true;
@@ -568,10 +484,6 @@ function parseArgs(argv: string[]): Parsed {
       parsed.flags.base = readValue(argv, ++i, arg);
       continue;
     }
-    if (takesValue(arg, "--tmux-session")) {
-      parsed.flags.tmuxSession = readValue(argv, ++i, arg);
-      continue;
-    }
     if (takesValue(arg, "--home-path")) {
       parsed.flags.homePaths = [...(parsed.flags.homePaths ?? []), readValue(argv, ++i, arg)];
       continue;
@@ -610,10 +522,6 @@ function parseArgs(argv: string[]): Parsed {
     }
     if (arg.startsWith("--base=")) {
       parsed.flags.base = arg.slice("--base=".length);
-      continue;
-    }
-    if (arg.startsWith("--tmux-session=")) {
-      parsed.flags.tmuxSession = arg.slice("--tmux-session=".length);
       continue;
     }
     if (arg.startsWith("--home-path=")) {
@@ -668,29 +576,11 @@ async function maybeOnboard(): Promise<void> {
 }
 
 async function openDashboard(parsed: Parsed): Promise<void> {
-  if (parsed.flags.noTmux || parsed.flags.headless) {
-    await runInteractiveTui({
-      backend: parsed.flags.backend,
-      model: parsed.flags.model,
-      worktree: parsed.flags.worktree,
-      detach: parsed.flags.detach,
-    });
-    return;
-  }
   await refreshModelCache();
-  if (!parsed.flags.noNative && process.env.RUDDER_LEGACY_TMUX !== "1" && await runNativeDashboard()) {
+  if (await runNativeDashboard()) {
     return;
   }
-  if (hasTmux()) {
-    await openTmuxDashboard(parsed);
-    return;
-  }
-  await runInteractiveTui({
-    backend: parsed.flags.backend,
-    model: parsed.flags.model,
-    worktree: parsed.flags.worktree,
-    detach: parsed.flags.detach,
-  });
+  throw new Error("rudder-native binary is not available. Reinstall or rebuild Rudder, then run `rudder` again.");
 }
 
 async function refreshModelCache(): Promise<void> {
@@ -790,55 +680,6 @@ async function runNativeCommand(args: string[]): Promise<void> {
   process.exitCode = code ?? 1;
 }
 
-async function openTmuxDashboard(parsed: Parsed): Promise<void> {
-  if (!hasTmux()) {
-    await runInteractiveTui({
-      backend: parsed.flags.backend,
-      model: parsed.flags.model,
-      worktree: parsed.flags.worktree,
-      detach: parsed.flags.detach,
-    });
-    return;
-  }
-  const repoRoot = findRepoRoot();
-  const sessionName = parsed.flags.tmuxSession ?? repoTmuxSessionName(repoRoot);
-  const entry = process.argv[1];
-  if (!entry) {
-    throw new Error("Cannot locate Rudder entrypoint.");
-  }
-  const common = [
-    entry,
-  ];
-  const commonFlags = [
-    "--repo",
-    repoRoot,
-    "--tmux-session",
-    sessionName,
-    ...(parsed.flags.backend ? ["--backend", parsed.flags.backend] : []),
-    ...(parsed.flags.model ? ["--model", parsed.flags.model] : []),
-  ];
-  const managedCodexEnv = await codexEnvVars();
-  // Only inject codex env vars that are actually present. On platforms without a
-  // managed Codex binary codexEnvVars() returns {}, and interpolating the missing
-  // values would emit a literal `RUDDER_CODEX_BIN=undefined` that hard-fails Codex
-  // (and breaks the graceful optional-Codex behavior).
-  const codexEnvArgs = Object.entries(managedCodexEnv)
-    .filter(([, value]) => value != null && value !== "")
-    .map(([key, value]) => `${key}=${value}`);
-  const withManagedCodex = (args: string[]) => shellCommand("env", [...codexEnvArgs, ...args]);
-  await ensureTmuxDashboardSession({
-    repoRoot,
-    sessionName,
-    agentCommand: withManagedCodex([process.execPath, ...common, "__agents", ...commonFlags]),
-    workerCommand: withManagedCodex([process.execPath, ...common, "__worker-idle", ...commonFlags]),
-    taskCommand: withManagedCodex([process.execPath, ...common, "__task", ...commonFlags]),
-    backend: parsed.flags.backend === "codex" ? "codex" : "claude",
-    model: parsed.flags.model,
-  });
-  const code = await attachTmuxSession(sessionName);
-  process.exitCode = code;
-}
-
 async function resetLocalRudderSession(parsed: Parsed): Promise<void> {
   const repoRoot = findRepoRoot();
   const stateDir = projectStateDir(repoRoot);
@@ -848,11 +689,6 @@ async function resetLocalRudderSession(parsed: Parsed): Promise<void> {
     fsp.rm(path.join(stateDir, "tmux"), { recursive: true, force: true }),
   ]);
   await fsp.mkdir(runsDir(repoRoot), { recursive: true });
-
-  if (hasTmux()) {
-    const sessionName = parsed.flags.tmuxSession ?? repoTmuxSessionName(repoRoot);
-    await runCommand("tmux", ["kill-session", "-t", sessionName], { allowFailure: true });
-  }
 }
 
 async function packageVersion(): Promise<string> {
@@ -1123,9 +959,7 @@ function printHelp(): void {
 
 Usage:
   rudder                         Open native dashboard with real agent panes
-  rudder tmux                    Open tmux dashboard with native agent panes
   rudder restart                 Clear local session and open dashboard
-  rudder tui                     Open legacy full-screen stream TUI
   rudder "task"
   rudder run [options] "task"
   rudder claude [options] "task"
@@ -1201,9 +1035,6 @@ Options:
   -p, --port <port>               Board server port (default 4774)
       --n <count>                 Number of fan-out variants for rudder fanout (default 3)
       --open / --no-open          Open (or do not open) the browser for the board
-      --no-tmux                   Use the legacy TUI for bare rudder
-      --no-native                 Use the tmux dashboard instead of native
-      --headless                  Alias for --no-tmux on bare rudder
       --home-path <path>          Include extra HOME path in cloud snapshot
       --ssh <host>                BYOC SSH host from ~/.ssh/config
       --json                      Machine-readable output

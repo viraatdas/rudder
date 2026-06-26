@@ -1505,7 +1505,6 @@ fn deep_merge_json(left: &serde_json::Value, right: &serde_json::Value) -> serde
     }
 }
 
-
 pub(crate) fn diff_short_summary_at(cwd: &Path) -> Option<String> {
     let status = git_output(cwd, ["status", "--short"]).ok()?;
     if status.trim().is_empty() {

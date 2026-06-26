@@ -1,12 +1,10 @@
 import { spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import { createSpec, renderContract, verifyRun } from "./brain.js";
 import { ensureRudderCodexBinary } from "./codex-binary.js";
 import { getBackend } from "./backends.js";
 import { nativeAgentCommand } from "./native-agents.js";
-import { buildPlanPrompt, PLAN_MODE_CONTRACT } from "./plan-mode.js";
 import { mergeGeneratedRudderMd, withRudderMdLock } from "./rudder-md.js";
 import {
   createRunRecord,
@@ -58,7 +56,6 @@ import {
   shortenHome,
   textFromAssistantMessage,
 } from "./util.js";
-import { createAgentPane, killPane, normalizeTmuxDashboardLayout, paneExitStatus, respawnPane, selectPane } from "./tmux.js";
 import { taskDisplayLabel } from "./task-summary.js";
 import { captureSharedContextFromInput, redactSharedSecretValues, SHARED_CONTEXT_FILE, syncSharedContextToWorkspaces } from "./surfaces.js";
 
@@ -186,281 +183,6 @@ export async function startRun(params: {
     view: params.view,
   });
   return run;
-}
-
-export async function startNativeRun(params: {
-  task: string;
-  tmuxSessionName: string;
-  backend?: Exclude<BackendId, "acpx">;
-  model?: string;
-  effort?: EffortLevel;
-  workerPaneId?: string;
-  focus?: boolean;
-  silent?: boolean;
-}): Promise<RunRecord> {
-  const repoRoot = findRepoRoot();
-  const config = await loadConfig();
-  const backend = params.backend ?? toNativeBackend(config.lastUsedBackend ?? config.defaultBackend);
-  if (!commandExists(backend)) {
-    throw new MissingToolError(backend);
-  }
-  const model =
-    params.model ??
-    (backend === "claude"
-      ? config.backends.claude?.model
-      : config.backends.codex?.model);
-  const effort = params.effort ?? effortForBackend(backend, config);
-  ensureJj();
-  await ensureColocated(repoRoot);
-  const baseCommit = await baseRevision(repoRoot);
-  const targetBranch = await targetRevision(repoRoot);
-  const id = newRunId(params.task);
-  const worktreeInfo = await createRunWorkspace({ repoRoot, runId: id, task: params.task });
-  const run = await createRunRecord({
-    id,
-    repoRoot,
-    task: params.task,
-    backend,
-    model,
-    effort,
-    targetBranch,
-    baseCommit,
-    vcs: "jj",
-    useWorktree: true,
-    worktreeWorkspaceName: worktreeInfo.workspaceName,
-    worktreeJjChangeId: worktreeInfo.jjChangeId,
-    worktreePath: worktreeInfo.path,
-  });
-  run.session = {
-    ...(run.session ?? {}),
-    nativeSessionId: backend === "claude" ? randomUUID() : run.session?.nativeSessionId,
-    sessionName: params.tmuxSessionName,
-  };
-  run.status = "running";
-  await saveRunRecord(run);
-  await emit(run, {
-    ts: nowIso(),
-    runId: run.id,
-    type: "run.created",
-    message: `Created jj workspace ${shortenHome(worktreeInfo.path)}`,
-  });
-  await writeAgentContext(repoRoot);
-
-  await rememberBackendSelection({
-    backend,
-    model: params.model,
-    effort: params.effort,
-    updateModel: params.model !== undefined,
-    updateEffort: params.effort !== undefined,
-  });
-
-  try {
-    const backendAdapter = getBackend(backend);
-    const health = await backendAdapter.verify();
-    if (!health.ok) {
-      throw missingBackendError(backend, health.message);
-    }
-
-    const spec = await createSpec(run);
-    await emit(run, {
-      ts: nowIso(),
-      runId: run.id,
-      type: "planner.spec",
-      message: "Planner contract created",
-      data: spec as unknown as JsonValue,
-    });
-    const contract = renderContract(spec);
-    const codexCommand = backend === "codex" ? await ensureRudderCodexBinary() : undefined;
-    const command = nativeAgentCommand({
-      run,
-      prompt: params.task,
-      contract,
-      codexCommand,
-    });
-    await ensureDir(path.dirname(outputPath(repoRoot, run.id)));
-    const title = `${backend}:${shortRunTask(run)}`;
-    const paneId = params.workerPaneId;
-    if (paneId) {
-      await normalizeTmuxDashboardLayout(repoRoot, params.tmuxSessionName);
-      await respawnPane({
-        paneId,
-        cwd: worktreeInfo.path,
-        title,
-        command,
-        logPath: outputPath(repoRoot, run.id),
-      });
-    }
-    const launchedPaneId = paneId ?? await createAgentPane({
-      sessionName: params.tmuxSessionName,
-      cwd: worktreeInfo.path,
-      title,
-      command,
-      logPath: outputPath(repoRoot, run.id),
-    });
-    run.terminal = {
-      kind: "tmux",
-      sessionName: params.tmuxSessionName,
-      paneId: launchedPaneId,
-      paneTitle: title,
-      logPath: outputPath(repoRoot, run.id),
-      launchedAt: nowIso(),
-    };
-    await saveRunRecord(run);
-    await emit(run, {
-      ts: nowIso(),
-      runId: run.id,
-      type: "run.started",
-      message: `${backend} pane started`,
-      data: { paneId: launchedPaneId, worktree: worktreeInfo.path },
-    });
-    await writeAgentContext(repoRoot);
-    await normalizeTmuxDashboardLayout(repoRoot, params.tmuxSessionName);
-    if (params.focus !== false && launchedPaneId) {
-      await selectPane(launchedPaneId);
-    }
-    if (!params.silent) {
-      console.log(`Started ${run.id}`);
-    }
-    return run;
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    run.status = "failed";
-    await saveRunRecord(run);
-    await emit(run, { ts: nowIso(), runId: run.id, type: "run.failed", message });
-    await writeAgentContext(repoRoot);
-    throw error;
-  }
-}
-
-export async function startNativePlan(params: {
-  task: string;
-  tmuxSessionName: string;
-  backend?: Exclude<BackendId, "acpx">;
-  model?: string;
-  effort?: EffortLevel;
-  workerPaneId?: string;
-  focus?: boolean;
-  silent?: boolean;
-}): Promise<RunRecord> {
-  const repoRoot = findRepoRoot();
-  const config = await loadConfig();
-  const backend = params.backend ?? toNativeBackend(config.lastUsedBackend ?? config.defaultBackend);
-  if (!commandExists(backend)) {
-    throw new MissingToolError(backend);
-  }
-  const model =
-    params.model ??
-    (backend === "claude"
-      ? config.backends.claude?.model
-      : config.backends.codex?.model);
-  const effort = params.effort ?? effortForBackend(backend, config);
-  ensureJj();
-  await ensureColocated(repoRoot);
-  const baseCommit = await baseRevision(repoRoot);
-  const targetBranch = await targetRevision(repoRoot);
-  const id = newRunId(params.task);
-  const run = await createRunRecord({
-    id,
-    repoRoot,
-    task: params.task,
-    backend,
-    model,
-    effort,
-    mode: "plan",
-    targetBranch,
-    baseCommit,
-    vcs: "jj",
-    useWorktree: false,
-    worktreePath: repoRoot,
-  });
-  run.session = {
-    ...(run.session ?? {}),
-    nativeSessionId: backend === "claude" ? randomUUID() : run.session?.nativeSessionId,
-    sessionName: params.tmuxSessionName,
-  };
-  run.status = "running";
-  await saveRunRecord(run);
-  await emit(run, {
-    ts: nowIso(),
-    runId: run.id,
-    type: "run.created",
-    message: "Started read-only plan in current checkout",
-  });
-
-  await rememberBackendSelection({
-    backend,
-    model: params.model,
-    effort: params.effort,
-    updateModel: params.model !== undefined,
-    updateEffort: params.effort !== undefined,
-  });
-
-  try {
-    const backendAdapter = getBackend(backend);
-    const health = await backendAdapter.verify();
-    if (!health.ok) {
-      throw missingBackendError(backend, health.message);
-    }
-
-    const codexCommand = backend === "codex" ? await ensureRudderCodexBinary() : undefined;
-    const command = nativeAgentCommand({
-      run,
-      prompt: buildPlanPrompt(params.task),
-      contract: PLAN_MODE_CONTRACT,
-      mode: "plan",
-      codexCommand,
-    });
-    await ensureDir(path.dirname(outputPath(repoRoot, run.id)));
-    const title = `${backend}:plan:${shortRunTask(run)}`;
-    const paneId = params.workerPaneId;
-    if (paneId) {
-      await normalizeTmuxDashboardLayout(repoRoot, params.tmuxSessionName);
-      await respawnPane({
-        paneId,
-        cwd: repoRoot,
-        title,
-        command,
-        logPath: outputPath(repoRoot, run.id),
-      });
-    }
-    const launchedPaneId = paneId ?? await createAgentPane({
-      sessionName: params.tmuxSessionName,
-      cwd: repoRoot,
-      title,
-      command,
-      logPath: outputPath(repoRoot, run.id),
-    });
-    run.terminal = {
-      kind: "tmux",
-      sessionName: params.tmuxSessionName,
-      paneId: launchedPaneId,
-      paneTitle: title,
-      logPath: outputPath(repoRoot, run.id),
-      launchedAt: nowIso(),
-    };
-    await saveRunRecord(run);
-    await emit(run, {
-      ts: nowIso(),
-      runId: run.id,
-      type: "run.started",
-      message: `${backend} read-only planner pane started`,
-      data: { paneId: launchedPaneId, worktree: repoRoot },
-    });
-    await normalizeTmuxDashboardLayout(repoRoot, params.tmuxSessionName);
-    if (params.focus !== false && launchedPaneId) {
-      await selectPane(launchedPaneId);
-    }
-    if (!params.silent) {
-      console.log(`Started plan ${run.id}`);
-    }
-    return run;
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    run.status = "failed";
-    await saveRunRecord(run);
-    await emit(run, { ts: nowIso(), runId: run.id, type: "run.failed", message });
-    throw error;
-  }
 }
 
 export async function continueRun(params: {
@@ -837,10 +559,6 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function toNativeBackend(backend: BackendId): Exclude<BackendId, "acpx"> {
-  return backend === "codex" ? "codex" : "claude";
-}
-
 async function createRunWorkspace(params: {
   repoRoot: string;
   runId: string;
@@ -1022,9 +740,6 @@ export async function stopRun(runId: string, options?: { silent?: boolean }): Pr
   if (run.process?.pid && processAlive(run.process.pid)) {
     process.kill(run.process.pid, "SIGTERM");
   }
-  if (run.terminal?.kind === "tmux") {
-    await killPane(run.terminal.paneId).catch(() => undefined);
-  }
   run.status = "cancelled";
   run.process = {
     ...(run.process ?? {}),
@@ -1150,9 +865,6 @@ export async function deleteRun(runId: string, options?: { mergeFirst?: boolean;
   if (latest.process?.pid && processAlive(latest.process.pid)) {
     process.kill(latest.process.pid, "SIGTERM");
   }
-  if (latest.terminal?.kind === "tmux") {
-    await killPane(latest.terminal.paneId).catch(() => undefined);
-  }
   if (latest.worktree.enabled) {
     await removeRunWorkspace(latest, options?.force ?? true).catch(() => undefined);
   }
@@ -1224,116 +936,6 @@ function canCleanupRun(run: RunRecord, force: boolean): boolean {
     return run.status === "merged" || run.status === "completed";
   }
   return run.status === "merged";
-}
-
-export async function reconcileNativeTerminals(repoRoot: string): Promise<void> {
-  const runs = await listRuns(repoRoot);
-  let touched = false;
-  let contextTouched = false;
-  for (const run of runs) {
-    if (run.terminal?.kind !== "tmux") {
-      continue;
-    }
-    if (run.status === "running") {
-      const exitCode = await paneExitStatus(run.terminal.paneId).catch(() => null);
-      if (exitCode === null) {
-        continue;
-      }
-      run.process = {
-        ...(run.process ?? {}),
-        endedAt: nowIso(),
-        exitCode,
-        signal: null,
-      };
-      if (exitCode !== 0) {
-        run.status = "failed";
-        await saveRunRecord(run);
-        await emit(run, { ts: nowIso(), runId: run.id, type: "run.failed", message: `Backend exited with ${exitCode}` });
-        touched = true;
-        contextTouched = contextTouched || run.mode !== "plan";
-        continue;
-      }
-
-      if (run.mode === "plan") {
-        run.status = "completed";
-        await saveRunRecord(run);
-        await emit(run, {
-          ts: nowIso(),
-          runId: run.id,
-          type: "run.completed",
-          message: "Plan completed",
-        });
-        touched = true;
-        continue;
-      }
-
-      run.status = "verifying";
-      await saveRunRecord(run);
-      const verification = await verifyRun(run);
-      run.verification = verification;
-      await saveRunRecord(run);
-      await emit(run, {
-        ts: nowIso(),
-        runId: run.id,
-        type: "verifier.result",
-        message: verification.notes,
-        data: verification as unknown as JsonValue,
-      });
-
-      if (shouldAutoSteer(run, verification)) {
-        const waitingSince = nowIso();
-        run.status = "steering";
-        run.autoSteer = {
-          count: run.autoSteer?.count ?? 0,
-          max: run.autoSteer?.max ?? 2,
-          waitingSince,
-        };
-        await saveRunRecord(run);
-        await emit(run, { ts: waitingSince, runId: run.id, type: "steerer.waiting", message: "Waiting 10 seconds before automatic steering" });
-      } else {
-        run.status = verification.shouldContinue ? "failed" : "completed";
-        await saveRunRecord(run);
-        await emit(run, {
-          ts: nowIso(),
-          runId: run.id,
-          type: run.status === "completed" ? "run.completed" : "run.failed",
-          message: run.status === "completed" ? "Run completed" : `Run failed verification: ${verification.missing.join("; ")}`,
-        });
-      }
-      touched = true;
-      contextTouched = true;
-      continue;
-    }
-
-    if (run.mode !== "plan" && run.status === "steering" && run.autoSteer?.waitingSince && Date.now() - Date.parse(run.autoSteer.waitingSince) >= AUTO_STEER_DELAY_MS) {
-      const steeringPrompt = buildSteeringPrompt(run.verification ?? { satisfied: [], missing: [], notes: "", shouldContinue: false });
-      run.currentPrompt = steeringPrompt;
-      run.turns = [...(run.turns ?? []), { ts: nowIso(), prompt: steeringPrompt, source: "steerer" }];
-      run.autoSteer = {
-        count: (run.autoSteer?.count ?? 0) + 1,
-        max: run.autoSteer?.max ?? 2,
-      };
-      run.status = "running";
-      await saveRunRecord(run);
-      await emit(run, { ts: nowIso(), runId: run.id, type: "steerer.prompt", message: "Automatic steering prompt sent", data: { prompt: steeringPrompt } });
-      const spec = await createSpec(run);
-      const codexCommand = run.backend === "codex" ? await ensureRudderCodexBinary() : undefined;
-      const command = nativeAgentCommand({ run, prompt: steeringPrompt, contract: renderContract(spec), codexCommand });
-      await respawnPane({
-        paneId: run.terminal.paneId,
-        cwd: run.worktree.path,
-        title: `${run.backend}:${shortRunTask(run)}`,
-        command,
-        logPath: outputPath(repoRoot, run.id),
-      });
-      await emit(run, { ts: nowIso(), runId: run.id, type: "run.started", message: `${run.backend} pane restarted`, data: { paneId: run.terminal.paneId } });
-      touched = true;
-      contextTouched = true;
-    }
-  }
-  if (touched && contextTouched) {
-    await writeAgentContext(repoRoot);
-  }
 }
 
 async function emit(run: RunRecord, event: RudderEvent): Promise<void> {

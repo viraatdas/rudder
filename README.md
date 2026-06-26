@@ -48,10 +48,9 @@ rudder
 ```
 
 With no arguments, `rudder` opens the dashboard. Type in the bottom input and
-press `Enter` to start a one-off agent in your main checkout. This is the default
-for questions, repo inspection, docs/API research, and small direct changes. Use
-`/plan <text>` when you want the orchestrator to plan a DAG and run isolated
-workers.
+press `Enter` to hand the request to the orchestrator. It can answer, inspect the
+repo, or plan a DAG and run isolated workers. Use `/ask <text>` when you want a
+one-off agent in the main checkout with no DAG.
 
 If a task needs shared local context like API tokens, private URLs, account ids,
 or environment values, save it with `/share <text>` in the task input. Rudder
@@ -91,7 +90,7 @@ to `~/.rudder/config.json`.
 │ task list     │ live Claude Code or Codex terminal           │
 │ status/model  │ DAG-over-orchestrator, scrollback, review    │
 ├───────────────┴────────────────────────────────────────────┤
-│ task input: one-off agent by default, /plan for DAGs         │
+│ task input: orchestrator by default, /ask for one-off        │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -191,13 +190,12 @@ reused next time. Rudder refreshes model metadata from
 ## One-Off and Planning
 
 Type a fresh request in the bottom task input. When no plan is active, Rudder
-starts one conversational agent in the main checkout and shows it in the
-`one-off` section. This keeps ordinary questions like "where is the app?" or "is
-it ready to use?" out of the DAG planner.
+starts the orchestrator, which can inspect the repo, plan the work, and spawn
+isolated workers when needed.
 
-Use `/plan <text>` for planned implementation work. This starts the orchestrator,
-which decomposes the work into isolated workers. `/ask <text>` is kept as an
-explicit alias for the default one-off path.
+Use `/ask <text>` for a one-off conversational agent in the main checkout, with
+no DAG. Use `/plan <text>` when you want to be explicit about the orchestrator /
+DAG path; it is the same route as plain input.
 
 For planned work, Rudder runs a dedicated Claude Code orchestrator PTY with a DAG
 pane above it. The flow stays inside Rudder: the orchestrator researches
@@ -323,16 +321,6 @@ rudder delete <runId>
 rudder merge <runId>
 rudder sync <runId>
 rudder cleanup
-```
-
-## Other interfaces
-
-The native dashboard is the default. Older interfaces remain available:
-
-```bash
-rudder tmux          # legacy tmux dashboard
-rudder tui           # Ink-based interactive TUI
-rudder --no-native   # skip the native binary
 ```
 
 ## Troubleshooting

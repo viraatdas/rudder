@@ -147,7 +147,10 @@ fn write_config_atomically(path: &Path, config: &serde_json::Value) -> Result<()
             .unwrap_or_default()
             .as_millis()
     ));
-    fs::write(&temp, format!("{}\n", serde_json::to_string_pretty(config)?))?;
+    fs::write(
+        &temp,
+        format!("{}\n", serde_json::to_string_pretty(config)?),
+    )?;
     fs::rename(&temp, path)?;
     set_private_file_mode(path);
     Ok(())

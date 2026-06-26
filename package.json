@@ -1,6 +1,6 @@
 {
   "name": "@viraatdas/rudder",
-  "version": "2.10.7",
+  "version": "2.10.8",
   "description": "A Claude Code-style terminal app for running coding agents with worktree-isolated runs.",
   "license": "MIT",
   "homepage": "https://rudder.viraat.dev",
@@ -39,15 +39,12 @@
   },
   "devDependencies": {
     "@types/node": "^22.15.3",
-    "@types/react": "^19.2.14",
     "@types/ws": "^8.5.13",
     "esbuild": "^0.24.0",
     "preact": "^10.25.0",
     "typescript": "^5.8.3"
   },
   "dependencies": {
-    "ink": "^7.0.3",
-    "react": "^19.2.6",
     "ws": "^8.18.0"
   }
 }

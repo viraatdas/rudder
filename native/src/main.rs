@@ -417,7 +417,7 @@ enum AgentMode {
     Main,
     /// A single conversational agent the user talks to in the MAIN checkout for a
     /// question or a small self-contained change — NOT a DAG node. Spawned by
-    /// default task input (or /ask). Structurally like Main (main checkout, no jj
+    /// `/ask`. Structurally like Main (main checkout, no jj
     /// worktree, bypass-permissions tools), distinct in intent + its own list section.
     OneOff,
 }
@@ -469,7 +469,6 @@ struct App {
     task_history: Vec<String>,
     task_history_index: Option<usize>,
     task_history_draft: String,
-    plan_mode: bool,
     agents: Vec<AgentRun>,
     /// Queue of planned (not-yet-launched) DAG nodes. The scheduler drains these
     /// into live agents as their hard deps merge and parallelism slots free.
@@ -897,6 +896,41 @@ impl AgentRun {
     }
 }
 
+fn merge_label_for_run(run: &AgentRun) -> String {
+    if let Some(node_id) = run.node_id.as_ref().filter(|id| !id.trim().is_empty()) {
+        return node_id.clone();
+    }
+    if !run.task_summary.trim().is_empty() {
+        return truncate_chars(run.task_summary.trim(), 24);
+    }
+    let task = short_task(&run.task);
+    if !task.trim().is_empty() {
+        return truncate_chars(&task, 24);
+    }
+    truncate_chars(&run.id, 18)
+}
+
+fn merge_all_labels(runs: &[&AgentRun]) -> Vec<String> {
+    runs.iter().map(|run| merge_label_for_run(run)).collect()
+}
+
+fn summarize_labels(labels: &[String], limit: usize) -> String {
+    let shown = labels
+        .iter()
+        .take(limit)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let remaining = labels.len().saturating_sub(limit);
+    if remaining == 0 {
+        shown
+    } else if shown.is_empty() {
+        format!("+{remaining} more")
+    } else {
+        format!("{shown}, +{remaining} more")
+    }
+}
+
 #[derive(Clone, Debug)]
 struct AgentTurn {
     ts: String,
@@ -1031,7 +1065,6 @@ impl App {
             task_history: Vec::new(),
             task_history_index: None,
             task_history_draft: String::new(),
-            plan_mode: false,
             agents,
             planned_nodes: restored_queue.planned_nodes,
             plan_review: restored_plan_review,
@@ -1336,8 +1369,8 @@ impl App {
     }
 
     /// The single quit gate: quitting with agents still running needs a second
-    /// press (Ctrl+C, q, or y) to confirm. Every quit key — Ctrl+C and the
-    /// pane-local `q`s — routes through here so none can skip the guard.
+    /// press of the same quit intent (Ctrl+C or q). Every quit key — Ctrl+C and
+    /// the pane-local `q`s — routes through here so none can skip the guard.
     fn confirm_or_quit(&mut self) -> bool {
         let running = self
             .agents
@@ -1349,7 +1382,7 @@ impl App {
         }
         self.quit_confirm_pending = true;
         self.notice = Some(format!(
-            "{running} agent{} still running. press q / Ctrl+C again (or y) to quit; any other key cancels. Claude agents auto-resume on next rudder.",
+            "{running} agent{} still running. press q / Ctrl+C again to quit; any other key cancels. Claude agents auto-resume on next rudder.",
             if running == 1 { "" } else { "s" }
         ));
         false
@@ -1364,14 +1397,10 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return self.confirm_or_quit();
         }
-        // Any other key dismisses the pending quit confirmation. A repeated quit
-        // key (q, like the y the notice offers) confirms; Ctrl+C re-enters
-        // confirm_or_quit above and confirms there.
+        // Any other key dismisses the pending quit confirmation. A repeated q
+        // confirms; Ctrl+C re-enters confirm_or_quit above and confirms there.
         if self.quit_confirm_pending {
-            if matches!(
-                key.code,
-                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Char('q')
-            ) {
+            if matches!(key.code, KeyCode::Char('q')) {
                 return true;
             }
             self.quit_confirm_pending = false;
@@ -2400,7 +2429,10 @@ impl App {
                 self.task_input.push('/');
                 self.task_cursor = 1;
                 self.picker_index = 0;
-                self.notice = Some("type /model, /main|/m, /goal, /usage, or /cloud".to_string());
+                self.notice = Some(
+                    "type /ask for a one-off, /plan for DAG work, /model, /main|/m, /usage, or /cloud"
+                        .to_string(),
+                );
             }
             KeyCode::Char(ch) => {
                 self.reset_task_history_navigation();
@@ -3385,14 +3417,6 @@ impl App {
             return;
         }
 
-        if self.plan_mode {
-            // Explicit /plan mode: a read-only planner that never spawns workers.
-            // The /plan toggle is unchanged by reconcile: it always runs a fresh
-            // read-only planner regardless of any active plan.
-            self.start_plan_task(&input);
-            return;
-        }
-
         // Once a DAG has launched, keep using the live orchestrator as the
         // high-level conversation surface even after every worker has merged. That
         // lets the user ask for a retro, status, or a follow-up without losing the
@@ -3919,103 +3943,6 @@ impl App {
             spawn_task_summary_worker(self.task_summary_tx.clone(), run_id, input.to_string());
         }
         let _ = write_rudder_context(&self.cwd, &self.agents, None);
-    }
-
-    fn start_plan_task(&mut self, input: &str) {
-        let model = self.model.clone();
-        let backend = self.backend;
-        let effort = self.effort;
-        let session_id = mint_session_id_for(backend);
-        let command = agent_command(
-            backend,
-            &model,
-            effort,
-            input,
-            AgentMode::Plan,
-            session_id.as_deref(),
-        );
-        let options = TerminalPaneOptions {
-            size: TerminalSize::default(),
-            cwd: Some(self.cwd.clone()),
-            ..TerminalPaneOptions::default()
-        };
-
-        let created_at = now_stamp();
-        let mut run = AgentRun {
-            id: new_run_id(input),
-            created_at: created_at.clone(),
-            mode: AgentMode::Plan,
-            task: input.to_string(),
-            task_summary: summarize_task(input),
-            current_prompt: input.to_string(),
-            turns: vec![AgentTurn {
-                ts: created_at.clone(),
-                prompt: input.to_string(),
-                source: "user".to_string(),
-            }],
-            last_user_input_at: created_at,
-            backend,
-            model,
-            effort,
-            status: AgentStatus::Running,
-            cwd: self.cwd.clone(),
-            worktree_branch: None,
-            worktree_path: None,
-            workspace_name: None,
-            jj_change_id: None,
-            session_id,
-            terminal: None,
-            terminal_size: None,
-            review_terminal: None,
-            review_size: None,
-            review_error: None,
-            last_output_at: Instant::now(),
-            completed_at: None,
-            autosteered: true,
-            interactive_orchestrator: false,
-            needs_permission: false,
-            permission_notified: false,
-            needs_user_input: false,
-            user_input_notified: false,
-            last_error: None,
-            worker_input_draft: String::new(),
-            worker_input_cursor: 0,
-            worker_input_is_prompt: false,
-            last_drain_at: None,
-            review_source_ids: Vec::new(),
-            deps: Vec::new(),
-            soft_deps: Vec::new(),
-            node_id: None,
-            reconcile_planner: false,
-            plan_stream: None,
-            last_worker_input_at: None,
-            ready_since: None,
-            merge_resolver: false,
-        };
-
-        match TerminalPane::spawn_shell_or_command(Some(command), options) {
-            Ok(mut terminal) => {
-                let _ = terminal.drain_output();
-                run.terminal = Some(terminal);
-                self.notice = Some("read-only planner started".to_string());
-            }
-            Err(error) => {
-                run.status = AgentStatus::Failed;
-                run.last_error = Some(error.to_string());
-                self.notice = Some(format!(
-                    "failed to start {} planner: {error}",
-                    backend.as_str()
-                ));
-            }
-        }
-
-        self.agents.push(run);
-        self.selected_agent = self.agents.len().saturating_sub(1);
-        self.delete_pending = None;
-        self.focus = FocusPane::Worker;
-        if let Some(run) = self.agents.get(self.selected_agent) {
-            let _ = save_native_run_record(&self.cwd, run);
-        }
     }
 
     fn start_rudder_plan_task(&mut self, input: &str) {
@@ -5157,7 +5084,7 @@ impl App {
             }
             Some("/help") => {
                 self.notice = Some(
-                    "panes: Option-1/2/3 or ^W · keys: j/k select · Enter focus · v diff · m merge · M merge all · R review all · g nest · o web ui · x stop · dd delete · P model — commands: /model /fast /automerge /merge-all /review-all /main /ask /plan /share /usage /goal /cloud /web — DAG node ids (n0, n1…) match the agent rows and the worker pane title"
+                    "plain input -> orchestrator/DAG · /ask <text> -> one-off main-checkout agent · /plan <text> -> force orchestrator/DAG · panes: Option-1/2/3 or ^W · keys: j/k select · Enter focus · v diff · m merge · M merge all · R review all · g nest · o web ui · x stop · dd delete · P model — commands: /model /fast /main /ask /plan /share /usage /goal /cloud /web"
                         .to_string(),
                 );
                 true
@@ -6768,6 +6695,13 @@ impl App {
     fn push_activity(&mut self, msg: impl Into<String>) {
         let msg = msg.into();
         self.notice = Some(msg.clone());
+        self.record_activity(msg);
+    }
+
+    /// Append a one-line entry to the conductor activity log without taking over
+    /// the task-pane notice. Used when a modal is already carrying the active prompt.
+    fn record_activity(&mut self, msg: impl Into<String>) {
+        let msg = msg.into();
         // Mirror every conductor/steer line into the append-only narration stream the
         // web board tails, so "what's happening" shows up live in the browser too.
         self.append_activity_jsonl(&msg, "action");
@@ -8843,20 +8777,39 @@ impl App {
         }
         let ids: Vec<String> = ready_runs.iter().map(|r| r.id.clone()).collect();
         let count = ids.len();
+        let labels = merge_all_labels(&ready_runs);
+        let skipped_count = ready_runs
+            .iter()
+            .filter(|run| self.auto_merge_skip.contains(&run.id))
+            .count();
+
+        let mut detail_parts = vec![format!("Ready: {}", summarize_labels(&labels, 6))];
+        if skipped_count > 0 {
+            detail_parts.push(format!(
+                "{skipped_count} parked by auto-merge after conflict; merge-all will retry and pause on any conflict"
+            ));
+        }
+        if pending_total > 0 {
+            detail_parts.push(format!(
+                "{pending_total} uncommitted file{p1} across {pending_runs} worktree{p2} will be auto-committed",
+                p1 = if pending_total == 1 { "" } else { "s" },
+                p2 = if pending_runs == 1 { "" } else { "s" },
+            ));
+        }
+        let detail = detail_parts.join(" · ");
 
         let _ = count;
         self.delete_pending = None;
         self.merge_confirm = Some(MergeConfirmation {
             intent: MergeIntent::All { ids },
-            detail: (pending_total > 0).then(|| {
-                format!(
-                    "{pending_total} uncommitted file{p1} across {pending_runs} worktree{p2} will be auto-committed.",
-                    p1 = if pending_total == 1 { "" } else { "s" },
-                    p2 = if pending_runs == 1 { "" } else { "s" },
-                )
-            }),
+            detail: Some(detail),
         });
         self.conflict_prompt = None;
+        self.record_activity(format!(
+            "merge-all ready: {count} worktree{} ({})",
+            if count == 1 { "" } else { "s" },
+            summarize_labels(&labels, 8)
+        ));
         // The modal carries the question and the keys; a parallel notice would
         // just duplicate (and outlive) it.
         self.notice = None;
@@ -8933,6 +8886,20 @@ impl App {
             MergeIntent::All { ids } => {
                 let total = ids.len();
                 let mut merged = 0;
+                let labels = ids
+                    .iter()
+                    .filter_map(|id| {
+                        self.agents
+                            .iter()
+                            .find(|run| run.id == *id)
+                            .map(merge_label_for_run)
+                    })
+                    .collect::<Vec<_>>();
+                self.push_activity(format!(
+                    "merge-all started: {total} worktree{} ({})",
+                    if total == 1 { "" } else { "s" },
+                    summarize_labels(&labels, 8)
+                ));
                 for (position, id) in ids.iter().enumerate() {
                     let Some(index) = self.agents.iter().position(|run| run.id == *id) else {
                         continue;
@@ -8956,21 +8923,23 @@ impl App {
                             agent_id,
                         );
                         if let Some(notice) = self.notice.take() {
-                            self.notice = Some(format!(
+                            let message = format!(
                                 "merged {merged}/{total} · {notice}{}",
                                 if remaining > 0 {
                                     format!(" · {remaining} more wait in review")
                                 } else {
                                     String::new()
                                 }
-                            ));
+                            );
+                            self.push_activity(format!("merge-all stopped: {message}"));
+                            self.notice = Some(message);
                         }
                         return;
                     }
                     merged += 1;
                 }
                 self.delete_pending = None;
-                self.notice = Some(format!(
+                self.push_activity(format!(
                     "merged {merged} worktree{}",
                     if merged == 1 { "" } else { "s" }
                 ));
@@ -9063,11 +9032,13 @@ impl App {
         } else {
             "merge"
         };
-        self.notice = Some(format!(
+        let message = format!(
             "{operation_label} conflict in {} ({count} file{}): press y to let AI resolve & complete the merge, or n to do it manually",
             short_task(&self.conflict_prompt.as_ref().map(|p| p.task.clone()).unwrap_or_default()),
             if count == 1 { "" } else { "s" }
-        ));
+        );
+        self.notice = Some(message.clone());
+        self.record_activity(message);
     }
 
     /// STEERING: re-goal a running/finished worker by RESUMING its session (so it

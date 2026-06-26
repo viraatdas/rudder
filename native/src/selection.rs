@@ -259,7 +259,8 @@ pub(crate) fn emit_osc52_clipboard(text: &str) -> Result<()> {
     let mut out = std::io::stdout().lock();
     out.write_all(seq.as_bytes())
         .context("failed to write OSC 52 clipboard sequence")?;
-    out.flush().context("failed to flush OSC 52 clipboard sequence")?;
+    out.flush()
+        .context("failed to flush OSC 52 clipboard sequence")?;
     Ok(())
 }
 

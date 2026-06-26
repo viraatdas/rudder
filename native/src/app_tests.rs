@@ -1910,11 +1910,23 @@ fn task_cursor_from_selection_point_accounts_for_newlines() {
     // 'c'), not 3 — the '\n' is a real source char the old wrap-based mapping dropped,
     // which shifted the cursor and corrupted later edits on multi-line task input.
     let v = "ab\ncd";
-    assert_eq!(task_cursor_from_selection_point(v, SelectionPoint { row: 0, col: 0 }, 80), 0);
-    assert_eq!(task_cursor_from_selection_point(v, SelectionPoint { row: 1, col: 0 }, 80), 3);
-    assert_eq!(task_cursor_from_selection_point(v, SelectionPoint { row: 1, col: 1 }, 80), 4);
+    assert_eq!(
+        task_cursor_from_selection_point(v, SelectionPoint { row: 0, col: 0 }, 80),
+        0
+    );
+    assert_eq!(
+        task_cursor_from_selection_point(v, SelectionPoint { row: 1, col: 0 }, 80),
+        3
+    );
+    assert_eq!(
+        task_cursor_from_selection_point(v, SelectionPoint { row: 1, col: 1 }, 80),
+        4
+    );
     // Clicking past the end of row 0 clamps before the newline (end of "ab" = idx 2).
-    assert_eq!(task_cursor_from_selection_point(v, SelectionPoint { row: 0, col: 9 }, 80), 2);
+    assert_eq!(
+        task_cursor_from_selection_point(v, SelectionPoint { row: 0, col: 9 }, 80),
+        2
+    );
 }
 
 #[test]
@@ -1926,7 +1938,11 @@ fn assert_no_hard_cycle_allows_hard_dep_on_out_of_block_parent() {
         prompt: "do".to_string(),
         goal: None,
         success: None,
-        deps: vec![PlanEdge { on: dep.to_string(), edge: EdgeType::Hard, why: Some("x".into()) }],
+        deps: vec![PlanEdge {
+            on: dep.to_string(),
+            edge: EdgeType::Hard,
+            why: Some("x".into()),
+        }],
         backend: None,
         model: None,
         effort: None,
@@ -2969,6 +2985,28 @@ fn cloud_prompt_upload_without_selected_run_is_not_scratch() {
 #[test]
 fn slash_commands_rank_closest_matches() {
     let mut app = App::new();
+
+    app.task_input = "/as".to_string();
+    let ask_suggestions = suggestions_for(&app);
+    let ask = ask_suggestions
+        .first()
+        .expect("/ask suggestion should be present");
+    assert_eq!(ask.label.as_str(), "/ask <text>");
+    assert!(
+        ask.detail.contains("one-off"),
+        "/ask suggestion should explain one-off behavior"
+    );
+
+    app.task_input = "/pl".to_string();
+    let plan_suggestions = suggestions_for(&app);
+    let plan = plan_suggestions
+        .first()
+        .expect("/plan suggestion should be present");
+    assert_eq!(plan.label.as_str(), "/plan <text>");
+    assert!(
+        plan.detail.contains("DAG"),
+        "/plan suggestion should explain DAG behavior"
+    );
 
     app.task_input = "/cl".to_string();
     assert_eq!(
@@ -4192,6 +4230,36 @@ fn q_confirms_before_quitting_with_running_agents() {
 }
 
 #[test]
+fn ctrl_c_confirms_before_quitting_and_y_does_not_confirm() {
+    let mut app = App::new();
+    app.focus = FocusPane::Agents;
+
+    let command = TerminalCommand::with_args("sh", ["-c", "sleep 2"]);
+    let pane = TerminalPane::spawn_shell_or_command(
+        Some(command),
+        TerminalPaneOptions {
+            size: TerminalSize { rows: 5, cols: 20 },
+            ..Default::default()
+        },
+    )
+    .expect("spawn test pty");
+    let mut run = test_agent_run_with_terminal(&app, pane);
+    run.status = AgentStatus::Running;
+    app.agents.push(run);
+
+    assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+    assert!(app.quit_confirm_pending);
+    assert!(!app.notice.as_deref().unwrap_or_default().contains("(or y)"));
+
+    assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::empty())));
+    assert!(!app.quit_confirm_pending);
+    assert_eq!(app.notice.as_deref(), Some("quit cancelled"));
+
+    assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+    assert!(app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+}
+
+#[test]
 fn esc_dismisses_the_notice_without_being_consumed() {
     let mut app = App::new();
     app.focus = FocusPane::Agents;
@@ -4490,6 +4558,37 @@ fn merge_all_command_opens_confirmation() {
         app.merge_confirm.as_ref().map(|confirm| &confirm.intent),
         Some(MergeIntent::All { ids }) if ids == &vec!["run-1".to_string()]
     ));
+}
+
+#[test]
+fn merge_all_confirmation_names_ready_nodes_and_logs_action() {
+    let mut app = App::new();
+    let mut first = test_agent_run("run-1", "first task");
+    first.status = AgentStatus::Done;
+    first.node_id = Some("n1".to_string());
+    first.worktree_path = Some(app.cwd.join("worktree-1"));
+    let mut second = test_agent_run("run-2", "second task");
+    second.status = AgentStatus::Done;
+    second.node_id = Some("n2".to_string());
+    second.worktree_path = Some(app.cwd.join("worktree-2"));
+    app.auto_merge_skip.push("run-2".to_string());
+    app.agents.push(first);
+    app.agents.push(second);
+
+    app.request_merge_all_ready();
+
+    let detail = app
+        .merge_confirm
+        .as_ref()
+        .and_then(|confirm| confirm.detail.as_deref())
+        .unwrap_or_default();
+    assert!(detail.contains("Ready: n1, n2"));
+    assert!(detail.contains("parked by auto-merge"));
+    assert!(app
+        .activity_log
+        .iter()
+        .any(|line| line.contains("merge-all ready: 2 worktrees (n1, n2)")));
+    assert!(app.notice.is_none());
 }
 
 #[test]
@@ -5632,7 +5731,11 @@ fn claude_settings_wire_stop_and_idle_hooks_to_the_signal_file() {
         true,
     ))
     .expect("valid settings json");
-    assert_eq!(fast["fastMode"], serde_json::Value::Bool(true), "fastMode flag set");
+    assert_eq!(
+        fast["fastMode"],
+        serde_json::Value::Bool(true),
+        "fastMode flag set"
+    );
 }
 
 #[test]
