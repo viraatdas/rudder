@@ -6,13 +6,13 @@
     <title>Rudder</title>
     <meta
       name="description"
-      content="Rudder is a terminal orchestrator for coding agents. Describe a goal; it plans a task DAG, runs Claude Code and Codex agents in parallel across isolated jj workspaces, then helps you review and merge."
+      content="Rudder is a terminal orchestrator for coding agents. Describe a goal; it plans a task DAG you can edit before it runs, runs Claude Code and Codex agents in parallel across isolated jj workspaces, then helps you review and merge."
     />
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <meta property="og:title" content="Rudder" />
     <meta
       property="og:description"
-      content="A terminal orchestrator for coding agents: plan a task DAG, run Claude Code and Codex in parallel across isolated jj workspaces, review, and merge."
+      content="A terminal orchestrator for coding agents: plan a task DAG, edit it before it runs, run Claude Code and Codex in parallel across isolated jj workspaces, review, and merge."
     />
     <meta property="og:image" content="/screenshot.svg" />
     <meta name="theme-color" content="#ffffff" />
@@ -546,6 +546,87 @@
         line-height: 1.35;
       }
 
+      .principles {
+        margin-top: 32px;
+        border-top: 1px solid var(--line);
+      }
+
+      .principle {
+        display: grid;
+        grid-template-columns: minmax(56px, 0.16fr) minmax(0, 1fr);
+        gap: 28px;
+        padding: 28px 0;
+        border-bottom: 1px solid var(--soft-line);
+      }
+
+      .principle-index {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 14px;
+        font-weight: 700;
+        color: var(--cyan);
+      }
+
+      .principle-index.green {
+        color: var(--green);
+      }
+
+      .principle-index.amber {
+        color: var(--amber);
+      }
+
+      .principle-index.magenta {
+        color: var(--magenta);
+      }
+
+      .principle h3 {
+        margin-bottom: 12px;
+        font-size: clamp(22px, 3vw, 34px);
+        font-weight: 390;
+        line-height: 1.05;
+        letter-spacing: 0;
+        text-transform: none;
+      }
+
+      .principle p {
+        max-width: 720px;
+        color: var(--muted);
+        font-size: 16px;
+        line-height: 1.6;
+      }
+
+      .edit-fields {
+        align-self: start;
+        border: 1px solid var(--line);
+        background: var(--panel);
+      }
+
+      .edit-field {
+        display: grid;
+        grid-template-columns: minmax(132px, max-content) minmax(0, 1fr);
+        gap: 16px;
+        align-items: baseline;
+        padding: 15px 18px;
+        border-top: 1px solid var(--soft-line);
+      }
+
+      .edit-field:first-child {
+        border-top: 0;
+      }
+
+      .edit-field code {
+        color: var(--cyan);
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 13px;
+        font-weight: 600;
+        white-space: nowrap;
+      }
+
+      .edit-field span {
+        color: var(--muted);
+        font-size: 15px;
+        line-height: 1.45;
+      }
+
       .motion-ready [data-reveal] {
         opacity: 0;
         transform: translateY(18px);
@@ -664,6 +745,17 @@
           grid-template-columns: 1fr;
           gap: 4px;
         }
+
+        .principle {
+          grid-template-columns: 1fr;
+          gap: 10px;
+          padding: 22px 0;
+        }
+
+        .edit-field {
+          grid-template-columns: 1fr;
+          gap: 4px;
+        }
       }
 
       @media (prefers-reduced-motion: reduce) {
@@ -759,8 +851,8 @@ rudder</code>
               <h3>Plan into a DAG</h3>
               <p>
                 Describe a goal once. A read-only planner inspects the repo and
-                emits a task DAG with typed hard and soft dependencies, which you
-                refine in chat before it launches.
+                emits a task DAG with typed hard and soft dependencies. Edit any
+                node inline, or refine the whole plan by chat, before it launches.
               </p>
             </article>
             <article class="card">
@@ -781,6 +873,123 @@ rudder</code>
                 unblocks its children automatically.
               </p>
             </article>
+          </div>
+        </section>
+
+        <section class="section" aria-labelledby="idea-title">
+          <div class="section-head" data-reveal>
+            <h2 id="idea-title">A few opinions, made into a tool.</h2>
+            <p>
+              Rudder is not trying to be a faster chat window. It takes a stance
+              on how agents should work: plan first, isolate the work, and keep
+              you steering with full visibility and undo.
+            </p>
+          </div>
+
+          <div class="principles" data-reveal-group>
+            <article class="principle">
+              <span class="principle-index cyan">01</span>
+              <div>
+                <h3>Plan before you build.</h3>
+                <p>
+                  The planner is read-only. It inspects the repo, asks a round of
+                  questions before it assumes anything, and proposes a DAG.
+                  Nothing is written to your code until you approve it.
+                </p>
+              </div>
+            </article>
+            <article class="principle">
+              <span class="principle-index green">02</span>
+              <div>
+                <h3>Isolate the work, don't coordinate it.</h3>
+                <p>
+                  Every node runs in its own jj workspace, never nested in your
+                  repo, so parallel agents never collide live. The only thing
+                  left to reconcile is a merge, and Rudder handles that.
+                </p>
+              </div>
+            </article>
+            <article class="principle">
+              <span class="principle-index amber">03</span>
+              <div>
+                <h3>Steer, don't babysit.</h3>
+                <p>
+                  The orchestrator acts on its own: it expands the plan, fixes
+                  drift, and merges clean work. Every action is logged and every
+                  action is undoable, so you stay in control without watching
+                  each step.
+                </p>
+              </div>
+            </article>
+            <article class="principle">
+              <span class="principle-index magenta">04</span>
+              <div>
+                <h3>Block only on real gates.</h3>
+                <p>
+                  Hard edges wait for a parent to merge; soft edges are context
+                  only. Work that can run in parallel does, and the plan blocks
+                  just where one task truly depends on another.
+                </p>
+              </div>
+            </article>
+          </div>
+        </section>
+
+        <section class="section" aria-labelledby="edit-title">
+          <div class="section-head" data-reveal>
+            <h2 id="edit-title">Edit the plan before it runs.</h2>
+            <p>
+              The DAG is a draft, not a verdict. Press v on the orchestrator to
+              open plan review, then edit any node inline: its title, goal,
+              success criteria, dependencies, and the prompt the agent will run.
+              Approve once and Rudder launches the plan you actually want.
+            </p>
+          </div>
+
+          <div class="control-stage" aria-label="Plan edit mode">
+            <div class="edit-fields" data-reveal>
+              <div class="edit-field">
+                <code>title</code><span>name the task so it reads cleanly in the agents list</span>
+              </div>
+              <div class="edit-field">
+                <code>goal</code><span>what this node is responsible for building</span>
+              </div>
+              <div class="edit-field">
+                <code>done</code><span>the success criteria that mark the task complete</span>
+              </div>
+              <div class="edit-field">
+                <code>hard deps</code><span>node IDs that must merge before this one starts</span>
+              </div>
+              <div class="edit-field">
+                <code>soft deps</code><span>context-only links that never gate, so siblings run in parallel</span>
+              </div>
+              <div class="edit-field">
+                <code>prompt</code><span>the exact instructions handed to Claude Code or Codex</span>
+              </div>
+            </div>
+
+            <div class="control-side">
+              <div class="leader-card" data-reveal>
+                <span class="leader-title">Plan review keys</span>
+                <div class="leader-grid">
+                  <div class="leader-item">
+                    <code>v</code><span>open plan review on the orchestrator</span>
+                  </div>
+                  <div class="leader-item">
+                    <code>Tab</code><span>move between fields on a node</span>
+                  </div>
+                  <div class="leader-item">
+                    <code>Ctrl-S</code><span>save your edits to the DAG</span>
+                  </div>
+                  <div class="leader-item">
+                    <code>Ctrl-Enter</code><span>approve and launch the plan</span>
+                  </div>
+                  <div class="leader-item">
+                    <code>Esc</code><span>hide review, back to the orchestrator</span>
+                  </div>
+                </div>
+              </div>
+            </div>
           </div>
         </section>
 
