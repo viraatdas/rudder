@@ -4561,6 +4561,29 @@ fn merge_all_command_opens_confirmation() {
 }
 
 #[test]
+fn merge_all_command_includes_jj_workspace_runs_without_legacy_path() {
+    let mut app = App::new();
+    let mut run = test_agent_run("run-1", "test task");
+    run.status = AgentStatus::Done;
+    run.node_id = Some("n1".to_string());
+    run.workspace_name = Some("rudder-17824484932183-fe7bf2".to_string());
+    run.jj_change_id = Some("wuytqszwzqswmkrzrznwvrqmonnzkvoo".to_string());
+    app.agents.push(run);
+
+    assert!(app.handle_command("/merge-all"));
+
+    assert!(matches!(
+        app.merge_confirm.as_ref().map(|confirm| &confirm.intent),
+        Some(MergeIntent::All { ids }) if ids == &vec!["run-1".to_string()]
+    ));
+    assert!(app
+        .merge_confirm
+        .as_ref()
+        .and_then(|confirm| confirm.detail.as_deref())
+        .is_some_and(|detail| detail.contains("Ready: n1")));
+}
+
+#[test]
 fn merge_all_confirmation_names_ready_nodes_and_logs_action() {
     let mut app = App::new();
     let mut first = test_agent_run("run-1", "first task");
@@ -6394,6 +6417,8 @@ fn write_rudder_context_includes_global_job_snapshot() {
     done.cwd = repo.join("claude-worktree");
     done.status = AgentStatus::Done;
     done.node_id = Some("n3".to_string());
+    done.workspace_name = Some("rudder-run-claude-test".to_string());
+    done.jj_change_id = Some("zzzzzzzz".to_string());
 
     let pending = WorktreeInfo {
         id: "pending-1".to_string(),

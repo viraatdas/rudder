@@ -888,6 +888,15 @@ impl AgentRun {
         self.mode == AgentMode::OneOff
     }
 
+    /// Finished worker runs are mergeable if Rudder has any integration handle for
+    /// them: legacy git worktree path/branch or jj workspace/change identity.
+    fn has_merge_source(&self) -> bool {
+        self.worktree_path.is_some()
+            || self.worktree_branch.is_some()
+            || self.workspace_name.is_some()
+            || self.jj_change_id.is_some()
+    }
+
     /// A "pinned planner" renders in the orchestrator section at the top of the list
     /// (above main + every status bucket), not in a status bucket. The headless
     /// RudderPlan orchestrator is the only such row.
@@ -6087,7 +6096,7 @@ impl App {
             self.notice = Some(format!("{token} is already merged"));
             return;
         }
-        if run.worktree_path.is_none() && run.worktree_branch.is_none() {
+        if !run.has_merge_source() {
             self.notice = Some(format!("{token} has no workspace to merge"));
             return;
         }
@@ -8709,9 +8718,7 @@ impl App {
             self.notice = Some("one-off agent: merge disabled".to_string());
             return;
         }
-        // A run is mergeable when it has a workspace path (jj workspace for new
-        // runs, git worktree for legacy runs) or a legacy git branch.
-        if run.worktree_path.is_none() && run.worktree_branch.is_none() {
+        if !run.has_merge_source() {
             self.notice = Some("selected agent has no workspace to merge".to_string());
             return;
         }
@@ -8752,9 +8759,10 @@ impl App {
             .iter()
             .filter(|run| {
                 run.status == AgentStatus::Done
-                    && (run.worktree_path.is_some() || run.worktree_branch.is_some())
+                    && run.has_merge_source()
                     && !run.is_main()
                     && !run.is_oneoff()
+                    && !run.is_orchestrator()
                     && !claimed.contains(&run.id)
             })
             .collect();

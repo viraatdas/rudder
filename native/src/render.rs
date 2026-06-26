@@ -4025,9 +4025,7 @@ pub(crate) fn agent_awaits_merge(agent: &AgentRun) -> bool {
         && !agent.is_main()
         && !agent.is_oneoff()
         && !matches!(agent.mode, AgentMode::Plan | AgentMode::RudderPlan)
-        && (agent.worktree_path.is_some()
-            || agent.worktree_branch.is_some()
-            || agent.workspace_name.is_some())
+        && agent.has_merge_source()
 }
 
 pub(crate) fn agent_status_style(agent: &AgentRun) -> Style {

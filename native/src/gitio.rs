@@ -1776,7 +1776,7 @@ fn agent_deps_label(agent: &AgentRun) -> String {
 }
 
 fn agent_is_mergeable_worker(agent: &AgentRun) -> bool {
-    !agent.is_main() && !agent.is_oneoff() && !agent.is_orchestrator()
+    !agent.is_main() && !agent.is_oneoff() && !agent.is_orchestrator() && agent.has_merge_source()
 }
 
 pub(crate) fn sync_shared_context_surfaces(
