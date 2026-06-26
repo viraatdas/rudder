@@ -1,6 +1,6 @@
 {
   "name": "@viraatdas/rudder",
-  "version": "2.10.8",
+  "version": "2.10.9",
   "description": "A Claude Code-style terminal app for running coding agents with worktree-isolated runs.",
   "license": "MIT",
   "homepage": "https://rudder.viraat.dev",
@@ -13,7 +13,8 @@
     "rudder": "dist/index.js"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json && npm run build-board && npm run build-native && npm run copy-native",
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
+    "build": "npm run clean && tsc -p tsconfig.json && npm run build-board && npm run build-native && npm run copy-native",
     "build-board": "esbuild src/board/ui/index.tsx --bundle --minify --format=esm --jsx=automatic --jsx-import-source=preact --outfile=dist/board/board.js && esbuild src/board/ui/board.css --bundle --minify --outfile=dist/board/board.css",
     "build-native": "cargo build --release --manifest-path native/Cargo.toml",
     "check": "tsc -p tsconfig.json --noEmit",
