@@ -24,7 +24,7 @@
   <line x1="0" y1="56" x2="2000" y2="56" stroke="#e6e7eb" stroke-width="1"/>
 
   <!-- ===== left pane: agents ===== -->
-  <rect x="24" y="80" width="520" height="800" fill="#ffffff" stroke="#e6e7eb" stroke-width="1"/>
+  <rect x="24" y="80" width="520" height="676" fill="#ffffff" stroke="#e6e7eb" stroke-width="1"/>
   <rect x="24" y="80" width="120" height="28" fill="#0b747c"/>
   <text x="40" y="100" fill="#ffffff" class="sm">agents</text>
 
@@ -51,10 +51,10 @@
     <text x="80" y="526" class="muted sm">todo</text>
   </g>
 
-  <!-- ===== right pane: orchestrator ===== -->
-  <rect x="568" y="80" width="1408" height="800" fill="#ffffff" stroke="#0b747c" stroke-width="1.5"/>
+  <!-- ===== right pane: worker / orchestrator ===== -->
+  <rect x="568" y="80" width="1408" height="676" fill="#ffffff" stroke="#0b747c" stroke-width="1.5"/>
   <rect x="568" y="80" width="220" height="28" fill="#0b747c"/>
-  <text x="584" y="100" fill="#ffffff" class="sm">orchestrator</text>
+  <text x="584" y="100" fill="#ffffff" class="sm">worker</text>
 
   <text x="600" y="156" class="teal t">◆ ORCHESTRATOR  ·  plan · 4 tasks</text>
 
@@ -88,11 +88,13 @@
   <text x="600" y="622" class="muted sm">module fetches /me/top/tracks once a session token exists. The scaffold +</text>
   <text x="600" y="650" class="muted sm">dark theme styles land first so the wiring node can mount the views.</text>
 
-  <!-- chat input pinned -->
-  <line x1="600" y1="804" x2="1944" y2="804" stroke="#eef0f3" stroke-width="1"/>
-  <text x="600" y="846" class="teal t">›</text>
-  <text x="628" y="846" class="muted t">chat to refine the plan, or press Enter to approve &amp; launch</text>
+  <!-- ===== bottom pane: task ===== -->
+  <rect x="24" y="776" width="1952" height="130" fill="#ffffff" stroke="#e6e7eb" stroke-width="1"/>
+  <rect x="24" y="776" width="120" height="28" fill="#0b747c"/>
+  <text x="40" y="796" fill="#ffffff" class="sm">task</text>
 
-  <!-- ===== bottom task bar ===== -->
-  <rect x="24" y="892" width="1952" height="14" fill="none"/>
+  <text x="48" y="852" class="teal t">›</text>
+  <text x="76" y="852" class="ink t">build a spotify top-tracks dashboard</text>
+  <rect x="616" y="834" width="11" height="24" fill="#15803d"/>
+  <text x="48" y="888" class="muted sm">start a plan, answer the planner, or add work to a running DAG</text>
 </svg>
