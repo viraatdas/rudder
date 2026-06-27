@@ -65,84 +65,12 @@
             </div>
           </div>
 
-          <div class="screen" data-reveal aria-label="A live task DAG: nodes flow from planned to running to review to merged.">
-            <div class="screen-head">
-              <span class="live">live</span>
-              <span class="path">rudder &middot; orchestrator</span>
-              <span class="caret" aria-hidden="true">&#9608;</span>
-            </div>
-            <div class="screen-body">
-              <svg
-                class="dag"
-                data-dag
-                viewBox="0 30 800 350"
-                role="img"
-                aria-label="A task graph in flight: scaffold merged, auth flow in review, api client running, dashboard and tests still planned."
-              >
-                <g class="dag-edges" aria-hidden="true">
-                  <path class="edge" data-edge="01-02" d="M170,210 C 215,210 205,85 250,85" />
-                  <path class="edge" data-edge="01-03" d="M170,210 C 215,210 205,335 250,335" />
-                  <path class="edge soft" data-edge="02-03" d="M320,115 C 320,180 320,240 320,305" />
-                  <path class="edge" data-edge="02-04" d="M390,85 C 435,85 425,210 470,210" />
-                  <path class="edge" data-edge="03-04" d="M390,335 C 435,335 425,210 470,210" />
-                  <path class="edge" data-edge="04-05" d="M610,210 C 623,210 627,210 640,210" />
-                </g>
-                <g class="dag-nodes">
-                  <g class="node-pos" transform="translate(30,180)">
-                    <g class="node" data-node="01" data-status="merged">
-                      <rect class="node-box" x="0" y="0" width="140" height="60" rx="11" />
-                      <circle class="node-dot" cx="122" cy="17" r="4" />
-                      <text class="node-id" x="14" y="24">01</text>
-                      <text class="node-title" x="14" y="41">scaffold</text>
-                      <text class="node-state" x="14" y="53">merged</text>
-                    </g>
-                  </g>
-                  <g class="node-pos" transform="translate(250,55)">
-                    <g class="node" data-node="02" data-status="review">
-                      <rect class="node-box" x="0" y="0" width="140" height="60" rx="11" />
-                      <circle class="node-dot" cx="122" cy="17" r="4" />
-                      <text class="node-id" x="14" y="24">02</text>
-                      <text class="node-title" x="14" y="41">auth flow</text>
-                      <text class="node-state" x="14" y="53">review</text>
-                    </g>
-                  </g>
-                  <g class="node-pos" transform="translate(250,305)">
-                    <g class="node" data-node="03" data-status="running">
-                      <rect class="node-box" x="0" y="0" width="140" height="60" rx="11" />
-                      <circle class="node-dot" cx="122" cy="17" r="4" />
-                      <text class="node-id" x="14" y="24">03</text>
-                      <text class="node-title" x="14" y="41">api client</text>
-                      <text class="node-state" x="14" y="53">running</text>
-                    </g>
-                  </g>
-                  <g class="node-pos" transform="translate(470,180)">
-                    <g class="node" data-node="04" data-status="planned">
-                      <rect class="node-box" x="0" y="0" width="140" height="60" rx="11" />
-                      <circle class="node-dot" cx="122" cy="17" r="4" />
-                      <text class="node-id" x="14" y="24">04</text>
-                      <text class="node-title" x="14" y="41">dashboard</text>
-                      <text class="node-state" x="14" y="53">planned</text>
-                    </g>
-                  </g>
-                  <g class="node-pos" transform="translate(640,180)">
-                    <g class="node" data-node="05" data-status="planned">
-                      <rect class="node-box" x="0" y="0" width="140" height="60" rx="11" />
-                      <circle class="node-dot" cx="122" cy="17" r="4" />
-                      <text class="node-id" x="14" y="24">05</text>
-                      <text class="node-title" x="14" y="41">tests</text>
-                      <text class="node-state" x="14" y="53">planned</text>
-                    </g>
-                  </g>
-                </g>
-              </svg>
-              <div class="legend" aria-hidden="true">
-                <span><i style="--c: var(--s-planned)"></i>planned</span>
-                <span><i style="--c: var(--s-running)"></i>running</span>
-                <span><i style="--c: var(--s-review)"></i>review</span>
-                <span><i style="--c: var(--s-merged)"></i>merged</span>
-              </div>
-            </div>
-          </div>
+          <figure class="shot" data-reveal>
+            <img
+              src="/screenshot.svg"
+              alt="Rudder's dashboard: an agents list on the left, the worker pane showing the orchestrator's live task DAG and plan on the right, and a task box along the bottom."
+            />
+          </figure>
         </section>
 
         <section class="section" aria-labelledby="flow-title">
@@ -345,13 +273,6 @@
               commands from there start with the Ctrl-W leader.
             </p>
           </div>
-
-          <figure class="shot" data-reveal>
-            <img
-              src="/screenshot.svg"
-              alt="Rudder's dashboard: an agents list on the left, the orchestrator's live task DAG and plan on the right, and a chat input to refine the plan."
-            />
-          </figure>
 
           <div class="panes" data-reveal-group>
             <div class="pane">

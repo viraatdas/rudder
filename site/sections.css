@@ -295,9 +295,9 @@ kbd {
   line-height: 1.35;
 }
 
-/* controls: dashboard screenshot */
+/* hero: dashboard screenshot */
 .shot {
-  margin: 44px 0 0;
+  margin: 0;
   border: 1px solid var(--line);
   border-radius: 14px;
   overflow: hidden;
@@ -315,7 +315,7 @@ kbd {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 1px;
-  margin-top: 20px;
+  margin-top: 44px;
   background: var(--line);
   border: 1px solid var(--line);
   border-radius: 14px;
