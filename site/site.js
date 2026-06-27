@@ -1,33 +1,5 @@
 const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
-/* ----- scroll reveals: IntersectionObserver + class-driven final state -----
-   The .in class persists, so content can never get stuck mid-animation. */
-if (!reduceMotion && "IntersectionObserver" in window) {
-  document.documentElement.classList.add("motion-ready");
-
-  const revealIO = new IntersectionObserver((entries) => {
-    entries.forEach((entry) => {
-      if (!entry.isIntersecting) return;
-      const el = entry.target;
-      if (el.hasAttribute("data-reveal-group")) {
-        Array.from(el.children).forEach((child, i) => {
-          child.style.transitionDelay = i * 70 + "ms";
-        });
-      }
-      el.classList.add("in");
-      revealIO.unobserve(el);
-    });
-  }, { rootMargin: "0px 0px -10% 0px" });
-
-  document
-    .querySelectorAll("[data-reveal], [data-reveal-group]")
-    .forEach((el) => revealIO.observe(el));
-
-  // hero headline underline draw
-  const steer = document.querySelector("h1 .steer");
-  if (steer) setTimeout(() => steer.classList.add("drawn"), 600);
-}
-
 /* ----- task-pane typewriter ----- */
 (function typer() {
   const target = document.querySelector("[data-type-text]");

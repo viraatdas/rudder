@@ -15,7 +15,7 @@
       content="A terminal orchestrator for coding agents: plan a task DAG, edit it before it runs, run Claude Code and Codex in parallel across isolated jj workspaces, review, and merge."
     />
     <meta property="og:image" content="/screenshot.svg" />
-    <meta name="theme-color" content="#fcfcfd" />
+    <meta name="theme-color" content="#ffffff" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
@@ -41,13 +41,8 @@
       <main>
         <section class="hero" aria-labelledby="hero-title">
           <div>
-            <p class="eyebrow" data-reveal>
-              <span class="dot" aria-hidden="true"></span>
-              plan &middot; run in parallel &middot; review &middot; merge
-            </p>
-            <h1 id="hero-title" data-reveal>
-              <span class="steer">Steer</span> your coding agents.
-            </h1>
+            <p class="eyebrow" data-reveal>plan, run in parallel, review, merge</p>
+            <h1 id="hero-title" data-reveal>Steer your coding agents.</h1>
             <p class="lede" data-reveal>
               Rudder is the terminal orchestrator. Describe a goal; it plans the
               work into a task DAG you can edit before it runs, executes Claude
@@ -75,7 +70,6 @@
 
         <section class="section" aria-labelledby="flow-title">
           <div class="section-head" data-reveal>
-            <p class="kicker">how it works</p>
             <h2 id="flow-title">One goal in. A steered plan out.</h2>
             <p>
               You describe the outcome. Rudder turns it into a graph of tasks and
@@ -84,27 +78,27 @@
           </div>
 
           <div class="flow" data-reveal-group>
-            <div class="flow-step" style="--c: var(--ink)">
+            <div class="flow-step">
               <span class="marker">Describe</span>
               <h3>The goal</h3>
               <p>Type what you want built into the task box, in plain language.</p>
             </div>
-            <div class="flow-step" style="--c: var(--cyan)">
+            <div class="flow-step">
               <span class="marker">Plan</span>
               <h3>A task DAG</h3>
               <p>A read-only planner inspects the repo and proposes typed dependencies.</p>
             </div>
-            <div class="flow-step" style="--c: var(--magenta)">
+            <div class="flow-step">
               <span class="marker">Run</span>
               <h3>In parallel</h3>
               <p>Claude Code and Codex build ready nodes in isolated jj workspaces.</p>
             </div>
-            <div class="flow-step" style="--c: var(--amber)">
+            <div class="flow-step">
               <span class="marker">Review</span>
               <h3>A live diff</h3>
               <p>Press v for the jj diff of any node, right inside the pane.</p>
             </div>
-            <div class="flow-step" style="--c: var(--green)">
+            <div class="flow-step">
               <span class="marker">Merge</span>
               <h3>And unblock</h3>
               <p>Clean work merges mechanically and unblocks its children.</p>
@@ -114,18 +108,17 @@
 
         <section class="section" aria-labelledby="why-title">
           <div class="section-head" data-reveal>
-            <p class="kicker">not a transcript ui</p>
             <h2 id="why-title">A plan you can watch and steer.</h2>
             <p>
-              Rudder gives you a goal, decomposes the work, and shows every node's
-              status live. Refine the plan by chat, add tasks while it runs, then
-              review and merge.
+              Rudder is not a transcript UI. You give it a goal, it decomposes the
+              work, and shows every node's status live. Refine the plan by chat,
+              add tasks while it runs, then review and merge.
             </p>
           </div>
 
           <div class="features" data-reveal-group>
-            <article class="feature" style="--c: var(--cyan)">
-              <span class="tag">orchestrate</span>
+            <article class="feature">
+              <span class="tag">Orchestrate</span>
               <h3>Plan into a DAG</h3>
               <p>
                 Describe a goal once. A read-only planner inspects the repo and
@@ -133,8 +126,8 @@
                 node inline, or refine the whole plan by chat, before it launches.
               </p>
             </article>
-            <article class="feature" style="--c: var(--magenta)">
-              <span class="tag">parallel</span>
+            <article class="feature">
+              <span class="tag">Parallel</span>
               <h3>Agents in jj workspaces</h3>
               <p>
                 Ready nodes run Claude Code and Codex in parallel, each in its own
@@ -142,8 +135,8 @@
                 the main checkout.
               </p>
             </article>
-            <article class="feature" style="--c: var(--green)">
-              <span class="tag">review</span>
+            <article class="feature">
+              <span class="tag">Review</span>
               <h3>Review and merge</h3>
               <p>
                 Watch a live jj diff of any node, merge clean work mechanically,
@@ -156,7 +149,6 @@
 
         <section class="section" aria-labelledby="idea-title">
           <div class="section-head" data-reveal>
-            <p class="kicker">the philosophy</p>
             <h2 id="idea-title">A few opinions, made into a tool.</h2>
             <p>
               Rudder is not trying to be a faster chat window. It takes a stance on
@@ -166,57 +158,43 @@
           </div>
 
           <div class="principles" data-reveal-group>
-            <article class="principle" style="--c: var(--cyan)">
-              <span class="principle-index">01</span>
-              <div>
-                <h3>Plan before you build.</h3>
-                <p>
-                  The planner is read-only. It inspects the repo, asks a round of
-                  questions before it assumes anything, and proposes a DAG. Nothing
-                  is written to your code until you approve it.
-                </p>
-              </div>
+            <article class="principle">
+              <h3>Plan before you build.</h3>
+              <p>
+                The planner is read-only. It inspects the repo, asks a round of
+                questions before it assumes anything, and proposes a DAG. Nothing
+                is written to your code until you approve it.
+              </p>
             </article>
-            <article class="principle" style="--c: var(--green)">
-              <span class="principle-index">02</span>
-              <div>
-                <h3>Isolate the work, don't coordinate it.</h3>
-                <p>
-                  Every node runs in its own jj workspace, never nested in your
-                  repo, so parallel agents never collide live. The only thing left
-                  to reconcile is a merge, and Rudder handles that.
-                </p>
-              </div>
+            <article class="principle">
+              <h3>Isolate the work, don't coordinate it.</h3>
+              <p>
+                Every node runs in its own jj workspace, never nested in your repo,
+                so parallel agents never collide live. The only thing left to
+                reconcile is a merge, and Rudder handles that.
+              </p>
             </article>
-            <article class="principle" style="--c: var(--amber)">
-              <span class="principle-index">03</span>
-              <div>
-                <h3>Steer, don't babysit.</h3>
-                <p>
-                  The orchestrator acts on its own: it expands the plan, fixes
-                  drift, and merges clean work. Every action is logged and every
-                  action is undoable, so you stay in control without watching each
-                  step.
-                </p>
-              </div>
+            <article class="principle">
+              <h3>Steer, don't babysit.</h3>
+              <p>
+                The orchestrator acts on its own: it expands the plan, fixes drift,
+                and merges clean work. Every action is logged and every action is
+                undoable, so you stay in control without watching each step.
+              </p>
             </article>
-            <article class="principle" style="--c: var(--magenta)">
-              <span class="principle-index">04</span>
-              <div>
-                <h3>Block only on real gates.</h3>
-                <p>
-                  Hard edges wait for a parent to merge; soft edges are context
-                  only. Work that can run in parallel does, and the plan blocks
-                  just where one task truly depends on another.
-                </p>
-              </div>
+            <article class="principle">
+              <h3>Block only on real gates.</h3>
+              <p>
+                Hard edges wait for a parent to merge; soft edges are context only.
+                Work that can run in parallel does, and the plan blocks just where
+                one task truly depends on another.
+              </p>
             </article>
           </div>
         </section>
 
         <section class="section" aria-labelledby="edit-title">
           <div class="section-head" data-reveal>
-            <p class="kicker">plan edit mode</p>
             <h2 id="edit-title">Edit the plan before it runs.</h2>
             <p>
               The DAG is a draft, not a verdict. Press v on the orchestrator to
@@ -265,7 +243,6 @@
 
         <section class="section" aria-labelledby="controls-title">
           <div class="section-head" data-reveal>
-            <p class="kicker">controls</p>
             <h2 id="controls-title">Three panes, three jumps.</h2>
             <p>
               Option-1, Option-2, and Option-3 always mean Agents, Worker, and

@@ -1,25 +1,17 @@
 /* ---------- sections ---------- */
 .section {
-  margin-top: clamp(72px, 10vw, 132px);
+  margin-top: clamp(84px, 11vw, 152px);
 }
 
 .section-head {
-  max-width: 760px;
-}
-
-.kicker {
-  margin: 0 0 14px;
-  font-family: var(--font-mono);
-  font-size: 12.5px;
-  letter-spacing: 0.04em;
-  color: var(--cyan);
+  max-width: 720px;
 }
 
 h2 {
   margin: 0;
   font-family: var(--font-display);
-  font-size: clamp(30px, 4.6vw, 54px);
-  line-height: 1;
+  font-size: clamp(30px, 4.4vw, 50px);
+  line-height: 1.02;
   font-weight: 600;
   letter-spacing: -0.03em;
   text-wrap: balance;
@@ -27,25 +19,38 @@ h2 {
 
 .section-head p {
   margin: 18px 0 0;
-  max-width: 62ch;
+  max-width: 60ch;
   color: var(--muted);
-  font-size: clamp(16px, 1.6vw, 18px);
+  font-size: clamp(16px, 1.5vw, 18px);
   line-height: 1.6;
   text-wrap: pretty;
+}
+
+/* hero: dashboard screenshot */
+.shot {
+  margin: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  background: var(--panel);
+  box-shadow: var(--shadow-md);
+}
+.shot img {
+  display: block;
+  width: 100%;
+  height: auto;
 }
 
 /* flow: describe -> plan -> run -> review -> merge */
 .flow {
   display: grid;
   grid-template-columns: repeat(5, minmax(0, 1fr));
-  gap: 0;
-  margin-top: 44px;
-  border-top: 1px solid var(--line);
+  margin-top: 48px;
+  border-top: 1px solid var(--ink);
 }
-
 .flow-step {
-  position: relative;
-  padding: 26px 22px 24px 22px;
+  padding: 24px 22px 0 22px;
+  min-height: 156px;
   border-right: 1px solid var(--soft-line);
 }
 .flow-step:first-child {
@@ -55,32 +60,21 @@ h2 {
   border-right: 0;
   padding-right: 0;
 }
-
 .flow-step .marker {
-  display: inline-flex;
-  align-items: center;
-  gap: 9px;
-  margin-bottom: 14px;
+  display: block;
+  margin-bottom: 16px;
   font-family: var(--font-mono);
-  font-size: 12px;
-  letter-spacing: 0.06em;
+  font-size: 11.5px;
+  letter-spacing: 0.1em;
   text-transform: uppercase;
-  color: var(--c, var(--ink));
-}
-.flow-step .marker::before {
-  content: "";
-  width: 9px;
-  height: 9px;
-  border-radius: 50%;
-  background: var(--c, var(--ink));
-  box-shadow: 0 0 0 4px color-mix(in oklab, var(--c, #000) 14%, transparent);
+  color: var(--faint);
 }
 .flow-step h3 {
   margin: 0 0 8px;
   font-family: var(--font-display);
-  font-size: 21px;
+  font-size: 19px;
   font-weight: 600;
-  letter-spacing: -0.02em;
+  letter-spacing: -0.01em;
 }
 .flow-step p {
   margin: 0;
@@ -89,43 +83,33 @@ h2 {
   line-height: 1.5;
 }
 
-/* feature trio (top accent rule, not a uniform card) */
+/* feature trio: hairline columns, no boxes, no color noise */
 .features {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-  gap: 1px;
-  margin-top: 44px;
-  background: var(--line);
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin-top: 48px;
   border: 1px solid var(--line);
-  border-radius: 14px;
-  overflow: hidden;
 }
 .feature {
-  position: relative;
-  padding: 30px 26px 34px;
-  background: var(--panel);
+  padding: 30px 28px 34px;
+  border-right: 1px solid var(--line);
 }
-.feature::before {
-  content: "";
-  position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
-  height: 3px;
-  background: var(--c);
+.feature:last-child {
+  border-right: 0;
 }
 .feature .tag {
-  display: inline-block;
+  display: block;
   margin-bottom: 18px;
   font-family: var(--font-mono);
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--c);
+  font-size: 11.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--accent);
 }
 .feature h3 {
   margin: 0 0 12px;
   font-family: var(--font-display);
-  font-size: 23px;
+  font-size: 21px;
   font-weight: 600;
   letter-spacing: -0.02em;
 }
@@ -136,36 +120,30 @@ h2 {
   line-height: 1.6;
 }
 
-/* principles */
+/* principles: editorial two-column list, no numbers */
 .principles {
-  margin-top: 44px;
-  border-top: 1px solid var(--line);
+  margin-top: 48px;
+  border-top: 1px solid var(--ink);
 }
 .principle {
   display: grid;
-  grid-template-columns: minmax(54px, 0.14fr) minmax(0, 1fr);
-  gap: clamp(16px, 4vw, 48px);
+  grid-template-columns: minmax(0, 24ch) minmax(0, 1fr);
+  gap: clamp(20px, 5vw, 64px);
   padding: 30px 0;
   border-bottom: 1px solid var(--soft-line);
   align-items: baseline;
 }
-.principle-index {
-  font-family: var(--font-mono);
-  font-size: 14px;
-  font-weight: 700;
-  color: var(--c, var(--cyan));
-}
 .principle h3 {
-  margin: 0 0 10px;
+  margin: 0;
   font-family: var(--font-display);
-  font-size: clamp(22px, 3vw, 34px);
-  font-weight: 500;
+  font-size: clamp(20px, 2.4vw, 27px);
+  font-weight: 600;
   letter-spacing: -0.02em;
-  line-height: 1.04;
+  line-height: 1.1;
 }
 .principle p {
   margin: 0;
-  max-width: 64ch;
+  max-width: 62ch;
   color: var(--muted);
   font-size: 16px;
   line-height: 1.62;
@@ -174,22 +152,15 @@ h2 {
 /* edit-the-plan: node editor + keys */
 .edit-stage {
   display: grid;
-  grid-template-columns: minmax(0, 1.15fr) minmax(260px, 0.85fr);
-  gap: 20px;
-  margin-top: 44px;
+  grid-template-columns: minmax(0, 1.1fr) minmax(260px, 0.9fr);
+  gap: 16px;
+  margin-top: 48px;
 }
 .node-card {
-  position: relative;
-  border-radius: 14px;
-  background: radial-gradient(
-      130% 120% at 12% -20%,
-      var(--screen-grad),
-      var(--screen-bg) 62%
-    );
-  border: 1px solid rgba(125, 162, 210, 0.22);
-  box-shadow: var(--shadow-md);
+  border-radius: var(--radius-lg);
+  background: var(--screen-bg);
+  border: 1px solid var(--screen-line);
   padding: 22px clamp(16px, 3vw, 28px) 24px;
-  overflow: hidden;
 }
 .node-card .nc-head {
   display: flex;
@@ -201,10 +172,10 @@ h2 {
   color: var(--screen-muted);
 }
 .node-card .nc-chip {
-  padding: 3px 9px;
-  border-radius: 999px;
-  background: color-mix(in oklab, var(--s-control) 18%, transparent);
-  color: var(--s-control);
+  padding: 3px 8px;
+  border-radius: var(--radius);
+  border: 1px solid var(--screen-line);
+  color: var(--screen-accent);
   font-weight: 600;
 }
 .nc-field {
@@ -221,7 +192,7 @@ h2 {
 .nc-field .k {
   font-family: var(--font-mono);
   font-size: 12px;
-  color: var(--s-running);
+  color: var(--screen-muted);
 }
 .nc-field .v {
   font-size: 14.5px;
@@ -240,29 +211,29 @@ h2 {
   height: 1.05em;
   margin-left: 1px;
   vertical-align: text-bottom;
-  background: var(--s-control);
+  background: var(--screen-accent);
   animation: blink 1.05s steps(2, start) infinite;
 }
 .nc-field .editcaret {
   display: none;
 }
 
-/* reused: keys panel */
+/* keys panel */
 .keys-card {
   align-self: start;
   border: 1px solid var(--line);
-  border-radius: 14px;
+  border-radius: var(--radius-lg);
   background: var(--panel);
-  box-shadow: var(--shadow-sm);
   padding: 20px 22px;
 }
 .keys-card .keys-title {
   display: block;
   margin-bottom: 14px;
   font-family: var(--font-mono);
-  font-size: 12px;
-  letter-spacing: 0.04em;
-  color: var(--magenta);
+  font-size: 11.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--faint);
 }
 .keys-row {
   display: grid;
@@ -278,10 +249,9 @@ h2 {
 kbd {
   display: inline-flex;
   align-items: center;
-  padding: 4px 8px;
+  padding: 3px 7px;
   border: 1px solid var(--line);
-  border-bottom-width: 2px;
-  border-radius: 6px;
+  border-radius: var(--radius);
   background: var(--paper-2);
   font-family: var(--font-mono);
   font-size: 12px;
@@ -295,58 +265,42 @@ kbd {
   line-height: 1.35;
 }
 
-/* hero: dashboard screenshot */
-.shot {
-  margin: 0;
-  border: 1px solid var(--line);
-  border-radius: 14px;
-  overflow: hidden;
-  background: var(--panel);
-  box-shadow: var(--shadow-lg);
-}
-.shot img {
-  display: block;
-  width: 100%;
-  height: auto;
-}
-
 /* controls: three panes */
 .panes {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 1px;
-  margin-top: 44px;
-  background: var(--line);
+  margin-top: 48px;
   border: 1px solid var(--line);
-  border-radius: 14px;
-  overflow: hidden;
 }
 .pane {
-  background: var(--panel);
-  padding: 26px 24px 28px;
-  transition: background 200ms ease, transform 200ms var(--ease-quint);
+  padding: 28px 26px 30px;
+  border-right: 1px solid var(--line);
+  transition: background 160ms ease;
+}
+.pane:last-child {
+  border-right: 0;
 }
 .pane:hover {
   background: var(--paper-2);
 }
 .pane .key {
   display: inline-flex;
-  padding: 5px 9px;
+  padding: 4px 8px;
   margin-bottom: 18px;
-  border: 1px solid var(--cyan);
-  border-radius: 6px;
-  color: var(--cyan);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  color: var(--accent);
   font-family: var(--font-mono);
   font-size: 12.5px;
-  font-weight: 700;
+  font-weight: 600;
 }
 .pane h3 {
   margin: 0 0 12px;
   font-family: var(--font-display);
-  font-size: clamp(24px, 3vw, 34px);
-  font-weight: 500;
+  font-size: clamp(22px, 2.6vw, 30px);
+  font-weight: 600;
   letter-spacing: -0.02em;
-  line-height: 0.98;
+  line-height: 1;
 }
 .pane p {
   margin: 0;
@@ -358,38 +312,37 @@ kbd {
 .control-extra {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(260px, 0.8fr);
-  gap: 20px;
-  margin-top: 20px;
+  gap: 16px;
+  margin-top: 16px;
 }
 .type-card {
   border: 1px solid var(--line);
-  border-radius: 14px;
+  border-radius: var(--radius-lg);
   background: var(--panel);
-  box-shadow: var(--shadow-sm);
   padding: 22px;
   font-family: var(--font-mono);
 }
 .type-label {
   display: block;
   margin-bottom: 16px;
-  color: var(--muted);
+  color: var(--faint);
   font-size: 11.5px;
-  letter-spacing: 0.05em;
+  letter-spacing: 0.08em;
   text-transform: uppercase;
 }
 .typed-line {
   color: var(--ink);
-  font-size: clamp(17px, 2.4vw, 24px);
+  font-size: clamp(16px, 2.2vw, 22px);
   line-height: 1.25;
   overflow-wrap: anywhere;
 }
 .typed-line .gt {
-  color: var(--cyan);
+  color: var(--accent);
 }
 .cursor {
   display: inline-block;
   width: 0.55em;
-  color: var(--green);
+  color: var(--accent);
   animation: blink 1s steps(2, start) infinite;
 }
 @keyframes blink {
@@ -398,70 +351,46 @@ kbd {
   }
 }
 
-/* closing cta */
+/* closing cta: flat dark band */
 .cta {
-  position: relative;
-  margin-top: clamp(80px, 11vw, 150px);
-  padding: clamp(40px, 6vw, 76px) clamp(24px, 5vw, 64px);
-  border-radius: 18px;
-  background: radial-gradient(
-      130% 140% at 14% 0%,
-      var(--screen-grad),
-      var(--screen-bg) 60%
-    );
-  border: 1px solid rgba(125, 162, 210, 0.22);
-  box-shadow: var(--shadow-lg);
-  overflow: hidden;
-}
-.cta::before {
-  content: "";
-  position: absolute;
-  inset: 0;
-  pointer-events: none;
-  background-image:
-    linear-gradient(var(--screen-line) 1px, transparent 1px),
-    linear-gradient(90deg, var(--screen-line) 1px, transparent 1px);
-  background-size: 30px 30px;
-  mask-image: radial-gradient(110% 120% at 80% 0%, #000, transparent 80%);
-  opacity: 0.55;
+  margin-top: clamp(96px, 12vw, 168px);
+  padding: clamp(48px, 6vw, 84px) clamp(28px, 5vw, 64px);
+  border-radius: var(--radius-lg);
+  background: var(--screen-bg);
+  border: 1px solid var(--screen-line);
 }
 .cta h2 {
-  position: relative;
   color: var(--screen-ink);
-  font-size: clamp(32px, 5vw, 60px);
+  font-size: clamp(32px, 4.6vw, 54px);
 }
 .cta p {
-  position: relative;
   margin: 16px 0 0;
   max-width: 52ch;
   color: var(--screen-muted);
-  font-size: clamp(16px, 1.7vw, 19px);
+  font-size: clamp(16px, 1.6vw, 18px);
   line-height: 1.55;
 }
-.cta .actions {
-  position: relative;
-}
 .cta .install {
-  border-color: rgba(125, 162, 210, 0.3);
-  background: rgba(255, 255, 255, 0.04);
+  border-color: var(--screen-line);
+  background: rgba(255, 255, 255, 0.03);
 }
 .cta .install code {
   color: var(--screen-ink);
 }
 .cta .install code .prompt {
-  color: var(--s-running);
+  color: var(--screen-accent);
 }
 .cta .copy {
   background: var(--screen-ink);
   color: var(--screen-bg);
-  border-left-color: rgba(125, 162, 210, 0.3);
+  border-left-color: var(--screen-line);
 }
 .cta .button-link {
-  border-color: rgba(125, 162, 210, 0.3);
+  border-color: var(--screen-line);
   color: var(--screen-ink);
 }
 .cta .button-link:hover {
-  background: rgba(255, 255, 255, 0.06);
+  background: rgba(255, 255, 255, 0.05);
 }
 
 footer {
@@ -470,7 +399,7 @@ footer {
   gap: 14px 28px;
   align-items: center;
   justify-content: space-between;
-  margin-top: 48px;
+  margin-top: 56px;
   padding: 30px 0 56px;
   border-top: 1px solid var(--line);
   color: var(--muted);
