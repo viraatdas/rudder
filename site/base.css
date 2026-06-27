@@ -1,0 +1,311 @@
+:root {
+  --paper: #fcfcfd;
+  --paper-2: #f5f6f8;
+  --ink: #14161a;
+  --muted: #515967;
+  --line: #e3e5ea;
+  --soft-line: #eef0f3;
+  --panel: #ffffff;
+
+  --cyan: #0b747c;
+  --green: #15803d;
+  --amber: #b45309;
+  --magenta: #a21caf;
+
+  /* dark instrument screen */
+  --screen-bg: #0e1320;
+  --screen-grad: #131a2c;
+  --screen-line: rgba(125, 162, 210, 0.16);
+  --screen-line-strong: rgba(150, 180, 214, 0.34);
+  --screen-muted: #8a95ab;
+  --screen-ink: #eef2f8;
+
+  /* status, brightened for the dark screen */
+  --s-planned: #8b94a3;
+  --s-running: #2dd4bf;
+  --s-review: #fbbf24;
+  --s-merged: #4ade80;
+  --s-control: #e879f9;
+
+  --shadow-sm: 0 1px 2px rgba(16, 24, 40, 0.06);
+  --shadow-md: 0 10px 28px rgba(16, 24, 40, 0.08);
+  --shadow-lg: 0 24px 60px rgba(13, 19, 40, 0.16);
+
+  --ease-quint: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-expo: cubic-bezier(0.16, 1, 0.3, 1);
+
+  --font-display: "Bricolage Grotesque", ui-sans-serif, system-ui,
+    -apple-system, sans-serif;
+  --font-sans: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+    "Segoe UI", sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+  color: var(--ink);
+  background: var(--paper);
+  font-family: var(--font-sans);
+  font-weight: 400;
+  -webkit-font-smoothing: antialiased;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  overflow-x: hidden;
+}
+
+/* faint blueprint grid on the paper */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background-image:
+    linear-gradient(rgba(20, 40, 70, 0.04) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(20, 40, 70, 0.03) 1px, transparent 1px);
+  background-size: 52px 52px;
+  mask-image: radial-gradient(120% 80% at 70% 0%, #000 0%, transparent 72%);
+}
+
+a {
+  color: inherit;
+  text-decoration-color: rgba(20, 22, 26, 0.35);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 4px;
+  transition: color 160ms ease, text-decoration-color 160ms ease;
+}
+
+a:hover {
+  color: var(--cyan);
+  text-decoration-color: currentColor;
+}
+
+:focus-visible {
+  outline: 2px solid var(--cyan);
+  outline-offset: 3px;
+  border-radius: 2px;
+}
+
+.page {
+  position: relative;
+  max-width: 1320px;
+  margin: 0 auto;
+  padding: 26px clamp(16px, 4vw, 40px) 0;
+}
+
+/* ---------- header ---------- */
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  padding-bottom: clamp(40px, 6vw, 72px);
+}
+
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 11px;
+  font-family: var(--font-display);
+  font-size: 18px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  text-decoration: none;
+}
+
+.brand img {
+  width: 26px;
+  height: 26px;
+}
+
+nav {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 8px 22px;
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.nav-cta {
+  padding: 7px 14px;
+  border: 1px solid var(--ink);
+  border-radius: 999px;
+  color: var(--ink);
+  text-decoration: none;
+  font-weight: 540;
+  transition: background 160ms ease, color 160ms ease,
+    transform 160ms var(--ease-quint);
+}
+
+.nav-cta:hover {
+  background: var(--ink);
+  color: var(--paper);
+  transform: translateY(-1px);
+}
+
+/* ---------- hero ---------- */
+.hero {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: clamp(28px, 4vw, 44px);
+}
+
+.eyebrow {
+  margin: 0 0 20px;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  letter-spacing: 0.02em;
+}
+
+.eyebrow .dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--s-merged);
+  box-shadow: 0 0 0 0 rgba(74, 222, 128, 0.5);
+  animation: livepulse 2.6s ease-out infinite;
+}
+
+@keyframes livepulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(21, 128, 61, 0.4);
+  }
+  70%,
+  100% {
+    box-shadow: 0 0 0 7px rgba(21, 128, 61, 0);
+  }
+}
+
+h1 {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: clamp(46px, 8.4vw, 92px);
+  line-height: 0.94;
+  font-weight: 600;
+  letter-spacing: -0.035em;
+  max-width: 16ch;
+  text-wrap: balance;
+}
+
+h1 .steer {
+  position: relative;
+  white-space: nowrap;
+}
+
+h1 .steer::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0.06em;
+  height: 0.09em;
+  background: linear-gradient(
+    90deg,
+    var(--cyan),
+    var(--magenta) 50%,
+    var(--amber)
+  );
+  transform: scaleX(1);
+  transform-origin: left;
+  border-radius: 2px;
+}
+
+.lede {
+  margin: 26px 0 0;
+  max-width: 60ch;
+  font-size: clamp(17px, 1.9vw, 21px);
+  line-height: 1.5;
+  color: #3a404b;
+  text-wrap: pretty;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 30px;
+}
+
+.install {
+  display: inline-flex;
+  align-items: stretch;
+  width: min(100%, 420px);
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+  box-shadow: var(--shadow-sm);
+  overflow: hidden;
+}
+
+.install code {
+  min-width: 0;
+  flex: 1;
+  padding: 13px 15px;
+  overflow-x: auto;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 1.5;
+  white-space: pre;
+}
+
+.install code .prompt {
+  color: var(--cyan);
+  user-select: none;
+}
+
+.copy,
+.button-link {
+  appearance: none;
+  border: 0;
+  cursor: pointer;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 560;
+  text-decoration: none;
+  transition: background 160ms ease, color 160ms ease,
+    transform 160ms var(--ease-quint);
+}
+
+.copy {
+  flex: 0 0 auto;
+  padding: 0 16px;
+  border-left: 1px solid var(--line);
+  background: var(--ink);
+  color: #fff;
+}
+
+.button-link {
+  display: inline-flex;
+  align-items: center;
+  padding: 0 18px;
+  min-height: 44px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: transparent;
+  color: var(--ink);
+}
+
+.button-link:hover,
+.copy:hover {
+  transform: translateY(-1px);
+}
+
+.button-link:hover {
+  background: var(--paper-2);
+}

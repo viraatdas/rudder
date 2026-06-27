@@ -1,0 +1,213 @@
+/* ---------- the screen (live DAG) ---------- */
+.screen {
+  position: relative;
+  margin-top: clamp(20px, 3vw, 30px);
+  border-radius: 16px;
+  background:
+    radial-gradient(
+      130% 120% at 18% -10%,
+      var(--screen-grad),
+      var(--screen-bg) 60%
+    );
+  border: 1px solid rgba(125, 162, 210, 0.22);
+  box-shadow: var(--shadow-lg);
+  overflow: hidden;
+}
+
+.screen::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background-image:
+    linear-gradient(var(--screen-line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--screen-line) 1px, transparent 1px);
+  background-size: 30px 30px;
+  mask-image: radial-gradient(120% 120% at 50% 0%, #000, transparent 85%);
+  opacity: 0.4;
+}
+
+.screen-head {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 13px 18px;
+  border-bottom: 1px solid var(--screen-line);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--screen-muted);
+}
+
+.screen-head .live {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--s-control);
+}
+
+.screen-head .live::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--s-control);
+  animation: livepulse-m 2.4s ease-out infinite;
+}
+
+@keyframes livepulse-m {
+  0% {
+    box-shadow: 0 0 0 0 rgba(232, 121, 249, 0.45);
+  }
+  70%,
+  100% {
+    box-shadow: 0 0 0 6px rgba(232, 121, 249, 0);
+  }
+}
+
+.screen-head .path {
+  color: var(--screen-muted);
+}
+
+.screen-head .caret {
+  color: var(--s-control);
+  animation: blink 1.1s steps(2, start) infinite;
+}
+
+.screen-body {
+  position: relative;
+  padding: clamp(8px, 2vw, 22px) clamp(6px, 2vw, 24px) 6px;
+}
+
+.dag {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+.node-box {
+  fill: rgba(255, 255, 255, 0.03);
+  stroke: var(--nc, var(--s-planned));
+  stroke-width: 2.1;
+  transition: stroke 0.45s ease, fill 0.45s ease;
+}
+.node[data-status="planned"] .node-box {
+  stroke-width: 1.5;
+}
+
+.node {
+  --nc: var(--s-planned);
+  transform-box: fill-box;
+  transform-origin: center;
+}
+/* choreographed entrance: only when JS confirms motion (.choreo) */
+.dag.choreo .node {
+  opacity: 0;
+  transform: translateY(7px) scale(0.92);
+  transition: opacity 0.5s var(--ease-quint),
+    transform 0.5s var(--ease-quint);
+}
+.dag.choreo .node.shown {
+  opacity: 1;
+  transform: none;
+}
+.node[data-status="running"] {
+  --nc: var(--s-running);
+}
+.node[data-status="review"] {
+  --nc: var(--s-review);
+}
+.node[data-status="merged"] {
+  --nc: var(--s-merged);
+}
+
+.node[data-status="running"] .node-box {
+  fill: color-mix(in oklab, var(--s-running) 24%, transparent);
+  filter: drop-shadow(0 0 7px color-mix(in oklab, var(--s-running) 45%, transparent));
+  animation: nodebreathe 2.3s var(--ease-quint) infinite;
+}
+.node[data-status="merged"] .node-box {
+  fill: color-mix(in oklab, var(--s-merged) 22%, transparent);
+}
+.node[data-status="review"] .node-box {
+  fill: color-mix(in oklab, var(--s-review) 22%, transparent);
+}
+
+@keyframes nodebreathe {
+  0%,
+  100% {
+    stroke-width: 1.4;
+  }
+  50% {
+    stroke-width: 2.6;
+  }
+}
+
+.node-dot {
+  fill: var(--nc);
+  r: 5;
+  transition: fill 0.45s ease;
+}
+.node-id {
+  fill: var(--nc);
+  font: 700 12px var(--font-mono);
+  transition: fill 0.45s ease;
+}
+.node-title {
+  fill: var(--screen-ink);
+  font: 600 15px var(--font-sans);
+}
+.node-state {
+  fill: var(--nc);
+  font: 600 9px var(--font-mono);
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+  transition: fill 0.45s ease;
+}
+.merge-ring {
+  fill: none;
+  stroke: var(--s-merged);
+  stroke-width: 1.5;
+}
+
+.edge {
+  fill: none;
+  stroke: var(--screen-line-strong);
+  stroke-width: 1.4;
+}
+.edge.soft {
+  stroke-dasharray: 2 6;
+  stroke: rgba(150, 180, 214, 0.22);
+}
+.edge.flow {
+  stroke: var(--s-running);
+  stroke-dasharray: 4 7;
+  animation: edgeflow 1.05s linear infinite;
+}
+@keyframes edgeflow {
+  to {
+    stroke-dashoffset: -11;
+  }
+}
+
+.legend {
+  position: relative;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 18px;
+  padding: 4px 8px 16px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--screen-muted);
+}
+.legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+.legend i {
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  background: var(--c);
+}

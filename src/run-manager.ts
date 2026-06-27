@@ -473,9 +473,7 @@ function buildSteeringPrompt(verification: VerificationResult): string {
 
 export async function writeAgentContext(repoRoot: string): Promise<void> {
   const runs = await listRuns(repoRoot);
-  const active = runs.filter((run) => isContextActiveStatus(run.status));
-  const ready = runs.filter((run) => isContextReadyStatus(run.status));
-  const completed = runs.filter((run) => isContextCompletedStatus(run.status));
+  const context = classifyContextRuns(runs);
   const lines = [
     "# RUDDER - Orchestrated Run Status   (read-only; re-read at the top of every significant step)",
     "",
@@ -484,49 +482,105 @@ export async function writeAgentContext(repoRoot: string): Promise<void> {
     `Updated: ${nowIso()}`,
     "",
     "## Global job snapshot",
-    ...formatRunSnapshot(runs, active, ready, completed),
+    ...formatRunSnapshot(context),
     "",
     "## Active local Rudder agents",
-    ...(active.length
-      ? active.map((run) => formatAgentContextRun(run))
+    ...(context.active.length
+      ? context.active.map((run) => formatAgentContextRun(run))
       : ["- None"]),
     "",
     "## Ready local Rudder agents",
-    ...(ready.length
-      ? ready.map((run) => formatAgentContextRun(run))
+    ...(context.ready.length
+      ? context.ready.map((run) => formatAgentContextRun(run))
       : ["- None"]),
     "",
     "## Completed local Rudder agents",
-    ...(completed.length
-      ? completed.slice(0, 12).map((run) => formatAgentContextRun(run))
+    ...(context.completed.length
+      ? context.completed.slice(0, 12).map((run) => formatAgentContextRun(run))
       : ["- None"]),
     "",
   ];
   await writeRudderContextFiles(repoRoot, runs, `${lines.join("\n")}\n`);
 }
 
-function formatRunSnapshot(
-  runs: RunRecord[],
-  active: RunRecord[],
-  ready: RunRecord[],
-  completed: RunRecord[],
-): string[] {
-  const merged = runs.filter((run) => run.status === "merged").length;
-  const failed = runs.filter((run) => run.status === "failed").length;
-  const stopped = runs.filter((run) => run.status === "cancelled").length;
-  const claude = runs.filter((run) => run.backend === "claude").length;
-  const codex = runs.filter((run) => run.backend === "codex").length;
-  const running = active.length;
-  const waiting = 0;
-  const pendingStarts = 0;
-  const readyCount = ready.length;
+type ContextRunBuckets = {
+  active: RunRecord[];
+  ready: RunRecord[];
+  completed: RunRecord[];
+  counts: {
+    total: number;
+    running: number;
+    waiting: number;
+    ready: number;
+    mergeReady: number;
+    merged: number;
+    failed: number;
+    stopped: number;
+    pendingStarts: number;
+    claude: number;
+    codex: number;
+    acpx: number;
+  };
+};
+
+function classifyContextRuns(runs: RunRecord[]): ContextRunBuckets {
+  const active: RunRecord[] = [];
+  const ready: RunRecord[] = [];
+  const completed: RunRecord[] = [];
+  const counts: ContextRunBuckets["counts"] = {
+    total: runs.length,
+    running: 0,
+    waiting: 0,
+    ready: 0,
+    mergeReady: 0,
+    merged: 0,
+    failed: 0,
+    stopped: 0,
+    pendingStarts: 0,
+    claude: 0,
+    codex: 0,
+    acpx: 0,
+  };
+
+  for (const run of runs) {
+    if (run.backend === "claude") counts.claude += 1;
+    if (run.backend === "codex") counts.codex += 1;
+    if (run.backend === "acpx") counts.acpx += 1;
+
+    if (isContextRunningStatus(run.status)) counts.running += 1;
+    if (isContextWaitingStatus(run.status)) counts.waiting += 1;
+    if (run.status === "created") counts.pendingStarts += 1;
+    if (run.status === "merged") counts.merged += 1;
+    if (run.status === "failed") counts.failed += 1;
+    if (run.status === "cancelled") counts.stopped += 1;
+
+    if (isContextActiveStatus(run.status)) {
+      active.push(run);
+    }
+    if (isContextReadyStatus(run.status)) {
+      ready.push(run);
+      counts.ready += 1;
+      if (runHasMergeSource(run)) {
+        counts.mergeReady += 1;
+      }
+    }
+    if (isContextCompletedStatus(run.status)) {
+      completed.push(run);
+    }
+  }
+
+  return { active, ready, completed, counts };
+}
+
+function formatRunSnapshot(context: ContextRunBuckets): string[] {
+  const { counts } = context;
   return [
-    `- totals: total=${runs.length} running=${running} waiting=${waiting} done=${readyCount} merged=${merged} failed=${failed} stopped=${stopped} pending-starts=${pendingStarts}`,
-    `- active-now: running=${running} waiting=${waiting} review-ready=${readyCount} merge-ready=${readyCount} pending-starts=${pendingStarts}`,
-    `- completed: merged=${merged} failed=${failed} stopped=${stopped}`,
-    `- backends: claude=${claude} codex=${codex}`,
-    `- ready-to-act: review-ready=${readyCount} merge-ready=${readyCount}`,
-    `- archived: terminal-history=${completed.length}`,
+    `- totals: total=${counts.total} running=${counts.running} waiting=${counts.waiting} done=${counts.ready} merged=${counts.merged} failed=${counts.failed} stopped=${counts.stopped} pending-starts=${counts.pendingStarts}`,
+    `- active-now: running=${counts.running} waiting=${counts.waiting} review-ready=${counts.ready} merge-ready=${counts.mergeReady} pending-starts=${counts.pendingStarts}`,
+    `- completed: merged=${counts.merged} failed=${counts.failed} stopped=${counts.stopped}`,
+    `- backends: claude=${counts.claude} codex=${counts.codex} acpx=${counts.acpx}`,
+    `- ready-to-act: review-ready=${counts.ready} merge-ready=${counts.mergeReady}`,
+    `- archived: terminal-history=${context.completed.length}`,
   ];
 }
 
@@ -1240,12 +1294,27 @@ function isContextActiveStatus(status: RunRecord["status"]): boolean {
   return isActiveStatus(status);
 }
 
+function isContextRunningStatus(status: RunRecord["status"]): boolean {
+  return status === "running" || status === "verifying";
+}
+
+function isContextWaitingStatus(status: RunRecord["status"]): boolean {
+  return status === "steering";
+}
+
 function isContextReadyStatus(status: RunRecord["status"]): boolean {
   return status === "completed" || status === "merge-conflict";
 }
 
 function isContextCompletedStatus(status: RunRecord["status"]): boolean {
   return status === "merged" || status === "failed" || status === "cancelled";
+}
+
+function runHasMergeSource(run: RunRecord): boolean {
+  return Boolean(
+    run.worktree.enabled &&
+      (run.worktree.path || run.worktree.branch || run.worktree.workspaceName || run.worktree.jjChangeId),
+  );
 }
 
 function terminalExitCode(status: RunRecord["status"]): number {

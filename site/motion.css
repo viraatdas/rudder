@@ -1,0 +1,99 @@
+/* motion defaults: visible-first, gated on JS adding .motion-ready.
+   final state is class-driven (.in) so it always persists. */
+.motion-ready [data-reveal] {
+  opacity: 0;
+  transform: translateY(22px);
+  transition: opacity 0.6s var(--ease-expo), transform 0.6s var(--ease-expo);
+}
+.motion-ready [data-reveal].in {
+  opacity: 1;
+  transform: none;
+}
+.motion-ready [data-reveal-group] > * {
+  opacity: 0;
+  transform: translateY(18px);
+  transition: opacity 0.55s var(--ease-expo), transform 0.55s var(--ease-expo);
+}
+.motion-ready [data-reveal-group].in > * {
+  opacity: 1;
+  transform: none;
+}
+
+.merge-ring {
+  transform-box: fill-box;
+  transform-origin: center;
+}
+.motion-ready h1 .steer::after {
+  transform: scaleX(0);
+  transition: transform 0.7s 0.5s var(--ease-expo);
+}
+.motion-ready h1 .steer.drawn::after {
+  transform: scaleX(1);
+}
+
+/* ---------- responsive ---------- */
+@media (max-width: 920px) {
+  .flow {
+    grid-template-columns: 1fr 1fr;
+  }
+  .flow-step {
+    border-bottom: 1px solid var(--soft-line);
+    padding-right: 20px;
+  }
+  .flow-step:nth-child(2n) {
+    border-right: 0;
+  }
+  .panes {
+    grid-template-columns: 1fr;
+  }
+  .edit-stage,
+  .control-extra {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 600px) {
+  header {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 16px;
+  }
+  nav {
+    justify-content: flex-start;
+  }
+  .flow {
+    grid-template-columns: 1fr;
+  }
+  .flow-step {
+    border-right: 0;
+  }
+  .principle {
+    grid-template-columns: 1fr;
+    gap: 8px;
+    padding: 24px 0;
+  }
+  .nc-field {
+    grid-template-columns: 1fr;
+    gap: 3px;
+  }
+  .keys-row {
+    grid-template-columns: 1fr;
+    gap: 4px;
+  }
+  .install {
+    width: 100%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
