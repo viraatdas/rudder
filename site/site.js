@@ -33,6 +33,7 @@ if (!reduceMotion && "IntersectionObserver" in window) {
   const svg = document.querySelector("[data-dag]");
   if (!svg) return;
 
+  const screen = svg.closest(".screen");
   const STATE = { planned: "planned", running: "running", review: "review", merged: "merged" };
   const node = (id) => svg.querySelector(`.node[data-node="${id}"]`);
   const edge = (key) => svg.querySelector(`.edge[data-edge="${key}"]`);
@@ -82,6 +83,30 @@ if (!reduceMotion && "IntersectionObserver" in window) {
 
   function flow(key, on) {
     edge(key)?.classList.toggle("flow", on);
+    pulse(key, on);
+  }
+
+  function pulse(key, on) {
+    const existing = svg.querySelector(`.pulse[data-pulse="${key}"]`);
+    if (!on) {
+      existing?.remove();
+      return;
+    }
+    if (existing || reduceMotion) return;
+    const e = edge(key);
+    const pathData = e?.getAttribute("d");
+    if (!pathData) return;
+    const ns = "http://www.w3.org/2000/svg";
+    const dot = document.createElementNS(ns, "circle");
+    dot.setAttribute("class", "pulse");
+    dot.setAttribute("data-pulse", key);
+    dot.setAttribute("r", "4");
+    const motion = document.createElementNS(ns, "animateMotion");
+    motion.setAttribute("dur", "1.4s");
+    motion.setAttribute("repeatCount", "indefinite");
+    motion.setAttribute("path", pathData);
+    dot.appendChild(motion);
+    svg.querySelector(".dag-edges")?.appendChild(dot);
   }
 
   // reduced motion / no orchestration: keep the authored steady state.
@@ -119,6 +144,8 @@ if (!reduceMotion && "IntersectionObserver" in window) {
   const run = () => {
     if (started) return;
     started = true;
+    screen?.classList.add("scanning");
+    setTimeout(() => screen?.classList.remove("scanning"), 1500);
     T.forEach(([t, fn]) => setTimeout(fn, t));
   };
 

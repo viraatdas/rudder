@@ -45,11 +45,15 @@ h2 {
 
 .flow-step {
   position: relative;
-  padding: 26px 22px 24px 0;
+  padding: 26px 22px 24px 22px;
   border-right: 1px solid var(--soft-line);
+}
+.flow-step:first-child {
+  padding-left: 0;
 }
 .flow-step:last-child {
   border-right: 0;
+  padding-right: 0;
 }
 
 .flow-step .marker {
@@ -291,12 +295,27 @@ kbd {
   line-height: 1.35;
 }
 
+/* controls: dashboard screenshot */
+.shot {
+  margin: 44px 0 0;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  overflow: hidden;
+  background: var(--panel);
+  box-shadow: var(--shadow-lg);
+}
+.shot img {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
 /* controls: three panes */
 .panes {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 1px;
-  margin-top: 44px;
+  margin-top: 20px;
   background: var(--line);
   border: 1px solid var(--line);
   border-radius: 14px;

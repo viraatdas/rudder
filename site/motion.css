@@ -38,7 +38,11 @@
   }
   .flow-step {
     border-bottom: 1px solid var(--soft-line);
+    padding-left: 22px;
     padding-right: 20px;
+  }
+  .flow-step:nth-child(odd) {
+    padding-left: 0;
   }
   .flow-step:nth-child(2n) {
     border-right: 0;
@@ -66,6 +70,8 @@
   }
   .flow-step {
     border-right: 0;
+    padding-left: 0;
+    padding-right: 0;
   }
   .principle {
     grid-template-columns: 1fr;

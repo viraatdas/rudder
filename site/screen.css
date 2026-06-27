@@ -79,6 +79,36 @@
   padding: clamp(8px, 2vw, 22px) clamp(6px, 2vw, 24px) 6px;
 }
 
+/* power-on light sweep, fired once when the DAG starts */
+.screen-body::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  pointer-events: none;
+  background: linear-gradient(
+    100deg,
+    transparent 38%,
+    rgba(45, 212, 191, 0.12) 50%,
+    transparent 62%
+  );
+  transform: translateX(-110%);
+  opacity: 0;
+}
+.screen.scanning .screen-body::after {
+  animation: screensweep 1.2s var(--ease-quint) 0.1s 1;
+}
+@keyframes screensweep {
+  0% {
+    transform: translateX(-110%);
+    opacity: 1;
+  }
+  100% {
+    transform: translateX(110%);
+    opacity: 0;
+  }
+}
+
 .dag {
   display: block;
   width: 100%;
@@ -122,15 +152,24 @@
 }
 
 .node[data-status="running"] .node-box {
-  fill: color-mix(in oklab, var(--s-running) 24%, transparent);
-  filter: drop-shadow(0 0 7px color-mix(in oklab, var(--s-running) 45%, transparent));
+  fill: color-mix(in oklab, var(--s-running) 26%, transparent);
+  filter: drop-shadow(0 0 11px color-mix(in oklab, var(--s-running) 62%, transparent));
   animation: nodebreathe 2.3s var(--ease-quint) infinite;
 }
 .node[data-status="merged"] .node-box {
   fill: color-mix(in oklab, var(--s-merged) 22%, transparent);
+  filter: drop-shadow(0 0 7px color-mix(in oklab, var(--s-merged) 34%, transparent));
 }
 .node[data-status="review"] .node-box {
-  fill: color-mix(in oklab, var(--s-review) 22%, transparent);
+  fill: color-mix(in oklab, var(--s-review) 24%, transparent);
+  filter: drop-shadow(0 0 9px color-mix(in oklab, var(--s-review) 42%, transparent));
+}
+
+/* traveling data pulse along an active edge */
+.pulse {
+  fill: #e8fdf8;
+  filter: drop-shadow(0 0 4px var(--s-running))
+    drop-shadow(0 0 9px var(--s-running));
 }
 
 @keyframes nodebreathe {
@@ -167,7 +206,8 @@
 .merge-ring {
   fill: none;
   stroke: var(--s-merged);
-  stroke-width: 1.5;
+  stroke-width: 1.6;
+  filter: drop-shadow(0 0 5px var(--s-merged));
 }
 
 .edge {
@@ -181,7 +221,9 @@
 }
 .edge.flow {
   stroke: var(--s-running);
+  stroke-width: 1.8;
   stroke-dasharray: 4 7;
+  filter: drop-shadow(0 0 3px var(--s-running));
   animation: edgeflow 1.05s linear infinite;
 }
 @keyframes edgeflow {
