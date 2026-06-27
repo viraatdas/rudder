@@ -15,32 +15,61 @@
       content="A terminal orchestrator for coding agents: plan a task DAG, edit it before it runs, run Claude Code and Codex in parallel across isolated jj workspaces, review, and merge."
     />
     <meta property="og:image" content="/screenshot.svg" />
-    <meta name="theme-color" content="#ffffff" />
+    <meta name="theme-color" content="#fcfcfd" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,500;12..96,600;12..96,700&display=swap"
+      rel="stylesheet"
+    />
     <style>
       :root {
-        color: #1a1a1a;
-        background: #ffffff;
-        font-family:
-          ui-sans-serif,
-          system-ui,
-          -apple-system,
-          BlinkMacSystemFont,
-          "Segoe UI",
-          sans-serif;
-        font-weight: 400;
-        --paper: #ffffff;
-        --ink: #1a1a1a;
-        --muted: #5b6470;
-        --line: #e6e7eb;
+        --paper: #fcfcfd;
+        --paper-2: #f5f6f8;
+        --ink: #14161a;
+        --muted: #515967;
+        --line: #e3e5ea;
         --soft-line: #eef0f3;
         --panel: #ffffff;
+
         --cyan: #0b747c;
         --green: #15803d;
         --amber: #b45309;
         --magenta: #a21caf;
-        --shadow-color: rgba(16, 24, 40, 0.1);
+
+        /* dark instrument screen */
+        --screen-bg: #0e1320;
+        --screen-grad: #131a2c;
+        --screen-line: rgba(125, 162, 210, 0.16);
+        --screen-line-strong: rgba(150, 180, 214, 0.34);
+        --screen-muted: #8a95ab;
+        --screen-ink: #eef2f8;
+
+        /* status, brightened for the dark screen */
+        --s-planned: #8b94a3;
+        --s-running: #2dd4bf;
+        --s-review: #fbbf24;
+        --s-merged: #4ade80;
+        --s-control: #e879f9;
+
         --shadow-sm: 0 1px 2px rgba(16, 24, 40, 0.06);
-        --shadow-lg: 0 18px 44px rgba(16, 24, 40, 0.1);
+        --shadow-md: 0 10px 28px rgba(16, 24, 40, 0.08);
+        --shadow-lg: 0 24px 60px rgba(13, 19, 40, 0.16);
+
+        --ease-quint: cubic-bezier(0.22, 1, 0.36, 1);
+        --ease-expo: cubic-bezier(0.16, 1, 0.3, 1);
+
+        --font-display: "Bricolage Grotesque", ui-sans-serif, system-ui,
+          -apple-system, sans-serif;
+        --font-sans: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+          "Segoe UI", sans-serif;
+        --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+        color: var(--ink);
+        background: var(--paper);
+        font-family: var(--font-sans);
+        font-weight: 400;
+        -webkit-font-smoothing: antialiased;
       }
 
       * {
@@ -55,23 +84,26 @@
         margin: 0;
         background: var(--paper);
         color: var(--ink);
+        overflow-x: hidden;
       }
 
+      /* faint blueprint grid on the paper */
       body::before {
         content: "";
         position: fixed;
         inset: 0;
+        z-index: -1;
         pointer-events: none;
         background-image:
-          linear-gradient(rgba(21, 21, 21, 0.035) 1px, transparent 1px),
-          linear-gradient(90deg, rgba(21, 21, 21, 0.025) 1px, transparent 1px);
-        background-size: 48px 48px;
-        mask-image: linear-gradient(to bottom, #000 0%, transparent 70%);
+          linear-gradient(rgba(20, 40, 70, 0.04) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(20, 40, 70, 0.03) 1px, transparent 1px);
+        background-size: 52px 52px;
+        mask-image: radial-gradient(120% 80% at 70% 0%, #000 0%, transparent 72%);
       }
 
       a {
         color: inherit;
-        text-decoration-color: rgba(21, 21, 21, 0.55);
+        text-decoration-color: rgba(20, 22, 26, 0.35);
         text-decoration-thickness: 1px;
         text-underline-offset: 4px;
         transition: color 160ms ease, text-decoration-color 160ms ease;
@@ -82,679 +114,988 @@
         text-decoration-color: currentColor;
       }
 
-      .page {
-        position: relative;
-        max-width: 1440px;
-        margin: 0 auto;
-        padding: 28px 24px 72px;
+      :focus-visible {
+        outline: 2px solid var(--cyan);
+        outline-offset: 3px;
+        border-radius: 2px;
       }
 
+      .page {
+        position: relative;
+        max-width: 1320px;
+        margin: 0 auto;
+        padding: 26px clamp(16px, 4vw, 40px) 0;
+      }
+
+      /* ---------- header ---------- */
       header {
         display: flex;
         align-items: center;
         justify-content: space-between;
         gap: 24px;
-        padding-bottom: clamp(48px, 7vw, 92px);
+        padding-bottom: clamp(40px, 6vw, 72px);
       }
 
       .brand {
         display: inline-flex;
         align-items: center;
-        gap: 12px;
-        font-size: 15px;
-        font-weight: 520;
+        gap: 11px;
+        font-family: var(--font-display);
+        font-size: 18px;
+        font-weight: 600;
+        letter-spacing: -0.01em;
         text-decoration: none;
       }
 
       .brand img {
-        width: 28px;
-        height: 28px;
+        width: 26px;
+        height: 26px;
       }
 
       nav {
         display: flex;
         flex-wrap: wrap;
         justify-content: flex-end;
-        gap: 10px 18px;
+        align-items: center;
+        gap: 8px 22px;
         color: var(--muted);
         font-size: 14px;
       }
 
+      .nav-cta {
+        padding: 7px 14px;
+        border: 1px solid var(--ink);
+        border-radius: 999px;
+        color: var(--ink);
+        text-decoration: none;
+        font-weight: 540;
+        transition: background 160ms ease, color 160ms ease,
+          transform 160ms var(--ease-quint);
+      }
+
+      .nav-cta:hover {
+        background: var(--ink);
+        color: var(--paper);
+        transform: translateY(-1px);
+      }
+
+      /* ---------- hero ---------- */
       .hero {
-        max-width: 1120px;
+        display: grid;
+        grid-template-columns: minmax(0, 1fr);
+        gap: clamp(28px, 4vw, 44px);
       }
 
       .eyebrow {
-        margin: 0 0 18px;
-        color: var(--cyan);
-        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-        font-size: 13px;
-        font-weight: 600;
-        text-transform: uppercase;
+        margin: 0 0 20px;
+        display: inline-flex;
+        align-items: center;
+        gap: 10px;
+        color: var(--muted);
+        font-family: var(--font-mono);
+        font-size: 12.5px;
+        letter-spacing: 0.02em;
       }
 
-      h1,
-      h2,
-      h3,
-      p {
-        margin: 0;
+      .eyebrow .dot {
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: var(--s-merged);
+        box-shadow: 0 0 0 0 rgba(74, 222, 128, 0.5);
+        animation: livepulse 2.6s ease-out infinite;
+      }
+
+      @keyframes livepulse {
+        0% {
+          box-shadow: 0 0 0 0 rgba(21, 128, 61, 0.4);
+        }
+        70%,
+        100% {
+          box-shadow: 0 0 0 7px rgba(21, 128, 61, 0);
+        }
       }
 
       h1 {
-        max-width: 1120px;
-        font-size: clamp(56px, 9vw, 126px);
-        line-height: 0.9;
-        font-weight: 380;
-        letter-spacing: 0;
+        margin: 0;
+        font-family: var(--font-display);
+        font-size: clamp(46px, 8.4vw, 92px);
+        line-height: 0.94;
+        font-weight: 600;
+        letter-spacing: -0.035em;
+        max-width: 16ch;
+        text-wrap: balance;
+      }
+
+      h1 .steer {
+        position: relative;
+        white-space: nowrap;
+      }
+
+      h1 .steer::after {
+        content: "";
+        position: absolute;
+        left: 0;
+        right: 0;
+        bottom: 0.06em;
+        height: 0.09em;
+        background: linear-gradient(
+          90deg,
+          var(--cyan),
+          var(--magenta) 50%,
+          var(--amber)
+        );
+        transform: scaleX(1);
+        transform-origin: left;
+        border-radius: 2px;
       }
 
       .lede {
-        margin-top: 28px;
-        max-width: 820px;
-        font-size: clamp(19px, 2.2vw, 28px);
-        line-height: 1.35;
-        color: #3a3f47;
+        margin: 26px 0 0;
+        max-width: 60ch;
+        font-size: clamp(17px, 1.9vw, 21px);
+        line-height: 1.5;
+        color: #3a404b;
+        text-wrap: pretty;
       }
 
       .actions {
         display: flex;
         flex-wrap: wrap;
         gap: 12px;
-        margin-top: 34px;
+        margin-top: 30px;
       }
 
       .install {
         display: inline-flex;
         align-items: stretch;
-        width: min(100%, 430px);
+        width: min(100%, 420px);
         min-width: 0;
-        max-width: 100%;
         border: 1px solid var(--line);
+        border-radius: 10px;
         background: var(--panel);
         box-shadow: var(--shadow-sm);
+        overflow: hidden;
       }
 
       .install code {
         min-width: 0;
         flex: 1;
-        padding: 12px 14px;
+        padding: 13px 15px;
         overflow-x: auto;
-        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-family: var(--font-mono);
         font-size: 13px;
-        line-height: 1.55;
+        line-height: 1.5;
         white-space: pre;
+      }
+
+      .install code .prompt {
+        color: var(--cyan);
+        user-select: none;
       }
 
       .copy,
       .button-link {
         appearance: none;
-        border: 1px solid var(--line);
-        background: var(--ink);
-        color: #fff;
+        border: 0;
         cursor: pointer;
         font: inherit;
         font-size: 13px;
         font-weight: 560;
         text-decoration: none;
-        transition: transform 160ms ease, background 160ms ease, color 160ms ease;
+        transition: background 160ms ease, color 160ms ease,
+          transform 160ms var(--ease-quint);
       }
 
       .copy {
         flex: 0 0 auto;
-        border-width: 0 0 0 1px;
         padding: 0 16px;
+        border-left: 1px solid var(--line);
+        background: var(--ink);
+        color: #fff;
       }
 
       .button-link {
         display: inline-flex;
         align-items: center;
         padding: 0 18px;
+        min-height: 44px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
         background: transparent;
         color: var(--ink);
       }
 
-      .copy:hover,
+      .button-link:hover,
+      .copy:hover {
+        transform: translateY(-1px);
+      }
+
       .button-link:hover {
-        transform: translate(-1px, -1px);
+        background: var(--paper-2);
       }
 
-      .copy:focus-visible,
-      .button-link:focus-visible,
-      a:focus-visible {
-        outline: 2px solid var(--cyan);
-        outline-offset: 3px;
-      }
-
-      .product {
-        margin-top: 54px;
-      }
-
-      .shot {
+      /* ---------- the screen (live DAG) ---------- */
+      .screen {
         position: relative;
-        overflow: hidden;
-        aspect-ratio: 2000 / 930;
-        border: 1px solid var(--line);
-        background: var(--paper);
+        margin-top: clamp(20px, 3vw, 30px);
+        border-radius: 16px;
+        background:
+          radial-gradient(
+            130% 120% at 18% -10%,
+            var(--screen-grad),
+            var(--screen-bg) 60%
+          );
+        border: 1px solid rgba(125, 162, 210, 0.22);
         box-shadow: var(--shadow-lg);
+        overflow: hidden;
       }
 
-      .shot img {
+      .screen::before {
+        content: "";
+        position: absolute;
+        inset: 0;
+        pointer-events: none;
+        background-image:
+          linear-gradient(var(--screen-line) 1px, transparent 1px),
+          linear-gradient(90deg, var(--screen-line) 1px, transparent 1px);
+        background-size: 30px 30px;
+        mask-image: radial-gradient(120% 120% at 50% 0%, #000, transparent 85%);
+        opacity: 0.4;
+      }
+
+      .screen-head {
+        position: relative;
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        padding: 13px 18px;
+        border-bottom: 1px solid var(--screen-line);
+        font-family: var(--font-mono);
+        font-size: 12px;
+        color: var(--screen-muted);
+      }
+
+      .screen-head .live {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        color: var(--s-control);
+      }
+
+      .screen-head .live::before {
+        content: "";
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: var(--s-control);
+        animation: livepulse-m 2.4s ease-out infinite;
+      }
+
+      @keyframes livepulse-m {
+        0% {
+          box-shadow: 0 0 0 0 rgba(232, 121, 249, 0.45);
+        }
+        70%,
+        100% {
+          box-shadow: 0 0 0 6px rgba(232, 121, 249, 0);
+        }
+      }
+
+      .screen-head .path {
+        color: var(--screen-muted);
+      }
+
+      .screen-head .caret {
+        color: var(--s-control);
+        animation: blink 1.1s steps(2, start) infinite;
+      }
+
+      .screen-body {
+        position: relative;
+        padding: clamp(8px, 2vw, 22px) clamp(6px, 2vw, 24px) 6px;
+      }
+
+      .dag {
         display: block;
         width: 100%;
         height: auto;
       }
 
-      .terminal-bar {
-        display: grid;
-        grid-template-columns: repeat(4, minmax(0, 1fr));
-        border-width: 0 1px 1px;
-        border-style: solid;
-        border-color: var(--line);
-        background: var(--panel);
-        box-shadow: var(--shadow-lg);
+      .node-box {
+        fill: rgba(255, 255, 255, 0.03);
+        stroke: var(--nc, var(--s-planned));
+        stroke-width: 2.1;
+        transition: stroke 0.45s ease, fill 0.45s ease;
+      }
+      .node[data-status="planned"] .node-box {
+        stroke-width: 1.5;
       }
 
-      .terminal-stat {
-        min-width: 0;
-        padding: 15px 16px;
-        border-right: 1px solid var(--soft-line);
+      .node {
+        --nc: var(--s-planned);
+        transform-box: fill-box;
+        transform-origin: center;
+      }
+      /* choreographed entrance: only when JS confirms motion (.choreo) */
+      .dag.choreo .node {
+        opacity: 0;
+        transform: translateY(7px) scale(0.92);
+        transition: opacity 0.5s var(--ease-quint),
+          transform 0.5s var(--ease-quint);
+      }
+      .dag.choreo .node.shown {
+        opacity: 1;
+        transform: none;
+      }
+      .node[data-status="running"] {
+        --nc: var(--s-running);
+      }
+      .node[data-status="review"] {
+        --nc: var(--s-review);
+      }
+      .node[data-status="merged"] {
+        --nc: var(--s-merged);
       }
 
-      .terminal-stat:last-child {
-        border-right: 0;
+      .node[data-status="running"] .node-box {
+        fill: color-mix(in oklab, var(--s-running) 24%, transparent);
+        filter: drop-shadow(0 0 7px color-mix(in oklab, var(--s-running) 45%, transparent));
+        animation: nodebreathe 2.3s var(--ease-quint) infinite;
+      }
+      .node[data-status="merged"] .node-box {
+        fill: color-mix(in oklab, var(--s-merged) 22%, transparent);
+      }
+      .node[data-status="review"] .node-box {
+        fill: color-mix(in oklab, var(--s-review) 22%, transparent);
       }
 
-      .terminal-stat strong {
-        display: block;
-        margin-bottom: 5px;
-        color: var(--ink);
-        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-        font-size: 13px;
+      @keyframes nodebreathe {
+        0%,
+        100% {
+          stroke-width: 1.4;
+        }
+        50% {
+          stroke-width: 2.6;
+        }
       }
 
-      .terminal-stat span {
-        color: var(--muted);
-        font-size: 14px;
-        line-height: 1.35;
+      .node-dot {
+        fill: var(--nc);
+        r: 5;
+        transition: fill 0.45s ease;
+      }
+      .node-id {
+        fill: var(--nc);
+        font: 700 12px var(--font-mono);
+        transition: fill 0.45s ease;
+      }
+      .node-title {
+        fill: var(--screen-ink);
+        font: 600 15px var(--font-sans);
+      }
+      .node-state {
+        fill: var(--nc);
+        font: 600 9px var(--font-mono);
+        letter-spacing: 0.13em;
+        text-transform: uppercase;
+        transition: fill 0.45s ease;
+      }
+      .merge-ring {
+        fill: none;
+        stroke: var(--s-merged);
+        stroke-width: 1.5;
       }
 
+      .edge {
+        fill: none;
+        stroke: var(--screen-line-strong);
+        stroke-width: 1.4;
+      }
+      .edge.soft {
+        stroke-dasharray: 2 6;
+        stroke: rgba(150, 180, 214, 0.22);
+      }
+      .edge.flow {
+        stroke: var(--s-running);
+        stroke-dasharray: 4 7;
+        animation: edgeflow 1.05s linear infinite;
+      }
+      @keyframes edgeflow {
+        to {
+          stroke-dashoffset: -11;
+        }
+      }
+
+      .legend {
+        position: relative;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px 18px;
+        padding: 4px 8px 16px;
+        font-family: var(--font-mono);
+        font-size: 11.5px;
+        color: var(--screen-muted);
+      }
+      .legend span {
+        display: inline-flex;
+        align-items: center;
+        gap: 7px;
+      }
+      .legend i {
+        width: 8px;
+        height: 8px;
+        border-radius: 2px;
+        background: var(--c);
+      }
+
+      /* ---------- sections ---------- */
       .section {
-        margin-top: clamp(68px, 9vw, 118px);
+        margin-top: clamp(72px, 10vw, 132px);
       }
 
       .section-head {
-        display: grid;
-        grid-template-columns: minmax(0, 0.75fr) minmax(320px, 1fr);
-        gap: 32px;
-        align-items: end;
-        padding-top: 22px;
-        border-top: 1px solid var(--line);
+        max-width: 760px;
+      }
+
+      .kicker {
+        margin: 0 0 14px;
+        font-family: var(--font-mono);
+        font-size: 12.5px;
+        letter-spacing: 0.04em;
+        color: var(--cyan);
       }
 
       h2 {
-        font-size: clamp(30px, 5vw, 64px);
-        line-height: 0.96;
-        font-weight: 390;
-        letter-spacing: 0;
+        margin: 0;
+        font-family: var(--font-display);
+        font-size: clamp(30px, 4.6vw, 54px);
+        line-height: 1;
+        font-weight: 600;
+        letter-spacing: -0.03em;
+        text-wrap: balance;
       }
 
       .section-head p {
+        margin: 18px 0 0;
+        max-width: 62ch;
         color: var(--muted);
-        font-size: 17px;
+        font-size: clamp(16px, 1.6vw, 18px);
         line-height: 1.6;
+        text-wrap: pretty;
       }
 
-      .grid {
+      /* flow: describe -> plan -> run -> review -> merge */
+      .flow {
         display: grid;
-        grid-template-columns: repeat(3, minmax(0, 1fr));
-        gap: 18px;
-        margin-top: 32px;
-      }
-
-      .card {
-        min-height: 226px;
-        padding: 22px;
-        border: 1px solid var(--line);
-        background: var(--panel);
-        box-shadow: var(--shadow-sm);
-        transition: transform 180ms ease, box-shadow 180ms ease;
-      }
-
-      .card:hover {
-        transform: translate(-2px, -2px);
-        box-shadow: var(--shadow-lg);
-      }
-
-      .card h3 {
-        margin-bottom: 14px;
-        font-size: 14px;
-        line-height: 1.2;
-        font-weight: 700;
-        letter-spacing: 0.08em;
-        text-transform: uppercase;
-      }
-
-      .card p {
-        color: var(--muted);
-        font-size: 15px;
-        line-height: 1.55;
-      }
-
-      .card .tag {
-        display: inline-flex;
-        margin-bottom: 22px;
-        padding: 3px 7px;
-        border: 1px solid currentColor;
-        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-        font-size: 12px;
-        font-weight: 700;
-      }
-
-      .tag.green {
-        color: var(--green);
-      }
-
-      .tag.cyan {
-        color: var(--cyan);
-      }
-
-      .tag.amber {
-        color: var(--amber);
-      }
-
-      .tag.magenta {
-        color: var(--magenta);
-      }
-
-      .control-stage {
-        display: grid;
-        grid-template-columns: minmax(0, 1.15fr) minmax(280px, 0.85fr);
-        gap: 18px;
-        margin-top: 32px;
-      }
-
-      .key-map,
-      .type-card,
-      .leader-card,
-      .command-strip {
-        border: 1px solid var(--line);
-        background: var(--panel);
-      }
-
-      .key-map {
-        display: grid;
-        grid-template-columns: repeat(3, minmax(0, 1fr));
-        min-height: 260px;
-      }
-
-      .key-tile {
-        display: grid;
-        align-content: space-between;
-        min-width: 0;
-        padding: 24px;
-        border-right: 1px solid var(--soft-line);
-        transition: background 180ms ease, transform 180ms ease;
-      }
-
-      .key-tile:last-child {
-        border-right: 0;
-      }
-
-      .key-tile:hover {
-        background: var(--paper-2, #f6f7f9);
-        transform: translateY(-2px);
-      }
-
-      .key {
-        display: inline-flex;
-        width: fit-content;
-        padding: 5px 8px;
-        border: 1px solid currentColor;
-        border-radius: 2px;
-        box-shadow: none;
-        color: var(--cyan);
-        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-        font-size: 13px;
-        font-weight: 700;
-      }
-
-      .key-tile strong {
-        display: block;
-        font-size: clamp(26px, 4vw, 46px);
-        font-weight: 390;
-        line-height: 0.96;
-      }
-
-      .key-tile span:not(.key) {
-        display: block;
-        margin-top: 14px;
-        color: var(--muted);
-        font-size: 15px;
-        line-height: 1.45;
-      }
-
-      .control-side {
-        display: grid;
-        gap: 18px;
-      }
-
-      .type-card {
-        min-height: 128px;
-        padding: 20px;
-        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      }
-
-      .type-label {
-        display: block;
-        margin-bottom: 18px;
-        color: var(--muted);
-        font-size: 12px;
-        text-transform: uppercase;
-      }
-
-      .typed-line {
-        color: var(--ink);
-        font-size: clamp(18px, 2.8vw, 26px);
-        line-height: 1.2;
-        overflow-wrap: anywhere;
-      }
-
-      .leader-card {
-        padding: 18px;
-      }
-
-      .leader-title {
-        display: block;
-        margin-bottom: 14px;
-        color: var(--ink);
-        font-size: 14px;
-        font-weight: 700;
-        letter-spacing: 0.08em;
-        text-transform: uppercase;
-      }
-
-      .leader-grid {
-        display: grid;
-        gap: 10px;
-      }
-
-      .leader-item {
-        display: grid;
-        grid-template-columns: minmax(142px, max-content) minmax(0, 1fr);
-        gap: 14px;
-        align-items: center;
-        padding: 10px 0;
-        border-top: 1px solid var(--soft-line);
-      }
-
-      .leader-item:first-child {
-        border-top: 0;
-        padding-top: 0;
-      }
-
-      .leader-item:last-child {
-        padding-bottom: 0;
-      }
-
-      .leader-item code {
-        color: var(--cyan);
-        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-        font-size: 13px;
-        white-space: nowrap;
-      }
-
-      .leader-item span {
-        color: var(--muted);
-        font-size: 14px;
-        line-height: 1.35;
-      }
-
-      .cursor {
-        display: inline-block;
-        width: 0.58em;
-        color: var(--green);
-        animation: blink 1s steps(2, start) infinite;
-      }
-
-      .command-strip {
-        display: grid;
-      }
-
-      .command-chip {
-        display: grid;
-        grid-template-columns: minmax(96px, max-content) minmax(0, 1fr);
-        gap: 16px;
-        align-items: center;
-        padding: 15px 18px;
-        border-top: 1px solid var(--soft-line);
-      }
-
-      .command-chip:first-child {
-        border-top: 0;
-      }
-
-      .command-chip code {
-        color: var(--magenta);
-        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-        font-size: 13px;
-        white-space: nowrap;
-      }
-
-      .command-chip span {
-        color: var(--muted);
-        font-size: 15px;
-        line-height: 1.35;
-      }
-
-      .principles {
-        margin-top: 32px;
+        grid-template-columns: repeat(5, minmax(0, 1fr));
+        gap: 0;
+        margin-top: 44px;
         border-top: 1px solid var(--line);
       }
 
-      .principle {
-        display: grid;
-        grid-template-columns: minmax(56px, 0.16fr) minmax(0, 1fr);
-        gap: 28px;
-        padding: 28px 0;
-        border-bottom: 1px solid var(--soft-line);
+      .flow-step {
+        position: relative;
+        padding: 26px 22px 24px 0;
+        border-right: 1px solid var(--soft-line);
+      }
+      .flow-step:last-child {
+        border-right: 0;
       }
 
-      .principle-index {
-        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-        font-size: 14px;
-        font-weight: 700;
-        color: var(--cyan);
+      .flow-step .marker {
+        display: inline-flex;
+        align-items: center;
+        gap: 9px;
+        margin-bottom: 14px;
+        font-family: var(--font-mono);
+        font-size: 12px;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+        color: var(--c, var(--ink));
       }
-
-      .principle-index.green {
-        color: var(--green);
+      .flow-step .marker::before {
+        content: "";
+        width: 9px;
+        height: 9px;
+        border-radius: 50%;
+        background: var(--c, var(--ink));
+        box-shadow: 0 0 0 4px color-mix(in oklab, var(--c, #000) 14%, transparent);
       }
-
-      .principle-index.amber {
-        color: var(--amber);
+      .flow-step h3 {
+        margin: 0 0 8px;
+        font-family: var(--font-display);
+        font-size: 21px;
+        font-weight: 600;
+        letter-spacing: -0.02em;
       }
-
-      .principle-index.magenta {
-        color: var(--magenta);
-      }
-
-      .principle h3 {
-        margin-bottom: 12px;
-        font-size: clamp(22px, 3vw, 34px);
-        font-weight: 390;
-        line-height: 1.05;
-        letter-spacing: 0;
-        text-transform: none;
-      }
-
-      .principle p {
-        max-width: 720px;
+      .flow-step p {
+        margin: 0;
         color: var(--muted);
-        font-size: 16px;
+        font-size: 14.5px;
+        line-height: 1.5;
+      }
+
+      /* feature trio (top accent rule, not a uniform card) */
+      .features {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+        gap: 1px;
+        margin-top: 44px;
+        background: var(--line);
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        overflow: hidden;
+      }
+      .feature {
+        position: relative;
+        padding: 30px 26px 34px;
+        background: var(--panel);
+      }
+      .feature::before {
+        content: "";
+        position: absolute;
+        top: 0;
+        left: 0;
+        right: 0;
+        height: 3px;
+        background: var(--c);
+      }
+      .feature .tag {
+        display: inline-block;
+        margin-bottom: 18px;
+        font-family: var(--font-mono);
+        font-size: 12px;
+        font-weight: 600;
+        color: var(--c);
+      }
+      .feature h3 {
+        margin: 0 0 12px;
+        font-family: var(--font-display);
+        font-size: 23px;
+        font-weight: 600;
+        letter-spacing: -0.02em;
+      }
+      .feature p {
+        margin: 0;
+        color: var(--muted);
+        font-size: 15px;
         line-height: 1.6;
       }
 
-      .edit-fields {
-        align-self: start;
-        border: 1px solid var(--line);
-        background: var(--panel);
+      /* principles */
+      .principles {
+        margin-top: 44px;
+        border-top: 1px solid var(--line);
       }
-
-      .edit-field {
+      .principle {
         display: grid;
-        grid-template-columns: minmax(132px, max-content) minmax(0, 1fr);
-        gap: 16px;
+        grid-template-columns: minmax(54px, 0.14fr) minmax(0, 1fr);
+        gap: clamp(16px, 4vw, 48px);
+        padding: 30px 0;
+        border-bottom: 1px solid var(--soft-line);
         align-items: baseline;
-        padding: 15px 18px;
-        border-top: 1px solid var(--soft-line);
+      }
+      .principle-index {
+        font-family: var(--font-mono);
+        font-size: 14px;
+        font-weight: 700;
+        color: var(--c, var(--cyan));
+      }
+      .principle h3 {
+        margin: 0 0 10px;
+        font-family: var(--font-display);
+        font-size: clamp(22px, 3vw, 34px);
+        font-weight: 500;
+        letter-spacing: -0.02em;
+        line-height: 1.04;
+      }
+      .principle p {
+        margin: 0;
+        max-width: 64ch;
+        color: var(--muted);
+        font-size: 16px;
+        line-height: 1.62;
       }
 
-      .edit-field:first-child {
+      /* edit-the-plan: node editor + keys */
+      .edit-stage {
+        display: grid;
+        grid-template-columns: minmax(0, 1.15fr) minmax(260px, 0.85fr);
+        gap: 20px;
+        margin-top: 44px;
+      }
+      .node-card {
+        position: relative;
+        border-radius: 14px;
+        background: radial-gradient(
+            130% 120% at 12% -20%,
+            var(--screen-grad),
+            var(--screen-bg) 62%
+          );
+        border: 1px solid rgba(125, 162, 210, 0.22);
+        box-shadow: var(--shadow-md);
+        padding: 22px clamp(16px, 3vw, 28px) 24px;
+        overflow: hidden;
+      }
+      .node-card .nc-head {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        margin-bottom: 18px;
+        font-family: var(--font-mono);
+        font-size: 12px;
+        color: var(--screen-muted);
+      }
+      .node-card .nc-chip {
+        padding: 3px 9px;
+        border-radius: 999px;
+        background: color-mix(in oklab, var(--s-control) 18%, transparent);
+        color: var(--s-control);
+        font-weight: 600;
+      }
+      .nc-field {
+        display: grid;
+        grid-template-columns: 92px minmax(0, 1fr);
+        gap: 14px;
+        align-items: baseline;
+        padding: 11px 0;
+        border-top: 1px solid var(--screen-line);
+      }
+      .nc-field:first-of-type {
         border-top: 0;
       }
+      .nc-field .k {
+        font-family: var(--font-mono);
+        font-size: 12px;
+        color: var(--s-running);
+      }
+      .nc-field .v {
+        font-size: 14.5px;
+        color: var(--screen-ink);
+        line-height: 1.4;
+      }
+      .nc-field .v.muted {
+        color: var(--screen-muted);
+      }
+      .nc-field.active .v {
+        color: #fff;
+      }
+      .nc-field.active .editcaret {
+        display: inline-block;
+        width: 2px;
+        height: 1.05em;
+        margin-left: 1px;
+        vertical-align: text-bottom;
+        background: var(--s-control);
+        animation: blink 1.05s steps(2, start) infinite;
+      }
+      .nc-field .editcaret {
+        display: none;
+      }
 
-      .edit-field code {
-        color: var(--cyan);
-        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-        font-size: 13px;
+      /* reused: keys panel */
+      .keys-card {
+        align-self: start;
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        background: var(--panel);
+        box-shadow: var(--shadow-sm);
+        padding: 20px 22px;
+      }
+      .keys-card .keys-title {
+        display: block;
+        margin-bottom: 14px;
+        font-family: var(--font-mono);
+        font-size: 12px;
+        letter-spacing: 0.04em;
+        color: var(--magenta);
+      }
+      .keys-row {
+        display: grid;
+        grid-template-columns: minmax(96px, max-content) minmax(0, 1fr);
+        gap: 14px;
+        align-items: center;
+        padding: 11px 0;
+        border-top: 1px solid var(--soft-line);
+      }
+      .keys-row:first-of-type {
+        border-top: 0;
+      }
+      kbd {
+        display: inline-flex;
+        align-items: center;
+        padding: 4px 8px;
+        border: 1px solid var(--line);
+        border-bottom-width: 2px;
+        border-radius: 6px;
+        background: var(--paper-2);
+        font-family: var(--font-mono);
+        font-size: 12px;
         font-weight: 600;
+        color: var(--ink);
         white-space: nowrap;
       }
-
-      .edit-field span {
+      .keys-row span {
         color: var(--muted);
-        font-size: 15px;
-        line-height: 1.45;
+        font-size: 14px;
+        line-height: 1.35;
       }
 
-      .motion-ready [data-reveal] {
-        opacity: 0;
-        transform: translateY(18px);
+      /* controls: three panes */
+      .panes {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 1px;
+        margin-top: 44px;
+        background: var(--line);
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        overflow: hidden;
+      }
+      .pane {
+        background: var(--panel);
+        padding: 26px 24px 28px;
+        transition: background 200ms ease, transform 200ms var(--ease-quint);
+      }
+      .pane:hover {
+        background: var(--paper-2);
+      }
+      .pane .key {
+        display: inline-flex;
+        padding: 5px 9px;
+        margin-bottom: 18px;
+        border: 1px solid var(--cyan);
+        border-radius: 6px;
+        color: var(--cyan);
+        font-family: var(--font-mono);
+        font-size: 12.5px;
+        font-weight: 700;
+      }
+      .pane h3 {
+        margin: 0 0 12px;
+        font-family: var(--font-display);
+        font-size: clamp(24px, 3vw, 34px);
+        font-weight: 500;
+        letter-spacing: -0.02em;
+        line-height: 0.98;
+      }
+      .pane p {
+        margin: 0;
+        color: var(--muted);
+        font-size: 14.5px;
+        line-height: 1.5;
       }
 
-      .motion-ready [data-reveal-group] > * {
-        opacity: 0;
-        transform: translateY(18px);
+      .control-extra {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(260px, 0.8fr);
+        gap: 20px;
+        margin-top: 20px;
       }
-
+      .type-card {
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        background: var(--panel);
+        box-shadow: var(--shadow-sm);
+        padding: 22px;
+        font-family: var(--font-mono);
+      }
+      .type-label {
+        display: block;
+        margin-bottom: 16px;
+        color: var(--muted);
+        font-size: 11.5px;
+        letter-spacing: 0.05em;
+        text-transform: uppercase;
+      }
+      .typed-line {
+        color: var(--ink);
+        font-size: clamp(17px, 2.4vw, 24px);
+        line-height: 1.25;
+        overflow-wrap: anywhere;
+      }
+      .typed-line .gt {
+        color: var(--cyan);
+      }
+      .cursor {
+        display: inline-block;
+        width: 0.55em;
+        color: var(--green);
+        animation: blink 1s steps(2, start) infinite;
+      }
       @keyframes blink {
         50% {
           opacity: 0;
         }
       }
 
-      @media (max-width: 960px) {
-        .section-head {
+      /* closing cta */
+      .cta {
+        position: relative;
+        margin-top: clamp(80px, 11vw, 150px);
+        padding: clamp(40px, 6vw, 76px) clamp(24px, 5vw, 64px);
+        border-radius: 18px;
+        background: radial-gradient(
+            130% 140% at 14% 0%,
+            var(--screen-grad),
+            var(--screen-bg) 60%
+          );
+        border: 1px solid rgba(125, 162, 210, 0.22);
+        box-shadow: var(--shadow-lg);
+        overflow: hidden;
+      }
+      .cta::before {
+        content: "";
+        position: absolute;
+        inset: 0;
+        pointer-events: none;
+        background-image:
+          linear-gradient(var(--screen-line) 1px, transparent 1px),
+          linear-gradient(90deg, var(--screen-line) 1px, transparent 1px);
+        background-size: 30px 30px;
+        mask-image: radial-gradient(110% 120% at 80% 0%, #000, transparent 80%);
+        opacity: 0.55;
+      }
+      .cta h2 {
+        position: relative;
+        color: var(--screen-ink);
+        font-size: clamp(32px, 5vw, 60px);
+      }
+      .cta p {
+        position: relative;
+        margin: 16px 0 0;
+        max-width: 52ch;
+        color: var(--screen-muted);
+        font-size: clamp(16px, 1.7vw, 19px);
+        line-height: 1.55;
+      }
+      .cta .actions {
+        position: relative;
+      }
+      .cta .install {
+        border-color: rgba(125, 162, 210, 0.3);
+        background: rgba(255, 255, 255, 0.04);
+      }
+      .cta .install code {
+        color: var(--screen-ink);
+      }
+      .cta .install code .prompt {
+        color: var(--s-running);
+      }
+      .cta .copy {
+        background: var(--screen-ink);
+        color: var(--screen-bg);
+        border-left-color: rgba(125, 162, 210, 0.3);
+      }
+      .cta .button-link {
+        border-color: rgba(125, 162, 210, 0.3);
+        color: var(--screen-ink);
+      }
+      .cta .button-link:hover {
+        background: rgba(255, 255, 255, 0.06);
+      }
+
+      footer {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 14px 28px;
+        align-items: center;
+        justify-content: space-between;
+        margin-top: 48px;
+        padding: 30px 0 56px;
+        border-top: 1px solid var(--line);
+        color: var(--muted);
+        font-size: 13.5px;
+      }
+      footer nav {
+        gap: 8px 20px;
+      }
+
+      /* motion defaults: visible-first, gated on JS adding .motion-ready.
+         final state is class-driven (.in) so it always persists. */
+      .motion-ready [data-reveal] {
+        opacity: 0;
+        transform: translateY(22px);
+        transition: opacity 0.6s var(--ease-expo), transform 0.6s var(--ease-expo);
+      }
+      .motion-ready [data-reveal].in {
+        opacity: 1;
+        transform: none;
+      }
+      .motion-ready [data-reveal-group] > * {
+        opacity: 0;
+        transform: translateY(18px);
+        transition: opacity 0.55s var(--ease-expo), transform 0.55s var(--ease-expo);
+      }
+      .motion-ready [data-reveal-group].in > * {
+        opacity: 1;
+        transform: none;
+      }
+
+      .merge-ring {
+        transform-box: fill-box;
+        transform-origin: center;
+      }
+      .motion-ready h1 .steer::after {
+        transform: scaleX(0);
+        transition: transform 0.7s 0.5s var(--ease-expo);
+      }
+      .motion-ready h1 .steer.drawn::after {
+        transform: scaleX(1);
+      }
+
+      /* ---------- responsive ---------- */
+      @media (max-width: 920px) {
+        .flow {
+          grid-template-columns: 1fr 1fr;
+        }
+        .flow-step {
+          border-bottom: 1px solid var(--soft-line);
+          padding-right: 20px;
+        }
+        .flow-step:nth-child(2n) {
+          border-right: 0;
+        }
+        .panes {
           grid-template-columns: 1fr;
         }
-
-        .grid,
-        .control-stage,
-        .key-map {
+        .edit-stage,
+        .control-extra {
           grid-template-columns: 1fr;
-        }
-
-        .key-tile {
-          border-right: 0;
-          border-bottom: 1px solid var(--soft-line);
-        }
-
-        .key-tile:last-child {
-          border-bottom: 0;
-        }
-
-        .terminal-bar {
-          grid-template-columns: repeat(2, minmax(0, 1fr));
-        }
-
-        .terminal-stat:nth-child(2) {
-          border-right: 0;
-        }
-
-        .terminal-stat:nth-child(-n + 2) {
-          border-bottom: 1px solid var(--soft-line);
         }
       }
 
-      @media (max-width: 620px) {
-        .page {
-          padding: 22px 16px 54px;
-        }
-
+      @media (max-width: 600px) {
         header {
-          align-items: flex-start;
           flex-direction: column;
+          align-items: flex-start;
+          gap: 16px;
         }
-
         nav {
           justify-content: flex-start;
         }
-
-        .install {
-          width: 100%;
-        }
-
-        h1 {
-          font-size: clamp(38px, 10.6vw, 44px);
-          line-height: 0.98;
-        }
-
-        .copy {
-          padding: 0 12px;
-        }
-
-        .button-link {
-          min-height: 42px;
-        }
-
-        .shot,
-        .terminal-bar {
-          box-shadow: var(--shadow-lg);
-        }
-
-        .shot {
-          aspect-ratio: 16 / 11;
-        }
-
-        .shot img {
-          width: 150%;
-          max-width: none;
-          transform: translateX(-6%);
-        }
-
-        .terminal-bar {
+        .flow {
           grid-template-columns: 1fr;
         }
-
-        .terminal-stat,
-        .terminal-stat:nth-child(2) {
+        .flow-step {
           border-right: 0;
-          border-bottom: 1px solid var(--soft-line);
         }
-
-        .terminal-stat:last-child {
-          border-bottom: 0;
-        }
-
-        .command-chip {
-          grid-template-columns: 1fr;
-          gap: 5px;
-        }
-
-        .leader-item {
-          grid-template-columns: 1fr;
-          gap: 4px;
-        }
-
         .principle {
           grid-template-columns: 1fr;
-          gap: 10px;
-          padding: 22px 0;
+          gap: 8px;
+          padding: 24px 0;
         }
-
-        .edit-field {
+        .nc-field {
+          grid-template-columns: 1fr;
+          gap: 3px;
+        }
+        .keys-row {
           grid-template-columns: 1fr;
           gap: 4px;
+        }
+        .install {
+          width: 100%;
         }
       }
 
@@ -762,13 +1103,11 @@
         html {
           scroll-behavior: auto;
         }
-
         *,
         *::before,
         *::after {
           animation-duration: 0.01ms !important;
           animation-iteration-count: 1 !important;
-          scroll-behavior: auto !important;
           transition-duration: 0.01ms !important;
         }
       }
@@ -784,70 +1123,170 @@
         <nav aria-label="Primary navigation">
           <a href="https://www.npmjs.com/package/@viraatdas/rudder">npm</a>
           <a href="https://github.com/viraatdas/rudder">GitHub</a>
-          <a href="/login">Sign in</a>
+          <a class="nav-cta" href="/login">Sign in</a>
         </nav>
       </header>
 
       <main>
         <section class="hero" aria-labelledby="hero-title">
-          <p class="eyebrow" data-reveal>Plan. Run in parallel. Review. Merge.</p>
-          <h1 id="hero-title" data-reveal>The terminal orchestrator for coding agents.</h1>
-          <p class="lede" data-reveal>
-            Describe a goal. Rudder plans it into a task DAG, runs Claude Code and
-            Codex agents in parallel across isolated jj workspaces, and keeps
-            planning, review, and merge in one terminal dashboard.
-          </p>
-          <div class="actions" data-reveal>
-            <div class="install">
-              <code id="install-command">npm install -g @viraatdas/rudder@latest
-rudder</code>
-              <button class="copy" type="button" data-copy="install-command">Copy</button>
+          <div>
+            <p class="eyebrow" data-reveal>
+              <span class="dot" aria-hidden="true"></span>
+              plan &middot; run in parallel &middot; review &middot; merge
+            </p>
+            <h1 id="hero-title" data-reveal>
+              <span class="steer">Steer</span> your coding agents.
+            </h1>
+            <p class="lede" data-reveal>
+              Rudder is the terminal orchestrator. Describe a goal; it plans the
+              work into a task DAG you can edit before it runs, executes Claude
+              Code and Codex in parallel across isolated jj workspaces, then keeps
+              review and merge in one dashboard.
+            </p>
+            <div class="actions" data-reveal>
+              <div class="install">
+                <code id="install-command"><span class="prompt">$ </span>npm install -g @viraatdas/rudder@latest</code>
+                <button class="copy" type="button" data-copy="install-command" data-copy-value="npm install -g @viraatdas/rudder@latest">
+                  Copy
+                </button>
+              </div>
+              <a class="button-link" href="https://github.com/viraatdas/rudder">View source</a>
             </div>
-            <a class="button-link" href="https://github.com/viraatdas/rudder">View source</a>
+          </div>
+
+          <div class="screen" data-reveal aria-label="A live task DAG: nodes flow from planned to running to review to merged.">
+            <div class="screen-head">
+              <span class="live">live</span>
+              <span class="path">rudder &middot; orchestrator &middot; spotify-top-tracks</span>
+              <span class="caret" aria-hidden="true">&#9608;</span>
+            </div>
+            <div class="screen-body">
+              <svg
+                class="dag"
+                data-dag
+                viewBox="0 30 800 350"
+                role="img"
+                aria-label="A task graph in flight: scaffold merged, auth flow in review, api client running, dashboard and tests still planned."
+              >
+                <g class="dag-edges" aria-hidden="true">
+                  <path class="edge" data-edge="01-02" d="M170,210 C 215,210 205,85 250,85" />
+                  <path class="edge" data-edge="01-03" d="M170,210 C 215,210 205,335 250,335" />
+                  <path class="edge soft" data-edge="02-03" d="M320,115 C 320,180 320,240 320,305" />
+                  <path class="edge" data-edge="02-04" d="M390,85 C 435,85 425,210 470,210" />
+                  <path class="edge" data-edge="03-04" d="M390,335 C 435,335 425,210 470,210" />
+                  <path class="edge" data-edge="04-05" d="M610,210 C 623,210 627,210 640,210" />
+                </g>
+                <g class="dag-nodes">
+                  <g class="node-pos" transform="translate(30,180)">
+                    <g class="node" data-node="01" data-status="merged">
+                      <rect class="node-box" x="0" y="0" width="140" height="60" rx="11" />
+                      <circle class="node-dot" cx="122" cy="17" r="4" />
+                      <text class="node-id" x="14" y="24">01</text>
+                      <text class="node-title" x="14" y="41">scaffold</text>
+                      <text class="node-state" x="14" y="53">merged</text>
+                    </g>
+                  </g>
+                  <g class="node-pos" transform="translate(250,55)">
+                    <g class="node" data-node="02" data-status="review">
+                      <rect class="node-box" x="0" y="0" width="140" height="60" rx="11" />
+                      <circle class="node-dot" cx="122" cy="17" r="4" />
+                      <text class="node-id" x="14" y="24">02</text>
+                      <text class="node-title" x="14" y="41">auth flow</text>
+                      <text class="node-state" x="14" y="53">review</text>
+                    </g>
+                  </g>
+                  <g class="node-pos" transform="translate(250,305)">
+                    <g class="node" data-node="03" data-status="running">
+                      <rect class="node-box" x="0" y="0" width="140" height="60" rx="11" />
+                      <circle class="node-dot" cx="122" cy="17" r="4" />
+                      <text class="node-id" x="14" y="24">03</text>
+                      <text class="node-title" x="14" y="41">api client</text>
+                      <text class="node-state" x="14" y="53">running</text>
+                    </g>
+                  </g>
+                  <g class="node-pos" transform="translate(470,180)">
+                    <g class="node" data-node="04" data-status="planned">
+                      <rect class="node-box" x="0" y="0" width="140" height="60" rx="11" />
+                      <circle class="node-dot" cx="122" cy="17" r="4" />
+                      <text class="node-id" x="14" y="24">04</text>
+                      <text class="node-title" x="14" y="41">dashboard</text>
+                      <text class="node-state" x="14" y="53">planned</text>
+                    </g>
+                  </g>
+                  <g class="node-pos" transform="translate(640,180)">
+                    <g class="node" data-node="05" data-status="planned">
+                      <rect class="node-box" x="0" y="0" width="140" height="60" rx="11" />
+                      <circle class="node-dot" cx="122" cy="17" r="4" />
+                      <text class="node-id" x="14" y="24">05</text>
+                      <text class="node-title" x="14" y="41">tests</text>
+                      <text class="node-state" x="14" y="53">planned</text>
+                    </g>
+                  </g>
+                </g>
+              </svg>
+              <div class="legend" aria-hidden="true">
+                <span><i style="--c: var(--s-planned)"></i>planned</span>
+                <span><i style="--c: var(--s-running)"></i>running</span>
+                <span><i style="--c: var(--s-review)"></i>review</span>
+                <span><i style="--c: var(--s-merged)"></i>merged</span>
+              </div>
+            </div>
           </div>
         </section>
 
-        <section class="product" aria-label="Rudder orchestrator pane" data-reveal>
-          <div class="shot">
-            <img
-              src="/screenshot.svg"
-              alt="Rudder's orchestrator pane: an agents list, a live task DAG with running, review, merged, and todo nodes, and a plan you can refine by chat."
-            />
+        <section class="section" aria-labelledby="flow-title">
+          <div class="section-head" data-reveal>
+            <p class="kicker">how it works</p>
+            <h2 id="flow-title">One goal in. A steered plan out.</h2>
+            <p>
+              You describe the outcome. Rudder turns it into a graph of tasks and
+              drives each one from planned to merged, in parallel, while you watch.
+            </p>
           </div>
-          <div class="terminal-bar" aria-label="How Rudder works">
-            <div class="terminal-stat">
-              <strong>Describe a goal</strong>
-              <span>Rudder plans it into a task DAG with typed dependencies, read-only first.</span>
+
+          <div class="flow" data-reveal-group>
+            <div class="flow-step" style="--c: var(--ink)">
+              <span class="marker">Describe</span>
+              <h3>The goal</h3>
+              <p>Type what you want built into the task box, in plain language.</p>
             </div>
-            <div class="terminal-stat">
-              <strong>Run in parallel</strong>
-              <span>Claude Code and Codex implement the nodes in isolated jj workspaces.</span>
+            <div class="flow-step" style="--c: var(--cyan)">
+              <span class="marker">Plan</span>
+              <h3>A task DAG</h3>
+              <p>A read-only planner inspects the repo and proposes typed dependencies.</p>
             </div>
-            <div class="terminal-stat">
-              <strong>v to review</strong>
-              <span>A live jj diff of any agent's workspace, right in the pane.</span>
+            <div class="flow-step" style="--c: var(--magenta)">
+              <span class="marker">Run</span>
+              <h3>In parallel</h3>
+              <p>Claude Code and Codex build ready nodes in isolated jj workspaces.</p>
             </div>
-            <div class="terminal-stat">
-              <strong>m to merge</strong>
-              <span>Clean nodes merge mechanically; conflicts can start an AI resolver.</span>
+            <div class="flow-step" style="--c: var(--amber)">
+              <span class="marker">Review</span>
+              <h3>A live diff</h3>
+              <p>Press v for the jj diff of any node, right inside the pane.</p>
+            </div>
+            <div class="flow-step" style="--c: var(--green)">
+              <span class="marker">Merge</span>
+              <h3>And unblock</h3>
+              <p>Clean work merges mechanically and unblocks its children.</p>
             </div>
           </div>
         </section>
 
         <section class="section" aria-labelledby="why-title">
           <div class="section-head" data-reveal>
+            <p class="kicker">not a transcript ui</p>
             <h2 id="why-title">A plan you can watch and steer.</h2>
             <p>
-              Rudder is not a transcript UI. You give it a goal, it decomposes the
-              work into a task DAG, and the orchestrator pane shows the plan and
-              every node's status live. Refine the plan by chat, add tasks while it
-              runs, then review and merge.
+              Rudder gives you a goal, decomposes the work, and shows every node's
+              status live. Refine the plan by chat, add tasks while it runs, then
+              review and merge.
             </p>
           </div>
 
-          <div class="grid" data-reveal-group>
-            <article class="card">
-              <span class="tag cyan">orchestrate</span>
+          <div class="features" data-reveal-group>
+            <article class="feature" style="--c: var(--cyan)">
+              <span class="tag">orchestrate</span>
               <h3>Plan into a DAG</h3>
               <p>
                 Describe a goal once. A read-only planner inspects the repo and
@@ -855,17 +1294,17 @@ rudder</code>
                 node inline, or refine the whole plan by chat, before it launches.
               </p>
             </article>
-            <article class="card">
-              <span class="tag green">parallel</span>
+            <article class="feature" style="--c: var(--magenta)">
+              <span class="tag">parallel</span>
               <h3>Agents in jj workspaces</h3>
               <p>
                 Ready nodes run Claude Code and Codex in parallel, each in its own
-                isolated jj workspace, so they build concurrently without
-                trampling the main checkout.
+                isolated jj workspace, so they build concurrently without trampling
+                the main checkout.
               </p>
             </article>
-            <article class="card">
-              <span class="tag amber">review</span>
+            <article class="feature" style="--c: var(--green)">
+              <span class="tag">review</span>
               <h3>Review and merge</h3>
               <p>
                 Watch a live jj diff of any node, merge clean work mechanically,
@@ -878,51 +1317,52 @@ rudder</code>
 
         <section class="section" aria-labelledby="idea-title">
           <div class="section-head" data-reveal>
+            <p class="kicker">the philosophy</p>
             <h2 id="idea-title">A few opinions, made into a tool.</h2>
             <p>
-              Rudder is not trying to be a faster chat window. It takes a stance
-              on how agents should work: plan first, isolate the work, and keep
-              you steering with full visibility and undo.
+              Rudder is not trying to be a faster chat window. It takes a stance on
+              how agents should work: plan first, isolate the work, and keep you
+              steering with full visibility and undo.
             </p>
           </div>
 
           <div class="principles" data-reveal-group>
-            <article class="principle">
-              <span class="principle-index cyan">01</span>
+            <article class="principle" style="--c: var(--cyan)">
+              <span class="principle-index">01</span>
               <div>
                 <h3>Plan before you build.</h3>
                 <p>
                   The planner is read-only. It inspects the repo, asks a round of
-                  questions before it assumes anything, and proposes a DAG.
-                  Nothing is written to your code until you approve it.
+                  questions before it assumes anything, and proposes a DAG. Nothing
+                  is written to your code until you approve it.
                 </p>
               </div>
             </article>
-            <article class="principle">
-              <span class="principle-index green">02</span>
+            <article class="principle" style="--c: var(--green)">
+              <span class="principle-index">02</span>
               <div>
                 <h3>Isolate the work, don't coordinate it.</h3>
                 <p>
                   Every node runs in its own jj workspace, never nested in your
-                  repo, so parallel agents never collide live. The only thing
-                  left to reconcile is a merge, and Rudder handles that.
+                  repo, so parallel agents never collide live. The only thing left
+                  to reconcile is a merge, and Rudder handles that.
                 </p>
               </div>
             </article>
-            <article class="principle">
-              <span class="principle-index amber">03</span>
+            <article class="principle" style="--c: var(--amber)">
+              <span class="principle-index">03</span>
               <div>
                 <h3>Steer, don't babysit.</h3>
                 <p>
                   The orchestrator acts on its own: it expands the plan, fixes
                   drift, and merges clean work. Every action is logged and every
-                  action is undoable, so you stay in control without watching
-                  each step.
+                  action is undoable, so you stay in control without watching each
+                  step.
                 </p>
               </div>
             </article>
-            <article class="principle">
-              <span class="principle-index magenta">04</span>
+            <article class="principle" style="--c: var(--magenta)">
+              <span class="principle-index">04</span>
               <div>
                 <h3>Block only on real gates.</h3>
                 <p>
@@ -937,250 +1377,307 @@ rudder</code>
 
         <section class="section" aria-labelledby="edit-title">
           <div class="section-head" data-reveal>
+            <p class="kicker">plan edit mode</p>
             <h2 id="edit-title">Edit the plan before it runs.</h2>
             <p>
               The DAG is a draft, not a verdict. Press v on the orchestrator to
-              open plan review, then edit any node inline: its title, goal,
-              success criteria, dependencies, and the prompt the agent will run.
-              Approve once and Rudder launches the plan you actually want.
+              open plan review, then edit any node inline: its title, goal, success
+              criteria, dependencies, and the prompt the agent will run. Approve
+              once and Rudder launches the plan you actually want.
             </p>
           </div>
 
-          <div class="control-stage" aria-label="Plan edit mode">
-            <div class="edit-fields" data-reveal>
-              <div class="edit-field">
-                <code>title</code><span>name the task so it reads cleanly in the agents list</span>
+          <div class="edit-stage">
+            <div class="node-card" data-reveal aria-label="Editing a node in plan review.">
+              <div class="nc-head">
+                <span class="nc-chip">plan review</span>
+                <span>node 04 &middot; dashboard</span>
               </div>
-              <div class="edit-field">
-                <code>goal</code><span>what this node is responsible for building</span>
+              <div class="nc-field">
+                <span class="k">title</span><span class="v">dashboard</span>
               </div>
-              <div class="edit-field">
-                <code>done</code><span>the success criteria that mark the task complete</span>
+              <div class="nc-field active">
+                <span class="k">goal</span><span class="v">render the top-tracks view from the api client<span class="editcaret"></span></span>
               </div>
-              <div class="edit-field">
-                <code>hard deps</code><span>node IDs that must merge before this one starts</span>
+              <div class="nc-field">
+                <span class="k">done</span><span class="v muted">tracks list renders with cover art and play counts</span>
               </div>
-              <div class="edit-field">
-                <code>soft deps</code><span>context-only links that never gate, so siblings run in parallel</span>
+              <div class="nc-field">
+                <span class="k">hard deps</span><span class="v">02 &nbsp; 03</span>
               </div>
-              <div class="edit-field">
-                <code>prompt</code><span>the exact instructions handed to Claude Code or Codex</span>
+              <div class="nc-field">
+                <span class="k">soft deps</span><span class="v muted">none</span>
+              </div>
+              <div class="nc-field">
+                <span class="k">prompt</span><span class="v muted">build the dashboard route, fetch via the api client, gate on auth&hellip;</span>
               </div>
             </div>
 
-            <div class="control-side">
-              <div class="leader-card" data-reveal>
-                <span class="leader-title">Plan review keys</span>
-                <div class="leader-grid">
-                  <div class="leader-item">
-                    <code>v</code><span>open plan review on the orchestrator</span>
-                  </div>
-                  <div class="leader-item">
-                    <code>Tab</code><span>move between fields on a node</span>
-                  </div>
-                  <div class="leader-item">
-                    <code>Ctrl-S</code><span>save your edits to the DAG</span>
-                  </div>
-                  <div class="leader-item">
-                    <code>Ctrl-Enter</code><span>approve and launch the plan</span>
-                  </div>
-                  <div class="leader-item">
-                    <code>Esc</code><span>hide review, back to the orchestrator</span>
-                  </div>
-                </div>
-              </div>
+            <div class="keys-card" data-reveal>
+              <span class="keys-title">plan review keys</span>
+              <div class="keys-row"><kbd>v</kbd><span>open plan review on the orchestrator</span></div>
+              <div class="keys-row"><kbd>Tab</kbd><span>move between fields on a node</span></div>
+              <div class="keys-row"><kbd>Ctrl-S</kbd><span>save your edits to the DAG</span></div>
+              <div class="keys-row"><kbd>Ctrl-Enter</kbd><span>approve and launch the plan</span></div>
+              <div class="keys-row"><kbd>Esc</kbd><span>hide review, back to the orchestrator</span></div>
             </div>
           </div>
         </section>
 
-        <section class="section" aria-labelledby="shortcuts-title">
+        <section class="section" aria-labelledby="controls-title">
           <div class="section-head" data-reveal>
-            <h2 id="shortcuts-title">Three panes, three jumps.</h2>
+            <p class="kicker">controls</p>
+            <h2 id="controls-title">Three panes, three jumps.</h2>
             <p>
               Option-1, Option-2, and Option-3 always mean Agents, Worker, and
-              Task. The Worker pane still belongs to Claude or Codex, so dashboard
+              Task. The Worker pane belongs to Claude or Codex, so dashboard
               commands from there start with the Ctrl-W leader.
             </p>
           </div>
 
-          <div class="control-stage" aria-label="Rudder controls">
-            <div class="key-map" data-key-map>
-              <div class="key-tile">
-                <span class="key">Option-1</span>
-                <strong>Agents list</strong>
-                <span>
-                  Pick a run, move with j/k, then review, merge, rename, or delete.
-                </span>
-              </div>
-              <div class="key-tile">
-                <span class="key">Option-2</span>
-                <strong>Worker terminal</strong>
-                <span>
-                  Talk directly to Claude Code or Codex. Tab and prompts stay native.
-                </span>
-              </div>
-              <div class="key-tile">
-                <span class="key">Option-3</span>
-                <strong>Task box</strong>
-                <span>
-                  Start a plan, answer planner questions, or add work to a running DAG.
-                </span>
+          <div class="panes" data-reveal-group>
+            <div class="pane">
+              <span class="key">Option-1</span>
+              <h3>Agents</h3>
+              <p>Pick a run, move with j/k, then review, merge, rename, or delete.</p>
+            </div>
+            <div class="pane">
+              <span class="key">Option-2</span>
+              <h3>Worker</h3>
+              <p>Talk directly to Claude Code or Codex. Tab and prompts stay native.</p>
+            </div>
+            <div class="pane">
+              <span class="key">Option-3</span>
+              <h3>Task</h3>
+              <p>Start a plan, answer planner questions, or add work to a running DAG.</p>
+            </div>
+          </div>
+
+          <div class="control-extra">
+            <div class="type-card" data-type-card>
+              <span class="type-label">task pane</span>
+              <div class="typed-line">
+                <span class="gt">&rsaquo; </span><span data-type-text>build a spotify top-tracks dashboard</span><span class="cursor">_</span>
               </div>
             </div>
 
-            <div class="control-side">
-              <div class="type-card" data-type-card>
-                <span class="type-label">task pane</span>
-                <div class="typed-line"><span data-type-text>build a spotify top-tracks dashboard</span><span class="cursor">_</span></div>
-              </div>
-
-              <div class="leader-card">
-                <span class="leader-title">From inside Worker</span>
-                <div class="leader-grid">
-                  <div class="leader-item">
-                    <code>Ctrl-W then 1/2/3</code><span>use the same pane jumps</span>
-                  </div>
-                  <div class="leader-item">
-                    <code>Ctrl-W then v</code><span>open review for the selected agent</span>
-                  </div>
-                  <div class="leader-item">
-                    <code>Ctrl-W then m</code><span>merge the selected agent</span>
-                  </div>
-                </div>
-              </div>
-
-              <div class="command-strip">
-                <div class="command-chip">
-                  <code>Option-v</code><span>toggle review for the selected agent</span>
-                </div>
-                <div class="command-chip">
-                  <code>Ctrl-W</code><span>one-shot dashboard leader from any pane</span>
-                </div>
-                <div class="command-chip">
-                  <code>Tab</code><span>stays inside Claude or Codex</span>
-                </div>
-                <div class="command-chip">
-                  <code>/model</code><span>switch Claude, Codex, model, effort</span>
-                </div>
-              </div>
+            <div class="keys-card">
+              <span class="keys-title">from inside worker</span>
+              <div class="keys-row"><kbd>Ctrl-W 1/2/3</kbd><span>use the same pane jumps</span></div>
+              <div class="keys-row"><kbd>Ctrl-W v</kbd><span>open review for the selected agent</span></div>
+              <div class="keys-row"><kbd>Ctrl-W m</kbd><span>merge the selected agent</span></div>
+              <div class="keys-row"><kbd>/model</kbd><span>switch Claude, Codex, model, effort</span></div>
             </div>
           </div>
         </section>
 
+        <section class="cta" aria-labelledby="cta-title">
+          <h2 id="cta-title" data-reveal>Start steering.</h2>
+          <p data-reveal>
+            Install Rudder, describe a goal, and watch the plan run. Free and open
+            source.
+          </p>
+          <div class="actions" data-reveal>
+            <div class="install">
+              <code id="install-command-2"><span class="prompt">$ </span>npm install -g @viraatdas/rudder@latest</code>
+              <button class="copy" type="button" data-copy="install-command-2" data-copy-value="npm install -g @viraatdas/rudder@latest">
+                Copy
+              </button>
+            </div>
+            <a class="button-link" href="https://github.com/viraatdas/rudder">View source</a>
+          </div>
+        </section>
       </main>
+
+      <footer>
+        <a class="brand" href="/">
+          <img src="/favicon.svg" alt="" />
+          <span>Rudder</span>
+        </a>
+        <nav aria-label="Footer navigation">
+          <a href="https://www.npmjs.com/package/@viraatdas/rudder">npm</a>
+          <a href="https://github.com/viraatdas/rudder">GitHub</a>
+          <a href="/login">Sign in</a>
+        </nav>
+      </footer>
     </div>
 
     <script type="module">
-      import { animate, inView, stagger } from "https://cdn.jsdelivr.net/npm/motion@12.40.0/+esm";
-
       const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
-      if (!reduceMotion) {
+      /* ----- scroll reveals: IntersectionObserver + class-driven final state -----
+         The .in class persists, so content can never get stuck mid-animation. */
+      if (!reduceMotion && "IntersectionObserver" in window) {
         document.documentElement.classList.add("motion-ready");
 
-        inView("[data-reveal]", (element) => {
-          animate(element, { opacity: 1, y: 0 }, { duration: 0.55, ease: [0.22, 1, 0.36, 1] });
-        }, { margin: "0px 0px -12% 0px" });
-
-        inView("[data-reveal-group]", (element) => {
-          const children = Array.from(element.children);
-          animate(children, { opacity: [0, 1], y: [18, 0] }, {
-            delay: stagger(0.06),
-            duration: 0.45,
-            ease: [0.22, 1, 0.36, 1],
-          });
-        }, { margin: "0px 0px -12% 0px" });
-
-        inView("[data-key-map]", (element) => {
-          const tiles = Array.from(element.children);
-          animate(tiles, { opacity: [0, 1], y: [22, 0] }, {
-            delay: stagger(0.08),
-            duration: 0.52,
-            ease: [0.22, 1, 0.36, 1],
-          });
-          animate(tiles.map((tile) => tile.querySelector(".key")).filter(Boolean), { y: [-6, 0] }, {
-            delay: stagger(0.08, { startDelay: 0.18 }),
-            duration: 0.38,
-            ease: "easeOut",
-          });
-        }, { margin: "0px 0px -12% 0px" });
-
-        inView(".command-strip", (element) => {
-          animate(Array.from(element.children), { opacity: [0, 1], x: [14, 0] }, {
-            delay: stagger(0.05),
-            duration: 0.36,
-            ease: [0.22, 1, 0.36, 1],
-          });
-        }, { margin: "0px 0px -12% 0px" });
-
-        inView("[data-type-card]", () => {
-          const target = document.querySelector("[data-type-text]");
-          if (!target) return;
-
-          const phrases = [
-            "build a spotify top-tracks dashboard",
-            "answer the planner's questions first",
-            "/model codex gpt-5.5",
-            "add a settings page",
-          ];
-          let phraseIndex = 0;
-          let charIndex = 0;
-          let deleting = false;
-
-          const tick = () => {
-            const phrase = phrases[phraseIndex];
-            target.textContent = phrase.slice(0, charIndex);
-
-            if (!deleting && charIndex < phrase.length) {
-              charIndex += 1;
-              window.setTimeout(tick, 44);
-              return;
+        const revealIO = new IntersectionObserver((entries) => {
+          entries.forEach((entry) => {
+            if (!entry.isIntersecting) return;
+            const el = entry.target;
+            if (el.hasAttribute("data-reveal-group")) {
+              Array.from(el.children).forEach((child, i) => {
+                child.style.transitionDelay = i * 70 + "ms";
+              });
             }
+            el.classList.add("in");
+            revealIO.unobserve(el);
+          });
+        }, { rootMargin: "0px 0px -10% 0px" });
 
-            if (!deleting) {
-              deleting = true;
-              window.setTimeout(tick, 980);
-              return;
-            }
+        document
+          .querySelectorAll("[data-reveal], [data-reveal-group]")
+          .forEach((el) => revealIO.observe(el));
 
-            if (charIndex > 0) {
-              charIndex -= 1;
-              window.setTimeout(tick, 24);
-              return;
-            }
-
-            deleting = false;
-            phraseIndex = (phraseIndex + 1) % phrases.length;
-            window.setTimeout(tick, 220);
-          };
-
-          tick();
-        }, { margin: "0px 0px -12% 0px" });
+        // hero headline underline draw
+        const steer = document.querySelector("h1 .steer");
+        if (steer) setTimeout(() => steer.classList.add("drawn"), 600);
       }
 
+      /* ----- live DAG choreography ----- */
+      (function dag() {
+        const svg = document.querySelector("[data-dag]");
+        if (!svg) return;
+
+        const STATE = { planned: "planned", running: "running", review: "review", merged: "merged" };
+        const node = (id) => svg.querySelector(`.node[data-node="${id}"]`);
+        const edge = (key) => svg.querySelector(`.edge[data-edge="${key}"]`);
+
+        function setStatus(id, status) {
+          const n = node(id);
+          if (!n) return;
+          const prev = n.getAttribute("data-status");
+          n.setAttribute("data-status", status);
+          const label = n.querySelector(".node-state");
+          if (label) label.textContent = status;
+          if (!reduceMotion && status === STATE.merged && prev !== STATE.merged) ring(n);
+        }
+
+        function ring(n) {
+          const ns = "http://www.w3.org/2000/svg";
+          const c = document.createElementNS(ns, "circle");
+          c.setAttribute("class", "merge-ring");
+          c.setAttribute("cx", "70");
+          c.setAttribute("cy", "30");
+          c.setAttribute("r", "30");
+          n.appendChild(c);
+          c.animate(
+            [
+              { opacity: 0.9, transform: "scale(0.6)" },
+              { opacity: 0, transform: "scale(1.7)" },
+            ],
+            { duration: 600, easing: "cubic-bezier(0.16,1,0.3,1)" }
+          );
+          setTimeout(() => c.remove(), 700);
+        }
+
+        function reveal(id) {
+          node(id)?.classList.add("shown");
+        }
+
+        function drawEdge(key) {
+          const e = edge(key);
+          if (!e) return;
+          e.style.strokeDashoffset = "0";
+          setTimeout(() => {
+            e.style.strokeDasharray = "";
+            e.style.strokeDashoffset = "";
+            e.style.transition = "";
+          }, 760);
+        }
+
+        function flow(key, on) {
+          edge(key)?.classList.toggle("flow", on);
+        }
+
+        // reduced motion / no orchestration: keep the authored steady state.
+        if (reduceMotion) return;
+
+        // prep: hide nodes (via .choreo) and "lift" the edges so they can draw in.
+        const nodes = ["01", "02", "03", "04", "05"];
+        const edges = ["01-02", "01-03", "02-03", "02-04", "03-04", "04-05"];
+        svg.classList.add("choreo");
+        edges.forEach((key) => {
+          const e = edge(key);
+          if (!e) return;
+          const L = e.getTotalLength();
+          e.style.strokeDasharray = String(L);
+          e.style.strokeDashoffset = String(L);
+          e.style.transition = "stroke-dashoffset 0.7s cubic-bezier(0.22,1,0.36,1)";
+        });
+        nodes.forEach((id) => setStatus(id, STATE.planned));
+
+        // build the graph, then settle into a believable in-flight state:
+        // 01 merged, 02 in review, 03 running, 04 + 05 still planned.
+        const T = [
+          [120, () => { reveal("01"); setStatus("01", STATE.running); }],
+          [620, () => { drawEdge("01-02"); drawEdge("01-03"); drawEdge("02-03"); }],
+          [1000, () => { reveal("02"); reveal("03"); }],
+          [1320, () => { drawEdge("02-04"); drawEdge("03-04"); }],
+          [1560, () => { reveal("04"); }],
+          [1800, () => { drawEdge("04-05"); reveal("05"); }],
+          [2400, () => { setStatus("01", STATE.merged); }],
+          [2800, () => { setStatus("02", STATE.running); setStatus("03", STATE.running); flow("01-02", true); flow("01-03", true); }],
+          [4600, () => { setStatus("02", STATE.review); flow("01-02", false); }],
+        ];
+
+        let started = false;
+        const run = () => {
+          if (started) return;
+          started = true;
+          T.forEach(([t, fn]) => setTimeout(fn, t));
+        };
+
+        // start when the screen scrolls into view (it's near the top, so this fires fast)
+        if ("IntersectionObserver" in window) {
+          const io = new IntersectionObserver((entries) => {
+            entries.forEach((en) => {
+              if (en.isIntersecting) { run(); io.disconnect(); }
+            });
+          }, { threshold: 0.35 });
+          io.observe(svg);
+        } else {
+          run();
+        }
+      })();
+
+      /* ----- task-pane typewriter ----- */
+      (function typer() {
+        const target = document.querySelector("[data-type-text]");
+        if (!target || reduceMotion) return;
+        const phrases = [
+          "build a spotify top-tracks dashboard",
+          "answer the planner's questions first",
+          "edit node 04, then approve the plan",
+          "/model codex gpt-5.5",
+        ];
+        let pi = 0, ci = 0, deleting = false;
+        const tick = () => {
+          const p = phrases[pi];
+          target.textContent = p.slice(0, ci);
+          if (!deleting && ci < p.length) { ci++; return void setTimeout(tick, 46); }
+          if (!deleting) { deleting = true; return void setTimeout(tick, 1100); }
+          if (ci > 0) { ci--; return void setTimeout(tick, 24); }
+          deleting = false; pi = (pi + 1) % phrases.length; setTimeout(tick, 260);
+        };
+        tick();
+      })();
+
+      /* ----- copy buttons ----- */
       document.querySelectorAll("[data-copy]").forEach((button) => {
         button.addEventListener("click", async () => {
-          const target = document.getElementById(button.dataset.copy);
-          if (!target) return;
-
+          const value = button.dataset.copyValue
+            || document.getElementById(button.dataset.copy)?.textContent.replace(/^\$\s*/, "").trim()
+            || "";
           const original = button.textContent;
-          let copied = true;
-          try {
-            await navigator.clipboard.writeText(target.textContent.trim());
-          } catch {
-            copied = false;
-          }
-          button.textContent = copied ? "Copied" : "Copy failed";
-          button.style.background = copied ? "var(--green)" : "var(--amber)";
-
-          if (!reduceMotion) {
-            animate(button, { scale: [1, 0.96, 1] }, { duration: 0.28, ease: "easeOut" });
-          }
-
-          window.setTimeout(() => {
-            button.textContent = original;
-            button.style.background = "";
-          }, 1200);
+          let ok = true;
+          try { await navigator.clipboard.writeText(value); } catch { ok = false; }
+          button.textContent = ok ? "Copied" : "Copy failed";
+          if (!reduceMotion)
+            button.animate(
+              [{ transform: "scale(1)" }, { transform: "scale(0.94)" }, { transform: "scale(1)" }],
+              { duration: 300, easing: "ease-out" }
+            );
+          setTimeout(() => { button.textContent = original; }, 1200);
         });
       });
     </script>
