@@ -126,19 +126,38 @@ if (!reduceMotion && "IntersectionObserver" in window) {
   });
   nodes.forEach((id) => setStatus(id, STATE.planned));
 
-  // build the graph, then settle into a believable in-flight state:
-  // 01 merged, 02 in review, 03 running, 04 + 05 still planned.
-  const T = [
-    [120, () => { reveal("01"); setStatus("01", STATE.running); }],
-    [620, () => { drawEdge("01-02"); drawEdge("01-03"); drawEdge("02-03"); }],
-    [1000, () => { reveal("02"); reveal("03"); }],
-    [1320, () => { drawEdge("02-04"); drawEdge("03-04"); }],
-    [1560, () => { reveal("04"); }],
-    [1800, () => { drawEdge("04-05"); reveal("05"); }],
-    [2400, () => { setStatus("01", STATE.merged); }],
-    [2800, () => { setStatus("02", STATE.running); setStatus("03", STATE.running); flow("01-02", true); flow("01-03", true); }],
-    [4600, () => { setStatus("02", STATE.review); flow("01-02", false); }],
-  ];
+  const at = (t, fn) => setTimeout(fn, t);
+
+  // one-time assembly: nodes appear, edges draw in.
+  function build() {
+    at(120, () => reveal("01"));
+    at(620, () => { drawEdge("01-02"); drawEdge("01-03"); drawEdge("02-03"); });
+    at(1000, () => { reveal("02"); reveal("03"); });
+    at(1320, () => { drawEdge("02-04"); drawEdge("03-04"); });
+    at(1560, () => reveal("04"));
+    at(1800, () => { drawEdge("04-05"); reveal("05"); });
+  }
+
+  // the living lifecycle: statuses flow planned -> running -> review -> merged,
+  // unblocking children, then it resets and runs again. it never freezes.
+  function cycle() {
+    nodes.forEach((id) => setStatus(id, STATE.planned));
+    ["01-02", "01-03", "02-04", "03-04", "04-05"].forEach((k) => flow(k, false));
+
+    at(500, () => setStatus("01", STATE.running));
+    at(1700, () => setStatus("01", STATE.merged));
+    at(2100, () => { setStatus("02", STATE.running); setStatus("03", STATE.running); flow("01-02", true); flow("01-03", true); });
+    at(3500, () => setStatus("02", STATE.review));
+    at(3900, () => setStatus("03", STATE.review));
+    at(4600, () => { setStatus("02", STATE.merged); setStatus("03", STATE.merged); flow("01-02", false); flow("01-03", false); });
+    at(5000, () => { setStatus("04", STATE.running); flow("02-04", true); flow("03-04", true); });
+    at(6400, () => setStatus("04", STATE.review));
+    at(7100, () => { setStatus("04", STATE.merged); flow("02-04", false); flow("03-04", false); });
+    at(7500, () => { setStatus("05", STATE.running); flow("04-05", true); });
+    at(8800, () => setStatus("05", STATE.review));
+    at(9400, () => { setStatus("05", STATE.merged); flow("04-05", false); });
+    at(12200, cycle); // hold the finished plan, then run it again
+  }
 
   let started = false;
   const run = () => {
@@ -146,7 +165,8 @@ if (!reduceMotion && "IntersectionObserver" in window) {
     started = true;
     screen?.classList.add("scanning");
     setTimeout(() => screen?.classList.remove("scanning"), 1500);
-    T.forEach(([t, fn]) => setTimeout(fn, t));
+    build();
+    at(2100, cycle);
   };
 
   // start when the screen scrolls into view (it's near the top, so this fires fast)
