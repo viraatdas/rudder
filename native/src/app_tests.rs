@@ -58,6 +58,23 @@ fn merge_package_json_bails_on_invalid_json() {
     assert!(merge_package_json("{not json", "{}").is_none());
 }
 
+#[test]
+fn merge_decisions_sides_recovers_entries_from_conflicted_content() {
+    let left = "# Decisions\n\n## n1: foundation\n- **Did:** Added schema\n- **By:** n1\n";
+    let conflicted = "# Decisions\n\n<<<<<<< Conflict 1 of 1\n## n2: worker\n- **Did:** Added detector\n- **By:** n2\n=======\n## n3: sibling\n- **Did:** Added collector\n- **By:** n3\n>>>>>>> Conflict 1 of 1\n";
+    let merged = merge_decisions_sides(&[left.to_string(), conflicted.to_string()])
+        .expect("decisions merge");
+    assert!(merged.starts_with("# Decisions"));
+    assert!(merged.contains("## n1: foundation"));
+    assert!(merged.contains("## n2: worker"));
+    assert!(merged.contains("## n3: sibling"));
+    assert_eq!(merged.matches("## n2: worker").count(), 1);
+    assert!(
+        !contains_conflict_markers(&merged),
+        "merged decisions must be marker-free:\n{merged}"
+    );
+}
+
 /// Flatten a rendered Line back into its plain text (span contents joined).
 fn flatten_line(line: &ratatui::text::Line<'_>) -> String {
     line.spans.iter().map(|s| s.content.as_ref()).collect()
@@ -2797,6 +2814,42 @@ fn jj_run_record_writes_vcs_jj_and_workspace_fields() {
     );
     // jj runs omit the legacy git branch field.
     assert!(worktree.get("branch").is_none());
+
+    let _ = fs::remove_dir_all(repo_root);
+}
+
+#[test]
+fn run_record_round_trips_merge_resolver_flag() {
+    let repo_root = std::env::temp_dir().join(format!(
+        "rudder-resolver-record-test-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&repo_root).expect("create test repo root");
+
+    let mut run = test_agent_run("resolver-run-1", "resolve merge conflicts");
+    run.status = AgentStatus::Done;
+    run.merge_resolver = true;
+
+    save_native_run_record(&repo_root, &run).expect("save resolver run record");
+    let raw = fs::read_to_string(native_run_dir(&repo_root, "resolver-run-1").join("run.json"))
+        .expect("read run.json");
+    let value: serde_json::Value = serde_json::from_str(&raw).expect("parse run.json");
+    assert_eq!(
+        value.get("mergeResolver").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+
+    let loaded = load_persisted_agents(&repo_root);
+    assert_eq!(loaded.len(), 1);
+    assert!(
+        loaded[0].merge_resolver,
+        "resolver discriminator survives reload"
+    );
+    assert_eq!(loaded[0].status, AgentStatus::Done);
 
     let _ = fs::remove_dir_all(repo_root);
 }
@@ -6412,6 +6465,7 @@ fn write_rudder_context_includes_global_job_snapshot() {
     running.deps = vec!["n0".to_string()];
     running.soft_deps = vec!["n2".to_string()];
     running.needs_user_input = true;
+    fs::create_dir_all(&running.cwd).unwrap();
 
     let mut done = test_agent_run("run-claude", "finish claude worker");
     done.cwd = repo.join("claude-worktree");
@@ -6419,6 +6473,13 @@ fn write_rudder_context_includes_global_job_snapshot() {
     done.node_id = Some("n3".to_string());
     done.workspace_name = Some("rudder-run-claude-test".to_string());
     done.jj_change_id = Some("zzzzzzzz".to_string());
+    fs::create_dir_all(&done.cwd).unwrap();
+
+    let mut merged = test_agent_run("run-merged", "already merged worker");
+    merged.cwd = repo.join("merged-worktree");
+    merged.status = AgentStatus::Merged;
+    merged.node_id = Some("n4".to_string());
+    fs::create_dir_all(&merged.cwd).unwrap();
 
     let pending = WorktreeInfo {
         id: "pending-1".to_string(),
@@ -6429,20 +6490,60 @@ fn write_rudder_context_includes_global_job_snapshot() {
         jj_change_id: None,
     };
 
-    write_rudder_context(&repo, &[running, done], Some(&pending)).expect("write RUDDER.md");
+    write_rudder_context(&repo, &[running, done, merged], Some(&pending)).expect("write RUDDER.md");
     let text = fs::read_to_string(repo.join("RUDDER.md")).unwrap();
 
     assert!(text.contains("## Global job snapshot"));
     assert!(text.contains(
-        "- totals: total=3 running=1 waiting=1 done=1 merged=0 failed=0 stopped=0 pending-starts=1"
+        "- totals: total=4 running=1 waiting=1 done=1 merged=1 failed=0 stopped=0 pending-starts=1"
     ));
-    assert!(text.contains("- backends: claude=1 codex=1"));
+    assert!(text.contains(
+        "- active-now: running=1 waiting=1 review-ready=1 merge-ready=1 pending-starts=1"
+    ));
+    assert!(text.contains("- completed: merged=1 failed=0 stopped=0"));
+    assert!(text.contains("- backends: claude=2 codex=1"));
     assert!(text.contains("- ready-to-act: review-ready=1 merge-ready=1"));
-    assert!(text.contains("run-codex node=n1 mode=execute status=running waiting=user-input backend=codex model=gpt-5.1-codex-max"));
-    assert!(text.contains("deps=hard=[n0] soft=[n2]"));
-    assert!(text.contains("run-claude node=n3 mode=execute status=done backend=claude"));
-    assert!(text.contains("merge=needs-merge"));
+    assert!(text.contains("## Active local Rudder agents"));
+    assert!(text.contains("## Ready local Rudder agents"));
+    assert!(text.contains("## Completed local Rudder agents"));
+    let active_section = text
+        .split("## Active local Rudder agents")
+        .nth(1)
+        .unwrap()
+        .split("## Ready local Rudder agents")
+        .next()
+        .unwrap();
+    assert!(active_section.contains("run-codex node=n1 mode=execute status=running waiting=user-input backend=codex model=gpt-5.1-codex-max"));
+    assert!(active_section.contains("deps=hard=[n0] soft=[n2]"));
+    assert!(!active_section.contains("run-claude"));
+    assert!(!active_section.contains("run-merged"));
+    let ready_section = text
+        .split("## Ready local Rudder agents")
+        .nth(1)
+        .unwrap()
+        .split("## Completed local Rudder agents")
+        .next()
+        .unwrap();
+    assert!(ready_section.contains("run-claude node=n3 mode=execute status=done backend=claude"));
+    assert!(ready_section.contains("merge=needs-merge"));
+    assert!(!ready_section.contains("run-merged"));
+    let completed_section = text
+        .split("## Completed local Rudder agents")
+        .nth(1)
+        .unwrap();
+    assert!(
+        completed_section.contains("run-merged node=n4 mode=execute status=merged backend=claude")
+    );
     assert!(text.contains("status=starting backend=pending model=pending"));
+    let worker_text = fs::read_to_string(repo.join("codex-worktree").join("RUDDER.md"))
+        .expect("running workspace RUDDER.md");
+    assert_eq!(worker_text, text);
+    let ready_text = fs::read_to_string(repo.join("claude-worktree").join("RUDDER.md"))
+        .expect("ready workspace RUDDER.md");
+    assert_eq!(ready_text, text);
+    let completed_text = fs::read_to_string(repo.join("merged-worktree").join("RUDDER.md"))
+        .expect("completed workspace RUDDER.md");
+    assert_eq!(completed_text, text);
 
     let _ = fs::remove_dir_all(&repo);
 }
@@ -6458,6 +6559,9 @@ fn orchestrator_prompts_include_global_monitoring_contract() {
     let codex_prompt = codex_orchestrator_prompt("monitor the current threads");
     assert!(codex_prompt.contains("Global job snapshot"));
     assert!(codex_prompt.contains("Active local Rudder agents"));
+    assert!(codex_prompt.contains("Ready local Rudder agents"));
+    assert!(codex_prompt.contains("Completed local Rudder agents"));
+    assert!(codex_prompt.contains("Active as live or waiting only"));
     assert!(codex_prompt.contains("monitor the current threads"));
 }
 

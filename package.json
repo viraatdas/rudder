@@ -14,13 +14,14 @@
   },
   "scripts": {
     "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
-    "build": "npm run clean && tsc -p tsconfig.json && npm run build-board && npm run build-native && npm run copy-native",
+    "build": "npm run clean && tsc -p tsconfig.json && npm run build-board && npm run build-native && npm run copy-native && npm run chmod-cli",
     "build-board": "esbuild src/board/ui/index.tsx --bundle --minify --format=esm --jsx=automatic --jsx-import-source=preact --outfile=dist/board/board.js && esbuild src/board/ui/board.css --bundle --minify --outfile=dist/board/board.css",
     "build-native": "cargo build --release --manifest-path native/Cargo.toml",
     "check": "tsc -p tsconfig.json --noEmit",
-    "test": "tsc -p tsconfig.json && node --test tests/*.test.mjs",
+    "test": "tsc -p tsconfig.json && npm run chmod-cli && node --test tests/*.test.mjs",
     "test:worker-scroll": "cargo test --manifest-path native/Cargo.toml top_origin_scroll_region_history_scrolls_like_terminal_scrollback && cargo test --manifest-path native/Cargo.toml worker_wheel && cargo test --manifest-path native/Cargo.toml wheel_scroll && cargo test --manifest-path native/Cargo.toml worker_page && cargo test --manifest-path native/Cargo.toml codex_alternate_screen_page_key",
     "copy-native": "node -e \"const fs=require('fs');const path=require('path');const sources=[path.join('target','release','rudder-native'),path.join('native','target','release','rudder-native')];const src=sources.find((candidate)=>fs.existsSync(candidate));const dest=path.join('dist','native','rudder-native');if(src){fs.mkdirSync(path.dirname(dest),{recursive:true});fs.copyFileSync(src,dest);fs.chmodSync(dest,0o755);}else if(fs.existsSync(dest)){fs.unlinkSync(dest);}\"",
+    "chmod-cli": "node -e \"require('fs').chmodSync('dist/index.js',0o755)\"",
     "prepack": "npm run build",
     "postinstall": "node scripts/postinstall.mjs",
     "start": "node dist/index.js"

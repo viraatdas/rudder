@@ -1030,6 +1030,11 @@ Automatic local routing misclassified too many ordinary requests. A FRESH task
   `src/board/daemon.ts`, which reads the `## ` blocks and still tolerates legacy bullets).
 - **`RUDDER.md`** — read-only, orchestrator-owned, `freshness:`-stamped projection of
   the plan/status that workers re-read (`renderLiveRudderMd`). Git-excluded.
+  Native dashboard context writes must mirror the same generated block to every
+  known agent workspace, not only the root checkout or a pending worktree.
+  The generated status sections are intentionally separate: Active means live or
+  waiting, Ready means completed work awaiting review or merge, and Completed is
+  terminal history.
 - **`RUDDER_SHARED.md`** — gitignored local shared context for API tokens, private URLs,
   account ids, env vars, and setup details the user gives Rudder and expects every agent
   to use. It is intentionally separate from `DECISIONS.md` because it may contain
