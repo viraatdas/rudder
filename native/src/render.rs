@@ -3317,7 +3317,7 @@ pub(crate) fn task_default_hint(app: &App) -> &'static str {
     {
         "type to talk to the live orchestrator for status, retro, or follow-up control  ·  ^W pane"
     } else {
-        "type to hand a task to the orchestrator; /ask for a one-off  ·  Option-1/2/3 or ^W pane"
+        "type for orchestrator; /run for one mergeable worker; /ask for direct one-off  ·  Option-1/2/3 or ^W pane"
     }
 }
 
@@ -4008,6 +4008,10 @@ pub(crate) fn agent_status_label(agent: &AgentRun) -> &'static str {
         "plan mode"
     } else if agent.status == AgentStatus::Merged {
         "[x] merged"
+    } else if agent.has_merge_conflict() && agent.status == AgentStatus::Running {
+        "resolving conflict"
+    } else if agent.has_merge_conflict() && agent.status == AgentStatus::Done {
+        "merge conflict · press m"
     } else if agent.status == AgentStatus::Done && agent_awaits_merge(agent) {
         // "done" alone read as terminal, but a workspace run is NOT integrated (and
         // does not unblock its dependents) until it merges. Say what is missing.
@@ -4031,6 +4035,8 @@ pub(crate) fn agent_awaits_merge(agent: &AgentRun) -> bool {
 pub(crate) fn agent_status_style(agent: &AgentRun) -> Style {
     if agent.needs_permission || agent.needs_user_input {
         Style::default().fg(RUNNING_COLOR)
+    } else if agent.has_merge_conflict() {
+        Style::default().fg(FAILED_COLOR)
     } else {
         status_style(agent.status)
     }

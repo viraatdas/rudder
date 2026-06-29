@@ -312,6 +312,7 @@ fn manual_goal_slash_command_is_capped() {
 fn slash_command_rest_ignores_leading_whitespace_before_command() {
     assert_eq!(command_rest("  /goal   ship it", "/goal"), "   ship it");
     assert_eq!(command_rest("\t/ask explain auth", "/ask"), " explain auth");
+    assert_eq!(command_rest("/run build auth", "/run"), " build auth");
     assert_eq!(command_rest("/plan build it", "/plan"), " build it");
 }
 
@@ -2855,6 +2856,77 @@ fn run_record_round_trips_merge_resolver_flag() {
 }
 
 #[test]
+fn merge_conflict_run_record_round_trips_actionable_state() {
+    let repo_root = unique_test_repo("merge-conflict-record");
+    let run_dir = native_run_dir(&repo_root, "conflict-run-1");
+    fs::create_dir_all(&run_dir).expect("create run dir");
+    let worktree = repo_root.join("worktree");
+    let record = serde_json::json!({
+        "id": "conflict-run-1",
+        "status": "merge-conflict",
+        "vcs": "jj",
+        "mode": "execute",
+        "task": "build auth",
+        "taskSummary": "build auth",
+        "backend": "claude",
+        "model": "sonnet",
+        "createdAt": "2026-06-26T00:00:00.000Z",
+        "worktree": {
+            "enabled": true,
+            "path": worktree,
+            "workspaceName": "rudder-conflict-run-1",
+            "jjChangeId": "abc123",
+        },
+        "merge": {
+            "status": "conflict",
+            "conflictKind": "merge",
+            "conflictedFiles": ["src/auth.ts", "src/session.ts"],
+        },
+    });
+    fs::write(
+        run_dir.join("run.json"),
+        serde_json::to_string_pretty(&record).expect("serialize record"),
+    )
+    .expect("write run.json");
+
+    let loaded = load_persisted_agents(&repo_root);
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].status, AgentStatus::Done);
+    assert!(loaded[0].has_merge_conflict());
+    assert_eq!(
+        loaded[0].merge_conflict_files,
+        vec!["src/auth.ts".to_string(), "src/session.ts".to_string()]
+    );
+    assert_eq!(agent_status_label(&loaded[0]), "merge conflict · press m");
+
+    save_native_run_record(&repo_root, &loaded[0]).expect("save conflict record");
+    let raw = fs::read_to_string(native_run_dir(&repo_root, "conflict-run-1").join("run.json"))
+        .expect("read saved run.json");
+    let saved: serde_json::Value = serde_json::from_str(&raw).expect("parse saved run.json");
+    assert_eq!(
+        saved.get("status").and_then(|v| v.as_str()),
+        Some("merge-conflict")
+    );
+    assert_eq!(
+        saved
+            .get("merge")
+            .and_then(|v| v.get("status"))
+            .and_then(|v| v.as_str()),
+        Some("conflict")
+    );
+    assert_eq!(
+        saved
+            .get("merge")
+            .and_then(|v| v.get("conflictedFiles"))
+            .and_then(|v| v.as_array())
+            .map(|items| items.len()),
+        Some(2)
+    );
+
+    let _ = fs::remove_dir_all(repo_root);
+}
+
+#[test]
 fn legacy_git_run_record_keeps_vcs_git_and_branch() {
     let repo_root = std::env::temp_dir().join(format!(
         "rudder-git-record-test-{}-{}",
@@ -3048,6 +3120,17 @@ fn slash_commands_rank_closest_matches() {
     assert!(
         ask.detail.contains("one-off"),
         "/ask suggestion should explain one-off behavior"
+    );
+
+    app.task_input = "/ru".to_string();
+    let run_suggestions = suggestions_for(&app);
+    let run = run_suggestions
+        .first()
+        .expect("/run suggestion should be present");
+    assert_eq!(run.label.as_str(), "/run <task>");
+    assert!(
+        run.detail.contains("mergeable"),
+        "/run suggestion should explain mergeable worker behavior"
     );
 
     app.task_input = "/pl".to_string();
@@ -4191,6 +4274,9 @@ fn test_agent_run(id: &str, task: &str) -> AgentRun {
         last_worker_input_at: None,
         ready_since: None,
         merge_resolver: false,
+        merge_conflict: false,
+        merge_conflict_operation: ConflictOperation::Merge,
+        merge_conflict_files: Vec::new(),
     }
 }
 
@@ -4637,6 +4723,27 @@ fn merge_all_command_includes_jj_workspace_runs_without_legacy_path() {
 }
 
 #[test]
+fn merge_all_skips_recorded_merge_conflict_rows() {
+    let mut app = App::new();
+    let mut conflicted = test_agent_run("run-1", "conflicted task");
+    conflicted.status = AgentStatus::Done;
+    conflicted.node_id = Some("n1".to_string());
+    conflicted.workspace_name = Some("rudder-conflicted".to_string());
+    conflicted.jj_change_id = Some("abc123".to_string());
+    conflicted.merge_conflict = true;
+    conflicted.merge_conflict_files = vec!["src/auth.ts".to_string()];
+    app.agents.push(conflicted);
+
+    app.request_merge_all_ready();
+
+    assert!(app.merge_confirm.is_none());
+    assert!(app
+        .notice
+        .as_deref()
+        .is_some_and(|notice| notice.contains("need selected m")));
+}
+
+#[test]
 fn merge_all_confirmation_names_ready_nodes_and_logs_action() {
     let mut app = App::new();
     let mut first = test_agent_run("run-1", "first task");
@@ -4944,6 +5051,9 @@ fn delete_agent_requires_second_d() {
         last_worker_input_at: None,
         ready_since: None,
         merge_resolver: false,
+        merge_conflict: false,
+        merge_conflict_operation: ConflictOperation::Merge,
+        merge_conflict_files: Vec::new(),
     });
 
     app.delete_selected_agent();
@@ -6554,6 +6664,7 @@ fn orchestrator_prompts_include_global_monitoring_contract() {
     assert!(claude_prompt.contains("Global job snapshot"));
     assert!(claude_prompt.contains("wait for current Claude/Codex jobs"));
     assert!(claude_prompt.contains("RUDDER_REVIEW_ALL"));
+    assert!(claude_prompt.contains("RUDDER_RUN <task>"));
     assert!(claude_prompt.contains("RUDDER_MAIN <prompt>"));
 
     let codex_prompt = codex_orchestrator_prompt("monitor the current threads");
@@ -6562,6 +6673,7 @@ fn orchestrator_prompts_include_global_monitoring_contract() {
     assert!(codex_prompt.contains("Ready local Rudder agents"));
     assert!(codex_prompt.contains("Completed local Rudder agents"));
     assert!(codex_prompt.contains("Active as live or waiting only"));
+    assert!(codex_prompt.contains("RUDDER_RUN <task>"));
     assert!(codex_prompt.contains("monitor the current threads"));
 }
 
@@ -6638,6 +6750,51 @@ fn orchestrator_control_marker_can_stop_worker() {
     assert!(!text.contains("RUDDER_STOP"));
     assert!(text.contains("before") && text.contains("after"));
 
+    let _ = fs::remove_dir_all(&repo);
+}
+
+#[cfg(not(windows))]
+#[test]
+fn orchestrator_run_marker_starts_manual_execute_worker() {
+    let _env = env_guard();
+    let repo = unique_test_repo("orch-run-marker");
+    let worker = repo.join("fake-worker.sh");
+    write_fake_bin(&worker, FAKE_CONDUCTOR_WORKER);
+    std::env::set_var("RUDDER_CODEX_BIN", &worker);
+    fs::write(
+        repo.join("RUDDER.md"),
+        "before\nRUDDER_RUN build the settings panel\nafter\n",
+    )
+    .unwrap();
+
+    let mut app = App::new();
+    app.cwd = repo.clone();
+    app.backend = Backend::Codex;
+    app.interactive_orchestrator = true;
+    let mut orch = test_agent_run("orch-1", "plan it");
+    orch.cwd = repo.clone();
+    orch.mode = AgentMode::RudderPlan;
+    orch.backend = Backend::Claude;
+    orch.autosteered = false;
+    orch.interactive_orchestrator = true;
+    orch.status = AgentStatus::Running;
+    app.agents.push(orch);
+
+    app.scan_orchestrator_skill_markers();
+
+    let spawned = app
+        .agents
+        .iter()
+        .find(|run| run.mode == AgentMode::Execute)
+        .expect("RUDDER_RUN starts an execute worker");
+    assert!(spawned.node_id.is_none(), "RUDDER_RUN is not a DAG node");
+    let text = fs::read_to_string(repo.join("RUDDER.md")).unwrap();
+    assert!(!text.contains("RUDDER_RUN"));
+
+    for run in &mut app.agents {
+        run.terminal = None;
+    }
+    std::env::remove_var("RUDDER_CODEX_BIN");
     let _ = fs::remove_dir_all(&repo);
 }
 
@@ -7564,6 +7721,46 @@ fn plan_command_starts_orchestrator_for_dag_work() {
         "/plan starts the initial orchestrator planner"
     );
 
+    std::env::remove_var("RUDDER_CODEX_BIN");
+    let _ = fs::remove_dir_all(&repo);
+}
+
+#[cfg(not(windows))]
+#[test]
+fn run_command_starts_single_execute_worker() {
+    let _env = env_guard();
+    let repo = unique_test_repo("run-cmd");
+    let worker = repo.join("fake-worker.sh");
+    write_fake_bin(&worker, FAKE_CONDUCTOR_WORKER);
+    std::env::set_var("RUDDER_CODEX_BIN", &worker);
+
+    let mut app = App::new();
+    app.cwd = repo.clone();
+    app.backend = Backend::Codex;
+
+    let handled = app.handle_command("/run build the settings panel");
+    assert!(handled, "/run is a recognized command");
+    let spawned = app
+        .agents
+        .last()
+        .expect("an execute worker spawned by /run");
+    assert_eq!(spawned.mode, AgentMode::Execute);
+    assert!(
+        !spawned.is_oneoff(),
+        "/run is not the direct main-checkout one-off path"
+    );
+    assert!(
+        !spawned.is_orchestrator(),
+        "/run skips the planner/orchestrator path"
+    );
+    assert!(
+        spawned.node_id.is_none(),
+        "/run creates one manual worker, not a DAG node"
+    );
+
+    if let Some(run) = app.agents.last_mut() {
+        run.terminal = None;
+    }
     std::env::remove_var("RUDDER_CODEX_BIN");
     let _ = fs::remove_dir_all(&repo);
 }

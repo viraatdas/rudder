@@ -49,8 +49,9 @@ rudder
 
 With no arguments, `rudder` opens the dashboard. Type in the bottom input and
 press `Enter` to hand the request to the orchestrator. It can answer, inspect the
-repo, or plan a DAG and run isolated workers. Use `/ask <text>` when you want a
-one-off agent in the main checkout with no DAG.
+repo, or plan a DAG and run isolated workers. Use `/run <task>` when you want
+exactly one isolated mergeable worker with no DAG. Use `/ask <text>` when you
+want a one-off agent in the main checkout with no merge step.
 
 If a task needs shared local context like API tokens, private URLs, account ids,
 or environment values, save it with `/share <text>` in the task input. Rudder
@@ -90,7 +91,7 @@ to `~/.rudder/config.json`.
 │ task list     │ live Claude Code or Codex terminal           │
 │ status/model  │ DAG-over-orchestrator, scrollback, review    │
 ├───────────────┴────────────────────────────────────────────┤
-│ task input: orchestrator by default, /ask for one-off        │
+│ task input: orchestrator by default, /run single, /ask direct │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -158,8 +159,9 @@ running, Rudder also exposes matching project skills; the orchestrator can write
 | --- | --- |
 | `/model` | Pick provider, then model, then effort |
 | `/fast` | Fast mode for new agents: flagship model at low effort (Claude opus / Codex gpt-5.5); `/model` switches back |
-| `/ask <text>` | Start a one-off conversational agent in the main checkout |
 | `/plan <text>` | Start the orchestrator / DAG planner |
+| `/run <task>` | Start one isolated mergeable worker, with no DAG |
+| `/ask <text>` | Start a one-off conversational agent in the main checkout |
 | `/share <text>` | Save gitignored shared context for all agents in `RUDDER_SHARED.md` |
 | `/main` or `/m` | Start a new main-branch agent |
 | `/review-all` | Combine completed worktrees and start a Codex review-all agent |
@@ -194,8 +196,10 @@ starts the orchestrator, which can inspect the repo, plan the work, and spawn
 isolated workers when needed.
 
 Use `/ask <text>` for a one-off conversational agent in the main checkout, with
-no DAG. Use `/plan <text>` when you want to be explicit about the orchestrator /
-DAG path; it is the same route as plain input.
+no DAG and no merge step. Use `/run <task>` for exactly one isolated worker that
+lands in Review and merges back with `m` or `/merge-all`. Use `/plan <text>` when
+you want to be explicit about the orchestrator / DAG path; it is the same route
+as plain input.
 
 For planned work, Rudder runs a dedicated Claude Code orchestrator PTY with a DAG
 pane above it. The flow stays inside Rudder: the orchestrator researches

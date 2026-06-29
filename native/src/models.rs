@@ -290,6 +290,11 @@ pub(crate) fn command_suggestions() -> Vec<Suggestion> {
             action: SuggestionAction::Insert("/ask ".to_string()),
         },
         Suggestion {
+            label: "/run <task>".to_string(),
+            detail: "one isolated mergeable worker, no DAG".to_string(),
+            action: SuggestionAction::Insert("/run ".to_string()),
+        },
+        Suggestion {
             label: "/plan <text>".to_string(),
             detail: "orchestrator planner for DAG work (same route as plain input)".to_string(),
             action: SuggestionAction::Insert("/plan ".to_string()),

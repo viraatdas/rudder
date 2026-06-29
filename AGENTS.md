@@ -422,7 +422,7 @@ slash commands, plan refinements, and empty-Enter approval. When the interactive
 Claude orchestrator is running, it can also edit the DAG in `RUDDER.md` and use
 generated project skills under `.claude/skills/rudder-*` for dashboard actions
 (`model`, `main`, `goal`, `usage`, `cloud/login`, `review-all`, `merge-all`,
-`automerge`, `plan/ask`, and DAG editing/approval). Rudder consumes the
+`automerge`, `plan/run/ask`, and DAG editing/approval). Rudder consumes the
 corresponding one-shot `RUDDER_*` control markers from `RUDDER.md`.
 
 ### Review and merge-all
@@ -932,7 +932,7 @@ Signal hygiene: hook writes are ATOMIC (`printf > tmp && mv`, v2.6.x) so the pol
 never reads a torn JSON, and `cleanup_run_signals` removes a run's three signal files on
 agent delete.
 
-### 14.4c Default task input: orchestrator by default, `/ask` for one-off
+### 14.4c Default task input: orchestrator by default, `/run` for one worker, `/ask` for direct one-off
 Automatic local routing misclassified too many ordinary requests. A FRESH task
 (no active plan) now has a deterministic contract:
 
@@ -942,6 +942,12 @@ Automatic local routing misclassified too many ordinary requests. A FRESH task
   Rudder's normal control markers. There is no local one-off-vs-DAG router.
 - **`/plan <text>`** is an explicit alias for the same orchestrator / DAG path.
   Use it when you want the command line to state the intent clearly.
+- **`/run <task>`** is the explicit escape hatch for exactly one isolated worker
+  with no DAG. It calls `start_execute_task_node(..., None)` and creates a normal
+  **`AgentMode::Execute`** run. In a git repo, this uses the jj workspace launch
+  path (`prepare_jj_workspace`), has no `node_id`, lands in Review when done, and
+  is mergeable through selected `m` or `/merge-all` into the current integration
+  checkout.
 - **`/ask <text>`** is the explicit escape hatch for one-off work. It calls
   `start_oneoff_task`, spawning a single conversational **`AgentMode::OneOff`**
   agent in the MAIN checkout (`create_oneoff_agent`, cwd = repo root, NO jj

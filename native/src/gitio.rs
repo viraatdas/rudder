@@ -269,6 +269,9 @@ pub(crate) fn create_main_agent(
         last_worker_input_at: None,
         ready_since: None,
         merge_resolver: false,
+        merge_conflict: false,
+        merge_conflict_operation: ConflictOperation::Merge,
+        merge_conflict_files: Vec::new(),
     }
 }
 
@@ -498,6 +501,43 @@ pub(crate) fn agent_from_run_record(
         .get("mergeResolver")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or_else(|| record.get("resolverFor").is_some());
+    let merge_state = record.get("merge");
+    let sync_state = record.get("sync");
+    let merge_status = merge_state
+        .and_then(|value| value.get("status"))
+        .and_then(serde_json::Value::as_str);
+    let sync_status = sync_state
+        .and_then(|value| value.get("status"))
+        .and_then(serde_json::Value::as_str);
+    let record_status = record.get("status").and_then(serde_json::Value::as_str);
+    let merge_conflict = record_status == Some("merge-conflict")
+        || merge_status == Some("conflict")
+        || sync_status == Some("conflict");
+    let conflict_kind = merge_state
+        .and_then(|value| value.get("conflictKind"))
+        .or_else(|| sync_state.and_then(|value| value.get("conflictKind")))
+        .and_then(serde_json::Value::as_str);
+    let merge_conflict_operation = if conflict_kind == Some("rebase") {
+        ConflictOperation::Rebase
+    } else {
+        ConflictOperation::Merge
+    };
+    let conflict_files_from = |state: Option<&serde_json::Value>| {
+        state
+            .and_then(|value| value.get("conflictedFiles"))
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(ToOwned::to_owned))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+    let mut merge_conflict_files = conflict_files_from(merge_state);
+    if merge_conflict_files.is_empty() {
+        merge_conflict_files = conflict_files_from(sync_state);
+    }
     let interactive_orchestrator = record
         .get("interactiveOrchestrator")
         .and_then(serde_json::Value::as_bool)
@@ -560,6 +600,9 @@ pub(crate) fn agent_from_run_record(
         last_worker_input_at: None,
         ready_since: None,
         merge_resolver,
+        merge_conflict,
+        merge_conflict_operation,
+        merge_conflict_files,
     })
 }
 
@@ -675,9 +718,14 @@ pub(crate) fn save_native_run_record(repo_root: &Path, run: &AgentRun) -> Result
             map.insert("branch".to_string(), serde_json::json!(branch));
         }
     }
-    let record = serde_json::json!({
+    let record_status = if run.status == AgentStatus::Done && run.merge_conflict {
+        "merge-conflict"
+    } else {
+        run_record_status(run.status)
+    };
+    let mut record = serde_json::json!({
         "id": run.id,
-        "status": run_record_status(run.status),
+        "status": record_status,
         "vcs": if is_jj_run { "jj" } else { "git" },
         "mode": run.mode.as_str(),
         // Whether this RudderPlan row is a TRANSIENT reconcile planner (vs the pinned
@@ -710,6 +758,23 @@ pub(crate) fn save_native_run_record(repo_root: &Path, run: &AgentRun) -> Result
         "planDeps": run.deps,
         "session": run.session_id.as_ref().map(|sid| serde_json::json!({ "nativeSessionId": sid })),
     });
+    if run.merge_conflict {
+        let conflict_kind = if run.merge_conflict_operation == ConflictOperation::Rebase {
+            "rebase"
+        } else {
+            "merge"
+        };
+        if let Some(map) = record.as_object_mut() {
+            map.insert(
+                "merge".to_string(),
+                serde_json::json!({
+                    "status": "conflict",
+                    "conflictKind": conflict_kind,
+                    "conflictedFiles": run.merge_conflict_files,
+                }),
+            );
+        }
+    }
     let temp = record_path.with_extension(format!(
         "json.{}.{}.tmp",
         std::process::id(),

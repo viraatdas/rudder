@@ -91,7 +91,7 @@ const ORCHESTRATOR_SKILLS: &[OrchestratorSkill] = &[
         slug: "rudder-monitor-work",
         name: "rudder-monitor-work",
         description: "Use when the user asks to monitor current Claude, Codex, or Rudder jobs and then take follow-up actions when they finish.",
-        body: "Read RUDDER.md's generated Global job snapshot plus Active, Ready, and Completed local Rudder agent sections first. Active means live or waiting, Ready means completed work awaiting review or merge, and Completed is terminal history. If relevant jobs are still running or waiting, report a concise status grounded in those rows and keep monitoring by re-reading RUDDER.md; do not invent completion. Once the relevant workers are done, use RUDDER_REVIEW_ALL for a whole-repo review, RUDDER_MERGE_ALL or RUDDER_AUTOMERGE on for ready merges, and RUDDER_ADD_TASK or RUDDER_ASK for fixes found by review. For repo-specific final steps such as push, publish, release, or deploy, start a main-checkout/one-off worker with RUDDER_MAIN <prompt> or RUDDER_ASK <prompt> that names the exact final action. Do not run final release commands directly from the orchestrator.",
+        body: "Read RUDDER.md's generated Global job snapshot plus Active, Ready, and Completed local Rudder agent sections first. Active means live or waiting, Ready means completed work awaiting review or merge, and Completed is terminal history. If relevant jobs are still running or waiting, report a concise status grounded in those rows and keep monitoring by re-reading RUDDER.md; do not invent completion. Once the relevant workers are done, use RUDDER_REVIEW_ALL for a whole-repo review, RUDDER_MERGE_ALL or RUDDER_AUTOMERGE on for ready merges, and RUDDER_ADD_TASK or RUDDER_RUN for fixes found by review. For repo-specific final steps such as push, publish, release, or deploy, start a main-checkout/one-off worker with RUDDER_MAIN <prompt> or RUDDER_ASK <prompt> that names the exact final action. Do not run final release commands directly from the orchestrator.",
     },
     OrchestratorSkill {
         slug: "rudder-review-merge",
@@ -102,8 +102,8 @@ const ORCHESTRATOR_SKILLS: &[OrchestratorSkill] = &[
     OrchestratorSkill {
         slug: "rudder-plan-ask",
         name: "rudder-plan-ask",
-        description: "Use when the user explicitly asks to force a DAG plan, add work to the running DAG, re-plan the running DAG, or force a one-off ask.",
-        body: "Write RUDDER_ADD_TASK <task> to append one new task to the running DAG, RUDDER_REPLAN <direction> to structurally revise the running DAG, RUDDER_PLAN <task> to force a fresh DAG planner, or RUDDER_ASK <question or small change> to start a one-off agent in the main checkout. Rudder consumes the marker and runs the matching action.",
+        description: "Use when the user explicitly asks to force a DAG plan, add work to the running DAG, re-plan the running DAG, force one isolated worker, or force a one-off ask.",
+        body: "Write RUDDER_ADD_TASK <task> to append one new task to the running DAG, RUDDER_REPLAN <direction> to structurally revise the running DAG, RUDDER_PLAN <task> to force a fresh DAG planner, RUDDER_RUN <task> to start exactly one isolated mergeable worker with no DAG, or RUDDER_ASK <question or small change> to start a one-off agent in the main checkout. Rudder consumes the marker and runs the matching action.",
     },
     OrchestratorSkill {
         slug: "rudder-worker-control",
@@ -641,6 +641,9 @@ pub(crate) fn review_all_run(
         last_worker_input_at: None,
         ready_since: None,
         merge_resolver: false,
+        merge_conflict: false,
+        merge_conflict_operation: ConflictOperation::Merge,
+        merge_conflict_files: Vec::new(),
     }
 }
 

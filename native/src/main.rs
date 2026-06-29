@@ -853,6 +853,13 @@ struct AgentRun {
     /// with no conflicts left, the merge is finalized (the node flips to Merged so
     /// its children unblock); if conflicts remain it drops to manual.
     merge_resolver: bool,
+    /// True when the run's work completed but its integration is parked on a merge
+    /// conflict. This is distinct from `merge_resolver`: a parked conflict is waiting
+    /// for the user to press `m` (or approve a resolver), while a resolver is actively
+    /// running in this same row.
+    merge_conflict: bool,
+    merge_conflict_operation: ConflictOperation,
+    merge_conflict_files: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -895,6 +902,10 @@ impl AgentRun {
             || self.worktree_branch.is_some()
             || self.workspace_name.is_some()
             || self.jj_change_id.is_some()
+    }
+
+    fn has_merge_conflict(&self) -> bool {
+        self.merge_conflict
     }
 
     /// A "pinned planner" renders in the orchestrator section at the top of the list
@@ -2439,7 +2450,7 @@ impl App {
                 self.task_cursor = 1;
                 self.picker_index = 0;
                 self.notice = Some(
-                    "type /ask for a one-off, /plan for DAG work, /model, /main|/m, /usage, or /cloud"
+                    "type /run for one mergeable worker, /ask for direct one-off, /plan for DAG, /model, /main|/m, /usage, or /cloud"
                         .to_string(),
                 );
             }
@@ -3759,6 +3770,9 @@ impl App {
             last_worker_input_at: None,
             ready_since: None,
             merge_resolver: false,
+            merge_conflict: false,
+            merge_conflict_operation: ConflictOperation::Merge,
+            merge_conflict_files: Vec::new(),
         };
 
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
@@ -3926,6 +3940,9 @@ impl App {
             last_worker_input_at: None,
             ready_since: None,
             merge_resolver: false,
+            merge_conflict: false,
+            merge_conflict_operation: ConflictOperation::Merge,
+            merge_conflict_files: Vec::new(),
         };
 
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
@@ -4064,6 +4081,9 @@ impl App {
             last_worker_input_at: None,
             ready_since: None,
             merge_resolver: false,
+            merge_conflict: false,
+            merge_conflict_operation: ConflictOperation::Merge,
+            merge_conflict_files: Vec::new(),
         };
 
         // INTERACTIVE orchestrator: it never exits and presents its DAG via RUDDER.md, so
@@ -5043,11 +5063,25 @@ impl App {
                 let rest = command_rest(input, "/plan").trim();
                 if rest.is_empty() {
                     self.notice = Some(
-                        "usage: /plan <task> — same as plain input: the orchestrator plans + implements it (use /ask for a one-off)"
+                        "usage: /plan <task> — same as plain input: the orchestrator plans + implements it (use /run for one isolated worker, /ask for direct one-off)"
                             .to_string(),
                     );
                 } else {
                     self.start_rudder_plan_task(rest);
+                }
+                true
+            }
+            Some("/run") => {
+                // Force one isolated implementation worker. This skips the
+                // planner/DAG, but unlike /ask it is mergeable through m/M.
+                let rest = command_rest(input, "/run").trim();
+                if rest.is_empty() {
+                    self.notice = Some(
+                        "usage: /run <task> — one isolated jj worker, no DAG; merge with m or /merge-all"
+                            .to_string(),
+                    );
+                } else {
+                    self.start_single_run_task(rest);
                 }
                 true
             }
@@ -5093,7 +5127,7 @@ impl App {
             }
             Some("/help") => {
                 self.notice = Some(
-                    "plain input -> orchestrator/DAG · /ask <text> -> one-off main-checkout agent · /plan <text> -> force orchestrator/DAG · panes: Option-1/2/3 or ^W · keys: j/k select · Enter focus · v diff · m merge · M merge all · R review all · g nest · o web ui · x stop · dd delete · P model — commands: /model /fast /main /ask /plan /share /usage /goal /cloud /web"
+                    "plain input -> orchestrator/DAG · /run <task> -> one isolated mergeable worker · /ask <text> -> direct main-checkout one-off · /plan <text> -> force orchestrator/DAG · panes: Option-1/2/3 or ^W · keys: j/k select · Enter focus · v diff · m merge · M merge all · R review all · g nest · o web ui · x stop · dd delete · P model — commands: /model /fast /main /run /ask /plan /share /usage /goal /cloud /web"
                         .to_string(),
                 );
                 true
@@ -5591,6 +5625,9 @@ impl App {
             last_worker_input_at: None,
             ready_since: None,
             merge_resolver: false,
+            merge_conflict: false,
+            merge_conflict_operation: ConflictOperation::Merge,
+            merge_conflict_files: Vec::new(),
         };
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
             Ok(mut terminal) => {
@@ -5608,6 +5645,39 @@ impl App {
         self.selected_agent = self.agents.len().saturating_sub(1);
         self.delete_pending = None;
         self.focus = FocusPane::Worker;
+    }
+
+    /// Spawn exactly one normal execute worker without invoking the planner. In a git
+    /// repo this uses the same jj workspace isolation as DAG workers, so the result
+    /// appears in Review and is integrated with `m` or `/merge-all`.
+    fn start_single_run_task(&mut self, input: &str) {
+        let input = input.trim();
+        if input.is_empty() {
+            return;
+        }
+        let before = self.agents.len();
+        self.notice = None;
+        self.start_execute_task_node(input, None, None);
+        let launch_notice = self.notice.clone();
+        if self.agents.len() > before {
+            let Some(run) = self.agents.last() else {
+                return;
+            };
+            if run.status == AgentStatus::Running && run.has_merge_source() {
+                self.notice = Some(
+                    "isolated worker running; merge with m or /merge-all when done".to_string(),
+                );
+            } else if run.status == AgentStatus::Running
+                && !launch_notice
+                    .as_deref()
+                    .is_some_and(|notice| notice.starts_with("jj workspace failed:"))
+            {
+                self.notice = Some(
+                    "worker running in the current checkout; no merge step outside a git repo"
+                        .to_string(),
+                );
+            }
+        }
     }
 
     fn refresh_cloud_workspace_status(&mut self) {
@@ -5981,6 +6051,15 @@ impl App {
                 self.notice = Some("RUDDER_PLAN requires a task".to_string());
             } else {
                 self.handle_command(&format!("/plan {rest}"));
+            }
+            return;
+        }
+        if let Some(rest) = marker.strip_prefix("RUDDER_RUN") {
+            let rest = rest.trim();
+            if rest.is_empty() {
+                self.notice = Some("RUDDER_RUN requires a task".to_string());
+            } else {
+                self.handle_command(&format!("/run {rest}"));
             }
             return;
         }
@@ -8204,6 +8283,7 @@ impl App {
                     && run.status == AgentStatus::Done
                     && !run.is_main()
                     && !run.merge_resolver
+                    && !run.has_merge_conflict()
                     && !self.auto_merge_skip.contains(&run.id)
             });
             let Some(index) = next else { break };
@@ -8315,8 +8395,16 @@ impl App {
                     self.auto_merge_skip.push(id.clone());
                     self.persist_auto_merge_skip();
                 }
+                if let Some(run) = self.agents.get_mut(index) {
+                    run.status = AgentStatus::Done;
+                    run.merge_conflict = true;
+                    run.merge_conflict_operation = ConflictOperation::Merge;
+                    run.merge_conflict_files = conflicts.clone();
+                    run.last_error = Some(format!("resolver left {} conflict(s)", conflicts.len()));
+                    let _ = save_native_run_record(&self.cwd, run);
+                }
                 self.notice = Some(format!(
-                    "resolver left {} conflict(s) in {}; resolve and press m",
+                    "resolver left {} conflict(s) in {}; press m to retry or resolve manually",
                     conflicts.len(),
                     short_task(&label)
                 ));
@@ -8701,6 +8789,56 @@ impl App {
         let _ = write_rudder_context(&self.cwd, &self.agents, None);
     }
 
+    fn start_stored_merge_conflict_resolution(&mut self, index: usize) {
+        let Some(run) = self.agents.get(index) else {
+            self.notice = Some("no agent selected".to_string());
+            return;
+        };
+        if !run.has_merge_conflict() {
+            self.notice = Some("selected agent is not in a merge conflict".to_string());
+            return;
+        }
+
+        let operation = run.merge_conflict_operation;
+        let repo_root = if operation == ConflictOperation::Rebase {
+            run.worktree_path.clone().unwrap_or_else(|| run.cwd.clone())
+        } else {
+            self.cwd.clone()
+        };
+        let mut files = run.merge_conflict_files.clone();
+        if files.is_empty() {
+            files = if operation == ConflictOperation::Rebase {
+                conflicted_files(&repo_root)
+            } else {
+                jj_unresolved_conflicts(&repo_root)
+            };
+        }
+        let task = run
+            .task
+            .strip_prefix("Resolve merge conflicts: ")
+            .or_else(|| run.task.strip_prefix("Resolve rebase conflicts: "))
+            .unwrap_or(&run.task)
+            .to_string();
+        self.conflict_prompt = Some(MergeConflictPrompt {
+            operation,
+            task,
+            conflicted_files: files,
+            error: run
+                .last_error
+                .clone()
+                .unwrap_or_else(|| "merge conflict is still unresolved".to_string()),
+            repo_root,
+            target_branch: current_branch_at(&self.cwd),
+            source_branch: run.worktree_branch.clone(),
+            worktree_path: run.worktree_path.clone(),
+            agent_id: Some(run.id.clone()),
+        });
+        self.merge_confirm = None;
+        self.delete_pending = None;
+        self.notice = None;
+        self.start_conflict_resolution_agent();
+    }
+
     fn request_merge_selected_agent(&mut self) {
         if self.selected_is_main() {
             self.notice = Some("main agent: merge disabled".to_string());
@@ -8716,6 +8854,10 @@ impl App {
         }
         if run.is_oneoff() {
             self.notice = Some("one-off agent: merge disabled".to_string());
+            return;
+        }
+        if run.has_merge_conflict() {
+            self.start_stored_merge_conflict_resolution(self.selected_agent);
             return;
         }
         if !run.has_merge_source() {
@@ -8763,12 +8905,32 @@ impl App {
                     && !run.is_main()
                     && !run.is_oneoff()
                     && !run.is_orchestrator()
+                    && !run.has_merge_conflict()
                     && !claimed.contains(&run.id)
             })
             .collect();
 
         if ready_runs.is_empty() {
-            self.notice = Some("no completed workspaces ready to merge".to_string());
+            let conflict_count = self
+                .agents
+                .iter()
+                .filter(|run| {
+                    run.status == AgentStatus::Done
+                        && run.has_merge_conflict()
+                        && !run.is_main()
+                        && !run.is_oneoff()
+                        && !run.is_orchestrator()
+                        && !claimed.contains(&run.id)
+                })
+                .count();
+            self.notice = Some(if conflict_count > 0 {
+                format!(
+                    "{conflict_count} merge-conflict row{} need selected m before merge-all can continue",
+                    if conflict_count == 1 { "" } else { "s" }
+                )
+            } else {
+                "no completed workspaces ready to merge".to_string()
+            });
             return;
         }
 
@@ -9005,6 +9167,7 @@ impl App {
 
         let count = conflicts.len();
         let target_branch = current_branch_at(&self.cwd);
+        let conflict_files = conflicts.clone();
         self.conflict_prompt = Some(MergeConflictPrompt {
             operation,
             task,
@@ -9026,7 +9189,12 @@ impl App {
                 // Stopped buried it in "closed" looking cancelled. Park it in the
                 // auto-merge skip list so auto-merge does not re-conflict every tick;
                 // a successful merge or re-goal clears the skip.
+                run.status = AgentStatus::Done;
                 run.last_error = Some(error.to_string());
+                run.merge_resolver = false;
+                run.merge_conflict = true;
+                run.merge_conflict_operation = operation;
+                run.merge_conflict_files = conflict_files;
                 let _ = save_native_run_record(&self.cwd, run);
                 let id = self.agents[index].id.clone();
                 if !self.auto_merge_skip.contains(&id) {
@@ -9163,6 +9331,9 @@ impl App {
                     run.needs_user_input = false;
                     run.user_input_notified = false;
                     run.last_error = None;
+                    run.merge_resolver = false;
+                    run.merge_conflict = false;
+                    run.merge_conflict_files.clear();
                     run.current_prompt = new_goal.to_string();
                     run.turns.push(AgentTurn {
                         ts: now.clone(),
@@ -9227,11 +9398,27 @@ impl App {
             if run.is_main() {
                 return false;
             }
+            let was_conflict_resolver = run.merge_resolver || run.merge_conflict;
+            let unresolved = if was_conflict_resolver {
+                jj_unresolved_conflicts(&run.cwd)
+            } else {
+                Vec::new()
+            };
             run.terminal = None;
             run.review_terminal = None;
-            run.status = AgentStatus::Stopped;
+            run.status = if was_conflict_resolver {
+                AgentStatus::Done
+            } else {
+                AgentStatus::Stopped
+            };
             run.completed_at = Some(Instant::now());
             run.merge_resolver = false;
+            if was_conflict_resolver {
+                run.merge_conflict = true;
+                if !unresolved.is_empty() {
+                    run.merge_conflict_files = unresolved;
+                }
+            }
             run.needs_permission = false;
             run.permission_notified = false;
             run.needs_user_input = false;
@@ -9350,6 +9537,7 @@ impl App {
                 p.repo_root.clone(),
                 p.source_branch.clone(),
                 p.worktree_path.clone(),
+                p.conflicted_files.clone(),
             )
         });
         self.conflict_prompt = None;
@@ -9371,8 +9559,14 @@ impl App {
         let model = self.agents[index].model.clone();
         let effort = self.agents[index].effort;
         let terminal_size = self.agents[index].terminal_size.unwrap_or_default();
-        let (operation, resolver_cwd, source_branch, worktree_path) =
-            conflict_context.unwrap_or((ConflictOperation::Merge, self.cwd.clone(), None, None));
+        let (operation, resolver_cwd, source_branch, worktree_path, conflicted_files) =
+            conflict_context.unwrap_or((
+                ConflictOperation::Merge,
+                self.cwd.clone(),
+                None,
+                None,
+                Vec::new(),
+            ));
         let session_id = mint_session_id_for(backend);
         let resolver_run_id = self.agents[index].id.clone();
         let mut command = agent_command(
@@ -9435,6 +9629,9 @@ impl App {
                     // (flip the node to Merged, unblock children) once they finish
                     // with no conflicts left. Git rebase resolvers keep manual flow.
                     run.merge_resolver = operation == ConflictOperation::Merge;
+                    run.merge_conflict = true;
+                    run.merge_conflict_operation = operation;
+                    run.merge_conflict_files = conflicted_files;
                     run.ready_since = None;
                     run.task = if original_task.is_empty() {
                         if operation == ConflictOperation::Rebase {
@@ -9478,10 +9675,17 @@ impl App {
             }
             Err(error) => {
                 if let Some(run) = self.agents.get_mut(index) {
-                    run.status = AgentStatus::Failed;
+                    run.status = AgentStatus::Done;
+                    run.merge_resolver = false;
+                    run.merge_conflict = true;
+                    run.merge_conflict_operation = operation;
+                    run.merge_conflict_files = conflicted_files;
                     run.last_error = Some(error.to_string());
+                    let _ = save_native_run_record(&self.cwd, run);
                 }
-                self.notice = Some(format!("failed to start AI resolver: {error}"));
+                self.notice = Some(format!(
+                    "failed to start AI resolver: {error}; press m to retry"
+                ));
             }
         }
     }
@@ -9698,6 +9902,9 @@ What to do\n\
                 run.status = AgentStatus::Merged;
                 run.worktree_branch = None;
                 run.completed_at = Some(Instant::now());
+                run.merge_resolver = false;
+                run.merge_conflict = false;
+                run.merge_conflict_files.clear();
                 run.needs_permission = false;
                 run.permission_notified = false;
                 run.needs_user_input = false;
@@ -10713,6 +10920,7 @@ fn is_orchestrator_skill_marker(line: &str) -> bool {
         "RUDDER_ADD_TASK",
         "RUDDER_REPLAN",
         "RUDDER_PLAN",
+        "RUDDER_RUN",
         "RUDDER_ASK",
     ]
     .iter()
