@@ -6,6 +6,19 @@ RUN cargo build --release --manifest-path native/Cargo.toml \
   && cp target/release/rudder-native /rudder-native \
   || cp native/target/release/rudder-native /rudder-native
 
+FROM node:22-slim AS cli-builder
+WORKDIR /src
+COPY package.json package-lock.json tsconfig.json ./
+COPY scripts ./scripts
+RUN RUDDER_SKIP_POSTINSTALL=1 npm ci --no-audit --no-fund
+COPY src ./src
+# Build the TypeScript CLI and bundled board without requiring an untracked
+# host dist/. The native binary comes from the target-platform Rust stage.
+RUN npm run clean \
+  && npx tsc -p tsconfig.json \
+  && npm run build-board \
+  && npm run chmod-cli
+
 FROM node:22-slim
 
 ENV RUDDER_CLOUD_WORKER=1 \
@@ -15,15 +28,18 @@ ENV RUDDER_CLOUD_WORKER=1 \
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
-    ca-certificates curl git openssh-client tar gzip zsh \
+    ca-certificates curl git openssh-client tar gzip zsh tini \
     python3 build-essential \
   && rm -rf /var/lib/apt/lists/*
 
+ARG CLAUDE_CODE_VERSION=2.1.196
+ARG CODEX_VERSION=0.142.4
+ARG ACPX_VERSION=0.11.2
 RUN npm install -g \
-    @anthropic-ai/claude-code@latest \
-    @openai/codex@latest \
-    acpx@latest \
-    hunkdiff@latest \
+    "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
+    "@openai/codex@${CODEX_VERSION}" \
+    "acpx@${ACPX_VERSION}" \
+    --no-audit --no-fund \
   && npm cache clean --force
 
 # jj (Jujutsu) is Rudder's required internal VCS substrate. node:22-slim ships no
@@ -50,28 +66,30 @@ WORKDIR /opt/rudder
 # resolves; RUDDER_SKIP_POSTINSTALL makes it a no-op since jj is installed above.
 COPY package.json package-lock.json ./
 COPY scripts ./scripts
-RUN RUDDER_SKIP_POSTINSTALL=1 npm ci --omit=dev
-COPY dist ./dist
+RUN RUDDER_SKIP_POSTINSTALL=1 npm ci --omit=dev --no-audit --no-fund
+COPY --from=cli-builder /src/dist ./dist
 COPY assets ./assets
 COPY --from=native-builder /rudder-native ./dist/native/rudder-native
 RUN chmod +x ./dist/native/rudder-native && RUDDER_SKIP_POSTINSTALL=1 npm link
 
 WORKDIR /opt/rudder-worker
-COPY cloud/worker/package.json ./package.json
-RUN npm install --omit=dev --no-audit --no-fund \
+COPY cloud/worker/package.json cloud/worker/package-lock.json ./
+RUN npm ci --omit=dev --no-audit --no-fund \
   && npm cache clean --force
 COPY cloud/worker/supervisor.mjs ./supervisor.mjs
+COPY cloud/worker/supervisor-lib.mjs ./supervisor-lib.mjs
 
 COPY cloud/worker/entrypoint.sh /usr/local/bin/rudder-worker
 RUN chmod +x /usr/local/bin/rudder-worker
 
-# Claude refuses --permission-mode bypassPermissions as root, so we run the
-# supervisor (and everything it spawns) as a non-root user.
+# The supervisor stays root so its worker token is not readable through
+# /proc/$PPID/environ by the coding agent. supervisor.mjs drops only the PTY
+# child to this uid/gid; Claude therefore still runs non-root.
 RUN useradd --create-home --shell /bin/bash --uid 1500 rudder \
   && mkdir -p /workspace \
-  && chown -R rudder:rudder /workspace /opt/rudder-worker
+  && chmod 1777 /workspace
 
-USER rudder
+USER root
 WORKDIR /workspace
 
-ENTRYPOINT ["rudder-worker"]
+ENTRYPOINT ["/usr/bin/tini", "--", "rudder-worker"]

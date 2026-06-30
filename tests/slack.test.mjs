@@ -4,6 +4,7 @@ import { createHmac } from "node:crypto";
 
 import {
   DEFAULT_SLACK_CHANNEL,
+  escapeSlackText,
   formatOutputForSlack,
   parseSlackCommand,
   slackConfigFromEnv,
@@ -55,6 +56,7 @@ test("verifySlackSignature rejects tampered body, stale ts, and missing secret",
   assert.equal(verifySlackSignature({ signingSecret: secret, timestamp, signature: sig, rawBody: body, now: (1700000000 + 999) * 1000 }), false);
   // no secret -> fail closed
   assert.equal(verifySlackSignature({ signingSecret: "", timestamp, signature: sig, rawBody: body, now: 1700000000 * 1000 }), false);
+  assert.equal(verifySlackSignature({ signingSecret: secret, timestamp: "1.7e9", signature: sig, rawBody: body, now: 1700000000 * 1000 }), false);
 });
 
 test("stripAnsi removes CSI/OSC/control bytes", () => {
@@ -72,6 +74,8 @@ test("formatOutputForSlack code-fences and tails long output", () => {
   assert.ok(out.startsWith("```"));
   assert.ok(out.includes("…"));
   assert.ok(out.length < 200);
+  assert.equal(formatOutputForSlack("```<!channel>```"), "```\n``\u200b`<!channel>``\u200b`\n```");
+  assert.equal(escapeSlackText("<&>"), "&lt;&amp;&gt;");
 });
 
 test("parseSlackCommand handles list/help/talk/output/stop", () => {

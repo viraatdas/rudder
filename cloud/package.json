@@ -13,7 +13,7 @@
     "@aws-sdk/s3-request-presigner": "^3.1047.0",
     "better-auth": "^1.4.0",
     "better-sqlite3": "^12.5.0",
-    "ws": "^8.18.0"
+    "ws": "^8.21.0"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
