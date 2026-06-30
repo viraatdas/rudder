@@ -78,16 +78,18 @@ export async function readJson<T>(filePath: string): Promise<T | null> {
   }
 }
 
-/**
- * Serializes async work per file path so concurrent writers (and
- * read-modify-write sequences) to the same file cannot interleave. Each call
- * runs after the previous one for that path settles, regardless of outcome.
- */
+/** Serializes JSON read/modify/write work both inside this process and across
+ * the detached board/worker processes. The directory lock is required for
+ * compare-and-swap writes such as worker-attempt ownership; atomic rename alone
+ * prevents torn JSON but cannot prevent a stale process from winning last. */
 const pathLocks = new Map<string, Promise<unknown>>();
 
 export function withPathLock<T>(filePath: string, fn: () => Promise<T>): Promise<T> {
   const key = path.resolve(filePath);
-  const run = (pathLocks.get(key) ?? Promise.resolve()).then(fn, fn);
+  const run = (pathLocks.get(key) ?? Promise.resolve()).then(
+    () => withFilesystemPathLock(key, fn),
+    () => withFilesystemPathLock(key, fn),
+  );
   const tail = run.then(
     () => undefined,
     () => undefined,
@@ -99,6 +101,38 @@ export function withPathLock<T>(filePath: string, fn: () => Promise<T>): Promise
     }
   });
   return run;
+}
+
+async function withFilesystemPathLock<T>(filePath: string, fn: () => Promise<T>): Promise<T> {
+  const lockDir = `${filePath}.lock`;
+  const deadline = Date.now() + 10_000;
+  await ensureDir(path.dirname(lockDir));
+  for (;;) {
+    try {
+      await fsp.mkdir(lockDir);
+      break;
+    } catch (error) {
+      const code = isRecord(error) && typeof error.code === "string" ? error.code : "";
+      if (code !== "EEXIST") throw error;
+      const age = await fsp.stat(lockDir).then((stat) => Date.now() - stat.mtimeMs).catch(() => null);
+      // JSON critical sections contain only a read + small temp-file rename;
+      // five seconds is safely beyond a live holder but still lets a restart
+      // recover a crashed lock within this call's ten-second deadline.
+      if (age !== null && age > 5_000) {
+        await fsp.rm(lockDir, { recursive: true, force: true });
+        continue;
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(`Timed out waiting for JSON lock: ${filePath}`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+  try {
+    return await fn();
+  } finally {
+    await fsp.rm(lockDir, { recursive: true, force: true }).catch(() => undefined);
+  }
 }
 
 async function writeJsonRaw(
@@ -135,11 +169,12 @@ export function writeJson(
  */
 export function updateJson<T>(
   filePath: string,
-  transform: (current: T | null) => JsonValue,
+  transform: (current: T | null) => JsonValue | undefined,
 ): Promise<void> {
   return withPathLock(filePath, async () => {
     const current = await readJson<T>(filePath);
-    await writeJsonRaw(filePath, transform(current));
+    const next = transform(current);
+    if (next !== undefined) await writeJsonRaw(filePath, next);
   });
 }
 

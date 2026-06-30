@@ -6,8 +6,11 @@ import {
   type Column,
   type MemoryEntry,
   type ProjectSummary,
+  type SteerReceipt,
+  type TaskUpdate,
   fetchLog,
   fetchProjects,
+  fetchSteerReceipt,
   postCancel,
   postMerge,
   postSteer,
@@ -178,6 +181,7 @@ function SkeletonTile() {
 // ---------------------------------------------------------------------------
 
 type View = "board" | "nest" | "activity" | "memory";
+type FocusTarget = HTMLElement | SVGElement;
 
 const VIEW_KEY = "rudder.board.view";
 
@@ -195,6 +199,9 @@ export function BoardView({ slug }: { slug: string }) {
   const { state, conn, name } = useBoardState(slug);
   const [view, setViewRaw] = useState<View>(loadView);
   const [selected, setSelected] = useState<string | null>(null);
+  const returnFocusRef = useRef<FocusTarget | null>(null);
+  const controlMode = window.__RUDDER_CONTROL_MODE__ ?? "projector";
+  const canMutate = window.__RUDDER_CAN_MUTATE__ !== false;
 
   const setView = (v: View) => {
     setViewRaw(v);
@@ -207,6 +214,10 @@ export function BoardView({ slug }: { slug: string }) {
 
   const nodes = useMemo(() => Array.from(state.nodes.values()), [state.nodes]);
   const selectedNode = selected ? state.nodes.get(selected) ?? null : null;
+  const openTask = (id: string, trigger: FocusTarget) => {
+    returnFocusRef.current = trigger;
+    setSelected(id);
+  };
 
   return (
     <div class="page board-page">
@@ -218,24 +229,35 @@ export function BoardView({ slug }: { slug: string }) {
         onView={setView}
         memoryCount={state.memory.length}
         latestActivity={state.activity.length ? state.activity[state.activity.length - 1] : null}
+        canMutate={canMutate}
       />
 
       <main class="board-main">
         {!state.loaded && conn !== "reconnecting" ? (
           <BoardSkeleton />
         ) : view === "board" ? (
-          <Board nodes={nodes} onOpen={setSelected} selected={selected} />
+          <Board nodes={nodes} onOpen={openTask} selected={selected} />
         ) : view === "nest" ? (
-          <Nest nodes={nodes} edges={state.edges} onOpen={setSelected} selected={selected} />
+          <Nest nodes={nodes} edges={state.edges} onOpen={openTask} selected={selected} />
         ) : view === "activity" ? (
-          <ActivityView slug={slug} activity={state.activity} />
+          <ActivityView
+            slug={slug}
+            activity={state.activity}
+            canSteerConductor={canMutate && controlMode === "projector"}
+          />
         ) : (
           <MemoryView memory={state.memory} />
         )}
       </main>
 
       {selectedNode && (
-        <CardDetail slug={slug} node={selectedNode} onClose={() => setSelected(null)} />
+        <CardDetail
+          slug={slug}
+          node={selectedNode}
+          onClose={() => setSelected(null)}
+          returnFocus={returnFocusRef.current}
+          canMutate={canMutate}
+        />
       )}
     </div>
   );
@@ -249,6 +271,7 @@ function Toolbar({
   onView,
   memoryCount,
   latestActivity,
+  canMutate,
 }: {
   slug: string;
   name: string;
@@ -257,6 +280,7 @@ function Toolbar({
   onView: (v: View) => void;
   memoryCount: number;
   latestActivity: ActivityEntry | null;
+  canMutate: boolean;
 }) {
   const [composerOpen, setComposerOpen] = useState(false);
   return (
@@ -282,11 +306,10 @@ function Toolbar({
       </div>
 
       <div class="toolbar-actions">
-        <div class="view-toggle" role="tablist" aria-label="View">
+        <div class="view-toggle" role="group" aria-label="View">
           <button
             type="button"
-            role="tab"
-            aria-selected={view === "board"}
+            aria-pressed={view === "board"}
             class={`toggle ${view === "board" ? "toggle-on" : ""}`}
             onClick={() => onView("board")}
           >
@@ -294,8 +317,7 @@ function Toolbar({
           </button>
           <button
             type="button"
-            role="tab"
-            aria-selected={view === "nest"}
+            aria-pressed={view === "nest"}
             class={`toggle ${view === "nest" ? "toggle-on" : ""}`}
             onClick={() => onView("nest")}
             title="Nest / DAG view"
@@ -304,8 +326,7 @@ function Toolbar({
           </button>
           <button
             type="button"
-            role="tab"
-            aria-selected={view === "activity"}
+            aria-pressed={view === "activity"}
             class={`toggle ${view === "activity" ? "toggle-on" : ""}`}
             onClick={() => onView("activity")}
             title="Live activity feed"
@@ -314,8 +335,7 @@ function Toolbar({
           </button>
           <button
             type="button"
-            role="tab"
-            aria-selected={view === "memory"}
+            aria-pressed={view === "memory"}
             class={`toggle ${view === "memory" ? "toggle-on" : ""}`}
             onClick={() => onView("memory")}
           >
@@ -324,9 +344,15 @@ function Toolbar({
           </button>
         </div>
 
-        <button type="button" class="btn btn-accent" onClick={() => setComposerOpen(true)}>
-          + Task
-        </button>
+        {canMutate ? (
+          <button type="button" class="btn btn-accent" onClick={() => setComposerOpen(true)}>
+            + Task
+          </button>
+        ) : (
+          <span class="readonly-pill mono" title="Open this project's own Rudder board to make changes">
+            read-only
+          </span>
+        )}
       </div>
 
       {composerOpen && <Composer slug={slug} onClose={() => setComposerOpen(false)} />}
@@ -360,24 +386,100 @@ function Composer({ slug, onClose }: { slug: string; onClose: () => void }) {
   const [prompt, setPrompt] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [queued, setQueued] = useState<{
+    requestId?: string;
+    state: "queued" | "delivered";
+    message: string;
+  } | null>(null);
   const ref = useRef<HTMLTextAreaElement>(null);
+  const dialogRef = useRef<HTMLFormElement>(null);
+  const busyRef = useRef(false);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+  busyRef.current = busy;
 
   useEffect(() => {
+    const returnFocus = document.activeElement as HTMLElement | null;
     ref.current?.focus();
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.key === "Escape") {
+        e.preventDefault();
+        if (!busyRef.current) onCloseRef.current();
+        return;
+      }
+      if (e.key !== "Tab" || !dialogRef.current) return;
+      const focusable = Array.from(
+        dialogRef.current.querySelectorAll<HTMLElement>(
+          'button:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+        ),
+      );
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (first && last && e.shiftKey && document.activeElement === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (first && last && !e.shiftKey && document.activeElement === last) {
+        e.preventDefault();
+        first.focus();
+      }
     };
     window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      returnFocus?.focus();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (queued?.state !== "queued" || !queued.requestId) return;
+    let cancelled = false;
+    let timer: number | undefined;
+    const check = async () => {
+      try {
+        const receipt = await fetchSteerReceipt(slug, queued.requestId!);
+        if (cancelled) return;
+        if (receipt.status === "delivered") {
+          setQueued({ requestId: receipt.requestId, state: "delivered", message: "Delivered to the native conductor" });
+          return;
+        }
+        if (receipt.status === "failed") {
+          setQueued(null);
+          setError(receipt.error || "The native conductor could not accept the task");
+          return;
+        }
+      } catch {
+        // Keep the durable queued state visible and retry a transient read.
+      }
+      if (!cancelled) timer = window.setTimeout(check, 500);
+    };
+    timer = window.setTimeout(check, 250);
+    return () => {
+      cancelled = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [slug, queued?.state, queued?.requestId]);
 
   const submit = async () => {
     const text = prompt.trim();
     if (!text || busy) return;
     setBusy(true);
     setError(null);
+    setQueued(null);
     try {
-      await postTask(slug, text);
+      const receipt = await postTask(slug, text);
+      if (receipt.status === "queued") {
+        setPrompt("");
+        setQueued({
+          requestId: receipt.requestId,
+          state: "queued",
+          message: "Queued for the native conductor",
+        });
+        setBusy(false);
+        return;
+      }
+      if (receipt.status === "failed") {
+        throw new Error("The task could not be delivered to the conductor");
+      }
       onClose();
     } catch (e: any) {
       setError(String(e?.message ?? e));
@@ -393,32 +495,48 @@ function Composer({ slug, onClose }: { slug: string; onClose: () => void }) {
   };
 
   return (
-    <div class="overlay" onClick={onClose}>
-      <div class="composer" onClick={(e) => e.stopPropagation()}>
+    <div class="overlay" onClick={() => { if (!busy) onClose(); }}>
+      <form
+        ref={dialogRef}
+        class="composer"
+        onClick={(e) => e.stopPropagation()}
+        onSubmit={(e) => {
+          e.preventDefault();
+          void submit();
+        }}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="new-task-title"
+        aria-busy={busy}
+      >
         <div class="composer-head">
-          <span class="composer-title">New task</span>
-          <span class="composer-hint mono">⌘⏎ to run · esc to close</span>
+          <span class="composer-title" id="new-task-title">New task</span>
+          <span class="composer-hint mono" id="new-task-hint">⌘/Ctrl + Enter to run · Esc to close</span>
         </div>
+        <label class="sr-only" for="new-task-prompt">Task description</label>
         <textarea
           ref={ref}
+          id="new-task-prompt"
           class="composer-input mono"
           rows={5}
           placeholder="Describe the task. The agent decomposes and schedules it."
           value={prompt}
+          aria-describedby="new-task-hint"
           onInput={(e) => setPrompt((e.target as HTMLTextAreaElement).value)}
           onKeyDown={onKeyDown}
-          disabled={busy}
+          readOnly={busy}
         />
-        {error && <div class="banner banner-error mono">{error}</div>}
+        {error && <div class="banner banner-error mono" role="alert">{error}</div>}
+        {queued && <div class="banner mono" role="status">{queued.message}</div>}
         <div class="composer-actions">
           <button type="button" class="btn" onClick={onClose} disabled={busy}>
-            Cancel
+            {queued ? "Close" : "Cancel"}
           </button>
-          <button type="button" class="btn btn-accent" onClick={submit} disabled={busy || !prompt.trim()}>
+          <button type="submit" class="btn btn-accent" disabled={busy || !prompt.trim()}>
             {busy ? "Running…" : "Run task"}
           </button>
         </div>
-      </div>
+      </form>
     </div>
   );
 }
@@ -433,7 +551,7 @@ function Board({
   selected,
 }: {
   nodes: BoardNode[];
-  onOpen: (id: string) => void;
+  onOpen: (id: string, trigger: FocusTarget) => void;
   selected: string | null;
 }) {
   const byColumn = useMemo(() => {
@@ -479,7 +597,7 @@ function Card({
   selected,
 }: {
   node: BoardNode;
-  onOpen: (id: string) => void;
+  onOpen: (id: string, trigger: FocusTarget) => void;
   selected: boolean;
 }) {
   const token = statusToken(node);
@@ -489,12 +607,16 @@ function Card({
     <article
       class={`card ${selected ? "card-selected" : ""}`}
       data-status={token}
+      data-task-id={node.id}
       tabIndex={0}
-      onClick={() => onOpen(node.id)}
+      role="button"
+      aria-haspopup="dialog"
+      aria-expanded={selected}
+      onClick={(e) => onOpen(node.id, e.currentTarget as HTMLElement)}
       onKeyDown={(e) => {
         if (e.key === "Enter" || e.key === " ") {
           e.preventDefault();
-          onOpen(node.id);
+          onOpen(node.id, e.currentTarget as HTMLElement);
         }
       }}
     >
@@ -660,7 +782,7 @@ function Nest({
 }: {
   nodes: BoardNode[];
   edges: BoardEdge[];
-  onOpen: (id: string) => void;
+  onOpen: (id: string, trigger: FocusTarget) => void;
   selected: string | null;
 }) {
   const layout = useMemo(() => computeLayout(nodes), [nodes]);
@@ -699,7 +821,7 @@ function Nest({
         width={layout.width}
         height={layout.height}
         viewBox={`0 0 ${layout.width} ${layout.height}`}
-        role="img"
+        role="group"
         aria-label="Task dependency graph"
       >
         <defs>
@@ -749,21 +871,24 @@ function Nest({
             if (!p) return null;
             const token = statusToken(n);
             const isSel = selected === n.id;
-            const onActivate = () => onOpen(n.id);
+            const onActivate = (trigger: FocusTarget) => onOpen(n.id, trigger);
             return (
               <g
                 key={n.id}
                 class={`node ${isSel ? "node-selected" : ""}`}
                 data-status={token}
+                data-task-id={n.id}
                 transform={`translate(${p.x} ${p.y})`}
                 tabIndex={0}
                 role="button"
                 aria-label={`${statusLabel(n)}: ${n.title}`}
-                onClick={onActivate}
+                aria-haspopup="dialog"
+                aria-expanded={isSel}
+                onClick={(ev) => onActivate(ev.currentTarget as SVGElement)}
                 onKeyDown={(ev) => {
                   if (ev.key === "Enter" || ev.key === " ") {
                     ev.preventDefault();
-                    onActivate();
+                    onActivate(ev.currentTarget as SVGElement);
                   }
                 }}
               >
@@ -792,10 +917,14 @@ function CardDetail({
   slug,
   node,
   onClose,
+  returnFocus,
+  canMutate,
 }: {
   slug: string;
   node: BoardNode;
   onClose: () => void;
+  returnFocus: FocusTarget | null;
+  canMutate: boolean;
 }) {
   const [log, setLog] = useState<string | null>(null);
   const [logError, setLogError] = useState<string | null>(null);
@@ -804,27 +933,73 @@ function CardDetail({
     msg: null,
     err: null,
   });
+  const drawerRef = useRef<HTMLElement>(null);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
   const token = statusToken(node);
   const running = isRunning(node);
   // A node is mergeable when its worker has finished and it is awaiting the
   // merge gate. Run-derived nodes carry status "completed"; graph-projected
   // scheduled nodes carry status "review" (and land in the review column).
-  const mergeable =
-    node.status === "completed" || node.status === "review" || node.column === "review";
+  const canRequestChanges = node.status === "completed" || node.status === "review";
+  const mergeable = canRequestChanges || node.column === "review";
+  const steerable = running || canRequestChanges;
+  const requestingChanges = canRequestChanges && !running;
+  const targetId = node.runId ?? node.id;
+  const composerId = `task-update-${node.id.replace(/[^A-Za-z0-9_-]/g, "-")}`;
 
   useEffect(() => {
+    const focusTarget = returnFocus ?? (document.activeElement as FocusTarget | null);
+    const frame = window.requestAnimationFrame(() => {
+      const preferred = drawerRef.current?.querySelector<HTMLElement>("[data-autofocus]");
+      (preferred ?? drawerRef.current)?.focus();
+    });
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.key === "Escape") {
+        e.preventDefault();
+        onCloseRef.current();
+        return;
+      }
+      if (e.key !== "Tab" || !drawerRef.current) return;
+      const focusable = Array.from(
+        drawerRef.current.querySelectorAll<HTMLElement>(
+          'a[href], button:not([disabled]), textarea:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex="-1"])',
+        ),
+      );
+      if (focusable.length === 0) {
+        e.preventDefault();
+        drawerRef.current.focus();
+        return;
+      }
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault();
+        first.focus();
+      }
     };
     window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.removeEventListener("keydown", onKey);
+      if (focusTarget?.isConnected) {
+        focusTarget.focus();
+      } else {
+        const replacement = Array.from(document.querySelectorAll<FocusTarget>("[data-task-id]"))
+          .find((element) => element.getAttribute("data-task-id") === node.id);
+        replacement?.focus();
+      }
+    };
+  }, [node.id]);
 
   useEffect(() => {
     let cancelled = false;
     setLog(null);
     setLogError(null);
-    fetchLog(slug, node.id, 200)
+    fetchLog(slug, targetId, 200)
       .then((t) => {
         if (!cancelled) setLog(t);
       })
@@ -834,7 +1009,7 @@ function CardDetail({
     return () => {
       cancelled = true;
     };
-  }, [slug, node.id]);
+  }, [slug, targetId]);
 
   // Append the live lastLine so the drawer feels live between log backfills.
   const liveLog = useMemo(() => {
@@ -847,7 +1022,7 @@ function CardDetail({
   const doMerge = async () => {
     setAction({ busy: true, msg: null, err: null });
     try {
-      const r = await postMerge(slug, node.id);
+      const r = await postMerge(slug, targetId);
       // Server normalizes to "merge-conflict"; also treat the raw jj/graph
       // signals "conflict"/"blocked" as conflicts so server + UI agree.
       const isConflict =
@@ -870,7 +1045,7 @@ function CardDetail({
   const doCancel = async () => {
     setAction({ busy: true, msg: null, err: null });
     try {
-      await postCancel(slug, node.id);
+      await postCancel(slug, targetId);
       setAction({ busy: false, msg: "cancel requested", err: null });
     } catch (e: any) {
       setAction({ busy: false, msg: null, err: String(e?.message ?? e) });
@@ -879,7 +1054,16 @@ function CardDetail({
 
   return (
     <div class="drawer-overlay" onClick={onClose}>
-      <aside class="drawer" onClick={(e) => e.stopPropagation()} data-status={token}>
+      <aside
+        ref={drawerRef}
+        class="drawer"
+        onClick={(e) => e.stopPropagation()}
+        data-status={token}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="task-detail-title"
+        tabIndex={-1}
+      >
         <div class="drawer-spine" data-status={token} />
         <header class="drawer-head">
           <div class="drawer-head-top">
@@ -890,7 +1074,7 @@ function CardDetail({
               ✕
             </button>
           </div>
-          <h2 class="drawer-title">{node.title}</h2>
+          <h2 class="drawer-title" id="task-detail-title">{node.title}</h2>
           <div class="drawer-meta mono">
             <span>{node.backend}</span>
             {node.model && <span>{node.model}</span>}
@@ -908,42 +1092,115 @@ function CardDetail({
           )}
         </header>
 
-        <div class="drawer-actions">
+        {canMutate && <div class="drawer-actions">
           {mergeable && (
             <button type="button" class="btn btn-accent" onClick={doMerge} disabled={action.busy}>
               {action.busy ? "Merging…" : "Merge"}
             </button>
           )}
-          {running && (
-            <button type="button" class="btn btn-danger" onClick={doCancel} disabled={action.busy}>
-              {action.busy ? "…" : "Cancel"}
+          {requestingChanges && (
+            <button
+              type="button"
+              class="btn"
+              onClick={() => document.getElementById(composerId)?.focus()}
+              disabled={action.busy}
+            >
+              Request changes
             </button>
           )}
-          {action.msg && <span class="action-msg mono">{action.msg}</span>}
-          {action.err && <span class="action-err mono">{action.err}</span>}
+          {running && (
+            <button type="button" class="btn btn-danger" onClick={doCancel} disabled={action.busy}>
+              {action.busy ? "Stopping…" : "Stop"}
+            </button>
+          )}
+          {action.msg && <span class="action-msg" aria-live="polite">{action.msg}</span>}
+          {action.err && <span class="action-err" role="alert">{action.err}</span>}
+        </div>}
+
+        <div class="drawer-scroll">
+          <TaskUpdates updates={node.updates ?? []} lastLine={node.lastLine} />
+          <div class="drawer-log">
+            <div class="drawer-log-head mono">
+              <span>Worker log</span>
+              {running && <span class="pulse-dot" aria-hidden="true" />}
+            </div>
+            <LogPane text={liveLog} error={logError} loading={log === null && !logError} />
+          </div>
         </div>
 
-        {running && (
+        {canMutate && steerable && (
           <div class="drawer-steer">
-            <div class="drawer-steer-head mono">Steer this agent</div>
-            <SteerBox
+            <SteerComposer
               slug={slug}
-              targetId={node.id}
-              placeholder="Send an instruction to this worker…  (⌘⏎)"
+              targetId={targetId}
+              inputId={composerId}
+              label={requestingChanges ? "Request changes" : "Send update"}
+              submitLabel={requestingChanges ? "Request changes" : "Send update"}
+              placeholder={
+                requestingChanges
+                  ? "Describe what should change before this task is merged."
+                  : "Add context or redirect this worker."
+              }
+              autoFocus
             />
           </div>
         )}
-
-        <div class="drawer-log">
-          <div class="drawer-log-head mono">
-            <span>log</span>
-            {running && <span class="pulse-dot" aria-hidden="true" />}
-          </div>
-          <LogPane text={liveLog} error={logError} loading={log === null && !logError} />
-        </div>
       </aside>
     </div>
   );
+}
+
+function TaskUpdates({ updates, lastLine }: { updates: TaskUpdate[]; lastLine: string | null }) {
+  const visible = updates.filter((update) => update.instruction.trim());
+  return (
+    <section class="task-updates" aria-labelledby="task-updates-title">
+      <div class="task-updates-head">
+        <h3 id="task-updates-title">Updates</h3>
+        {visible.length > 0 && <span class="task-updates-count mono">{visible.length}</span>}
+      </div>
+      <div class="task-thread">
+        {visible.length === 0 && !lastLine && (
+          <p class="task-thread-empty">No updates have been sent yet.</p>
+        )}
+        {visible.map((update, index) => (
+          <article class="task-update task-update-user" key={`${update.ts}-${index}`}>
+            <div class="task-update-avatar" aria-hidden="true">Y</div>
+            <div class="task-update-body">
+              <div class="task-update-meta">
+                <span>{updateAuthor(update.source)}</span>
+                <time class="mono" dateTime={update.ts}>{fmtTime(update.ts)}</time>
+              </div>
+              <p>{update.instruction}</p>
+            </div>
+          </article>
+        ))}
+        {lastLine && (
+          <article class="task-update task-update-agent">
+            <div class="task-update-avatar task-update-avatar-agent" aria-hidden="true">R</div>
+            <div class="task-update-body">
+              <div class="task-update-meta"><span>Latest from worker</span></div>
+              <p class="mono">{lastLine}</p>
+            </div>
+          </article>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function updateAuthor(source?: string): string {
+  const normalized = (source ?? "").trim().toLowerCase();
+  if (
+    !normalized ||
+    normalized === "user" ||
+    normalized === "web" ||
+    normalized === "operator" ||
+    normalized === "regoal"
+  ) {
+    return "You";
+  }
+  if (normalized === "steerer" || normalized === "rudder") return "Rudder";
+  return source ?? "You";
 }
 
 function LogPane({ text, error, loading }: { text: string; error: string | null; loading: boolean }) {
@@ -956,11 +1213,11 @@ function LogPane({ text, error, loading }: { text: string; error: string | null;
   if (error) return <div class="banner banner-error mono">log unavailable: {error}</div>;
   if (loading) {
     return (
-      <pre class="log-pre mono">
+      <div class="log-pre log-loading mono" aria-label="Loading worker log">
         <div class="skel skel-line" style="width:70%" />
         <div class="skel skel-line" style="width:90%" />
         <div class="skel skel-line" style="width:55%" />
-      </pre>
+      </div>
     );
   }
   return (
@@ -971,35 +1228,99 @@ function LogPane({ text, error, loading }: { text: string; error: string | null;
 }
 
 // ---------------------------------------------------------------------------
-// SteerBox — send an instruction to a running agent (or the conductor). The
-// text is delivered straight into that agent's live terminal by the native TUI.
+// SteerComposer — multiline, truthful steering for a worker or conductor. HTTP
+// acceptance can mean queued or delivered; reflect the server receipt exactly.
 // ---------------------------------------------------------------------------
 
-function SteerBox({
+type SteerFeedback = {
+  instruction: string;
+  requestId?: string;
+  state: "sending" | "queued" | "accepted" | "delivered" | "failed";
+  message: string;
+};
+
+function receiptMessage(receipt: SteerReceipt): string {
+  if (receipt.status === "failed") return receipt.error || "Delivery failed";
+  if (receipt.status === "accepted") {
+    return receipt.mode === "resumed" ? "Accepted · agent is resuming" : "Accepted · agent is restarting";
+  }
+  if (receipt.status === "delivered") {
+    return receipt.mode === "resumed" ? "Delivered · agent resumed" : "Delivered to agent";
+  }
+  if (receipt.mode === "resumed") return "Queued · agent is resuming";
+  if (receipt.mode === "redirected") return "Queued for the live agent";
+  return "Queued for delivery";
+}
+
+function SteerComposer({
   slug,
   targetId,
+  inputId,
+  label,
+  submitLabel,
   placeholder,
+  autoFocus = false,
 }: {
   slug: string;
   targetId: string;
+  inputId: string;
+  label: string;
+  submitLabel: string;
   placeholder: string;
+  autoFocus?: boolean;
 }) {
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
-  const [msg, setMsg] = useState<string | null>(null);
+  const [feedback, setFeedback] = useState<SteerFeedback | null>(null);
   const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (
+      feedback?.state !== "queued" ||
+      !feedback.requestId ||
+      window.__RUDDER_CONTROL_MODE__ !== "projector"
+    ) return;
+    let cancelled = false;
+    let timer: number | undefined;
+    const check = async () => {
+      try {
+        const receipt = await fetchSteerReceipt(slug, feedback.requestId!);
+        if (cancelled) return;
+        if (receipt.status === "delivered" || receipt.status === "failed") {
+          setFeedback((current) => current?.requestId === receipt.requestId
+            ? { ...current, state: receipt.status, message: receiptMessage(receipt) }
+            : current);
+          return;
+        }
+      } catch {
+        // A transient read failure does not change the durable queued state.
+      }
+      if (!cancelled) timer = window.setTimeout(check, 500);
+    };
+    timer = window.setTimeout(check, 250);
+    return () => {
+      cancelled = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [slug, feedback?.state, feedback?.requestId]);
 
   const submit = async () => {
     const instruction = text.trim();
     if (!instruction || busy) return;
     setBusy(true);
-    setMsg(null);
+    setFeedback({ instruction, state: "sending", message: "Sending request…" });
     setErr(null);
     try {
-      await postSteer(slug, targetId, instruction);
+      const receipt = await postSteer(slug, targetId, instruction);
       setText("");
-      setMsg("sent");
+      setFeedback({
+        instruction,
+        requestId: receipt.requestId,
+        state: receipt.status,
+        message: receiptMessage(receipt),
+      });
     } catch (e: any) {
+      setFeedback(null);
       setErr(String(e?.message ?? e));
     } finally {
       setBusy(false);
@@ -1014,29 +1335,49 @@ function SteerBox({
   };
 
   return (
-    <div class="steer">
-      <div class="steer-row">
-        <input
-          class="steer-input mono"
-          type="text"
+    <form
+      class="steer"
+      onSubmit={(e) => {
+        e.preventDefault();
+        void submit();
+      }}
+      aria-busy={busy}
+    >
+      <label class="steer-label" for={inputId}>{label}</label>
+      <textarea
+          id={inputId}
+          class="steer-input"
+          rows={3}
+          maxLength={8000}
           placeholder={placeholder}
           value={text}
           disabled={busy}
-          onInput={(e) => setText((e.target as HTMLInputElement).value)}
+          data-autofocus={autoFocus ? "true" : undefined}
+          aria-describedby={`${inputId}-hint${feedback ? ` ${inputId}-status` : ""}`}
+          onInput={(e) => {
+            setText((e.target as HTMLTextAreaElement).value);
+            if (err) setErr(null);
+          }}
           onKeyDown={onKeyDown}
         />
-        <button
-          type="button"
-          class="btn btn-accent"
-          onClick={submit}
-          disabled={busy || !text.trim()}
-        >
-          {busy ? "…" : "Steer"}
+      <div class="steer-actions">
+        <span class="steer-hint" id={`${inputId}-hint`}>⌘/Ctrl + Enter to send</span>
+        <button type="submit" class="btn btn-accent" disabled={busy || !text.trim()}>
+          {busy ? "Sending…" : submitLabel}
         </button>
       </div>
-      {msg && <span class="action-msg mono">{msg}</span>}
-      {err && <span class="action-err mono">{err}</span>}
-    </div>
+      {feedback && (
+        <div
+          class={`steer-feedback steer-feedback-${feedback.state}`}
+          id={`${inputId}-status`}
+          aria-live="polite"
+        >
+          <span class="steer-feedback-state">{feedback.message}</span>
+          <span class="steer-feedback-text">{feedback.instruction}</span>
+        </div>
+      )}
+      {err && <div class="action-err steer-error" role="alert">Could not send: {err}</div>}
+    </form>
   );
 }
 
@@ -1044,7 +1385,15 @@ function SteerBox({
 // ActivityView — the live narration feed plus a conductor steering box.
 // ---------------------------------------------------------------------------
 
-function ActivityView({ slug, activity }: { slug: string; activity: ActivityEntry[] }) {
+function ActivityView({
+  slug,
+  activity,
+  canSteerConductor,
+}: {
+  slug: string;
+  activity: ActivityEntry[];
+  canSteerConductor: boolean;
+}) {
   const feedRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     const el = feedRef.current;
@@ -1053,14 +1402,18 @@ function ActivityView({ slug, activity }: { slug: string; activity: ActivityEntr
 
   return (
     <div class="activity">
-      <div class="activity-steer">
-        <div class="activity-steer-head mono">Steer the conductor</div>
-        <SteerBox
-          slug={slug}
-          targetId="conductor"
-          placeholder="Tell the live orchestrator what to do next…  (⌘⏎)"
-        />
-      </div>
+      {canSteerConductor && (
+        <div class="activity-steer">
+          <SteerComposer
+            slug={slug}
+            targetId="conductor"
+            inputId="conductor-update"
+            label="Message conductor"
+            submitLabel="Send update"
+            placeholder="Tell the live orchestrator what to do next."
+          />
+        </div>
+      )}
       {activity.length === 0 ? (
         <div class="empty">
           <div class="empty-title">no activity yet</div>
@@ -1082,7 +1435,8 @@ function ActivityView({ slug, activity }: { slug: string; activity: ActivityEntr
 }
 
 function fmtTime(ts: string): string {
-  const d = new Date(ts);
+  const value = /^\d{10,}$/.test(ts.trim()) ? Number(ts) : ts;
+  const d = new Date(value);
   if (Number.isNaN(d.getTime())) return "";
   return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }

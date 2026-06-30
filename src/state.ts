@@ -22,6 +22,7 @@ import {
   nowIso,
   readJson,
   rudderHome,
+  runCommand,
   shortHash,
   slugPrefix,
   slugify,
@@ -48,6 +49,64 @@ export function cloudAuthPath(): string {
 
 export function projectStateDir(repoRoot: string): string {
   return path.join(repoRoot, ".rudder");
+}
+
+const PROJECT_RUNTIME_IGNORES = [
+  ".rudder/",
+  ".rudder-worktrees/",
+  "RUDDER.md",
+  "RUDDER_SHARED.md",
+];
+const projectRuntimeIgnoreInstalls = new Map<string, Promise<void>>();
+
+/**
+ * Keep Rudder's live control plane out of every jj snapshot. This must run
+ * before creating scaffold changes or workspaces: adding the ignores after a
+ * workspace command is too late because jj snapshots the current checkout as
+ * part of that command.
+ *
+ * We write both .gitignore (the existing, visible project contract) and Git's
+ * local exclude file. The latter applies immediately across colocated jj
+ * workspaces, including a scaffold change created before an older Rudder
+ * version had installed the project-level rules.
+ */
+export function ensureProjectRuntimeIgnored(repoRoot: string): Promise<void> {
+  const key = path.resolve(repoRoot);
+  const existing = projectRuntimeIgnoreInstalls.get(key);
+  if (existing) return existing;
+  const install = installProjectRuntimeIgnores(key).catch((error) => {
+    projectRuntimeIgnoreInstalls.delete(key);
+    throw error;
+  });
+  projectRuntimeIgnoreInstalls.set(key, install);
+  return install;
+}
+
+async function installProjectRuntimeIgnores(repoRoot: string): Promise<void> {
+  const targets = [path.join(repoRoot, ".gitignore")];
+  const exclude = await runCommand("git", ["rev-parse", "--git-path", "info/exclude"], {
+    cwd: repoRoot,
+    allowFailure: true,
+  }).catch(() => null);
+  const excludePath = exclude?.stdout.trim();
+  if (excludePath) {
+    targets.push(path.isAbsolute(excludePath) ? excludePath : path.resolve(repoRoot, excludePath));
+  }
+  for (const target of new Set(targets)) {
+    for (const line of PROJECT_RUNTIME_IGNORES) {
+      await ensureIgnoreLine(target, line);
+    }
+  }
+}
+
+async function ensureIgnoreLine(filePath: string, line: string): Promise<void> {
+  const existing = await fsp.readFile(filePath, "utf8").catch(() => "");
+  if (existing.split(/\r?\n/).some((item) => item.trim() === line)) {
+    return;
+  }
+  const prefix = existing && !existing.endsWith("\n") ? "\n" : "";
+  await ensureDir(path.dirname(filePath));
+  await fsp.appendFile(filePath, `${prefix}${line}\n`, "utf8");
 }
 
 export function runsDir(repoRoot: string): string {
@@ -346,10 +405,35 @@ export async function createRunRecord(params: {
   return record;
 }
 
-export async function saveRunRecord(record: RunRecord): Promise<void> {
+export async function saveRunRecord(
+  record: RunRecord,
+  options?: { expectedAttemptId?: string; expectedStartedAt?: string },
+): Promise<boolean> {
   record.taskSummary = record.taskSummary || summarizeTask(record.task);
   record.updatedAt = nowIso();
+  let saved = false;
   await updateJson<RunRecord>(runRecordPath(record.repoRoot, record.id), (prev) => {
+    // A redirected headless run starts a fresh attempt. Backend/controller
+    // callbacks from the superseded process may still arrive briefly after the
+    // signal; keep those stale snapshots from overwriting the new turn.
+    if (
+      options?.expectedAttemptId &&
+      prev &&
+      prev.process?.attemptId !== options.expectedAttemptId
+    ) {
+      return prev;
+    }
+    // Runs created by an older Rudder have no attempt id. Their worker still
+    // carries the original startedAt, so use it as a migration-safe ownership
+    // token and reject it once a redirect installs a new attempt.
+    if (
+      !options?.expectedAttemptId &&
+      options?.expectedStartedAt &&
+      prev &&
+      (Boolean(prev.process?.attemptId) || prev.process?.startedAt !== options.expectedStartedAt)
+    ) {
+      return prev;
+    }
     // A long-lived in-memory `record` can be stale: the background LLM
     // summarizer reads + rewrites run.json out of band. Preserve the title it
     // persisted instead of clobbering it with the naive summary.
@@ -357,8 +441,10 @@ export async function saveRunRecord(record: RunRecord): Promise<void> {
       record.taskSummary = prev.taskSummary;
       record.taskSummaryLlm = true;
     }
+    saved = true;
     return record;
   });
+  return saved;
 }
 
 const inflightLlmSummaries = new Set<string>();
@@ -424,16 +510,23 @@ function maybeBackgroundLlmSummarize(record: RunRecord): void {
       if (!title) {
         return;
       }
-      const fresh = await readJson<RunRecord>(runRecordPath(record.repoRoot, record.id));
-      if (!fresh) {
-        return;
-      }
-      if (fresh.taskSummaryLlm) {
-        return;
-      }
-      fresh.taskSummary = title;
-      fresh.taskSummaryLlm = true;
-      await saveRunRecord(fresh);
+      const file = runRecordPath(record.repoRoot, record.id);
+      await updateJson<RunRecord>(file, (fresh) => {
+        if (!fresh) return undefined;
+        if (fresh.taskSummaryLlm) return fresh as unknown as JsonValue;
+        const currentNaive = summarizeTask(fresh.task);
+        const currentTitle = (fresh.taskSummary ?? "").trim();
+        if (currentTitle && currentTitle !== currentNaive) {
+          return fresh as unknown as JsonValue;
+        }
+        // Merge only the summary fields into the record read under the
+        // cross-process lock. Never rewrite status/turn/process ownership from
+        // the stale snapshot that initiated the LLM request.
+        fresh.taskSummary = title;
+        fresh.taskSummaryLlm = true;
+        fresh.updatedAt = nowIso();
+        return fresh as unknown as JsonValue;
+      });
     } catch {
       // swallow — background best-effort
     } finally {

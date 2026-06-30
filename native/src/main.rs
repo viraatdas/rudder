@@ -962,6 +962,11 @@ struct AgentTurn {
     source: String,
 }
 
+enum SteerDelivery {
+    Delivered,
+    Failed(String),
+}
+
 #[derive(Clone)]
 struct Suggestion {
     label: String,
@@ -6937,7 +6942,7 @@ impl App {
             Ok(entries) => entries,
             Err(_) => return,
         };
-        let mut requests: Vec<(std::path::PathBuf, String, String)> = Vec::new();
+        let mut requests: Vec<(std::path::PathBuf, String, String, String, String)> = Vec::new();
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
@@ -6964,52 +6969,218 @@ impl App {
                 .unwrap_or("")
                 .trim()
                 .to_string();
-            requests.push((path, task_id, instruction));
+            let request_id = value
+                .get("requestId")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let kind = value
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("steer")
+                .trim()
+                .to_string();
+            requests.push((path, task_id, instruction, request_id, kind));
         }
         // Stable order so multiple queued steers apply in filename (timestamp) order.
         requests.sort_by(|a, b| a.0.cmp(&b.0));
-        for (path, task_id, instruction) in requests {
-            // Consume first: a delivery failure must not re-inject in a loop.
-            let _ = std::fs::remove_file(&path);
-            if instruction.is_empty() {
+        for (path, task_id, instruction, request_id, kind) in requests {
+            let valid_request_id = request_id.len() >= 8
+                && request_id.len() <= 128
+                && request_id
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '-');
+            if valid_request_id
+                && self
+                    .cwd
+                    .join(".rudder")
+                    .join("steer-receipts")
+                    .join(format!("{request_id}.json"))
+                    .is_file()
+            {
+                // Receipt existence is the at-most-once ledger. A crash after
+                // injection but before inbox cleanup must not inject it again.
+                let _ = std::fs::remove_file(&path);
                 continue;
             }
-            self.deliver_steer(&task_id, &instruction);
+            if instruction.is_empty() {
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
+            if valid_request_id && self.write_steer_processing(&request_id).is_err() {
+                // Do not touch the PTY until the at-most-once tombstone is
+                // durable. A later poll can safely retry the filesystem write.
+                continue;
+            }
+            let result = match kind.as_str() {
+                "cancel" => self.deliver_cancel_request(&task_id),
+                "merge" => self.deliver_merge_request(&task_id),
+                _ => self.deliver_steer_request(&task_id, &instruction),
+            };
+            let _ = self.write_steer_receipt(&request_id, &result);
+            // The durable receipt is written after the injection attempt, then
+            // the request is consumed. This gives the browser a correlated
+            // delivered/failed outcome without risking repeated PTY input.
+            let _ = std::fs::remove_file(&path);
         }
     }
 
+    fn write_steer_processing(&self, request_id: &str) -> io::Result<()> {
+        let dir = self.cwd.join(".rudder").join("steer-receipts");
+        std::fs::create_dir_all(&dir)?;
+        let file = dir.join(format!("{request_id}.json"));
+        let temp = dir.join(format!("{request_id}.{}.tmp", std::process::id()));
+        let value = serde_json::json!({
+            "requestId": request_id,
+            "status": "processing",
+        });
+        std::fs::write(&temp, serde_json::to_vec(&value)?)?;
+        std::fs::rename(temp, file)
+    }
+
+    fn write_steer_receipt(&self, request_id: &str, result: &SteerDelivery) -> io::Result<()> {
+        if request_id.len() < 8
+            || request_id.len() > 128
+            || !request_id
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+        {
+            return Ok(());
+        }
+        let dir = self.cwd.join(".rudder").join("steer-receipts");
+        std::fs::create_dir_all(&dir)?;
+        let file = dir.join(format!("{request_id}.json"));
+        let temp = dir.join(format!("{request_id}.{}.tmp", std::process::id()));
+        let value = match result {
+            SteerDelivery::Delivered => serde_json::json!({
+                "requestId": request_id,
+                "status": "delivered",
+            }),
+            SteerDelivery::Failed(error) => serde_json::json!({
+                "requestId": request_id,
+                "status": "failed",
+                "error": error,
+            }),
+        };
+        std::fs::write(&temp, serde_json::to_vec(&value)?)?;
+        std::fs::rename(temp, file)
+    }
+
     /// Route one steer instruction from the web board to its target agent (or the
-    /// live conductor) and record it in the activity feed. A blank/`conductor`/
-    /// `orchestrator` target steers the interactive orchestrator pane.
-    fn deliver_steer(&mut self, task_id: &str, instruction: &str) {
+    /// high-level task-input path) and record it in the activity feed. A blank/
+    /// `conductor`/`orchestrator` target deliberately goes through
+    /// `start_task_from_input`: that is the same decision path as the task pane, so
+    /// it can converse with a live conductor, refine/rebase an active plan, or start
+    /// fresh work even when no conductor PTY currently exists.
+    fn deliver_steer_request(&mut self, task_id: &str, instruction: &str) -> SteerDelivery {
         // The web board is now token-gated, but treat steer text as untrusted in depth:
-        // strip control characters so it can't inject extra Enter keys or escape
-        // sequences into the agent PTY (live_inject_at appends one \r to submit it).
+        // Strip terminal escape/control characters while preserving intentional
+        // newlines. live_inject_at wraps multiline text in bracketed paste, so
+        // those newlines remain one composed message rather than extra submits.
         let instruction = sanitize_steer_instruction(instruction);
         if instruction.is_empty() {
-            return;
+            return SteerDelivery::Failed(
+                "instruction became empty after sanitization".to_string(),
+            );
         }
         let conductor_target = task_id.is_empty()
             || task_id.eq_ignore_ascii_case("conductor")
             || task_id.eq_ignore_ascii_case("orchestrator");
-        let index = if conductor_target {
-            self.agents.iter().position(|run| run.is_orchestrator())
-        } else {
-            self.agent_index_for_token(task_id)
-        };
+        if conductor_target {
+            self.start_task_from_input(&instruction);
+            // Do not replace the notice produced by the task-input path (for
+            // example a command result or a planner error); the activity stream is
+            // enough to acknowledge the web action without hiding that feedback.
+            self.record_activity(format!("steered conductor: {instruction}"));
+            return SteerDelivery::Delivered;
+        }
+
+        let index = self.agent_index_for_token(task_id);
         let Some(index) = index else {
             self.push_activity(format!("steer: target not found ({task_id})"));
-            return;
+            return SteerDelivery::Failed(format!("target not found: {task_id}"));
         };
-        let label = if conductor_target {
-            "conductor".to_string()
-        } else {
-            task_id.to_string()
+        let label = task_id.to_string();
+        match self.agents[index].status {
+            AgentStatus::Running => {
+                if self.live_inject_at(index, &instruction) {
+                    // A browser steer is a real user turn, not an ephemeral PTY
+                    // keystroke. Persist the same conversation metadata as direct
+                    // worker/orchestrator input so restart/context views retain it.
+                    let now = now_stamp();
+                    let cwd = self.cwd.clone();
+                    if let Some(run) = self.agents.get_mut(index) {
+                        run.current_prompt = instruction.clone();
+                        run.turns.push(AgentTurn {
+                            ts: now.clone(),
+                            prompt: instruction.clone(),
+                            source: "user".to_string(),
+                        });
+                        run.last_user_input_at = now;
+                        run.ready_since = None;
+                        run.needs_user_input = false;
+                        run.user_input_notified = false;
+                        let _ = save_native_run_record(&cwd, run);
+                    }
+                    self.push_activity(format!("steered {label}: {instruction}"));
+                    SteerDelivery::Delivered
+                } else {
+                    self.push_activity(format!("steer: {label} has no live terminal"));
+                    SteerDelivery::Failed(format!("{label} has no live terminal"))
+                }
+            }
+            AgentStatus::Done => {
+                // Completed workers keep their workspace and session. Re-goal the
+                // same row so review feedback resumes in place instead of being
+                // dropped into an idle PTY or spawning unrelated work.
+                if !self.regoal_agent_at(index, &instruction) {
+                    self.record_activity(format!("steer: {label} could not be resumed"));
+                    SteerDelivery::Failed(format!("{label} could not be resumed"))
+                } else {
+                    SteerDelivery::Delivered
+                }
+            }
+            status => {
+                self.push_activity(format!(
+                    "steer: {label} unavailable (status={})",
+                    status.as_str()
+                ));
+                SteerDelivery::Failed(format!("{label} is unavailable ({})", status.as_str()))
+            }
+        }
+    }
+
+    fn deliver_cancel_request(&mut self, task_id: &str) -> SteerDelivery {
+        let Some(index) = self.agent_index_for_token(task_id) else {
+            return SteerDelivery::Failed(format!("target not found: {task_id}"));
         };
-        if self.live_inject_at(index, &instruction) {
-            self.push_activity(format!("steered {label}: {instruction}"));
+        if self.agents[index].is_orchestrator() {
+            return SteerDelivery::Failed(
+                "the conductor cannot be stopped from a task card".to_string(),
+            );
+        }
+        if self.stop_agent_at(index) {
+            SteerDelivery::Delivered
         } else {
-            self.push_activity(format!("steer: {label} has no live terminal"));
+            SteerDelivery::Failed(format!("{task_id} could not be stopped"))
+        }
+    }
+
+    fn deliver_merge_request(&mut self, task_id: &str) -> SteerDelivery {
+        if self.agent_index_for_token(task_id).is_none() {
+            return SteerDelivery::Failed(format!("target not found: {task_id}"));
+        }
+        self.merge_agent_for_marker(task_id);
+        match self.agent_index_for_token(task_id) {
+            Some(index) if self.agents[index].status == AgentStatus::Merged => {
+                SteerDelivery::Delivered
+            }
+            _ => SteerDelivery::Failed(
+                self.notice
+                    .clone()
+                    .unwrap_or_else(|| format!("{task_id} could not be merged")),
+            ),
         }
     }
 
@@ -9416,7 +9587,13 @@ impl App {
         {
             Some(terminal) => {
                 terminal.reset_scrollback();
-                terminal.write_input(format!("{text}\r").as_bytes())
+                if text.contains('\n') {
+                    let mut payload = bracketed_paste_bytes(text);
+                    payload.push(b'\r');
+                    terminal.write_input(&payload)
+                } else {
+                    terminal.write_input(format!("{text}\r").as_bytes())
+                }
             }
             None => return false,
         };
@@ -10530,18 +10707,31 @@ fn command_rest<'a>(input: &'a str, command: &str) -> &'a str {
     input.trim_start().strip_prefix(command).unwrap_or_default()
 }
 
-/// Neutralize an untrusted steer instruction before it is injected into a live agent
-/// PTY. The text arrives from the web board (`.rudder/steer/*.json`) and is written to
-/// the terminal followed by a single Enter, so any embedded control character is a
-/// vector: CR/LF would submit extra command lines and ESC could smuggle terminal escape
-/// sequences. Replace every control char with a space and collapse runs of whitespace so
-/// the instruction stays exactly one line of printable text.
+/// Neutralize an untrusted steer instruction before it reaches a live agent PTY.
+/// Preserve line breaks from the multiline web composer, but remove terminal
+/// escapes and other controls. Multiline delivery uses bracketed paste so the
+/// embedded newlines do not become independent submits.
 fn sanitize_steer_instruction(raw: &str) -> String {
-    let cleaned: String = raw
+    let normalized = raw.replace("\r\n", "\n").replace('\r', "\n");
+    let cleaned: String = normalized
         .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
+        .map(|c| {
+            if c == '\n' {
+                '\n'
+            } else if c.is_control() {
+                ' '
+            } else {
+                c
+            }
+        })
         .collect();
-    cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
+    cleaned
+        .lines()
+        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
 }
 
 /// Open a URL in the user's default browser. Spawned detached with null stdio so

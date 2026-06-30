@@ -281,7 +281,15 @@ export type RunRecord = {
     jjChangeId?: string;
   };
   process?: {
+    /** Detached Rudder __worker process that owns verification/lifecycle. */
+    controllerPid?: number;
+    /** Backend CLI child (Claude/Codex/acpx) when one is active. */
+    backendPid?: number;
     pid?: number;
+    /** Identifies the worker pass that currently owns this run record. A web
+     * redirect starts a new attempt so the superseded worker cannot write a
+     * stale terminal status over the new turn. */
+    attemptId?: string;
     startedAt?: string;
     endedAt?: string;
     exitCode?: number | null;
@@ -291,7 +299,7 @@ export type RunRecord = {
   turns?: Array<{
     ts: string;
     prompt: string;
-    source: "user" | "steerer";
+    source: "user" | "steerer" | "regoal";
   }>;
   lastUserInputAt?: string;
   autoSteer?: {
@@ -474,9 +482,12 @@ export type ProjectSummary = {
 };
 
 export type BoardNode = {
+  /** Stable graph node id when this run belongs to the DAG; otherwise run id. */
   id: string;
+  /** Concrete run id once a worker has launched. */
+  runId?: string;
   title: string;
-  status: RunStatus;
+  status: RunStatus | NodeStatus;
   column: BoardColumn;
   blocked: boolean;
   backend: BackendId;
@@ -489,6 +500,8 @@ export type BoardNode = {
   updatedAt: string;
   worktree: { path: string; workspaceName?: string } | null;
   merge: MergeState | null;
+  /** User-authored follow-up turns, oldest first. The initial task is omitted. */
+  updates: Array<{ instruction: string; ts: string; source?: string }>;
 };
 
 export type BoardEdge = {

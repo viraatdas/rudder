@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
+import fsp from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 
 import {
   dependents,
   frontier,
   hardParents,
+  graphPath,
   isReady,
   judgeParents,
   mirrorNodeStatus,
@@ -12,6 +16,7 @@ import {
   projectNodeStatus,
   readyNodes,
   softParents,
+  updateGraph,
 } from "../dist/graph.js";
 import { buildFanoutDag, gateDecision, parsePlanBlock } from "../dist/planner.js";
 
@@ -604,6 +609,22 @@ test("mirrorPlanIntoGraph on an empty payload clears the whole graph", () => {
   g = mirrorPlanIntoGraph(g, {});
   assert.deepEqual(Object.keys(g.nodes), []);
   assert.deepEqual(Object.keys(g.edges), []);
+});
+
+test("updateGraph never replaces an unreadable existing graph with an empty DAG", async (t) => {
+  const repo = await fsp.mkdtemp(path.join(os.tmpdir(), "rudder-graph-guard-"));
+  t.after(() => fsp.rm(repo, { recursive: true, force: true }));
+  await fsp.mkdir(path.dirname(graphPath(repo)), { recursive: true });
+  await fsp.writeFile(graphPath(repo), "{not-json", "utf8");
+
+  await assert.rejects(
+    updateGraph(repo, (graph) => {
+      graph.integrationChangeId = "must-not-land";
+      return graph;
+    }),
+    /Refusing to replace an unreadable existing graph/,
+  );
+  assert.equal(await fsp.readFile(graphPath(repo), "utf8"), "{not-json");
 });
 
 // ---------------------------------------------------------------------------

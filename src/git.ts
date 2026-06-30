@@ -126,6 +126,11 @@ export function processAlive(pid: number | undefined): boolean {
   }
 }
 
+export function runProcessAlive(run: RunRecord): boolean {
+  return [run.process?.controllerPid, run.process?.backendPid, run.process?.pid]
+    .some((pid) => processAlive(pid));
+}
+
 export async function activeRunsForCheckout(repoRoot: string, checkoutPath: string): Promise<RunRecord[]> {
   const runs = await listRuns(repoRoot);
   const active: RunRecord[] = [];
@@ -136,7 +141,7 @@ export async function activeRunsForCheckout(repoRoot: string, checkoutPath: stri
     if (!(await sameFilesystemPath(run.worktree.path, checkoutPath))) {
       continue;
     }
-    if (processAlive(run.process?.pid)) {
+    if (runProcessAlive(run)) {
       active.push(run);
     }
   }

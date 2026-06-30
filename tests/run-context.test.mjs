@@ -5,7 +5,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { writeAgentContext } from "../dist/run-manager.js";
-import { createRunRecord, saveRunRecord } from "../dist/state.js";
+import { createRunRecord, loadRunRecord, saveRunRecord } from "../dist/state.js";
 
 test("writeAgentContext separates active, ready, completed, and merge-ready runs", async (t) => {
   const repo = await fsp.mkdtemp(path.join(os.tmpdir(), "rudder-run-context-"));
@@ -75,4 +75,36 @@ test("writeAgentContext separates active, ready, completed, and merge-ready runs
 
   const workspaceCopy = await fsp.readFile(path.join(repo, "ready-worktree-workspace", "RUDDER.md"), "utf8");
   assert.equal(workspaceCopy, text);
+});
+
+test("legacy startedAt ownership cannot overwrite a newly redirected attempt", async (t) => {
+  const repo = await fsp.mkdtemp(path.join(os.tmpdir(), "rudder-run-ownership-"));
+  t.after(() => fsp.rm(repo, { recursive: true, force: true }));
+  const run = await createRunRecord({
+    id: "legacy-run",
+    repoRoot: repo,
+    task: "legacy task",
+    backend: "claude",
+    targetBranch: "base",
+    baseCommit: "base",
+    vcs: "jj",
+    useWorktree: false,
+    worktreePath: repo,
+  });
+  const legacyStartedAt = "2026-01-01T00:00:00.000Z";
+  run.status = "running";
+  run.process = { startedAt: legacyStartedAt };
+  await saveRunRecord(run);
+
+  const redirected = await loadRunRecord(repo, run.id);
+  redirected.status = "running";
+  redirected.process = { attemptId: "new-attempt", startedAt: "2026-01-01T00:00:01.000Z" };
+  await saveRunRecord(redirected);
+
+  run.status = "failed";
+  const saved = await saveRunRecord(run, { expectedStartedAt: legacyStartedAt });
+  assert.equal(saved, false);
+  const final = await loadRunRecord(repo, run.id);
+  assert.equal(final.process.attemptId, "new-attempt");
+  assert.equal(final.status, "running");
 });

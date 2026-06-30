@@ -23,8 +23,16 @@ export type MergeState = {
 
 export type Tokens = { input: number; output: number };
 
+export type TaskUpdate = {
+  instruction: string;
+  ts: string;
+  source?: string;
+};
+
 export type BoardNode = {
   id: string;
+  /** Stable graph identity is `id`; scheduled tasks expose their worker here. */
+  runId?: string;
   title: string;
   status: string;
   column: Column;
@@ -39,9 +47,10 @@ export type BoardNode = {
   updatedAt: string;
   worktree: { path: string; workspaceName?: string } | null;
   merge: MergeState | null;
+  updates: TaskUpdate[];
 };
 
-export type BoardEdge = { from: string; to: string; kind: "hard" | "soft" };
+export type BoardEdge = { from: string; to: string; kind: "hard" | "soft" | "judge" };
 
 export type PlanGate = {
   id: string;
@@ -119,12 +128,22 @@ export async function fetchLog(slug: string, id: string, tail = 200): Promise<st
   return res.text();
 }
 
-export async function postTask(slug: string, prompt: string): Promise<{ runId?: string; nodeIds?: string[] }> {
+export async function postTask(
+  slug: string,
+  prompt: string,
+): Promise<{
+  runId?: string;
+  nodeId?: string;
+  nodeIds?: string[];
+  requestId?: string;
+  status?: "queued" | "accepted" | "delivered" | "failed";
+}> {
+  const requestId = newClientRequestId();
   return jsonOrThrow(
-    await fetch(`/api/projects/${encodeURIComponent(slug)}/tasks`, {
+    await fetchMutationWithRetry(`/api/projects/${encodeURIComponent(slug)}/tasks`, {
       method: "POST",
       headers: mutationHeaders({ "content-type": "application/json" }),
-      body: JSON.stringify({ prompt }),
+      body: JSON.stringify({ prompt, requestId }),
     })
   );
 }
@@ -153,16 +172,53 @@ export async function postCancel(slug: string, id: string): Promise<void> {
 
 // Steer a running agent (id) or the conductor (id = "conductor"). The instruction
 // is delivered straight into that agent's live terminal by the native TUI.
-export async function postSteer(slug: string, id: string, instruction: string): Promise<void> {
+export type SteerReceipt = {
+  requestId: string;
+  status: "queued" | "accepted" | "delivered" | "failed";
+  mode: "redirected" | "resumed" | "queued";
+  error?: string;
+};
+
+export async function postSteer(
+  slug: string,
+  id: string,
+  instruction: string,
+): Promise<SteerReceipt> {
+  const requestId = newClientRequestId();
   const target = id === "conductor"
     ? `/api/projects/${encodeURIComponent(slug)}/steer`
     : `/api/projects/${encodeURIComponent(slug)}/tasks/${encodeURIComponent(id)}/steer`;
-  await jsonOrThrow(
-    await fetch(target, {
+  return jsonOrThrow(
+    await fetchMutationWithRetry(target, {
       method: "POST",
       headers: mutationHeaders({ "content-type": "application/json" }),
-      body: JSON.stringify({ instruction }),
+      body: JSON.stringify({ instruction, requestId }),
     })
+  );
+}
+
+function newClientRequestId(): string {
+  return globalThis.crypto?.randomUUID?.() ??
+    `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
+}
+
+async function fetchMutationWithRetry(input: RequestInfo | URL, init: RequestInit): Promise<Response> {
+  try {
+    return await fetch(input, init);
+  } catch {
+    // Loopback responses can still be lost during a daemon/browser handoff.
+    // Retry once with the same requestId so the server's durable claim makes
+    // the mutation idempotent.
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    return fetch(input, init);
+  }
+}
+
+export async function fetchSteerReceipt(slug: string, requestId: string): Promise<SteerReceipt> {
+  return jsonOrThrow(
+    await fetch(
+      `/api/projects/${encodeURIComponent(slug)}/steer-receipts/${encodeURIComponent(requestId)}`,
+    ),
   );
 }
 

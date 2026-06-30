@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { randomBytes, timingSafeEqual } from "node:crypto";
+import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import http from "node:http";
@@ -71,7 +71,7 @@ function denyMutation(req: IncomingMessage, res: ServerResponse): boolean {
 import { findProjectBySlug, loadProjects, loadRunRecord, outputPath, projectStateDir, runsDir } from "../state.js";
 import { mergeJjRunIntoCurrentWorkspace } from "../jj.js";
 import { hardParents, readGraph, softParents, updateGraph } from "../graph.js";
-import { stopRun } from "../run-manager.js";
+import { continueRun, stopRun } from "../run-manager.js";
 import type { RudderBus } from "../bus.js";
 import { mergeNodeIntoIntegration, reconcileInjection, withSchedulerLock } from "../scheduler.js";
 import { nowIso } from "../util.js";
@@ -94,6 +94,15 @@ export type BoardDaemonHandle = {
   port: number;
   url: string;
   close: () => Promise<void>;
+};
+
+export type BoardControlMode = "projector" | "scheduler";
+type SteerReceiptPayload = {
+  requestId: string;
+  status: "queued" | "accepted" | "delivered" | "failed";
+  mode: "queued" | "redirected" | "resumed";
+  taskId?: string;
+  error?: string;
 };
 
 // dist/board/daemon.js sits next to dist/board/board.{js,css}, so the prebuilt
@@ -119,7 +128,10 @@ export async function startBoardDaemon(opts: {
   repoRoot: string;
   open?: boolean;
   bus?: RudderBus;
+  /** projector = native TUI owns PTYs; scheduler = this daemon owns workers. */
+  controlMode?: BoardControlMode;
 }): Promise<BoardDaemonHandle> {
+  const controlMode = opts.controlMode ?? "projector";
   // Subscribe the SSE broadcaster to the shared bus: node.*/schedule.*/merge.*
   // events re-broadcast a fresh snapshot to every connected client (simplest
   // correct projection; the SPA always rebuilds from the snapshot on connect).
@@ -133,7 +145,7 @@ export async function startBoardDaemon(opts: {
   }
 
   const server = http.createServer((req, res) => {
-    handleRequest(req, res, opts.bus).catch((error) => {
+    handleRequest(req, res, opts.bus, controlMode, opts.repoRoot).catch((error) => {
       const message = error instanceof Error ? error.message : String(error);
       if (!res.headersSent) {
         sendJson(res, 500, { error: message });
@@ -190,8 +202,7 @@ export async function startBoardDaemon(opts: {
   let slug = "";
   try {
     const projects = await loadProjects();
-    const resolved = path.resolve(opts.repoRoot);
-    slug = projects.find((entry) => path.resolve(entry.repoRoot) === resolved)?.slug ?? "";
+    slug = projects.find((entry) => sameRepoPath(entry.repoRoot, opts.repoRoot))?.slug ?? "";
   } catch {
     slug = "";
   }
@@ -203,7 +214,13 @@ export async function startBoardDaemon(opts: {
   return { port, url, close };
 }
 
-async function handleRequest(req: IncomingMessage, res: ServerResponse, bus?: RudderBus): Promise<void> {
+async function handleRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  bus: RudderBus | undefined,
+  controlMode: BoardControlMode,
+  ownerRepoRoot: string,
+): Promise<void> {
   const url = new URL(req.url || "/", "http://127.0.0.1");
   const pathname = decodeURIComponent(url.pathname);
   const method = (req.method || "GET").toUpperCase();
@@ -235,18 +252,23 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, bus?: Ru
   if (apiMatch) {
     const slug = apiMatch[1] ?? "";
     const rest = apiMatch[2] ?? "";
-    await handleProjectApi(req, res, method, slug, rest, url, bus);
+    await handleProjectApi(req, res, method, slug, rest, url, bus, controlMode, ownerRepoRoot);
     return;
   }
 
   // SPA shell for the index and per-project routes.
   if (method === "GET" && (pathname === "/" || pathname === "/rudder")) {
-    sendHtml(res, renderShell(""));
+    sendHtml(res, renderShell("", controlMode, false));
     return;
   }
   const slugMatch = pathname.match(/^\/rudder\/([^/]+)\/?$/);
   if (method === "GET" && slugMatch) {
-    sendHtml(res, renderShell(slugMatch[1] ?? ""));
+    const slug = slugMatch[1] ?? "";
+    const project = await findProjectBySlug(slug);
+    const canMutate = Boolean(
+      project && sameRepoPath(project.repoRoot, ownerRepoRoot),
+    );
+    sendHtml(res, renderShell(slug, controlMode, canMutate));
     return;
   }
 
@@ -261,6 +283,8 @@ async function handleProjectApi(
   rest: string,
   url: URL,
   bus?: RudderBus,
+  controlMode: BoardControlMode = "projector",
+  ownerRepoRoot = "",
 ): Promise<void> {
   const project = await findProjectBySlug(slug);
   if (!project) {
@@ -271,6 +295,19 @@ async function handleProjectApi(
   // Every mutating route is a POST. Require the secret token (+ loopback origin)
   // before any of them run, so a cross-site page cannot steer/inject/merge/cancel.
   if (method === "POST" && denyMutation(req, res)) {
+    return;
+  }
+  // One daemon owns exactly one repository's scheduler or native-projector
+  // channel. Other registered projects remain readable in the overview, but
+  // mutations here would route work to the wrong owner.
+  if (
+    method === "POST" &&
+    ownerRepoRoot &&
+    !sameRepoPath(project.repoRoot, ownerRepoRoot)
+  ) {
+    sendJson(res, 409, {
+      error: "this board daemon is read-only for that project; open its own Rudder board to make changes",
+    });
     return;
   }
 
@@ -285,6 +322,18 @@ async function handleProjectApi(
     return;
   }
 
+  const steerReceiptMatch = rest.match(/^\/steer-receipts\/([A-Za-z0-9-]+)$/);
+  if (steerReceiptMatch && method === "GET") {
+    const requestId = steerReceiptMatch[1] ?? "";
+    const receipt = await readSteerReceipt(project.repoRoot, requestId);
+    if (receipt) {
+      sendJson(res, receipt.status === "queued" ? 202 : 200, receipt);
+    } else {
+      sendJson(res, 202, { requestId, status: "queued", mode: "queued" });
+    }
+    return;
+  }
+
   if (rest === "/tasks" && method === "POST") {
     const body = await readJsonBody(req);
     const prompt = typeof body.prompt === "string" ? body.prompt.trim() : "";
@@ -292,8 +341,39 @@ async function handleProjectApi(
       sendJson(res, 400, { error: "missing prompt" });
       return;
     }
+    // In projector mode graph.json is a one-way mirror written by the native
+    // dashboard. Queue the request through its durable control inbox so the TUI
+    // handles it exactly like text entered in the task pane. Writing graph.json
+    // here would create a card the TUI never schedules.
+    if (controlMode === "projector") {
+      const queued = await writeSteerRequest(
+        project.repoRoot,
+        "conductor",
+        prompt,
+        "task",
+        requestIdFromBody(body),
+      );
+      sendJson(res, queued.status === "queued" ? 202 : 200, { ...queued, nodeIds: [] });
+      return;
+    }
     if (!bus) {
       sendJson(res, 503, { error: "scheduler not available" });
+      return;
+    }
+    const requestId = requestIdFromBody(body);
+    const claimed = await claimSteerRequest(project.repoRoot, requestId, "conductor", prompt);
+    if (!claimed) {
+      const existing = await readSteerReceipt(project.repoRoot, requestId);
+      if (existing?.taskId) {
+        sendJson(res, 200, {
+          requestId,
+          status: existing.status,
+          nodeId: existing.taskId,
+          nodeIds: [existing.taskId],
+        });
+      } else {
+        sendJson(res, 202, { requestId, status: "queued", nodeIds: [] });
+      }
       return;
     }
     // The injection chokepoint: a typed task becomes a NEW node reconciled
@@ -303,7 +383,13 @@ async function handleProjectApi(
     const result = await inRepo(project.repoRoot, () =>
       reconcileInjection(project.repoRoot, { prompt, ...(title ? { title } : {}) }, bus),
     );
-    sendJson(res, 200, { nodeId: result.nodeId, nodeIds: [result.nodeId] });
+    await writeSteerReceipt(project.repoRoot, {
+      requestId,
+      status: "accepted",
+      mode: "queued",
+      taskId: result.nodeId,
+    });
+    sendJson(res, 200, { requestId, nodeId: result.nodeId, nodeIds: [result.nodeId] });
     return;
   }
 
@@ -311,7 +397,12 @@ async function handleProjectApi(
   if (logMatch && method === "GET") {
     const id = logMatch[1] ?? "";
     const tail = Number.parseInt(url.searchParams.get("tail") ?? "200", 10);
-    const text = await readLogTail(project.repoRoot, id, Number.isFinite(tail) ? tail : 200);
+    const target = await resolveSteerTarget(project.repoRoot, id);
+    const text = await readLogTail(
+      project.repoRoot,
+      target?.run.id ?? id,
+      Number.isFinite(tail) ? tail : 200,
+    );
     res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
     res.end(text);
     return;
@@ -322,6 +413,11 @@ async function handleProjectApi(
   const approveMatch = rest.match(/^\/tasks\/([^/]+)\/approve$/);
   if (approveMatch && method === "POST") {
     const id = approveMatch[1] ?? "";
+    if (controlMode === "projector") {
+      const queued = await writeSteerRequest(project.repoRoot, id, "merge", "merge");
+      sendJson(res, queued.status === "queued" ? 202 : 200, queued);
+      return;
+    }
     if (!bus) {
       sendJson(res, 503, { error: "scheduler not available" });
       return;
@@ -356,6 +452,14 @@ async function handleProjectApi(
   const mergeMatch = rest.match(/^\/tasks\/([^/]+)\/merge$/);
   if (mergeMatch && method === "POST") {
     const id = mergeMatch[1] ?? "";
+    if (controlMode === "projector") {
+      const queued = await writeSteerRequest(project.repoRoot, id, "merge", "merge");
+      sendJson(res, queued.status === "queued" ? 202 : 200, {
+        ...queued,
+        conflictedFiles: [],
+      });
+      return;
+    }
     // A graph node id routes through the daemon's integration merge (same path
     // as approve). A bare run id keeps the legacy run-merge for unmanaged runs.
     if (bus) {
@@ -395,7 +499,14 @@ async function handleProjectApi(
   const cancelMatch = rest.match(/^\/tasks\/([^/]+)\/cancel$/);
   if (cancelMatch && method === "POST") {
     const id = cancelMatch[1] ?? "";
-    await inRepo(project.repoRoot, () => stopRun(id, { silent: true }));
+    if (controlMode === "projector") {
+      const queued = await writeSteerRequest(project.repoRoot, id, "cancel", "cancel");
+      sendJson(res, queued.status === "queued" ? 202 : 200, queued);
+      return;
+    }
+    const graph = await readGraph(project.repoRoot);
+    const node = graph.nodes[id] ?? Object.values(graph.nodes).find((candidate) => candidate.runId === id);
+    await inRepo(project.repoRoot, () => stopRun(node?.runId ?? id, { silent: true }));
     sendJson(res, 200, { ok: true });
     return;
   }
@@ -418,8 +529,66 @@ async function handleProjectApi(
       sendJson(res, 400, { error: "missing instruction" });
       return;
     }
-    await writeSteerRequest(project.repoRoot, id, instruction);
-    sendJson(res, 200, { ok: true, taskId: id });
+    if (instruction.length > 8_000) {
+      sendJson(res, 413, { error: "instruction is too long (maximum 8000 characters)" });
+      return;
+    }
+    if (controlMode === "scheduler") {
+      if (!bus) {
+        sendJson(res, 503, { error: "scheduler not available" });
+        return;
+      }
+      const requestId = requestIdFromBody(body);
+      const claimed = await claimSteerRequest(project.repoRoot, requestId, id, instruction);
+      if (!claimed) {
+        const existing = await readSteerReceipt(project.repoRoot, requestId);
+        sendJson(res, existing?.status === "queued" ? 202 : 200, existing ?? {
+          requestId,
+          status: "queued",
+          mode: "queued",
+          taskId: id,
+        });
+        return;
+      }
+      const result = await inRepo(project.repoRoot, () =>
+        withSchedulerLock(
+          project.repoRoot,
+          () => steerHeadlessRun(project.repoRoot, id, instruction, bus, requestId),
+        ),
+      );
+      if (!result.ok) {
+        await writeSteerReceipt(project.repoRoot, {
+          requestId,
+          status: "failed",
+          mode: "queued",
+          taskId: id,
+          error: result.error,
+        });
+        sendJson(res, result.status, { error: result.error });
+        return;
+      }
+      await writeSteerReceipt(project.repoRoot, result.receipt);
+      sendJson(res, 200, result.receipt);
+      return;
+    }
+
+    const target = await resolveSteerTarget(project.repoRoot, id);
+    if (!target) {
+      sendJson(res, 404, { error: `unknown task: ${id}` });
+      return;
+    }
+    if (!isSteerable(target.run.status, target.node?.status)) {
+      sendJson(res, 409, { error: `task is ${target.node?.status ?? target.run.status} and cannot be steered` });
+      return;
+    }
+    const queued = await writeSteerRequest(
+      project.repoRoot,
+      target.node?.id ?? id,
+      instruction,
+      "steer",
+      requestIdFromBody(body),
+    );
+    sendJson(res, queued.status === "queued" ? 202 : 200, queued);
     return;
   }
   // Conductor-level steer: same inbox, target "conductor".
@@ -434,8 +603,24 @@ async function handleProjectApi(
       sendJson(res, 400, { error: "missing instruction" });
       return;
     }
-    await writeSteerRequest(project.repoRoot, "conductor", instruction);
-    sendJson(res, 200, { ok: true, taskId: "conductor" });
+    if (instruction.length > 8_000) {
+      sendJson(res, 413, { error: "instruction is too long (maximum 8000 characters)" });
+      return;
+    }
+    if (controlMode === "scheduler") {
+      sendJson(res, 409, {
+        error: "the standalone board has no live conductor; create a task or steer a running worker instead",
+      });
+      return;
+    }
+    const queued = await writeSteerRequest(
+      project.repoRoot,
+      "conductor",
+      instruction,
+      "steer",
+      requestIdFromBody(body),
+    );
+    sendJson(res, queued.status === "queued" ? 202 : 200, queued);
     return;
   }
 
@@ -445,15 +630,244 @@ async function handleProjectApi(
 // Write one steer request into .rudder/steer/. Filename is timestamp-prefixed so
 // the native poller applies queued steers in order; the id is sanitized so a node
 // id never escapes the inbox dir.
-async function writeSteerRequest(repoRoot: string, taskId: string, instruction: string): Promise<void> {
+async function writeSteerRequest(
+  repoRoot: string,
+  taskId: string,
+  instruction: string,
+  kind: "steer" | "task" | "merge" | "cancel",
+  requestedRequestId?: string,
+): Promise<{ ok: true } & SteerReceiptPayload> {
   const dir = path.join(projectStateDir(repoRoot), "steer");
   await fsp.mkdir(dir, { recursive: true });
+  await pruneSteerReceipts(repoRoot).catch(() => undefined);
   const ts = Date.now();
+  const requestId = requestedRequestId ?? randomUUID();
+  const claimed = await claimSteerRequest(repoRoot, requestId, taskId, instruction);
+  if (!claimed) {
+    const existing = await readSteerReceipt(repoRoot, requestId);
+    return { ok: true, ...(existing ?? { requestId, status: "queued", mode: "queued", taskId }) };
+  }
   const safeId = (taskId || "conductor").replace(/[^A-Za-z0-9_.-]/g, "-").slice(0, 64) || "conductor";
-  const file = path.join(dir, `${ts}-${safeId}.json`);
-  const tmp = `${file}.tmp`;
-  await fsp.writeFile(tmp, JSON.stringify({ taskId, instruction, ts: new Date(ts).toISOString() }));
+  // hrtime + UUID prevents same-millisecond steers from overwriting each other;
+  // the zero-padded wall-clock prefix retains delivery order for the TUI poller.
+  const sequence = process.hrtime.bigint().toString().padStart(20, "0");
+  const file = path.join(dir, `${String(ts).padStart(13, "0")}-${sequence}-${safeId}-${requestId}.json`);
+  const tmp = `${file}.${process.pid}.tmp`;
+  await fsp.writeFile(tmp, JSON.stringify({ requestId, kind, taskId, instruction, ts: new Date(ts).toISOString() }));
   await fsp.rename(tmp, file);
+  return { ok: true, requestId, status: "queued", mode: "queued", taskId };
+}
+
+function requestIdFromBody(body: Record<string, unknown>): string {
+  const value = typeof body.requestId === "string" ? body.requestId.trim() : "";
+  return /^[A-Za-z0-9-]{8,128}$/.test(value) ? value : randomUUID();
+}
+
+async function claimSteerRequest(
+  repoRoot: string,
+  requestId: string,
+  taskId: string,
+  instruction: string,
+): Promise<boolean> {
+  const dir = path.join(projectStateDir(repoRoot), "steer-claims");
+  await fsp.mkdir(dir, { recursive: true });
+  try {
+    await fsp.writeFile(
+      path.join(dir, `${requestId}.json`),
+      JSON.stringify({ requestId, taskId, instruction, claimedAt: nowIso() }),
+      { flag: "wx" },
+    );
+    return true;
+  } catch (error) {
+    if (error && typeof error === "object" && "code" in error && error.code === "EEXIST") {
+      return false;
+    }
+    throw error;
+  }
+}
+
+async function writeSteerReceipt(repoRoot: string, receipt: SteerReceiptPayload): Promise<void> {
+  const dir = path.join(projectStateDir(repoRoot), "steer-receipts");
+  await fsp.mkdir(dir, { recursive: true });
+  const file = path.join(dir, `${receipt.requestId}.json`);
+  const temp = `${file}.${process.pid}.tmp`;
+  await fsp.writeFile(temp, JSON.stringify(receipt));
+  await fsp.rename(temp, file);
+}
+
+async function pruneSteerReceipts(repoRoot: string): Promise<void> {
+  const dir = path.join(projectStateDir(repoRoot), "steer-receipts");
+  const entries = await fsp.readdir(dir, { withFileTypes: true }).catch(() => []);
+  const files = await Promise.all(entries
+    .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
+    .map(async (entry) => ({
+      path: path.join(dir, entry.name),
+      mtimeMs: await fsp.stat(path.join(dir, entry.name)).then((stat) => stat.mtimeMs).catch(() => 0),
+    })));
+  files.sort((left, right) => left.mtimeMs - right.mtimeMs);
+  const now = Date.now();
+  for (let index = 0; index < files.length; index += 1) {
+    const file = files[index]!;
+    const expired = now - file.mtimeMs > 24 * 60 * 60 * 1_000;
+    const overCapAndObserved = files.length - index > 1_000 && now - file.mtimeMs > 5 * 60 * 1_000;
+    if (expired || overCapAndObserved) {
+      await fsp.unlink(file.path).catch(() => undefined);
+      await fsp.unlink(
+        path.join(projectStateDir(repoRoot), "steer-claims", path.basename(file.path)),
+      ).catch(() => undefined);
+    }
+  }
+}
+
+async function readSteerReceipt(
+  repoRoot: string,
+  requestId: string,
+): Promise<SteerReceiptPayload | null> {
+  if (!/^[A-Za-z0-9-]{8,128}$/.test(requestId)) return null;
+  const file = path.join(projectStateDir(repoRoot), "steer-receipts", `${requestId}.json`);
+  const value = await fsp.readFile(file, "utf8")
+    .then((raw) => JSON.parse(raw) as Record<string, unknown>)
+    .catch(() => null);
+  if (!value) return null;
+  if (value.status === "processing") {
+    return { requestId, status: "queued", mode: "queued" };
+  }
+  if (
+    value.status !== "queued" &&
+    value.status !== "accepted" &&
+    value.status !== "delivered" &&
+    value.status !== "failed"
+  ) return null;
+  return {
+    requestId,
+    status: value.status,
+    mode: value.mode === "redirected" || value.mode === "resumed" ? value.mode : "queued",
+    ...(typeof value.taskId === "string" ? { taskId: value.taskId } : {}),
+    ...(typeof value.error === "string" ? { error: value.error } : {}),
+  };
+}
+
+async function resolveSteerTarget(
+  repoRoot: string,
+  id: string,
+): Promise<{ run: RunRecord; node?: TaskNode } | null> {
+  const graph = await readGraph(repoRoot);
+  const node = graph.nodes[id] ?? Object.values(graph.nodes).find((candidate) => candidate.runId === id);
+  const runId = node?.runId ?? id;
+  if (!runId) return null;
+  const run = await loadRunRecord(repoRoot, runId);
+  return run ? { run, ...(node ? { node } : {}) } : null;
+}
+
+function isSteerable(
+  runStatus: RunStatus,
+  nodeStatus?: NodeStatus,
+  runMode?: RunRecord["mode"],
+): boolean {
+  // Native TUI records may contain runtime-only mode strings outside the TS
+  // union. A standalone headless daemon must never relaunch those as execute
+  // workers. Undefined remains accepted for legacy headless records.
+  if (runMode && runMode !== "execute") return false;
+  if (nodeStatus === "merged" || nodeStatus === "blocked" || nodeStatus === "failed") return false;
+  return runStatus === "created" ||
+    runStatus === "running" ||
+    runStatus === "steering" ||
+    runStatus === "verifying" ||
+    runStatus === "completed";
+}
+
+async function steerHeadlessRun(
+  repoRoot: string,
+  id: string,
+  instruction: string,
+  bus: RudderBus,
+  requestId: string,
+): Promise<
+  | { ok: true; receipt: { ok: true; requestId: string; status: "accepted"; mode: "redirected" | "resumed"; taskId: string } }
+  | { ok: false; status: 404 | 409; error: string }
+> {
+  const target = await resolveSteerTarget(repoRoot, id);
+  if (!target) {
+    return { ok: false, status: 404, error: `unknown task: ${id}` };
+  }
+  if (!isSteerable(target.run.status, target.node?.status, target.run.mode)) {
+    return {
+      ok: false,
+      status: 409,
+      error: `task is ${target.node?.status ?? target.run.status} and cannot be steered`,
+    };
+  }
+
+  const active = target.run.status === "created" ||
+    target.run.status === "running" ||
+    target.run.status === "steering" ||
+    target.run.status === "verifying";
+  const mode = active ? "redirected" as const : "resumed" as const;
+
+  // A live run without an attempt id may belong to a pre-upgrade worker whose
+  // unconditional writes cannot participate in the new ownership CAS. Review
+  // feedback is safe once that worker is finished; live redirect is not.
+  if (active && !target.run.process?.attemptId) {
+    return {
+      ok: false,
+      status: 409,
+      error: "this live worker predates safe web redirects; let it reach Review, then request changes",
+    };
+  }
+
+  try {
+    await continueRun({
+      runId: target.run.id,
+      prompt: instruction,
+      interrupt: active,
+      silent: true,
+    });
+  } catch (error) {
+    return {
+      ok: false,
+      status: 409,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+
+  if (target.node) {
+    await updateGraph(repoRoot, (graph) => {
+      const node = graph.nodes[target.node!.id];
+      if (node) {
+        node.status = "running";
+        // Revised work must pass through Review again; never retain an approval
+        // from the previous turn.
+        delete node.reviewState;
+        node.updatedAt = nowIso();
+      }
+      return graph;
+    });
+  }
+
+  bus.publish({
+    ts: nowIso(),
+    runId: target.run.id,
+    ...(target.node ? { nodeId: target.node.id } : {}),
+    type: "node.running",
+    message: mode === "redirected"
+      ? `Redirected ${target.node?.id ?? target.run.id} from the web board`
+      : `Reopened ${target.node?.id ?? target.run.id} with review feedback`,
+    data: { instruction },
+  });
+
+  return {
+    ok: true,
+    receipt: {
+      ok: true,
+      requestId,
+      // The attempt is installed, but the backend has not acknowledged model
+      // delivery yet. "accepted" is terminal UI feedback without overstating
+      // the handoff as model delivery.
+      status: "accepted",
+      mode,
+      taskId: target.node?.id ?? target.run.id,
+    },
+  };
 }
 
 async function handleProjectsList(res: ServerResponse): Promise<void> {
@@ -730,18 +1144,30 @@ export function columnForStatus(status: RunStatus): BoardNode["column"] {
   }
 }
 
-function projectRunToNode(run: RunRecord, lastLine: string | null): BoardNode {
+function userUpdates(run: RunRecord): BoardNode["updates"] {
+  const turns = run.turns ?? [];
+  const start = turns[0]?.prompt === run.task ? 1 : 0;
+  return turns
+    .slice(start)
+    .filter((turn) => turn.source === "user" || turn.source === "regoal")
+    .map((turn) => ({ instruction: turn.prompt, ts: turn.ts, source: turn.source }));
+}
+
+function projectRunToNode(run: RunRecord, lastLine: string | null, graphNode?: TaskNode): BoardNode {
   return {
-    id: run.id,
-    title: run.taskSummary || run.task,
-    status: run.status,
-    column: columnForStatus(run.status),
-    blocked: false,
+    // Keep the graph id stable across planned -> launched so an open issue drawer
+    // does not disappear exactly when the worker starts. Pure runs use run.id.
+    id: graphNode?.id ?? run.id,
+    runId: run.id,
+    title: graphNode?.title || run.taskSummary || run.task,
+    status: graphNode?.status ?? run.status,
+    column: graphNode ? columnForNodeStatus(graphNode.status) : columnForStatus(run.status),
+    blocked: graphNode?.status === "blocked",
     backend: run.backend,
     model: run.model,
     effort: run.effort,
     lastLine,
-    tokens: null,
+    tokens: run.tokens ?? graphNode?.tokens ?? null,
     deps: { hard: [], soft: [] },
     createdAt: run.createdAt,
     updatedAt: run.updatedAt,
@@ -749,6 +1175,7 @@ function projectRunToNode(run: RunRecord, lastLine: string | null): BoardNode {
       ? { path: run.worktree.path, workspaceName: run.worktree.workspaceName }
       : null,
     merge: run.merge ?? null,
+    updates: userUpdates(run),
   };
 }
 
@@ -780,10 +1207,11 @@ function projectTaskNodeToBoardNode(
 ): BoardNode {
   return {
     id: node.id,
+    ...(node.runId ? { runId: node.runId } : {}),
     title: node.title,
     // RunStatus and NodeStatus share running/merged/failed; the SPA reads
     // `column` for layout, so the broad status string is sufficient here.
-    status: node.status as unknown as RunStatus,
+    status: node.status,
     column: columnForNodeStatus(node.status),
     blocked: node.status === "blocked",
     backend: node.backend,
@@ -796,27 +1224,23 @@ function projectTaskNodeToBoardNode(
     updatedAt: node.updatedAt,
     worktree: node.worktree ? { path: node.worktree.path, workspaceName: node.worktree.workspaceName } : null,
     merge: null,
+    updates: [],
   };
 }
 
 // Build {from-node-id -> {hard,soft}} maps so each BoardNode carries the ids of
 // its incoming parents, and the flat BoardEdge list for the Nest/DAG view.
 function projectGraphEdges(graph: RudderGraph): { edges: BoardEdge[]; depsByNode: Map<string, { hard: string[]; soft: string[] }> } {
-  // A launched node is shown on the board under its runId, but graph edges
-  // reference node ids. Map every edge/dep endpoint to the id the board actually
-  // displays the node under (runId once scheduled, else the node id) so Nest-view
-  // arrows resolve to a real node instead of dangling.
-  const displayId = (id: string): string => graph.nodes[id]?.runId ?? id;
   const edges: BoardEdge[] = [];
   const depsByNode = new Map<string, { hard: string[]; soft: string[] }>();
   for (const id of Object.keys(graph.nodes)) {
     depsByNode.set(id, {
-      hard: hardParents(graph, id).map(displayId),
-      soft: softParents(graph, id).map(displayId),
+      hard: hardParents(graph, id),
+      soft: softParents(graph, id),
     });
   }
   for (const edge of Object.values(graph.edges)) {
-    edges.push({ from: displayId(edge.from), to: displayId(edge.to), kind: edge.type });
+    edges.push({ from: edge.from, to: edge.to, kind: edge.type });
   }
   return { edges, depsByNode };
 }
@@ -827,31 +1251,19 @@ async function buildSnapshot(project: ProjectEntry): Promise<BoardSnapshot> {
   const { edges, depsByNode } = projectGraphEdges(graph);
 
   const nodes: BoardNode[] = [];
-  // Run-derived nodes are authoritative. Track which graph nodes they cover so
-  // we do not double-list a node that has already been scheduled into a run.
-  const coveredNodeIds = new Set<string>();
-  for (const node of Object.values(graph.nodes)) {
-    if (node.runId) {
-      coveredNodeIds.add(node.runId);
-    }
-  }
-
   for (const run of runs) {
     const lastLine = await lastNonEmptyLine(project.repoRoot, run.id);
-    const boardNode = projectRunToNode(run, lastLine);
+    const graphNode =
+      Object.values(graph.nodes).find((candidate) => candidate.runId === run.id) ??
+      graph.nodes[run.id];
+    const boardNode = projectRunToNode(run, lastLine, graphNode);
     // If a graph node points at this run (by runId, or by node id), the GRAPH node
     // is authoritative for scheduled nodes: the daemon writes merged/blocked/review
     // to graph.json, not run.json. Override the projected column/status/blocked so
     // merged nodes leave Review and blocked nodes surface. Pure run-derived nodes
     // (no graph entry) keep their run-projected status untouched.
-    const graphNode =
-      Object.values(graph.nodes).find((candidate) => candidate.runId === run.id) ??
-      graph.nodes[run.id];
     if (graphNode) {
       boardNode.deps = depsByNode.get(graphNode.id) ?? boardNode.deps;
-      boardNode.column = columnForNodeStatus(graphNode.status);
-      boardNode.status = graphNode.status as unknown as RunStatus;
-      boardNode.blocked = graphNode.status === "blocked";
     }
     nodes.push(boardNode);
   }
@@ -1099,7 +1511,7 @@ async function loadActivity(repoRoot: string): Promise<BoardSnapshot["activity"]
 // HTML shell. The SPA owns all CSS; this carries no inline styles.
 // ---------------------------------------------------------------------------
 
-function renderShell(slug: string): string {
+function renderShell(slug: string, controlMode: BoardControlMode, canMutate: boolean): string {
   const slugJson = JSON.stringify(slug ?? "");
   return `<!doctype html>
 <html lang="en">
@@ -1111,11 +1523,23 @@ function renderShell(slug: string): string {
   </head>
   <body>
     <div id="app"></div>
-    <script>window.__RUDDER_SLUG__ = ${slugJson}; window.__RUDDER_TOKEN__ = ${JSON.stringify(BOARD_TOKEN)}</script>
+    <script>window.__RUDDER_SLUG__ = ${slugJson}; window.__RUDDER_TOKEN__ = ${JSON.stringify(BOARD_TOKEN)}; window.__RUDDER_CONTROL_MODE__ = ${JSON.stringify(controlMode)}; window.__RUDDER_CAN_MUTATE__ = ${JSON.stringify(canMutate)}</script>
     <script type="module" src="/board.js"></script>
   </body>
 </html>
 `;
+}
+
+function sameRepoPath(left: string, right: string): boolean {
+  const canonical = (value: string): string => {
+    const resolved = path.resolve(value);
+    try {
+      return fs.realpathSync(resolved);
+    } catch {
+      return resolved;
+    }
+  };
+  return canonical(left) === canonical(right);
 }
 
 // ---------------------------------------------------------------------------
