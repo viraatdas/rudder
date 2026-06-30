@@ -23,6 +23,13 @@ an optional hosted worker mode that keeps the same local control surface.
 It ships as the npm package `@viraatdas/rudder`, binary `rudder`
 (`dist/index.js`).
 
+Release rule for pushes: when pushing Rudder product changes to `origin/main`,
+ship them as an npm versioned release unless the user explicitly asks for a
+non-release push. Run the relevant tests, commit the change, run `npm version
+patch`/`minor`/`major` as appropriate, then push `main` and the created tag.
+After pushing, verify the GitHub release workflow and `npm view
+@viraatdas/rudder version` so the user knows which version contains the fix.
+
 Two big pieces, one product:
 
 - A **TypeScript orchestrator** (the `rudder` CLI): argument parsing, run

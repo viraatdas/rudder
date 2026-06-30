@@ -7467,6 +7467,74 @@ fn task_input_routes_to_live_orchestrator_after_launch() {
 
 #[cfg(not(windows))]
 #[test]
+fn task_input_sends_enter_key_to_live_orchestrator() {
+    let _env = env_guard();
+    let repo = unique_test_repo("orch-task-enter");
+    let capture = repo.join("orchestrator-bytes.bin");
+    let ready = repo.join("orchestrator-ready");
+    let script = format!(
+        "stty raw -echo; : > {}; dd bs=1 count=4 of={} 2>/dev/null; sleep 1",
+        shell_single_quote(&ready.to_string_lossy()),
+        shell_single_quote(&capture.to_string_lossy())
+    );
+    let command = TerminalCommand::with_args("/bin/sh", vec!["-lc".to_string(), script]);
+    let pane = TerminalPane::spawn_shell_or_command(
+        Some(command),
+        TerminalPaneOptions {
+            size: TerminalSize { rows: 10, cols: 80 },
+            scrollback_lines: 100,
+            ..Default::default()
+        },
+    )
+    .expect("spawn orchestrator pty");
+
+    for _ in 0..40 {
+        if ready.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert!(ready.exists(), "orchestrator pty is ready for raw input");
+
+    let mut app = App::new();
+    app.cwd = repo.clone();
+    app.interactive_orchestrator = true;
+    let mut orch = test_agent_run("orch-1", "plan it");
+    orch.cwd = repo.clone();
+    orch.mode = AgentMode::RudderPlan;
+    orch.backend = Backend::Claude;
+    orch.autosteered = false;
+    orch.interactive_orchestrator = true;
+    orch.status = AgentStatus::Running;
+    orch.terminal = Some(pane);
+    app.agents.push(orch);
+
+    let mut worker = test_agent_run("run-1", "do node");
+    worker.cwd = repo.clone();
+    worker.node_id = Some("n0".to_string());
+    worker.status = AgentStatus::Running;
+    app.agents.push(worker);
+
+    app.start_task_from_input("go!");
+
+    let mut captured = Vec::new();
+    for _ in 0..40 {
+        if let Ok(bytes) = fs::read(&capture) {
+            captured = bytes;
+            if captured.len() >= 4 {
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert_eq!(captured, b"go!\r");
+    assert_eq!(app.notice.as_deref(), Some("sent to orchestrator"));
+
+    let _ = fs::remove_dir_all(&repo);
+}
+
+#[cfg(not(windows))]
+#[test]
 fn approval_does_not_stop_orchestrator_in_headless_mode() {
     // Headless decomposer (interactive_orchestrator = false): the orchestrator
     // exits on its own, so approval must NOT reach in and stop a RudderPlan row.

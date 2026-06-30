@@ -3532,7 +3532,13 @@ impl App {
             let Some(terminal) = self.agents[index].terminal.as_mut() else {
                 return false;
             };
-            terminal.write_input(format!("{input}\r").as_bytes())
+            terminal.reset_scrollback();
+            terminal.write_input(input.as_bytes()).and_then(|()| {
+                terminal.write_input(
+                    &terminal_bytes_for_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+                        .unwrap_or_else(|| b"\r".to_vec()),
+                )
+            })
         };
         if let Err(error) = write_result {
             self.notice = Some(format!("could not send to orchestrator: {error}"));
