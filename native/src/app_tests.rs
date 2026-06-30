@@ -1676,7 +1676,7 @@ fn worker_wheel_at_edge_does_not_flash_notice() {
         row: 1,
         modifiers: KeyModifiers::empty(),
     };
-    assert!(app.scroll_selected_worker_or_forward(
+    assert!(!app.scroll_selected_worker_or_forward(
         mouse,
         Rect {
             x: 0,
@@ -1687,6 +1687,151 @@ fn worker_wheel_at_edge_does_not_flash_notice() {
     ));
 
     assert_eq!(app.notice.as_deref(), Some("keep me"));
+}
+
+#[cfg(not(windows))]
+#[test]
+fn terminal_snapshot_queries_do_not_drain_pending_output() {
+    let command = TerminalCommand::with_args(
+        "/bin/sh",
+        [
+            "-lc",
+            "printf '\\033[?1049h\\033[?1000h\\033[?1006hready\\r\\n'; sleep 1",
+        ],
+    );
+    let mut pane = TerminalPane::spawn_shell_or_command(
+        Some(command),
+        TerminalPaneOptions {
+            size: TerminalSize { rows: 5, cols: 20 },
+            scrollback_lines: 100,
+            ..Default::default()
+        },
+    )
+    .expect("spawn test pty");
+
+    std::thread::sleep(Duration::from_millis(80));
+    assert!(!pane.uses_alternate_screen_snapshot());
+    assert!(!pane.wants_sgr_mouse_events_snapshot());
+    assert!(!pane.visible_lines_snapshot().join("\n").contains("ready"));
+
+    for _ in 0..20 {
+        pane.drain_output();
+        if pane.uses_alternate_screen_snapshot() && pane.wants_sgr_mouse_events_snapshot() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    assert!(pane.uses_alternate_screen_snapshot());
+    assert!(pane.wants_sgr_mouse_events_snapshot());
+    assert!(pane.visible_lines_snapshot().join("\n").contains("ready"));
+}
+
+#[cfg(not(windows))]
+#[test]
+fn worker_scroll_moves_existing_scrollback_with_pending_output() {
+    let command = TerminalCommand::with_args(
+        "/bin/sh",
+        [
+            "-lc",
+            "i=1; while [ $i -le 40 ]; do printf 'line%03d\\r\\n' $i; i=$((i+1)); done; sleep 0.2; printf 'pending-output\\r\\n'; sleep 1",
+        ],
+    );
+    let mut pane = TerminalPane::spawn_shell_or_command(
+        Some(command),
+        TerminalPaneOptions {
+            size: TerminalSize { rows: 5, cols: 20 },
+            scrollback_lines: 100,
+            ..Default::default()
+        },
+    )
+    .expect("spawn test pty");
+
+    for _ in 0..20 {
+        std::thread::sleep(Duration::from_millis(25));
+        pane.drain_output();
+        if pane.visible_lines_snapshot().join("\n").contains("line040") {
+            break;
+        }
+    }
+    assert!(pane.visible_lines_snapshot().join("\n").contains("line040"));
+    std::thread::sleep(Duration::from_millis(260));
+
+    let mut app = App::new();
+    app.focus = FocusPane::Worker;
+    app.worker_area = Some(Rect {
+        x: 0,
+        y: 0,
+        width: 20,
+        height: 7,
+    });
+    app.agents.push(test_agent_run_with_terminal(&app, pane));
+    app.selected_agent = 0;
+
+    let changed = app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::ScrollUp,
+        column: 1,
+        row: 1,
+        modifiers: KeyModifiers::empty(),
+    });
+    assert!(
+        changed,
+        "scroll should move existing scrollback immediately"
+    );
+    let scrolled = app
+        .selected_terminal_mut()
+        .map(|terminal| terminal.visible_lines_snapshot().join("\n"))
+        .unwrap_or_default();
+    assert!(scrolled.contains("line037"), "scrolled was {scrolled:?}");
+    assert!(
+        !scrolled.contains("pending-output"),
+        "scroll handler must not drain pending PTY output: {scrolled:?}"
+    );
+}
+
+#[cfg(not(windows))]
+#[test]
+fn no_op_worker_scroll_does_not_mark_dirty() {
+    let command = TerminalCommand::with_args("/bin/sh", ["-lc", "printf 'ready\\r\\n'; sleep 1"]);
+    let mut pane = TerminalPane::spawn_shell_or_command(
+        Some(command),
+        TerminalPaneOptions {
+            size: TerminalSize { rows: 5, cols: 20 },
+            scrollback_lines: 100,
+            ..Default::default()
+        },
+    )
+    .expect("spawn test pty");
+
+    for _ in 0..20 {
+        std::thread::sleep(Duration::from_millis(25));
+        pane.drain_output();
+        if pane.visible_lines_snapshot().join("\n").contains("ready") {
+            break;
+        }
+    }
+
+    let mut app = App::new();
+    app.focus = FocusPane::Worker;
+    app.worker_area = Some(Rect {
+        x: 0,
+        y: 0,
+        width: 20,
+        height: 7,
+    });
+    app.agents.push(test_agent_run_with_terminal(&app, pane));
+    app.selected_agent = 0;
+    app.dirty = false;
+
+    let changed = app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::ScrollDown,
+        column: 1,
+        row: 1,
+        modifiers: KeyModifiers::empty(),
+    });
+
+    assert!(!changed, "scroll at the bottom should be a no-op");
+    assert!(!app.dirty, "no-op scroll must not force a redraw");
 }
 
 #[cfg(not(windows))]
@@ -8609,6 +8754,30 @@ fn render_worker_text(app: &mut App, width: u16, height: u16) -> String {
         .iter()
         .map(|cell| cell.symbol())
         .collect()
+}
+
+#[test]
+fn oneoff_worker_title_uses_friendly_identity_not_run_id() {
+    let mut app = App::new();
+    app.focus = FocusPane::Worker;
+    let mut run = test_agent_run(
+        "1782777962862889000-one-off-1834",
+        "read slack threads cedar-amil status",
+    );
+    run.mode = AgentMode::OneOff;
+    run.task_summary = "read slack threads cedar-amil status".to_string();
+    app.agents = vec![run];
+    app.selected_agent = 0;
+
+    let text = render_worker_text(&mut app, 100, 12);
+    assert!(
+        text.contains("worker · q1 · read slack threads cedar-amil status"),
+        "one-off worker title should be human-readable:\n{text}"
+    );
+    assert!(
+        !text.contains("1782777962862889000-one-off-1834"),
+        "generated run id should not appear in the worker title:\n{text}"
+    );
 }
 
 #[test]

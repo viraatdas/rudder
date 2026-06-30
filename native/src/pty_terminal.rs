@@ -365,10 +365,28 @@ impl TerminalPane {
 
     pub fn styled_lines(&mut self) -> Vec<Vec<StyledTerminalCell>> {
         self.drain_output();
+        self.styled_lines_snapshot()
+    }
+
+    pub fn styled_lines_snapshot(&mut self) -> Vec<Vec<StyledTerminalCell>> {
         if self.styled_lines_cache.is_none() {
             self.styled_lines_cache = Some(self.compute_styled_lines_snapshot());
         }
         self.styled_lines_cache.clone().unwrap_or_default()
+    }
+
+    pub fn styled_line_window_snapshot(
+        &mut self,
+        height: usize,
+    ) -> (usize, Vec<Vec<StyledTerminalCell>>) {
+        if self.styled_lines_cache.is_none() {
+            self.styled_lines_cache = Some(self.compute_styled_lines_snapshot());
+        }
+        let Some(rows) = self.styled_lines_cache.as_ref() else {
+            return (0, Vec::new());
+        };
+        let start = rows.len().saturating_sub(height);
+        (start, rows[start..].iter().take(height).cloned().collect())
     }
 
     fn compute_styled_lines_snapshot(&self) -> Vec<Vec<StyledTerminalCell>> {
@@ -471,6 +489,10 @@ impl TerminalPane {
 
     pub fn wants_sgr_mouse_events(&mut self) -> bool {
         self.drain_output();
+        self.wants_sgr_mouse_events_snapshot()
+    }
+
+    pub fn wants_sgr_mouse_events_snapshot(&self) -> bool {
         let screen = self.parser.screen();
         screen.mouse_protocol_mode() != vt100::MouseProtocolMode::None
             && screen.mouse_protocol_encoding() == vt100::MouseProtocolEncoding::Sgr
@@ -478,6 +500,10 @@ impl TerminalPane {
 
     pub fn uses_alternate_screen(&mut self) -> bool {
         self.drain_output();
+        self.uses_alternate_screen_snapshot()
+    }
+
+    pub fn uses_alternate_screen_snapshot(&self) -> bool {
         self.parser.screen().alternate_screen()
     }
 

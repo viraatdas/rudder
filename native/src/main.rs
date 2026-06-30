@@ -62,6 +62,8 @@ mod detect;
 use crate::detect::*;
 mod theme;
 use crate::theme::*;
+mod perf;
+use crate::perf::*;
 mod plan_stream;
 
 mod signals;
@@ -667,6 +669,8 @@ struct App {
     /// not changed, so a burst of poll ticks coalesces into one shell-out. None
     /// until the first mirror.
     last_mirror_signature: Option<u64>,
+    /// TEMPORARY: default-on native TUI perf diagnostics for the scroll-latency pass.
+    perf: PerfLogger,
 }
 
 #[derive(Clone, Debug)]
@@ -1185,6 +1189,7 @@ impl App {
             session_started_iso,
             quit_confirm_pending: false,
             last_mirror_signature: None,
+            perf: PerfLogger::new(),
         }
     }
 
@@ -2744,10 +2749,9 @@ impl App {
         let _ = write_rudder_context(&self.cwd, &self.agents, None);
     }
 
-    fn handle_mouse(&mut self, mouse: MouseEvent) {
+    fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
         if is_scroll_mouse_event(mouse.kind) {
-            self.handle_pane_scroll(mouse);
-            return;
+            return self.handle_pane_scroll(mouse);
         }
 
         // Continue an in-progress drag even if the pointer leaves the pane, so a fast
@@ -2768,7 +2772,7 @@ impl App {
                     block_inner(worker_area)
                 };
                 if self.handle_orchestrator_selection_mouse(mouse, orch_area) {
-                    return;
+                    return true;
                 }
             }
         }
@@ -2788,7 +2792,7 @@ impl App {
                     block_inner(worker_area)
                 };
                 if self.handle_worker_selection_mouse(mouse, worker_inner) {
-                    return;
+                    return true;
                 }
             }
         }
@@ -2800,7 +2804,7 @@ impl App {
             self.worker_selection = None;
             self.task_selection = None;
             self.handle_agents_mouse(mouse, agents_area);
-            return;
+            return true;
         }
 
         if let Some(task_area) = self
@@ -2809,16 +2813,16 @@ impl App {
         {
             self.worker_selection = None;
             if self.handle_task_selection_mouse(mouse, block_inner(task_area)) {
-                return;
+                return true;
             }
-            return;
+            return false;
         }
 
         let Some(worker_area) = self
             .worker_area
             .filter(|area| rect_contains(*area, mouse.column, mouse.row))
         else {
-            return;
+            return false;
         };
 
         self.task_selection = None;
@@ -2827,14 +2831,14 @@ impl App {
         if self.worker_view == WorkerView::PlanReview {
             self.worker_selection = None;
             self.orch_selection = None;
-            return;
+            return true;
         }
 
         if self.worker_view == WorkerView::Diff {
             if self.write_mouse_to_selected_review(mouse, inner) {
-                return;
+                return true;
             }
-            return;
+            return false;
         }
 
         // Headless orchestrator renders composed Lines, not a PTY: select over the
@@ -2843,7 +2847,7 @@ impl App {
         if self.selected_uses_headless_orchestrator_chat() {
             self.worker_selection = None;
             self.handle_orchestrator_selection_mouse(mouse, inner);
-            return;
+            return true;
         }
 
         if self.selected_interactive_orchestrator_active() {
@@ -2851,27 +2855,25 @@ impl App {
             if rect_contains(dag_area, mouse.column, mouse.row) {
                 self.worker_selection = None;
                 self.handle_orchestrator_selection_mouse(mouse, block_inner(dag_area));
-                return;
+                return true;
             }
             if rect_contains(term_area, mouse.column, mouse.row) {
                 self.orch_selection = None;
                 let term_inner = block_inner(term_area);
                 if self.handle_worker_selection_mouse(mouse, term_inner) {
-                    return;
+                    return true;
                 }
                 if self.write_mouse_to_selected_worker(mouse, term_inner) {
-                    return;
+                    return true;
                 }
             }
-            return;
+            return false;
         }
 
         if self.handle_worker_selection_mouse(mouse, inner) {
-            return;
+            return true;
         }
-        if self.write_mouse_to_selected_worker(mouse, inner) {
-            return;
-        }
+        self.write_mouse_to_selected_worker(mouse, inner)
     }
 
     fn handle_agents_mouse(&mut self, mouse: MouseEvent, area: Rect) {
@@ -2896,7 +2898,8 @@ impl App {
         }
     }
 
-    fn handle_pane_scroll(&mut self, mouse: MouseEvent) {
+    fn handle_pane_scroll(&mut self, mouse: MouseEvent) -> bool {
+        let started = Instant::now();
         // The focus-shortcut routes scrolls to the worker pane only when the
         // pointer is also over the worker pane; otherwise the regular
         // pointer-based routing below kicks in so scrolling over a different
@@ -2912,18 +2915,28 @@ impl App {
                     "mouse {:?} @{},{} focus=worker view={:?}",
                     mouse.kind, mouse.column, mouse.row, self.worker_view
                 ));
-                if self.worker_view == WorkerView::PlanReview {
-                    self.scroll_plan_review(mouse, inner);
+                let changed = if self.worker_view == WorkerView::PlanReview {
+                    self.scroll_plan_review(mouse, inner)
                 } else if self.selected_interactive_orchestrator_active() {
-                    self.scroll_interactive_orchestrator(mouse, area);
+                    self.scroll_interactive_orchestrator(mouse, area)
                 } else if self.selected_headless_orchestrator_rendered_view_active() {
-                    self.scroll_orchestrator_dag(mouse, inner);
+                    self.scroll_orchestrator_dag(mouse, inner)
                 } else if self.worker_view == WorkerView::Diff {
-                    let _ = self.scroll_selected_review_or_forward(mouse, inner);
+                    self.scroll_selected_review_or_forward(mouse, inner)
                 } else {
-                    let _ = self.scroll_selected_worker_or_forward(mouse, inner);
-                }
-                return;
+                    self.scroll_selected_worker_or_forward(mouse, inner)
+                };
+                self.perf.log_duration(
+                    "scroll_event",
+                    started,
+                    serde_json::json!({
+                        "pane": "worker-focus",
+                        "view": format!("{:?}", self.worker_view),
+                        "kind": format!("{:?}", mouse.kind),
+                        "changed": changed,
+                    }),
+                );
+                return changed;
             }
         }
 
@@ -2936,18 +2949,28 @@ impl App {
                 "mouse {:?} @{},{} pane=worker view={:?}",
                 mouse.kind, mouse.column, mouse.row, self.worker_view
             ));
-            if self.worker_view == WorkerView::PlanReview {
-                self.scroll_plan_review(mouse, inner);
+            let changed = if self.worker_view == WorkerView::PlanReview {
+                self.scroll_plan_review(mouse, inner)
             } else if self.selected_interactive_orchestrator_active() {
-                self.scroll_interactive_orchestrator(mouse, area);
+                self.scroll_interactive_orchestrator(mouse, area)
             } else if self.selected_headless_orchestrator_rendered_view_active() {
-                self.scroll_orchestrator_dag(mouse, inner);
+                self.scroll_orchestrator_dag(mouse, inner)
             } else if self.worker_view == WorkerView::Diff {
-                let _ = self.scroll_selected_review_or_forward(mouse, inner);
+                self.scroll_selected_review_or_forward(mouse, inner)
             } else {
-                let _ = self.scroll_selected_worker_or_forward(mouse, inner);
-            }
-            return;
+                self.scroll_selected_worker_or_forward(mouse, inner)
+            };
+            self.perf.log_duration(
+                "scroll_event",
+                started,
+                serde_json::json!({
+                    "pane": "worker",
+                    "view": format!("{:?}", self.worker_view),
+                    "kind": format!("{:?}", mouse.kind),
+                    "changed": changed,
+                }),
+            );
+            return changed;
         }
 
         if self
@@ -2958,33 +2981,55 @@ impl App {
                 "mouse {:?} @{},{} pane=agents",
                 mouse.kind, mouse.column, mouse.row
             ));
+            let before = self.selected_agent;
             if matches!(mouse.kind, MouseEventKind::ScrollUp) {
                 self.select_previous_agent();
             } else if matches!(mouse.kind, MouseEventKind::ScrollDown) {
                 self.select_next_agent();
             }
-            return;
+            let changed = self.selected_agent != before;
+            self.perf.log_duration(
+                "scroll_event",
+                started,
+                serde_json::json!({
+                    "pane": "agents",
+                    "kind": format!("{:?}", mouse.kind),
+                    "changed": changed,
+                }),
+            );
+            return changed;
         }
 
         self.set_mouse_debug(format!(
             "mouse {:?} @{},{} pane=none route=ignored",
             mouse.kind, mouse.column, mouse.row
         ));
+        self.perf.log_duration(
+            "scroll_event",
+            started,
+            serde_json::json!({
+                "pane": "none",
+                "kind": format!("{:?}", mouse.kind),
+                "changed": false,
+            }),
+        );
+        false
     }
 
-    fn scroll_interactive_orchestrator(&mut self, mouse: MouseEvent, area: Rect) {
+    fn scroll_interactive_orchestrator(&mut self, mouse: MouseEvent, area: Rect) -> bool {
         let (dag_area, term_area) = interactive_orchestrator_areas(area);
         if rect_contains(dag_area, mouse.column, mouse.row) {
-            self.scroll_orchestrator_dag(mouse, block_inner(dag_area));
-            return;
+            return self.scroll_orchestrator_dag(mouse, block_inner(dag_area));
         }
         if rect_contains(term_area, mouse.column, mouse.row) {
-            let _ = self.scroll_selected_worker_or_forward(mouse, block_inner(term_area));
+            return self.scroll_selected_worker_or_forward(mouse, block_inner(term_area));
         }
+        false
     }
 
-    fn scroll_plan_review(&mut self, mouse: MouseEvent, area: Rect) {
+    fn scroll_plan_review(&mut self, mouse: MouseEvent, area: Rect) -> bool {
         let rows = mouse_scrollback_delta(mouse, area.height);
+        let before = self.plan_review.scroll;
         if rows > 0 {
             self.plan_review.scroll = self.plan_review.scroll.saturating_sub(rows as usize);
         } else if rows < 0 {
@@ -2993,7 +3038,7 @@ impl App {
                 .scroll
                 .saturating_add(rows.unsigned_abs() as usize);
         }
-        self.dirty = true;
+        self.plan_review.scroll != before
     }
 
     fn set_mouse_debug(&mut self, message: String) {
@@ -3224,7 +3269,7 @@ impl App {
             return false;
         };
         let before = terminal.scrollback();
-        let alternate = terminal.uses_alternate_screen();
+        let alternate = terminal.uses_alternate_screen_snapshot();
         let mut forwarded = false;
         let mut write_error = None;
         terminal.scrollback_by(rows);
@@ -3233,7 +3278,7 @@ impl App {
         let wants_mouse = if moved || rows == 0 {
             false
         } else {
-            terminal.wants_sgr_mouse_events()
+            terminal.wants_sgr_mouse_events_snapshot()
         };
         if !moved && rows != 0 && wants_mouse {
             if let Some(bytes) = mouse_bytes {
@@ -3261,25 +3306,23 @@ impl App {
             self.set_selected_error(error);
             return true;
         }
-        if moved || forwarded {
-            return true;
-        }
-        true
+        moved || forwarded
     }
 
     /// Scroll the orchestrator DAG command-center view. The DAG is a static list of
     /// rendered lines (not a PTY), so we move an app-level line offset. ScrollUp
     /// reveals earlier lines (smaller offset); ScrollDown reveals later lines. The
     /// upper bound is clamped against the rendered content in `render_orchestrator`.
-    fn scroll_orchestrator_dag(&mut self, mouse: MouseEvent, area: Rect) {
+    fn scroll_orchestrator_dag(&mut self, mouse: MouseEvent, area: Rect) -> bool {
         let delta = mouse_scrollback_delta(mouse, area.height);
         if delta == 0 {
-            return;
+            return false;
         }
         // Scrolling shifts which rows are on screen; a stale selection would then
         // highlight the wrong text, so drop it.
-        self.orch_selection = None;
+        let had_selection = self.orch_selection.take().is_some();
         let before = self.orch_dag_scroll;
+        let before_follow = self.orch_follow_bottom;
         // Positive delta is ScrollUp (toward the top), which lowers the offset.
         if delta > 0 {
             self.orch_follow_bottom = false;
@@ -3293,7 +3336,6 @@ impl App {
                 self.orch_follow_bottom = true;
             }
         }
-        self.dirty = true;
         self.set_mouse_debug(format!(
             "mouse {:?} @{},{} pane=orchestrator-dag delta={} before={} after={} max={} follow={}",
             mouse.kind,
@@ -3305,6 +3347,7 @@ impl App {
             self.orch_dag_max_scroll,
             self.orch_follow_bottom
         ));
+        self.orch_dag_scroll != before || self.orch_follow_bottom != before_follow || had_selection
     }
 
     fn write_mouse_to_selected_review(&mut self, mouse: MouseEvent, area: Rect) -> bool {
@@ -3338,14 +3381,14 @@ impl App {
             return false;
         };
         let before = review.scrollback();
-        let alternate = review.uses_alternate_screen();
+        let alternate = review.uses_alternate_screen_snapshot();
         review.scrollback_by(rows);
         let after = review.scrollback();
         let moved = after != before;
         let wants_mouse = if moved || rows == 0 {
             false
         } else {
-            review.wants_sgr_mouse_events()
+            review.wants_sgr_mouse_events_snapshot()
         };
         let mut forwarded = false;
         let mut write_error = None;
@@ -3375,10 +3418,7 @@ impl App {
             self.set_selected_review_error(error);
             return true;
         }
-        if moved || forwarded {
-            return true;
-        }
-        true
+        moved || forwarded
     }
 
     fn handle_worker_page_key(&mut self, key: KeyEvent, rows: isize) {
@@ -3387,7 +3427,7 @@ impl App {
         };
         let result = match self.selected_terminal_mut() {
             Some(terminal) => {
-                if terminal.uses_alternate_screen() {
+                if terminal.uses_alternate_screen_snapshot() {
                     terminal.write_input(&bytes)
                 } else {
                     terminal.scrollback_by(rows);
@@ -9919,6 +9959,7 @@ What to do\n\
     }
 
     fn poll_agents(&mut self) {
+        let poll_started = Instant::now();
         self.poll_task_summary_workers();
         self.poll_completion_summary_workers();
 
@@ -9953,6 +9994,7 @@ What to do\n\
         let mut any_dirty = false;
         let mut context_dirty = false;
         let mut completed_rudder_plans = Vec::new();
+        let mut drain_perf = Vec::new();
         for (index, run) in self.agents.iter_mut().enumerate() {
             let mut changed = false;
             let Some(terminal) = run.terminal.as_mut() else {
@@ -9993,7 +10035,18 @@ What to do\n\
                 continue;
             }
             run.last_drain_at = Some(now);
-            let had_output = !terminal.drain_output().is_empty();
+            let drain_started = Instant::now();
+            let drained = terminal.drain_output();
+            let drained_bytes = drained.len();
+            let had_output = drained_bytes > 0;
+            drain_perf.push(serde_json::json!({
+                "run_id": run.id.clone(),
+                "index": index,
+                "focused": is_focused,
+                "streaming_planner": is_streaming_planner,
+                "bytes": drained_bytes,
+                "duration_us": drain_started.elapsed().as_micros() as u64,
+            }));
             if had_output {
                 any_dirty = true;
             }
@@ -10328,6 +10381,18 @@ What to do\n\
         if any_dirty {
             self.dirty = true;
         }
+        for fields in drain_perf {
+            self.perf.log("pty_drain_parse", fields);
+        }
+        self.perf.log_duration(
+            "poll_agents",
+            poll_started,
+            serde_json::json!({
+                "agents": self.agents.len(),
+                "any_dirty": any_dirty,
+                "context_dirty": context_dirty,
+            }),
+        );
     }
 
     fn poll_task_summary_workers(&mut self) {
@@ -10653,12 +10718,16 @@ fn run(terminal: &mut Tui) -> Result<()> {
     app.mirror_graph();
 
     loop {
+        let frame_started = Instant::now();
         // poll_agents flips app.dirty when any state mutates (PTY bytes,
         // status change, cloud info, etc).
         app.poll_agents();
         app.refresh_tab_title();
         if app.take_dirty() {
+            let draw_started = Instant::now();
             terminal.draw(|frame| render(frame, &mut app))?;
+            app.perf
+                .log_duration("terminal_draw", draw_started, serde_json::json!({}));
         }
 
         // While a planner is actively streaming, poll faster so its live transcript
@@ -10670,10 +10739,12 @@ fn run(terminal: &mut Tui) -> Result<()> {
             TICK_RATE
         };
         if event::poll(poll_timeout)? {
+            let mut drained_events = 0_usize;
             if handle_event(&mut app, event::read()?) {
                 app.shutdown();
                 break;
             }
+            drained_events += 1;
 
             for _ in 1..MAX_EVENTS_PER_FRAME {
                 if !event::poll(Duration::ZERO)? {
@@ -10683,8 +10754,17 @@ fn run(terminal: &mut Tui) -> Result<()> {
                     app.shutdown();
                     return Ok(());
                 }
+                drained_events += 1;
             }
+            app.perf.log(
+                "event_drain",
+                serde_json::json!({
+                    "count": drained_events,
+                }),
+            );
         }
+        app.perf
+            .log_duration("frame_total", frame_started, serde_json::json!({}));
     }
 
     Ok(())
@@ -10928,18 +11008,25 @@ fn is_orchestrator_skill_marker(line: &str) -> bool {
 }
 
 fn handle_event(app: &mut App, event: Event) -> bool {
-    // Any inbound terminal event is a user-visible signal: mark dirty so the
-    // next tick re-renders. Resize must redraw too.
-    app.mark_dirty();
     match event {
-        Event::Key(key) if key.kind == KeyEventKind::Press => app.handle_key(key),
+        Event::Key(key) if key.kind == KeyEventKind::Press => {
+            app.mark_dirty();
+            app.handle_key(key)
+        }
         Event::Key(_) => false,
         Event::Paste(text) => {
+            app.mark_dirty();
             app.handle_paste(text);
             false
         }
         Event::Mouse(mouse) => {
-            app.handle_mouse(mouse);
+            if app.handle_mouse(mouse) {
+                app.mark_dirty();
+            }
+            false
+        }
+        Event::Resize(_, _) => {
+            app.mark_dirty();
             false
         }
         _ => false,

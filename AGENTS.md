@@ -359,6 +359,14 @@ planner every tick. Completion of an interactive agent is declared once it has l
 idle for `READY_GRACE` = 3200 ms (or on clean process exit), which is robust against a
 TUI that repaints while idle.
 
+**Temporary perf diagnostics.** During the worker/review scroll-latency pass, the native
+TUI writes default-on NDJSON timing logs to `~/.rudder/native-perf.ndjson` unless
+`RUDDER_NATIVE_PERF=0`. This logs scroll routing, queued event drain counts, `poll_agents`,
+PTY drain/parse, worker/review line rendering, `terminal.draw`, and frame totals. Logs
+rotate at 10MB, keep three rotated files, and startup deletes perf logs older than three
+days. Treat this as temporary instrumentation to remove or make opt-in after the scroll
+performance pass.
+
 ### Panes and focus
 `FocusPane = Agents | Worker | Task`.
 - **Agents**: the run list. Grouped: a `main`-branch agent section first, then

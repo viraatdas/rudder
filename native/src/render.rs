@@ -2853,7 +2853,7 @@ pub(crate) fn render_worker(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     // label. Without this the pane just said "worker" and the user had to infer
     // the mapping from the agents-pane highlight.
     let identity = app.agents.get(app.selected_agent).map(|run| {
-        let id = run.node_id.clone().unwrap_or_else(|| run.id.clone());
+        let id = worker_title_id(app, run);
         let label = if run.task_summary.trim().is_empty() {
             summarize_task(&run.task)
         } else {
@@ -2896,6 +2896,27 @@ pub(crate) fn render_worker(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             WorkerView::PlanReview => set_plan_review_cursor(frame, inner, app),
         }
     }
+}
+
+fn worker_title_id(app: &App, run: &AgentRun) -> String {
+    if let Some(node_id) = run.node_id.as_ref().filter(|id| !id.trim().is_empty()) {
+        return node_id.clone();
+    }
+    if run.is_oneoff() {
+        return format!("q{}", oneoff_display_index(app, &run.id).unwrap_or(1));
+    }
+    if run.is_main() {
+        return "main".to_string();
+    }
+    run.id.clone()
+}
+
+fn oneoff_display_index(app: &App, run_id: &str) -> Option<usize> {
+    app.agents
+        .iter()
+        .filter(|agent| agent.is_oneoff())
+        .position(|agent| agent.id == run_id)
+        .map(|index| index + 1)
 }
 
 pub(crate) fn plan_review_lines(app: &mut App, height: usize, width: usize) -> Vec<Line<'static>> {
@@ -3159,6 +3180,7 @@ pub(crate) fn set_review_cursor(frame: &mut Frame<'_>, inner: Rect, app: &App) {
 }
 
 pub(crate) fn worker_lines(app: &mut App, height: usize, width: usize) -> Vec<Line<'static>> {
+    let perf_start = Instant::now();
     let Some(run) = app.agents.get_mut(app.selected_agent) else {
         return vec![
             Line::from(""),
@@ -3183,6 +3205,7 @@ pub(crate) fn worker_lines(app: &mut App, height: usize, width: usize) -> Vec<Li
 
     let backend = run.backend;
     let focused = app.focus == FocusPane::Worker;
+    let run_id = run.id.clone();
     let Some(terminal) = run.terminal.as_mut() else {
         return vec![
             Line::from(Span::styled(
@@ -3209,14 +3232,14 @@ pub(crate) fn worker_lines(app: &mut App, height: usize, width: usize) -> Vec<Li
         .worker_selection
         .map(normalize_selection)
         .filter(|selection| !selection_is_empty(*selection));
-    let styled_rows = terminal.styled_lines();
-    let start_row = styled_rows.len().saturating_sub(height);
+    let (start_row, styled_rows) = terminal.styled_line_window_snapshot(height);
     let cursor = worker_render_cursor(backend, terminal, focused, height, width, start_row);
-    let mut lines = styled_rows
+    let row_count = styled_rows.len();
+    let lines = styled_rows
         .into_iter()
         .enumerate()
-        .skip(start_row)
-        .map(|(row, cells)| {
+        .map(|(offset, cells)| {
+            let row = start_row + offset;
             styled_terminal_line(
                 cells,
                 selection_for_row(selection, row),
@@ -3226,9 +3249,17 @@ pub(crate) fn worker_lines(app: &mut App, height: usize, width: usize) -> Vec<Li
             )
         })
         .collect::<Vec<_>>();
-    if lines.len() > height {
-        lines = lines.split_off(lines.len() - height);
-    }
+    app.perf.log_duration(
+        "worker_lines",
+        perf_start,
+        serde_json::json!({
+            "run_id": run_id,
+            "rows": row_count,
+            "height": height,
+            "width": width,
+            "start_row": start_row,
+        }),
+    );
     lines
 }
 
@@ -3260,6 +3291,7 @@ pub(crate) fn force_worker_cursor(backend: Backend) -> bool {
 }
 
 pub(crate) fn review_lines(app: &mut App, height: usize) -> Vec<Line<'static>> {
+    let perf_start = Instant::now();
     let Some(run) = app.agents.get_mut(app.selected_agent) else {
         return vec![Line::from(Span::styled(
             "No agent selected.",
@@ -3279,6 +3311,7 @@ pub(crate) fn review_lines(app: &mut App, height: usize) -> Vec<Line<'static>> {
         ];
     }
 
+    let run_id = run.id.clone();
     let Some(review) = run.review_terminal.as_mut() else {
         return vec![
             Line::from(Span::styled("Opening jj diff...", muted_style(true))),
@@ -3290,14 +3323,21 @@ pub(crate) fn review_lines(app: &mut App, height: usize) -> Vec<Line<'static>> {
         ];
     };
 
-    let mut lines = review
-        .styled_lines()
+    let (_start_row, styled_rows) = review.styled_line_window_snapshot(height);
+    let row_count = styled_rows.len();
+    let lines = styled_rows
         .into_iter()
         .map(|cells| styled_terminal_line(cells, None, None))
         .collect::<Vec<_>>();
-    if lines.len() > height {
-        lines = lines.split_off(lines.len() - height);
-    }
+    app.perf.log_duration(
+        "review_lines",
+        perf_start,
+        serde_json::json!({
+            "run_id": run_id,
+            "rows": row_count,
+            "height": height,
+        }),
+    );
     lines
 }
 
