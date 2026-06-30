@@ -10,7 +10,7 @@ import {
   runCommandSync,
   shortHash,
 } from "./util.js";
-import { saveRunRecord, worktreePath } from "./state.js";
+import { ensureProjectRuntimeIgnored, saveRunRecord, worktreePath } from "./state.js";
 import { withIntegrationLock } from "./rudder-md.js";
 
 // Minimum jj version we are confident in. Older releases may lack flags we use
@@ -54,11 +54,26 @@ export async function jjVersion(): Promise<string> {
  * jj repo, no-op. Otherwise runs `jj git init --colocate`.
  */
 export async function ensureColocated(repoRoot: string): Promise<void> {
+  // Every jj command snapshots the working copy by default, including `jj
+  // root`. Install the exclusions before even probing repository state.
+  await ensureProjectRuntimeIgnored(repoRoot);
   ensureJj();
-  if (isJjRepo(repoRoot)) {
-    return;
+  if (!isJjRepo(repoRoot)) {
+    await runCommand("jj", ["git", "init", "--colocate"], { cwd: repoRoot });
   }
-  await runCommand("jj", ["git", "init", "--colocate"], { cwd: repoRoot });
+  await untrackLegacyRudderState(repoRoot);
+}
+
+/** Remove runtime files snapshotted by older Rudder versions while preserving
+ * them on disk. Ignore rules alone do not untrack a path already present in @. */
+async function untrackLegacyRudderState(repoRoot: string): Promise<void> {
+  const tracked = await runCommand(
+    "jj",
+    ["file", "list", "--ignore-working-copy", "-r", "@", ".rudder"],
+    { cwd: repoRoot, allowFailure: true },
+  );
+  if (tracked.code !== 0 || !tracked.stdout.trim()) return;
+  await runCommand("jj", ["file", "untrack", ".rudder"], { cwd: repoRoot });
 }
 
 export function isJjRepo(cwd: string): boolean {
@@ -131,6 +146,15 @@ async function jjReadInWorkspace(
  */
 export async function currentJjChangeId(workspacePath: string): Promise<string> {
   const result = await jjReadInWorkspace(workspacePath, ["log", "--no-graph", "-r", "@", "-T", "change_id"]);
+  return result.code === 0 ? result.stdout.trim().split(/\s+/)[0] ?? "" : "";
+}
+
+/** The immutable commit id of a workspace's current revision. Prefer this when
+ * feeding a finished workspace into a merge: concurrent jj snapshots can make
+ * its stable change id divergent, while the workspace's @ commit remains an
+ * unambiguous revision. */
+export async function currentJjCommitId(workspacePath: string): Promise<string> {
+  const result = await jjReadInWorkspace(workspacePath, ["log", "--no-graph", "-r", "@", "-T", "commit_id"]);
   return result.code === 0 ? result.stdout.trim().split(/\s+/)[0] ?? "" : "";
 }
 
@@ -248,6 +272,9 @@ export async function createNodeWorkspace(params: {
   atChangeId?: string;
 }): Promise<{ workspaceName: string; path: string }> {
   ensureJj();
+  // jj snapshots the main checkout while adding a workspace. Runtime state
+  // must already be excluded at that exact point.
+  await ensureProjectRuntimeIgnored(params.repoRoot);
   const id = params.nodeId ?? params.runId;
   if (!id) {
     throw new Error("createNodeWorkspace requires nodeId or runId.");

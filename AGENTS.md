@@ -630,6 +630,9 @@ From `package.json`:
 
 `tests/` are integration tests that import from `dist/` (so build first):
 `rebase-first.test.mjs` exercises merge/rebase/sync via `git.ts` + `state.ts`.
+`board-steer.test.mjs` covers both web-control owners: projector requests become
+durable native inbox entries, and a real standalone board redirects a delayed fake
+worker end-to-end before returning the same task/workspace to Review.
 `e2e-orchestrator.test.mjs` is the WHOLE-WORKFLOW test: it drives the real
 `rudder plan` + `rudder board` CLIs against a throwaway git+jj repo and verifies the
 DAG drains end-to-end (schedule → isolated jj workspace → worker → verify → jj merge →
@@ -765,6 +768,14 @@ and runs them as a fleet. This section is the map of that orchestrator.
   `rudder __worker` subprocesses. When the TUI is up it starts the daemon
   **projector-only** (`scheduler:false`): the board serves HTTP+SSE and reflects
   `graph.json` but never launches — so there is no double-launch.
+- **Web control follows the owner.** The board daemon receives an explicit
+  `scheduler | projector` control mode. In scheduler mode, task updates call
+  `continueRun` under the scheduler lock (a running pass is redirected; Review is
+  resumed) and a per-attempt id prevents the superseded worker from writing stale
+  terminal state. In projector mode, updates and `+ Task` are queued in
+  `.rudder/steer/`; the TUI consumes them through the same paths as worker PTY and
+  task-pane input. Never mutate `graph.json` from a projector-mode browser action:
+  the TUI deliberately does not read its mirror back.
 - `graph.json` is a **one-way mirror**: the TUI writes it (coalesced — the payload is
   hashed and the write skipped when unchanged), the daemon/board read it; the TUI never
   reads it back for scheduling. They are mutually-exclusive schedulers, not duplicates —

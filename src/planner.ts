@@ -15,6 +15,7 @@ import { createEmptyChange, currentJjChangeId } from "./jj.js";
 import { newEdgeId, newNodeId, updateGraph } from "./graph.js";
 import { nowIso } from "./util.js";
 import { DEFAULT_SUCCESS, deriveGoal, formatGoalPrompt, normalizeGoalLine } from "./goal.js";
+import { ensureProjectRuntimeIgnored } from "./state.js";
 
 export { loadInstructionFiles } from "./brain.js";
 
@@ -544,6 +545,9 @@ export function buildFanoutDag(task: string, n: number, opts: FanoutOptions = {}
 // ---------------------------------------------------------------------------
 
 export async function scaffoldPlan(repoRoot: string, dag: PlanDag): Promise<void> {
+  // Install the runtime exclusions before the first jj command snapshots @, so
+  // graph.json and worker ledgers can never become parents of task changes.
+  await ensureProjectRuntimeIgnored(repoRoot);
   const order = topoOrderHard(dag);
   const trunk = (await currentJjChangeId(repoRoot)) || "@";
 

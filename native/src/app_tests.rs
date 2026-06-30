@@ -535,19 +535,15 @@ fn push_activity_appends_parseable_jsonl_for_the_web_board() {
 }
 
 #[test]
-fn sanitize_steer_instruction_strips_control_chars_so_no_extra_pty_lines() {
-    // A steer instruction is injected into a live agent PTY with a trailing Enter, so
-    // embedded CR/LF/ESC from an untrusted web-board payload must not survive (they
-    // would submit extra command lines or smuggle terminal escapes).
+fn sanitize_steer_instruction_preserves_lines_and_strips_terminal_controls() {
+    // Newlines are safe inside bracketed paste and preserve the web composer's
+    // structure; ESC and other controls must not reach the terminal.
     let dirty = "run tests\rrm -rf /\nthen leak\x1bsecret\tnow";
     let clean = sanitize_steer_instruction(dirty);
-    assert!(
-        !clean.contains('\r') && !clean.contains('\n') && !clean.contains('\x1b'),
-        "control characters are stripped: {clean:?}"
-    );
+    assert!(!clean.contains('\r') && !clean.contains('\x1b'));
     assert_eq!(
-        clean, "run tests rm -rf / then leak secret now",
-        "stays one printable line with collapsed whitespace"
+        clean, "run tests\nrm -rf /\nthen leak secret now",
+        "preserves composer line breaks while stripping terminal controls"
     );
     // All-control input collapses to empty (deliver_steer then drops it).
     assert!(sanitize_steer_instruction("\r\n\t\x1b").is_empty());
@@ -561,7 +557,7 @@ fn poll_steer_inbox_consumes_files_and_records_unknown_target() {
     let request = steer.join("1700000000000-n7.json");
     std::fs::write(
         &request,
-        r#"{"taskId":"n7","instruction":"focus on the failing test"}"#,
+        r#"{"requestId":"request-00000007","taskId":"n7","instruction":"focus on the failing test"}"#,
     )
     .unwrap();
 
@@ -579,8 +575,203 @@ fn poll_steer_inbox_consumes_files_and_records_unknown_target() {
         "records the unroutable steer: {:?}",
         app.activity_log
     );
+    let receipt = dir
+        .join(".rudder")
+        .join("steer-receipts")
+        .join("request-00000007.json");
+    let value: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&receipt).unwrap()).unwrap();
+    assert_eq!(value["status"], "failed");
+    assert!(value["error"].as_str().unwrap_or_default().contains("n7"));
+
+    // Receipt existence is an at-most-once ledger after a crash/restart: a
+    // leftover duplicate inbox file is consumed without routing a second time.
+    let activity_count = app.activity_log.len();
+    std::fs::write(
+        &request,
+        r#"{"requestId":"request-00000007","taskId":"n7","instruction":"focus on the failing test"}"#,
+    )
+    .unwrap();
+    app.poll_steer_inbox();
+    assert!(!request.exists());
+    assert_eq!(app.activity_log.len(), activity_count);
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn web_conductor_steer_uses_task_input_path_without_a_live_conductor() {
+    let dir = unique_test_repo("web-conductor-steer");
+    let mut app = App::new();
+    app.cwd = dir.clone();
+    assert!(
+        !app.agents.iter().any(AgentRun::is_orchestrator),
+        "fixture intentionally has no conductor PTY"
+    );
+
+    // /help is a task-input command with no process spawn, so it proves the
+    // conductor web target reached start_task_from_input rather than the old
+    // "target not found" branch.
+    let _ = app.deliver_steer_request("conductor", "/help");
+
+    assert!(
+        app.notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("plain input -> orchestrator/DAG")),
+        "task-input command result remains visible: {:?}",
+        app.notice
+    );
+    assert!(
+        app.activity_log
+            .iter()
+            .any(|line| line.contains("steered conductor: /help")),
+        "web action is acknowledged in activity: {:?}",
+        app.activity_log
+    );
+    assert!(app.agents.is_empty(), "the command did not spawn an agent");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(not(windows))]
+#[test]
+fn web_steer_running_worker_injects_and_persists_a_user_turn() {
+    let dir = unique_test_repo("web-running-steer");
+    let mut app = App::new();
+    app.cwd = dir.clone();
+    let command = TerminalCommand::with_args("/bin/sh", ["-lc", "sleep 5"]);
+    let pane = TerminalPane::spawn_shell_or_command(
+        Some(command),
+        TerminalPaneOptions {
+            size: TerminalSize { rows: 5, cols: 40 },
+            cwd: Some(dir.clone()),
+            ..Default::default()
+        },
+    )
+    .expect("spawn fake worker PTY");
+    let mut run = test_agent_run_with_terminal(&app, pane);
+    run.id = "web-running-worker".to_string();
+    run.node_id = Some("n-running".to_string());
+    run.needs_user_input = true;
+    run.user_input_notified = true;
+    app.agents.push(run);
+
+    let _ = app.deliver_steer_request("n-running", "focus on the failing parser test");
+
+    let run = &app.agents[0];
+    assert_eq!(run.status, AgentStatus::Running);
+    assert_eq!(run.current_prompt, "focus on the failing parser test");
+    assert_ne!(run.last_user_input_at, "1");
+    assert!(!run.needs_user_input);
+    let turn = run.turns.last().expect("steer appended a turn");
+    assert_eq!(turn.prompt, "focus on the failing parser test");
+    assert_eq!(turn.source, "user");
+
+    let saved: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(
+            dir.join(".rudder")
+                .join("runs")
+                .join("web-running-worker")
+                .join("run.json"),
+        )
+        .expect("running steer persisted run.json"),
+    )
+    .expect("parse persisted run record");
+    assert_eq!(saved["currentPrompt"], "focus on the failing parser test");
+    assert_eq!(
+        saved["turns"].as_array().and_then(|turns| turns.last()),
+        Some(&serde_json::json!({
+            "ts": run.last_user_input_at,
+            "prompt": "focus on the failing parser test",
+            "source": "user",
+        }))
+    );
+
+    app.agents[0].terminal = None;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn web_steer_rejects_terminal_worker_statuses() {
+    let dir = unique_test_repo("web-terminal-steer");
+    for status in [
+        AgentStatus::Merged,
+        AgentStatus::Failed,
+        AgentStatus::Stopped,
+    ] {
+        let mut app = App::new();
+        app.cwd = dir.clone();
+        let mut run = test_agent_run("terminal-worker", "finished task");
+        run.node_id = Some("n-terminal".to_string());
+        run.status = status;
+        app.agents.push(run);
+
+        let _ = app.deliver_steer_request("n-terminal", "change the implementation");
+
+        assert_eq!(app.agents[0].status, status);
+        assert_eq!(app.agents[0].turns.len(), 1, "no turn was appended");
+        assert!(
+            app.activity_log.iter().any(|line| {
+                line.contains("steer: n-terminal unavailable") && line.contains(status.as_str())
+            }),
+            "status is reported as unavailable: {:?}",
+            app.activity_log
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(not(windows))]
+#[test]
+fn web_steer_done_worker_regoals_the_same_row() {
+    let _env = env_guard();
+    let dir = unique_test_repo("web-done-steer");
+    let fake = dir.join("fake-claude.sh");
+    write_fake_bin(&fake, "#!/bin/sh\nsleep 5\n");
+    let old_claude = std::env::var_os("RUDDER_CLAUDE_BIN");
+    let old_home = std::env::var_os("RUDDER_HOME");
+    std::env::set_var("RUDDER_CLAUDE_BIN", &fake);
+    std::env::set_var("RUDDER_HOME", dir.join("home"));
+
+    let mut app = App::new();
+    app.cwd = dir.clone();
+    let mut run = test_agent_run("web-done-worker", "implement parser");
+    run.cwd = dir.clone();
+    run.node_id = Some("n-done".to_string());
+    run.status = AgentStatus::Done;
+    run.completed_at = Some(Instant::now());
+    run.session_id = Some("web-steer-session".to_string());
+    app.agents.push(run);
+
+    let _ = app.deliver_steer_request("n-done", "also cover malformed input");
+
+    let status = app.agents[0].status;
+    let current_prompt = app.agents[0].current_prompt.clone();
+    let last_turn = app.agents[0].turns.last().cloned();
+    let activity = app.activity_log.clone();
+    app.agents[0].terminal = None;
+    match old_claude {
+        Some(value) => std::env::set_var("RUDDER_CLAUDE_BIN", value),
+        None => std::env::remove_var("RUDDER_CLAUDE_BIN"),
+    }
+    match old_home {
+        Some(value) => std::env::set_var("RUDDER_HOME", value),
+        None => std::env::remove_var("RUDDER_HOME"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_eq!(status, AgentStatus::Running);
+    assert_eq!(current_prompt, "also cover malformed input");
+    let last_turn = last_turn.expect("re-goal appended a turn");
+    assert_eq!(last_turn.prompt, "also cover malformed input");
+    assert_eq!(last_turn.source, "regoal");
+    assert!(
+        activity
+            .iter()
+            .any(|line| line.contains("re-goaled n-done: also cover malformed input")),
+        "same worker row was resumed: {activity:?}"
+    );
 }
 
 #[test]

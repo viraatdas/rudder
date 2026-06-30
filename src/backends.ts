@@ -57,10 +57,14 @@ function fakeBackend(id: BackendId): BackendAdapter {
       // test's ordering assertions) see the same run.process timing shape.
       request.run.process = {
         ...(request.run.process ?? {}),
-        startedAt: nowIso(),
+        startedAt: request.run.process?.startedAt ?? nowIso(),
       };
       request.run.status = "running";
-      await saveRunRecord(request.run);
+      await saveBackendRun(request.run);
+      const delayMs = Number(process.env.RUDDER_FAKE_BACKEND_DELAY_MS) || 0;
+      if (delayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
       const root = request.run.worktree?.path ?? request.run.repoRoot;
       const source = request.run.task ?? request.prompt ?? "";
       const blocks = [...source.matchAll(/\[\[FAKE_FILE:(.+?)\]\]\n([\s\S]*?)\n\[\[\/FAKE_FILE\]\]/g)];
@@ -94,7 +98,7 @@ function fakeBackend(id: BackendId): BackendAdapter {
         exitCode: 0,
         signal: null,
       };
-      await saveRunRecord(request.run);
+      await saveBackendRun(request.run);
       return 0;
     },
   };
@@ -117,7 +121,7 @@ function claudeBackend(): BackendAdapter {
         ...(request.run.session ?? {}),
         nativeSessionId: sessionId,
       };
-      await saveRunRecord(request.run);
+      await saveBackendRun(request.run);
       const env = await backendEnv("anthropic");
       const effort = normalizeEffortForBackend("claude", request.run.effort);
       const args = compact([
@@ -168,21 +172,39 @@ function codexBackend(): BackendAdapter {
       const command = await ensureRudderCodexBinary();
       const env = await codexLaunchEnv(await backendEnv("openai"));
       const effort = normalizeEffortForBackend("codex", request.run.effort);
-      const args = compact([
-        "exec",
-        "--json",
-        "--color",
-        "never",
-        "--model",
-        request.run.model || "gpt-5.5",
-        "--dangerously-bypass-approvals-and-sandbox",
-        "--enable",
-        "goals",
-        ...CODEX_RUDDER_CONFIG_ARGS,
-        effort ? "-c" : undefined,
-        effort ? `model_reasoning_effort="${effort}"` : undefined,
-        `${request.contract}\n\n${prompt}`,
-      ]);
+      const sessionId = request.run.session?.nativeSessionId;
+      const isFollowUp = (request.run.turns?.length ?? 0) > 1 && Boolean(sessionId);
+      const args = compact(isFollowUp
+        ? [
+            "exec",
+            "resume",
+            "--json",
+            "--model",
+            request.run.model || "gpt-5.5",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--enable",
+            "goals",
+            ...CODEX_RUDDER_CONFIG_ARGS,
+            effort ? "-c" : undefined,
+            effort ? `model_reasoning_effort="${effort}"` : undefined,
+            sessionId,
+            `${request.contract}\n\n${prompt}`,
+          ]
+        : [
+            "exec",
+            "--json",
+            "--color",
+            "never",
+            "--model",
+            request.run.model || "gpt-5.5",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--enable",
+            "goals",
+            ...CODEX_RUDDER_CONFIG_ARGS,
+            effort ? "-c" : undefined,
+            effort ? `model_reasoning_effort="${effort}"` : undefined,
+            `${request.contract}\n\n${prompt}`,
+          ]);
       return await spawnAndStream({
         command,
         args,
@@ -216,7 +238,7 @@ function acpxBackend(): BackendAdapter {
         ...(request.run.session ?? {}),
         sessionName,
       };
-      await saveRunRecord(request.run);
+      await saveBackendRun(request.run);
       await runCommand("acpx", ["codex", "sessions", "ensure", "--name", sessionName], {
         cwd: request.run.worktree.path,
         env,
@@ -326,10 +348,14 @@ async function spawnAndStream(params: {
   params.request.run.process = {
     ...(params.request.run.process ?? {}),
     pid: child.pid,
-    startedAt: nowIso(),
+    backendPid: child.pid,
+    // startedAt identifies the owning worker attempt (and is the legacy
+    // ownership token when attemptId is absent). Do not replace it merely
+    // because the backend child started a moment later.
+    startedAt: params.request.run.process?.startedAt ?? nowIso(),
   };
   params.request.run.status = "running";
-  await saveRunRecord(params.request.run);
+  await saveBackendRun(params.request.run);
 
   let outRest = "";
   let errRest = "";
@@ -402,7 +428,7 @@ async function spawnAndStream(params: {
           const previous = params.request.run.tokens;
           if (!previous || usageState.input + usageState.output >= previous.input + previous.output) {
             params.request.run.tokens = { input: usageState.input, output: usageState.output };
-            await saveRunRecord(params.request.run);
+            await saveBackendRun(params.request.run);
           }
         }
         await params.emit({
@@ -443,7 +469,7 @@ async function emitBackendLine(
       ...(run.session ?? {}),
       nativeSessionId: sessionId,
     };
-    await saveRunRecord(run);
+    await saveBackendRun(run);
   }
   await emit({
     ts: nowIso(),
@@ -455,7 +481,27 @@ async function emitBackendLine(
 }
 
 function sessionIdFromBackendData(data: unknown): string | undefined {
-  return isRecord(data) && typeof data.session_id === "string" ? data.session_id : undefined;
+  if (!isRecord(data)) return undefined;
+  if (typeof data.session_id === "string") return data.session_id;
+  // `codex exec --json` announces the resumable conversation with a
+  // thread.started event. Persist it so a web steer resumes model context rather
+  // than merely re-running in the same workspace.
+  return data.type === "thread.started" && typeof data.thread_id === "string"
+    ? data.thread_id
+    : undefined;
+}
+
+function saveBackendRun(run: RunRequest["run"]): Promise<boolean> {
+  const expectedAttemptId = run.process?.attemptId;
+  const expectedStartedAt = run.process?.startedAt;
+  return saveRunRecord(
+    run,
+    expectedAttemptId
+      ? { expectedAttemptId }
+      : expectedStartedAt
+        ? { expectedStartedAt }
+        : undefined,
+  );
 }
 
 /**
@@ -588,4 +634,3 @@ function isStreamingTextEvent(data: unknown): boolean {
   const event = data.event;
   return event.type === "content_block_delta" && isRecord(event.delta) && typeof event.delta.text === "string";
 }
-

@@ -93,6 +93,19 @@ async function makeWorkspace(t) {
   git(["add", "-A"]);
   git(["commit", "-q", "-m", "initial"]);
 
+  // Simulate an upgrade from a Rudder version that let live state enter jj's
+  // working-copy commit. The current CLI must install ignores before its first
+  // probe and untrack this path without deleting it from disk.
+  assert.equal(spawnSync("jj", ["git", "init", "--colocate"], { cwd: repo, stdio: "ignore" }).status, 0);
+  await fsp.mkdir(path.join(repo, ".rudder"), { recursive: true });
+  await fsp.writeFile(path.join(repo, ".rudder", "preexisting.json"), "{}\n");
+  assert.equal(spawnSync("jj", ["status"], { cwd: repo, stdio: "ignore" }).status, 0);
+  const legacyFiles = spawnSync("jj", ["file", "list", "--ignore-working-copy", "-r", "@", ".rudder"], {
+    cwd: repo,
+    encoding: "utf8",
+  });
+  assert.match(legacyFiles.stdout, /\.rudder\/preexisting\.json/, "fixture starts with legacy tracked state");
+
   const baseEnv = {
     RUDDER_HOME: home,
     RUDDER_DISABLE_UPDATE_CHECK: "1",
@@ -146,9 +159,21 @@ async function planAndDrain(t, ws, tasks) {
     const g = await readJson(ws.graphFile).catch(() => null);
     if (!g) return null;
     const ns = Object.values(g.nodes);
-    return ns.every((n) => n.status === "merged" || n.status === "failed") ? g : null;
+    // `every([])` is true; require the planned fleet to be present so a brief
+    // empty/default graph cannot look like a successfully drained DAG.
+    return ns.length > 0 && ns.every((n) => n.status === "merged" || n.status === "failed") ? g : null;
   }, { timeoutMs: 60_000 });
   assert.ok(drained, `DAG did not drain within timeout. board log:\n${boardLog}`);
+  const tracked = spawnSync("jj", ["file", "list", "-r", "@"], {
+    cwd: ws.repo,
+    encoding: "utf8",
+  });
+  assert.equal(tracked.status, 0, `jj file list failed:\n${tracked.stderr}`);
+  assert.equal(
+    tracked.stdout.split(/\r?\n/).some((file) => file === ".rudder" || file.startsWith(".rudder/")),
+    false,
+    "Rudder's live .rudder control state must never be captured in a jj revision",
+  );
   const rudderPath = path.join(ws.repo, "RUDDER.md");
   let lastRudderMd = "";
   const rudderMd = await poll(async () => {

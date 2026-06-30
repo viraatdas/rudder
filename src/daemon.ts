@@ -8,7 +8,7 @@ import { DEFAULT_BOARD_PORT } from "./types.js";
 import { ensureDir, readJson, writeJson } from "./util.js";
 import { shortenHome } from "./util.js";
 import { startBoardDaemon } from "./board/daemon.js";
-import type { BoardDaemonHandle } from "./board/daemon.js";
+import type { BoardControlMode, BoardDaemonHandle } from "./board/daemon.js";
 import { RudderBus } from "./bus.js";
 import { onRunTransition, scheduleTick } from "./scheduler.js";
 import { renderLiveRudderMd } from "./surfaces.js";
@@ -19,6 +19,7 @@ export type DaemonPidFile = {
   pid: number;
   port: number;
   startedAt: string;
+  controlMode?: BoardControlMode;
 };
 
 export function daemonPidPath(repoRoot: string): string {
@@ -56,9 +57,21 @@ export async function ensureBoardRunning(
   const project = await registerProject(repoRoot).catch(() => null);
   const slug = project?.slug ?? "";
   const projectPath = slug ? `/rudder/${slug}` : "/rudder";
+  const runScheduler = opts?.scheduler ?? true;
+  const requestedMode: BoardControlMode = runScheduler ? "scheduler" : "projector";
 
   const existing = await readPidFile(repoRoot);
   if (existing && existing.pid !== process.pid && processAlive(existing.pid)) {
+    if (!existing.controlMode) {
+      throw new Error(
+        `An older board process already owns this repository on port ${existing.port}; stop it once so Rudder can record its control mode safely.`,
+      );
+    }
+    if (existing.controlMode !== requestedMode) {
+      throw new Error(
+        `A ${existing.controlMode} board already owns this repository on port ${existing.port}; stop it before starting ${requestedMode} mode.`,
+      );
+    }
     const url = `http://127.0.0.1:${existing.port}`;
     return { port: existing.port, url, slug, projectUrl: `${url}${projectPath}`, started: false };
   }
@@ -69,7 +82,13 @@ export async function ensureBoardRunning(
   // One bus shared between the scheduler (producer) and the board SSE
   // broadcaster (consumer). The daemon is the single authoritative scheduler.
   const bus = new RudderBus();
-  const handle = await startBoardDaemon({ port, repoRoot, open: opts?.open, bus });
+  const handle = await startBoardDaemon({
+    port,
+    repoRoot,
+    open: opts?.open,
+    bus,
+    controlMode: requestedMode,
+  });
 
   // Projector-only mode: when scheduler === false the board still serves
   // HTTP + SSE + fs.watch (so it reflects whatever is written to graph.json),
@@ -77,7 +96,6 @@ export async function ensureBoardRunning(
   // this way so the TUI remains the sole scheduler and there is no double-launch
   // (the TUI mirrors its plan into graph.json; the daemon only projects it). The
   // standalone `rudder board`/`serve` paths keep the full scheduler (default).
-  const runScheduler = opts?.scheduler ?? true;
   const scheduler = runScheduler ? startScheduler(repoRoot, bus) : { stop: (): void => {} };
 
   await ensureDir(projectStateDir(repoRoot));
@@ -85,6 +103,7 @@ export async function ensureBoardRunning(
     pid: process.pid,
     port: handle.port,
     startedAt: new Date().toISOString(),
+    controlMode: requestedMode,
   });
 
   const cleanup = async (): Promise<void> => {
@@ -124,17 +143,30 @@ export async function ensureBoardRunning(
  */
 function startScheduler(repoRoot: string, bus: RudderBus): { stop: () => void } {
   let stopped = false;
+  let tickInFlight = false;
+
+  // Coalesce interval ticks. A tick can spend several seconds creating jj
+  // workspaces; blindly enqueueing another locked tick every second starves the
+  // completion transitions that need the same lock to move nodes through Review.
+  const tick = (): void => {
+    if (stopped || tickInFlight) return;
+    tickInFlight = true;
+    void scheduleTick(repoRoot, bus)
+      .catch((error) => {
+        console.warn(`rudder scheduler tick failed: ${error instanceof Error ? error.message : String(error)}`);
+      })
+      .finally(() => {
+        tickInFlight = false;
+      });
+  };
 
   // Render the live RUDDER.md once on startup and tick immediately so a daemon
   // restart catches up missed transitions from disk.
   void renderLiveRudderMd(repoRoot).catch(() => undefined);
-  void scheduleTick(repoRoot, bus).catch(() => undefined);
+  tick();
 
   const interval = setInterval(() => {
-    if (stopped) {
-      return;
-    }
-    void scheduleTick(repoRoot, bus).catch(() => undefined);
+    tick();
   }, SCHEDULE_TICK_MS);
   interval.unref?.();
 
@@ -155,7 +187,11 @@ function startScheduler(repoRoot: string, bus: RudderBus): { stop: () => void } 
     const timer = setTimeout(() => {
       runTimers.delete(runId);
       if (!stopped) {
-        void onRunTransition(repoRoot, runId, bus).catch(() => undefined);
+        void onRunTransition(repoRoot, runId, bus).catch((error) => {
+          console.warn(
+            `rudder scheduler transition failed for ${runId}: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        });
       }
     }, 100);
     timer.unref?.();

@@ -3,6 +3,7 @@ import {
   createEmptyChange,
   createNodeWorkspace,
   currentJjChangeId,
+  currentJjCommitId,
   currentOpId,
   exportToGit,
   jjDiff,
@@ -23,8 +24,8 @@ import {
 } from "./graph.js";
 import { reconcile } from "./planner.js";
 import { DEFAULT_SUCCESS, deriveGoal, formatGoalPrompt, normalizeGoalLine } from "./goal.js";
-import { createRunRecord, loadConfig, loadRunRecord, runDir } from "./state.js";
-import { spawnWorker } from "./run-manager.js";
+import { createRunRecord, loadConfig, loadRunRecord, runDir, saveRunRecord } from "./state.js";
+import { newAttemptId, spawnWorker } from "./run-manager.js";
 import { ensureDecisionsFile, renderLiveRudderMd } from "./surfaces.js";
 import { withIntegrationLock } from "./rudder-md.js";
 import type {
@@ -265,7 +266,11 @@ export async function launchNode(
     return g;
   });
 
-  spawnWorker(repoRoot, run.id);
+  const attemptId = newAttemptId();
+  const pid = spawnWorker(repoRoot, run.id, attemptId);
+  run.status = "running";
+  run.process = { pid, controllerPid: pid, attemptId, startedAt: nowIso() };
+  await saveRunRecord(run);
 
   bus.publish({
     ts: nowIso(),
@@ -292,8 +297,13 @@ export async function mergeNodeIntoIntegration(repoRoot: string, node: TaskNode,
 }
 
 async function mergeNodeIntoIntegrationLocked(repoRoot: string, node: TaskNode, bus: RudderBus): Promise<void> {
-  const nodeChangeId = node.jjChangeId || (node.worktree?.path ? await currentJjChangeId(node.worktree.path) : "");
-  if (!nodeChangeId) {
+  // A change id can become divergent when jj snapshots a live workspace while
+  // sibling workspaces are integrating. The workspace's immutable @ commit id
+  // always identifies the exact finished revision, so prefer it at this seam.
+  const nodeRevision = node.worktree?.path
+    ? (await currentJjCommitId(node.worktree.path)) || node.jjChangeId || ""
+    : node.jjChangeId || "";
+  if (!nodeRevision) {
     bus.publish({
       ts: nowIso(),
       runId: node.runId ?? node.id,
@@ -319,7 +329,7 @@ async function mergeNodeIntoIntegrationLocked(repoRoot: string, node: TaskNode, 
 
   const result = await mergeNode({
     repoRoot,
-    nodeChangeId,
+    nodeChangeId: nodeRevision,
     intoChangeId: intoChange,
     message: `rudder: ${node.title.slice(0, 72)}`,
   });
@@ -500,7 +510,8 @@ async function spawnResolver(
   // already has a resolverRunId). So only persist the back-pointer once the worker is
   // actually live; on a failed spawn, leave the node blocked WITHOUT a resolverRunId so
   // a later merge attempt can retry, and surface the failure.
-  const pid = spawnWorker(repoRoot, run.id);
+  const attemptId = newAttemptId();
+  const pid = spawnWorker(repoRoot, run.id, attemptId);
   if (pid === undefined) {
     await updateGraph(repoRoot, (g) => {
       const current = g.nodes[node.id];
@@ -518,6 +529,9 @@ async function spawnResolver(
     });
     throw new Error(`failed to spawn conflict resolver ${run.id} for node ${node.id}`);
   }
+  run.status = "running";
+  run.process = { pid, controllerPid: pid, attemptId, startedAt: nowIso() };
+  await saveRunRecord(run);
 
   // Resolver is live: hold the original node blocked and back-point at its resolver.
   await updateGraph(repoRoot, (g) => {

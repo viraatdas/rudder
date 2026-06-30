@@ -12,8 +12,8 @@ import type {
   RunStatus,
   TaskNode,
 } from "./types.js";
-import { projectStateDir } from "./state.js";
-import { nowIso, readJson, shortHash, updateJson } from "./util.js";
+import { ensureProjectRuntimeIgnored, projectStateDir } from "./state.js";
+import { nowIso, pathExists, readJson, shortHash, updateJson } from "./util.js";
 
 // ---------------------------------------------------------------------------
 // graph.json IO. The graph is the daemon-owned DAG topology. nodes/edges are
@@ -75,8 +75,19 @@ export async function updateGraph(
   repoRoot: string,
   fn: (graph: RudderGraph) => RudderGraph | void,
 ): Promise<RudderGraph> {
+  // graph.json is mutable scheduler state, never source code. Install the
+  // exclusion before the first write even when callers bypass `rudder plan`.
+  await ensureProjectRuntimeIgnored(repoRoot);
   let result: RudderGraph = emptyGraph(repoRoot);
-  await updateJson<RudderGraph>(graphPath(repoRoot), (current) => {
+  const file = graphPath(repoRoot);
+  const existed = await pathExists(file);
+  await updateJson<RudderGraph>(file, (current) => {
+    // Once a graph exists, a transient/contended read must never be interpreted
+    // as an empty DAG. Throwing leaves the atomic file untouched and lets the
+    // scheduler retry; silently using emptyGraph here can erase the whole fleet.
+    if (existed && !(current && current.version === 1 && current.nodes && current.edges)) {
+      throw new Error(`Refusing to replace an unreadable existing graph: ${file}`);
+    }
     const base: RudderGraph =
       current && current.version === 1 && current.nodes && current.edges
         ? current

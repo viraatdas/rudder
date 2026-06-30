@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import { createSpec, renderContract, verifyRun } from "./brain.js";
@@ -9,6 +10,7 @@ import { mergeGeneratedRudderMd, withRudderMdLock } from "./rudder-md.js";
 import {
   createRunRecord,
   agentContextPath,
+  ensureProjectRuntimeIgnored,
   eventsPath,
   listRuns,
   loadConfig,
@@ -30,6 +32,7 @@ import {
   findRepoRoot,
   mergeGitRunIntoCurrentBranch,
   processAlive,
+  runProcessAlive,
   removeGitWorktree,
   syncGitRunWorktree,
 } from "./git.js";
@@ -102,6 +105,7 @@ export async function startRun(params: {
 
   ensureJj();
   await ensureColocated(repoRoot);
+  await ensureProjectRuntimeIgnored(repoRoot);
 
   const active = await activeRunsForCheckout(repoRoot, repoRoot);
   if (params.queue && active.length > 0) {
@@ -146,9 +150,12 @@ export async function startRun(params: {
     updateModel: params.model !== undefined,
     updateEffort: params.effort !== undefined,
   });
-  const pid = spawnWorker(repoRoot, run.id);
+  const attemptId = newAttemptId();
+  const pid = spawnWorker(repoRoot, run.id, attemptId);
   run.process = {
     pid,
+    controllerPid: pid,
+    attemptId,
     startedAt: nowIso(),
   };
   run.status = "running";
@@ -196,26 +203,33 @@ export async function continueRun(params: {
   if (!run) {
     throw new Error(`Run not found: ${params.runId}`);
   }
-  if (run.mode === "plan") {
-    throw new Error("Plan runs are interactive read-only sessions. Continue the planner in its worker pane.");
+  if (run.mode && run.mode !== "execute") {
+    throw new Error("Only headless execute runs can be continued from the standalone board.");
   }
   if (isActiveStatus(run.status) && run.status !== "steering" && !params.interrupt) {
     throw new Error("That agent is still running. Wait for it to finish before sending another message.");
   }
-  if (params.interrupt && run.process?.pid && processAlive(run.process.pid)) {
-    process.kill(run.process.pid, "SIGTERM");
-    await delay(350);
+  if (params.interrupt) {
+    await interruptWorkerAttempt(repoRoot, run);
   }
   const prompt = params.prompt.trim();
   if (!prompt) {
     throw new Error("Missing prompt.");
   }
   const ts = nowIso();
+  const attemptId = newAttemptId();
   run.status = "running";
   run.currentPrompt = prompt;
   run.lastUserInputAt = ts;
   run.turns = [...(run.turns ?? []), { ts, prompt, source: "user" }];
   run.autoSteer = { count: 0, max: run.autoSteer?.max ?? 2 };
+  const pid = spawnWorker(repoRoot, run.id, attemptId);
+  run.process = {
+    pid,
+    controllerPid: pid,
+    attemptId,
+    startedAt: ts,
+  };
   await saveRunRecord(run);
   await emit(run, {
     ts,
@@ -225,16 +239,83 @@ export async function continueRun(params: {
     data: { prompt },
   });
   await writeAgentContext(repoRoot);
-  const pid = spawnWorker(repoRoot, run.id);
-  run.process = {
-    pid,
-    startedAt: nowIso(),
-  };
-  await saveRunRecord(run);
   if (!params.silent) {
     console.log(`Continued ${run.id}`);
   }
   return run;
+}
+
+async function interruptWorkerAttempt(repoRoot: string, owned: RunRecord): Promise<void> {
+  const known = new Set<number>();
+  const controllerGroups = new Set<number>();
+  const collect = (run: RunRecord | null): void => {
+    if (run?.process?.controllerPid && run.process.controllerPid !== process.pid) {
+      controllerGroups.add(run.process.controllerPid);
+    }
+    for (const pid of [run?.process?.controllerPid, run?.process?.backendPid, run?.process?.pid]) {
+      if (pid && pid !== process.pid) known.add(pid);
+    }
+  };
+  collect(owned);
+
+  const terminate = async (signal: NodeJS.Signals, timeoutMs: number): Promise<boolean> => {
+    const deadline = Date.now() + timeoutMs;
+    const signalled = new Set<number>();
+    const signalledGroups = new Set<number>();
+    const stopped = (): boolean =>
+      [...known].every((pid) => !processAlive(pid)) &&
+      [...controllerGroups].every((pid) => !processGroupAlive(pid));
+    while (Date.now() < deadline) {
+      const latest = await loadRunRecord(repoRoot, owned.id);
+      if (latest && sameAttempt(latest, owned)) collect(latest);
+      for (const pid of controllerGroups) {
+        if (!processGroupAlive(pid) || signalledGroups.has(pid)) continue;
+        signalProcessGroup(pid, signal);
+        signalledGroups.add(pid);
+      }
+      for (const pid of known) {
+        if (!processAlive(pid) || signalled.has(pid)) continue;
+        try {
+          process.kill(pid, signal);
+        } catch {
+          // It exited between processAlive and kill.
+        }
+        signalled.add(pid);
+      }
+      if (stopped()) {
+        // Let a controller that just spawned a backend publish that pid before
+        // declaring the old attempt fully quiesced.
+        await delay(75);
+        const settled = await loadRunRecord(repoRoot, owned.id);
+        if (settled && sameAttempt(settled, owned)) collect(settled);
+        if (stopped()) return true;
+      }
+      await delay(50);
+    }
+    return stopped();
+  };
+
+  if (await terminate("SIGTERM", 2_000)) return;
+  if (await terminate("SIGKILL", 1_000)) return;
+  throw new Error("Could not stop the previous worker cleanly; redirect was not started.");
+}
+
+function processGroupAlive(controllerPid: number): boolean {
+  if (process.platform === "win32") return processAlive(controllerPid);
+  try {
+    process.kill(-controllerPid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function signalProcessGroup(controllerPid: number, signal: NodeJS.Signals): void {
+  try {
+    process.kill(process.platform === "win32" ? controllerPid : -controllerPid, signal);
+  } catch {
+    // The process group exited between the liveness check and signal.
+  }
 }
 
 /**
@@ -243,8 +324,16 @@ export async function continueRun(params: {
  * detached, stdio:"ignore", unref) is defined in exactly one place. Returns the
  * spawned worker pid (or undefined if the platform did not assign one).
  */
-export function spawnWorker(repoRoot: string, runId: string): number | undefined {
-  const worker = spawn(process.execPath, [process.argv[1] ?? "", "__worker", "--repo", repoRoot, "--run", runId], {
+export function spawnWorker(repoRoot: string, runId: string, attemptId?: string): number | undefined {
+  const worker = spawn(process.execPath, [
+    process.argv[1] ?? "",
+    "__worker",
+    "--repo",
+    repoRoot,
+    "--run",
+    runId,
+    ...(attemptId ? ["--attempt", attemptId] : []),
+  ], {
     cwd: repoRoot,
     detached: true,
     stdio: "ignore",
@@ -253,9 +342,60 @@ export function spawnWorker(repoRoot: string, runId: string): number | undefined
   return worker.pid;
 }
 
-export async function workerRun(repoRoot: string, runId: string): Promise<void> {
-  const run = await loadRunRecord(repoRoot, runId);
+export function newAttemptId(): string {
+  return randomUUID();
+}
+
+async function loadOwnedAttempt(
+  repoRoot: string,
+  runId: string,
+  attemptId?: string,
+): Promise<RunRecord | null> {
+  for (let i = 0; i < (attemptId ? 600 : 1); i += 1) {
+    const run = await loadRunRecord(repoRoot, runId);
+    if (!run) return null;
+    if (!attemptId || run.process?.attemptId === attemptId) return run;
+    // startRun/continueRun spawn immediately before their atomic run.json save.
+    // Give the cross-process JSON lock a bounded handoff window instead of
+    // letting the child read the previous attempt and execute the wrong prompt.
+    await delay(25);
+  }
+  return null;
+}
+
+function sameAttempt(left: RunRecord, right: RunRecord): boolean {
+  const leftId = left.process?.attemptId;
+  const rightId = right.process?.attemptId;
+  if (leftId || rightId) return Boolean(leftId && rightId && leftId === rightId);
+  return left.process?.startedAt === right.process?.startedAt;
+}
+
+async function attemptOwnsRun(repoRoot: string, run: RunRecord): Promise<boolean> {
+  const latest = await loadRunRecord(repoRoot, run.id);
+  return Boolean(latest && sameAttempt(latest, run));
+}
+
+function saveOwnedRun(run: RunRecord): Promise<boolean> {
+  const expectedAttemptId = run.process?.attemptId;
+  const expectedStartedAt = run.process?.startedAt;
+  return saveRunRecord(
+    run,
+    expectedAttemptId
+      ? { expectedAttemptId }
+      : expectedStartedAt
+        ? { expectedStartedAt }
+        : undefined,
+  );
+}
+
+export async function workerRun(repoRoot: string, runId: string, attemptId?: string): Promise<void> {
+  const run = await loadOwnedAttempt(repoRoot, runId, attemptId);
   if (!run) {
+    // A superseded worker may start after a redirect has already installed a
+    // newer attempt. Exiting quietly is the ownership contract, not an error.
+    if (attemptId && await loadRunRecord(repoRoot, runId)) {
+      return;
+    }
     throw new Error(`Run not found: ${runId}`);
   }
   try {
@@ -263,13 +403,17 @@ export async function workerRun(repoRoot: string, runId: string): Promise<void> 
     while (true) {
       const pass = await runBackendPass(current);
       current = pass.run;
+      if (!(await attemptOwnsRun(repoRoot, current))) {
+        await writeAgentContext(repoRoot);
+        return;
+      }
       if (pass.exitCode !== 0) {
         if (await newerWorkerOwnsRun(repoRoot, current)) {
           await writeAgentContext(repoRoot);
           return;
         }
         current.status = "failed";
-        await saveRunRecord(current);
+        if (!(await saveOwnedRun(current))) return;
         await emit(current, {
           ts: nowIso(),
           runId,
@@ -281,10 +425,11 @@ export async function workerRun(repoRoot: string, runId: string): Promise<void> 
       }
 
       current.status = "verifying";
-      await saveRunRecord(current);
+      if (!(await saveOwnedRun(current))) return;
       const verification = await verifyRun(current);
+      if (!(await attemptOwnsRun(repoRoot, current))) return;
       current.verification = verification;
-      await saveRunRecord(current);
+      if (!(await saveOwnedRun(current))) return;
       await emit(current, {
         ts: nowIso(),
         runId,
@@ -301,7 +446,7 @@ export async function workerRun(repoRoot: string, runId: string): Promise<void> 
           max: current.autoSteer?.max ?? 2,
           waitingSince,
         };
-        await saveRunRecord(current);
+        if (!(await saveOwnedRun(current))) return;
         await emit(current, {
           ts: waitingSince,
           runId,
@@ -314,10 +459,13 @@ export async function workerRun(repoRoot: string, runId: string): Promise<void> 
         if (!latest) {
           return;
         }
+        if (!sameAttempt(latest, current)) {
+          return;
+        }
         if (latest.lastUserInputAt && latest.lastUserInputAt > waitingSince) {
           if (latest.status !== "running") {
             latest.status = "completed";
-            await saveRunRecord(latest);
+            if (!(await saveOwnedRun(latest))) return;
             await emit(latest, {
               ts: nowIso(),
               runId,
@@ -336,7 +484,7 @@ export async function workerRun(repoRoot: string, runId: string): Promise<void> 
           max: latest.autoSteer?.max ?? 2,
         };
         latest.status = "running";
-        await saveRunRecord(latest);
+        if (!(await saveOwnedRun(latest))) return;
         await emit(latest, {
           ts: nowIso(),
           runId,
@@ -349,7 +497,7 @@ export async function workerRun(repoRoot: string, runId: string): Promise<void> 
       }
 
       current.status = verification.shouldContinue ? "failed" : "completed";
-      await saveRunRecord(current);
+      if (!(await saveOwnedRun(current))) return;
       await emit(current, {
         ts: nowIso(),
         runId,
@@ -375,7 +523,7 @@ export async function workerRun(repoRoot: string, runId: string): Promise<void> 
       exitCode: 1,
       signal: null,
     };
-    await saveRunRecord(run);
+    if (!(await saveOwnedRun(run))) return;
     await emit(run, {
       ts: nowIso(),
       runId,
@@ -388,6 +536,9 @@ export async function workerRun(repoRoot: string, runId: string): Promise<void> 
 
 async function newerWorkerOwnsRun(repoRoot: string, staleRun: RunRecord): Promise<boolean> {
   const latest = await loadRunRecord(repoRoot, staleRun.id);
+  if (latest?.process?.attemptId && staleRun.process?.attemptId) {
+    return latest.process.attemptId !== staleRun.process.attemptId;
+  }
   return Boolean(
     latest &&
       isActiveStatus(latest.status) &&
@@ -398,8 +549,8 @@ async function newerWorkerOwnsRun(repoRoot: string, staleRun: RunRecord): Promis
 }
 
 async function runBackendPass(run: RunRecord): Promise<{ run: RunRecord; exitCode: number }> {
-  if (run.mode === "plan") {
-    throw new Error("Plan runs do not use the background worker.");
+  if (run.mode && run.mode !== "execute") {
+    throw new Error("Only execute runs use the background worker.");
   }
   const spec = await createSpec(run);
   await emit(run, {
@@ -430,7 +581,7 @@ async function runBackendPass(run: RunRecord): Promise<{ run: RunRecord; exitCod
     exitCode,
     signal: null,
   };
-  await saveRunRecord(run);
+  await saveOwnedRun(run);
   return { run, exitCode };
 }
 
@@ -737,7 +888,7 @@ export async function statusRuns(options?: { json?: boolean }): Promise<void> {
     return;
   }
   for (const run of active) {
-    const alive = processAlive(run.process?.pid) ? "alive" : "stale";
+    const alive = runProcessAlive(run) ? "alive" : "stale";
     console.log(`${run.id}  ${run.status}  ${alive}  ${run.backend}  ${run.task}`);
   }
 }
@@ -830,12 +981,12 @@ export async function stopRun(runId: string, options?: { silent?: boolean }): Pr
   if (!run) {
     throw new Error(`Run not found: ${runId}`);
   }
-  if (run.process?.pid && processAlive(run.process.pid)) {
-    process.kill(run.process.pid, "SIGTERM");
-  }
+  await interruptWorkerAttempt(repoRoot, run);
   run.status = "cancelled";
   run.process = {
     ...(run.process ?? {}),
+    // Invalidate every callback still carrying the old ownership token.
+    attemptId: newAttemptId(),
     endedAt: nowIso(),
     signal: "SIGTERM",
   };
@@ -955,9 +1106,7 @@ export async function deleteRun(runId: string, options?: { mergeFirst?: boolean;
     const message = mergeError instanceof Error ? mergeError.message : String(mergeError);
     throw new Error(`Merge failed for ${runId}; run was not deleted. ${message}`);
   }
-  if (latest.process?.pid && processAlive(latest.process.pid)) {
-    process.kill(latest.process.pid, "SIGTERM");
-  }
+  await interruptWorkerAttempt(repoRoot, latest);
   if (latest.worktree.enabled) {
     await removeRunWorkspace(latest, options?.force ?? true).catch(() => undefined);
   }

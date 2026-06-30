@@ -5,6 +5,8 @@ declare global {
   interface Window {
     __RUDDER_SLUG__?: string;
     __RUDDER_TOKEN__?: string;
+    __RUDDER_CONTROL_MODE__?: "projector" | "scheduler";
+    __RUDDER_CAN_MUTATE__?: boolean;
   }
 }
 

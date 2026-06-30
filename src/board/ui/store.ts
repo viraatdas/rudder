@@ -28,6 +28,8 @@ export type Action =
   | { type: "SNAPSHOT"; snapshot: BoardSnapshot }
   | { type: "NODE_UPSERT"; node: BoardNode }
   | { type: "NODE_REMOVE"; id: string }
+  | { type: "EDGE_UPSERT"; edge: BoardEdge }
+  | { type: "EDGE_REMOVE"; from: string; to: string }
   | { type: "MEMORY"; memory: MemoryEntry[] }
   | { type: "ACTIVITY"; activity: ActivityEntry[] };
 
@@ -60,6 +62,18 @@ export function reducer(state: BoardState, action: Action): BoardState {
       nodes.delete(action.id);
       return { ...state, nodes };
     }
+    case "EDGE_UPSERT": {
+      const edges = state.edges.filter(
+        (edge) => !(edge.from === action.edge.from && edge.to === action.edge.to && edge.kind === action.edge.kind),
+      );
+      edges.push(action.edge);
+      return { ...state, edges };
+    }
+    case "EDGE_REMOVE":
+      return {
+        ...state,
+        edges: state.edges.filter((edge) => !(edge.from === action.from && edge.to === action.to)),
+      };
     case "MEMORY":
       return { ...state, memory: action.memory };
     case "ACTIVITY":
@@ -148,6 +162,25 @@ export function useBoardState(slug: string): UseBoard {
         const data = JSON.parse((e as MessageEvent).data);
         const id = typeof data === "string" ? data : data.id;
         if (id) dispatch({ type: "NODE_REMOVE", id });
+      } catch {
+        /* ignore */
+      }
+    });
+
+    es.addEventListener("edge.added", (e) => {
+      if (cancelled) return;
+      try {
+        dispatch({ type: "EDGE_UPSERT", edge: JSON.parse((e as MessageEvent).data) });
+      } catch {
+        /* ignore */
+      }
+    });
+
+    es.addEventListener("edge.removed", (e) => {
+      if (cancelled) return;
+      try {
+        const data = JSON.parse((e as MessageEvent).data);
+        if (data?.from && data?.to) dispatch({ type: "EDGE_REMOVE", from: data.from, to: data.to });
       } catch {
         /* ignore */
       }

@@ -9,6 +9,7 @@ import {
   createNodeWorkspace,
   createRunJjWorkspace,
   currentJjChangeId,
+  currentJjCommitId,
   currentOpId,
   forgetWorkspace,
   isJjRepo,
@@ -85,6 +86,14 @@ test("currentJjChangeId reads the @ change id", async (t) => {
   process.env.JJ_TARGET_CHANGE = "targetchange";
 
   assert.equal(await currentJjChangeId(env.repo), "targetchange");
+});
+
+test("currentJjCommitId reads the unambiguous @ revision", async (t) => {
+  const env = await setupFakeJj(t);
+  process.env.JJ_TARGET_CHANGE = "commit123";
+
+  assert.equal(await currentJjCommitId(env.repo), "commit123");
+  assert.match(await readLog(env.log), /log --no-graph -r @ -T commit_id/);
 });
 
 test("isJjRepo detects the fake jj repo", async (t) => {

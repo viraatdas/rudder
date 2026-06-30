@@ -61,6 +61,7 @@ type Parsed = {
     cwd?: string;
     repo?: string;
     run?: string;
+    attempt?: string;
     task?: string;
     node?: string;
     base?: string;
@@ -144,7 +145,7 @@ export async function main(): Promise<void> {
       if (!repo || !run) {
         throw new Error("__worker requires --repo and --run");
       }
-      await workerRun(repo, run);
+      await workerRun(repo, run, parsed.flags.attempt);
       return;
     }
     case "__launch-node": {
@@ -472,6 +473,10 @@ function parseArgs(argv: string[]): Parsed {
       parsed.flags.run = readValue(argv, ++i, arg);
       continue;
     }
+    if (takesValue(arg, "--attempt")) {
+      parsed.flags.attempt = readValue(argv, ++i, arg);
+      continue;
+    }
     if (takesValue(arg, "--task")) {
       parsed.flags.task = readValue(argv, ++i, arg);
       continue;
@@ -510,6 +515,10 @@ function parseArgs(argv: string[]): Parsed {
     }
     if (arg.startsWith("--run=")) {
       parsed.flags.run = arg.slice("--run=".length);
+      continue;
+    }
+    if (arg.startsWith("--attempt=")) {
+      parsed.flags.attempt = arg.slice("--attempt=".length);
       continue;
     }
     if (arg.startsWith("--task=")) {
@@ -620,9 +629,9 @@ async function runNativeDashboard(): Promise<boolean> {
   // The daemon here must NOT run the launching scheduler, or both would launch
   // the same graph.json node (double-launch). So we pass scheduler:false: the
   // board still serves HTTP + SSE + fs.watch and reflects the mirrored graph,
-  // but never launches. (Limitation: in projector-only mode a board-composer POST
-  // only writes a planned node to graph.json; the TUI will not auto-pick it up
-  // for scheduling. That is acceptable for now.)
+  // but never launches. Browser task/steer requests use the native control inbox
+  // in this mode, so the TUI handles them through the same path as task-pane input
+  // instead of writing graph state it cannot read back.
   // ensureBoardRunning returns promptly; the listeners keep running on the Node
   // event loop while the native TUI is in the foreground. Strictly non-fatal: if
   // it throws, log a notice and keep launching the TUI - the daemon must never

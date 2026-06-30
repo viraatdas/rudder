@@ -108,6 +108,19 @@ to `~/.rudder/config.json`.
 Mouse wheel and trackpad scroll the pane under the pointer. Over the worker or
 review pane they scroll Rudder's captured scrollback.
 
+### Web board
+
+Press `o` in the agents pane (or type `/web`) to open the live project board in
+your browser. The board is a second control surface, not just a monitor: open a
+task to send an update while it runs, or request changes from Review to resume
+the same agent in the same workspace. The task's update thread records your
+directions alongside the latest worker activity. `+ Task` follows the same
+orchestrator path as typing in the dashboard task pane.
+
+The board also works on its own with `rudder board`: in that mode updates
+redirect or resume the detached worker directly and move revised work back
+through Review before it can merge.
+
 ## Keyboard shortcuts
 
 **Direct (work from any pane):**
@@ -147,7 +160,8 @@ scroll the pane.
 
 **In the agents pane:** `j` / `k` or arrows move the selection, `Enter` focuses
 the worker, `m` / `M` / `R` / `r` / `d` act on the selection, `x` stops a running
-agent (keeping its worktree), and `g` toggles the nested DAG view.
+agent (keeping its worktree), `g` toggles the nested DAG view, and `o` opens the
+web board.
 
 ## Commands and Orchestrator Skills
 
