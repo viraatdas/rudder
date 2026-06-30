@@ -6342,11 +6342,17 @@ fn wired_worker_waits_for_the_signal_and_ignores_idle_chrome() {
     // disk), a mid-turn idle screen — claude's "shift+tab to cycle" footer, which
     // the scrape treats as done — must NOT flip the worker to review past
     // READY_GRACE. Only the Stop-hook/notify signal (or process exit) may.
+    let _env = env_guard();
+    let home = unique_test_repo("sig-wait-home");
+    let prior_home = std::env::var_os("RUDDER_HOME");
+    std::env::set_var("RUDDER_HOME", &home);
+
     let run_id = "sig-wait-itest";
     let wiring = crate::signals::prepare_worker_signals(run_id, Backend::Claude);
-    let Some(settings) = wiring.claude_settings.clone() else {
-        return; // no HOME in this env
-    };
+    let settings = wiring
+        .claude_settings
+        .clone()
+        .expect("RUDDER_HOME-backed signal settings are writable");
     assert!(
         crate::signals::worker_has_config(run_id, Backend::Claude),
         "config wired"
@@ -6398,6 +6404,11 @@ fn wired_worker_waits_for_the_signal_and_ignores_idle_chrome() {
 
     let _ = std::fs::remove_file(&sig);
     let _ = std::fs::remove_file(&settings);
+    match prior_home {
+        Some(value) => std::env::set_var("RUDDER_HOME", value),
+        None => std::env::remove_var("RUDDER_HOME"),
+    }
+    let _ = std::fs::remove_dir_all(&home);
 }
 
 #[cfg(not(windows))]
