@@ -641,9 +641,7 @@ and exits 0, see `getBackend`/`fakeBackend`), and `RUDDER_AUTO_STEER_DELAY_MS` (
 post-pass steering wait). No auth or real model needed. Note: the `cloud/` subproject has its
 own build. `cloud-cli-protocol`, `cloud-cli-e2e`, `cloud-control-plane`, `cloud-relay`, and
 `slack` need `npm --prefix cloud run build` first; the worker suite is
-`npm --prefix cloud/worker test`. `.github/workflows/cloud-ci.yml` runs these, the native
-cloud tests, dependency audits, clean-context Docker builds, and a Linux node-pty privilege
-smoke test for every cloud-related PR.
+`npm --prefix cloud/worker test`.
 
 Always, before shipping a source change:
 1. `npm run check` (or `npm run build`),
