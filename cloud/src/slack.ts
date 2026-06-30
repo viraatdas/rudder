@@ -50,8 +50,11 @@ export function verifySlackSignature(params: {
   if (!signingSecret || !timestamp || !signature) {
     return false;
   }
+  if (!/^\d{1,16}$/.test(timestamp)) {
+    return false;
+  }
   const ts = Number(timestamp);
-  if (!Number.isFinite(ts)) {
+  if (!Number.isSafeInteger(ts)) {
     return false;
   }
   // Reject anything older than 5 minutes to blunt replay attacks.
@@ -95,6 +98,9 @@ export function formatOutputForSlack(raw: string, maxChars = 2600): string {
     .map((line) => line.replace(/\s+$/g, ""))
     .join("\n")
     .replace(/\n{3,}/g, "\n\n")
+    // Terminal output is untrusted. Prevent it from closing our code fence and
+    // turning subsequent text into active Slack markup or mentions.
+    .replace(/```/g, "``\u200b`")
     .trim();
   if (!cleaned) {
     return "_(no output yet)_";
@@ -126,6 +132,7 @@ export async function postSlackMessage(params: {
         unfurl_links: false,
         unfurl_media: false,
       }),
+      signal: AbortSignal.timeout(10_000),
     });
     const data = (await res.json()) as { ok?: boolean; ts?: string; error?: string };
     if (!data.ok) {
@@ -135,6 +142,13 @@ export async function postSlackMessage(params: {
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error.message : String(error) };
   }
+}
+
+export function escapeSlackText(text: string): string {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
 }
 
 export type SlackCommand =

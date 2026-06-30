@@ -496,14 +496,14 @@ Both use the same worker image and snapshot format; they differ in lifecycle + s
 
 ### 9.2 CLI (`src/cloud.ts`)
 Subcommands: `login`, `launch`, `sail`, `byoc`, `vm`/`byo-vm`, `list`/`ls`, `status`,
-`logs`, `attach`, `workspace`, `onload`, `bootstrap`, `pause`, `resume`, `stop`,
+`logs`, `attach`, `workspace`, `onload`, `bootstrap`, `pause`, `resume`, `stop`, `delete`,
 `setup-github`, `setup-google`, `setup-byoc`, `setup-vm`, `setup-fly`, `setup`,
 `runtime`.
 - `login` runs a browser/device-style flow (polls `/api/cli/login/poll`) and stores
   `CloudAuthState` in `~/.rudder/cloud.json` (`cloudAuthPath()`, mode `0o600`): `token`,
   `cloudUrl`, `defaultRuntime`, `byocSshHost`, `accountId`, `email`, `expiresAt`.
 - `onload` snapshots the current Rudder workspace (repo + selected HOME auth/config) and
-  uploads it via an S3 presigned URL so a worker can continue the task.
+  sends it to the control plane, which stores it in S3 so a worker can continue the task.
 - Error messages prefer the parsed server error, then the body, then `<status>
   <statusText>` (so empty gateway responses still report a code).
 
@@ -538,12 +538,12 @@ rudder-cloud/rudder-cloud.sqlite` locally, or restored from S3 at
 `rudder_workspaces` (unique on `account_id + workspace_key`), `rudder_settings` (OAuth
 client ids/secrets), plus the Better Auth tables. **Stateless control plane:** when
 `RUDDER_CLOUD_PERSIST_STATE=1` and `RUDDER_S3_BUCKET` is set, SQLite is restored from S3
-on boot and persisted after each request (debounced), so the Fly app can restart without
+on boot and persisted after state-changing operations (debounced), so the Fly app can restart without
 losing sails/workspaces. Deploy config: `cloud/fly.toml` + `cloud/Dockerfile`.
 
 ### 9.6 Runtimes: Fly Machines + BYOC
 - **Fly Machines (managed):** `createFlyMachine` POSTs `/v1/apps/{app}/machines` with
-  `RUDDER_WORKER_IMAGE` (`auto_destroy:false`). Idle pause via `shouldPauseStaleSail`;
+  `RUDDER_WORKER_IMAGE` (`auto_destroy:true` for task sails, `false` for workspaces). Idle pause via `shouldPauseStaleSail`;
   workspace idle-stop via `sweepIdleWorkspaces`; true cleanup via the admin GC.
 - **BYOC (bring your own compute):** `byoVmBootstrapCommand` emits a `docker run` script
   (with `arm64` detection) that `startByoVmWorkerOverSsh` runs over SSH (under `nohup`
@@ -553,29 +553,29 @@ losing sails/workspaces. Deploy config: `cloud/fly.toml` + `cloud/Dockerfile`.
 ### 9.7 WebSocket streaming
 Each sail/workspace has a `Channel`: one worker WS + N client WS + a ~256KB ring buffer
 replayed on attach. The worker pipes PTY bytes as binary frames; the control plane
-broadcasts them to clients (permessage-deflate for frames over ~1KB). A channel is
-disposed when the worker and all clients disconnect. (This is a WebSocket bridge, not an
+broadcasts them to clients (permessage-deflate for frames over ~1KB). Disconnected
+channels retain their bounded replay buffer for one hour (and at most 500 channels), so
+completed output remains available. (This is a WebSocket bridge, not an
 SSH tunnel: no key distribution, simpler firewall traversal, but Fly must not strip the
 `Upgrade` header.)
 
 ### 9.8 Worker image (`cloud/worker/`)
-`Dockerfile` (base `node:22-slim`, runs as non-root `rudder`) + `entrypoint.sh` +
-`supervisor.mjs`. The supervisor installs the agent CLIs (claude-code, codex, acpx,
-hunkdiff), fetches + restores the snapshot from `RUDDER_SNAPSHOT_URL`, handles migrated
-agents (`migration.json`), spawns `rudder` (workspace) or `rudder codex --worktree
-<task>` (sail) under a `node-pty` 120x32, bridges I/O to the control-plane WS, and
-reports a final heartbeat on exit. On restart it checks `.rudder-staged.json` and
-re-fetches a fresh signed URL from the snapshot-url endpoint.
+`Dockerfile` (base `node:22-slim`) + `entrypoint.sh` + `supervisor.mjs`. Agent CLIs are
+pinned and installed at image-build time. The root supervisor fetches + restores the
+snapshot, handles migrated agents (`migration.json`), then spawns `rudder` under a
+`node-pty` 120x32 as uid/gid 1500; this keeps supervisor credentials outside the coding
+agent's uid. It buffers pre-connect output, applies bounded backpressure and reconnect
+backoff, bridges I/O to the control-plane WS, and awaits the final heartbeat on exit. On
+restart it validates a root-owned staged marker and refreshes the signed snapshot URL.
 
 ### 9.9 Known limitations (current state, not action items)
-Documented so they are not rediscovered: workspace re-use ignores a newer snapshot with
-the same fingerprint; migrated-agent fresh-prompt fallback is silent on a corrupt
-`run.json`; deleting a workspace SQLite row can orphan its Fly volume; worker tokens
-(`rdrw_*`) and Rudder CLI tokens never expire/rotate; an expired presigned URL can hang
-silently if the snapshot-url endpoint is unreachable; BYOC has no crash timeout (can sit
-"running"); OAuth reconfig has no rollback; attach-during-restart replays the pre-pause
-buffer; `includeRudderState` copies all `run.json` with no pruning. The cloud path is
-functional but less battle-tested than the local dashboard; treat it as beta.
+Documented so they are not rediscovered: snapshot uploads are still JSON-base64 (about
+33% wire expansion and full-memory copies) rather than direct presigned PUTs;
+migrated-agent fresh-prompt fallback is silent on a corrupt `run.json`; Rudder CLI tokens
+do not expire and worker tokens rotate only on reprovision/bootstrap; BYOC has no crash
+timeout (it can sit `running` after a host failure); OAuth reconfiguration has no
+rollback; attach-during-restart can replay the retained pre-pause buffer; and
+`includeRudderState` copies all `run.json` with no pruning. The cloud path remains beta.
 
 ---
 
@@ -639,7 +639,9 @@ It is deterministic via TEST-ONLY env hooks baked into the production code:
 `RUDDER_FAKE_BACKEND=1` (each worker applies `[[FAKE_FILE:..]]` edits from the node prompt
 and exits 0, see `getBackend`/`fakeBackend`), and `RUDDER_AUTO_STEER_DELAY_MS` (shrinks the
 post-pass steering wait). No auth or real model needed. Note: the `cloud/` subproject has its
-own build — `cloud-relay`/`slack` tests need `npm --prefix cloud run build` first.
+own build. `cloud-cli-protocol`, `cloud-cli-e2e`, `cloud-control-plane`, `cloud-relay`, and
+`slack` need `npm --prefix cloud run build` first; the worker suite is
+`npm --prefix cloud/worker test`.
 
 Always, before shipping a source change:
 1. `npm run check` (or `npm run build`),

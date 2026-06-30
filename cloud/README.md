@@ -16,6 +16,7 @@ rudder cloud list                             # see every instance on your accou
 rudder cloud talk <id> "what are you doing?"  # message any instance, see its reply
 rudder cloud output <id>                      # latest output from an instance
 rudder cloud attach <id>                      # full interactive terminal
+rudder cloud delete <id>                      # destroy its machine/volume and snapshot
 ```
 
 `rudder cloud quickstart` prints this list at any time.
@@ -59,13 +60,17 @@ rudder cloud slack manifest          # prints a JSON manifest to paste at api.sl
 flyctl secrets set \
   SLACK_BOT_TOKEN=xoxb-... \
   SLACK_SIGNING_SECRET=... \
+  RUDDER_SLACK_ALLOWED_USERS=U0123ABC,U0456DEF \
+  RUDDER_SLACK_ACCOUNT_IDS=github:123456 \
   RUDDER_SLACK_CHANNEL=C0B78TDLM5G \
   -a rudder-cloud-control
 ```
 
 The events request URL is `https://<control-plane>/api/slack/events`. Inbound
 requests are verified with `SLACK_SIGNING_SECRET` (v0 signature, 5-minute replay
-window) and deduped by Slack `event_id`.
+window) and deduped by Slack `event_id`. Both the Slack user and the Rudder
+account must be explicitly allow-listed; when either allow-list is empty,
+control commands and cross-tenant launch announcements fail closed.
 
 ## Environment
 
@@ -82,18 +87,23 @@ RUDDER_CLOUD_STATE_KEY=control-plane/rudder-cloud.sqlite
 RUDDER_CLOUD_PERSIST_STATE=1
 AWS_REGION=us-east-1
 FLY_API_TOKEN=<fly token>
-FLY_APP_NAME=<existing fly machines app>
-FLY_REGION=iad
+RUDDER_FLY_APP_NAME=<existing worker machines app>
+RUDDER_FLY_REGION=iad
 RUDDER_WORKER_IMAGE=<registry image for cloud/worker/Dockerfile>
+RUDDER_WORKER_CPUS=2
+RUDDER_WORKER_MEMORY_MB=2048
+RUDDER_EXTERNAL_REQUEST_TIMEOUT_MS=15000
 SLACK_BOT_TOKEN=<xoxb- bot token, enables the Slack control surface>
 SLACK_SIGNING_SECRET=<verifies inbound Slack events>
 RUDDER_SLACK_CHANNEL=C0B78TDLM5G
+RUDDER_SLACK_ALLOWED_USERS=<comma-separated Slack user ids>
+RUDDER_SLACK_ACCOUNT_IDS=<comma-separated Rudder account ids>
 ```
 
 `SLACK_*` are optional; when `SLACK_BOT_TOKEN` is unset the Slack surface is
 simply disabled. See "Slack — the shared main panel" below.
 
-`FLY_API_TOKEN` and `FLY_APP_NAME` are only required for the managed Fly
+`FLY_API_TOKEN` and `RUDDER_FLY_APP_NAME` are only required for the managed Fly
 Machines runtime. BYOC runs still require `RUDDER_S3_BUCKET` and
 `RUDDER_WORKER_IMAGE` so the control plane can store a snapshot and print a
 worker command for the user's server.
@@ -109,8 +119,8 @@ Current Exla defaults:
 ```bash
 RUDDER_S3_BUCKET=rudder-cloud-snapshots-597088032164-us-east-1
 AWS_REGION=us-east-1
-FLY_APP_NAME=rudder-workers-exla
-FLY_REGION=iad
+RUDDER_FLY_APP_NAME=rudder-workers-exla
+RUDDER_FLY_REGION=iad
 RUDDER_WORKER_IMAGE=public.ecr.aws/exla/rudder-worker:latest
 ```
 
@@ -125,9 +135,9 @@ Generated AWS secrets:
 - `rudder/better-auth-secret`
 - `rudder/fly-api-token`
 
-Google/GitHub OAuth client IDs and client secrets still need to be created in
-the provider consoles and added as Fly secrets before the hosted login flow
-can go live.
+Google/GitHub OAuth require both a client ID and a client secret. The checked-in
+Fly configuration carries the hosted client IDs; the corresponding secrets
+remain Fly secrets. `/health` reports which providers are fully configured.
 
 Until provider OAuth clients are installed, login still works through an
 already-authenticated GitHub CLI or GitHub's device flow. `rudder login` sends
@@ -239,7 +249,7 @@ flyctl deploy --remote-only
 ## Fly Machines
 
 Rudder Cloud creates one Fly Machine per sail through the Fly Machines API.
-`FLY_APP_NAME` must point at an existing Fly app, and `RUDDER_WORKER_IMAGE`
+`RUDDER_FLY_APP_NAME` must point at an existing Fly app, and `RUDDER_WORKER_IMAGE`
 should be an image built from `worker/Dockerfile`.
 
 ```bash
@@ -254,9 +264,11 @@ docker buildx build --platform linux/arm64 \
   --push .
 ```
 
-The worker image installs Rudder, acpx, and Hunk at startup, downloads the
-snapshot from S3, restores selected HOME config, and starts `rudder run
---worktree "$RUDDER_TASK"` inside the unpacked repo.
+The worker image builds Rudder and installs pinned Claude Code, Codex, acpx, and
+jj versions at image-build time. At runtime its root supervisor downloads the
+snapshot, restores selected HOME config, then launches `rudder <backend>
+--worktree -- "$RUDDER_TASK"` as the unprivileged `rudder` user. The privilege
+boundary keeps the worker bearer token out of the coding agent's process.
 
 ## Bring Your Own VM
 

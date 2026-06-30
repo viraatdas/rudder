@@ -7,12 +7,13 @@ import { Readable } from "node:stream";
 import { betterAuth } from "better-auth";
 import Database from "better-sqlite3";
 import { toNodeHandler } from "better-auth/node";
-import { GetObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
+import { DeleteObjectCommand, GetObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import type { Duplex } from "node:stream";
-import { WebSocket, WebSocketServer } from "ws";
+import { WebSocket, WebSocketServer, type RawData } from "ws";
 import {
   formatOutputForSlack,
+  escapeSlackText,
   parseSlackCommand,
   postSlackMessage,
   slackConfigFromEnv,
@@ -55,6 +56,7 @@ type Sail = {
   machineId?: string;
   machineState?: string;
   snapshotKey?: string;
+  lastActivityAt?: string;
   lastHeartbeatAt?: string;
   slackThreadTs?: string;
   createdAt: string;
@@ -90,25 +92,28 @@ type FlyMachine = {
   config?: JsonRecord;
 };
 
-const port = Number(process.env.PORT || 3000);
-const baseURL = requiredEnv("BETTER_AUTH_URL", `http://localhost:${port}`);
-const authBaseURL = `${baseURL.replace(/\/$/, "")}/api/auth`;
+const port = positiveIntegerEnv("PORT", 3000, 1, 65_535);
+const baseURL = requiredEnv("BETTER_AUTH_URL", `http://localhost:${port}`).replace(/\/+$/, "");
+const authBaseURL = `${baseURL}/api/auth`;
 const dataDir = process.env.RUDDER_CLOUD_DATA_DIR || path.join(os.homedir(), ".rudder-cloud");
 const dbPath = process.env.RUDDER_CLOUD_DB || path.join(dataDir, "rudder-cloud.sqlite");
 const awsRegion = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || "us-east-1";
 const snapshotBucket = process.env.RUDDER_S3_BUCKET || "";
 const flyApiToken = process.env.FLY_API_TOKEN || "";
 const flyApiBase = (process.env.FLY_API_HOSTNAME || "https://api.machines.dev").replace(/\/$/, "");
-const flyAppName = (process.env.RUDDER_FLY_APP_NAME || process.env.FLY_APP_NAME || "").trim();
+// Fly injects FLY_APP_NAME with the control plane's own app name. Falling back
+// to it can accidentally provision user workers inside the control-plane app.
+const flyAppName = (process.env.RUDDER_FLY_APP_NAME || "").trim();
 const flyRegion = (process.env.RUDDER_FLY_REGION || process.env.FLY_REGION || "iad").trim();
 const flyWorkerImage = process.env.RUDDER_WORKER_IMAGE || "ghcr.io/viraatdas/rudder-worker:latest";
-const flyWorkerMemoryMb = Number(process.env.RUDDER_WORKER_MEMORY_MB || 1024);
-const flyWorkerCpus = Number(process.env.RUDDER_WORKER_CPUS || 1);
+const flyWorkerMemoryMb = positiveIntegerEnv("RUDDER_WORKER_MEMORY_MB", 1024, 256, 65_536);
+const flyWorkerCpus = positiveIntegerEnv("RUDDER_WORKER_CPUS", 1, 1, 64);
 const flyWorkerCpuKind = process.env.RUDDER_WORKER_CPU_KIND || "shared";
-const flyWorkspaceVolumeGb = Number(process.env.RUDDER_WORKSPACE_VOLUME_GB || 3);
-const idlePauseMs = Number(process.env.RUDDER_IDLE_PAUSE_MS || 120 * 60 * 1000);
+const flyWorkspaceVolumeGb = positiveIntegerEnv("RUDDER_WORKSPACE_VOLUME_GB", 3, 1, 500);
+const idlePauseMs = nonNegativeIntegerEnv("RUDDER_IDLE_PAUSE_MS", 120 * 60 * 1000, 30 * 24 * 60 * 60 * 1000);
 const stateKey = process.env.RUDDER_CLOUD_STATE_KEY || "control-plane/rudder-cloud.sqlite";
 const persistStateToS3 = process.env.RUDDER_CLOUD_PERSIST_STATE !== "0";
+const MAX_STATE_DB_BYTES = 512 * 1024 * 1024;
 const githubDeviceClientId = process.env.RUDDER_GITHUB_DEVICE_CLIENT_ID || "178c6fc778ccc68e1d6a";
 const publicLoginUrl = (process.env.RUDDER_PUBLIC_LOGIN_URL || "").trim();
 const adminEmails = new Set((process.env.RUDDER_ADMIN_EMAILS || "viraat.laldas@gmail.com,viraat@exla.ai")
@@ -123,6 +128,13 @@ const slackAllowedUsers = new Set((process.env.RUDDER_SLACK_ALLOWED_USERS || "")
   .split(",")
   .map((id) => id.trim())
   .filter(Boolean));
+// Explicitly opt accounts into the shared Slack surface. Without this tenant
+// boundary, launching from any Rudder account would disclose its repo/task in
+// one global channel and let allowlisted Slack operators control it.
+const slackAccountIds = new Set((process.env.RUDDER_SLACK_ACCOUNT_IDS || "")
+  .split(",")
+  .map((id) => id.trim())
+  .filter(Boolean));
 const deviceLogins = new Map<string, DeviceLogin>();
 const githubBrowserLogins = new Map<string, GithubBrowserLogin>();
 const s3 = new S3Client({ region: awsRegion });
@@ -130,12 +142,19 @@ const slack = slackConfigFromEnv();
 // Slack message events are delivered at-least-once; dedupe by event_id so a
 // retry doesn't double-inject into an instance.
 const seenSlackEvents = new Set<string>();
+const MAX_DEVICE_LOGINS = 10_000;
+const EXTERNAL_REQUEST_TIMEOUT_MS = positiveIntegerEnv("RUDDER_EXTERNAL_REQUEST_TIMEOUT_MS", 15_000, 1_000, 120_000);
+const maxActiveSailsPerAccount = positiveIntegerEnv("RUDDER_MAX_ACTIVE_SAILS_PER_ACCOUNT", 20, 1, 1_000);
+const maxWorkspacesPerAccount = positiveIntegerEnv("RUDDER_MAX_WORKSPACES_PER_ACCOUNT", 10, 1, 1_000);
 
 await fs.mkdir(dataDir, { recursive: true });
 await restoreDatabaseFromS3();
 
 const database = new Database(dbPath);
 database.pragma("journal_mode = WAL");
+database.pragma("busy_timeout = 5000");
+database.pragma("foreign_keys = ON");
+await fs.chmod(dbPath, 0o600).catch(() => undefined);
 database.exec(`
   create table if not exists user (
     id text primary key not null,
@@ -202,6 +221,7 @@ database.exec(`
     snapshot_key text,
     manifest_json text,
     worker_token_hash text,
+    last_activity_at text,
     last_heartbeat_at text,
     created_at text not null,
     updated_at text not null
@@ -233,23 +253,28 @@ ensureColumn("rudder_sails", "worker_token_hash", "text");
 ensureColumn("rudder_sails", "last_heartbeat_at", "text");
 ensureColumn("rudder_sails", "runtime", "text");
 ensureColumn("rudder_sails", "slack_thread_ts", "text");
+ensureColumn("rudder_sails", "last_activity_at", "text");
 ensureColumn("rudder_workspaces", "region", "text");
 ensureColumn("rudder_workspaces", "snapshot_fingerprint", "text");
 ensureColumn("rudder_workspaces", "volume_id", "text");
 
 const insertToken = database.prepare(`
-  insert or replace into rudder_tokens (token_hash, account_id, email, created_at, last_used_at)
+  insert into rudder_tokens (token_hash, account_id, email, created_at, last_used_at)
   values (@tokenHash, @accountId, @email, @createdAt, @lastUsedAt)
 `);
 const findToken = database.prepare("select * from rudder_tokens where token_hash = ?");
-const touchToken = database.prepare("update rudder_tokens set last_used_at = ? where token_hash = ?");
+const touchToken = database.prepare(`
+  update rudder_tokens
+  set last_used_at = ?
+  where token_hash = ? and (last_used_at is null or last_used_at < ?)
+`);
 const insertSail = database.prepare(`
   insert into rudder_sails (
     id, account_id, status, runtime, repo_name, task, branch, machine_id, machine_state,
-    snapshot_key, manifest_json, worker_token_hash, last_heartbeat_at, created_at, updated_at
+    snapshot_key, manifest_json, worker_token_hash, last_activity_at, last_heartbeat_at, created_at, updated_at
   ) values (
     @id, @accountId, @status, @runtime, @repoName, @task, @branch, @machineId, @machineState,
-    @snapshotKey, @manifestJson, @workerTokenHash, @lastHeartbeatAt, @createdAt, @updatedAt
+    @snapshotKey, @manifestJson, @workerTokenHash, @lastActivityAt, @lastHeartbeatAt, @createdAt, @updatedAt
   )
 `);
 const updateSail = database.prepare(`
@@ -265,12 +290,21 @@ const findSailById = database.prepare("select * from rudder_sails where id = ?")
 const listSailsForAccount = database.prepare(
   "select * from rudder_sails where account_id = ? order by updated_at desc limit 100",
 );
+const countActiveSailsForAccount = database.prepare(
+  "select count(*) as count from rudder_sails where account_id = ? and status in ('queued','running','paused')",
+);
 const updateHeartbeat = database.prepare(`
   update rudder_sails
   set status = @status,
       machine_id = coalesce(@machineId, machine_id),
       machine_state = @machineState,
       last_heartbeat_at = @lastHeartbeatAt,
+      updated_at = @updatedAt
+  where id = @id
+`);
+const updateSailActivity = database.prepare(`
+  update rudder_sails
+  set last_activity_at = @lastActivityAt,
       updated_at = @updatedAt
   where id = @id
 `);
@@ -315,6 +349,9 @@ const findWorkspaceForAccount = database.prepare(
 const listWorkspacesForAccount = database.prepare(
   "select * from rudder_workspaces where account_id = ? order by updated_at desc limit 100",
 );
+const countWorkspacesForAccount = database.prepare(
+  "select count(*) as count from rudder_workspaces where account_id = ?",
+);
 const listAllRunningWorkspaces = database.prepare(
   "select * from rudder_workspaces where status in ('running','paused','queued')",
 );
@@ -351,10 +388,11 @@ const updateWorkspaceHeartbeat = database.prepare(`
       machine_id = coalesce(@machineId, machine_id),
       machine_state = @machineState,
       last_heartbeat_at = @lastHeartbeatAt,
-      last_activity_at = @lastActivityAt,
       updated_at = @updatedAt
   where id = @id
 `);
+const deleteSailRow = database.prepare("delete from rudder_sails where id = ? and account_id = ?");
+const deleteWorkspaceRow = database.prepare("delete from rudder_workspaces where id = ? and account_id = ?");
 const getSetting = database.prepare("select value from rudder_settings where key = ?");
 const upsertSetting = database.prepare(`
   insert into rudder_settings (key, value, updated_at)
@@ -367,13 +405,13 @@ let auth: ReturnType<typeof createBetterAuth> = createBetterAuth();
 let authHandler = toNodeHandler(auth.handler);
 
 const server = http.createServer(async (req, res) => {
-  res.once("finish", () => {
-    schedulePersistDatabase();
-  });
   try {
     const url = new URL(req.url || "/", baseURL);
-    if (url.pathname.startsWith("/api/auth")) {
+    if (url.pathname === "/api/auth" || url.pathname.startsWith("/api/auth/")) {
       refreshAuthHandler();
+      // Better Auth owns its SQL statements, so this is the one route family
+      // whose mutations cannot call markDatabaseDirty directly.
+      res.once("finish", markDatabaseDirty);
       authHandler(req, res);
       return;
     }
@@ -385,6 +423,10 @@ const server = http.createServer(async (req, res) => {
         byoVm: Boolean(snapshotBucket && flyWorkerImage),
         state: Boolean(snapshotBucket && persistStateToS3),
         auth: configuredProviders(),
+        slack: {
+          enabled: slack.enabled,
+          scoped: slackAccountIds.size > 0,
+        },
       });
       return;
     }
@@ -409,14 +451,16 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     if (req.method === "POST" && url.pathname === "/api/cli/login") {
+      checkGlobalRateLimit("cli-login", 300);
       await handleCliLoginStart(res);
       return;
     }
     if (req.method === "POST" && url.pathname === "/api/cli/login/github-token") {
+      checkGlobalRateLimit("github-token", 60);
       await handleCliGithubToken(req, res);
       return;
     }
-    if (url.pathname === "/api/cli/login/poll") {
+    if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/cli/login/poll") {
       await handleCliLoginPoll(req, res);
       return;
     }
@@ -452,12 +496,16 @@ const server = http.createServer(async (req, res) => {
       await handleSlackEvents(req, res);
       return;
     }
-    if (url.pathname.startsWith("/api/rudder/sail")) {
+    if (url.pathname === "/api/rudder/sail" || url.pathname.startsWith("/api/rudder/sail/")) {
       await handleSailApi(req, res, url);
       return;
     }
-    if (url.pathname.startsWith("/api/rudder/workspace")) {
+    if (url.pathname === "/api/rudder/workspace" || url.pathname.startsWith("/api/rudder/workspace/")) {
       await handleWorkspaceApi(req, res, url);
+      return;
+    }
+    if (url.pathname.startsWith("/api/") || req.method !== "GET") {
+      sendJson(res, 404, { error: "not found" });
       return;
     }
     renderHome(res);
@@ -465,7 +513,18 @@ const server = http.createServer(async (req, res) => {
     const status = error && typeof error === "object" && "status" in error && typeof error.status === "number"
       ? error.status
       : 500;
-    console.error(`request error ${req.method} ${req.url} -> ${status}`, error);
+    if (status >= 500) {
+      console.error(`request error ${req.method} ${req.url} -> ${status}`, error);
+    }
+    if (res.headersSent) {
+      if (!res.writableEnded) {
+        res.end();
+      }
+      return;
+    }
+    if (status === 413) {
+      res.setHeader("connection", "close");
+    }
     sendJson(res, status, { error: error instanceof Error ? error.message : String(error) });
   }
 });
@@ -473,12 +532,21 @@ const server = http.createServer(async (req, res) => {
 const SAIL_ATTACH_PATH_RE = /^\/api\/rudder\/sail\/([^/]+)\/(worker|attach)$/;
 const WORKSPACE_ATTACH_PATH_RE = /^\/api\/rudder\/workspace\/([^/]+)\/(worker|attach)$/;
 const REPLAY_BUFFER_BYTES = 256 * 1024;
+const MAX_REPLAY_BUFFER_CHUNKS = 512;
+const MAX_WS_PAYLOAD_BYTES = 2 * 1024 * 1024;
+const MAX_WS_BACKPRESSURE_BYTES = 4 * 1024 * 1024;
+const MAX_CHANNEL_CLIENTS = 32;
+const CHANNEL_RETENTION_MS = positiveIntegerEnv("RUDDER_CHANNEL_RETENTION_MS", 60 * 60 * 1000, 60_000, 24 * 60 * 60 * 1000);
+const MAX_RETAINED_CHANNELS = 500;
+const ACTIVITY_WRITE_INTERVAL_MS = 30_000;
 
 type Channel = {
   worker?: WebSocket;
   clients: Set<WebSocket>;
   buffer: Buffer[];
   bufferBytes: number;
+  lastTouchedAt: number;
+  cleanupTimer?: NodeJS.Timeout;
 };
 
 type ChannelKind = "sail" | "workspace";
@@ -488,6 +556,7 @@ const workspaceChannels = new Map<string, Channel>();
 
 const wss = new WebSocketServer({
   noServer: true,
+  maxPayload: MAX_WS_PAYLOAD_BYTES,
   // Compress large terminal redraws (a single Claude frame can be many kB of
   // ANSI). Skip small frames so per-keystroke echoes don't pay the deflate
   // tax.
@@ -496,6 +565,22 @@ const wss = new WebSocketServer({
     zlibDeflateOptions: { level: 1 },
   },
 });
+const socketAlive = new WeakMap<WebSocket, boolean>();
+const socketHealthTimer = setInterval(() => {
+  for (const ws of wss.clients) {
+    if (socketAlive.get(ws) === false) {
+      ws.terminate();
+      continue;
+    }
+    socketAlive.set(ws, false);
+    try {
+      ws.ping();
+    } catch {
+      ws.terminate();
+    }
+  }
+}, 30_000);
+socketHealthTimer.unref?.();
 
 server.on("upgrade", (req: IncomingMessage, socket: Duplex, head: Buffer) => {
   try {
@@ -546,7 +631,7 @@ function handleSailUpgrade(
     return;
   }
   if (String(sailRow.account_id) !== auth.accountId) {
-    destroyUpgrade(socket, 403);
+    destroyUpgrade(socket, 404);
     return;
   }
   wss.handleUpgrade(req, socket, head, (ws) => attachClient("sail", sailId, ws));
@@ -582,7 +667,7 @@ function handleWorkspaceUpgrade(
     return;
   }
   if (String(workspaceRow.account_id) !== auth.accountId) {
-    destroyUpgrade(socket, 403);
+    destroyUpgrade(socket, 404);
     return;
   }
   wss.handleUpgrade(req, socket, head, (ws) => attachClient("workspace", workspaceId, ws));
@@ -609,9 +694,14 @@ function getChannel(kind: ChannelKind, id: string): Channel {
   const map = channelMap(kind);
   let channel = map.get(id);
   if (!channel) {
-    channel = { clients: new Set(), buffer: [], bufferBytes: 0 };
+    channel = { clients: new Set(), buffer: [], bufferBytes: 0, lastTouchedAt: Date.now() };
     map.set(id, channel);
+    trimRetainedChannels(map);
+  } else if (channel.cleanupTimer) {
+    clearTimeout(channel.cleanupTimer);
+    channel.cleanupTimer = undefined;
   }
+  channel.lastTouchedAt = Date.now();
   return channel;
 }
 
@@ -622,12 +712,52 @@ function disposeChannelIfEmpty(kind: ChannelKind, id: string): void {
     return;
   }
   if (!channel.worker && channel.clients.size === 0) {
-    map.delete(id);
+    if (channel.bufferBytes === 0) {
+      map.delete(id);
+      lastActivityWrites.delete(`${kind}:${id}`);
+      return;
+    }
+    channel.cleanupTimer ??= setTimeout(() => {
+      const current = map.get(id);
+      if (current === channel && !current.worker && current.clients.size === 0) {
+        map.delete(id);
+        lastActivityWrites.delete(`${kind}:${id}`);
+      }
+    }, CHANNEL_RETENTION_MS);
+    channel.cleanupTimer.unref?.();
   }
+}
+
+function trimRetainedChannels(map: Map<string, Channel>): void {
+  if (map.size <= MAX_RETAINED_CHANNELS) {
+    return;
+  }
+  const candidates = [...map.entries()]
+    .filter(([, channel]) => !channel.worker && channel.clients.size === 0)
+    .sort((a, b) => a[1].lastTouchedAt - b[1].lastTouchedAt);
+  while (map.size > MAX_RETAINED_CHANNELS && candidates.length > 0) {
+    const [id, channel] = candidates.shift()!;
+    if (channel.cleanupTimer) {
+      clearTimeout(channel.cleanupTimer);
+    }
+    map.delete(id);
+    for (const kind of ["sail", "workspace"] as const) {
+      if (channelMap(kind) === map) {
+        lastActivityWrites.delete(`${kind}:${id}`);
+        break;
+      }
+    }
+  }
+}
+
+function trackSocket(ws: WebSocket): void {
+  socketAlive.set(ws, true);
+  ws.on("pong", () => socketAlive.set(ws, true));
 }
 
 function attachWorker(kind: ChannelKind, id: string, ws: WebSocket): void {
   const channel = getChannel(kind, id);
+  trackSocket(ws);
   if (channel.worker && channel.worker.readyState === WebSocket.OPEN) {
     try {
       channel.worker.close(4000, "replaced");
@@ -636,51 +766,51 @@ function attachWorker(kind: ChannelKind, id: string, ws: WebSocket): void {
     }
   }
   channel.worker = ws;
-  channel.buffer = [];
-  channel.bufferBytes = 0;
+  channel.lastTouchedAt = Date.now();
   broadcastStatus(channel, "worker-connected");
 
   ws.on("message", (data, isBinary) => {
-    if (isBinary && data instanceof Buffer) {
-      pushBuffer(channel, data);
+    const bytes = rawDataToBuffer(data);
+    if (isBinary) {
+      pushBuffer(channel, bytes);
+      touchInstanceActivity(kind, id);
       for (const client of channel.clients) {
-        if (client.readyState === WebSocket.OPEN) {
-          client.send(data, { binary: true });
-        }
+        sendSocketFrame(client, bytes, true);
       }
       return;
     }
-    if (data instanceof Buffer) {
-      const text = data.toString("utf8");
-      forwardTextToClients(channel, text);
-    }
+    forwardTextToClients(channel, bytes.toString("utf8"));
   });
 
   ws.on("close", () => {
     if (channel.worker === ws) {
       channel.worker = undefined;
+      channel.lastTouchedAt = Date.now();
+      broadcastStatus(channel, "worker-disconnected");
+      disposeChannelIfEmpty(kind, id);
     }
-    broadcastStatus(channel, "worker-disconnected");
-    disposeChannelIfEmpty(kind, id);
   });
   ws.on("error", () => undefined);
 }
 
 function attachClient(kind: ChannelKind, id: string, ws: WebSocket): void {
   const channel = getChannel(kind, id);
-  channel.clients.add(ws);
-  if (kind === "workspace") {
-    touchWorkspaceActivity(id);
+  trackSocket(ws);
+  if (channel.clients.size >= MAX_CHANNEL_CLIENTS) {
+    ws.close(1013, "too many attached clients");
+    disposeChannelIfEmpty(kind, id);
+    return;
   }
+  channel.clients.add(ws);
+  channel.lastTouchedAt = Date.now();
+  touchInstanceActivity(kind, id, true);
 
-  ws.send(JSON.stringify({
+  sendSocketFrame(ws, JSON.stringify({
     type: "status",
-    state: channel.worker ? "worker-connected" : "worker-waiting",
-  }));
+    state: channel.worker?.readyState === WebSocket.OPEN ? "worker-connected" : "worker-waiting",
+  }), false);
   for (const chunk of channel.buffer) {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(chunk, { binary: true });
-    }
+    sendSocketFrame(ws, chunk, true);
   }
 
   ws.on("message", (data, isBinary) => {
@@ -688,16 +818,15 @@ function attachClient(kind: ChannelKind, id: string, ws: WebSocket): void {
     if (!worker || worker.readyState !== WebSocket.OPEN) {
       return;
     }
-    if (isBinary && data instanceof Buffer) {
-      worker.send(data, { binary: true });
-      if (kind === "workspace") {
-        touchWorkspaceActivity(id);
+    const bytes = rawDataToBuffer(data);
+    if (isBinary) {
+      if (!sendSocketFrame(worker, bytes, true)) {
+        return;
       }
+      touchInstanceActivity(kind, id);
       return;
     }
-    if (data instanceof Buffer) {
-      worker.send(data.toString("utf8"));
-    }
+    sendSocketFrame(worker, bytes.toString("utf8"), false);
   });
 
   ws.on("close", () => {
@@ -708,9 +837,16 @@ function attachClient(kind: ChannelKind, id: string, ws: WebSocket): void {
 }
 
 function pushBuffer(channel: Channel, chunk: Buffer): void {
-  channel.buffer.push(chunk);
-  channel.bufferBytes += chunk.length;
-  while (channel.bufferBytes > REPLAY_BUFFER_BYTES && channel.buffer.length > 1) {
+  const retained = chunk.length > REPLAY_BUFFER_BYTES
+    ? Buffer.from(chunk.subarray(chunk.length - REPLAY_BUFFER_BYTES))
+    : Buffer.from(chunk);
+  channel.buffer.push(retained);
+  channel.bufferBytes += retained.length;
+  channel.lastTouchedAt = Date.now();
+  while (
+    (channel.bufferBytes > REPLAY_BUFFER_BYTES || channel.buffer.length > MAX_REPLAY_BUFFER_CHUNKS)
+    && channel.buffer.length > 0
+  ) {
     const dropped = channel.buffer.shift();
     if (dropped) {
       channel.bufferBytes -= dropped.length;
@@ -718,20 +854,47 @@ function pushBuffer(channel: Channel, chunk: Buffer): void {
   }
 }
 
+function rawDataToBuffer(data: RawData): Buffer {
+  if (Buffer.isBuffer(data)) {
+    return data;
+  }
+  if (Array.isArray(data)) {
+    return Buffer.concat(data);
+  }
+  return Buffer.from(data);
+}
+
+function sendSocketFrame(ws: WebSocket, data: Buffer | string, binary: boolean): boolean {
+  if (ws.readyState !== WebSocket.OPEN) {
+    return false;
+  }
+  if (ws.bufferedAmount > MAX_WS_BACKPRESSURE_BYTES) {
+    ws.close(1013, "slow consumer");
+    return false;
+  }
+  try {
+    ws.send(data, { binary }, (error) => {
+      if (error && ws.readyState === WebSocket.OPEN) {
+        ws.terminate();
+      }
+    });
+    return true;
+  } catch {
+    ws.terminate();
+    return false;
+  }
+}
+
 function forwardTextToClients(channel: Channel, text: string): void {
   for (const client of channel.clients) {
-    if (client.readyState === WebSocket.OPEN) {
-      client.send(text);
-    }
+    sendSocketFrame(client, text, false);
   }
 }
 
 function broadcastStatus(channel: Channel, state: string): void {
   const payload = JSON.stringify({ type: "status", state });
   for (const client of channel.clients) {
-    if (client.readyState === WebSocket.OPEN) {
-      client.send(payload);
-    }
+    sendSocketFrame(client, payload, false);
   }
 }
 
@@ -746,16 +909,16 @@ function sendInputToChannel(kind: ChannelKind, id: string, text: string, submit 
     return false;
   }
   const payload = submit ? `${text}\r` : text;
-  worker.send(Buffer.from(payload, "utf8"), { binary: true });
-  if (kind === "workspace") {
-    touchWorkspaceActivity(id);
+  const delivered = sendSocketFrame(worker, Buffer.from(payload, "utf8"), true);
+  if (delivered) {
+    touchInstanceActivity(kind, id);
   }
-  return true;
+  return delivered;
 }
 
-// Read the most recent raw output (with ANSI) buffered for an instance. The
-// replay buffer only exists while the worker is connected, so this returns ""
-// for paused/dead instances.
+// Read the most recent raw output (with ANSI) buffered for an instance. Empty
+// channels retain this bounded tail for a configurable window so completion
+// heartbeats, Slack, and `cloud output` do not race the worker's socket close.
 function readChannelOutput(kind: ChannelKind, id: string): string {
   const channel = channelMap(kind).get(id);
   if (!channel || channel.buffer.length === 0) {
@@ -769,29 +932,80 @@ function instanceHasLiveWorker(kind: ChannelKind, id: string): boolean {
   return Boolean(worker && worker.readyState === WebSocket.OPEN);
 }
 
-function touchWorkspaceActivity(workspaceId: string): void {
+const lastActivityWrites = new Map<string, number>();
+
+function touchInstanceActivity(kind: ChannelKind, id: string, force = false): void {
+  const key = `${kind}:${id}`;
+  const nowMs = Date.now();
+  if (!force && nowMs - (lastActivityWrites.get(key) ?? 0) < ACTIVITY_WRITE_INTERVAL_MS) {
+    return;
+  }
+  lastActivityWrites.set(key, nowMs);
   try {
-    const now = new Date().toISOString();
-    updateWorkspaceActivity.run({ id: workspaceId, lastActivityAt: now, updatedAt: now });
+    const now = new Date(nowMs).toISOString();
+    if (kind === "workspace") {
+      updateWorkspaceActivity.run({ id, lastActivityAt: now, updatedAt: now });
+    } else {
+      updateSailActivity.run({ id, lastActivityAt: now, updatedAt: now });
+    }
+    markDatabaseDirty();
   } catch {
     // ignore
   }
 }
 
+server.requestTimeout = 5 * 60 * 1000;
+server.headersTimeout = 30 * 1000;
+server.keepAliveTimeout = 65 * 1000;
 server.listen(port, () => {
   console.log(`rudder cloud listening on ${baseURL}`);
 });
 
+let shuttingDown = false;
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.once(signal, () => {
-    void persistDatabaseToS3().finally(() => {
-      process.exit(signal === "SIGINT" ? 130 : 143);
-    });
+    void shutdown(signal);
   });
 }
 
-const workspaceIdleMs = Number(process.env.RUDDER_WORKSPACE_IDLE_MS || 30 * 60 * 1000);
-const workspaceSweepIntervalMs = Number(process.env.RUDDER_WORKSPACE_SWEEP_MS || 60 * 1000);
+async function shutdown(signal: "SIGINT" | "SIGTERM"): Promise<void> {
+  if (shuttingDown) {
+    return;
+  }
+  shuttingDown = true;
+  clearInterval(socketHealthTimer);
+  if (persistTimer) {
+    clearTimeout(persistTimer);
+    persistTimer = undefined;
+  }
+  const closed = new Promise<void>((resolve) => server.close(() => resolve()));
+  for (const ws of wss.clients) {
+    try {
+      ws.close(1001, "server shutdown");
+    } catch {
+      ws.terminate();
+    }
+  }
+  const forceClose = setTimeout(() => {
+    for (const ws of wss.clients) {
+      ws.terminate();
+    }
+    server.closeAllConnections?.();
+  }, 1_500);
+  forceClose.unref?.();
+  await Promise.race([closed, sleep(2_000)]);
+  clearTimeout(forceClose);
+  await Promise.race([persistDatabaseToS3(true), sleep(6_000)]);
+  try {
+    database.close();
+  } catch {
+    // ignore
+  }
+  process.exit(signal === "SIGINT" ? 130 : 143);
+}
+
+const workspaceIdleMs = nonNegativeIntegerEnv("RUDDER_WORKSPACE_IDLE_MS", 30 * 60 * 1000, 30 * 24 * 60 * 60 * 1000);
+const workspaceSweepIntervalMs = nonNegativeIntegerEnv("RUDDER_WORKSPACE_SWEEP_MS", 60 * 1000, 24 * 60 * 60 * 1000);
 if (workspaceIdleMs >= 60 * 1000 && workspaceSweepIntervalMs >= 10 * 1000) {
   const timer = setInterval(() => {
     void sweepIdleWorkspaces().catch(() => undefined);
@@ -806,39 +1020,45 @@ async function sweepIdleWorkspaces(): Promise<void> {
   const rows = listAllRunningWorkspaces.all() as Record<string, unknown>[];
   const now = Date.now();
   for (const row of rows) {
-    const workspace = rowToWorkspace(row);
-    if (!workspace.machineId) {
-      continue;
-    }
-    if (workspaceChannels.get(workspace.id)?.clients.size) {
-      continue;
-    }
-    const last = workspace.lastActivityAt ?? workspace.lastHeartbeatAt ?? workspace.updatedAt;
-    const lastMs = Date.parse(last);
-    if (!Number.isFinite(lastMs) || now - lastMs < workspaceIdleMs) {
-      continue;
-    }
-    try {
-      await flyRequest<FlyMachine>(
-        `/v1/apps/${encodeURIComponent(flyAppName)}/machines/${encodeURIComponent(workspace.machineId)}/stop`,
-        { method: "POST", body: { signal: "SIGTERM", timeout: "10s" } },
-      );
-      updateWorkspaceMachine.run({
-        id: workspace.id,
-        status: "stopped",
-        machineId: workspace.machineId,
-        machineState: "stopping",
-        updatedAt: new Date().toISOString(),
-      });
-    } catch {
-      // ignore; will retry next sweep
-    }
+    const candidate = rowToWorkspace(row);
+    await withOperationLock(`workspace:${candidate.accountId}:${candidate.workspaceKey}`, async () => {
+      const currentRow = findWorkspaceById.get(candidate.id) as Record<string, unknown> | undefined;
+      if (!currentRow) return;
+      const workspace = rowToWorkspace(currentRow);
+      if (
+        !workspace.machineId
+        || !["running", "paused", "queued"].includes(workspace.status)
+        || workspaceChannels.get(workspace.id)?.clients.size
+      ) return;
+      const last = workspace.lastActivityAt ?? workspace.createdAt;
+      const lastMs = Date.parse(last);
+      if (!Number.isFinite(lastMs) || now - lastMs < workspaceIdleMs) return;
+      try {
+        await flyRequest<FlyMachine>(
+          `/v1/apps/${encodeURIComponent(flyAppName)}/machines/${encodeURIComponent(workspace.machineId)}/stop`,
+          { method: "POST", body: { signal: "SIGTERM", timeout: "10s" } },
+        );
+        updateWorkspaceMachine.run({
+          id: workspace.id,
+          status: "stopped",
+          machineId: workspace.machineId,
+          machineState: "stopping",
+          updatedAt: new Date().toISOString(),
+        });
+        markDatabaseDirty();
+      } catch {
+        // ignore; will retry next sweep
+      }
+    });
   }
 }
 
 let persistTimer: NodeJS.Timeout | undefined;
 let persistInFlight = false;
 let persistAgain = false;
+let databaseDirty = false;
+let lastPersistAt = 0;
+const MIN_PERSIST_INTERVAL_MS = positiveIntegerEnv("RUDDER_STATE_PERSIST_INTERVAL_MS", 5_000, 750, 60_000);
 
 async function restoreDatabaseFromS3(): Promise<void> {
   if (!snapshotBucket || !persistStateToS3) {
@@ -852,11 +1072,23 @@ async function restoreDatabaseFromS3(): Promise<void> {
     if (!response.Body) {
       return;
     }
-    const buffer = await streamToBuffer(response.Body);
+    if (typeof response.ContentLength === "number" && response.ContentLength > MAX_STATE_DB_BYTES) {
+      throw new Error("persisted database exceeds the restore size limit");
+    }
+    const buffer = await streamToBuffer(response.Body, MAX_STATE_DB_BYTES);
     if (buffer.length === 0) {
       return;
     }
-    await fs.writeFile(dbPath, buffer, { mode: 0o600 });
+    if (buffer.length < 100 || buffer.subarray(0, 16).toString("binary") !== "SQLite format 3\0") {
+      throw new Error("persisted database is not a valid SQLite file");
+    }
+    const tempPath = `${dbPath}.${process.pid}.restore`;
+    await fs.writeFile(tempPath, buffer, { mode: 0o600 });
+    await Promise.all([
+      fs.rm(`${dbPath}-wal`, { force: true }),
+      fs.rm(`${dbPath}-shm`, { force: true }),
+    ]);
+    await fs.rename(tempPath, dbPath);
   } catch (error) {
     const name = error && typeof error === "object" && "name" in error ? String(error.name) : "";
     if (name !== "NoSuchKey" && name !== "NotFound") {
@@ -870,26 +1102,41 @@ function schedulePersistDatabase(): void {
     return;
   }
   if (persistTimer) {
-    clearTimeout(persistTimer);
+    return;
   }
   persistTimer = setTimeout(() => {
     persistTimer = undefined;
     void persistDatabaseToS3();
-  }, 750);
+  }, Math.max(750, lastPersistAt + MIN_PERSIST_INTERVAL_MS - Date.now()));
   persistTimer.unref?.();
 }
 
-async function persistDatabaseToS3(): Promise<void> {
+function markDatabaseDirty(): void {
+  databaseDirty = true;
+  schedulePersistDatabase();
+}
+
+async function persistDatabaseToS3(force = false): Promise<void> {
   if (!snapshotBucket || !persistStateToS3) {
+    return;
+  }
+  if (!force && !databaseDirty) {
     return;
   }
   if (persistInFlight) {
     persistAgain = true;
+    if (force) {
+      while (persistInFlight) {
+        await sleep(25);
+      }
+      return await persistDatabaseToS3(true);
+    }
     return;
   }
   persistInFlight = true;
+  databaseDirty = false;
   try {
-    database.pragma("wal_checkpoint(FULL)");
+    database.pragma("wal_checkpoint(TRUNCATE)");
     const body = await fs.readFile(dbPath);
     await s3.send(new PutObjectCommand({
       Bucket: snapshotBucket,
@@ -898,7 +1145,10 @@ async function persistDatabaseToS3(): Promise<void> {
       ContentType: "application/vnd.sqlite3",
       ServerSideEncryption: "AES256",
     }));
+    lastPersistAt = Date.now();
   } catch (error) {
+    databaseDirty = true;
+    persistAgain = true;
     console.warn(`rudder cloud state persist failed: ${error instanceof Error ? error.message : String(error)}`);
   } finally {
     persistInFlight = false;
@@ -909,28 +1159,39 @@ async function persistDatabaseToS3(): Promise<void> {
   }
 }
 
-async function streamToBuffer(body: unknown): Promise<Buffer> {
+async function streamToBuffer(body: unknown, maxBytes = Number.MAX_SAFE_INTEGER): Promise<Buffer> {
   if (Buffer.isBuffer(body)) {
+    if (body.length > maxBytes) throw new Error("stream exceeds size limit");
     return body;
   }
   if (body instanceof Uint8Array) {
+    if (body.byteLength > maxBytes) throw new Error("stream exceeds size limit");
     return Buffer.from(body);
   }
   if (body instanceof Readable || (body && typeof body === "object" && Symbol.asyncIterator in body)) {
     const chunks: Buffer[] = [];
+    let total = 0;
     for await (const chunk of body as AsyncIterable<Buffer | Uint8Array | string>) {
-      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      total += bytes.length;
+      if (total > maxBytes) throw new Error("stream exceeds size limit");
+      chunks.push(bytes);
     }
-    return Buffer.concat(chunks);
+    return Buffer.concat(chunks, total);
   }
   if (body && typeof body === "object" && "transformToByteArray" in body) {
     const bytes = await (body as { transformToByteArray(): Promise<Uint8Array> }).transformToByteArray();
+    if (bytes.byteLength > maxBytes) throw new Error("stream exceeds size limit");
     return Buffer.from(bytes);
   }
   throw new Error("unsupported S3 body type");
 }
 
 async function handleCliLoginStart(res: ServerResponse): Promise<void> {
+  pruneLoginState();
+  if (deviceLogins.size >= MAX_DEVICE_LOGINS) {
+    throw tooManyRequests("too many active login sessions; try again shortly");
+  }
   const deviceCode = randomUUID();
   const expiresAt = Date.now() + 5 * 60 * 1000;
   deviceLogins.set(deviceCode, { deviceCode, expiresAt });
@@ -951,6 +1212,8 @@ async function handleCliLoginPoll(req: IncomingMessage, res: ServerResponse): Pr
   const deviceCode = stringField(body, "deviceCode") || url.searchParams.get("device_code") || "";
   const login = deviceLogins.get(deviceCode);
   if (!login || login.expiresAt < Date.now()) {
+    deviceLogins.delete(deviceCode);
+    githubBrowserLogins.delete(deviceCode);
     sendJson(res, 404, { error: "login expired" });
     return;
   }
@@ -979,7 +1242,7 @@ async function handleCliGithubToken(req: IncomingMessage, res: ServerResponse): 
     throw badRequest("token is required");
   }
   const user = await githubUser(githubToken);
-  const issued = issueRudderToken(`github:${user.id}`, user.email ?? `${user.login}@users.noreply.github.com`);
+  const issued = issueRudderToken(`github:${user.id}`, user.email);
   const responseBody: JsonRecord = {
     token: issued.token,
     accountId: issued.accountId,
@@ -1001,6 +1264,7 @@ function issueRudderToken(accountId: string, email?: string): { token: string; a
     createdAt: now,
     lastUsedAt: now,
   });
+  markDatabaseDirty();
   return { token: rudderToken, accountId, email };
 }
 
@@ -1318,7 +1582,7 @@ async function handleCliGithubWait(url: URL, res: ServerResponse): Promise<void>
   });
   if (poll.access_token) {
     const user = await githubUser(poll.access_token);
-    const issued = issueRudderToken(`github:${user.id}`, user.email ?? `${user.login}@users.noreply.github.com`);
+    const issued = issueRudderToken(`github:${user.id}`, user.email);
     login.token = issued.token;
     login.accountId = issued.accountId;
     login.email = issued.email;
@@ -1379,6 +1643,35 @@ async function startGithubBrowserLogin(deviceCode: string): Promise<GithubBrowse
   return githubLogin;
 }
 
+function pruneLoginState(now = Date.now()): void {
+  for (const [deviceCode, login] of deviceLogins) {
+    if (login.expiresAt < now) {
+      deviceLogins.delete(deviceCode);
+      githubBrowserLogins.delete(deviceCode);
+    }
+  }
+  for (const [deviceCode, login] of githubBrowserLogins) {
+    if (login.expiresAt < now || !deviceLogins.has(deviceCode)) {
+      githubBrowserLogins.delete(deviceCode);
+    }
+  }
+}
+
+const rateLimitWindows = new Map<string, { startedAt: number; count: number }>();
+
+function checkGlobalRateLimit(key: string, limit: number, windowMs = 60_000): void {
+  const now = Date.now();
+  const current = rateLimitWindows.get(key);
+  if (!current || now - current.startedAt >= windowMs) {
+    rateLimitWindows.set(key, { startedAt: now, count: 1 });
+    return;
+  }
+  current.count += 1;
+  if (current.count > limit) {
+    throw tooManyRequests("too many login attempts; try again shortly");
+  }
+}
+
 async function githubOAuthRequest<T>(url: string, body: Record<string, string>): Promise<T> {
   const response = await fetch(url, {
     method: "POST",
@@ -1387,11 +1680,12 @@ async function githubOAuthRequest<T>(url: string, body: Record<string, string>):
       "Content-Type": "application/json",
     },
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(EXTERNAL_REQUEST_TIMEOUT_MS),
   });
   const text = await response.text();
   const parsed = text ? parseJson(text) : null;
   if (!response.ok) {
-    throw new Error(responseErrorMessage(parsed) ?? text.trim() ?? `${response.status} ${response.statusText}`);
+    throw new Error(responseErrorMessage(parsed) || text.trim() || `${response.status} ${response.statusText}`);
   }
   return parsed as T;
 }
@@ -1404,11 +1698,12 @@ async function githubManifestConversion(code: string): Promise<JsonRecord> {
       "User-Agent": "rudder-cloud",
       "X-GitHub-Api-Version": "2022-11-28",
     },
+    signal: AbortSignal.timeout(EXTERNAL_REQUEST_TIMEOUT_MS),
   });
   const text = await response.text();
   const parsed = text ? parseJson(text) : null;
   if (!response.ok) {
-    throw new Error(responseErrorMessage(parsed) ?? text.trim() ?? `GitHub manifest conversion failed: ${response.status}`);
+    throw new Error(responseErrorMessage(parsed) || text.trim() || `GitHub manifest conversion failed: ${response.status}`);
   }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
     throw new Error("GitHub manifest conversion returned an unexpected response");
@@ -1484,6 +1779,9 @@ async function handleCliApprove(req: IncomingMessage, res: ServerResponse, url: 
     renderLoginPage(url, res);
     return;
   }
+  if (typeof session.user.id !== "string" || !session.user.id) {
+    throw unauthorized();
+  }
   // Only bake the email into the (admin-trusted) rdr_ token when it is VERIFIED, so
   // the token path shares the same invariant as requireAdminRequest's session path:
   // an unverified email can never become an admin token. (better-auth is social-only
@@ -1494,7 +1792,7 @@ async function handleCliApprove(req: IncomingMessage, res: ServerResponse, url: 
       ? session.user.email
       : undefined;
   const issued = issueRudderToken(
-    String(session.user.id || `better-auth:${randomUUID()}`),
+    session.user.id,
     verifiedEmail,
   );
   login.token = issued.token;
@@ -1543,10 +1841,6 @@ async function handleAdminWorkspaceGc(
       skipped.push({ kind: "workspace", id, reason: "no machineId" });
       continue;
     }
-    if (status === "stopped" && !machineId) {
-      skipped.push({ kind: "workspace", id, reason: "already stopped" });
-      continue;
-    }
     try {
       const exists = await flyMachineExists(machineId);
       if (exists) {
@@ -1559,11 +1853,11 @@ async function handleAdminWorkspaceGc(
         reclaimedVolumes.push({ id, volumeId });
       }
       if (!dryRun) {
-        update.run("stopped", now, id);
         if (volumeId) {
           await destroyWorkspaceVolume(volumeId);
           clearVolume.run(now, id);
         }
+        update.run("stopped", now, id);
       }
     } catch (error) {
       errors.push({
@@ -1606,7 +1900,7 @@ async function handleAdminWorkspaceGc(
   }
 
   if (!dryRun && (reclaimedWorkspaces.length || reclaimedSails.length)) {
-    schedulePersistDatabase();
+    markDatabaseDirty();
   }
 
   sendJson(res, 200, {
@@ -1621,35 +1915,8 @@ async function handleAdminWorkspaceGc(
 }
 
 async function flyMachineExists(machineId: string): Promise<boolean> {
-  const response = await fetch(
-    `${flyApiBase}/v1/apps/${encodeURIComponent(flyAppName)}/machines/${encodeURIComponent(machineId)}`,
-    {
-      method: "GET",
-      headers: {
-        Authorization: `Bearer ${flyApiToken}`,
-        Accept: "application/json",
-      },
-    },
-  );
-  if (response.status === 404) {
-    return false;
-  }
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`Fly API ${response.status}: ${text.trim()}`);
-  }
-  // 200 means the machine exists, but Fly may still report state "destroyed"
-  // for already-deleted machines. Treat destroyed/destroying as gone.
-  try {
-    const body = (await response.json()) as { state?: string } | null;
-    const state = body?.state;
-    if (state === "destroyed" || state === "destroying") {
-      return false;
-    }
-  } catch {
-    // fall through: assume exists
-  }
-  return true;
+  const machine = await getFlyMachineIfPresent(machineId);
+  return Boolean(machine && machine.state !== "destroyed" && machine.state !== "destroying");
 }
 
 async function requireAdminRequest(req: IncomingMessage): Promise<void> {
@@ -1694,6 +1961,12 @@ async function handleSailApi(req: IncomingMessage, res: ServerResponse, url: URL
     return;
   }
 
+  const snapshotUrlMatch = url.pathname.match(/^\/api\/rudder\/sail\/([^/]+)\/snapshot-url$/);
+  if (req.method === "GET" && snapshotUrlMatch) {
+    await handleSailSnapshotUrl(req, res, snapshotUrlMatch[1]);
+    return;
+  }
+
   const authContext = requireBearer(req);
   if (req.method === "GET" && url.pathname === "/api/rudder/sail") {
     await refreshAccountSails(authContext.accountId);
@@ -1701,14 +1974,24 @@ async function handleSailApi(req: IncomingMessage, res: ServerResponse, url: URL
     return;
   }
   if (req.method === "POST" && url.pathname === "/api/rudder/sail/launch") {
-    const body = await readJsonBody(req, MAX_SNAPSHOT_BODY_BYTES);
-    const sail = await createSail(authContext.accountId, body);
+    const sail = await withSnapshotRequestBudget(req, async () => {
+      const body = await readJsonBody(req, MAX_SNAPSHOT_BODY_BYTES);
+      return await withOperationLock(
+        `account:${authContext.accountId}:sail-launch`,
+        async () => createSail(authContext.accountId, body),
+      );
+    });
     sendJson(res, 200, sail);
     return;
   }
   if (req.method === "POST" && url.pathname === "/api/rudder/sail/onload") {
-    const body = await readJsonBody(req, MAX_SNAPSHOT_BODY_BYTES);
-    const sail = await createSail(authContext.accountId, body, stringField(body, "runId"));
+    const sail = await withSnapshotRequestBudget(req, async () => {
+      const body = await readJsonBody(req, MAX_SNAPSHOT_BODY_BYTES);
+      return await withOperationLock(
+        `account:${authContext.accountId}:sail-launch`,
+        async () => createSail(authContext.accountId, body, stringField(body, "runId")),
+      );
+    });
     sendJson(res, 200, sail);
     return;
   }
@@ -1719,7 +2002,10 @@ async function handleSailApi(req: IncomingMessage, res: ServerResponse, url: URL
       sendJson(res, 404, { error: "sail not found" });
       return;
     }
-    const next = await refreshByoVmBootstrap(sail, authContext.accountId);
+    const next = await withOperationLock(
+      `sail:${sail.id}`,
+      async () => refreshByoVmBootstrap(sail, authContext.accountId),
+    );
     sendJson(res, 200, next);
     return;
   }
@@ -1735,6 +2021,9 @@ async function handleSailApi(req: IncomingMessage, res: ServerResponse, url: URL
     if (typeof text !== "string" || text.length === 0) {
       sendJson(res, 400, { error: "text is required" });
       return;
+    }
+    if (Buffer.byteLength(text, "utf8") > 64 * 1024) {
+      throw payloadTooLarge();
     }
     const submit = body && typeof body === "object" && !Array.isArray(body) && body.submit === false ? false : true;
     const delivered = sendInputToChannel("sail", sail.id, text, submit);
@@ -1764,8 +2053,22 @@ async function handleSailApi(req: IncomingMessage, res: ServerResponse, url: URL
       sendJson(res, 404, { error: "sail not found" });
       return;
     }
-    const next = await mutateSail(sail, authContext.accountId, match[2]);
+    const next = await withOperationLock(
+      `sail:${sail.id}`,
+      async () => mutateSail(sail, authContext.accountId, match[2]),
+    );
     sendJson(res, 200, next);
+    return;
+  }
+  const deleteMatch = url.pathname.match(/^\/api\/rudder\/sail\/([^/]+)\/delete$/);
+  if (req.method === "POST" && deleteMatch) {
+    const sail = getAccountSail(deleteMatch[1], authContext.accountId);
+    if (!sail) {
+      sendJson(res, 404, { error: "sail not found" });
+      return;
+    }
+    await withOperationLock(`sail:${sail.id}`, async () => deleteSail(sail, authContext.accountId));
+    sendJson(res, 200, { ok: true, id: sail.id, deleted: true });
     return;
   }
   sendJson(res, 404, { error: "not found" });
@@ -1786,6 +2089,7 @@ async function handleWorkspaceApi(req: IncomingMessage, res: ServerResponse, url
 
   const authContext = requireBearer(req);
   if (req.method === "GET" && url.pathname === "/api/rudder/workspace") {
+    await refreshAccountWorkspaces(authContext.accountId);
     sendJson(res, 200, {
       workspaces: listAccountWorkspaces(authContext.accountId).map(annotateWorkspaceClients),
     });
@@ -1804,12 +2108,16 @@ async function handleWorkspaceApi(req: IncomingMessage, res: ServerResponse, url
       sendJson(res, 404, { error: "workspace not found" });
       return;
     }
-    sendJson(res, 200, annotateWorkspaceClients(rowToWorkspace(row)));
+    await refreshWorkspaceRow(rowToWorkspace(row));
+    const refreshed = findWorkspaceByKey.get(authContext.accountId, key) as Record<string, unknown> | undefined;
+    sendJson(res, 200, annotateWorkspaceClients(rowToWorkspace(refreshed ?? row)));
     return;
   }
   if (req.method === "POST" && url.pathname === "/api/rudder/workspace/attach") {
-    const body = await readJsonBody(req, MAX_SNAPSHOT_BODY_BYTES);
-    const result = await ensureWorkspaceForAttach(authContext.accountId, body);
+    const result = await withSnapshotRequestBudget(req, async () => {
+      const body = await readJsonBody(req, MAX_SNAPSHOT_BODY_BYTES);
+      return await ensureWorkspaceForAttach(authContext.accountId, body);
+    });
     sendJson(res, 200, result);
     return;
   }
@@ -1820,8 +2128,25 @@ async function handleWorkspaceApi(req: IncomingMessage, res: ServerResponse, url
       sendJson(res, 404, { error: "workspace not found" });
       return;
     }
-    const next = await mutateWorkspace(workspace, stopMatch[2]);
+    const next = await withOperationLock(
+      `workspace:${workspace.accountId}:${workspace.workspaceKey}`,
+      async () => mutateWorkspace(workspace, stopMatch[2]),
+    );
     sendJson(res, 200, next);
+    return;
+  }
+  const deleteMatch = url.pathname.match(/^\/api\/rudder\/workspace\/([^/]+)\/delete$/);
+  if (req.method === "POST" && deleteMatch) {
+    const workspace = getAccountWorkspace(deleteMatch[1], authContext.accountId);
+    if (!workspace) {
+      sendJson(res, 404, { error: "workspace not found" });
+      return;
+    }
+    await withOperationLock(
+      `workspace:${workspace.accountId}:${workspace.workspaceKey}`,
+      async () => deleteWorkspace(workspace),
+    );
+    sendJson(res, 200, { ok: true, id: workspace.id, deleted: true });
     return;
   }
   sendJson(res, 404, { error: "not found" });
@@ -1830,37 +2155,56 @@ async function handleWorkspaceApi(req: IncomingMessage, res: ServerResponse, url
 async function createSail(accountId: string, body: Json, preferredId?: string): Promise<Sail> {
   const runtime = sailRuntimeFromBody(body);
   ensureCloudRuntimeConfigured(runtime);
+  const active = countActiveSailsForAccount.get(accountId) as { count?: number } | undefined;
+  if ((active?.count ?? 0) >= maxActiveSailsPerAccount) {
+    throw tooManyRequests(`active sail limit reached (${maxActiveSailsPerAccount}); stop or delete an instance first`);
+  }
   const now = new Date().toISOString();
-  const snapshot = await storeSnapshot(accountId, body);
-  const id = preferredId || uniqueSailId(stringField(body, "name"));
+  const id = preferredId ? validatePreferredSailId(preferredId) : uniqueSailId(stringField(body, "name"));
+  if (findSailById.get(id)) {
+    throw conflict(`sail already exists: ${id}`);
+  }
   const workerToken = `rdrw_${randomBytes(32).toString("base64url")}`;
   const task = stringField(body, "task");
   const repoName = stringField(body, "repoName");
+  if (task && Buffer.byteLength(task, "utf8") > 64 * 1024) {
+    throw payloadTooLarge();
+  }
+  if (repoName && Buffer.byteLength(repoName, "utf8") > 255) {
+    throw badRequest("repoName is too long");
+  }
+  const snapshot = await storeSnapshot(accountId, body);
   const snapshotInput = objectField(body, "snapshot");
   const manifest = snapshotInput ? objectField(snapshotInput, "manifest") : undefined;
   const manifestRepo = manifest ? objectField(manifest, "repo") : undefined;
   const branch = manifestRepo ? stringField(manifestRepo, "branch") : undefined;
-  insertSail.run({
-    id,
-    accountId,
-    status: "queued",
-    runtime,
-    repoName: repoName ?? null,
-    task: task ?? null,
-    branch: branch ?? null,
-    machineId: null,
-    machineState: runtime === "byo-vm" ? "bootstrap-pending" : null,
-    snapshotKey: snapshot.key,
-    manifestJson: JSON.stringify(manifest ?? {}),
-    workerTokenHash: tokenHash(workerToken),
-    lastHeartbeatAt: null,
-    createdAt: now,
-    updatedAt: now,
-  });
-
-  // Announce the new instance into the shared Slack channel so it is talk-able
-  // from there. Fire-and-forget: a Slack hiccup must never fail a launch.
-  void announceSailToSlack(id, task, repoName, runtime);
+  try {
+    insertSail.run({
+      id,
+      accountId,
+      status: "queued",
+      runtime,
+      repoName: repoName ?? null,
+      task: task ?? null,
+      branch: branch ?? null,
+      machineId: null,
+      machineState: runtime === "byo-vm" ? "bootstrap-pending" : null,
+      snapshotKey: snapshot.key,
+      manifestJson: JSON.stringify(manifest ?? {}),
+      workerTokenHash: tokenHash(workerToken),
+      lastActivityAt: now,
+      lastHeartbeatAt: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+  } catch (error) {
+    await deleteSnapshotBestEffort(snapshot.key);
+    if (isSqliteConstraint(error)) {
+      throw conflict(`sail already exists: ${id}`);
+    }
+    throw error;
+  }
+  markDatabaseDirty();
 
   if (runtime === "byo-vm") {
     const sail = getAccountSail(id, accountId) ?? {
@@ -1875,7 +2219,7 @@ async function createSail(accountId: string, body: Json, preferredId?: string): 
       createdAt: now,
       updatedAt: now,
     };
-    return {
+    const result = {
       ...sail,
       bootstrapCommand: await byoVmBootstrapCommand({
         sailId: id,
@@ -1886,26 +2230,48 @@ async function createSail(accountId: string, body: Json, preferredId?: string): 
         repoName,
       }),
     };
+    void announceSailToSlack(id, accountId, task, repoName, runtime);
+    return result;
   }
 
-  const snapshotUrl = await signedSnapshotUrl(snapshot.key);
-  const machine = await createFlyMachine({
-    sailId: id,
-    accountId,
-    snapshotUrl,
-    workerToken,
-    task,
-    repoName,
-  });
+  let machine: FlyMachine;
+  try {
+    const snapshotUrl = await signedSnapshotUrl(snapshot.key);
+    machine = await createFlyMachine({
+      sailId: id,
+      accountId,
+      snapshotUrl,
+      workerToken,
+      task,
+      repoName,
+    });
+    if (!machine.id) {
+      throw new Error("Fly create did not return a machine id");
+    }
+    const status = flyStateToSailStatus(machine.state);
+    updateSail.run({
+      id,
+      accountId,
+      status,
+      machineId: machine.id,
+      machineState: machine.state ?? null,
+      updatedAt: new Date().toISOString(),
+    });
+    markDatabaseDirty();
+  } catch (error) {
+    updateSail.run({
+      id,
+      accountId,
+      status: "failed",
+      machineId: null,
+      machineState: "provision-failed",
+      updatedAt: new Date().toISOString(),
+    });
+    markDatabaseDirty();
+    throw error;
+  }
   const status = flyStateToSailStatus(machine.state);
-  updateSail.run({
-    id,
-    accountId,
-    status,
-    machineId: machine.id ?? null,
-    machineState: machine.state ?? null,
-    updatedAt: new Date().toISOString(),
-  });
+  void announceSailToSlack(id, accountId, task, repoName, runtime);
   return getAccountSail(id, accountId) ?? {
     id,
     status,
@@ -1919,6 +2285,14 @@ async function createSail(accountId: string, body: Json, preferredId?: string): 
     createdAt: now,
     updatedAt: now,
   };
+}
+
+function validatePreferredSailId(value: string): string {
+  const id = value.trim();
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(id)) {
+    throw badRequest("runId must be 1-128 URL-safe characters");
+  }
+  return id;
 }
 
 function uniqueSailId(name?: string): string {
@@ -1969,7 +2343,13 @@ async function storeSnapshot(accountId: string, body: Json): Promise<{ key: stri
   if (!base64) {
     throw badRequest("snapshot.base64 is required");
   }
+  if (base64.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(base64)) {
+    throw badRequest("snapshot.base64 is invalid");
+  }
   const buffer = Buffer.from(base64, "base64");
+  if (buffer.length < 2 || buffer[0] !== 0x1f || buffer[1] !== 0x8b) {
+    throw badRequest("snapshot must be a gzip archive");
+  }
   const key = `snapshots/${accountId}/${new Date().toISOString().slice(0, 10)}/${randomUUID()}.tgz`;
   await s3.send(new PutObjectCommand({
     Bucket: snapshotBucket,
@@ -2026,14 +2406,14 @@ async function createFlyMachine(params: {
         restart: {
           policy: "no",
         },
-        auto_destroy: false,
+        // Sails are task-scoped. Once the supervisor exits, there is no state
+        // worth keeping on the ephemeral root disk; Fly should reclaim it.
+        auto_destroy: true,
       },
+      skip_launch: false,
     },
   });
-  if (!machine.id) {
-    return machine;
-  }
-  return await startFlyMachine(machine.id, `sail ${params.sailId}`);
+  return machine;
 }
 
 async function mutateSail(sail: Sail, accountId: string, action: string): Promise<Sail> {
@@ -2044,11 +2424,12 @@ async function mutateSail(sail: Sail, accountId: string, action: string): Promis
     updateSail.run({
       id: sail.id,
       accountId,
-      status: "stopped",
+      status: "completed",
       machineId: sail.machineId ?? null,
       machineState: "stopped",
       updatedAt: new Date().toISOString(),
     });
+    markDatabaseDirty();
     return getAccountSail(sail.id, accountId) ?? sail;
   }
   throw badRequest("BYO VM sails cannot be paused or resumed from Rudder Cloud. Stop the worker on your VM, or use stop to mark it stopped.");
@@ -2063,29 +2444,125 @@ async function mutateFlySail(sail: Sail, accountId: string, action: string): Pro
     machine = await flyRequest<FlyMachine>(
       `/v1/apps/${encodeURIComponent(flyAppName)}/machines/${encodeURIComponent(sail.machineId)}/suspend`,
       { method: "POST", body: {} },
-    );
+    ) ?? {};
   } else if (action === "resume" || action === "onload") {
-    machine = await flyRequest<FlyMachine>(
-      `/v1/apps/${encodeURIComponent(flyAppName)}/machines/${encodeURIComponent(sail.machineId)}/start`,
-      { method: "POST", body: {} },
-    );
+    machine = await startFlyMachine(sail.machineId, `sail ${sail.id}`);
   } else if (action === "stop") {
     machine = await flyRequest<FlyMachine>(
       `/v1/apps/${encodeURIComponent(flyAppName)}/machines/${encodeURIComponent(sail.machineId)}/stop`,
       { method: "POST", body: { signal: "SIGINT", timeout: "10s" } },
-    );
+    ) ?? {};
   } else {
     throw badRequest(`unsupported sail action: ${action}`);
   }
   updateSail.run({
     id: sail.id,
     accountId,
-    status: action === "pause" ? "paused" : flyStateToSailStatus(machine.state),
+    status: action === "pause"
+      ? "paused"
+      : action === "stop"
+        ? "completed"
+        : flyStateToSailStatus(machine.state),
     machineId: sail.machineId,
     machineState: machine.state ?? null,
     updatedAt: new Date().toISOString(),
   });
+  markDatabaseDirty();
   return getAccountSail(sail.id, accountId) ?? sail;
+}
+
+async function deleteSail(sail: Sail, accountId: string): Promise<void> {
+  if (sail.runtime === "fly" && sail.machineId) {
+    await destroyFlyMachine(sail.machineId);
+  }
+  closeChannel("sail", sail.id, "instance deleted");
+  deleteSailRow.run(sail.id, accountId);
+  lastActivityWrites.delete(`sail:${sail.id}`);
+  markDatabaseDirty();
+  await deleteSnapshotBestEffort(sail.snapshotKey);
+}
+
+async function deleteWorkspace(workspace: Workspace): Promise<void> {
+  if (workspace.machineId) {
+    await destroyFlyMachine(workspace.machineId, true);
+  }
+  if (workspace.volumeId) {
+    await destroyWorkspaceVolume(workspace.volumeId);
+  }
+  closeChannel("workspace", workspace.id, "workspace deleted");
+  deleteWorkspaceRow.run(workspace.id, workspace.accountId);
+  lastActivityWrites.delete(`workspace:${workspace.id}`);
+  markDatabaseDirty();
+  await deleteSnapshotBestEffort(workspace.snapshotKey);
+}
+
+async function destroyFlyMachine(machineId: string, waitUntilDestroyed = false): Promise<void> {
+  try {
+    await flyRequest<FlyMachine>(
+      `/v1/apps/${encodeURIComponent(flyAppName)}/machines/${encodeURIComponent(machineId)}?force=true`,
+      { method: "DELETE" },
+    );
+  } catch (error) {
+    if (!isHttpStatus(error, 404)) {
+      throw error;
+    }
+  }
+  if (waitUntilDestroyed) {
+    try {
+      await flyRequest<JsonRecord>(
+        `/v1/apps/${encodeURIComponent(flyAppName)}/machines/${encodeURIComponent(machineId)}/wait?state=destroyed&timeout=10`,
+        { method: "GET" },
+      );
+    } catch (error) {
+      if (!isHttpStatus(error, 404)) {
+        throw error;
+      }
+    }
+  }
+}
+
+async function deleteSnapshotBestEffort(key: string | undefined): Promise<void> {
+  if (!key || !snapshotBucket) {
+    return;
+  }
+  try {
+    await s3.send(new DeleteObjectCommand({ Bucket: snapshotBucket, Key: key }));
+  } catch (error) {
+    console.warn(`delete snapshot ${key} failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function closeChannel(kind: ChannelKind, id: string, reason: string): void {
+  const map = channelMap(kind);
+  const channel = map.get(id);
+  if (!channel) {
+    return;
+  }
+  if (channel.cleanupTimer) {
+    clearTimeout(channel.cleanupTimer);
+  }
+  const sockets = channel.worker ? [channel.worker, ...channel.clients] : [...channel.clients];
+  map.delete(id);
+  for (const ws of sockets) {
+    try {
+      ws.close(1000, reason);
+    } catch {
+      ws.terminate();
+    }
+  }
+}
+
+function disconnectWorker(kind: ChannelKind, id: string, reason: string): void {
+  const channel = channelMap(kind).get(id);
+  const worker = channel?.worker;
+  if (!worker) {
+    return;
+  }
+  try {
+    worker.close(4001, reason);
+  } catch {
+    worker.terminate();
+  }
 }
 
 async function refreshByoVmBootstrap(sail: Sail, accountId: string): Promise<Sail> {
@@ -2103,6 +2580,8 @@ async function refreshByoVmBootstrap(sail: Sail, accountId: string): Promise<Sai
     workerTokenHash: tokenHash(workerToken),
     updatedAt: now,
   });
+  markDatabaseDirty();
+  disconnectWorker("sail", sail.id, "credentials rotated");
   const next = getAccountSail(sail.id, accountId) ?? { ...sail, updatedAt: now };
   return {
     ...next,
@@ -2137,7 +2616,9 @@ async function byoVmBootstrapCommand(params: {
   ];
   const armWorkerImage = imageWithTag(flyWorkerImage, "arm64");
   const dockerLines = [
-    "docker run --rm",
+    // BYOC hosts commonly cache `latest`; always pull so a control-plane deploy
+    // cannot keep launching an old, protocol-incompatible worker image.
+    "docker run --rm --pull=always",
     ...env.map(([key, value]) => `  -e ${key}=${shellQuote(value)}`),
     "  \"$RUDDER_WORKER_IMAGE\"",
   ];
@@ -2152,60 +2633,122 @@ async function byoVmBootstrapCommand(params: {
 }
 
 async function handleWorkerHeartbeat(req: IncomingMessage, res: ServerResponse, sailId: string): Promise<void> {
+  const authRow = findSailById.get(sailId) as Record<string, unknown> | undefined;
+  if (!authRow) {
+    sendJson(res, 404, { error: "sail not found" });
+    return;
+  }
+  requireWorkerBearer(req, authRow);
+  const body = await readJsonBody(req);
   const sailRow = findSailById.get(sailId) as Record<string, unknown> | undefined;
   if (!sailRow) {
     sendJson(res, 404, { error: "sail not found" });
     return;
   }
+  // A bootstrap rotation may happen while the request body is in flight.
   requireWorkerBearer(req, sailRow);
-  const body = await readJsonBody(req);
   const state = stringField(body, "state");
-  const status: SailStatus = state === "completed"
+  const reportedStatus: SailStatus = state === "completed"
     ? "completed"
     : state === "failed"
       ? "failed"
       : "running";
   const now = new Date().toISOString();
-  const previousStatus = String(sailRow.status);
+  const previousStatus = String(sailRow.status) as SailStatus;
+  // Late periodic heartbeats must not resurrect a completed/failed/paused sail.
+  // Resume updates the row to running before the worker can reconnect, so preserving
+  // paused here does not block a legitimate resume.
+  const status = previousStatus === "completed" || previousStatus === "failed"
+    ? previousStatus
+    : reportedStatus === "running" && previousStatus === "paused"
+      ? previousStatus
+      : reportedStatus;
   updateHeartbeat.run({
     id: sailId,
     status,
     machineId: stringField(body, "machineId") ?? null,
-    machineState: state || status,
+    machineState: status === reportedStatus ? state || status : optionalString(sailRow.machine_state) ?? status,
     lastHeartbeatAt: now,
     updatedAt: now,
   });
+  markDatabaseDirty();
   // On the transition into a terminal state, post the final result + a tail of
   // output into the instance's Slack thread.
   if ((status === "completed" || status === "failed") && previousStatus !== status) {
     const threadTs = optionalString(sailRow.slack_thread_ts);
     const icon = status === "completed" ? "✅" : "❌";
     const tail = readChannelOutput("sail", sailId);
-    void postToSlack(
-      `${icon} *${sailId}* ${status}.${tail ? `\n${formatOutputForSlack(tail)}` : ""}`,
-      threadTs,
-    );
+    if (threadTs && slackAccountIds.has(String(sailRow.account_id))) {
+      void postToSlack(
+        `${icon} *${sailId}* ${status}.${tail ? `\n${formatOutputForSlack(tail)}` : ""}`,
+        threadTs,
+      );
+    }
   }
   sendJson(res, 200, { ok: true, status });
 }
 
 async function refreshAccountSails(accountId: string): Promise<void> {
+  if (Date.now() - (lastSailRefreshAt.get(accountId) ?? 0) < 5_000) {
+    return;
+  }
+  const existing = sailRefreshes.get(accountId);
+  if (existing) {
+    await existing;
+    return;
+  }
+  const refresh = refreshAccountSailsCore(accountId).then(() => {
+    lastSailRefreshAt.set(accountId, Date.now());
+  }).finally(() => {
+    if (sailRefreshes.get(accountId) === refresh) {
+      sailRefreshes.delete(accountId);
+    }
+  });
+  sailRefreshes.set(accountId, refresh);
+  await refresh;
+}
+
+const sailRefreshes = new Map<string, Promise<void>>();
+const lastSailRefreshAt = new Map<string, number>();
+
+async function refreshAccountSailsCore(accountId: string): Promise<void> {
   const sails = listAccountSails(accountId);
-  for (const sail of sails) {
+  await mapWithConcurrency(sails, 8, async (sail) => {
+    await withOperationLock(`sail:${sail.id}`, async () => {
     if (sail.runtime !== "fly" || !flyApiToken || !flyAppName) {
-      continue;
+      return;
     }
     if (sail.status === "completed" || sail.status === "failed") {
-      continue;
+      return;
     }
     if (!sail.machineId) {
-      continue;
+      return;
     }
-    if (shouldPauseStaleSail(sail)) {
-      await flyRequest<FlyMachine>(
+    const machine = await getFlyMachineIfPresent(sail.machineId).catch(() => undefined);
+    if (machine === undefined) {
+      return;
+    }
+    if (machine === null) {
+      updateSail.run({
+        id: sail.id,
+        accountId,
+        status: "completed",
+        machineId: sail.machineId,
+        machineState: "destroyed",
+        updatedAt: new Date().toISOString(),
+      });
+      markDatabaseDirty();
+      return;
+    }
+    const latestSail = getAccountSail(sail.id, accountId) ?? sail;
+    if (shouldPauseStaleSail(latestSail) && !["suspended", "stopped", "stopping"].includes(machine.state ?? "")) {
+      const suspended = await flyRequest<FlyMachine>(
         `/v1/apps/${encodeURIComponent(flyAppName)}/machines/${encodeURIComponent(sail.machineId)}/suspend`,
         { method: "POST", body: {} },
       ).catch(() => null);
+      if (!suspended) {
+        return;
+      }
       const now = new Date().toISOString();
       updateSail.run({
         id: sail.id,
@@ -2215,23 +2758,41 @@ async function refreshAccountSails(accountId: string): Promise<void> {
         machineState: "suspended",
         updatedAt: now,
       });
-      continue;
+      markDatabaseDirty();
+      return;
     }
-    const machine = await flyRequest<FlyMachine>(
-      `/v1/apps/${encodeURIComponent(flyAppName)}/machines/${encodeURIComponent(sail.machineId)}`,
-      { method: "GET" },
-    ).catch(() => null);
-    if (!machine) {
-      continue;
-    }
+    const refreshedStatus = flyStateToSailStatus(machine.state);
     updateSail.run({
       id: sail.id,
       accountId,
-      status: flyStateToSailStatus(machine.state),
+      status: refreshedStatus === "queued" && latestSail.status === "running" ? "running" : refreshedStatus,
       machineId: sail.machineId,
       machineState: machine.state ?? null,
       updatedAt: new Date().toISOString(),
     });
+    markDatabaseDirty();
+    });
+  });
+}
+
+const operationTails = new Map<string, Promise<void>>();
+
+async function withOperationLock<T>(key: string, operation: () => Promise<T>): Promise<T> {
+  const previous = operationTails.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const tail = previous.catch(() => undefined).then(() => gate);
+  operationTails.set(key, tail);
+  await previous.catch(() => undefined);
+  try {
+    return await operation();
+  } finally {
+    release();
+    if (operationTails.get(key) === tail) {
+      operationTails.delete(key);
+    }
   }
 }
 
@@ -2239,24 +2800,33 @@ function shouldPauseStaleSail(sail: Sail): boolean {
   if (sail.status !== "running" || !idlePauseMs || idlePauseMs < 1000) {
     return false;
   }
-  const heartbeatOrCreated = sail.lastHeartbeatAt ?? sail.createdAt;
-  const lastSeen = Date.parse(heartbeatOrCreated);
+  const lastActivity = sail.lastActivityAt ?? sail.lastHeartbeatAt ?? sail.createdAt;
+  const lastSeen = Date.parse(lastActivity);
   return Number.isFinite(lastSeen) && Date.now() - lastSeen > idlePauseMs;
 }
 
 async function ensureWorkspaceForAttach(accountId: string, body: Json): Promise<JsonRecord> {
   ensureCloudRuntimeConfigured("fly");
-  const workspaceKey = stringField(body, "workspaceKey");
+  const workspaceKey = stringField(body, "workspaceKey")?.trim();
   if (!workspaceKey || workspaceKey.length < 4 || workspaceKey.length > 128) {
     throw badRequest("workspaceKey is required (4-128 chars)");
   }
-  const repoName = stringField(body, "repoName");
-  const existingRow = findWorkspaceByKey.get(accountId, workspaceKey) as Record<string, unknown> | undefined;
-  if (existingRow) {
-    const existing = rowToWorkspace(existingRow);
-    return await reuseOrRestartWorkspace(existing, body, repoName);
+  if (!/^[A-Za-z0-9._:@/+\-=]+$/.test(workspaceKey)) {
+    throw badRequest("workspaceKey contains unsupported characters");
   }
-  return await createWorkspace(accountId, workspaceKey, body, repoName);
+  return await withOperationLock(`workspace:${accountId}:${workspaceKey}`, async () => {
+    const repoName = stringField(body, "repoName");
+    const existingRow = findWorkspaceByKey.get(accountId, workspaceKey) as Record<string, unknown> | undefined;
+    if (existingRow) {
+      const existing = rowToWorkspace(existingRow);
+      return await reuseOrRestartWorkspace(existing, body, repoName);
+    }
+    return await withOperationLock(`account:${accountId}:workspace-create`, async () => {
+      // Another workspace-key operation for this account may have consumed the
+      // final quota slot while we waited for the account-wide creation lock.
+      return await createWorkspace(accountId, workspaceKey, body, repoName);
+    });
+  });
 }
 
 async function createWorkspace(
@@ -2265,49 +2835,97 @@ async function createWorkspace(
   body: Json,
   repoName: string | undefined,
 ): Promise<JsonRecord> {
-  const region = sanitizeRegion(stringField(body, "region"));
+  const count = countWorkspacesForAccount.get(accountId) as { count?: number } | undefined;
+  if ((count?.count ?? 0) >= maxWorkspacesPerAccount) {
+    throw tooManyRequests(`workspace limit reached (${maxWorkspacesPerAccount}); delete a workspace first`);
+  }
+  const requestedRegion = stringField(body, "region");
+  const region = sanitizeRegion(requestedRegion);
+  if (requestedRegion && !region) {
+    throw badRequest("region must be a three-letter Fly region code");
+  }
+  if (repoName && Buffer.byteLength(repoName, "utf8") > 255) {
+    throw badRequest("repoName is too long");
+  }
   const snapshot = await storeSnapshot(accountId, body);
   const snapshotFingerprint = stringField(body, "snapshotFingerprint") ?? null;
   const now = new Date().toISOString();
   const id = uniqueWorkspaceId(repoName);
   const workerToken = `rdrw_${randomBytes(32).toString("base64url")}`;
-  insertWorkspace.run({
-    id,
-    accountId,
-    workspaceKey,
-    repoName: repoName ?? null,
-    status: "queued",
-    machineId: null,
-    machineState: null,
-    snapshotKey: snapshot.key,
-    snapshotFingerprint,
-    region,
-    volumeId: null,
-    workerTokenHash: tokenHash(workerToken),
-    lastActivityAt: now,
-    lastHeartbeatAt: null,
-    createdAt: now,
-    updatedAt: now,
-  });
+  try {
+    insertWorkspace.run({
+      id,
+      accountId,
+      workspaceKey,
+      repoName: repoName ?? null,
+      status: "queued",
+      machineId: null,
+      machineState: null,
+      snapshotKey: snapshot.key,
+      snapshotFingerprint,
+      region,
+      volumeId: null,
+      workerTokenHash: tokenHash(workerToken),
+      lastActivityAt: now,
+      lastHeartbeatAt: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+  } catch (error) {
+    await deleteSnapshotBestEffort(snapshot.key);
+    if (isSqliteConstraint(error)) {
+      throw conflict("workspace was created concurrently; retry attach");
+    }
+    throw error;
+  }
+  markDatabaseDirty();
   const regionToUse = region ?? flyRegion;
-  const volume = await createWorkspaceVolume(id, regionToUse);
-  const volumeId = volume.id;
-  updateWorkspaceVolume.run({
-    id,
-    volumeId: volumeId ?? null,
-    region: regionToUse,
-    updatedAt: new Date().toISOString(),
-  });
-  const snapshotUrl = await signedSnapshotUrl(snapshot.key);
-  const machine = await createFlyWorkspaceMachine({
-    workspaceId: id,
-    accountId,
-    snapshotUrl,
-    workerToken,
-    repoName,
-    region: regionToUse,
-    volumeId,
-  });
+  let volumeId: string | undefined;
+  let machine: FlyMachine | undefined;
+  try {
+    const volume = await createWorkspaceVolume(id, regionToUse);
+    if (!volume.id) {
+      throw new Error("Fly create did not return a volume id");
+    }
+    volumeId = volume.id;
+    updateWorkspaceVolume.run({
+      id,
+      volumeId,
+      region: regionToUse,
+      updatedAt: new Date().toISOString(),
+    });
+    markDatabaseDirty();
+    const snapshotUrl = await signedSnapshotUrl(snapshot.key);
+    machine = await createFlyWorkspaceMachine({
+      workspaceId: id,
+      accountId,
+      snapshotUrl,
+      workerToken,
+      repoName,
+      region: regionToUse,
+      volumeId,
+    });
+    if (!machine.id) {
+      throw new Error("Fly create did not return a machine id");
+    }
+  } catch (error) {
+    if (machine?.id) {
+      await destroyFlyMachine(machine.id, true).catch(() => undefined);
+    }
+    if (volumeId) {
+      await destroyWorkspaceVolume(volumeId).catch(() => undefined);
+    }
+    updateWorkspaceVolume.run({ id, volumeId: null, region: regionToUse, updatedAt: new Date().toISOString() });
+    updateWorkspaceMachine.run({
+      id,
+      status: "failed",
+      machineId: null,
+      machineState: "provision-failed",
+      updatedAt: new Date().toISOString(),
+    });
+    markDatabaseDirty();
+    throw error;
+  }
   const started = workspaceStartResult(machine.state);
   updateWorkspaceMachine.run({
     id,
@@ -2316,6 +2934,7 @@ async function createWorkspace(
     machineState: started.machineState,
     updatedAt: new Date().toISOString(),
   });
+  markDatabaseDirty();
   const workspace = (findWorkspaceById.get(id) as Record<string, unknown> | undefined);
   const result = workspace ? rowToWorkspace(workspace) : {
     id,
@@ -2342,10 +2961,7 @@ async function reuseOrRestartWorkspace(
   ensureFlyConfigured();
   let machine: FlyMachine | null = null;
   if (workspace.machineId) {
-    machine = await flyRequest<FlyMachine>(
-      `/v1/apps/${encodeURIComponent(flyAppName)}/machines/${encodeURIComponent(workspace.machineId)}`,
-      { method: "GET" },
-    ).catch(() => null);
+    machine = await getFlyMachineIfPresent(workspace.machineId);
   }
   if (instanceHasLiveWorker("workspace", workspace.id)) {
     const now = new Date().toISOString();
@@ -2357,11 +2973,12 @@ async function reuseOrRestartWorkspace(
       updatedAt: now,
     });
     updateWorkspaceActivity.run({ id: workspace.id, lastActivityAt: now, updatedAt: now });
+    markDatabaseDirty();
     const next = findWorkspaceById.get(workspace.id) as Record<string, unknown> | undefined;
     return { ...(next ? rowToWorkspace(next) : { ...workspace, status: "running" }), isNew: false } as unknown as JsonRecord;
   }
   // Path 1: machine already running -> just attach.
-  if (machine && (machine.state === "started" || machine.state === "starting")) {
+  if (machine && (machine.state === "started" || machine.state === "starting" || machine.state === "running")) {
     const now = new Date().toISOString();
     updateWorkspaceMachine.run({
       id: workspace.id,
@@ -2371,6 +2988,7 @@ async function reuseOrRestartWorkspace(
       updatedAt: now,
     });
     updateWorkspaceActivity.run({ id: workspace.id, lastActivityAt: now, updatedAt: now });
+    markDatabaseDirty();
     const next = findWorkspaceById.get(workspace.id) as Record<string, unknown> | undefined;
     return { ...(next ? rowToWorkspace(next) : workspace), isNew: false } as unknown as JsonRecord;
   }
@@ -2416,6 +3034,7 @@ async function reuseOrRestartWorkspace(
         updatedAt: now,
       });
       updateWorkspaceActivity.run({ id: workspace.id, lastActivityAt: now, updatedAt: now });
+      markDatabaseDirty();
       const next = findWorkspaceById.get(workspace.id) as Record<string, unknown> | undefined;
       return { ...(next ? rowToWorkspace(next) : workspace), isNew: false } as unknown as JsonRecord;
     }
@@ -2427,56 +3046,119 @@ async function reuseOrRestartWorkspace(
   // or fingerprint mismatch (user's local state changed). Need a fresh
   // snapshot from the CLI. Also destroy + recreate the volume so the user
   // sees their new repo state instead of the cached one on the old disk.
-  if (workspace.volumeId) {
-    await destroyWorkspaceVolume(workspace.volumeId);
-  }
-  if (workspace.machineId && machine && machine.state !== "destroyed" && machine.state !== "destroying") {
-    await flyRequest<FlyMachine>(
-      `/v1/apps/${encodeURIComponent(flyAppName)}/machines/${encodeURIComponent(workspace.machineId)}?force=true`,
-      { method: "DELETE" },
-    ).catch(() => null);
-  }
   if (!snapshotInput) {
     throw badRequest("snapshot is required to (re)create this workspace");
   }
+  const requestedRegion = stringField(body, "region");
+  const sanitizedRegion = sanitizeRegion(requestedRegion);
+  if (requestedRegion && !sanitizedRegion) {
+    throw badRequest("region must be a three-letter Fly region code");
+  }
+  const region = sanitizedRegion ?? workspace.region ?? null;
+  const regionToUse = region ?? flyRegion;
+  // Upload and validate the replacement before touching the working machine.
+  // A failed S3 request must leave the existing workspace intact.
   const snapshotKey = (await storeSnapshot(workspace.accountId, body)).key;
+  // A Fly volume cannot be deleted while still attached. Destroy the machine
+  // first, then its volume. Never swallow either failure and provision a second
+  // set of resources alongside the first one.
+  try {
+    if (workspace.machineId && machine && machine.state !== "destroyed" && machine.state !== "destroying") {
+      await destroyFlyMachine(workspace.machineId, true);
+    }
+    if (workspace.volumeId) {
+      await destroyWorkspaceVolume(workspace.volumeId);
+    }
+  } catch (error) {
+    await deleteSnapshotBestEffort(snapshotKey);
+    throw error;
+  }
   const workerToken = `rdrw_${randomBytes(32).toString("base64url")}`;
   const now = new Date().toISOString();
-  const region = sanitizeRegion(stringField(body, "region")) ?? workspace.region ?? null;
-  const regionToUse = region ?? flyRegion;
-  let newVolumeId: string | undefined;
-  try {
-    const freshVolume = await createWorkspaceVolume(workspace.id, regionToUse);
-    newVolumeId = freshVolume.id;
-  } catch (error) {
-    // Volume name may still be reserved if the prior delete is still
-    // settling on Fly's side. Retry once with a timestamp suffix.
-    const message = error instanceof Error ? error.message : String(error);
-    console.warn(`recreate volume for ${workspace.id} failed (${message}); retrying with suffix`);
-    const suffixed = await createWorkspaceVolumeNamed(
-      workspaceVolumeName(workspace.id, String(Date.now()).slice(-6)),
-      regionToUse,
-    );
-    newVolumeId = suffixed.id;
-  }
-  updateWorkspaceVolume.run({
+  // Teardown succeeded, so make the database immediately stop advertising the
+  // old resources. Persist the replacement snapshot now; every later failure
+  // leaves a coherent, retryable failed row rather than stale machine/volume ids.
+  updateWorkspaceMachine.run({
     id: workspace.id,
-    volumeId: newVolumeId ?? null,
-    region: regionToUse,
-    updatedAt: new Date().toISOString(),
+    status: "queued",
+    machineId: null,
+    machineState: "destroyed",
+    updatedAt: now,
   });
+  updateWorkspaceVolume.run({ id: workspace.id, volumeId: null, region: regionToUse, updatedAt: now });
   updateWorkspaceSnapshot.run({ id: workspace.id, snapshotKey, snapshotFingerprint: incomingFingerprint, updatedAt: now });
-  updateWorkspaceWorkerToken.run({ id: workspace.id, workerTokenHash: tokenHash(workerToken), updatedAt: now });
-  const snapshotUrl = await signedSnapshotUrl(snapshotKey);
-  const fresh = await createFlyWorkspaceMachine({
-    workspaceId: workspace.id,
-    accountId: workspace.accountId,
-    snapshotUrl,
-    workerToken,
-    repoName: repoName ?? workspace.repoName,
-    region: regionToUse,
-    volumeId: newVolumeId,
-  });
+  markDatabaseDirty();
+  let newVolumeId: string | undefined;
+  let fresh: FlyMachine | undefined;
+  try {
+    try {
+      const freshVolume = await createWorkspaceVolume(workspace.id, regionToUse);
+      if (!freshVolume.id) {
+        throw new Error("Fly create did not return a volume id");
+      }
+      newVolumeId = freshVolume.id;
+    } catch (error) {
+      if (!isHttpStatus(error, 409) && !isHttpStatus(error, 422)) {
+        throw error;
+      }
+      // Volume name may still be reserved if the prior delete is settling.
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(`recreate volume for ${workspace.id} failed (${message}); retrying with suffix`);
+      const suffixed = await createWorkspaceVolumeNamed(
+        workspaceVolumeName(workspace.id, String(Date.now()).slice(-6)),
+        regionToUse,
+      );
+      if (!suffixed.id) {
+        throw new Error("Fly create did not return a volume id");
+      }
+      newVolumeId = suffixed.id;
+    }
+    updateWorkspaceVolume.run({
+      id: workspace.id,
+      volumeId: newVolumeId,
+      region: regionToUse,
+      updatedAt: new Date().toISOString(),
+    });
+    updateWorkspaceWorkerToken.run({ id: workspace.id, workerTokenHash: tokenHash(workerToken), updatedAt: now });
+    markDatabaseDirty();
+    disconnectWorker("workspace", workspace.id, "credentials rotated");
+    const snapshotUrl = await signedSnapshotUrl(snapshotKey);
+    fresh = await createFlyWorkspaceMachine({
+      workspaceId: workspace.id,
+      accountId: workspace.accountId,
+      snapshotUrl,
+      workerToken,
+      repoName: repoName ?? workspace.repoName,
+      region: regionToUse,
+      volumeId: newVolumeId,
+    });
+    if (!fresh.id) {
+      throw new Error("Fly create did not return a machine id");
+    }
+  } catch (error) {
+    if (fresh?.id) {
+      await destroyFlyMachine(fresh.id, true).catch(() => undefined);
+    }
+    if (newVolumeId) {
+      await destroyWorkspaceVolume(newVolumeId).catch(() => undefined);
+    }
+    updateWorkspaceVolume.run({ id: workspace.id, volumeId: null, region: regionToUse, updatedAt: new Date().toISOString() });
+    updateWorkspaceMachine.run({
+      id: workspace.id,
+      status: "failed",
+      machineId: null,
+      machineState: "provision-failed",
+      updatedAt: new Date().toISOString(),
+    });
+    markDatabaseDirty();
+    if (workspace.snapshotKey && workspace.snapshotKey !== snapshotKey) {
+      void deleteSnapshotBestEffort(workspace.snapshotKey);
+    }
+    throw error;
+  }
+  if (!fresh) {
+    throw new Error("Fly workspace provisioning returned no machine");
+  }
   const started = workspaceStartResult(fresh.state);
   updateWorkspaceMachine.run({
     id: workspace.id,
@@ -2486,20 +3168,18 @@ async function reuseOrRestartWorkspace(
     updatedAt: new Date().toISOString(),
   });
   updateWorkspaceActivity.run({ id: workspace.id, lastActivityAt: now, updatedAt: now });
+  markDatabaseDirty();
+  if (workspace.snapshotKey && workspace.snapshotKey !== snapshotKey) {
+    void deleteSnapshotBestEffort(workspace.snapshotKey);
+  }
   const next = findWorkspaceById.get(workspace.id) as Record<string, unknown> | undefined;
   return { ...(next ? rowToWorkspace(next) : workspace), isNew: true } as unknown as JsonRecord;
 }
 
-const FLY_REGIONS = new Set([
-  "ams","arn","atl","bog","bom","bos","cdg","den","dfw","ewr","eze","fra","gdl",
-  "gig","gru","hkg","iad","jnb","lax","lhr","mad","maa","mia","nrt","ord","otp",
-  "phx","qro","scl","sea","sin","sjc","syd","waw","yul","yyz",
-]);
-
 function sanitizeRegion(value: string | undefined): string | null {
   if (!value) return null;
   const lower = value.trim().toLowerCase();
-  return FLY_REGIONS.has(lower) ? lower : null;
+  return /^[a-z]{3}$/.test(lower) ? lower : null;
 }
 
 async function warmRestartWorkspaceMachine(params: {
@@ -2524,12 +3204,14 @@ async function warmRestartWorkspaceMachine(params: {
 
 async function startFlyMachine(machineId: string, label: string): Promise<FlyMachine> {
   let lastError: unknown;
-  for (let attempt = 1; attempt <= 12; attempt += 1) {
+  const maxAttempts = 8;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
-      return await flyRequest<FlyMachine>(
+      const started = await flyRequest<FlyMachine>(
         `/v1/apps/${encodeURIComponent(flyAppName)}/machines/${encodeURIComponent(machineId)}/start`,
         { method: "POST", body: {} },
       );
+      return started ?? { id: machineId, state: "starting" };
     } catch (error) {
       lastError = error;
       const machine = await flyRequest<FlyMachine>(
@@ -2539,8 +3221,8 @@ async function startFlyMachine(machineId: string, label: string): Promise<FlyMac
       if (machine?.state === "started" || machine?.state === "starting") {
         return machine;
       }
-      if (attempt < 12) {
-        await sleep(Math.min(5000, attempt * 2000));
+      if (attempt < maxAttempts) {
+        await sleep(Math.min(2_000, 250 * (2 ** (attempt - 1))));
       }
     }
   }
@@ -2599,12 +3281,10 @@ async function createFlyWorkspaceMachine(params: {
       name: flyMachineName("rudder-ws", params.workspaceId),
       region: params.region || flyRegion,
       config,
+      skip_launch: false,
     },
   });
-  if (!machine.id) {
-    return machine;
-  }
-  return await startFlyMachine(machine.id, `workspace ${params.workspaceId}`);
+  return machine;
 }
 
 type FlyVolume = {
@@ -2658,15 +3338,17 @@ async function createWorkspaceVolumeNamed(name: string, region: string): Promise
 }
 
 async function destroyWorkspaceVolume(volumeId: string): Promise<void> {
-  if (!flyApiToken || !flyAppName) {
-    return;
+  ensureFlyConfigured();
+  try {
+    await flyRequest<FlyVolume>(
+      `/v1/apps/${encodeURIComponent(flyAppName)}/volumes/${encodeURIComponent(volumeId)}`,
+      { method: "DELETE" },
+    );
+  } catch (error) {
+    if (!isHttpStatus(error, 404)) {
+      throw error;
+    }
   }
-  await flyRequest<FlyVolume>(
-    `/v1/apps/${encodeURIComponent(flyAppName)}/volumes/${encodeURIComponent(volumeId)}`,
-    { method: "DELETE" },
-  ).catch((error) => {
-    console.warn(`destroy volume ${volumeId} failed: ${error instanceof Error ? error.message : String(error)}`);
-  });
 }
 
 async function mutateWorkspace(workspace: Workspace, action: string): Promise<Workspace> {
@@ -2674,20 +3356,27 @@ async function mutateWorkspace(workspace: Workspace, action: string): Promise<Wo
     throw badRequest("workspace does not have a Fly machine yet");
   }
   let machine: FlyMachine;
-  if (action === "stop" || action === "pause") {
+  if (action === "stop") {
     machine = await flyRequest<FlyMachine>(
       `/v1/apps/${encodeURIComponent(flyAppName)}/machines/${encodeURIComponent(workspace.machineId)}/stop`,
       { method: "POST", body: { signal: "SIGTERM", timeout: "10s" } },
-    );
+    ) ?? {};
+  } else if (action === "pause") {
+    machine = await flyRequest<FlyMachine>(
+      `/v1/apps/${encodeURIComponent(flyAppName)}/machines/${encodeURIComponent(workspace.machineId)}/suspend`,
+      { method: "POST", body: {} },
+    ) ?? {};
   } else if (action === "resume") {
     machine = await startFlyMachine(workspace.machineId, `workspace ${workspace.id}`);
   } else {
     throw badRequest(`unsupported workspace action: ${action}`);
   }
   const started = workspaceStartResult(machine.state);
-  const status = action === "stop" || action === "pause"
-    ? "stopped" as WorkspaceStatus
-    : started.status;
+  const status: WorkspaceStatus = action === "stop"
+    ? "stopped"
+    : action === "pause"
+      ? "paused"
+      : started.status;
   const now = new Date().toISOString();
   updateWorkspaceMachine.run({
     id: workspace.id,
@@ -2696,30 +3385,47 @@ async function mutateWorkspace(workspace: Workspace, action: string): Promise<Wo
     machineState: action === "stop" || action === "pause" ? machine.state ?? null : started.machineState,
     updatedAt: now,
   });
+  markDatabaseDirty();
   const next = findWorkspaceById.get(workspace.id) as Record<string, unknown> | undefined;
   return next ? rowToWorkspace(next) : { ...workspace, status, machineState: machine.state };
 }
 
 async function handleWorkspaceHeartbeat(req: IncomingMessage, res: ServerResponse, workspaceId: string): Promise<void> {
+  const authRow = findWorkspaceById.get(workspaceId) as Record<string, unknown> | undefined;
+  if (!authRow) {
+    sendJson(res, 404, { error: "workspace not found" });
+    return;
+  }
+  requireWorkerBearer(req, authRow);
+  const body = await readJsonBody(req);
   const row = findWorkspaceById.get(workspaceId) as Record<string, unknown> | undefined;
   if (!row) {
     sendJson(res, 404, { error: "workspace not found" });
     return;
   }
   requireWorkerBearer(req, row);
-  const body = await readJsonBody(req);
   const state = stringField(body, "state");
-  const status: WorkspaceStatus = state === "failed" ? "failed" : "running";
+  const reportedStatus: WorkspaceStatus = state === "failed"
+    ? "failed"
+    : state === "completed" || state === "stopped"
+      ? "stopped"
+      : "running";
+  const previousStatus = String(row.status) as WorkspaceStatus;
+  const status = previousStatus === "failed"
+    ? previousStatus
+    : reportedStatus === "running" && (previousStatus === "stopped" || previousStatus === "paused")
+      ? previousStatus
+      : reportedStatus;
   const now = new Date().toISOString();
   updateWorkspaceHeartbeat.run({
     id: workspaceId,
     status,
     machineId: stringField(body, "machineId") ?? null,
-    machineState: state || status,
+    machineState: status === reportedStatus ? state || status : optionalString(row.machine_state) ?? status,
     lastHeartbeatAt: now,
-    lastActivityAt: now,
     updatedAt: now,
   });
+  markDatabaseDirty();
   sendJson(res, 200, { ok: true, status });
 }
 
@@ -2737,6 +3443,87 @@ async function handleWorkspaceSnapshotUrl(req: IncomingMessage, res: ServerRespo
   }
   const signed = await signedSnapshotUrl(snapshotKey);
   sendJson(res, 200, { url: signed, expiresInSeconds: 3600 });
+}
+
+async function handleSailSnapshotUrl(req: IncomingMessage, res: ServerResponse, sailId: string): Promise<void> {
+  const row = findSailById.get(sailId) as Record<string, unknown> | undefined;
+  if (!row) {
+    sendJson(res, 404, { error: "sail not found" });
+    return;
+  }
+  requireWorkerBearer(req, row);
+  const snapshotKey = optionalString(row.snapshot_key);
+  if (!snapshotKey) {
+    sendJson(res, 400, { error: "sail has no snapshot" });
+    return;
+  }
+  const signed = await signedSnapshotUrl(snapshotKey);
+  sendJson(res, 200, { url: signed, expiresInSeconds: 3600 });
+}
+
+const workspaceRefreshes = new Map<string, Promise<void>>();
+const lastWorkspaceRefreshAt = new Map<string, number>();
+
+async function refreshAccountWorkspaces(accountId: string): Promise<void> {
+  if (!flyApiToken || !flyAppName || Date.now() - (lastWorkspaceRefreshAt.get(accountId) ?? 0) < 5_000) {
+    return;
+  }
+  const existing = workspaceRefreshes.get(accountId);
+  if (existing) {
+    await existing;
+    return;
+  }
+  const refresh = mapWithConcurrency(listAccountWorkspaces(accountId), 8, refreshWorkspaceRow)
+    .then(() => lastWorkspaceRefreshAt.set(accountId, Date.now()))
+    .then(() => undefined)
+    .finally(() => {
+      if (workspaceRefreshes.get(accountId) === refresh) {
+        workspaceRefreshes.delete(accountId);
+      }
+    });
+  workspaceRefreshes.set(accountId, refresh);
+  await refresh;
+}
+
+async function refreshWorkspaceRow(workspace: Workspace): Promise<void> {
+  await withOperationLock(`workspace:${workspace.accountId}:${workspace.workspaceKey}`, async () => {
+    await refreshWorkspaceRowCore(workspace);
+  });
+}
+
+async function refreshWorkspaceRowCore(workspace: Workspace): Promise<void> {
+  if (!flyApiToken || !flyAppName || !workspace.machineId || instanceHasLiveWorker("workspace", workspace.id)) {
+    return;
+  }
+  const machine = await getFlyMachineIfPresent(workspace.machineId).catch(() => undefined);
+  if (machine === undefined) {
+    return;
+  }
+  const now = new Date().toISOString();
+  if (machine === null || machine.state === "destroyed" || machine.state === "destroying") {
+    updateWorkspaceMachine.run({
+      id: workspace.id,
+      status: "stopped",
+      machineId: null,
+      machineState: "destroyed",
+      updatedAt: now,
+    });
+    markDatabaseDirty();
+    return;
+  }
+  const status = flyStateToWorkspaceStatus(machine.state);
+  // Unknown transient Fly states should not regress a healthy heartbeat to queued.
+  if (status === "queued" && workspace.status === "running") {
+    return;
+  }
+  updateWorkspaceMachine.run({
+    id: workspace.id,
+    status,
+    machineId: machine.id ?? workspace.machineId,
+    machineState: machine.state ?? workspace.machineState ?? null,
+    updatedAt: now,
+  });
+  markDatabaseDirty();
 }
 
 function listAccountWorkspaces(accountId: string): Workspace[] {
@@ -2781,8 +3568,10 @@ function flyStateToWorkspaceStatus(state: string | undefined): WorkspaceStatus {
       return "running";
     case "stopped":
     case "stopping":
-    case "suspended":
       return "stopped";
+    case "suspended":
+    case "suspending":
+      return "paused";
     case "destroyed":
       return "stopped";
     case "failed":
@@ -2815,6 +3604,31 @@ function slugForWorkspaceId(value: string | undefined): string {
   return slug || "";
 }
 
+class ExternalHttpError extends Error {
+  constructor(readonly status: number, message: string) {
+    super(message);
+    this.name = "ExternalHttpError";
+  }
+}
+
+function isHttpStatus(error: unknown, status: number): boolean {
+  return error instanceof ExternalHttpError && error.status === status;
+}
+
+async function getFlyMachineIfPresent(machineId: string): Promise<FlyMachine | null> {
+  try {
+    return await flyRequest<FlyMachine>(
+      `/v1/apps/${encodeURIComponent(flyAppName)}/machines/${encodeURIComponent(machineId)}`,
+      { method: "GET" },
+    );
+  } catch (error) {
+    if (isHttpStatus(error, 404)) {
+      return null;
+    }
+    throw error;
+  }
+}
+
 async function flyRequest<T>(pathname: string, init: { method: string; body?: JsonRecord }): Promise<T> {
   ensureFlyConfigured();
   const headers: Record<string, string> = {
@@ -2830,11 +3644,15 @@ async function flyRequest<T>(pathname: string, init: { method: string; body?: Js
     method: init.method,
     headers,
     body,
+    signal: AbortSignal.timeout(EXTERNAL_REQUEST_TIMEOUT_MS),
   });
   const text = await response.text();
   const parsed = text ? parseJson(text) : null;
   if (!response.ok) {
-    throw new Error(responseErrorMessage(parsed) ?? text.trim() ?? `Fly API ${response.status}`);
+    throw new ExternalHttpError(
+      response.status,
+      responseErrorMessage(parsed) || text.trim() || `Fly API ${response.status}`,
+    );
   }
   return parsed as T;
 }
@@ -2843,7 +3661,27 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function mapWithConcurrency<T>(
+  values: readonly T[],
+  concurrency: number,
+  mapper: (value: T) => Promise<void>,
+): Promise<void> {
+  let next = 0;
+  const workers = Array.from({ length: Math.min(concurrency, values.length) }, async () => {
+    for (;;) {
+      const index = next;
+      next += 1;
+      if (index >= values.length) {
+        return;
+      }
+      await mapper(values[index]);
+    }
+  });
+  await Promise.all(workers);
+}
+
 async function githubUser(token: string): Promise<{ id: number | string; login: string; email?: string }> {
+  const verifiedEmail = githubVerifiedPrimaryEmail(token);
   const response = await fetch("https://api.github.com/user", {
     headers: {
       Authorization: `Bearer ${token}`,
@@ -2851,6 +3689,7 @@ async function githubUser(token: string): Promise<{ id: number | string; login: 
       "User-Agent": "rudder-cloud",
       "X-GitHub-Api-Version": "2022-11-28",
     },
+    signal: AbortSignal.timeout(EXTERNAL_REQUEST_TIMEOUT_MS),
   });
   const text = await response.text();
   const parsed = text ? parseJson(text) : null;
@@ -2868,7 +3707,7 @@ async function githubUser(token: string): Promise<{ id: number | string; login: 
   // SECURITY: the public profile `email` is user-mutable and may be unverified, so it
   // must never drive authorization (it gates admin via adminEmails). Use the
   // GitHub-verified primary email instead; undefined when none is verified.
-  const email = await githubVerifiedPrimaryEmail(token);
+  const email = await verifiedEmail;
   return { id, login, email };
 }
 
@@ -2881,6 +3720,7 @@ async function githubVerifiedPrimaryEmail(token: string): Promise<string | undef
         "User-Agent": "rudder-cloud",
         "X-GitHub-Api-Version": "2022-11-28",
       },
+      signal: AbortSignal.timeout(EXTERNAL_REQUEST_TIMEOUT_MS),
     });
     if (!response.ok) {
       return undefined;
@@ -2928,22 +3768,26 @@ async function postToSlack(text: string, threadTs?: string): Promise<string | un
 // later replies route back to this instance.
 async function announceSailToSlack(
   id: string,
+  accountId: string,
   task: string | undefined,
   repoName: string | undefined,
   runtime: SailRuntime,
 ): Promise<void> {
-  if (!slack.enabled) {
+  if (!slack.enabled || !slackAccountIds.has(accountId)) {
     return;
   }
+  const safeRepo = repoName ? escapeSlackText(repoName).replace(/`/g, "\u02cb") : "";
+  const safeTask = task ? escapeSlackText(task).replace(/\r?\n/g, "\n> ") : "";
   const lines = [
     `🚀 *${id}* launched on ${runtime === "fly" ? "Fly" : "your VM"}.`,
-    repoName ? `repo: \`${repoName}\`` : "",
-    task ? `> ${task}` : "",
+    safeRepo ? `repo: \`${safeRepo}\`` : "",
+    safeTask ? `> ${safeTask}` : "",
     "_Reply in this thread to talk to the agent._",
   ].filter(Boolean);
   const ts = await postToSlack(lines.join("\n"));
   if (ts) {
     updateSailSlackThread.run({ id, threadTs: ts, updatedAt: new Date().toISOString() });
+    markDatabaseDirty();
   }
 }
 
@@ -2962,20 +3806,29 @@ function scheduleOutputEcho(sailId: string, threadTs: string | undefined, delayM
 // tarballs) are larger, so authenticated upload routes pass a bigger explicit cap.
 const DEFAULT_MAX_BODY_BYTES = 2 * 1024 * 1024;
 const MAX_SNAPSHOT_BODY_BYTES = 256 * 1024 * 1024;
+const MAX_INFLIGHT_SNAPSHOT_BODY_BYTES = 384 * 1024 * 1024;
+let inflightSnapshotBodyBytes = 0;
+
+async function withSnapshotRequestBudget<T>(req: IncomingMessage, operation: () => Promise<T>): Promise<T> {
+  const declared = Number(req.headers["content-length"]);
+  const reservation = Number.isFinite(declared) && declared >= 0
+    ? Math.min(declared, MAX_SNAPSHOT_BODY_BYTES)
+    : MAX_SNAPSHOT_BODY_BYTES;
+  if (inflightSnapshotBodyBytes + reservation > MAX_INFLIGHT_SNAPSHOT_BODY_BYTES) {
+    req.once("error", () => undefined);
+    req.resume();
+    throw tooManyRequests("too many snapshot uploads in progress; retry shortly");
+  }
+  inflightSnapshotBodyBytes += reservation;
+  try {
+    return await operation();
+  } finally {
+    inflightSnapshotBodyBytes -= reservation;
+  }
+}
 
 async function readRawBody(req: IncomingMessage, maxBytes = DEFAULT_MAX_BODY_BYTES): Promise<string> {
-  const chunks: Buffer[] = [];
-  let total = 0;
-  for await (const chunk of req) {
-    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-    total += buf.length;
-    if (total > maxBytes) {
-      req.destroy();
-      throw payloadTooLarge();
-    }
-    chunks.push(buf);
-  }
-  return Buffer.concat(chunks).toString("utf8");
+  return (await readBodyBuffer(req, maxBytes)).toString("utf8");
 }
 
 async function handleSlackEvents(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -3023,7 +3876,10 @@ async function handleSlackEvents(req: IncomingMessage, res: ServerResponse): Pro
     }
     seenSlackEvents.add(eventId);
     if (seenSlackEvents.size > 2000) {
-      seenSlackEvents.clear();
+      const oldest = seenSlackEvents.values().next().value;
+      if (oldest) {
+        seenSlackEvents.delete(oldest);
+      }
     }
   }
   const event = body.event as Record<string, unknown> | undefined;
@@ -3044,6 +3900,9 @@ async function processSlackEvent(event: Record<string, unknown>): Promise<void> 
   if (type !== "app_mention" && type !== "message") {
     return;
   }
+  if (typeof event.channel !== "string" || event.channel !== slack.channel) {
+    return;
+  }
   const text = typeof event.text === "string" ? event.text : "";
   const ts = typeof event.ts === "string" ? event.ts : undefined;
   const threadTs = typeof event.thread_ts === "string" ? event.thread_ts : undefined;
@@ -3054,7 +3913,10 @@ async function processSlackEvent(event: Record<string, unknown>): Promise<void> 
   const threadSail = threadTs
     ? (findSailBySlackThread.get(threadTs) as Record<string, unknown> | undefined)
     : undefined;
-  if (type === "message" && !threadSail) {
+  const allowedThreadSail = threadSail && slackAccountIds.has(String(threadSail.account_id))
+    ? threadSail
+    : undefined;
+  if (type === "message" && !allowedThreadSail) {
     return;
   }
 
@@ -3072,6 +3934,13 @@ async function processSlackEvent(event: Record<string, unknown>): Promise<void> 
       );
       return;
     }
+    if (slackAccountIds.size === 0) {
+      await postToSlack(
+        "Slack control is not scoped to a Rudder account. Set RUDDER_SLACK_ACCOUNT_IDS before enabling commands.",
+        replyThread,
+      );
+      return;
+    }
   }
 
   switch (command.action) {
@@ -3079,45 +3948,60 @@ async function processSlackEvent(event: Record<string, unknown>): Promise<void> 
       await postToSlack(SLACK_HELP_TEXT, replyThread);
       return;
     case "list": {
-      const sails = listRunningSails.all().map(rowToSail);
+      const sails = (listRunningSails.all() as Record<string, unknown>[])
+        .filter((row) => slackAccountIds.has(String(row.account_id)))
+        .map(rowToSail);
       if (sails.length === 0) {
         await postToSlack("No running cloud instances. Start one with `rudder cloud \"<task>\"`.", replyThread);
         return;
       }
       const lines = sails.map((s) => {
         const live = instanceHasLiveWorker("sail", s.id) ? "🟢" : "⚪️";
-        return `${live} *${s.id}* — ${s.status}${s.task ? ` · ${s.task}` : ""}`;
+        return `${live} *${s.id}* — ${s.status}${s.task ? ` · ${escapeSlackText(s.task)}` : ""}`;
       });
       await postToSlack(`*Cloud instances*\n${lines.join("\n")}`, replyThread);
       return;
     }
     case "output": {
+      const row = findSailById.get(command.id) as Record<string, unknown> | undefined;
+      if (!row || !slackAccountIds.has(String(row.account_id))) {
+        await postToSlack(`No instance \`${escapeSlackText(command.id)}\`.`, replyThread);
+        return;
+      }
       const tail = readChannelOutput("sail", command.id);
       await postToSlack(
-        instanceHasLiveWorker("sail", command.id)
-          ? formatOutputForSlack(tail)
-          : `*${command.id}* is not connected.`,
+        tail
+          ? `${instanceHasLiveWorker("sail", command.id) ? "" : `*${command.id}* is not connected; last output:\n`}${formatOutputForSlack(tail)}`
+          : `*${command.id}* is not connected and has no retained output.`,
         replyThread,
       );
       return;
     }
     case "stop": {
       const row = findSailById.get(command.id) as Record<string, unknown> | undefined;
-      if (!row) {
+      if (!row || !slackAccountIds.has(String(row.account_id))) {
         await postToSlack(`No instance \`${command.id}\`.`, replyThread);
         return;
       }
       const accountId = String(row.account_id);
       const sail = getAccountSail(command.id, accountId);
       if (sail) {
-        await mutateSail(sail, accountId, "stop").catch(() => undefined);
+        try {
+          await withOperationLock(`sail:${sail.id}`, async () => mutateSail(sail, accountId, "stop"));
+        } catch (error) {
+          await postToSlack(
+            `Could not stop *${command.id}*: ${escapeSlackText(error instanceof Error ? error.message : String(error))}`,
+            replyThread,
+          );
+          return;
+        }
       }
       await postToSlack(`🛑 Stopping *${command.id}*.`, replyThread);
       return;
     }
     case "talk":
     case "thread-reply": {
-      const targetId = command.action === "talk" ? command.id : String(threadSail?.id || "");
+      const targetId = command.action === "talk" ? command.id : String(allowedThreadSail?.id || "");
       const message = command.message;
       if (!targetId) {
         await postToSlack("Which instance? Use `talk <id> <message>` or reply in an instance thread.", replyThread);
@@ -3128,6 +4012,10 @@ async function processSlackEvent(event: Record<string, unknown>): Promise<void> 
       }
       // Route the echo into the instance's own thread when we know it.
       const sailRow = findSailById.get(targetId) as Record<string, unknown> | undefined;
+      if (!sailRow || !slackAccountIds.has(String(sailRow.account_id))) {
+        await postToSlack(`No instance \`${escapeSlackText(targetId)}\`.`, replyThread);
+        return;
+      }
       const ownThread = optionalString(sailRow?.slack_thread_ts) ?? replyThread;
       const delivered = sendInputToChannel("sail", targetId, message, true);
       if (!delivered) {
@@ -3161,6 +4049,7 @@ function rowToSail(row: unknown): Sail {
     machineId: optionalString(value.machine_id),
     machineState: optionalString(value.machine_state),
     snapshotKey: optionalString(value.snapshot_key),
+    lastActivityAt: optionalString(value.last_activity_at),
     lastHeartbeatAt: optionalString(value.last_heartbeat_at),
     slackThreadTs: optionalString(value.slack_thread_ts),
     createdAt: String(value.created_at),
@@ -3214,7 +4103,15 @@ function requireBearer(req: IncomingMessage): { accountId: string; email?: strin
   if (!row) {
     throw unauthorized();
   }
-  touchToken.run(new Date().toISOString(), hash);
+  const now = new Date();
+  const touched = touchToken.run(
+    now.toISOString(),
+    hash,
+    new Date(now.getTime() - 60 * 60 * 1000).toISOString(),
+  );
+  if (touched.changes > 0) {
+    markDatabaseDirty();
+  }
   return {
     accountId: String(row.account_id),
     email: optionalString(row.email),
@@ -3232,7 +4129,7 @@ function requireWorkerBearer(req: IncomingMessage, sailRow: Record<string, unkno
   const authHeader = req.headers.authorization || "";
   const token = authHeader.startsWith("Bearer ") ? authHeader.slice("Bearer ".length).trim() : "";
   const expected = optionalString(sailRow.worker_token_hash);
-  if (!token.startsWith("rdrw_") || !expected || tokenHash(token) !== expected) {
+  if (!token.startsWith("rdrw_") || !expected || !timingSafeEqualString(tokenHash(token), expected)) {
     throw unauthorized();
   }
 }
@@ -3300,6 +4197,7 @@ function settingValue(key: string): string | undefined {
 
 function setSetting(key: string, value: string): void {
   upsertSetting.run({ key, value, updatedAt: new Date().toISOString() });
+  markDatabaseDirty();
 }
 
 function ensureColumn(table: string, column: string, definition: string): void {
@@ -3360,21 +4258,69 @@ function renderExpiredPage(res: ServerResponse, status = 400): void {
 }
 
 async function readJsonBody(req: IncomingMessage, maxBytes = DEFAULT_MAX_BODY_BYTES): Promise<Json> {
-  const chunks: Buffer[] = [];
-  let total = 0;
-  for await (const chunk of req) {
-    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-    total += buf.length;
-    if (total > maxBytes) {
-      req.destroy();
-      throw payloadTooLarge();
-    }
-    chunks.push(buf);
-  }
-  if (chunks.length === 0) {
+  const body = await readBodyBuffer(req, maxBytes);
+  if (body.length === 0) {
     return {};
   }
-  return JSON.parse(Buffer.concat(chunks).toString("utf8")) as Json;
+  try {
+    return JSON.parse(body.toString("utf8")) as Json;
+  } catch {
+    throw badRequest("invalid JSON body");
+  }
+}
+
+async function readBodyBuffer(req: IncomingMessage, maxBytes: number): Promise<Buffer> {
+  const declaredLength = Number(req.headers["content-length"]);
+  const declaredTooLarge = Number.isFinite(declaredLength) && declaredLength > maxBytes;
+  return await new Promise<Buffer>((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let total = 0;
+    let exceeded = declaredTooLarge;
+    let settled = false;
+    const cleanup = () => {
+      req.off("data", onData);
+      req.off("end", onEnd);
+      req.off("error", onError);
+      req.off("aborted", onAborted);
+    };
+    const fail = (error: Error) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(error);
+    };
+    const onData = (chunk: Buffer | string) => {
+      if (exceeded) {
+        return;
+      }
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      total += buf.length;
+      if (total > maxBytes) {
+        // Drain the rest without retaining it. Waiting for end lets clients
+        // reliably receive the 413 instead of seeing an ECONNRESET mid-upload.
+        exceeded = true;
+        chunks.length = 0;
+        return;
+      }
+      chunks.push(buf);
+    };
+    const onEnd = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (exceeded) {
+        reject(payloadTooLarge());
+      } else {
+        resolve(Buffer.concat(chunks, total));
+      }
+    };
+    const onError = (error: Error) => fail(error);
+    const onAborted = () => fail(badRequest("request aborted"));
+    req.on("data", onData);
+    req.once("end", onEnd);
+    req.once("error", onError);
+    req.once("aborted", onAborted);
+  });
 }
 
 function objectField(value: Json | undefined, field: string): JsonRecord | undefined {
@@ -3396,13 +4342,26 @@ function optionalString(value: unknown): string | undefined {
 }
 
 function sendJson(res: ServerResponse, status: number, body: Json): void {
-  res.writeHead(status, { "content-type": "application/json" });
+  setResponseSecurityHeaders(res);
+  res.writeHead(status, { "content-type": "application/json; charset=utf-8" });
   res.end(JSON.stringify(body));
 }
 
 function sendHtml(res: ServerResponse, body: string, status = 200): void {
+  setResponseSecurityHeaders(res);
   res.writeHead(status, { "content-type": "text/html; charset=utf-8" });
   res.end(body);
+}
+
+function setResponseSecurityHeaders(res: ServerResponse): void {
+  res.setHeader("cache-control", "no-store");
+  res.setHeader("x-content-type-options", "nosniff");
+  res.setHeader("referrer-policy", "no-referrer");
+  res.setHeader("x-frame-options", "DENY");
+  res.setHeader(
+    "content-security-policy",
+    "default-src 'none'; style-src 'unsafe-inline'; img-src https: data:; form-action https://github.com; base-uri 'none'; frame-ancestors 'none'",
+  );
 }
 
 function escapeHtml(value: string): string {
@@ -3466,6 +4425,16 @@ function responseErrorMessage(value: Json | null): string | undefined {
       : undefined;
 }
 
+function isSqliteConstraint(error: unknown): boolean {
+  return Boolean(
+    error
+      && typeof error === "object"
+      && "code" in error
+      && typeof error.code === "string"
+      && error.code.startsWith("SQLITE_CONSTRAINT"),
+  );
+}
+
 function appendHeader(existing: number | string | string[] | undefined, value: string): string[] {
   if (Array.isArray(existing)) {
     return [...existing, value];
@@ -3504,7 +4473,7 @@ function ensureFlyConfigured(): void {
     throw new Error("FLY_API_TOKEN is required to create Fly Machines");
   }
   if (!flyAppName) {
-    throw new Error("FLY_APP_NAME is required to create Fly Machines");
+    throw new Error("RUDDER_FLY_APP_NAME is required to create Fly Machines");
   }
   if (!flyWorkerImage) {
     throw new Error("RUDDER_WORKER_IMAGE is required to create Fly Machines");
@@ -3523,9 +4492,21 @@ function unauthorized(): Error {
   return error;
 }
 
+function conflict(message: string): Error {
+  const error = new Error(message);
+  (error as Error & { status?: number }).status = 409;
+  return error;
+}
+
 function payloadTooLarge(): Error {
   const error = new Error("payload too large");
   (error as Error & { status?: number }).status = 413;
+  return error;
+}
+
+function tooManyRequests(message: string): Error {
+  const error = new Error(message);
+  (error as Error & { status?: number }).status = 429;
   return error;
 }
 
@@ -3533,6 +4514,30 @@ function requiredEnv(name: string, fallback?: string): string {
   const value = process.env[name] || fallback;
   if (!value) {
     throw new Error(`${name} is required`);
+  }
+  return value;
+}
+
+function positiveIntegerEnv(name: string, fallback: number, min: number, max: number): number {
+  const raw = process.env[name]?.trim();
+  if (!raw) {
+    return fallback;
+  }
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < min || value > max) {
+    throw new Error(`${name} must be an integer between ${min} and ${max}`);
+  }
+  return value;
+}
+
+function nonNegativeIntegerEnv(name: string, fallback: number, max: number): number {
+  const raw = process.env[name]?.trim();
+  if (!raw) {
+    return fallback;
+  }
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < 0 || value > max) {
+    throw new Error(`${name} must be an integer between 0 and ${max}`);
   }
   return value;
 }

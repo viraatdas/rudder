@@ -1,427 +1,663 @@
 #!/usr/bin/env node
-// Rudder cloud worker supervisor.
-// 1. Stages the snapshot into /workspace.
-// 2. Spawns `rudder` (or `rudder codex --worktree --json "$task"`) under a PTY.
-// 3. Bridges PTY stdin/stdout to a control-plane WebSocket so a remote
-//    `rudder cloud attach <id>` session can drive the worker live.
+// Rudder Cloud worker supervisor. It stages a snapshot, runs Rudder under a
+// PTY, and bridges that PTY to the control plane. The supervisor stays root in
+// the official image while the PTY child runs as uid/gid 1500. This keeps the
+// worker bearer token and signed snapshot URL outside the coding agent's uid.
 
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
-import { WebSocket } from "ws";
 import pty from "node-pty";
+import { WebSocket } from "ws";
+import {
+  BoundedByteQueue,
+  buildChildEnv,
+  filterCapturedEnv,
+  isPathInside,
+  parseControlMessage,
+  reconnectDelay,
+  safePathSegment,
+  sanitizeRepoName,
+} from "./supervisor-lib.mjs";
 
-const cloudUrl = (process.env.RUDDER_CLOUD_URL || "").trim();
-const sailId = (process.env.RUDDER_SAIL_ID || "").trim();
-const workspaceId = (process.env.RUDDER_WORKSPACE_ID || "").trim();
-const workerToken = (process.env.RUDDER_WORKER_TOKEN || "").trim();
-const snapshotUrl = (process.env.RUDDER_SNAPSHOT_URL || "").trim();
-const repoName = (process.env.RUDDER_REPO_NAME || "repo").trim() || "repo";
-const task = process.env.RUDDER_TASK || "";
-const flyMachineId = (process.env.FLY_MACHINE_ID || "").trim();
+const env = process.env;
+const cloudUrl = (env.RUDDER_CLOUD_URL || "").trim();
+const sailId = (env.RUDDER_SAIL_ID || "").trim();
+const workspaceId = (env.RUDDER_WORKSPACE_ID || "").trim();
+const workerToken = (env.RUDDER_WORKER_TOKEN || "").trim();
+const snapshotUrl = (env.RUDDER_SNAPSHOT_URL || "").trim();
+const repoName = sanitizeRepoName(env.RUDDER_REPO_NAME);
+const task = env.RUDDER_TASK || "";
+const flyMachineId = (env.FLY_MACHINE_ID || "").trim();
+const workspaceRoot = path.resolve(env.RUDDER_WORKSPACE_ROOT || "/workspace");
+const agentUid = boundedInteger(env.RUDDER_AGENT_UID, 1500, 1, 2 ** 31 - 1);
+const agentGid = boundedInteger(env.RUDDER_AGENT_GID, 1500, 1, 2 ** 31 - 1);
+const agentHome = path.resolve(env.RUDDER_AGENT_HOME || "/home/rudder");
+const supervisorDir = path.join(workspaceRoot, ".rudder-supervisor");
+const maxPendingOutputBytes = boundedInteger(
+  env.RUDDER_WORKER_OUTPUT_BUFFER_BYTES,
+  1024 * 1024,
+  64 * 1024,
+  8 * 1024 * 1024,
+);
 
 const isWorkspaceMode = Boolean(workspaceId);
 const sessionId = isWorkspaceMode ? workspaceId : sailId;
 const sessionKind = isWorkspaceMode ? "workspace" : "sail";
+const canDropPrivileges = typeof process.getuid === "function" && process.getuid() === 0;
 
-if (!sessionId) {
-  console.error("RUDDER_WORKSPACE_ID or RUDDER_SAIL_ID is required");
-  process.exit(2);
-}
-
-if (alreadyStaged()) {
-  console.log(`Rudder worker re-using staged workspace`);
-  chdirToStagedWorkdir();
-} else {
-  // Fly Machines disks are ephemeral across stop+start, so the staged marker
-  // is missing on every cold boot. Try fetching a freshly signed snapshot URL
-  // from the control plane first, because the URL injected via env is signed
-  // at machine-create time and expires after one hour.
-  const freshUrl = await freshSnapshotUrl();
-  const effectiveSnapshotUrl = freshUrl || snapshotUrl;
-  if (!effectiveSnapshotUrl) {
-    console.error("RUDDER_SNAPSHOT_URL is required for first start (and control-plane refresh failed)");
-    process.exit(2);
-  }
-  if (freshUrl) {
-    console.log("Using freshly signed snapshot URL from control plane.");
-  } else {
-    console.log("Falling back to snapshot URL from env (control-plane refresh unavailable).");
-  }
-  stageSnapshot(effectiveSnapshotUrl);
-  markStaged();
-}
-
-const cwd = process.cwd();
-console.log(`Rudder worker ready in ${cwd}`);
-
-const capturedEnv = loadCapturedEnv();
-if (Object.keys(capturedEnv).length > 0) {
-  console.log(`Loaded ${Object.keys(capturedEnv).length} captured env var(s) from local snapshot.`);
-}
-
-const command = "rudder";
-// Cloud task sails run Claude Code by default: claude-code is installed in the
-// worker image and the snapshot carries its auth. Codex is NOT usable here —
-// Rudder's pinned Codex fork has no managed linux/x64 binary, so `rudder codex`
-// exits 1 on boot. Override with RUDDER_CLOUD_BACKEND only if a working codex
-// binary is provided via RUDDER_CODEX_BIN.
-const cloudBackend = (process.env.RUDDER_CLOUD_BACKEND || "claude").trim() || "claude";
-const args = isWorkspaceMode
-  ? []
-  : task ? [cloudBackend, "--worktree", task] : [];
-
-// Build the agent's environment from a COPY with the control-plane secrets removed.
-// The supervisor already captured these into module-level consts at startup, so the
-// spawned coding agent never needs them — and must not see them: a steered or
-// otherwise compromised agent could read the worker bearer token / presigned snapshot
-// URL straight out of its own environment and exfiltrate them. (We mutate childEnv,
-// not process.env, so the supervisor's own WebSocket auth is unaffected.)
-const childEnv = {
-  ...process.env,
-  ...capturedEnv,
-  TERM: "xterm-256color",
-  COLORTERM: "truecolor",
-  RUDDER_HEADLESS: "0",
-  RUDDER_CLOUD_WORKER: "1",
-  RUDDER_DISABLE_AUTO_UPDATE: "1",
-  RUDDER_DISABLE_UPDATE_CHECK: "1",
-  RUDDER_DISABLE_ONBOARD_INSTALL: "1",
-  // Rudder's pinned Codex fork has no linux/x64 binary, so any codex-binary
-  // resolution (e.g. when the snapshot carries codex auth) would otherwise crash
-  // even a claude run. Point it at the stock @openai/codex installed in the image
-  // so resolution always succeeds; the default backend is still claude.
-  RUDDER_CODEX_BIN: process.env.RUDDER_CODEX_BIN || "codex",
-};
-for (const secret of ["RUDDER_WORKER_TOKEN", "RUDDER_SNAPSHOT_URL", "RUDDER_CLOUD_TOKEN"]) {
-  delete childEnv[secret];
-}
-
-const term = pty.spawn(command, args, {
-  name: "xterm-256color",
-  cols: 120,
-  rows: 32,
-  cwd,
-  env: childEnv,
-});
-
+let term = null;
 let ws = null;
-let wsReadyPromise = connect();
-let lastReportedState = "running";
-let exited = false;
-let heartbeatTimer = setInterval(reportHeartbeat, 30000);
-reportHeartbeat();
-
-term.onData((data) => {
-  process.stdout.write(data);
-  const socket = ws;
-  if (socket && socket.readyState === WebSocket.OPEN) {
-    socket.send(Buffer.from(data, "utf8"), { binary: true });
-  }
+let connectSocket = null;
+let reconnectTimer = null;
+let keepaliveTimer = null;
+let reconnectAttempt = 0;
+let heartbeatTimer = null;
+let forceExitTimer = null;
+let sendInFlight = false;
+let intentionalSignal = null;
+let terminalExited = false;
+let finalizing = false;
+let stdoutBackpressured = false;
+let lastReportedState = "starting";
+let loggedDroppedBytes = 0;
+const outbound = new BoundedByteQueue(maxPendingOutputBytes);
+const unprivilegedEnv = buildChildEnv(env, {}, {
+  HOME: agentHome,
+  USER: "rudder",
+  LOGNAME: "rudder",
+  SHELL: "/bin/bash",
 });
 
-term.onExit(({ exitCode, signal }) => {
-  exited = true;
-  clearInterval(heartbeatTimer);
-  const state = exitCode === 0 ? "completed" : "failed";
-  reportDone(state, exitCode ?? (signal ? 128 + signal : 1));
-  const socket = ws;
-  if (socket && socket.readyState === WebSocket.OPEN) {
-    socket.send(JSON.stringify({ type: "exit", code: exitCode, signal: signal ?? null }));
-    socket.close(1000, "worker-exit");
-  }
-  setTimeout(() => process.exit(exitCode ?? 1), 250).unref();
-});
+for (const signal of ["SIGTERM", "SIGINT"]) {
+  process.once(signal, () => beginShutdown(signal));
+}
 
-process.on("SIGTERM", () => {
-  if (!exited) {
-    term.kill("SIGTERM");
+try {
+  await main();
+} catch (error) {
+  const message = error instanceof Error ? error.message : String(error);
+  console.error(`Rudder worker startup failed: ${message}`);
+  if (!intentionalSignal) {
+    await reportState("failed", { exitCode: 1, phase: "startup" }, 2);
   }
-});
-process.on("SIGINT", () => {
-  if (!exited) {
-    term.kill("SIGINT");
+  process.exit(intentionalSignal ? signalExitCode(intentionalSignal) : 1);
+}
+
+async function main() {
+  if (!sessionId) {
+    throw new Error("RUDDER_WORKSPACE_ID or RUDDER_SAIL_ID is required");
   }
-});
+  ensureWorkspaceRoot();
+  void reportState("starting");
+
+  if (alreadyStaged()) {
+    console.log("Rudder worker re-using staged workspace");
+    chdirToStagedWorkdir();
+  } else {
+    const freshUrl = await freshSnapshotUrl();
+    const effectiveSnapshotUrl = freshUrl || snapshotUrl;
+    if (!effectiveSnapshotUrl) {
+      throw new Error("RUDDER_SNAPSHOT_URL is required for first start (and control-plane refresh failed)");
+    }
+    console.log(freshUrl
+      ? "Using a freshly signed snapshot URL from the control plane."
+      : "Using the snapshot URL supplied at machine creation.");
+    stageSnapshot(effectiveSnapshotUrl);
+    markStaged();
+  }
+
+  const cwd = process.cwd();
+  console.log(`Rudder worker ready in ${cwd}`);
+  const capturedEnv = loadCapturedEnv();
+  if (Object.keys(capturedEnv).length > 0) {
+    console.log(`Loaded ${Object.keys(capturedEnv).length} captured env var(s) from local snapshot.`);
+  }
+
+  const cloudBackend = (env.RUDDER_CLOUD_BACKEND || "claude").trim() || "claude";
+  if (!new Set(["claude", "codex", "acpx"]).has(cloudBackend)) {
+    throw new Error(`Unsupported RUDDER_CLOUD_BACKEND: ${cloudBackend}`);
+  }
+  // `--` is essential: a task beginning with --model/--cwd/etc. is user text,
+  // not a Rudder supervisor flag.
+  const args = isWorkspaceMode
+    ? []
+    : task ? [cloudBackend, "--worktree", "--", task] : [];
+  const childEnv = buildChildEnv(env, capturedEnv, {
+    HOME: agentHome,
+    USER: "rudder",
+    LOGNAME: "rudder",
+    SHELL: "/bin/bash",
+    TERM: "xterm-256color",
+    COLORTERM: "truecolor",
+    RUDDER_HEADLESS: "0",
+    RUDDER_CLOUD_WORKER: "1",
+    RUDDER_DISABLE_AUTO_UPDATE: "1",
+    RUDDER_DISABLE_UPDATE_CHECK: "1",
+    RUDDER_DISABLE_ONBOARD_INSTALL: "1",
+    RUDDER_CODEX_BIN: env.RUDDER_CODEX_BIN || "codex",
+  });
+
+  const ptyOptions = {
+    name: "xterm-256color",
+    cols: 120,
+    rows: 32,
+    cwd,
+    env: childEnv,
+    ...(canDropPrivileges ? { uid: agentUid, gid: agentGid } : {}),
+  };
+  if (!canDropPrivileges) {
+    console.warn("Worker supervisor is not root; PTY credential isolation is unavailable.");
+  }
+  const rudderCommand = (env.RUDDER_WORKER_COMMAND || "rudder").trim() || "rudder";
+  term = env.RUDDER_WORKER_TEST_PIPE === "1"
+    ? spawnPipeTerminal(rudderCommand, args, ptyOptions)
+    : pty.spawn(rudderCommand, args, ptyOptions);
+
+  term.onData((data) => {
+    if (!stdoutBackpressured && !process.stdout.write(data)) {
+      stdoutBackpressured = true;
+      process.stdout.once("drain", () => { stdoutBackpressured = false; });
+    }
+    outbound.push(Buffer.from(data, "utf8"));
+    flushOutbound();
+  });
+  term.onExit((event) => {
+    void finalizeExit(event);
+  });
+
+  connect();
+  lastReportedState = "running";
+  void reportState("running");
+  heartbeatTimer = setInterval(() => void reportState(lastReportedState), 30_000);
+  heartbeatTimer.unref?.();
+}
 
 function connect() {
-  if (!cloudUrl || !sessionId || !workerToken) {
-    return Promise.resolve(null);
+  if (
+    !cloudUrl
+    || !workerToken
+    || (terminalExited && (!finalizing || outbound.length === 0))
+    || ws?.readyState === WebSocket.OPEN
+    || connectSocket?.readyState === WebSocket.CONNECTING
+  ) {
+    return;
   }
-  const wsUrl = cloudUrl.replace(/^http/, "ws").replace(/\/$/, "")
-    + `/api/rudder/${sessionKind}/${encodeURIComponent(sessionId)}/worker`;
-  return new Promise((resolve) => {
-    let connected = false;
-    const socket = new WebSocket(wsUrl, {
-      headers: { authorization: `Bearer ${workerToken}` },
-    });
-    socket.binaryType = "nodebuffer";
-    socket.on("open", () => {
-      connected = true;
-      ws = socket;
-      socket.send(JSON.stringify({
-        type: "hello",
-        cols: term.cols,
-        rows: term.rows,
-        sessionKind,
-        sessionId,
-      }));
-      resolve(socket);
-    });
-    socket.on("message", (data, isBinary) => {
-      if (exited) {
+  let wsUrl;
+  try {
+    const url = new URL(cloudUrl);
+    if (url.protocol !== "http:" && url.protocol !== "https:") {
+      throw new Error("RUDDER_CLOUD_URL must use http or https");
+    }
+    url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+    url.pathname = `/api/rudder/${sessionKind}/${encodeURIComponent(sessionId)}/worker`;
+    url.search = "";
+    url.hash = "";
+    wsUrl = url.toString();
+  } catch (error) {
+    console.error(`Worker relay URL is invalid: ${error instanceof Error ? error.message : String(error)}`);
+    return;
+  }
+
+  const socket = new WebSocket(wsUrl, {
+    headers: { authorization: `Bearer ${workerToken}` },
+    handshakeTimeout: 10_000,
+    maxPayload: 1024 * 1024,
+  });
+  connectSocket = socket;
+  socket.binaryType = "nodebuffer";
+  let alive = true;
+
+  socket.on("open", () => {
+    if (terminalExited && outbound.length === 0) {
+      socket.close(1000, "worker-exit");
+      return;
+    }
+    connectSocket = null;
+    ws = socket;
+    reconnectAttempt = 0;
+    alive = true;
+    socket.send(JSON.stringify({
+      type: "hello",
+      cols: term?.cols || 120,
+      rows: term?.rows || 32,
+      sessionKind,
+      sessionId,
+    }));
+    keepaliveTimer = setInterval(() => {
+      if (socket.readyState !== WebSocket.OPEN) return;
+      if (!alive) {
+        socket.terminate();
         return;
       }
-      if (isBinary && Buffer.isBuffer(data)) {
-        term.write(data.toString("utf8"));
-        return;
-      }
-      const text = Buffer.isBuffer(data) ? data.toString("utf8") : String(data);
-      handleControl(text);
-    });
-    const reschedule = () => {
-      if (exited) {
-        return;
-      }
-      ws = null;
-      setTimeout(() => { wsReadyPromise = connect(); }, 2000);
-    };
-    socket.on("close", reschedule);
-    socket.on("error", () => {
-      if (!connected) {
-        try { socket.terminate(); } catch { /* ignore */ }
-        resolve(null);
-      }
-    });
+      alive = false;
+      try { socket.ping(); } catch { socket.terminate(); }
+    }, 20_000);
+    keepaliveTimer.unref?.();
+    flushOutbound();
+  });
+  socket.on("pong", () => { alive = true; });
+  socket.on("message", (data, isBinary) => {
+    if (terminalExited || !term) return;
+    if (isBinary) {
+      const input = Buffer.isBuffer(data) ? data : Buffer.from(data);
+      term.write(input.toString("utf8"));
+      return;
+    }
+    handleControl(Buffer.isBuffer(data) ? data.toString("utf8") : String(data));
+  });
+  socket.on("unexpected-response", (_request, response) => {
+    console.warn(`Worker relay rejected the connection with HTTP ${response.statusCode || "unknown"}.`);
+  });
+  socket.on("error", (error) => {
+    if (!terminalExited && reconnectAttempt === 0) {
+      console.warn(`Worker relay connection failed: ${error.message}`);
+    }
+  });
+  socket.on("close", () => {
+    if (keepaliveTimer) clearInterval(keepaliveTimer);
+    keepaliveTimer = null;
+    if (connectSocket === socket) connectSocket = null;
+    if (ws === socket) ws = null;
+    if (!terminalExited) scheduleReconnect();
+  });
+}
+
+function scheduleReconnect() {
+  if (reconnectTimer || terminalExited) return;
+  const delayMs = reconnectDelay(reconnectAttempt++);
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connect();
+  }, delayMs);
+}
+
+function flushOutbound() {
+  const socket = ws;
+  if (!socket || socket.readyState !== WebSocket.OPEN || sendInFlight) return;
+  const chunk = outbound.shift();
+  if (!chunk) return;
+  sendInFlight = true;
+  socket.send(chunk, { binary: true }, (error) => {
+    sendInFlight = false;
+    if (error) {
+      outbound.unshift(chunk);
+      try { socket.terminate(); } catch { /* ignore */ }
+      return;
+    }
+    if (outbound.droppedBytes > loggedDroppedBytes) {
+      console.warn(`Worker relay dropped ${outbound.droppedBytes - loggedDroppedBytes} byte(s) of old output under backpressure.`);
+      loggedDroppedBytes = outbound.droppedBytes;
+    }
+    flushOutbound();
   });
 }
 
 function handleControl(text) {
-  let payload = null;
+  const control = parseControlMessage(text);
+  if (!control || !term) return;
   try {
-    payload = JSON.parse(text);
+    if (control.type === "resize") {
+      term.resize(control.cols, control.rows);
+    } else if (control.type === "signal") {
+      term.kill(control.name);
+    }
   } catch {
-    return;
-  }
-  if (!payload || typeof payload !== "object") {
-    return;
-  }
-  if (payload.type === "resize" && Number.isFinite(payload.cols) && Number.isFinite(payload.rows)) {
-    const cols = Math.max(20, Math.min(500, Math.floor(payload.cols)));
-    const rows = Math.max(5, Math.min(200, Math.floor(payload.rows)));
-    try {
-      term.resize(cols, rows);
-    } catch {
-      // ignore
-    }
-    return;
-  }
-  if (payload.type === "signal" && typeof payload.name === "string") {
-    try {
-      term.kill(payload.name);
-    } catch {
-      // ignore
-    }
+    // The PTY may have exited between parsing and dispatch.
   }
 }
 
-function loadCapturedEnv() {
-  const candidates = [
-    "/workspace/unpacked/env/cloud-env.json",
-    path.join(process.cwd(), ".rudder", "cloud-env.json"),
-  ];
-  for (const candidate of candidates) {
-    if (!fs.existsSync(candidate)) {
-      continue;
-    }
-    try {
-      const raw = fs.readFileSync(candidate, "utf8");
-      const parsed = JSON.parse(raw);
-      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-        const out = {};
-        for (const [k, v] of Object.entries(parsed)) {
-          if (typeof k === "string" && typeof v === "string") {
-            out[k] = v;
-          }
-        }
-        return out;
-      }
-    } catch (error) {
-      console.error(`Failed to load captured env ${candidate}: ${error.message}`);
-    }
+function beginShutdown(signal) {
+  if (intentionalSignal) return;
+  intentionalSignal = signal;
+  if (!term || terminalExited) {
+    process.exit(signalExitCode(signal));
   }
-  return {};
+  try { term.kill(signal); } catch { /* finalize below */ }
+  forceExitTimer = setTimeout(() => {
+    try { term?.kill("SIGKILL"); } catch { /* ignore */ }
+    process.exit(signalExitCode(signal));
+  }, 8_000);
 }
 
-function stagedMarkerPath() {
-  return path.join("/workspace", ".rudder-staged.json");
+async function finalizeExit({ exitCode, signal }) {
+  if (finalizing) return;
+  finalizing = true;
+  terminalExited = true;
+  if (heartbeatTimer) clearInterval(heartbeatTimer);
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  if (forceExitTimer) clearTimeout(forceExitTimer);
+  const code = intentionalSignal
+    ? signalExitCode(intentionalSignal)
+    : exitCode ?? (signal ? 128 + signal : 1);
+  const state = code === 0 ? "completed" : "failed";
+  lastReportedState = state;
+
+  // Intentional Fly/Docker stops are lifecycle operations, not task failures.
+  // The control plane records the requested paused/stopped state itself.
+  await waitForOutboundDrain(2_000);
+  if (!intentionalSignal) {
+    await reportState(state, { exitCode: code }, 3);
+  }
+
+  const socket = ws;
+  if (socket?.readyState === WebSocket.OPEN) {
+    try {
+      socket.send(JSON.stringify({
+        type: "exit",
+        code,
+        signal: intentionalSignal || signal || null,
+      }));
+      socket.close(1000, "worker-exit");
+    } catch {
+      // ignore
+    }
+  }
+  process.exit(code);
+}
+
+async function waitForOutboundDrain(timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while ((outbound.length > 0 || sendInFlight) && Date.now() < deadline) {
+    if (!ws && !connectSocket && cloudUrl && workerToken) connect();
+    flushOutbound();
+    await delay(20);
+  }
+}
+
+function ensureWorkspaceRoot() {
+  fs.mkdirSync(workspaceRoot, { recursive: true });
+  const workspaceStat = fs.lstatSync(workspaceRoot);
+  if (!workspaceStat.isDirectory() || workspaceStat.isSymbolicLink()) {
+    throw new Error("RUDDER_WORKSPACE_ROOT must be a real directory");
+  }
+  if (canDropPrivileges) {
+    // Root-owned sticky workspace root: the agent can create worktrees, but
+    // cannot replace the root-owned supervisor metadata directory.
+    fs.chownSync(workspaceRoot, 0, 0);
+    fs.chmodSync(workspaceRoot, 0o1777);
+  }
+  const existing = fs.lstatSync(supervisorDir, { throwIfNoEntry: false });
+  if (existing && (!existing.isDirectory() || existing.isSymbolicLink())) {
+    fs.rmSync(supervisorDir, { recursive: true, force: true });
+  }
+  fs.mkdirSync(supervisorDir, { recursive: true, mode: 0o700 });
+  fs.chmodSync(supervisorDir, 0o700);
+  if (canDropPrivileges) fs.chownSync(supervisorDir, 0, 0);
+  fs.mkdirSync(agentHome, { recursive: true });
+  const homeStat = fs.lstatSync(agentHome);
+  if (!homeStat.isDirectory() || homeStat.isSymbolicLink()) {
+    throw new Error("RUDDER_AGENT_HOME must be a real directory");
+  }
+  if (canDropPrivileges) fs.chownSync(agentHome, agentUid, agentGid);
+}
+
+function markerPath() {
+  return path.join(supervisorDir, "staged.json");
 }
 
 function alreadyStaged() {
   try {
-    const raw = fs.readFileSync(stagedMarkerPath(), "utf8");
-    const parsed = JSON.parse(raw);
-    return typeof parsed?.workdir === "string" && fs.existsSync(parsed.workdir);
+    const stat = fs.lstatSync(markerPath());
+    if (!stat.isFile() || stat.isSymbolicLink() || (canDropPrivileges && stat.uid !== 0)) return false;
+    const parsed = JSON.parse(fs.readFileSync(markerPath(), "utf8"));
+    if (
+      parsed?.sessionKind !== sessionKind
+      || parsed?.sessionId !== sessionId
+      || parsed?.repoName !== repoName
+    ) return false;
+    if (typeof parsed?.workdir !== "string") return false;
+    const resolved = path.resolve(parsed.workdir);
+    const workdirStat = fs.lstatSync(resolved);
+    return isPathInside(workspaceRoot, resolved) && workdirStat.isDirectory() && !workdirStat.isSymbolicLink();
   } catch {
-    return false;
+    // Upgrade path from the former agent-writable marker. Only accept the one
+    // exact repository directory this machine is expected to use, then replace
+    // it with root-owned supervisor metadata.
+    try {
+      const legacyPath = path.join(workspaceRoot, ".rudder-staged.json");
+      const legacyStat = fs.lstatSync(legacyPath);
+      if (!legacyStat.isFile() || legacyStat.isSymbolicLink()) return false;
+      const parsed = JSON.parse(fs.readFileSync(legacyPath, "utf8"));
+      const resolved = path.resolve(parsed?.workdir || "");
+      const expected = path.join(workspaceRoot, repoName);
+      const workdirStat = fs.lstatSync(resolved);
+      if (resolved !== expected || !workdirStat.isDirectory() || workdirStat.isSymbolicLink()) return false;
+      markStaged(resolved);
+      return true;
+    } catch {
+      return false;
+    }
   }
 }
 
 function chdirToStagedWorkdir() {
-  const raw = fs.readFileSync(stagedMarkerPath(), "utf8");
-  const parsed = JSON.parse(raw);
+  const parsed = JSON.parse(fs.readFileSync(markerPath(), "utf8"));
   process.chdir(parsed.workdir);
 }
 
-function markStaged() {
-  try {
-    const payload = { workdir: process.cwd(), stagedAt: new Date().toISOString() };
-    fs.writeFileSync(stagedMarkerPath(), JSON.stringify(payload));
-  } catch {
-    // ignore
-  }
+function markStaged(workdir = process.cwd()) {
+  const payload = {
+    version: 2,
+    sessionKind,
+    sessionId,
+    repoName,
+    workdir,
+    stagedAt: new Date().toISOString(),
+  };
+  writeFileAtomic(markerPath(), `${JSON.stringify(payload)}\n`, 0o600, false);
 }
 
 async function freshSnapshotUrl() {
-  const id = (process.env.RUDDER_WORKSPACE_ID || "").trim();
-  const token = (process.env.RUDDER_WORKER_TOKEN || "").trim();
-  const base = (process.env.RUDDER_CLOUD_URL || "").trim();
-  if (!id || !token || !base) return null;
+  if (!workerToken || !cloudUrl) return null;
   try {
-    const url = `${base.replace(/\/$/, "")}/api/rudder/workspace/${encodeURIComponent(id)}/snapshot-url`;
-    const res = await fetch(url, {
-      headers: { authorization: `Bearer ${token}` },
+    const base = new URL(cloudUrl);
+    base.pathname = `/api/rudder/${sessionKind}/${encodeURIComponent(sessionId)}/snapshot-url`;
+    base.search = "";
+    base.hash = "";
+    const response = await fetch(base, {
+      headers: { authorization: `Bearer ${workerToken}` },
+      signal: AbortSignal.timeout(8_000),
     });
-    if (!res.ok) {
-      console.warn(`snapshot-url refresh: HTTP ${res.status}`);
+    if (!response.ok) {
+      console.warn(`snapshot-url refresh: HTTP ${response.status}`);
       return null;
     }
-    const data = await res.json();
-    return typeof data?.url === "string" ? data.url : null;
+    const data = await response.json();
+    return typeof data?.url === "string" && /^https?:\/\//.test(data.url) ? data.url : null;
   } catch (error) {
-    console.warn(`snapshot-url refresh failed: ${error?.message || error}`);
+    console.warn(`snapshot-url refresh failed: ${error instanceof Error ? error.message : String(error)}`);
     return null;
   }
 }
 
 function stageSnapshot(downloadUrl) {
-  fs.mkdirSync("/workspace", { recursive: true });
-  process.chdir("/workspace");
-  console.log("Downloading Rudder snapshot...");
-  sh(`curl -fsSL ${shQuote(downloadUrl)} -o snapshot.tgz`);
-  fs.mkdirSync("unpacked", { recursive: true });
-  sh("tar -xzf snapshot.tgz -C unpacked");
-  if (fs.existsSync("unpacked/home")) {
-    console.log("Restoring selected HOME config...");
-    const home = os.homedir() || process.env.HOME || "/root";
-    shSoft(`cp -R unpacked/home/. ${shQuote(home + "/")} 2>/dev/null`);
-    shSoft(`find ${shQuote(home)} -name '._*' -delete 2>/dev/null`);
+  const nonce = `${process.pid}-${Date.now()}`;
+  const unpackRoot = path.join(workspaceRoot, `.rudder-stage-${nonce}`);
+  const archivePath = path.join(unpackRoot, "snapshot.tgz");
+  prepareAgentDir(unpackRoot);
+  try {
+    console.log("Downloading Rudder snapshot...");
+    runCommand("curl", [
+      "--fail",
+      "--location",
+      "--silent",
+      "--show-error",
+      "--retry", "4",
+      "--retry-delay", "1",
+      "--retry-all-errors",
+      "--connect-timeout", "10",
+      "--max-time", String(boundedInteger(env.RUDDER_SNAPSHOT_DOWNLOAD_TIMEOUT, 600, 30, 3600)),
+      "--max-filesize", String(boundedInteger(env.RUDDER_SNAPSHOT_MAX_BYTES, 512 * 1024 * 1024, 1024, 2 ** 31 - 1)),
+      "--output", archivePath,
+      downloadUrl,
+    ], { label: "snapshot download" });
+    if (canDropPrivileges) fs.chownSync(archivePath, agentUid, agentGid);
+    runCommand("tar", ["-xzf", archivePath, "-C", unpackRoot, "--no-same-owner"], {
+      label: "snapshot extraction",
+      asAgent: true,
+    });
+    fs.rmSync(archivePath, { force: true });
+
+    const repoSource = path.join(unpackRoot, "repo");
+    if (!safeExtractedEntry(unpackRoot, repoSource, "directory")) {
+      throw new Error("snapshot is malformed: missing a safe repo/ directory");
+    }
+    restoreHome(unpackRoot);
+    persistCapturedEnv(unpackRoot);
+    const workdir = path.join(workspaceRoot, repoName);
+    if (!isPathInside(workspaceRoot, workdir) || workdir === supervisorDir) {
+      throw new Error("snapshot repository path is invalid");
+    }
+    fs.rmSync(workdir, { recursive: true, force: true });
+    fs.renameSync(repoSource, workdir);
+    process.chdir(workdir);
+    initializeGitBaseline(workdir);
+    stageMigratedAgents(workdir, unpackRoot);
+    fs.rmSync(unpackRoot, { recursive: true, force: true });
+  } catch (error) {
+    fs.rmSync(unpackRoot, { recursive: true, force: true });
+    throw error;
   }
-  let workdir;
-  if (fs.existsSync("unpacked/repo")) {
-    workdir = path.join("/workspace", repoName);
-    fs.mkdirSync(workdir, { recursive: true });
-    sh(`cp -R unpacked/repo/. ${shQuote(workdir + "/")}`);
-  } else {
-    workdir = "/workspace/unpacked";
-  }
-  process.chdir(workdir);
-  if (!fs.existsSync(".git")) {
-    console.log("Initializing cloud git baseline...");
-    sh("git init -q");
-    sh('git config user.email "rudder-cloud@local"');
-    sh('git config user.name "Rudder Cloud"');
-    sh("git add -A");
-    sh('git commit -qm "rudder cloud baseline" || true');
-  }
-  stageMigratedAgents(workdir);
 }
 
-function stageMigratedAgents(workdir) {
-  const migrationPath = "/workspace/unpacked/migration.json";
-  if (!fs.existsSync(migrationPath)) {
-    return;
+function restoreHome(unpackRoot) {
+  const source = path.join(unpackRoot, "home");
+  if (!safeExtractedEntry(unpackRoot, source, "directory")) return;
+  console.log("Restoring selected HOME config...");
+  runCommand("cp", ["-a", `${source}/.`, `${agentHome}/`], {
+    label: "HOME restore",
+    asAgent: true,
+  });
+  runCommand("find", [agentHome, "-name", "._*", "-delete"], {
+    label: "HOME metadata cleanup",
+    asAgent: true,
+    allowFailure: true,
+  });
+}
+
+function persistCapturedEnv(unpackRoot) {
+  const source = path.join(unpackRoot, "env", "cloud-env.json");
+  if (!safeExtractedEntry(unpackRoot, source, "file")) return;
+  // Parse and filter before persisting so a crafted snapshot cannot preserve
+  // supervisor/runtime variables for a later warm start.
+  try {
+    const filtered = filterCapturedEnv(JSON.parse(fs.readFileSync(source, "utf8")));
+    writeFileAtomic(
+      path.join(supervisorDir, "cloud-env.json"),
+      `${JSON.stringify(filtered)}\n`,
+      0o600,
+      false,
+    );
+  } catch (error) {
+    console.warn(`Ignoring invalid captured environment: ${error instanceof Error ? error.message : String(error)}`);
   }
+}
+
+function loadCapturedEnv() {
+  const candidates = [
+    { root: supervisorDir, path: path.join(supervisorDir, "cloud-env.json") },
+    { root: path.join(workspaceRoot, "unpacked"), path: path.join(workspaceRoot, "unpacked", "env", "cloud-env.json") },
+    { root: process.cwd(), path: path.join(process.cwd(), ".rudder", "cloud-env.json") },
+  ];
+  for (const candidate of candidates) {
+    try {
+      if (!safeExtractedEntry(candidate.root, candidate.path, "file")) continue;
+      return filterCapturedEnv(JSON.parse(fs.readFileSync(candidate.path, "utf8")));
+    } catch (error) {
+      console.error(`Failed to load captured env ${candidate.path}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  return {};
+}
+
+function initializeGitBaseline(workdir) {
+  console.log("Initializing cloud git baseline...");
+  // Snapshot creation deliberately excludes Git internals. Discard any crafted
+  // .git entry rather than trusting hooks/config supplied by an archive.
+  fs.rmSync(path.join(workdir, ".git"), { recursive: true, force: true });
+  runCommand("git", ["init", "-q"], { cwd: workdir, label: "git init", asAgent: true });
+  runCommand("git", ["config", "user.email", "rudder-cloud@local"], { cwd: workdir, label: "git config", asAgent: true });
+  runCommand("git", ["config", "user.name", "Rudder Cloud"], { cwd: workdir, label: "git config", asAgent: true });
+  runCommand("git", ["add", "-A"], { cwd: workdir, label: "git add", asAgent: true });
+  runCommand("git", ["commit", "-qm", "rudder cloud baseline"], {
+    cwd: workdir,
+    label: "git commit",
+    asAgent: true,
+    allowFailure: true,
+  });
+}
+
+function stageMigratedAgents(workdir, unpackRoot) {
+  const migrationPath = path.join(unpackRoot, "migration.json");
+  if (!safeExtractedEntry(unpackRoot, migrationPath, "file")) return;
   let manifest;
   try {
     manifest = JSON.parse(fs.readFileSync(migrationPath, "utf8"));
   } catch (error) {
-    console.error(`Migration manifest unreadable: ${error.message}`);
+    console.error(`Migration manifest unreadable: ${error instanceof Error ? error.message : String(error)}`);
     return;
   }
   const agents = Array.isArray(manifest?.agents) ? manifest.agents : [];
-  if (agents.length === 0) {
-    return;
-  }
+  if (agents.length === 0) return;
   console.log(`Restoring ${agents.length} migrated agent(s)...`);
-  const home = os.homedir() || process.env.HOME || "/root";
   const placed = [];
-  for (const agent of agents) {
-    if (!agent || typeof agent !== "object") {
+  const worktreeRoot = path.join(workspaceRoot, ".rudder-worktrees");
+  prepareAgentDir(worktreeRoot);
+
+  for (const agent of agents.slice(0, 100)) {
+    const runId = safePathSegment(agent?.runId);
+    if (!runId || typeof agent?.cloudWorktreeRelativePath !== "string") continue;
+    const cloudWorktree = remapCloudPath(agent.cloudWorktreeRelativePath);
+    if (!cloudWorktree || !isPathInside(worktreeRoot, cloudWorktree)) {
+      console.warn(`Migrated agent ${runId}: rejected invalid worktree path`);
       continue;
     }
-    if (typeof agent.runId !== "string") {
-      continue;
-    }
-    const cloudWorktree = typeof agent.cloudWorktreeRelativePath === "string"
-      ? agent.cloudWorktreeRelativePath
-      : null;
-    if (!cloudWorktree) {
-      continue;
-    }
-    const stagedWorktree = path.join("/workspace/unpacked/migrated-worktrees", agent.runId);
-    if (fs.existsSync(stagedWorktree)) {
-      fs.mkdirSync(cloudWorktree, { recursive: true });
-      sh(`cp -R ${shQuote(stagedWorktree + "/.")} ${shQuote(cloudWorktree + "/")}`);
-      if (!fs.existsSync(path.join(cloudWorktree, ".git"))) {
-        shSoft(`cd ${shQuote(cloudWorktree)} && git init -q && git config user.email rudder-cloud@local && git config user.name "Rudder Cloud" && git add -A && git commit -qm "rudder cloud baseline (migrated agent ${agent.runId})"`);
-      }
-    } else {
-      fs.mkdirSync(cloudWorktree, { recursive: true });
+    const stagedWorktree = path.join(unpackRoot, "migrated-worktrees", runId);
+    fs.rmSync(cloudWorktree, { recursive: true, force: true });
+    prepareAgentDir(cloudWorktree);
+    if (safeExtractedEntry(unpackRoot, stagedWorktree, "directory")) {
+      runCommand("cp", ["-a", `${stagedWorktree}/.`, `${cloudWorktree}/`], {
+        label: `migrated worktree ${runId}`,
+        asAgent: true,
+      });
+      initializeGitBaseline(cloudWorktree);
     }
 
-    const sessionId = typeof agent.sessionId === "string" && agent.sessionId.trim().length > 0
-      ? agent.sessionId.trim()
-      : "";
-    const sessionPathHint = typeof agent.sessionJsonlSnapshotPath === "string"
+    const sessionIdValue = safePathSegment(agent.sessionId, 200) || "";
+    const sessionHint = typeof agent.sessionJsonlSnapshotPath === "string"
       ? agent.sessionJsonlSnapshotPath.trim()
       : "";
     let sessionPlaced = "";
-    if (sessionId && sessionPathHint) {
-      const stagedJsonl = path.join("/workspace/unpacked", sessionPathHint);
-      if (fs.existsSync(stagedJsonl)) {
-        const encoded = encodeClaudeProjectsCwd(cloudWorktree);
-        const claudeProjectDir = path.join(home, ".claude", "projects", encoded);
-        fs.mkdirSync(claudeProjectDir, { recursive: true });
-        const dest = path.join(claudeProjectDir, `${sessionId}.jsonl`);
-        sh(`cp ${shQuote(stagedJsonl)} ${shQuote(dest)}`);
-        sessionPlaced = sessionId;
+    if (sessionIdValue && sessionHint) {
+      const stagedJsonl = path.resolve(unpackRoot, sessionHint);
+      if (safeExtractedEntry(unpackRoot, stagedJsonl, "file")) {
+        const projectDir = path.join(agentHome, ".claude", "projects", encodeClaudeProjectsCwd(cloudWorktree));
+        prepareAgentDir(projectDir);
+        const destination = path.join(projectDir, `${sessionIdValue}.jsonl`);
+        fs.copyFileSync(stagedJsonl, destination);
+        fs.chmodSync(destination, 0o600);
+        if (canDropPrivileges) fs.chownSync(destination, agentUid, agentGid);
+        sessionPlaced = sessionIdValue;
       } else {
-        console.log(`Migrated agent ${agent.runId}: jsonl missing in snapshot, falling back to fresh restart`);
+        console.log(`Migrated agent ${runId}: session jsonl missing, falling back to a fresh restart`);
       }
     }
     placed.push({
-      runId: agent.runId,
+      runId,
       sessionId: sessionPlaced,
       worktreePath: cloudWorktree,
-      worktreeBranch: agent.worktreeBranch || null,
-      task: agent.task || "",
-      taskSummary: agent.taskSummary || "",
-      backend: agent.backend || "claude",
+      worktreeBranch: typeof agent.worktreeBranch === "string" ? agent.worktreeBranch : null,
+      task: typeof agent.task === "string" ? agent.task : "",
+      taskSummary: typeof agent.taskSummary === "string" ? agent.taskSummary : "",
+      backend: typeof agent.backend === "string" ? agent.backend : "claude",
       freshPrompt: typeof agent.freshPrompt === "string" ? agent.freshPrompt : "",
     });
   }
 
-  if (placed.length === 0) {
-    return;
-  }
-
   for (const entry of placed) {
     const runJsonPath = path.join(workdir, ".rudder", "runs", entry.runId, "run.json");
-    if (!fs.existsSync(runJsonPath)) {
-      continue;
-    }
+    if (!isPathInside(workdir, runJsonPath) || !fs.existsSync(runJsonPath)) continue;
     let record;
     try {
       record = JSON.parse(fs.readFileSync(runJsonPath, "utf8"));
@@ -436,12 +672,9 @@ function stageMigratedAgents(workdir) {
       branch: entry.worktreeBranch || record.worktree?.branch,
     };
     if (entry.sessionId) {
-      record.session = {
-        ...(record.session || {}),
-        nativeSessionId: entry.sessionId,
-      };
+      record.session = { ...(record.session || {}), nativeSessionId: entry.sessionId };
     }
-    record.status = record.status === "completed" || record.status === "merged" ? record.status : "running";
+    if (record.status !== "completed" && record.status !== "merged") record.status = "running";
     record.migration = {
       origin: "local",
       pendingResume: Boolean(entry.sessionId),
@@ -451,69 +684,191 @@ function stageMigratedAgents(workdir) {
       freshPrompt: entry.freshPrompt || null,
       migratedAt: new Date().toISOString(),
     };
-    fs.writeFileSync(runJsonPath, JSON.stringify(record, null, 2));
+    writeFileAtomic(runJsonPath, `${JSON.stringify(record, null, 2)}\n`, 0o600, true);
   }
 
-  const summary = {
-    version: 1,
-    createdAt: new Date().toISOString(),
-    agents: placed,
-  };
-  const summaryDir = path.join(workdir, ".rudder");
-  fs.mkdirSync(summaryDir, { recursive: true });
-  fs.writeFileSync(path.join(summaryDir, "migration.json"), JSON.stringify(summary, null, 2));
-  console.log(`Migrated ${placed.length} agent(s); dashboard will resume them on startup.`);
+  if (placed.length > 0) {
+    const summaryPath = path.join(workdir, ".rudder", "migration.json");
+    prepareAgentDir(path.dirname(summaryPath));
+    writeFileAtomic(summaryPath, `${JSON.stringify({
+      version: 1,
+      createdAt: new Date().toISOString(),
+      agents: placed,
+    }, null, 2)}\n`, 0o600, true);
+    console.log(`Migrated ${placed.length} agent(s); dashboard will resume them on startup.`);
+  }
+}
+
+function remapCloudPath(value) {
+  const normalized = String(value).replaceAll("\\", "/");
+  if (normalized === "/workspace") return workspaceRoot;
+  if (normalized.startsWith("/workspace/")) {
+    return path.resolve(workspaceRoot, normalized.slice("/workspace/".length));
+  }
+  if (!path.isAbsolute(normalized)) return path.resolve(workspaceRoot, normalized);
+  return path.resolve(normalized);
 }
 
 function encodeClaudeProjectsCwd(absolutePath) {
   return String(absolutePath).replace(/[^A-Za-z0-9-]/g, "-");
 }
 
-function heartbeatUrl() {
-  return `${cloudUrl.replace(/\/$/, "")}/api/rudder/${sessionKind}/${encodeURIComponent(sessionId)}/heartbeat`;
-}
-
-function reportHeartbeat() {
-  if (!cloudUrl || !sessionId || !workerToken) {
-    return;
-  }
-  fetch(heartbeatUrl(), {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      authorization: `Bearer ${workerToken}`,
-    },
-    body: JSON.stringify({ state: lastReportedState, machineId: flyMachineId || undefined }),
-  }).catch(() => undefined);
-}
-
-function reportDone(state, code) {
+async function reportState(state, extra = {}, attempts = 1) {
   lastReportedState = state;
-  if (!cloudUrl || !sessionId || !workerToken) {
-    return;
+  if (!cloudUrl || !workerToken || !sessionId) return false;
+  let endpoint;
+  try {
+    endpoint = new URL(cloudUrl);
+    endpoint.pathname = `/api/rudder/${sessionKind}/${encodeURIComponent(sessionId)}/heartbeat`;
+    endpoint.search = "";
+    endpoint.hash = "";
+  } catch {
+    return false;
   }
-  // best-effort fire-and-forget; we exit shortly after
-  fetch(heartbeatUrl(), {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      authorization: `Bearer ${workerToken}`,
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      const response = await fetch(endpoint, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${workerToken}`,
+        },
+        body: JSON.stringify({ state, machineId: flyMachineId || undefined, ...extra }),
+        signal: AbortSignal.timeout(5_000),
+      });
+      if (response.ok) return true;
+      if (response.status >= 400 && response.status < 500) return false;
+    } catch {
+      // retry below
+    }
+    if (attempt + 1 < attempts) await delay(200 * (attempt + 1));
+  }
+  return false;
+}
+
+function prepareAgentDir(directory) {
+  const resolved = path.resolve(directory);
+  const base = isPathInside(agentHome, resolved)
+    ? agentHome
+    : isPathInside(workspaceRoot, resolved)
+      ? workspaceRoot
+      : null;
+  if (!base) throw new Error(`refusing to create agent directory outside managed roots: ${resolved}`);
+  const baseStat = fs.lstatSync(base);
+  if (!baseStat.isDirectory() || baseStat.isSymbolicLink()) {
+    throw new Error(`managed root is not a real directory: ${base}`);
+  }
+  let current = base;
+  const relative = path.relative(base, resolved);
+  for (const segment of relative.split(path.sep).filter(Boolean)) {
+    current = path.join(current, segment);
+    const stat = fs.lstatSync(current, { throwIfNoEntry: false });
+    if (!stat) {
+      fs.mkdirSync(current);
+    } else if (!stat.isDirectory() || stat.isSymbolicLink()) {
+      throw new Error(`refusing to follow a managed-directory symlink: ${current}`);
+    }
+    if (canDropPrivileges) fs.chownSync(current, agentUid, agentGid);
+  }
+  if (canDropPrivileges && resolved !== workspaceRoot) fs.chownSync(resolved, agentUid, agentGid);
+}
+
+function safeExtractedEntry(root, candidate, expected) {
+  try {
+    if (!isPathInside(root, candidate)) return false;
+    const stat = fs.lstatSync(candidate);
+    if (stat.isSymbolicLink()) return false;
+    if (expected === "file" && !stat.isFile()) return false;
+    if (expected === "directory" && !stat.isDirectory()) return false;
+    return isPathInside(fs.realpathSync(root), fs.realpathSync(candidate));
+  } catch {
+    return false;
+  }
+}
+
+function writeFileAtomic(destination, contents, mode, agentOwned) {
+  fs.mkdirSync(path.dirname(destination), { recursive: true });
+  const temporary = `${destination}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    fs.writeFileSync(temporary, contents, { mode });
+    fs.chmodSync(temporary, mode);
+    if (agentOwned && canDropPrivileges) fs.chownSync(temporary, agentUid, agentGid);
+    fs.renameSync(temporary, destination);
+  } finally {
+    fs.rmSync(temporary, { force: true });
+  }
+}
+
+function runCommand(program, args, options = {}) {
+  const result = spawnSync(program, args, {
+    cwd: options.cwd,
+    stdio: options.capture ? ["ignore", "pipe", "pipe"] : "inherit",
+    encoding: options.capture ? "utf8" : undefined,
+    env: options.asAgent ? unprivilegedEnv : env,
+    ...(options.asAgent && canDropPrivileges ? { uid: agentUid, gid: agentGid } : {}),
+  });
+  if (result.error && !options.allowFailure) {
+    throw new Error(`${options.label || program} failed: ${result.error.message}`);
+  }
+  if (result.status !== 0 && !options.allowFailure) {
+    throw new Error(`${options.label || program} failed with exit code ${result.status ?? "unknown"}`);
+  }
+  return result;
+}
+
+// Deterministic test adapter for hosts where native node-pty cannot allocate a
+// terminal (for example a sandboxed macOS CI runner). Production never sets
+// RUDDER_WORKER_TEST_PIPE and always exercises node-pty.
+function spawnPipeTerminal(program, args, options) {
+  const child = spawn(program, args, {
+    cwd: options.cwd,
+    env: options.env,
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  const dataListeners = new Set();
+  const exitListeners = new Set();
+  const earlyData = [];
+  let exitEvent = null;
+  const emitData = (chunk) => {
+    const text = chunk.toString("utf8");
+    if (dataListeners.size === 0) earlyData.push(text);
+    for (const listener of dataListeners) listener(text);
+  };
+  child.stdout.on("data", emitData);
+  child.stderr.on("data", emitData);
+  child.on("exit", (code, signal) => {
+    const signalNumber = signal === "SIGINT" ? 2 : signal === "SIGTERM" ? 15 : undefined;
+    exitEvent = { exitCode: code, signal: signalNumber };
+    for (const listener of exitListeners) listener(exitEvent);
+  });
+  return {
+    cols: options.cols,
+    rows: options.rows,
+    onData(listener) {
+      dataListeners.add(listener);
+      for (const text of earlyData.splice(0)) queueMicrotask(() => listener(text));
+      return { dispose: () => dataListeners.delete(listener) };
     },
-    body: JSON.stringify({ state, exitCode: code, machineId: flyMachineId || undefined }),
-  }).catch(() => undefined);
+    onExit(listener) {
+      exitListeners.add(listener);
+      if (exitEvent) queueMicrotask(() => listener(exitEvent));
+      return { dispose: () => exitListeners.delete(listener) };
+    },
+    write(value) { child.stdin.write(value); },
+    resize() {},
+    kill(signal) { child.kill(signal); },
+  };
 }
 
-function shSoft(cmd) {
-  spawnSync("sh", ["-c", cmd], { stdio: "inherit" });
+function signalExitCode(signal) {
+  return signal === "SIGINT" ? 130 : 143;
 }
 
-function sh(cmd) {
-  const result = spawnSync("sh", ["-c", cmd], { stdio: "inherit" });
-  if (result.status !== 0) {
-    throw new Error(`command failed (${result.status}): ${cmd}`);
-  }
+function boundedInteger(value, fallback, min, max) {
+  const parsed = Number.parseInt(String(value ?? ""), 10);
+  return Number.isFinite(parsed) ? Math.max(min, Math.min(max, parsed)) : fallback;
 }
 
-function shQuote(value) {
-  return `'${String(value).replace(/'/g, "'\\''")}'`;
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }

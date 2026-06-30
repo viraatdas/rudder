@@ -42,11 +42,11 @@
   "devDependencies": {
     "@types/node": "^22.15.3",
     "@types/ws": "^8.5.13",
-    "esbuild": "^0.24.0",
+    "esbuild": "^0.28.1",
     "preact": "^10.25.0",
     "typescript": "^5.8.3"
   },
   "dependencies": {
-    "ws": "^8.18.0"
+    "ws": "^8.21.0"
   }
 }

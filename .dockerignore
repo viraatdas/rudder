@@ -1,6 +1,7 @@
 .git
 .rudder
 node_modules
+dist
 cloud/node_modules
 cloud/dist
 target

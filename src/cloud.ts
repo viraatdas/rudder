@@ -21,6 +21,7 @@ import { cloudAuthPath } from "./state.js";
 import type { CloudAuthState, CloudSail, JsonValue } from "./types.js";
 import {
   ensureDir,
+  commandEnv,
   commandExists,
   expandHome,
   isTty,
@@ -90,15 +91,42 @@ type SnapshotOptions = {
   };
 };
 
+type CreatedSnapshot = {
+  tempDir: string;
+  archivePath: string;
+  manifest: SnapshotManifest;
+};
+
 type CloudClient = {
   baseUrl: string;
-  request<T>(pathOrUrl: string, init: { method: string; body?: JsonValue }): Promise<T>;
+  request<T>(pathOrUrl: string, init: { method: string; body?: JsonValue; timeoutMs?: number }): Promise<T>;
 };
 
 type CloudRuntime = "fly" | "byo-vm";
 
+class CloudRequestError extends Error {
+  readonly status: number;
+  readonly payload: JsonValue | null;
+
+  constructor(status: number, message: string, payload: JsonValue | null) {
+    super(message);
+    this.name = "CloudRequestError";
+    this.status = status;
+    this.payload = payload;
+  }
+}
+
 const DEFAULT_LOGIN_INTERVAL_MS = 2000;
 const DEFAULT_LOGIN_TIMEOUT_MS = 5 * 60 * 1000;
+const DEFAULT_CLOUD_REQUEST_TIMEOUT_MS = 30_000;
+const DEFAULT_CLOUD_UPLOAD_TIMEOUT_MS = 5 * 60_000;
+const DEFAULT_ATTACH_CONNECT_TIMEOUT_MS = 20_000;
+const DEFAULT_ATTACH_READY_TIMEOUT_MS = 5 * 60_000;
+const DEFAULT_REGION_DETECT_TIMEOUT_MS = 1_500;
+// The control plane accepts a 256 MiB JSON request. Base64 costs 4/3 plus
+// manifest/JSON overhead, so fail locally with a useful message before reading
+// an archive that cannot possibly be accepted.
+const MAX_SNAPSHOT_ARCHIVE_BYTES = 190 * 1024 * 1024;
 const DEFAULT_CLOUD_URL = "https://rudder-cloud-control.fly.dev";
 const GITHUB_CLI_CLIENT_ID = "178c6fc778ccc68e1d6a";
 const MAX_HOME_SECRET_SCAN_BYTES = 1024 * 1024;
@@ -122,7 +150,6 @@ const DEFAULT_HOME_PATHS = [
   "~/.bashrc",
   "~/.bash_profile",
   "~/.profile",
-  "~/.envrc",
   // Package managers
   "~/.npmrc",
   "~/.yarnrc",
@@ -154,6 +181,7 @@ const SECRET_PATH_PARTS = new Set([
   "keychains",
 ]);
 const BULKY_HOME_PATH_PARTS = new Set([
+  ".cache",
   "archived_sessions",
   "backups",
   "cache",
@@ -170,11 +198,9 @@ const BULKY_HOME_PATH_PARTS = new Set([
   "todos",
   "worktrees",
 ]);
+const ALWAYS_BULKY_PATH_PARTS = new Set(["node_modules"]);
 const SECRET_BASENAMES = new Set([
   ".env",
-  ".env.local",
-  ".env.production",
-  ".env.development",
   "id_rsa",
   "id_ed25519",
   "known_hosts",
@@ -268,6 +294,10 @@ export async function runCloudCommand(command: string, args: string[], options: 
     case "stop":
       await mutateSail("stop", rest, options);
       return;
+    case "delete":
+    case "rm":
+      await mutateSail("delete", rest, options);
+      return;
     case "setup-github":
       await setupOAuthProvider("github", rest, options);
       return;
@@ -308,7 +338,9 @@ export async function runCloudCommand(command: string, args: string[], options: 
 
 async function login(options: CloudCommandOptions): Promise<void> {
   const client = await cloudClient({ requireToken: false });
+  const failures: string[] = [];
   const browserLogin = await tryBrowserLogin(client, options).catch((error) => {
+    failures.push(`browser login: ${error instanceof Error ? error.message : String(error)}`);
     if (!options.json) {
       console.warn(`Browser login unavailable: ${error instanceof Error ? error.message : String(error)}`);
       console.warn("Trying local GitHub auth fallback...");
@@ -323,7 +355,10 @@ async function login(options: CloudCommandOptions): Promise<void> {
     }
   }
 
-  const githubLogin = await tryGithubCliLogin(client).catch(() => null);
+  const githubLogin = await tryGithubCliLogin(client).catch((error) => {
+    failures.push(`GitHub CLI login: ${error instanceof Error ? error.message : String(error)}`);
+    return null;
+  });
   if (githubLogin?.token || githubLogin?.accessToken) {
     const token = githubLogin.token ?? githubLogin.accessToken;
     if (token) {
@@ -332,7 +367,10 @@ async function login(options: CloudCommandOptions): Promise<void> {
     }
   }
 
-  const githubDeviceLogin = await tryGithubDeviceLogin(client, options).catch(() => null);
+  const githubDeviceLogin = await tryGithubDeviceLogin(client, options).catch((error) => {
+    failures.push(`GitHub device login: ${error instanceof Error ? error.message : String(error)}`);
+    return null;
+  });
   if (githubDeviceLogin?.token || githubDeviceLogin?.accessToken) {
     const token = githubDeviceLogin.token ?? githubDeviceLogin.accessToken;
     if (token) {
@@ -340,6 +378,9 @@ async function login(options: CloudCommandOptions): Promise<void> {
       return;
     }
   }
+
+  const detail = failures.length > 0 ? ` (${failures.join("; ")})` : "";
+  throw new Error(`Could not log in to Rudder Cloud${detail}.`);
 }
 
 async function tryBrowserLogin(client: CloudClient, options: CloudCommandOptions): Promise<LoginPollResponse | null> {
@@ -356,11 +397,11 @@ async function tryBrowserLogin(client: CloudClient, options: CloudCommandOptions
   const intervalMs = Math.max(1000, (response.interval ?? DEFAULT_LOGIN_INTERVAL_MS / 1000) * 1000);
   const timeoutMs = Math.max(intervalMs, (response.expiresIn ?? DEFAULT_LOGIN_TIMEOUT_MS / 1000) * 1000);
 
-  console.log(`Opening ${loginUrl}`);
+  loginProgress(options, `Opening ${loginUrl}`);
   if (!options.json) {
     openBrowser(loginUrl);
   }
-  console.log("Waiting for browser login to complete...");
+  loginProgress(options, "Waiting for browser login to complete...");
 
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
@@ -393,6 +434,9 @@ async function tryGithubCliLogin(client: CloudClient): Promise<LoginPollResponse
 }
 
 async function tryGithubDeviceLogin(client: CloudClient, options: CloudCommandOptions): Promise<LoginPollResponse | null> {
+  if (process.env.RUDDER_SKIP_GITHUB_DEVICE_LOGIN === "1") {
+    return null;
+  }
   const start = await githubOAuthRequest<{
     device_code?: string;
     user_code?: string;
@@ -452,20 +496,33 @@ async function tryGithubDeviceLogin(client: CloudClient, options: CloudCommandOp
 }
 
 async function githubOAuthRequest<T>(url: string, body: Record<string, string>): Promise<T> {
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      Accept: "application/json",
-      "Content-Type": "application/json",
+  const { response, text } = await fetchTextWithTimeout(
+    url,
+    {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
     },
-    body: JSON.stringify(body),
-  });
-  const text = await response.text();
+    cloudRequestTimeoutMs(),
+    "GitHub OAuth request",
+    1024 * 1024,
+  );
   const parsed = text ? parseJson(text) : null;
   if (!response.ok) {
     throw new Error(responseErrorMessage(parsed) || text.trim() || `${response.status} ${response.statusText}`);
   }
   return parsed as T;
+}
+
+function loginProgress(options: CloudCommandOptions, message: string): void {
+  if (options.json) {
+    process.stderr.write(`${message}\n`);
+    return;
+  }
+  console.log(message);
 }
 
 async function saveCloudLogin(
@@ -511,21 +568,18 @@ async function launch(
 ): Promise<void> {
   const raw = args.join(" ").trim();
   const repoRoot = findRepoRoot();
+  // Validate auth/runtime before doing the expensive filesystem walk, copy,
+  // and compression work. An unauthenticated launch should fail immediately.
+  const client = await cloudClient({ requireToken: true });
+  const runtime = await selectedCloudRuntime(explicitRuntime);
   const snapshot = await createSnapshot(repoRoot, options.homePaths ?? []);
   try {
-    const client = await cloudClient({ requireToken: true });
-    const runtime = await selectedCloudRuntime(explicitRuntime);
     const task = mode === "task" || runtime === "byo-vm" ? raw : "";
     const name = task ? cloudNameFromTask(task) : raw || randomCloudName();
     const body: Record<string, JsonValue> = {
       repoName: path.basename(repoRoot),
       name,
-      snapshot: {
-        name: path.basename(snapshot.archivePath),
-        contentType: "application/gzip",
-        base64: await fsp.readFile(snapshot.archivePath, "base64"),
-        manifest: snapshot.manifest as unknown as JsonValue,
-      },
+      snapshot: await snapshotPayload(snapshot),
     };
     if (runtime !== "fly") {
       body.runtime = runtime;
@@ -536,6 +590,7 @@ async function launch(
     const result = await client.request<JsonValue>("/api/rudder/sail/launch", {
       method: "POST",
       body,
+      timeoutMs: cloudUploadTimeoutMs(),
     });
     await printResult(result, options);
     await maybeAutoAttach(result, options);
@@ -546,10 +601,16 @@ async function launch(
 
 async function onload(args: string[], options: CloudCommandOptions): Promise<void> {
   const runId = args[0];
+  if (runId && (runId === "." || runId === ".." || runId.includes("/") || runId.includes("\\") || runId.includes("\0"))) {
+    throw new Error("Invalid run id. Usage: rudder cloud onload [runId]");
+  }
   const repoRoot = findRepoRoot();
   const runRecord = runId
     ? await readJson<JsonValue>(path.join(repoRoot, ".rudder", "runs", runId, "run.json"))
     : null;
+  if (runId && !runRecord) {
+    throw new Error(`Local Rudder run not found: ${runId}`);
+  }
   const worktreePath = runRecord && typeof runRecord === "object" && !Array.isArray(runRecord)
     ? (runRecord as Record<string, JsonValue>).worktree
     : undefined;
@@ -557,21 +618,16 @@ async function onload(args: string[], options: CloudCommandOptions): Promise<voi
     ? ((worktreePath as Record<string, JsonValue>).path as string | undefined)
     : undefined;
   const snapshotRoot = sourceRoot && await pathExists(sourceRoot) ? sourceRoot : repoRoot;
+  const client = await cloudClient({ requireToken: true });
+  const runtime = await selectedCloudRuntime();
   const snapshot = await createSnapshot(snapshotRoot, options.homePaths ?? [], { includeRudderState: !runId });
   try {
-    const client = await cloudClient({ requireToken: true });
-    const runtime = await selectedCloudRuntime();
     const name = runId ? undefined : `workspace-${path.basename(repoRoot)}`;
     const body: Record<string, JsonValue> = {
       repoName: path.basename(repoRoot),
       run: runRecord ?? null,
       workspace: !runId,
-      snapshot: {
-        name: path.basename(snapshot.archivePath),
-        contentType: "application/gzip",
-        base64: await fsp.readFile(snapshot.archivePath, "base64"),
-        manifest: snapshot.manifest as unknown as JsonValue,
-      },
+      snapshot: await snapshotPayload(snapshot),
     };
     if (runId) {
       body.runId = runId;
@@ -584,6 +640,7 @@ async function onload(args: string[], options: CloudCommandOptions): Promise<voi
     const result = await client.request<JsonValue>("/api/rudder/sail/onload", {
       method: "POST",
       body,
+      timeoutMs: cloudUploadTimeoutMs(),
     });
     await printResult(result, options);
     await maybeAutoAttach(result, options);
@@ -598,25 +655,18 @@ async function logs(args: string[], options: CloudCommandOptions): Promise<void>
     throw new Error("Usage: rudder cloud logs <id>");
   }
   const client = await cloudClient({ requireToken: true });
-  const result = await client.request<JsonValue>("/api/rudder/sail", { method: "GET" });
-  const sails = Array.isArray(result)
-    ? result
-    : result && typeof result === "object" && !Array.isArray(result) && Array.isArray((result as Record<string, JsonValue>).sails)
-      ? (result as Record<string, JsonValue>).sails as JsonValue[]
-      : [];
-  const match = sails.find((item) =>
-    item && typeof item === "object" && !Array.isArray(item) && (item as Record<string, JsonValue>).id === sailId
+  const result = await client.request<Record<string, JsonValue>>(
+    `/api/rudder/sail/${encodeURIComponent(sailId)}/output`,
+    { method: "GET" },
   );
-  if (!match) {
-    throw new Error(`Cloud worker not found: ${sailId}`);
-  }
   if (options.json) {
-    printJson(match);
+    printJson(result);
     return;
   }
-  console.log("Cloud log streaming is not available yet.");
-  console.log("Worker status:");
-  printSailList([match]);
+  const connected = result.connected === true ? "connected" : "disconnected";
+  console.log(`${sailId}  ${connected}`);
+  const output = typeof result.output === "string" ? stripAnsiForCli(result.output).trimEnd() : "";
+  console.log(output || "(no output yet)");
 }
 
 async function listSails(options: CloudCommandOptions): Promise<void> {
@@ -678,7 +728,11 @@ async function bootstrap(args: string[], options: CloudCommandOptions): Promise<
   await printResult(result, options);
 }
 
-async function mutateSail(action: "onload" | "pause" | "resume" | "stop", args: string[], options: CloudCommandOptions): Promise<void> {
+async function mutateSail(
+  action: "onload" | "pause" | "resume" | "stop" | "delete",
+  args: string[],
+  options: CloudCommandOptions,
+): Promise<void> {
   const sailId = args[0];
   if (!sailId) {
     throw new Error(`Missing sail id. Usage: rudder sail ${action} <id>`);
@@ -701,6 +755,9 @@ async function mutateSail(action: "onload" | "pause" | "resume" | "stop", args: 
 }
 
 function isSailNotFound(error: unknown): boolean {
+  if (error instanceof CloudRequestError && error.status === 404) {
+    return true;
+  }
   const message = error instanceof Error ? error.message : String(error);
   return /sail not found/i.test(message);
 }
@@ -712,10 +769,23 @@ async function talk(args: string[], options: CloudCommandOptions): Promise<void>
     throw new Error('Usage: rudder cloud talk <id> "<message>"');
   }
   const client = await cloudClient({ requireToken: true });
-  const result = await client.request<JsonValue>(
-    `/api/rudder/sail/${encodeURIComponent(sailId)}/input`,
-    { method: "POST", body: { text: message } },
-  );
+  let result: JsonValue;
+  try {
+    result = await client.request<JsonValue>(
+      `/api/rudder/sail/${encodeURIComponent(sailId)}/input`,
+      { method: "POST", body: { text: message } },
+    );
+  } catch (error) {
+    // A disconnected worker is a normal relay state, not a malformed request.
+    // The server returns 409 with a useful `{delivered:false}` payload; preserve
+    // the command's friendly output instead of turning that into a stack-level
+    // request failure.
+    if (error instanceof CloudRequestError && error.status === 409 && error.payload) {
+      result = error.payload;
+    } else {
+      throw error;
+    }
+  }
   if (options.json) {
     printJson(result);
     return;
@@ -901,13 +971,15 @@ async function setupByoc(args: string[], options: CloudCommandOptions): Promise<
     ].join("\n"));
   }
 
-  const configMentionsHost = configuredHosts.includes(host) || await sshConfigMentions(sshConfigPath, host);
-  const diagnostics = await checkByocHost(host);
   const client = await cloudClient({ requireToken: true });
   const state = await loadCloudAuth();
   if (!state || state.cloudUrl !== client.baseUrl) {
     throw new Error("Not logged in to this Rudder Cloud control plane. Run `rudder login` first.");
   }
+  const [configMentionsHost, diagnostics] = await Promise.all([
+    configuredHosts.includes(host) ? true : sshConfigMentions(sshConfigPath, host),
+    checkByocHost(host),
+  ]);
   await saveCloudAuth({
     ...state,
     defaultRuntime: state.defaultRuntime === "byo-vm" ? "fly" : state.defaultRuntime,
@@ -1102,14 +1174,18 @@ async function checkByocHost(host: string): Promise<{ ok: boolean; message: stri
   if (!commandExists("ssh")) {
     return { ok: false, message: "ssh is not installed or not on PATH" };
   }
-  const result = await runCommand("ssh", [
+  const result = await runCommandWithDeadline("ssh", [
     "-o",
     "BatchMode=yes",
     "-o",
     "ConnectTimeout=8",
+    "-o",
+    "ServerAliveInterval=5",
+    "-o",
+    "ServerAliveCountMax=2",
     host,
     "command -v docker >/dev/null && docker info >/dev/null 2>&1",
-  ], { allowFailure: true });
+  ], 20_000, { allowFailure: true });
   if (result.code === 0) {
     return { ok: true, message: "ok" };
   }
@@ -1125,14 +1201,67 @@ async function startByocWorkerOverSsh(host: string, bootstrapCommand: string): P
     "mkdir -p ~/.rudder/byoc",
     `nohup sh -lc ${shellQuote(nonInteractiveDockerCommand(bootstrapCommand))} > ~/.rudder/byoc/worker.log 2>&1 < /dev/null &`,
   ].join(" && ");
-  await runCommand("ssh", [
+  await runCommandWithDeadline("ssh", [
     "-o",
     "BatchMode=yes",
     "-o",
     "ConnectTimeout=10",
+    "-o",
+    "ServerAliveInterval=5",
+    "-o",
+    "ServerAliveCountMax=2",
     host,
     remoteCommand,
-  ]);
+  ], 30_000);
+}
+
+async function runCommandWithDeadline(
+  command: string,
+  args: string[],
+  timeoutMs: number,
+  options: { allowFailure?: boolean } = {},
+): Promise<{ stdout: string; stderr: string; code: number }> {
+  return await new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      env: commandEnv(),
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    let timedOut = false;
+    let forceKillTimer: NodeJS.Timeout | undefined;
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => { stdout += chunk; });
+    child.stderr.on("data", (chunk: string) => { stderr += chunk; });
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGTERM");
+      forceKillTimer = setTimeout(() => child.kill("SIGKILL"), 750);
+      forceKillTimer.unref?.();
+    }, timeoutMs);
+    timer.unref?.();
+    child.once("error", (error) => {
+      clearTimeout(timer);
+      if (forceKillTimer) clearTimeout(forceKillTimer);
+      reject(error);
+    });
+    child.once("close", (code) => {
+      clearTimeout(timer);
+      if (forceKillTimer) clearTimeout(forceKillTimer);
+      const exitCode = timedOut ? 124 : code ?? 1;
+      if (timedOut) {
+        stderr = `${stderr.trim()}${stderr.trim() ? "\n" : ""}${command} timed out after ${Math.ceil(timeoutMs / 1000)}s`;
+      }
+      if (exitCode !== 0 && !options.allowFailure) {
+        // Do not echo argv: the BYOC remote command contains the short-lived
+        // worker credential and snapshot URL.
+        reject(new Error(`${command} failed: ${stderr.trim() || stdout.trim()}`));
+        return;
+      }
+      resolve({ stdout, stderr, code: exitCode });
+    });
+  });
 }
 
 function nonInteractiveDockerCommand(command: string): string {
@@ -1146,16 +1275,19 @@ async function cloudClient(options: { requireToken: boolean }): Promise<CloudCli
   const baseUrl = normalizeCloudUrl(process.env.RUDDER_CLOUD_URL);
   const state = await loadCloudAuth();
   const envToken = process.env.RUDDER_CLOUD_TOKEN?.trim();
-  const token = envToken || (state?.cloudUrl === baseUrl ? state.token : undefined);
+  const token = envToken || (state?.cloudUrl === baseUrl ? state.token.trim() : undefined);
   if (options.requireToken && !token) {
     throw new Error("Not logged in to Rudder Cloud. Run `rudder login` first.");
   }
   return {
     baseUrl,
-    async request<T>(pathOrUrl: string, init: { method: string; body?: JsonValue }) {
+    async request<T>(pathOrUrl: string, init: { method: string; body?: JsonValue; timeoutMs?: number }) {
       const url = pathOrUrl.startsWith("http://") || pathOrUrl.startsWith("https://")
-        ? pathOrUrl
-        : new URL(pathOrUrl, `${baseUrl}/`).toString();
+        ? new URL(pathOrUrl)
+        : new URL(pathOrUrl, `${baseUrl}/`);
+      if (url.origin !== new URL(baseUrl).origin) {
+        throw new Error(`Refusing a cross-origin Rudder Cloud API URL: ${url.origin}`);
+      }
       const headers: Record<string, string> = {
         Accept: "application/json",
       };
@@ -1167,16 +1299,37 @@ async function cloudClient(options: { requireToken: boolean }): Promise<CloudCli
       if (token) {
         headers.Authorization = `Bearer ${token}`;
       }
-      const response = await fetch(url, {
-        method: init.method,
-        headers,
-        body,
-      });
-      const text = await response.text();
+      let response: Response;
+      let text: string;
+      try {
+        ({ response, text } = await fetchTextWithTimeout(
+          url,
+          {
+            method: init.method,
+            headers,
+            body,
+          },
+          init.timeoutMs ?? cloudRequestTimeoutMs(),
+          "Rudder Cloud request",
+          8 * 1024 * 1024,
+        ));
+      } catch (error) {
+        throw new Error(`Rudder Cloud request failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
       const parsed = text ? parseJson(text) : null;
       if (!response.ok) {
         const message = responseErrorMessage(parsed) || text.trim() || `${response.status} ${response.statusText}`;
-        throw new Error(`Rudder Cloud request failed: ${message}`);
+        throw new CloudRequestError(
+          response.status,
+          `Rudder Cloud request failed (${response.status}): ${message.slice(0, 2_000)}`,
+          parsed,
+        );
+      }
+      if (text && !response.headers.get("content-type")?.toLowerCase().includes("json")) {
+        throw new Error(`Rudder Cloud returned a non-JSON response (${response.status}).`);
+      }
+      if (text && typeof parsed === "string" && parsed === text) {
+        throw new Error(`Rudder Cloud returned invalid JSON (${response.status}).`);
       }
       return parsed as T;
     },
@@ -1197,10 +1350,15 @@ function normalizeCloudUrl(raw: string | undefined): string {
   if (url.protocol !== "http:" && url.protocol !== "https:") {
     throw new Error("RUDDER_CLOUD_URL must be a valid http(s) URL.");
   }
+  if (url.username || url.password) {
+    throw new Error("RUDDER_CLOUD_URL must not contain embedded credentials.");
+  }
   // The control plane hands back a shell command (bootstrapCommand) that the client
   // can auto-run over SSH, so a plain-HTTP control plane is a MITM-to-RCE risk.
   // Require https except for loopback dev or an explicit opt-in.
-  const isLoopback = url.hostname === "127.0.0.1" || url.hostname === "localhost" || url.hostname === "::1";
+  const isLoopback = url.hostname === "127.0.0.1"
+    || url.hostname === "localhost"
+    || url.hostname === "[::1]";
   if (url.protocol === "http:" && !isLoopback && process.env.RUDDER_CLOUD_ALLOW_HTTP !== "1") {
     throw new Error(
       "Refusing a plain-HTTP RUDDER_CLOUD_URL (it can be MITM'd into running arbitrary commands). " +
@@ -1210,6 +1368,102 @@ function normalizeCloudUrl(raw: string | undefined): string {
   url.hash = "";
   url.search = "";
   return url.toString().replace(/\/$/, "");
+}
+
+function timeoutFromEnv(name: string, fallback: number, maximum: number): number {
+  const raw = process.env[name]?.trim();
+  if (!raw) {
+    return fallback;
+  }
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 100 || parsed > maximum) {
+    throw new Error(`${name} must be a number of milliseconds between 100 and ${maximum}.`);
+  }
+  return Math.floor(parsed);
+}
+
+function cloudRequestTimeoutMs(): number {
+  return timeoutFromEnv("RUDDER_CLOUD_REQUEST_TIMEOUT_MS", DEFAULT_CLOUD_REQUEST_TIMEOUT_MS, 10 * 60_000);
+}
+
+function cloudUploadTimeoutMs(): number {
+  return timeoutFromEnv("RUDDER_CLOUD_UPLOAD_TIMEOUT_MS", DEFAULT_CLOUD_UPLOAD_TIMEOUT_MS, 30 * 60_000);
+}
+
+function attachConnectTimeoutMs(): number {
+  return timeoutFromEnv("RUDDER_CLOUD_ATTACH_TIMEOUT_MS", DEFAULT_ATTACH_CONNECT_TIMEOUT_MS, 10 * 60_000);
+}
+
+function attachReadyTimeoutMs(): number {
+  return timeoutFromEnv("RUDDER_CLOUD_READY_TIMEOUT_MS", DEFAULT_ATTACH_READY_TIMEOUT_MS, 30 * 60_000);
+}
+
+async function fetchWithTimeout(
+  url: string | URL,
+  init: RequestInit,
+  timeoutMs: number,
+  label: string,
+): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  timer.unref?.();
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } catch (error) {
+    if (controller.signal.aborted) {
+      throw new Error(`${label} timed out after ${Math.ceil(timeoutMs / 1000)}s`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function fetchTextWithTimeout(
+  url: string | URL,
+  init: RequestInit,
+  timeoutMs: number,
+  label: string,
+  maxBytes: number,
+): Promise<{ response: Response; text: string }> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  timer.unref?.();
+  try {
+    const response = await fetch(url, { ...init, signal: controller.signal });
+    const declared = Number(response.headers.get("content-length"));
+    if (Number.isFinite(declared) && declared > maxBytes) {
+      controller.abort();
+      throw new Error(`${label} response exceeded ${Math.floor(maxBytes / 1024 / 1024)} MiB`);
+    }
+    if (!response.body) {
+      return { response, text: "" };
+    }
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let total = 0;
+    let text = "";
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) {
+        text += decoder.decode();
+        return { response, text };
+      }
+      total += value.byteLength;
+      if (total > maxBytes) {
+        controller.abort();
+        throw new Error(`${label} response exceeded ${Math.floor(maxBytes / 1024 / 1024)} MiB`);
+      }
+      text += decoder.decode(value, { stream: true });
+    }
+  } catch (error) {
+    if (controller.signal.aborted && !(error instanceof Error && /response exceeded/.test(error.message))) {
+      throw new Error(`${label} timed out after ${Math.ceil(timeoutMs / 1000)}s`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function selectedCloudRuntime(explicit?: CloudRuntime): Promise<CloudRuntime> {
@@ -1271,79 +1525,104 @@ async function saveCloudAuth(state: CloudAuthState): Promise<void> {
   await writeJson(cloudAuthPath(), state, { mode: 0o600 });
 }
 
-async function createSnapshot(repoRoot: string, requestedHomePaths: string[], options: SnapshotOptions = {}): Promise<{
-  tempDir: string;
-  archivePath: string;
-  manifest: SnapshotManifest;
-}> {
+async function createSnapshot(
+  repoRoot: string,
+  requestedHomePaths: string[],
+  options: SnapshotOptions = {},
+): Promise<CreatedSnapshot> {
   const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), "rudder-cloud-"));
-  const stageDir = path.join(tempDir, "snapshot");
-  const repoStage = path.join(stageDir, "repo");
-  const homeStage = path.join(stageDir, "home");
-  await ensureDir(repoStage);
-  await copyRepoFiles(repoRoot, repoStage);
-  const rudderState = options.includeRudderState ? await copyRudderState(repoRoot, repoStage) : undefined;
+  try {
+    const stageDir = path.join(tempDir, "snapshot");
+    const repoStage = path.join(stageDir, "repo");
+    const homeStage = path.join(stageDir, "home");
+    await ensureDir(repoStage);
+    await copyRepoFiles(repoRoot, repoStage);
+    const rudderState = options.includeRudderState ? await copyRudderState(repoRoot, repoStage) : undefined;
 
-  const homePaths = normalizeHomePaths(requestedHomePaths);
-  const includedHomePaths: string[] = [];
-  for (const homePath of homePaths) {
-    const copied = await copyHomePath(homePath, homeStage);
-    if (copied) {
-      includedHomePaths.push(shortenHome(homePath));
+    const homePaths = normalizeHomePaths(requestedHomePaths);
+    const homeCopyResults = await mapLimit(homePaths, 8, async (homePath) => ({
+      homePath,
+      copied: await copyHomePath(homePath, homeStage),
+    }));
+    const includedHomePaths = homeCopyResults
+      .filter(({ copied }) => copied)
+      .map(({ homePath }) => shortenHome(homePath));
+
+    // On macOS, Claude Code stores its OAuth token in the Keychain rather than
+    // ~/.claude/.credentials.json, so the home-paths copy above doesn't pick it
+    // up. Extract it from the Keychain and stage it as a credentials file so
+    // the cloud worker boots already logged in.
+    if (await stageClaudeKeychainCredentials(homeStage)) {
+      includedHomePaths.push("~/.claude/.credentials.json (keychain)");
     }
-  }
 
-  // On macOS, Claude Code stores its OAuth token in the Keychain rather than
-  // ~/.claude/.credentials.json, so the home-paths copy above doesn't pick it
-  // up. Extract it from the Keychain and stage it as a credentials file so
-  // the cloud worker boots already logged in.
-  if (await stageClaudeKeychainCredentials(homeStage)) {
-    includedHomePaths.push("~/.claude/.credentials.json (keychain)");
-  }
+    const capturedEnv = captureCloudEnv();
+    let capturedEnvCount = 0;
+    if (Object.keys(capturedEnv).length > 0) {
+      await ensureDir(path.join(stageDir, "env"));
+      await writeJson(path.join(stageDir, "env", "cloud-env.json"), capturedEnv as unknown as JsonValue);
+      capturedEnvCount = Object.keys(capturedEnv).length;
+    }
 
-  const capturedEnv = captureCloudEnv();
-  let capturedEnvCount = 0;
-  if (Object.keys(capturedEnv).length > 0) {
-    await ensureDir(path.join(stageDir, "env"));
-    await writeJson(path.join(stageDir, "env", "cloud-env.json"), capturedEnv as unknown as JsonValue);
-    capturedEnvCount = Object.keys(capturedEnv).length;
-  }
+    let migratedAgentsCount = 0;
+    if (options.migration && options.migration.plan.migrated.length > 0) {
+      const entries = await stageMigratedAgents(
+        stageDir,
+        repoRoot,
+        options.migration.repoName,
+        options.migration.plan.migrated,
+      );
+      const migrationManifest: MigrationSnapshotManifest = {
+        version: 1,
+        createdAt: nowIso(),
+        agents: entries,
+      };
+      await writeJson(path.join(stageDir, "migration.json"), migrationManifest as unknown as JsonValue);
+      migratedAgentsCount = entries.length;
+    }
 
-  let migratedAgentsCount = 0;
-  if (options.migration && options.migration.plan.migrated.length > 0) {
-    const entries = await stageMigratedAgents(
-      stageDir,
-      repoRoot,
-      options.migration.repoName,
-      options.migration.plan.migrated,
-    );
-    const migrationManifest: MigrationSnapshotManifest = {
+    const [branch, commit] = await Promise.all([
+      currentBranch(repoRoot),
+      currentCommit(repoRoot),
+    ]);
+    const manifest: SnapshotManifest = {
       version: 1,
       createdAt: nowIso(),
-      agents: entries,
+      repo: {
+        root: path.basename(repoRoot),
+        branch,
+        commit,
+      },
+      homePaths: includedHomePaths,
+      ...(rudderState ? { rudderState } : {}),
+      ...(migratedAgentsCount > 0 ? { migratedAgents: migratedAgentsCount } : {}),
+      ...(capturedEnvCount > 0 ? { capturedEnvVars: capturedEnvCount } : {}),
     };
-    await writeJson(path.join(stageDir, "migration.json"), migrationManifest as unknown as JsonValue);
-    migratedAgentsCount = entries.length;
+    await writeJson(path.join(stageDir, "manifest.json"), manifest);
+
+    const archivePath = path.join(tempDir, `${newRunId("cloud-snapshot")}.tgz`);
+    await runCommand("tar", ["-czf", archivePath, "-C", stageDir, "."], { cwd: stageDir });
+    return { tempDir, archivePath, manifest };
+  } catch (error) {
+    await fsp.rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
+    throw error;
   }
+}
 
-  const manifest: SnapshotManifest = {
-    version: 1,
-    createdAt: nowIso(),
-    repo: {
-      root: path.basename(repoRoot),
-      branch: await currentBranch(repoRoot),
-      commit: await currentCommit(repoRoot),
-    },
-    homePaths: includedHomePaths,
-    ...(rudderState ? { rudderState } : {}),
-    ...(migratedAgentsCount > 0 ? { migratedAgents: migratedAgentsCount } : {}),
-    ...(capturedEnvCount > 0 ? { capturedEnvVars: capturedEnvCount } : {}),
+async function snapshotPayload(snapshot: CreatedSnapshot): Promise<JsonValue> {
+  const stat = await fsp.stat(snapshot.archivePath);
+  if (stat.size > MAX_SNAPSHOT_ARCHIVE_BYTES) {
+    throw new Error(
+      `Cloud snapshot is too large (${Math.ceil(stat.size / 1024 / 1024)} MiB; maximum ${Math.floor(MAX_SNAPSHOT_ARCHIVE_BYTES / 1024 / 1024)} MiB). `
+        + "Remove large untracked files or add them to .gitignore before retrying.",
+    );
+  }
+  return {
+    name: path.basename(snapshot.archivePath),
+    contentType: "application/gzip",
+    base64: await fsp.readFile(snapshot.archivePath, "base64"),
+    manifest: snapshot.manifest as unknown as JsonValue,
   };
-  await writeJson(path.join(stageDir, "manifest.json"), manifest);
-
-  const archivePath = path.join(tempDir, `${newRunId("cloud-snapshot")}.tgz`);
-  await runCommand("tar", ["-czf", archivePath, "-C", stageDir, "."], { cwd: stageDir });
-  return { tempDir, archivePath, manifest };
 }
 
 const CLOUD_ENV_DEFAULT_NAMES = new Set([
@@ -1498,22 +1777,22 @@ async function copyWorktreeFiles(worktreePath: string, target: string, _repoRoot
   const files = result.code === 0
     ? result.stdout.split("\0").filter(Boolean)
     : await listFiles(worktreePath);
-  for (const relative of files) {
+  await mapLimit(files, 24, async (relative) => {
     if (!relative || relative.startsWith(".git/") || relative === ".git" || relative.startsWith(".rudder/")) {
-      continue;
+      return;
     }
     const source = path.join(worktreePath, relative);
     const dest = path.join(target, relative);
     if (!isInside(worktreePath, source) || !isInside(target, dest)) {
-      continue;
+      return;
     }
     const stat = await fsp.lstat(source).catch(() => null);
-    if (!stat || stat.isDirectory() || !(await shouldIncludeSnapshotPath(source))) {
-      continue;
+    if (!stat || stat.isDirectory() || !(await shouldIncludeSnapshotPath(source, "repo"))) {
+      return;
     }
     await ensureDir(path.dirname(dest));
     await fsp.cp(source, dest, { dereference: false, force: true });
-  }
+  });
 }
 
 async function copyRudderState(repoRoot: string, repoStage: string): Promise<{ runs: number; files: string[] }> {
@@ -1557,22 +1836,46 @@ async function copyRepoFiles(repoRoot: string, repoStage: string): Promise<void>
   const files = result.code === 0
     ? result.stdout.split("\0").filter(Boolean)
     : await listFiles(repoRoot);
-  for (const relative of files) {
+  await mapLimit(files, 24, async (relative) => {
     if (!relative || relative.startsWith(".git/") || relative.startsWith(".rudder/")) {
-      continue;
+      return;
     }
     const source = path.join(repoRoot, relative);
     const target = path.join(repoStage, relative);
     if (!isInside(repoRoot, source) || !isInside(repoStage, target)) {
-      continue;
+      return;
     }
     const stat = await fsp.lstat(source).catch(() => null);
-    if (!stat || stat.isDirectory() || !(await shouldIncludeSnapshotPath(source))) {
-      continue;
+    if (!stat || stat.isDirectory() || !(await shouldIncludeSnapshotPath(source, "repo"))) {
+      return;
     }
     await ensureDir(path.dirname(target));
     await fsp.cp(source, target, { dereference: false, force: true });
+  });
+}
+
+async function mapLimit<T, R>(items: readonly T[], concurrency: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  if (items.length === 0) {
+    return [];
   }
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(Math.max(1, concurrency), items.length) }, async () => {
+    for (;;) {
+      const index = next;
+      next += 1;
+      if (index >= items.length) {
+        return;
+      }
+      results[index] = await fn(items[index]!);
+    }
+  });
+  const settled = await Promise.allSettled(workers);
+  const failed = settled.find((entry): entry is PromiseRejectedResult => entry.status === "rejected");
+  if (failed) {
+    throw failed.reason;
+  }
+  return results;
 }
 
 async function listFiles(dir: string): Promise<string[]> {
@@ -1616,7 +1919,10 @@ function normalizeHomePaths(requested: string[]): string[] {
     seen.add(resolved);
     paths.push(resolved);
   }
-  return paths;
+  // If the user explicitly selected a parent directory, do not walk/copy its
+  // default children a second time. This also prevents concurrent copies from
+  // racing on the same destination files.
+  return paths.filter((candidate) => !paths.some((other) => other !== candidate && isInside(other, candidate)));
 }
 
 async function stageClaudeKeychainCredentials(homeStage: string): Promise<boolean> {
@@ -1650,7 +1956,9 @@ async function stageClaudeKeychainCredentials(homeStage: string): Promise<boolea
 }
 
 async function copyHomePath(source: string, homeStage: string): Promise<boolean> {
-  if (!(await pathExists(source)) || !(await shouldIncludeSnapshotPath(source))) {
+  const exists = await pathExists(source);
+  const included = exists ? await shouldIncludeSnapshotPath(source, "home") : false;
+  if (!exists || !included) {
     return false;
   }
   const relative = path.relative(os.homedir(), source);
@@ -1659,25 +1967,33 @@ async function copyHomePath(source: string, homeStage: string): Promise<boolean>
     return false;
   }
   await fsp.cp(source, target, {
-    dereference: false,
+    // Absolute dotfile symlinks from the local machine are normally broken in
+    // the worker. Dereference only after shouldIncludeSnapshotPath verifies
+    // that every HOME symlink remains inside HOME and outside blocked paths.
+    dereference: true,
     recursive: true,
     force: true,
-    filter: async (candidate) => await shouldIncludeSnapshotPath(candidate),
+    filter: async (candidate) => await shouldIncludeSnapshotPath(candidate, "home"),
   });
   return true;
 }
 
-async function shouldIncludeSnapshotPath(candidate: string): Promise<boolean> {
+async function shouldIncludeSnapshotPath(candidate: string, scope: "repo" | "home"): Promise<boolean> {
   const normalized = path.resolve(candidate);
   const parts = normalized.split(path.sep).map((part) => part.toLowerCase());
   const basename = path.basename(normalized).toLowerCase();
   if (basename.startsWith("._")) {
     return false;
   }
-  if (parts.some((part) => SECRET_PATH_PARTS.has(part)) || SECRET_BASENAMES.has(basename)) {
+  if (
+    parts.some((part) => SECRET_PATH_PARTS.has(part))
+    || parts.some((part) => ALWAYS_BULKY_PATH_PARTS.has(part))
+    || SECRET_BASENAMES.has(basename)
+    || basename.startsWith(".env")
+  ) {
     return false;
   }
-  if (isInside(os.homedir(), normalized)) {
+  if (scope === "home") {
     if (parts.some((part) => BULKY_HOME_PATH_PARTS.has(part))) {
       return false;
     }
@@ -1686,11 +2002,69 @@ async function shouldIncludeSnapshotPath(candidate: string): Promise<boolean> {
     }
   }
   const stat = await fsp.lstat(normalized).catch(() => null);
-  if (!stat || !stat.isFile() || stat.size > MAX_HOME_SECRET_SCAN_BYTES) {
+  if (!stat) {
+    return false;
+  }
+  if (stat.isSymbolicLink()) {
+    if (scope === "repo") {
+      // Repository symlinks are part of source semantics and are archived as
+      // links (copyRepoFiles uses dereference:false).
+      return true;
+    }
+    const real = await fsp.realpath(normalized).catch(() => "");
+    if (!real || !isInside(await canonicalHomePath(), real)) {
+      return false;
+    }
+    return await shouldIncludeSnapshotPath(real, "home");
+  }
+  if (!stat.isFile()) {
     return true;
   }
-  const text = await fsp.readFile(normalized, "utf8").catch(() => "");
-  return !/(aws_access_key_id|aws_secret_access_key|aws_session_token|AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN)/.test(text);
+  if (scope === "repo") {
+    return true;
+  }
+  // Keep the existing cheap scan for ordinary files. Large HOME files used to
+  // bypass it entirely, allowing a large credentials dump to be uploaded just
+  // by padding it past 1 MiB; stream those files with bounded memory instead.
+  if (stat.size <= MAX_HOME_SECRET_SCAN_BYTES) {
+    const text = await fsp.readFile(normalized, "utf8").catch(() => null);
+    return text !== null && !cloudSecretMarkerPattern().test(text);
+  }
+  return !(await fileContainsCloudSecretMarker(normalized).catch(() => true));
+}
+
+let canonicalHomePathPromise: Promise<string> | undefined;
+function canonicalHomePath(): Promise<string> {
+  canonicalHomePathPromise ??= fsp.realpath(os.homedir()).catch(() => path.resolve(os.homedir()));
+  return canonicalHomePathPromise;
+}
+
+function cloudSecretMarkerPattern(): RegExp {
+  return /aws_access_key_id|aws_secret_access_key|aws_session_token/i;
+}
+
+async function fileContainsCloudSecretMarker(filePath: string): Promise<boolean> {
+  const handle = await fsp.open(filePath, "r").catch(() => null);
+  if (!handle) {
+    return true;
+  }
+  const buffer = Buffer.allocUnsafe(64 * 1024);
+  let carry = "";
+  try {
+    for (;;) {
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, null);
+      if (bytesRead === 0) {
+        return false;
+      }
+      const text = carry + buffer.toString("utf8", 0, bytesRead);
+      if (cloudSecretMarkerPattern().test(text)) {
+        return true;
+      }
+      carry = text.slice(-64);
+    }
+  } finally {
+    await handle.close();
+  }
 }
 
 function isInside(parent: string, child: string): boolean {
@@ -1855,15 +2229,16 @@ async function workspaceCommand(args: string[], options: CloudCommandOptions): P
     await workspaceStatus(options);
     return;
   }
-  if (sub === "stop" || sub === "pause" || sub === "resume") {
-    await workspaceMutate(sub, rest, options);
+  if (sub === "stop" || sub === "pause" || sub === "resume" || sub === "delete" || sub === "rm") {
+    const action = sub === "rm" ? "delete" : sub;
+    await workspaceMutate(action, rest, options);
     return;
   }
   if (sub === "list" || sub === "ls") {
     await workspaceList(options);
     return;
   }
-  throw new Error("Usage: rudder cloud workspace [attach [id]|share|status|pause|resume|stop|list]");
+  throw new Error("Usage: rudder cloud workspace [attach [id]|share|status|pause|resume|stop|delete|list]");
 }
 
 function computeWorkspaceKey(repoRoot: string): string {
@@ -1880,8 +2255,14 @@ async function detectFlyRegion(baseUrl: string): Promise<string | undefined> {
     return cachedFlyRegion;
   }
   try {
-    const response = await fetch(`${baseUrl.replace(/\/$/, "")}/health`, { method: "GET" });
+    const response = await fetchWithTimeout(
+      `${baseUrl.replace(/\/$/, "")}/health`,
+      { method: "GET" },
+      DEFAULT_REGION_DETECT_TIMEOUT_MS,
+      "Cloud region detection",
+    );
     const requestId = response.headers.get("fly-request-id");
+    await response.body?.cancel().catch(() => undefined);
     if (requestId) {
       // Fly request-id format: <ulid>-<region>
       const dash = requestId.lastIndexOf("-");
@@ -1897,19 +2278,34 @@ async function detectFlyRegion(baseUrl: string): Promise<string | undefined> {
   return undefined;
 }
 
-async function computeSnapshotFingerprint(repoRoot: string, _requestedHomePaths: string[]): Promise<string> {
+async function computeSnapshotFingerprint(repoRoot: string, requestedHomePaths: string[]): Promise<string> {
   const hash = createHash("sha256");
-  // Repo state: HEAD commit + the porcelain dirty file list. Two attaches
-  // from the same repo at the same commit with no edits should produce the
-  // same fingerprint.
+  // HEAD covers every unchanged tracked file. Porcelain identifies the much
+  // smaller dirty/untracked set, whose actual bytes are hashed below. Hashing
+  // only the porcelain text caused stale warm restarts whenever an already-M
+  // file was edited again because its status line did not change.
   const headCommit = await currentCommit(repoRoot).catch(() => "");
   hash.update(`repo:head:${headCommit}\n`);
-  const status = await runCommand("git", ["status", "--porcelain", "-z"], {
+  const status = await runCommand("git", ["status", "--porcelain=v1", "-z", "--untracked-files=all"], {
     cwd: repoRoot,
     allowFailure: true,
   });
   if (status.code === 0) {
     hash.update(`repo:status:${status.stdout}\n`);
+    for (const relative of dirtyPathsFromPorcelain(status.stdout).sort()) {
+      const candidate = path.join(repoRoot, relative);
+      if (isInside(repoRoot, candidate)) {
+        await updateHashForFile(hash, candidate, `repo:file:${relative}`);
+      }
+    }
+  }
+  // HOME selections are part of the snapshot too. Metadata is enough to
+  // invalidate the cache for ordinary editor/CLI rewrites without rereading
+  // large credential databases on every warm attach. The snapshot filter is
+  // applied here as well, so excluded secrets/bulk do not create churn.
+  const homeFingerprints = await mapLimit(normalizeHomePaths(requestedHomePaths), 8, fingerprintHomePath);
+  for (const entry of homeFingerprints.filter(Boolean).sort()) {
+    hash.update(`home:${entry}\n`);
   }
   // macOS Keychain claude credentials: hash content so re-logging in
   // invalidates the cache but a steady-state user keeps it.
@@ -1929,6 +2325,108 @@ async function computeSnapshotFingerprint(repoRoot: string, _requestedHomePaths:
     hash.update(`env:${key}:${createHash("sha256").update(env[key] ?? "").digest("hex")}\n`);
   }
   return hash.digest("hex").slice(0, 32);
+}
+
+function dirtyPathsFromPorcelain(value: string): string[] {
+  const records = value.split("\0");
+  const paths: string[] = [];
+  for (let i = 0; i < records.length; i += 1) {
+    const record = records[i];
+    if (!record || record.length < 4) {
+      continue;
+    }
+    const status = record.slice(0, 2);
+    const relative = record.slice(3);
+    if (relative) {
+      paths.push(relative);
+    }
+    // In -z mode rename/copy records are "XY new\0old\0". The snapshot
+    // contains the new path; consume the old path so it is not parsed as a
+    // status record on the next iteration.
+    if (/[RC]/.test(status)) {
+      i += 1;
+    }
+  }
+  return [...new Set(paths)];
+}
+
+async function updateHashForFile(
+  hash: ReturnType<typeof createHash>,
+  filePath: string,
+  label: string,
+): Promise<void> {
+  const stat = await fsp.lstat(filePath).catch(() => null);
+  if (!stat) {
+    hash.update(`${label}:missing\n`);
+    return;
+  }
+  hash.update(`${label}:mode=${stat.mode}:size=${stat.size}\n`);
+  if (stat.isSymbolicLink()) {
+    hash.update(`link:${await fsp.readlink(filePath).catch(() => "")}\n`);
+    return;
+  }
+  if (!stat.isFile()) {
+    return;
+  }
+  const handle = await fsp.open(filePath, "r");
+  const buffer = Buffer.allocUnsafe(128 * 1024);
+  try {
+    for (;;) {
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, null);
+      if (bytesRead === 0) {
+        break;
+      }
+      hash.update(buffer.subarray(0, bytesRead));
+    }
+  } finally {
+    await handle.close();
+  }
+  hash.update("\n");
+}
+
+async function fingerprintHomePath(source: string): Promise<string> {
+  if (!(await pathExists(source)) || !(await shouldIncludeSnapshotPath(source, "home"))) {
+    return "";
+  }
+  const hash = createHash("sha256");
+  const root = path.resolve(source);
+  const seenDirectories = new Set<string>();
+  async function walk(candidate: string, relative: string): Promise<void> {
+    if (!(await shouldIncludeSnapshotPath(candidate, "home"))) {
+      return;
+    }
+    let stat = await fsp.lstat(candidate).catch(() => null);
+    if (!stat) {
+      return;
+    }
+    let actual = candidate;
+    if (stat.isSymbolicLink()) {
+      actual = await fsp.realpath(candidate).catch(() => "");
+      if (!actual || !isInside(await canonicalHomePath(), actual)) {
+        return;
+      }
+      stat = await fsp.stat(actual).catch(() => null);
+      if (!stat) {
+        return;
+      }
+    }
+    hash.update(`${relative}\0${stat.mode}\0${stat.size}\0${stat.mtimeMs}\n`);
+    if (!stat.isDirectory()) {
+      return;
+    }
+    const realDirectory = await fsp.realpath(actual).catch(() => actual);
+    if (seenDirectories.has(realDirectory)) {
+      return;
+    }
+    seenDirectories.add(realDirectory);
+    const entries = await fsp.readdir(actual, { withFileTypes: true }).catch(() => []);
+    entries.sort((a, b) => a.name.localeCompare(b.name));
+    for (const entry of entries) {
+      await walk(path.join(actual, entry.name), path.posix.join(relative, entry.name));
+    }
+  }
+  await walk(root, shortenHome(root));
+  return `${shortenHome(root)}:${hash.digest("hex")}`;
 }
 
 async function workspaceAttach(args: string[], options: CloudCommandOptions): Promise<void> {
@@ -1987,12 +2485,7 @@ async function workspaceAttach(args: string[], options: CloudCommandOptions): Pr
     try {
       const body: Record<string, JsonValue> = {
         ...baseBody,
-        snapshot: {
-          name: path.basename(snapshot.archivePath),
-          contentType: "application/gzip",
-          base64: await fsp.readFile(snapshot.archivePath, "base64"),
-          manifest: snapshot.manifest as unknown as JsonValue,
-        } as JsonValue,
+        snapshot: await snapshotPayload(snapshot),
       };
       if (migrationPlan && migrationPlan.migrated.length > 0) {
         body.migratedAgents = summaryAsJson(migrationPlan);
@@ -2000,6 +2493,7 @@ async function workspaceAttach(args: string[], options: CloudCommandOptions): Pr
       result = await client.request<JsonValue>("/api/rudder/workspace/attach", {
         method: "POST",
         body,
+        timeoutMs: cloudUploadTimeoutMs(),
       });
     } finally {
       await fsp.rm(snapshot.tempDir, { recursive: true, force: true });
@@ -2069,8 +2563,9 @@ async function attachToWorkspaceResult(result: JsonValue, options: CloudCommandO
 
 async function workspaceAttachById(workspaceId: string, options: CloudCommandOptions): Promise<void> {
   if (options.json) {
-    printJson({ id: workspaceId, attaching: true });
-  } else if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    throw new Error("Cloud attach is an interactive stream and cannot be used with --json.");
+  }
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
     process.stderr.write(`Workspace ${workspaceId}: attach requires a TTY.\n`);
     return;
   }
@@ -2146,12 +2641,18 @@ async function workspaceStatus(options: CloudCommandOptions): Promise<void> {
     }
     return;
   }
-  const workspace = await lookupWorkspaceForRepo(options).catch((error) => {
-    if (!options.json) {
-      console.warn(`Could not reach Rudder Cloud: ${error instanceof Error ? error.message : String(error)}`);
+  let workspace: Record<string, JsonValue> | null;
+  try {
+    workspace = await lookupWorkspaceForRepo(options);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (options.json) {
+      printJson({ offline: true, workspace: null, error: message });
+    } else {
+      console.warn(`Could not reach Rudder Cloud: ${message}`);
     }
-    return null;
-  });
+    return;
+  }
   if (!workspace) {
     if (options.json) {
       printJson({ workspace: null });
@@ -2202,7 +2703,11 @@ function computeIdleMinutes(lastActivityAt: string | undefined): number | null {
   return Math.floor(diff / 60_000);
 }
 
-async function workspaceMutate(action: "pause" | "resume" | "stop", args: string[], options: CloudCommandOptions): Promise<void> {
+async function workspaceMutate(
+  action: "pause" | "resume" | "stop" | "delete",
+  args: string[],
+  options: CloudCommandOptions,
+): Promise<void> {
   const id = args[0];
   if (!id) {
     throw new Error(`Usage: rudder cloud workspace ${action} <id>`);
@@ -2226,6 +2731,9 @@ async function attach(args: string[], options: CloudCommandOptions): Promise<voi
   if (!sailId) {
     throw new Error("Usage: rudder cloud attach <id>");
   }
+  if (options.json) {
+    throw new Error("Cloud attach is an interactive stream and cannot be used with --json.");
+  }
   await runAttach({ kind: "sail", id: sailId, label: sailId }, options);
 }
 
@@ -2242,7 +2750,7 @@ async function runAttach(target: AttachTarget, options: CloudCommandOptions): Pr
   const baseUrl = client.baseUrl;
   const state = await loadCloudAuth();
   const envToken = process.env.RUDDER_CLOUD_TOKEN?.trim();
-  const token = envToken || (state?.cloudUrl === baseUrl ? state.token : undefined);
+  const token = envToken || (state?.cloudUrl === baseUrl ? state.token.trim() : undefined);
   if (!token) {
     throw new Error("Not logged in to Rudder Cloud. Run `rudder login` first.");
   }
@@ -2252,16 +2760,31 @@ async function runAttach(target: AttachTarget, options: CloudCommandOptions): Pr
   const stdin = process.stdin;
   const stdout = process.stdout;
   const isInteractive = Boolean(stdin.isTTY && stdout.isTTY);
+  const connectTimeoutMs = attachConnectTimeoutMs();
+  const readyTimeoutMs = attachReadyTimeoutMs();
 
   return await new Promise<AttachResult>((resolve, reject) => {
     const socket = new WebSocket(wsUrl, {
       headers: { authorization: `Bearer ${token}` },
+      handshakeTimeout: connectTimeoutMs,
+      maxPayload: 4 * 1024 * 1024,
     });
     socket.binaryType = "nodebuffer";
     let opened = false;
     let cleaned = false;
     let firstFrameRendered = false;
     let result: AttachResult = "exited";
+    let readyTimer: NodeJS.Timeout | undefined;
+    let resizeTimer: NodeJS.Timeout | undefined;
+    const connectTimer = setTimeout(() => {
+      if (opened) {
+        return;
+      }
+      cleanup();
+      try { socket.terminate(); } catch { /* ignore */ }
+      reject(new Error(`Cloud attach timed out after ${Math.ceil(connectTimeoutMs / 1000)}s`));
+    }, connectTimeoutMs);
+    connectTimer.unref?.();
 
     const splashAllowed = isInteractive && !options.json && !options.quietBanner;
     const splash = splashAllowed ? new AttachSplash(stdout, target.label) : null;
@@ -2273,6 +2796,22 @@ async function runAttach(target: AttachTarget, options: CloudCommandOptions): Pr
       const cols = stdout.columns ?? 120;
       const rows = stdout.rows ?? 32;
       socket.send(JSON.stringify({ type: "resize", cols, rows }));
+    };
+
+    const scheduleResize = () => {
+      if (resizeTimer) {
+        clearTimeout(resizeTimer);
+      }
+      resizeTimer = setTimeout(sendResize, 150);
+      resizeTimer.unref?.();
+    };
+
+    const markReady = () => {
+      firstFrameRendered = true;
+      if (readyTimer) {
+        clearTimeout(readyTimer);
+        readyTimer = undefined;
+      }
     };
 
     let lastCtrlC = 0;
@@ -2323,6 +2862,15 @@ async function runAttach(target: AttachTarget, options: CloudCommandOptions): Pr
         return;
       }
       cleaned = true;
+      clearTimeout(connectTimer);
+      if (readyTimer) {
+        clearTimeout(readyTimer);
+        readyTimer = undefined;
+      }
+      if (resizeTimer) {
+        clearTimeout(resizeTimer);
+        resizeTimer = undefined;
+      }
       stdin.off("data", onStdin);
       stdout.off("resize", onResize);
       process.off("SIGINT", onSigint);
@@ -2347,7 +2895,7 @@ async function runAttach(target: AttachTarget, options: CloudCommandOptions): Pr
           // ignore
         }
       }
-      if (splashAllowed) {
+      if (splashAllowed && opened) {
         // We held the local terminal in the alt-screen buffer for the entire
         // attach session (see AttachSplash.handoff). Restore the main buffer
         // and cursor now so the user is dropped back to their shell prompt
@@ -2377,6 +2925,13 @@ async function runAttach(target: AttachTarget, options: CloudCommandOptions): Pr
 
     socket.on("open", () => {
       opened = true;
+      clearTimeout(connectTimer);
+      readyTimer = setTimeout(() => {
+        cleanup();
+        try { socket.terminate(); } catch { /* ignore */ }
+        reject(new Error(`Cloud worker did not become ready within ${Math.ceil(readyTimeoutMs / 1000)}s`));
+      }, readyTimeoutMs);
+      readyTimer.unref?.();
       // Disable Nagle on the underlying TCP socket so single keystrokes don't
       // sit in the send buffer waiting for piggyback ACKs (~40ms savings per
       // keypress on the WAN).
@@ -2426,14 +2981,14 @@ async function runAttach(target: AttachTarget, options: CloudCommandOptions): Pr
     socket.on("message", (data, isBinary) => {
       if (isBinary && Buffer.isBuffer(data)) {
         if (!firstFrameRendered) {
-          firstFrameRendered = true;
+          markReady();
           splash?.handoff();
           // Re-send resize right after handoff and once more on a small
           // delay; some terminals don't surface accurate columns/rows
           // until after alt-screen exits, so the initial resize at WS
           // open can race.
           sendResize();
-          setTimeout(sendResize, 150);
+          scheduleResize();
         }
         stdout.write(data);
         return;
@@ -2453,14 +3008,18 @@ async function runAttach(target: AttachTarget, options: CloudCommandOptions): Pr
         reject(new Error(`Cloud attach failed (code ${code}${reasonText ? `: ${reasonText}` : ""})`));
         return;
       }
+      if (code !== 1000 && code !== 1001 && result === "exited") {
+        const reasonText = reason && reason.length ? reason.toString("utf8") : "";
+        reject(new Error(`Cloud attach disconnected (code ${code}${reasonText ? `: ${reasonText}` : ""})`));
+        return;
+      }
       resolve(result);
     });
 
     socket.on("error", (err) => {
-      if (!opened) {
-        cleanup();
-        reject(new Error(`Cloud attach failed: ${err.message}`));
-      }
+      cleanup();
+      try { socket.terminate(); } catch { /* ignore */ }
+      reject(new Error(`Cloud attach failed: ${err.message}`));
     });
 
     function handleControlText(text: string): void {
@@ -2476,10 +3035,14 @@ async function runAttach(target: AttachTarget, options: CloudCommandOptions): Pr
       }
       const message = payload as { type?: string; state?: string; code?: number };
       if (message.type === "exit") {
-        result = message.code === 0 ? "exited" : "failed";
-        if (typeof process.exitCode !== "number" && message.code !== undefined) {
-          process.exitCode = message.code;
+        const exitCode = Number.isInteger(message.code) && message.code! >= 0 && message.code! <= 255
+          ? message.code!
+          : 1;
+        result = exitCode === 0 ? "exited" : "failed";
+        if (typeof process.exitCode !== "number") {
+          process.exitCode = exitCode;
         }
+        try { socket.close(1000, "remote-exit"); } catch { /* ignore */ }
         return;
       }
       if (message.type === "status") {
@@ -2508,10 +3071,10 @@ async function runAttach(target: AttachTarget, options: CloudCommandOptions): Pr
             // 3-6s on warm restart because the worker may not flush until
             // after its first render. The binary-frame path below still
             // calls handoff() as a safety net if we never see this status.
-            firstFrameRendered = true;
+            markReady();
             splash.handoff();
             sendResize();
-            setTimeout(sendResize, 150);
+            scheduleResize();
           }
         } else if (!options.json && !options.quietBanner) {
           if (message.state === "worker-disconnected") {
@@ -2669,6 +3232,7 @@ Usage:
   rudder cloud onload [runId]
       no runId uploads the current Rudder workspace state
   rudder cloud logs <id>
+      show current worker status and buffered terminal output
   rudder cloud attach <id>
       stream the live cloud worker terminal into this pane
   rudder cloud talk <id> "<message>"
@@ -2679,7 +3243,9 @@ Usage:
       print the copy/paste setup for the whole flow
   rudder cloud slack [manifest]
       print Slack setup (one thread per instance in the shared channel)
-  rudder cloud workspace [attach [id]|share|status [--json]|pause <id>|resume <id>|stop <id>|list]
+  rudder cloud delete <id>
+      permanently delete a worker (or workspace with the same id)
+  rudder cloud workspace [attach [id]|share|status [--json]|pause <id>|resume <id>|stop <id>|delete <id>|list]
       shared cloud workspace for this repo
   rudder cloud bootstrap <id>
   rudder cloud runtime [fly|byoc]
@@ -2689,6 +3255,7 @@ Usage:
   rudder sail list
   rudder sail pause <id>
   rudder sail resume <id>
+  rudder sail delete <id>
   rudder cloud setup-github <client-id>
   rudder cloud setup-google <client-id>
 
@@ -2696,6 +3263,8 @@ Environment:
   RUDDER_CLOUD_URL              Cloud control plane URL (defaults to ${DEFAULT_CLOUD_URL})
   RUDDER_CLOUD_RUNTIME          fly, byoc, or byo-vm (overrides saved local default)
   RUDDER_CLOUD_HOME_PATHS       Extra comma-separated HOME paths to include in snapshots
+  RUDDER_CLOUD_REQUEST_TIMEOUT_MS  API request deadline (default ${DEFAULT_CLOUD_REQUEST_TIMEOUT_MS})
+  RUDDER_CLOUD_UPLOAD_TIMEOUT_MS   Snapshot upload deadline (default ${DEFAULT_CLOUD_UPLOAD_TIMEOUT_MS})
   RUDDER_GITHUB_CLIENT_ID       GitHub App OAuth client ID for setup-github
   RUDDER_GITHUB_CLIENT_SECRET   GitHub App OAuth client secret for setup-github
   RUDDER_GOOGLE_CLIENT_ID       Google OAuth client ID for setup-google

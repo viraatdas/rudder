@@ -1,5 +1,7 @@
 app = "rudder-cloud-control"
 primary_region = "iad"
+kill_signal = "SIGTERM"
+kill_timeout = 30
 
 [build]
   dockerfile = "Dockerfile"
@@ -14,7 +16,13 @@ primary_region = "iad"
   RUDDER_FLY_APP_NAME = "rudder-workers-exla"
   RUDDER_FLY_REGION = "iad"
   RUDDER_WORKER_IMAGE = "public.ecr.aws/exla/rudder-worker:latest"
+  RUDDER_WORKER_CPU_KIND = "shared"
+  RUDDER_WORKER_CPUS = "2"
+  RUDDER_WORKER_MEMORY_MB = "2048"
   RUDDER_IDLE_PAUSE_MS = "7200000"
+  RUDDER_WORKSPACE_IDLE_MS = "1800000"
+  RUDDER_WORKSPACE_SWEEP_MS = "60000"
+  RUDDER_CLOUD_PERSIST_STATE = "1"
   RUDDER_PUBLIC_LOGIN_URL = "https://rudder.viraat.dev/login"
   GOOGLE_CLIENT_ID = "126214446123-b245olbglilh1edvnk0qu7sb2asbin2q.apps.googleusercontent.com"
   GITHUB_CLIENT_ID = "Iv23liKY5Nx0Mc4EqByY"
@@ -33,9 +41,9 @@ primary_region = "iad"
     soft_limit = 100
 
   [[http_service.checks]]
-    interval = "30s"
-    timeout = "5s"
-    grace_period = "20s"
+    interval = "15s"
+    timeout = "3s"
+    grace_period = "10s"
     method = "GET"
     path = "/health"
 

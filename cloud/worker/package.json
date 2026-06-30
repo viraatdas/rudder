@@ -3,8 +3,11 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "scripts": {
+    "test": "node --test supervisor.test.mjs"
+  },
   "dependencies": {
     "node-pty": "^1.0.0",
-    "ws": "^8.18.0"
+    "ws": "^8.21.0"
   }
 }

@@ -20,7 +20,8 @@ pub(crate) fn read_cloud_summary() -> CloudSummary {
             connected: true,
             runtime: env::var("RUDDER_CLOUD_RUNTIME")
                 .ok()
-                .filter(|value| !value.trim().is_empty()),
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| normalize_cloud_runtime_label(&value)),
         };
     }
 
@@ -45,11 +46,12 @@ pub(crate) fn read_cloud_summary() -> CloudSummary {
     let runtime = env::var("RUDDER_CLOUD_RUNTIME")
         .ok()
         .filter(|value| !value.trim().is_empty())
+        .map(|value| normalize_cloud_runtime_label(&value))
         .or_else(|| {
             data.as_ref()
                 .and_then(|data| data.get("defaultRuntime"))
                 .and_then(serde_json::Value::as_str)
-                .map(|value| if value == "byo-vm" { "byoc" } else { value }.to_string())
+                .map(normalize_cloud_runtime_label)
         });
     CloudSummary { connected, runtime }
 }
@@ -75,14 +77,21 @@ pub(crate) fn cloud_workspace_label(workspace: Option<&CloudWorkspaceStatus>) ->
 
 pub(crate) fn query_cloud_workspace_status(cwd: &Path) -> Option<CloudWorkspaceStatus> {
     let rudder = locate_rudder_cli()?;
-    let mut child = Command::new(rudder)
+    let mut command = Command::new(rudder);
+    command
         .args(["cloud", "workspace", "status", "--json"])
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
+        // A background status refresh must never trigger a package update or
+        // spend its entire deadline checking npm before contacting cloud.
+        .env("RUDDER_DISABLE_AUTO_UPDATE", "1")
+        .env("RUDDER_DISABLE_UPDATE_CHECK", "1");
+    if env::var_os("RUDDER_CLOUD_REQUEST_TIMEOUT_MS").is_none() {
+        command.env("RUDDER_CLOUD_REQUEST_TIMEOUT_MS", "5000");
+    }
+    let mut child = command.spawn().ok()?;
     // Bound the wait. A slow or unreachable cloud relay would otherwise let the CLI
     // hang forever, wedging the status-feed caller with no deadline. Poll for exit
     // and kill the child if it overruns, treating an overrun as "status unavailable".
@@ -98,7 +107,11 @@ pub(crate) fn query_cloud_workspace_status(cwd: &Path) -> Option<CloudWorkspaceS
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
-            Err(_) => return None,
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
         }
     }
     let output = child.wait_with_output().ok()?;
@@ -111,7 +124,7 @@ pub(crate) fn query_cloud_workspace_status(cwd: &Path) -> Option<CloudWorkspaceS
         return None;
     }
     if value.get("workspace").is_some_and(|v| v.is_null()) {
-        return Some(CloudWorkspaceStatus::default());
+        return None;
     }
     let id = value
         .get("id")
@@ -156,9 +169,15 @@ pub(crate) fn locate_rudder_cli() -> Option<PathBuf> {
     // PATH lookup
     let path_var = env::var_os("PATH")?;
     for dir in env::split_paths(&path_var) {
-        let candidate = dir.join("rudder");
-        if candidate.is_file() {
-            return Some(candidate);
+        #[cfg(windows)]
+        let names = ["rudder.exe", "rudder.cmd", "rudder.bat", "rudder"];
+        #[cfg(not(windows))]
+        let names = ["rudder"];
+        for name in names {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
         }
     }
     None
@@ -167,7 +186,7 @@ pub(crate) fn locate_rudder_cli() -> Option<PathBuf> {
 pub(crate) fn cloud_args_need_auth(args: &[&str]) -> bool {
     !args
         .first()
-        .is_some_and(|arg| matches!(*arg, "help" | "login"))
+        .is_some_and(|arg| matches!(*arg, "help" | "login" | "quickstart" | "slack"))
 }
 
 pub(crate) fn cloud_args_start_worker(args: &[&str]) -> bool {
@@ -176,7 +195,9 @@ pub(crate) fn cloud_args_start_worker(args: &[&str]) -> bool {
         Some(
             "help" | "login" | "list" | "ls" | "status" | "runtime" | "setup" | "setup-byoc"
             | "setup-vm" | "setup-fly" | "bootstrap" | "pause" | "resume" | "stop" | "logs"
-            | "onload" | "byoc" | "vm" | "byo-vm",
+            | "delete" | "rm" | "onload" | "byoc" | "vm" | "byo-vm" | "attach" | "talk" | "say"
+            | "msg" | "output" | "tail" | "quickstart" | "slack" | "workspace" | "setup-github"
+            | "setup-google",
         ) => false,
         Some(_) => true,
     }
@@ -192,12 +213,21 @@ pub(crate) fn cloud_agent_label(args: &[String]) -> String {
             .map(|id| format!("cloud onload {id}"))
             .unwrap_or_else(|| "cloud onload".to_string()),
         Some("launch") => "cloud launch".to_string(),
-        Some("pause" | "resume" | "stop" | "status" | "logs") => args
-            .get(2)
-            .map(|id| format!("cloud {} {id}", args[1]))
-            .unwrap_or_else(|| format!("cloud {}", args[1])),
+        Some("pause" | "resume" | "stop" | "delete" | "status" | "logs" | "attach" | "output") => {
+            args.get(2)
+                .map(|id| format!("cloud {} {id}", args[1]))
+                .unwrap_or_else(|| format!("cloud {}", args[1]))
+        }
         Some(name) => format!("cloud {name}"),
         None => "cloud".to_string(),
+    }
+}
+
+fn normalize_cloud_runtime_label(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "byo" | "byoc" | "byo-vm" | "manual" | "self-hosted" | "vm" => "byoc".to_string(),
+        "fly-machine" | "fly-machines" => "fly".to_string(),
+        _ => value.trim().to_string(),
     }
 }
 
@@ -488,5 +518,43 @@ pub(crate) fn codex_session_id_if_cwd_matches(path: &Path, target_cwd: &Path) ->
         Some(session_id)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod cloud_protocol_tests {
+    use super::*;
+
+    #[test]
+    fn cloud_read_only_and_relay_commands_do_not_open_launch_prompt() {
+        for args in [
+            vec!["attach", "sail-1"],
+            vec!["talk", "sail-1", "hello"],
+            vec!["output", "sail-1"],
+            vec!["workspace", "status"],
+            vec!["delete", "sail-1"],
+            vec!["quickstart"],
+            vec!["slack", "manifest"],
+        ] {
+            assert!(!cloud_args_start_worker(&args), "misclassified {args:?}");
+        }
+        assert!(cloud_args_start_worker(&["launch", "fix", "it"]));
+        assert!(cloud_args_start_worker(&["fix", "it"]));
+    }
+
+    #[test]
+    fn unauthenticated_help_flows_remain_available() {
+        assert!(!cloud_args_need_auth(&["help"]));
+        assert!(!cloud_args_need_auth(&["login"]));
+        assert!(!cloud_args_need_auth(&["quickstart"]));
+        assert!(!cloud_args_need_auth(&["slack", "manifest"]));
+        assert!(cloud_args_need_auth(&["list"]));
+    }
+
+    #[test]
+    fn cloud_runtime_labels_match_cli_aliases() {
+        assert_eq!(normalize_cloud_runtime_label("byo-vm"), "byoc");
+        assert_eq!(normalize_cloud_runtime_label("VM"), "byoc");
+        assert_eq!(normalize_cloud_runtime_label("fly-machines"), "fly");
     }
 }
