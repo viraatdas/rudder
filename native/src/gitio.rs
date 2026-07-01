@@ -1649,6 +1649,9 @@ pub(crate) fn diff_short_summary_at(cwd: &Path) -> Option<String> {
 }
 
 pub(crate) fn play_completion_sound() {
+    if !config::completion_sound_enabled() {
+        return;
+    }
     let Some(sound_path) = completion_sound_path() else {
         return;
     };

@@ -6261,6 +6261,53 @@ fn claude_settings_wire_stop_and_idle_hooks_to_the_signal_file() {
 }
 
 #[test]
+fn completion_sound_defaults_off_and_config_parses_bool() {
+    assert_eq!(
+        config::config_completion_sound(&serde_json::json!({})),
+        None
+    );
+    assert_eq!(
+        config::config_completion_sound(&serde_json::json!({"completionSound": true})),
+        Some(true)
+    );
+    assert_eq!(
+        config::config_completion_sound(&serde_json::json!({"completionSound": false})),
+        Some(false)
+    );
+}
+
+#[test]
+fn sound_command_persists_completion_sound_toggle() {
+    let _env = env_guard();
+    let home = unique_test_repo("sound-config-home");
+    let previous_home = std::env::var_os("RUDDER_HOME");
+    std::env::set_var("RUDDER_HOME", &home);
+
+    let mut app = App::new();
+    assert!(!config::completion_sound_enabled(), "default is quiet");
+
+    assert!(app.handle_command("/sound on"));
+    assert!(config::completion_sound_enabled(), "sound on persisted");
+    assert_eq!(
+        app.notice.as_deref(),
+        Some("completion sound ON (saved): workers ping when they enter review")
+    );
+
+    assert!(app.handle_command("/sound off"));
+    assert!(!config::completion_sound_enabled(), "sound off persisted");
+    assert_eq!(
+        app.notice.as_deref(),
+        Some("completion sound OFF (saved): workers enter review silently")
+    );
+
+    match previous_home {
+        Some(value) => std::env::set_var("RUDDER_HOME", value),
+        None => std::env::remove_var("RUDDER_HOME"),
+    }
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
 fn codex_notify_script_writes_done_on_turn_complete() {
     use std::path::Path;
     let script = crate::signals::codex_notify_script(Path::new("/tmp/sig/run.json"));
@@ -7730,6 +7777,151 @@ fn task_input_sends_enter_key_to_live_orchestrator() {
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
     assert_eq!(captured, b"go!\r");
+    assert_eq!(app.notice.as_deref(), Some("sent to orchestrator"));
+
+    let _ = fs::remove_dir_all(&repo);
+}
+
+#[cfg(not(windows))]
+#[test]
+fn completed_plan_launch_followup_starts_fresh_dag_not_old_conductor() {
+    let _env = env_guard();
+    let repo = unique_test_repo("completed-plan-fresh-dag");
+    let old_capture = repo.join("old-orchestrator-input.txt");
+    let old_script = format!(
+        "stty raw -echo; if IFS= read -r line; then printf '%s' \"$line\" > {}; fi; sleep 1",
+        shell_single_quote(&old_capture.to_string_lossy())
+    );
+    let old_command = TerminalCommand::with_args("/bin/sh", vec!["-lc".to_string(), old_script]);
+    let old_pane = TerminalPane::spawn_shell_or_command(
+        Some(old_command),
+        TerminalPaneOptions {
+            size: TerminalSize { rows: 10, cols: 80 },
+            scrollback_lines: 100,
+            ..Default::default()
+        },
+    )
+    .expect("spawn old orchestrator pty");
+
+    let fake = repo.join("fake-codex.sh");
+    write_fake_bin(&fake, FAKE_CONDUCTOR_WORKER);
+    std::env::set_var("RUDDER_CODEX_BIN", &fake);
+
+    let mut app = App::new();
+    app.cwd = repo.clone();
+    app.backend = Backend::Codex;
+    app.interactive_orchestrator = true;
+    let mut orch = test_agent_run("orch-old", "old plan");
+    orch.cwd = repo.clone();
+    orch.mode = AgentMode::RudderPlan;
+    orch.backend = Backend::Codex;
+    orch.autosteered = false;
+    orch.interactive_orchestrator = true;
+    orch.status = AgentStatus::Running;
+    orch.terminal = Some(old_pane);
+    app.agents.push(orch);
+
+    let mut completed = test_agent_run("run-1", "old node");
+    completed.cwd = repo.clone();
+    completed.node_id = Some("n0".to_string());
+    completed.status = AgentStatus::Merged;
+    app.agents.push(completed);
+
+    app.start_task_from_input("launch separate agents to fix this then merge them all");
+
+    assert!(
+        !old_capture.exists(),
+        "work-launching follow-up was not typed into the completed plan's conductor"
+    );
+    let planners: Vec<&AgentRun> = app
+        .agents
+        .iter()
+        .filter(|run| run.is_orchestrator())
+        .collect();
+    assert_eq!(planners.len(), 1, "stale orchestrator retired");
+    let planner = planners[0];
+    assert_eq!(planner.id, app.agents[app.selected_agent].id);
+    assert_eq!(planner.mode, AgentMode::RudderPlan);
+    assert_eq!(
+        planner.task, "launch separate agents to fix this then merge them all",
+        "a fresh DAG planner owns the follow-up request"
+    );
+    assert!(
+        !planner.reconcile_planner,
+        "completed-plan implementation follow-up starts an initial planner"
+    );
+
+    for run in &mut app.agents {
+        run.terminal = None;
+    }
+    std::env::remove_var("RUDDER_CODEX_BIN");
+    let _ = fs::remove_dir_all(&repo);
+}
+
+#[cfg(not(windows))]
+#[test]
+fn completed_plan_status_question_still_goes_to_old_conductor() {
+    let _env = env_guard();
+    let repo = unique_test_repo("completed-plan-status-conductor");
+    let capture = repo.join("orchestrator-input.bin");
+    let ready = repo.join("orchestrator-ready");
+    let script = format!(
+        "stty raw -echo; : > {}; dd bs=1 count=20 of={} 2>/dev/null; sleep 1",
+        shell_single_quote(&ready.to_string_lossy()),
+        shell_single_quote(&capture.to_string_lossy())
+    );
+    let command = TerminalCommand::with_args("/bin/sh", vec!["-lc".to_string(), script]);
+    let pane = TerminalPane::spawn_shell_or_command(
+        Some(command),
+        TerminalPaneOptions {
+            size: TerminalSize { rows: 10, cols: 80 },
+            scrollback_lines: 100,
+            ..Default::default()
+        },
+    )
+    .expect("spawn orchestrator pty");
+
+    for _ in 0..40 {
+        if ready.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert!(ready.exists(), "orchestrator pty is ready for input");
+
+    let mut app = App::new();
+    app.cwd = repo.clone();
+    app.interactive_orchestrator = true;
+    let mut orch = test_agent_run("orch-1", "old plan");
+    orch.cwd = repo.clone();
+    orch.mode = AgentMode::RudderPlan;
+    orch.backend = Backend::Claude;
+    orch.autosteered = false;
+    orch.interactive_orchestrator = true;
+    orch.status = AgentStatus::Running;
+    orch.terminal = Some(pane);
+    app.agents.push(orch);
+
+    let mut completed = test_agent_run("run-1", "old node");
+    completed.cwd = repo.clone();
+    completed.node_id = Some("n0".to_string());
+    completed.status = AgentStatus::Merged;
+    app.agents.push(completed);
+
+    app.start_task_from_input("what is the status?");
+
+    let mut captured = Vec::new();
+    for _ in 0..40 {
+        if let Ok(bytes) = fs::read(&capture) {
+            captured = bytes;
+            if captured.len() >= 20 {
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert_eq!(captured, b"what is the status?\r");
+    assert_eq!(app.selected_agent, 0, "the old conductor stays selected");
     assert_eq!(app.notice.as_deref(), Some("sent to orchestrator"));
 
     let _ = fs::remove_dir_all(&repo);

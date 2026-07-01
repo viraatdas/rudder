@@ -118,6 +118,40 @@ pub(crate) fn fast_mode_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Whether Rudder should play a local completion sound when a worker enters review.
+/// Default is OFF: audio is useful for some long-running sessions, but surprising
+/// as an unconditional dashboard behavior.
+pub(crate) fn config_completion_sound(config: &serde_json::Value) -> Option<bool> {
+    config
+        .get("completionSound")
+        .and_then(serde_json::Value::as_bool)
+}
+
+pub(crate) fn completion_sound_enabled() -> bool {
+    load_rudder_config()
+        .as_ref()
+        .and_then(config_completion_sound)
+        .unwrap_or(false)
+}
+
+/// Persist the `/sound` toggle so the next session keeps the same audio behavior.
+pub(crate) fn save_completion_sound(enabled: bool) -> Result<()> {
+    let path = rudder_config_path().context("could not determine Rudder config path")?;
+    let mut config = load_config_for_write(&path);
+    if !config.is_object() {
+        config = default_config_value();
+    }
+    ensure_config_defaults(&mut config);
+    let root = config
+        .as_object_mut()
+        .context("Rudder config root is not an object")?;
+    root.insert(
+        "completionSound".to_string(),
+        serde_json::Value::Bool(enabled),
+    );
+    write_config_atomically(&path, &config)
+}
+
 /// Persist the `/fast` toggle so new sessions and freshly-launched workers see it.
 pub(crate) fn save_fast_mode(enabled: bool) -> Result<()> {
     let path = rudder_config_path().context("could not determine Rudder config path")?;

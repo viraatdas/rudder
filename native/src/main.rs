@@ -75,6 +75,10 @@ const TICK_RATE: Duration = Duration::from_millis(33);
 /// instead of being batched into 33ms bursts.
 const STREAM_TICK_RATE: Duration = Duration::from_millis(11);
 const MAX_EVENTS_PER_FRAME: usize = 64;
+/// Trackpad wheel bursts can deliver many tiny scroll events. The handler itself
+/// is cheap; the expensive part is flushing a full terminal draw. Briefly defer
+/// scroll-triggered paints so queued wheel deltas collapse into fewer flushes.
+const SCROLL_DRAW_DEFER: Duration = Duration::from_millis(8);
 /// After this brief output lull, re-check the screen for the idle prompt even if the
 /// agent is still emitting cursor-blink/animation repaints (which would otherwise
 /// keep it looking busy forever).
@@ -671,6 +675,8 @@ struct App {
     last_mirror_signature: Option<u64>,
     /// TEMPORARY: default-on native TUI perf diagnostics for the scroll-latency pass.
     perf: PerfLogger,
+    scroll_draw_defer_until: Option<Instant>,
+    scroll_events_since_draw: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -1195,6 +1201,8 @@ impl App {
             quit_confirm_pending: false,
             last_mirror_signature: None,
             perf: PerfLogger::new(),
+            scroll_draw_defer_until: None,
+            scroll_events_since_draw: 0,
         }
     }
 
@@ -1248,6 +1256,32 @@ impl App {
         let was = self.dirty;
         self.dirty = false;
         was
+    }
+
+    fn note_scroll_dirty(&mut self) {
+        self.scroll_draw_defer_until = Some(Instant::now() + SCROLL_DRAW_DEFER);
+        self.scroll_events_since_draw = self.scroll_events_since_draw.saturating_add(1);
+    }
+
+    fn should_defer_scroll_draw(&self) -> bool {
+        self.scroll_draw_defer_until
+            .is_some_and(|until| Instant::now() < until)
+    }
+
+    fn scroll_draw_poll_timeout(&self, normal: Duration) -> Duration {
+        let Some(until) = self.scroll_draw_defer_until else {
+            return normal;
+        };
+        let now = Instant::now();
+        if now >= until {
+            return normal;
+        }
+        normal.min(until.saturating_duration_since(now))
+    }
+
+    fn consume_scroll_draw_stats(&mut self) -> usize {
+        self.scroll_draw_defer_until = None;
+        std::mem::take(&mut self.scroll_events_since_draw)
     }
 
     /// Current spinner glyph for the active animation frame.
@@ -2941,6 +2975,9 @@ impl App {
                         "changed": changed,
                     }),
                 );
+                if changed {
+                    self.note_scroll_dirty();
+                }
                 return changed;
             }
         }
@@ -2975,6 +3012,9 @@ impl App {
                     "changed": changed,
                 }),
             );
+            if changed {
+                self.note_scroll_dirty();
+            }
             return changed;
         }
 
@@ -3002,6 +3042,9 @@ impl App {
                     "changed": changed,
                 }),
             );
+            if changed {
+                self.note_scroll_dirty();
+            }
             return changed;
         }
 
@@ -3482,16 +3525,6 @@ impl App {
             return;
         }
 
-        // Once a DAG has launched, keep using the live orchestrator as the
-        // high-level conversation surface even after every worker has merged. That
-        // lets the user ask for a retro, status, or a follow-up without losing the
-        // conductor context.
-        if self.agents.iter().any(|run| run.node_id.is_some())
-            && self.send_to_interactive_orchestrator(input)
-        {
-            return;
-        }
-
         // CONDUCTING: a plan is already active and approved. Prefer the live
         // high-level orchestrator when it exists so the user can talk to the
         // conductor and let it decide whether to inspect, explain, add work, re-plan,
@@ -3506,6 +3539,18 @@ impl App {
             } else {
                 self.reconcile_injection(&input);
             }
+            return;
+        }
+
+        // Completed DAG: keep the old live conductor only for status/retro/question
+        // style turns. Implementation-y follow-ups such as "launch separate agents
+        // to fix this" must start a fresh DAG directly; otherwise the request is just
+        // typed into the old orchestrator and depends on the model remembering to
+        // write a RUDDER_* marker.
+        if self.agents.iter().any(|run| run.node_id.is_some())
+            && completed_plan_input_is_conversation(input)
+            && self.send_to_interactive_orchestrator(input)
+        {
             return;
         }
 
@@ -5178,7 +5223,7 @@ impl App {
             }
             Some("/help") => {
                 self.notice = Some(
-                    "plain input -> orchestrator/DAG · /run <task> -> one isolated mergeable worker · /ask <text> -> direct main-checkout one-off · /plan <text> -> force orchestrator/DAG · panes: Option-1/2/3 or ^W · keys: j/k select · Enter focus · v diff · m merge · M merge all · R review all · g nest · o web ui · x stop · dd delete · P model — commands: /model /fast /main /run /ask /plan /share /usage /goal /cloud /web"
+                    "plain input -> orchestrator/DAG · /run <task> -> one isolated mergeable worker · /ask <text> -> direct main-checkout one-off · /plan <text> -> force orchestrator/DAG · panes: Option-1/2/3 or ^W · keys: j/k select · Enter focus · v diff · m merge · M merge all · R review all · g nest · o web ui · x stop · dd delete · P model — commands: /model /fast /sound /main /run /ask /plan /share /usage /goal /cloud /web"
                         .to_string(),
                 );
                 true
@@ -5319,6 +5364,36 @@ impl App {
                                 self.model
                             ))
                         });
+                    }
+                }
+                true
+            }
+            Some("/sound") => {
+                let arg = parts.next().unwrap_or("toggle").to_ascii_lowercase();
+                let enabled = match arg.as_str() {
+                    "on" | "true" | "1" => true,
+                    "off" | "false" | "0" => false,
+                    "toggle" => !config::completion_sound_enabled(),
+                    _ => {
+                        self.notice = Some(
+                            "usage: /sound [on|off|toggle] — completion pings are off by default"
+                                .to_string(),
+                        );
+                        return true;
+                    }
+                };
+                match config::save_completion_sound(enabled) {
+                    Ok(()) => {
+                        self.notice = Some(if enabled {
+                            "completion sound ON (saved): workers ping when they enter review"
+                                .to_string()
+                        } else {
+                            "completion sound OFF (saved): workers enter review silently"
+                                .to_string()
+                        });
+                    }
+                    Err(error) => {
+                        self.notice = Some(format!("sound setting failed: {error}"));
                     }
                 }
                 true
@@ -10919,11 +10994,35 @@ fn run(terminal: &mut Tui) -> Result<()> {
         // status change, cloud info, etc).
         app.poll_agents();
         app.refresh_tab_title();
-        if app.take_dirty() {
+        if drain_ready_events(&mut app, MAX_EVENTS_PER_FRAME)? {
+            app.shutdown();
+            break;
+        }
+        if app.dirty && app.should_defer_scroll_draw() {
+            app.perf.log(
+                "draw_deferred",
+                serde_json::json!({
+                    "reason": "scroll_burst",
+                    "scroll_events": app.scroll_events_since_draw,
+                }),
+            );
+        } else if app.take_dirty() {
             let draw_started = Instant::now();
-            terminal.draw(|frame| render(frame, &mut app))?;
-            app.perf
-                .log_duration("terminal_draw", draw_started, serde_json::json!({}));
+            let mut render_build_us = 0_u64;
+            terminal.draw(|frame| {
+                let render_started = Instant::now();
+                render(frame, &mut app);
+                render_build_us = render_started.elapsed().as_micros() as u64;
+            })?;
+            let scroll_events = app.consume_scroll_draw_stats();
+            app.perf.log_duration(
+                "terminal_draw",
+                draw_started,
+                serde_json::json!({
+                    "render_build_us": render_build_us,
+                    "scroll_events": scroll_events,
+                }),
+            );
         }
 
         // While a planner is actively streaming, poll faster so its live transcript
@@ -10934,36 +11033,66 @@ fn run(terminal: &mut Tui) -> Result<()> {
         } else {
             TICK_RATE
         };
+        let poll_timeout = app.scroll_draw_poll_timeout(poll_timeout);
+        let active_us_before_block = frame_started.elapsed().as_micros() as u64;
         if event::poll(poll_timeout)? {
-            let mut drained_events = 0_usize;
             if handle_event(&mut app, event::read()?) {
                 app.shutdown();
                 break;
             }
-            drained_events += 1;
-
-            for _ in 1..MAX_EVENTS_PER_FRAME {
-                if !event::poll(Duration::ZERO)? {
-                    break;
-                }
-                if handle_event(&mut app, event::read()?) {
-                    app.shutdown();
-                    return Ok(());
-                }
-                drained_events += 1;
-            }
+            let shutdown = drain_ready_events(&mut app, MAX_EVENTS_PER_FRAME.saturating_sub(1))?;
             app.perf.log(
                 "event_drain",
                 serde_json::json!({
-                    "count": drained_events,
+                    "count": 1,
+                    "phase": "blocking",
                 }),
             );
+            if shutdown {
+                app.shutdown();
+                return Ok(());
+            }
         }
-        app.perf
-            .log_duration("frame_total", frame_started, serde_json::json!({}));
+        app.perf.log_duration(
+            "frame_total",
+            frame_started,
+            serde_json::json!({
+                "active_us_before_block": active_us_before_block,
+            }),
+        );
     }
 
     Ok(())
+}
+
+fn drain_ready_events(app: &mut App, max_events: usize) -> Result<bool> {
+    let mut drained_events = 0_usize;
+    for _ in 0..max_events {
+        if !event::poll(Duration::ZERO)? {
+            break;
+        }
+        if handle_event(app, event::read()?) {
+            app.perf.log(
+                "event_drain",
+                serde_json::json!({
+                    "count": drained_events + 1,
+                    "phase": "ready",
+                }),
+            );
+            return Ok(true);
+        }
+        drained_events += 1;
+    }
+    if drained_events > 0 {
+        app.perf.log(
+            "event_drain",
+            serde_json::json!({
+                "count": drained_events,
+                "phase": "ready",
+            }),
+        );
+    }
+    Ok(false)
 }
 
 /// The files two agents' touched-file sets share (the predicted merge collision).
@@ -11201,6 +11330,49 @@ fn is_orchestrator_skill_marker(line: &str) -> bool {
     ]
     .iter()
     .any(|marker| line == *marker || line.starts_with(&format!("{marker} ")))
+}
+
+fn completed_plan_input_is_conversation(input: &str) -> bool {
+    let text = input.trim().to_ascii_lowercase();
+    if text.is_empty() {
+        return false;
+    }
+
+    // Work-launching language after a completed DAG should create a fresh task set
+    // directly, not rely on a long-lived conductor to remember the RUDDER_* marker API.
+    const WORK_VERBS: &[&str] = &[
+        "add ",
+        "build ",
+        "create ",
+        "deploy ",
+        "do more",
+        "fix ",
+        "implement ",
+        "launch ",
+        "merge ",
+        "new task",
+        "new tasks",
+        "run ",
+        "separate agent",
+        "ship ",
+        "spawn ",
+        "start ",
+        "wire ",
+    ];
+    if WORK_VERBS.iter().any(|needle| text.contains(needle)) {
+        return false;
+    }
+
+    const QUESTION_PREFIXES: &[&str] = &[
+        "are ", "can ", "could ", "did ", "do ", "does ", "how ", "is ", "should ", "status",
+        "what ", "what's", "whats ", "when ", "where ", "who ", "why ",
+    ];
+    text.ends_with('?')
+        || text.contains("what's the deal")
+        || text.contains("whats the deal")
+        || QUESTION_PREFIXES
+            .iter()
+            .any(|prefix| text.starts_with(prefix))
 }
 
 fn handle_event(app: &mut App, event: Event) -> bool {
