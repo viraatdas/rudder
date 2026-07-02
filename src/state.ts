@@ -31,6 +31,8 @@ import {
 } from "./util.js";
 import { llmSummarizeTask, summarizeTask } from "./task-summary.js";
 
+const OUTPUT_TXT_MAX_BYTES = 2 * 1024 * 1024;
+
 export function globalConfigPath(): string {
   return path.join(rudderHome(), "config.json");
 }
@@ -543,7 +545,30 @@ export async function appendEvent(repoRoot: string, event: RudderEvent): Promise
       ? event.message ?? (typeof event.data === "string" ? event.data : undefined)
       : undefined;
   if (text) {
-    await fsp.appendFile(outputPath(repoRoot, event.runId), text, "utf8");
+    const file = outputPath(repoRoot, event.runId);
+    await fsp.appendFile(file, text, "utf8");
+    await trimFileTail(file, OUTPUT_TXT_MAX_BYTES);
+  }
+}
+
+async function trimFileTail(file: string, maxBytes: number): Promise<void> {
+  const stat = await fsp.stat(file).catch(() => null);
+  if (!stat || stat.size <= maxBytes) {
+    return;
+  }
+  const keep = Math.max(1, maxBytes);
+  const handle = await fsp.open(file, "r").catch(() => null);
+  if (!handle) {
+    return;
+  }
+  try {
+    const buffer = Buffer.alloc(keep);
+    await handle.read(buffer, 0, keep, Math.max(0, stat.size - keep));
+    const temp = `${file}.${process.pid}.${Date.now()}.tmp`;
+    await fsp.writeFile(temp, buffer);
+    await fsp.rename(temp, file);
+  } finally {
+    await handle.close().catch(() => undefined);
   }
 }
 

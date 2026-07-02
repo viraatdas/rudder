@@ -62,6 +62,7 @@ export async function ensureRudderCodexBinary(): Promise<string> {
   const assets = platformAssetNames();
   const dest = managedBinaryPath();
   if (await verifyCachedManagedBinary(dest)) {
+    await pruneSupersededRudderCodexBinaries().catch(() => 0);
     return dest;
   }
 
@@ -69,6 +70,7 @@ export async function ensureRudderCodexBinary(): Promise<string> {
   if (!await verifyCachedManagedBinary(dest)) {
     throw new Error(`Managed Rudder Codex install failed verification: ${dest}`);
   }
+  await pruneSupersededRudderCodexBinaries().catch(() => 0);
   return dest;
 }
 
@@ -78,6 +80,24 @@ export function managedBinaryPath(): string {
 
 function managedChecksumPath(): string {
   return `${managedBinaryPath()}.sha256`;
+}
+
+export async function pruneSupersededRudderCodexBinaries(): Promise<number> {
+  const root = path.join(rudderHome(), "bin", "codex");
+  const entries = await fsp.readdir(root, { withFileTypes: true }).catch(() => []);
+  let removed = 0;
+  for (const entry of entries) {
+    if (!entry.isDirectory() || entry.name === RUDDER_CODEX_RELEASE) {
+      continue;
+    }
+    await fsp.rm(path.join(root, entry.name), { recursive: true, force: true }).then(
+      () => {
+        removed += 1;
+      },
+      () => undefined,
+    );
+  }
+  return removed;
 }
 
 function platformAssetNames(): string[] {

@@ -43,6 +43,7 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
     render_cloud_prompt(frame, area, app);
     render_merge_prompt(frame, area, app);
     render_mouse_debug(frame, area, app);
+    render_perf_hud(frame, area, app);
 }
 
 #[derive(Clone, Copy)]
@@ -91,6 +92,40 @@ pub(crate) fn render_mouse_debug(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Block::default()
                 .borders(Borders::ALL)
                 .title("mouse debug")
+                .style(app_style()),
+        )
+        .style(app_style())
+        .wrap(Wrap { trim: false }),
+        rect,
+    );
+}
+
+pub(crate) fn render_perf_hud(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    let agent_count = app.agents.len();
+    let Some(text) = app.perf_stats.hud_line(agent_count) else {
+        return;
+    };
+    let width = area.width.saturating_sub(4).min(120).max(20);
+    let height = 3_u16.min(area.height);
+    let x = area.right().saturating_sub(width + 2);
+    let y = 1_u16.min(area.bottom().saturating_sub(height));
+    let rect = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, rect);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            text,
+            Style::default().fg(ACCENT_2),
+        )))
+        .style(app_style())
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("perf")
                 .style(app_style()),
         )
         .style(app_style())
@@ -3249,9 +3284,12 @@ pub(crate) fn worker_lines(app: &mut App, height: usize, width: usize) -> Vec<Li
             )
         })
         .collect::<Vec<_>>();
-    app.perf.log_duration(
+    let duration = perf_start.elapsed();
+    app.record_perf_duration("worker_lines", duration);
+    app.log_perf_duration_over(
         "worker_lines",
-        perf_start,
+        duration,
+        SLOW_LINE_RENDER_THRESHOLD,
         serde_json::json!({
             "run_id": run_id,
             "rows": row_count,
@@ -3329,9 +3367,12 @@ pub(crate) fn review_lines(app: &mut App, height: usize) -> Vec<Line<'static>> {
         .into_iter()
         .map(|cells| styled_terminal_line(cells, None, None))
         .collect::<Vec<_>>();
-    app.perf.log_duration(
+    let duration = perf_start.elapsed();
+    app.record_perf_duration("review_lines", duration);
+    app.log_perf_duration_over(
         "review_lines",
-        perf_start,
+        duration,
+        SLOW_LINE_RENDER_THRESHOLD,
         serde_json::json!({
             "run_id": run_id,
             "rows": row_count,

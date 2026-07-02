@@ -11154,3 +11154,100 @@ fn cleanup_run_signals_removes_only_that_runs_files() {
     assert!(removed, "all three per-run signal files are removed");
     assert!(survivor_intact, "other runs' signal files are untouched");
 }
+
+#[test]
+fn native_perf_logger_is_disabled_by_default() {
+    let _env = env_guard();
+    let home = unique_test_repo("perf-home-default");
+    let prior_home = std::env::var_os("RUDDER_HOME");
+    let prior_perf = std::env::var_os("RUDDER_NATIVE_PERF");
+    std::env::set_var("RUDDER_HOME", &home);
+    std::env::remove_var("RUDDER_NATIVE_PERF");
+
+    let mut logger = PerfLogger::new();
+    logger.log("test_event", serde_json::json!({ "ok": true }));
+    drop(logger);
+    let files = fs::read_dir(&home)
+        .map(|entries| entries.flatten().count())
+        .unwrap_or(0);
+
+    match prior_home {
+        Some(value) => std::env::set_var("RUDDER_HOME", value),
+        None => std::env::remove_var("RUDDER_HOME"),
+    }
+    match prior_perf {
+        Some(value) => std::env::set_var("RUDDER_NATIVE_PERF", value),
+        None => std::env::remove_var("RUDDER_NATIVE_PERF"),
+    }
+    let _ = fs::remove_dir_all(&home);
+
+    assert_eq!(files, 0, "disabled perf logging must not create files");
+}
+
+#[test]
+fn native_perf_logger_uses_per_process_file_when_enabled() {
+    let _env = env_guard();
+    let home = unique_test_repo("perf-home-enabled");
+    let prior_home = std::env::var_os("RUDDER_HOME");
+    let prior_perf = std::env::var_os("RUDDER_NATIVE_PERF");
+    std::env::set_var("RUDDER_HOME", &home);
+    std::env::set_var("RUDDER_NATIVE_PERF", "1");
+
+    let mut logger = PerfLogger::new();
+    logger.log("test_event", serde_json::json!({ "ok": true }));
+    drop(logger);
+    let names = fs::read_dir(&home)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    match prior_home {
+        Some(value) => std::env::set_var("RUDDER_HOME", value),
+        None => std::env::remove_var("RUDDER_HOME"),
+    }
+    match prior_perf {
+        Some(value) => std::env::set_var("RUDDER_NATIVE_PERF", value),
+        None => std::env::remove_var("RUDDER_NATIVE_PERF"),
+    }
+    let _ = fs::remove_dir_all(&home);
+
+    assert!(
+        names
+            .iter()
+            .any(|name| name.starts_with("native-perf-") && name.ends_with(".ndjson")),
+        "enabled perf logging should use a per-process file, got {names:?}"
+    );
+    assert!(
+        !names.iter().any(|name| name == "native-perf.ndjson"),
+        "legacy shared perf log file must not be used"
+    );
+}
+
+#[test]
+fn cleanup_old_signals_prunes_without_run_delete() {
+    let _env = env_guard();
+    let home = unique_test_repo("signals-ttl-home");
+    let prior_home = std::env::var_os("RUDDER_HOME");
+    std::env::set_var("RUDDER_HOME", &home);
+
+    let dir = crate::signals::signals_dir().expect("signals dir under RUDDER_HOME");
+    fs::create_dir_all(&dir).expect("create signals dir");
+    let stale = dir.join("stale.json");
+    fs::write(&stale, "x").expect("seed stale signal");
+    std::thread::sleep(Duration::from_millis(2));
+    let removed = crate::signals::cleanup_old_signals(Duration::ZERO);
+    let gone = !stale.exists();
+
+    match prior_home {
+        Some(value) => std::env::set_var("RUDDER_HOME", value),
+        None => std::env::remove_var("RUDDER_HOME"),
+    }
+    let _ = fs::remove_dir_all(&home);
+
+    assert_eq!(removed, 1, "one stale signal should be pruned");
+    assert!(gone, "stale signal should be removed");
+}

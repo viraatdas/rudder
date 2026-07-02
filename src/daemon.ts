@@ -10,10 +10,12 @@ import { shortenHome } from "./util.js";
 import { startBoardDaemon } from "./board/daemon.js";
 import type { BoardControlMode, BoardDaemonHandle } from "./board/daemon.js";
 import { RudderBus } from "./bus.js";
+import { createLogger } from "./logger.js";
 import { onRunTransition, scheduleTick } from "./scheduler.js";
 import { renderLiveRudderMd } from "./surfaces.js";
 
 const SCHEDULE_TICK_MS = 1000;
+const logger = createLogger("daemon", { fileName: "daemon.log" });
 
 export type DaemonPidFile = {
   pid: number;
@@ -151,11 +153,20 @@ function startScheduler(repoRoot: string, bus: RudderBus): { stop: () => void } 
   const tick = (): void => {
     if (stopped || tickInFlight) return;
     tickInFlight = true;
+    const started = Date.now();
+    logger.debug("scheduler tick started", { repoRoot });
     void scheduleTick(repoRoot, bus)
       .catch((error) => {
-        console.warn(`rudder scheduler tick failed: ${error instanceof Error ? error.message : String(error)}`);
+        logger.warn("scheduler tick failed", {
+          repoRoot,
+          error: error instanceof Error ? error.message : String(error),
+        });
       })
       .finally(() => {
+        logger.debug("scheduler tick finished", {
+          repoRoot,
+          durationMs: Date.now() - started,
+        });
         tickInFlight = false;
       });
   };
@@ -188,9 +199,11 @@ function startScheduler(repoRoot: string, bus: RudderBus): { stop: () => void } 
       runTimers.delete(runId);
       if (!stopped) {
         void onRunTransition(repoRoot, runId, bus).catch((error) => {
-          console.warn(
-            `rudder scheduler transition failed for ${runId}: ${error instanceof Error ? error.message : String(error)}`,
-          );
+          logger.warn("scheduler transition failed", {
+            repoRoot,
+            runId,
+            error: error instanceof Error ? error.message : String(error),
+          });
         });
       }
     }, 100);

@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import { createSpec, renderContract, verifyRun } from "./brain.js";
@@ -321,25 +322,42 @@ function signalProcessGroup(controllerPid: number, signal: NodeJS.Signals): void
 /**
  * The detached `rudder __worker` spawn primitive. Both startRun/continueRun and
  * the scheduler launch workers through this one path so the spawn shape (flags,
- * detached, stdio:"ignore", unref) is defined in exactly one place. Returns the
+ * detached, stderr capture, unref) is defined in exactly one place. Returns the
  * spawned worker pid (or undefined if the platform did not assign one).
  */
 export function spawnWorker(repoRoot: string, runId: string, attemptId?: string): number | undefined {
-  const worker = spawn(process.execPath, [
-    process.argv[1] ?? "",
-    "__worker",
-    "--repo",
-    repoRoot,
-    "--run",
-    runId,
-    ...(attemptId ? ["--attempt", attemptId] : []),
-  ], {
-    cwd: repoRoot,
-    detached: true,
-    stdio: "ignore",
-  });
-  worker.unref();
-  return worker.pid;
+  let stderrFd: number | undefined;
+  try {
+    fs.mkdirSync(runDir(repoRoot, runId), { recursive: true });
+    stderrFd = fs.openSync(path.join(runDir(repoRoot, runId), "spawn-stderr.log"), "w", 0o600);
+  } catch {
+    stderrFd = undefined;
+  }
+  try {
+    const worker = spawn(process.execPath, [
+      process.argv[1] ?? "",
+      "__worker",
+      "--repo",
+      repoRoot,
+      "--run",
+      runId,
+      ...(attemptId ? ["--attempt", attemptId] : []),
+    ], {
+      cwd: repoRoot,
+      detached: true,
+      stdio: stderrFd === undefined ? "ignore" : ["ignore", "ignore", stderrFd],
+    });
+    worker.unref();
+    return worker.pid;
+  } finally {
+    if (stderrFd !== undefined) {
+      try {
+        fs.closeSync(stderrFd);
+      } catch {
+        // ignore
+      }
+    }
+  }
 }
 
 export function newAttemptId(): string {
@@ -966,10 +984,18 @@ export async function printLogs(runId?: string, follow = false): Promise<void> {
   if (!(await pathExists(file))) {
     return;
   }
-  const output = await fsp.readFile(file, "utf8");
-  process.stdout.write(output);
+  let offset = 0;
+  await new Promise<void>((resolve, reject) => {
+    const stream = fs.createReadStream(file);
+    stream.on("data", (chunk) => {
+      offset += Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(chunk);
+      process.stdout.write(chunk);
+    });
+    stream.on("error", reject);
+    stream.on("end", resolve);
+  });
   if (follow) {
-    await followFile(file, Buffer.byteLength(output), async (chunk) => {
+    await followFile(file, offset, async (chunk) => {
       process.stdout.write(chunk);
     });
   }

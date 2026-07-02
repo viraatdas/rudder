@@ -73,6 +73,7 @@ import { mergeJjRunIntoCurrentWorkspace } from "../jj.js";
 import { hardParents, readGraph, softParents, updateGraph } from "../graph.js";
 import { continueRun, stopRun } from "../run-manager.js";
 import type { RudderBus } from "../bus.js";
+import { createLogger } from "../logger.js";
 import { mergeNodeIntoIntegration, reconcileInjection, withSchedulerLock } from "../scheduler.js";
 import { nowIso } from "../util.js";
 import type {
@@ -109,6 +110,7 @@ type SteerReceiptPayload = {
 // SPA bundle resolves relative to this module's own URL.
 const BOARD_JS_PATH = fileURLToPath(new URL("./board.js", import.meta.url));
 const BOARD_CSS_PATH = fileURLToPath(new URL("./board.css", import.meta.url));
+const logger = createLogger("board", { fileName: "daemon.log" });
 
 type SseClient = {
   res: ServerResponse;
@@ -147,6 +149,12 @@ export async function startBoardDaemon(opts: {
   const server = http.createServer((req, res) => {
     handleRequest(req, res, opts.bus, controlMode, opts.repoRoot).catch((error) => {
       const message = error instanceof Error ? error.message : String(error);
+      logger.warn("board request failed", {
+        method: req.method,
+        url: req.url,
+        repoRoot: opts.repoRoot,
+        error: message,
+      });
       if (!res.headersSent) {
         sendJson(res, 500, { error: message });
       } else {

@@ -7,6 +7,7 @@ import { codexLaunchEnv } from "./codex-binary.js";
 import { runCloudCommand } from "./cloud.js";
 import { printContextAudit } from "./context-audit.js";
 import { currentBranch, findRepoRoot } from "./git.js";
+import { runGc } from "./gc.js";
 import { ensureBoardRunning } from "./daemon.js";
 import {
   createNodeWorkspace,
@@ -54,6 +55,7 @@ type Parsed = {
     worktree?: boolean;
     queue?: boolean;
     allowDirty?: boolean;
+    dryRun?: boolean;
     force?: boolean;
     nonInteractive?: boolean;
     model?: string;
@@ -292,6 +294,9 @@ export async function main(): Promise<void> {
     case "cleanup":
       await cleanupRuns(Boolean(parsed.flags.force));
       return;
+    case "gc":
+      await runGc({ dryRun: Boolean(parsed.flags.dryRun) });
+      return;
     case "board":
     case "serve": {
       await runBoard(parsed);
@@ -420,6 +425,10 @@ function parseArgs(argv: string[]): Parsed {
     }
     if (arg === "--force") {
       parsed.flags.force = true;
+      continue;
+    }
+    if (arg === "--dry-run") {
+      parsed.flags.dryRun = true;
       continue;
     }
     if (arg === "--non-interactive") {
@@ -606,6 +615,9 @@ async function runNativeDashboard(): Promise<boolean> {
   }
   const update = await getUpdateAvailable().catch(() => null);
   const env = await codexLaunchEnv(process.env);
+  const previousNativeTui = process.env.RUDDER_NATIVE_TUI;
+  process.env.RUDDER_NATIVE_TUI = "1";
+  env.RUDDER_NATIVE_TUI = "1";
   if (update) {
     env.RUDDER_UPDATE_AVAILABLE = update.latest;
     env.RUDDER_UPDATE_CURRENT = update.current;
@@ -666,10 +678,20 @@ async function runNativeDashboard(): Promise<boolean> {
     // The in-process board daemon keeps the event loop alive, so without closing it
     // the CLI would hang after the foreground TUI exits. Close it before returning.
     await board?.handle?.close().catch(() => undefined);
+    restoreNativeTuiEnv(previousNativeTui);
     return true;
   } catch {
     await board?.handle?.close().catch(() => undefined);
+    restoreNativeTuiEnv(previousNativeTui);
     return false;
+  }
+}
+
+function restoreNativeTuiEnv(previous: string | undefined): void {
+  if (previous === undefined) {
+    delete process.env.RUDDER_NATIVE_TUI;
+  } else {
+    process.env.RUDDER_NATIVE_TUI = previous;
   }
 }
 
@@ -998,6 +1020,7 @@ Run management:
   rudder merge <run>              Merge a run into the current change
   rudder sync [run]               Rebase a run's jj change onto its base without merging
   rudder cleanup [--force]        Remove merged run workspaces
+  rudder gc [--dry-run]           Prune bounded diagnostics, old binaries, and stale run records
   rudder undo [opId]              Rewind jj to an op id, or the last undo-stack entry (global)
 
 Planner:
@@ -1049,6 +1072,7 @@ Options:
       --json                      Machine-readable output
   -v, --version                   Print version
       --allow-dirty               Allow merge into dirty target branch
+      --dry-run                   Report gc cleanup without deleting
 
 Rebase-first merge:
   Set {"mergeStrategy":"rebase"} in ~/.rudder/config.json to rebase before

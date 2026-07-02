@@ -105,6 +105,12 @@ const TASK_HISTORY_LIMIT: usize = 100;
 const MOUSE_DEBUG_ENV: &str = "RUDDER_MOUSE_DEBUG";
 const RUDDER_MOUSE_ENABLE_SEQUENCES: &[u8] = b"\x1b[?1003l\x1b[?1000h\x1b[?1002h\x1b[?1006h";
 const RUDDER_MOUSE_DISABLE_SEQUENCES: &[u8] = b"\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
+const SLOW_FRAME_THRESHOLD: Duration = Duration::from_millis(66);
+const SLOW_POLL_THRESHOLD: Duration = Duration::from_millis(33);
+const SLOW_DRAW_THRESHOLD: Duration = Duration::from_millis(33);
+const SLOW_PTY_DRAIN_THRESHOLD: Duration = Duration::from_millis(10);
+const SLOW_SCROLL_THRESHOLD: Duration = Duration::from_millis(5);
+const SLOW_LINE_RENDER_THRESHOLD: Duration = Duration::from_millis(5);
 const REVIEW_ALL_MODEL: &str = "gpt-5.5";
 const REVIEW_ALL_EFFORT: EffortLevel = EffortLevel::XHigh;
 const TASK_SUMMARY_MODEL: &str = "claude-haiku-4-5-20251001";
@@ -673,8 +679,10 @@ struct App {
     /// not changed, so a burst of poll ticks coalesces into one shell-out. None
     /// until the first mirror.
     last_mirror_signature: Option<u64>,
-    /// TEMPORARY: default-on native TUI perf diagnostics for the scroll-latency pass.
+    /// Opt-in native TUI perf diagnostics (`RUDDER_NATIVE_PERF=1`) plus in-memory
+    /// latency samples for the optional HUD (`RUDDER_PERF_HUD=1`).
     perf: PerfLogger,
+    perf_stats: PerfStats,
     scroll_draw_defer_until: Option<Instant>,
     scroll_events_since_draw: usize,
 }
@@ -1087,6 +1095,9 @@ impl App {
         let (task_summary_tx, task_summary_rx) = mpsc::channel();
         let (completion_summary_tx, completion_summary_rx) = mpsc::channel();
         let branch = current_branch_at(&cwd);
+        let _ = signals::cleanup_old_signals(Duration::from_secs(7 * 24 * 60 * 60));
+        let perf = PerfLogger::new();
+        let perf_stats = PerfStats::new(perf.enabled());
         Self {
             focus: FocusPane::Task,
             nav_mode: false,
@@ -1200,7 +1211,8 @@ impl App {
             session_started_iso,
             quit_confirm_pending: false,
             last_mirror_signature: None,
-            perf: PerfLogger::new(),
+            perf,
+            perf_stats,
             scroll_draw_defer_until: None,
             scroll_events_since_draw: 0,
         }
@@ -1282,6 +1294,39 @@ impl App {
     fn consume_scroll_draw_stats(&mut self) -> usize {
         self.scroll_draw_defer_until = None;
         std::mem::take(&mut self.scroll_events_since_draw)
+    }
+
+    fn record_perf_duration(&mut self, metric: &'static str, duration: Duration) {
+        self.perf_stats.record_duration(metric, duration);
+    }
+
+    fn log_perf_duration_over(
+        &mut self,
+        event: &str,
+        duration: Duration,
+        threshold: Duration,
+        fields: serde_json::Value,
+    ) {
+        self.perf
+            .log_duration_over(event, duration, threshold, fields);
+    }
+
+    fn write_rudder_context_timed(&mut self, pending: Option<&WorktreeInfo>) -> Result<()> {
+        let started = Instant::now();
+        let result = write_rudder_context(&self.cwd, &self.agents, pending);
+        let duration = started.elapsed();
+        self.record_perf_duration("write_rudder_context", duration);
+        self.log_perf_duration_over(
+            "write_rudder_context",
+            duration,
+            SLOW_POLL_THRESHOLD,
+            serde_json::json!({
+                "agents": self.agents.len(),
+                "pending": pending.is_some(),
+                "ok": result.is_ok(),
+            }),
+        );
+        result
     }
 
     /// Current spinner glyph for the active animation frame.
@@ -2345,7 +2390,7 @@ impl App {
         if let Some(run) = self.agents.get(self.selected_agent) {
             let _ = save_native_run_record(&self.cwd, run);
         }
-        let _ = write_rudder_context(&self.cwd, &self.agents, None);
+        let _ = self.write_rudder_context_timed(None);
         if started {
             let count = self
                 .agents
@@ -2785,7 +2830,7 @@ impl App {
             record_agent_prompt(run, prompt, "user");
             let _ = save_native_run_record(&self.cwd, run);
         }
-        let _ = write_rudder_context(&self.cwd, &self.agents, None);
+        let _ = self.write_rudder_context_timed(None);
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
@@ -2965,9 +3010,12 @@ impl App {
                 } else {
                     self.scroll_selected_worker_or_forward(mouse, inner)
                 };
-                self.perf.log_duration(
+                let duration = started.elapsed();
+                self.record_perf_duration("scroll_event", duration);
+                self.log_perf_duration_over(
                     "scroll_event",
-                    started,
+                    duration,
+                    SLOW_SCROLL_THRESHOLD,
                     serde_json::json!({
                         "pane": "worker-focus",
                         "view": format!("{:?}", self.worker_view),
@@ -3002,9 +3050,12 @@ impl App {
             } else {
                 self.scroll_selected_worker_or_forward(mouse, inner)
             };
-            self.perf.log_duration(
+            let duration = started.elapsed();
+            self.record_perf_duration("scroll_event", duration);
+            self.log_perf_duration_over(
                 "scroll_event",
-                started,
+                duration,
+                SLOW_SCROLL_THRESHOLD,
                 serde_json::json!({
                     "pane": "worker",
                     "view": format!("{:?}", self.worker_view),
@@ -3033,9 +3084,12 @@ impl App {
                 self.select_next_agent();
             }
             let changed = self.selected_agent != before;
-            self.perf.log_duration(
+            let duration = started.elapsed();
+            self.record_perf_duration("scroll_event", duration);
+            self.log_perf_duration_over(
                 "scroll_event",
-                started,
+                duration,
+                SLOW_SCROLL_THRESHOLD,
                 serde_json::json!({
                     "pane": "agents",
                     "kind": format!("{:?}", mouse.kind),
@@ -3052,9 +3106,12 @@ impl App {
             "mouse {:?} @{},{} pane=none route=ignored",
             mouse.kind, mouse.column, mouse.row
         ));
-        self.perf.log_duration(
+        let duration = started.elapsed();
+        self.record_perf_duration("scroll_event", duration);
+        self.log_perf_duration_over(
             "scroll_event",
-            started,
+            duration,
+            SLOW_SCROLL_THRESHOLD,
             serde_json::json!({
                 "pane": "none",
                 "kind": format!("{:?}", mouse.kind),
@@ -3927,7 +3984,7 @@ impl App {
                 WorktreeInfo::current(self.cwd.clone())
             }
         };
-        if let Err(error) = write_rudder_context(&self.cwd, &self.agents, Some(&worktree)) {
+        if let Err(error) = self.write_rudder_context_timed(Some(&worktree)) {
             self.notice = Some(format!("context warning: {error}"));
         }
 
@@ -4064,7 +4121,7 @@ impl App {
         if should_generate_summary {
             spawn_task_summary_worker(self.task_summary_tx.clone(), run_id, input.to_string());
         }
-        let _ = write_rudder_context(&self.cwd, &self.agents, None);
+        let _ = self.write_rudder_context_timed(None);
     }
 
     fn start_rudder_plan_task(&mut self, input: &str) {
@@ -5082,7 +5139,7 @@ impl App {
                 self.worker_view = WorkerView::Terminal;
                 self.notice = Some(format!("restarted {}", short_task(&run.task)));
                 let _ = save_native_run_record(&self.cwd, run);
-                let _ = write_rudder_context(&self.cwd, &self.agents, None);
+                let _ = self.write_rudder_context_timed(None);
             }
             Err(error) => {
                 run.status = AgentStatus::Failed;
@@ -8512,6 +8569,7 @@ impl App {
             let Some(rudder) = locate_rudder_cli() else {
                 return;
             };
+            let mirror_started = Instant::now();
             let repo = self.cwd.clone();
             let child = Command::new(&rudder)
                 .arg("__graph-mirror")
@@ -8531,6 +8589,16 @@ impl App {
             }
             // Reap so we do not leave a zombie; ignore the outcome (best-effort).
             let _ = child.wait();
+            let duration = mirror_started.elapsed();
+            self.record_perf_duration("mirror_graph", duration);
+            self.log_perf_duration_over(
+                "mirror_graph",
+                duration,
+                SLOW_POLL_THRESHOLD,
+                serde_json::json!({
+                    "nodes": payload.get("nodes").and_then(|nodes| nodes.as_array()).map(|nodes| nodes.len()).unwrap_or(0),
+                }),
+            );
         }
     }
 
@@ -9078,7 +9146,7 @@ impl App {
                 "deleted agent from dashboard".to_string()
             }
         }));
-        let _ = write_rudder_context(&self.cwd, &self.agents, None);
+        let _ = self.write_rudder_context_timed(None);
     }
 
     fn start_stored_merge_conflict_resolution(&mut self, index: usize) {
@@ -9969,7 +10037,7 @@ impl App {
                 if let Some(run) = self.agents.get(index) {
                     let _ = save_native_run_record(&self.cwd, run);
                 }
-                let _ = write_rudder_context(&self.cwd, &self.agents, None);
+                let _ = self.write_rudder_context_timed(None);
             }
             Err(error) => {
                 if let Some(run) = self.agents.get_mut(index) {
@@ -10210,7 +10278,7 @@ What to do\n\
                 let _ = save_native_run_record(&self.cwd, run);
             }
         }
-        let _ = write_rudder_context(&self.cwd, &self.agents, None);
+        let _ = self.write_rudder_context_timed(None);
         // A merge is a meaningful node transition (-> merged); mirror it so the
         // board reflects it without waiting for the next poll pass. Coalesced.
         self.mirror_graph();
@@ -10252,7 +10320,7 @@ What to do\n\
         let mut any_dirty = false;
         let mut context_dirty = false;
         let mut completed_rudder_plans = Vec::new();
-        let mut drain_perf = Vec::new();
+        let mut drain_perf: Vec<(Duration, serde_json::Value)> = Vec::new();
         for (index, run) in self.agents.iter_mut().enumerate() {
             let mut changed = false;
             let Some(terminal) = run.terminal.as_mut() else {
@@ -10297,14 +10365,17 @@ What to do\n\
             let drained = terminal.drain_output();
             let drained_bytes = drained.len();
             let had_output = drained_bytes > 0;
-            drain_perf.push(serde_json::json!({
-                "run_id": run.id.clone(),
-                "index": index,
-                "focused": is_focused,
-                "streaming_planner": is_streaming_planner,
-                "bytes": drained_bytes,
-                "duration_us": drain_started.elapsed().as_micros() as u64,
-            }));
+            let drain_duration = drain_started.elapsed();
+            drain_perf.push((
+                drain_duration,
+                serde_json::json!({
+                    "run_id": run.id.clone(),
+                    "index": index,
+                    "focused": is_focused,
+                    "streaming_planner": is_streaming_planner,
+                    "bytes": drained_bytes,
+                }),
+            ));
             if had_output {
                 any_dirty = true;
             }
@@ -10633,18 +10704,27 @@ What to do\n\
         }
 
         if context_dirty {
-            let _ = write_rudder_context(&self.cwd, &self.agents, None);
+            let _ = self.write_rudder_context_timed(None);
         }
 
         if any_dirty {
             self.dirty = true;
         }
-        for fields in drain_perf {
-            self.perf.log("pty_drain_parse", fields);
+        for (duration, fields) in drain_perf {
+            self.record_perf_duration("pty_drain_parse", duration);
+            self.log_perf_duration_over(
+                "pty_drain_parse",
+                duration,
+                SLOW_PTY_DRAIN_THRESHOLD,
+                fields,
+            );
         }
-        self.perf.log_duration(
+        let poll_duration = poll_started.elapsed();
+        self.record_perf_duration("poll_agents", poll_duration);
+        self.log_perf_duration_over(
             "poll_agents",
-            poll_started,
+            poll_duration,
+            SLOW_POLL_THRESHOLD,
             serde_json::json!({
                 "agents": self.agents.len(),
                 "any_dirty": any_dirty,
@@ -10674,7 +10754,7 @@ What to do\n\
             changed = true;
         }
         if changed {
-            let _ = write_rudder_context(&self.cwd, &self.agents, None);
+            let _ = self.write_rudder_context_timed(None);
             self.dirty = true;
         }
     }
@@ -10695,7 +10775,7 @@ What to do\n\
                 let _ = save_native_run_record(&self.cwd, run);
             }
         }
-        let _ = write_rudder_context(&self.cwd, &self.agents, None);
+        let _ = self.write_rudder_context_timed(None);
     }
 }
 
@@ -11015,9 +11095,12 @@ fn run(terminal: &mut Tui) -> Result<()> {
                 render_build_us = render_started.elapsed().as_micros() as u64;
             })?;
             let scroll_events = app.consume_scroll_draw_stats();
-            app.perf.log_duration(
+            let draw_duration = draw_started.elapsed();
+            app.record_perf_duration("terminal_draw", draw_duration);
+            app.log_perf_duration_over(
                 "terminal_draw",
-                draw_started,
+                draw_duration,
+                SLOW_DRAW_THRESHOLD,
                 serde_json::json!({
                     "render_build_us": render_build_us,
                     "scroll_events": scroll_events,
@@ -11041,25 +11124,22 @@ fn run(terminal: &mut Tui) -> Result<()> {
                 break;
             }
             let shutdown = drain_ready_events(&mut app, MAX_EVENTS_PER_FRAME.saturating_sub(1))?;
-            app.perf.log(
-                "event_drain",
-                serde_json::json!({
-                    "count": 1,
-                    "phase": "blocking",
-                }),
-            );
             if shutdown {
                 app.shutdown();
                 return Ok(());
             }
         }
-        app.perf.log_duration(
+        let frame_duration = frame_started.elapsed();
+        app.record_perf_duration("frame_total", frame_duration);
+        app.log_perf_duration_over(
             "frame_total",
-            frame_started,
+            frame_duration,
+            SLOW_FRAME_THRESHOLD,
             serde_json::json!({
                 "active_us_before_block": active_us_before_block,
             }),
         );
+        app.perf_stats.emit_due(&mut app.perf);
     }
 
     Ok(())
@@ -11083,7 +11163,7 @@ fn drain_ready_events(app: &mut App, max_events: usize) -> Result<bool> {
         }
         drained_events += 1;
     }
-    if drained_events > 0 {
+    if drained_events > 1 {
         app.perf.log(
             "event_drain",
             serde_json::json!({

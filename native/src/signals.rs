@@ -20,6 +20,7 @@
 #![allow(unused_imports)]
 use super::*;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SignalState {
@@ -98,6 +99,38 @@ pub(crate) fn cleanup_run_signals(run_id: &str) {
     let _ = std::fs::remove_file(dir.join(format!("{run_id}.json")));
     let _ = std::fs::remove_file(dir.join(format!("{run_id}-claude.json")));
     let _ = std::fs::remove_file(dir.join(format!("{run_id}-notify.sh")));
+}
+
+/// Remove stale signal/config files that no run deletion ever reached. Best-effort.
+pub(crate) fn cleanup_old_signals(max_age: Duration) -> usize {
+    let Some(dir) = signals_dir() else {
+        return 0;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let Some(cutoff) = SystemTime::now().checked_sub(max_age) else {
+        return 0;
+    };
+    let mut removed = 0_usize;
+    for entry in entries.flatten() {
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        if modified >= cutoff {
+            continue;
+        }
+        if std::fs::remove_file(entry.path()).is_ok() {
+            removed = removed.saturating_add(1);
+        }
+    }
+    removed
 }
 
 /// Tolerant parse of the signal JSON body into a state.
