@@ -328,8 +328,8 @@ pub(crate) fn styled_terminal_line(
                 .unwrap_or_else(|| plain_terminal_cell(" ".to_string()));
             let mut style = terminal_cell_style(&cell);
             if selection.is_some_and(|(start, end)| col >= start && col <= end) {
-                // Light-theme text selection: a pale teal highlight with ink text,
-                // not a heavy dark block.
+                // A pale teal selection highlight stays readable in both terminal
+                // background and paper modes without becoming a heavy dark block.
                 style = style.fg(INK).bg(SURFACE_SEL);
             }
             if cursor_col == Some(col) {
@@ -341,8 +341,8 @@ pub(crate) fn styled_terminal_line(
     Line::from(spans)
 }
 
-/// A solid block cursor for the light theme: paper text on a teal accent fill, so
-/// it reads as a clear caret on white.
+/// A solid block cursor: paper text on a teal accent fill, so it reads clearly
+/// regardless of the terminal background.
 pub(crate) fn cursor_cell_style() -> Style {
     Style::default().fg(PAPER).bg(ACCENT)
 }

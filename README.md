@@ -181,6 +181,7 @@ running, Rudder also exposes matching project skills; the orchestrator can write
 | `/review-all` | Combine completed worktrees and start a Codex review-all agent |
 | `/merge-all` | Merge all completed worktrees |
 | `/automerge` | Toggle automatic clean merges (persists across sessions; shown in the agents pane header) |
+| `/color terminal\|paper` | Choose the native dashboard color mode; `terminal` uses your terminal foreground/background, `paper` restores the white canvas |
 | `/login` | Browser login for Rudder Cloud |
 | `/cloud` | Onload the current workspace or start a fresh cloud worker |
 | `/cloud list` | List cloud workers |

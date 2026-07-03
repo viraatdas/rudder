@@ -70,6 +70,7 @@ export type RudderConfig = {
   defaultBackend: BackendId;
   lastUsedBackend?: BackendId;
   mergeStrategy: MergeStrategy;
+  colorMode?: "terminal" | "paper";
   runPolicy: {
     sameCheckout: "single-active";
     concurrentPromptMode: "worktree" | "queue";

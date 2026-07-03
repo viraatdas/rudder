@@ -175,6 +175,7 @@ export function defaultConfig(): RudderConfig {
     version: 1,
     defaultBackend: "claude",
     mergeStrategy: "merge",
+    colorMode: "terminal",
     runPolicy: {
       sameCheckout: "single-active",
       concurrentPromptMode: "worktree",
@@ -200,6 +201,7 @@ function normalizeConfig(existing: RudderConfig): RudderConfig {
     ...defaults,
     ...existing,
     mergeStrategy: parseMergeStrategy(existing.mergeStrategy),
+    colorMode: existing.colorMode === "paper" ? "paper" : "terminal",
     runPolicy: {
       ...defaults.runPolicy,
       ...(existing.runPolicy ?? {}),

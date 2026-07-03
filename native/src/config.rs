@@ -134,6 +134,24 @@ pub(crate) fn completion_sound_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Dashboard color mode. `terminal` is the default so the native TUI leaves the
+/// terminal foreground/background alone and blends with the surrounding tab bar.
+/// `paper` preserves the previous hard-white canvas.
+pub(crate) fn config_color_mode(config: &serde_json::Value) -> Option<ColorMode> {
+    config
+        .get("colorMode")
+        .and_then(serde_json::Value::as_str)
+        .and_then(ColorMode::parse)
+}
+
+pub(crate) fn initial_color_mode() -> ColorMode {
+    std::env::var("RUDDER_COLOR_MODE")
+        .ok()
+        .and_then(|value| ColorMode::parse(&value))
+        .or_else(|| load_rudder_config().as_ref().and_then(config_color_mode))
+        .unwrap_or(ColorMode::Terminal)
+}
+
 /// Persist the `/sound` toggle so the next session keeps the same audio behavior.
 pub(crate) fn save_completion_sound(enabled: bool) -> Result<()> {
     let path = rudder_config_path().context("could not determine Rudder config path")?;
@@ -148,6 +166,25 @@ pub(crate) fn save_completion_sound(enabled: bool) -> Result<()> {
     root.insert(
         "completionSound".to_string(),
         serde_json::Value::Bool(enabled),
+    );
+    write_config_atomically(&path, &config)
+}
+
+/// Persist the dashboard color mode so the next session keeps matching the
+/// user's terminal background unless they explicitly pick the old paper canvas.
+pub(crate) fn save_color_mode(mode: ColorMode) -> Result<()> {
+    let path = rudder_config_path().context("could not determine Rudder config path")?;
+    let mut config = load_config_for_write(&path);
+    if !config.is_object() {
+        config = default_config_value();
+    }
+    ensure_config_defaults(&mut config);
+    let root = config
+        .as_object_mut()
+        .context("Rudder config root is not an object")?;
+    root.insert(
+        "colorMode".to_string(),
+        serde_json::Value::String(mode.as_str().to_string()),
     );
     write_config_atomically(&path, &config)
 }
@@ -306,6 +343,8 @@ pub(crate) fn ensure_config_defaults(config: &mut serde_json::Value) {
         .or_insert(serde_json::json!("claude"));
     root.entry("mergeStrategy".to_string())
         .or_insert(serde_json::json!("merge"));
+    root.entry("colorMode".to_string())
+        .or_insert(serde_json::json!("terminal"));
     root.entry("runPolicy".to_string()).or_insert_with(|| {
         serde_json::json!({
             "sameCheckout": "single-active",
@@ -324,6 +363,7 @@ pub(crate) fn default_config_value() -> serde_json::Value {
         "version": 1,
         "defaultBackend": "claude",
         "mergeStrategy": "merge",
+        "colorMode": "terminal",
         "runPolicy": {
             "sameCheckout": "single-active",
             "concurrentPromptMode": "worktree",

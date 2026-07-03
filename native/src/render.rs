@@ -6,8 +6,8 @@ use crate::plan_stream::{PlanEntry, PlanEntryKind};
 pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
     frame.render_widget(Clear, area);
-    // Paint the white canvas so the whole UI is light regardless of the user's
-    // terminal background, and bare text inherits the ink fg.
+    // In terminal-background mode this leaves the terminal foreground/background
+    // untouched; in paper mode it paints the previous white canvas.
     frame.render_widget(Block::default().style(app_style()), area);
 
     let task_height = task_pane_height(app, area.width);
@@ -3824,17 +3824,19 @@ pub(crate) fn pane_block(title: &str, focused: bool, nav_mode: bool) -> Block<'s
         Style::default().fg(INACTIVE_COLOR)
     };
 
-    // Focused: white text on a teal title fill. Unfocused: a quiet ink-on-paper
-    // label. No bold anywhere (the theme is thin).
+    // Focused: white text on a teal title fill. Unfocused: a quiet label with
+    // no forced background in terminal-background mode.
     let title_style = if focused {
         Style::default().fg(PAPER).bg(FOCUS_COLOR)
+    } else if terminal_background_mode() {
+        Style::default().fg(MUTED)
     } else {
         Style::default().fg(MUTED).bg(PAPER)
     };
     let _ = nav_mode;
 
-    // Carry the white canvas style so the pane interior is painted paper, not the
-    // terminal background.
+    // Carry the configured base style so pane interiors are consistent with the
+    // selected color mode.
     Block::default()
         .title(Line::from(Span::styled(format!(" {title} "), title_style)))
         .borders(Borders::ALL)
@@ -3954,9 +3956,7 @@ pub(crate) fn push_wrapped_word(
 
 pub(crate) fn pane_text_style(focused: bool) -> Style {
     if focused {
-        // Explicit ink. The app paints its own white canvas, so primary text must
-        // set a dark fg; the terminal-default fg could be light = invisible on white.
-        Style::default().fg(INK)
+        app_style()
     } else {
         Style::default().fg(MUTED)
     }
@@ -3980,11 +3980,15 @@ pub(crate) fn cloud_style(connected: bool, focused: bool) -> Style {
     Style::default().fg(color)
 }
 
-/// Base style for the whole UI: ink on the white canvas. Every pane block and
-/// paragraph carries this so the background is white regardless of the user's
-/// terminal theme, and bare `Span::raw` text inherits the ink fg.
+/// Base style for the whole UI. Terminal mode intentionally sets neither fg nor
+/// bg so the user's terminal theme shows through; paper mode restores the old
+/// ink-on-white canvas.
 pub(crate) fn app_style() -> Style {
-    Style::default().fg(INK).bg(PAPER)
+    if terminal_background_mode() {
+        Style::default()
+    } else {
+        Style::default().fg(INK).bg(PAPER)
+    }
 }
 
 pub(crate) fn error_style() -> Style {

@@ -6298,6 +6298,23 @@ fn completion_sound_defaults_off_and_config_parses_bool() {
 }
 
 #[test]
+fn color_mode_defaults_to_terminal_background_and_config_parses_aliases() {
+    assert_eq!(config::config_color_mode(&serde_json::json!({})), None);
+    assert_eq!(
+        config::config_color_mode(&serde_json::json!({"colorMode": "terminal"})),
+        Some(ColorMode::Terminal)
+    );
+    assert_eq!(
+        config::config_color_mode(&serde_json::json!({"colorMode": "terminal-bg"})),
+        Some(ColorMode::Terminal)
+    );
+    assert_eq!(
+        config::config_color_mode(&serde_json::json!({"colorMode": "paper"})),
+        Some(ColorMode::Paper)
+    );
+}
+
+#[test]
 fn sound_command_persists_completion_sound_toggle() {
     let _env = env_guard();
     let home = unique_test_repo("sound-config-home");
@@ -6319,6 +6336,45 @@ fn sound_command_persists_completion_sound_toggle() {
     assert_eq!(
         app.notice.as_deref(),
         Some("completion sound OFF (saved): workers enter review silently")
+    );
+
+    match previous_home {
+        Some(value) => std::env::set_var("RUDDER_HOME", value),
+        None => std::env::remove_var("RUDDER_HOME"),
+    }
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn color_command_persists_and_applies_dashboard_color_mode() {
+    let _env = env_guard();
+    let home = unique_test_repo("color-config-home");
+    let previous_home = std::env::var_os("RUDDER_HOME");
+    std::env::set_var("RUDDER_HOME", &home);
+
+    let mut app = App::new();
+    assert_eq!(color_mode(), ColorMode::Terminal);
+
+    assert!(app.handle_command("/color paper"));
+    assert_eq!(color_mode(), ColorMode::Paper);
+    assert_eq!(
+        config::config_color_mode(&config::load_rudder_config().expect("config saved")),
+        Some(ColorMode::Paper)
+    );
+    assert_eq!(
+        app.notice.as_deref(),
+        Some("color mode paper (saved): using Rudder's white paper canvas")
+    );
+
+    assert!(app.handle_command("/color terminal"));
+    assert_eq!(color_mode(), ColorMode::Terminal);
+    assert_eq!(
+        config::config_color_mode(&config::load_rudder_config().expect("config saved")),
+        Some(ColorMode::Terminal)
+    );
+    assert_eq!(
+        app.notice.as_deref(),
+        Some("color mode terminal (saved): using terminal foreground/background for the dashboard")
     );
 
     match previous_home {
@@ -9355,12 +9411,18 @@ fn task_hint_invites_adding_to_running_plan_post_launch() {
 }
 
 #[test]
-fn app_style_paints_white_with_ink_text() {
-    // The light theme paints its own canvas; primary text must set an explicit
-    // dark fg (terminal-default fg could be light = invisible on white).
+fn app_style_uses_terminal_background_by_default_and_keeps_paper_mode_available() {
+    set_color_mode(ColorMode::Terminal);
+    assert_eq!(app_style().bg, None);
+    assert_eq!(app_style().fg, None);
+    assert_eq!(pane_text_style(true).fg, None);
+
+    set_color_mode(ColorMode::Paper);
     assert_eq!(app_style().bg, Some(PAPER));
     assert_eq!(app_style().fg, Some(INK));
     assert_eq!(pane_text_style(true).fg, Some(INK));
+
+    set_color_mode(ColorMode::Terminal);
     // Thin theme: helpers carry no bold.
     assert!(!accent_style(true).add_modifier.contains(Modifier::BOLD));
     assert!(!header_style(true).add_modifier.contains(Modifier::BOLD));

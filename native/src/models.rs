@@ -349,6 +349,12 @@ pub(crate) fn command_suggestions() -> Vec<Suggestion> {
             action: SuggestionAction::RunCommand("/automerge".to_string()),
         },
         Suggestion {
+            label: "/color terminal|paper".to_string(),
+            detail: "pick dashboard color mode; terminal uses your terminal background"
+                .to_string(),
+            action: SuggestionAction::Insert("/color ".to_string()),
+        },
+        Suggestion {
             label: "/usage".to_string(),
             detail: "show tokens and estimated cost per model".to_string(),
             action: SuggestionAction::RunCommand("/usage".to_string()),

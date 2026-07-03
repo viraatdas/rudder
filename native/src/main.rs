@@ -1042,6 +1042,12 @@ impl App {
             .map(|path| dashboard_root(&path))
             .unwrap_or_else(|_| PathBuf::from("."));
         let selection = initial_selection();
+        let dashboard_color_mode = if cfg!(test) {
+            ColorMode::Terminal
+        } else {
+            config::initial_color_mode()
+        };
+        set_color_mode(dashboard_color_mode);
         let agents = if cfg!(test) {
             Vec::new()
         } else {
@@ -5280,7 +5286,7 @@ impl App {
             }
             Some("/help") => {
                 self.notice = Some(
-                    "plain input -> orchestrator/DAG · /run <task> -> one isolated mergeable worker · /ask <text> -> direct main-checkout one-off · /plan <text> -> force orchestrator/DAG · panes: Option-1/2/3 or ^W · keys: j/k select · Enter focus · v diff · m merge · M merge all · R review all · g nest · o web ui · x stop · dd delete · P model — commands: /model /fast /sound /main /run /ask /plan /share /usage /goal /cloud /web"
+                    "plain input -> orchestrator/DAG · /run <task> -> one isolated mergeable worker · /ask <text> -> direct main-checkout one-off · /plan <text> -> force orchestrator/DAG · panes: Option-1/2/3 or ^W · keys: j/k select · Enter focus · v diff · m merge · M merge all · R review all · g nest · o web ui · x stop · dd delete · P model — commands: /model /fast /sound /color /main /run /ask /plan /share /usage /goal /cloud /web"
                         .to_string(),
                 );
                 true
@@ -5453,6 +5459,39 @@ impl App {
                         self.notice = Some(format!("sound setting failed: {error}"));
                     }
                 }
+                true
+            }
+            Some("/color") => {
+                let arg = parts.next().unwrap_or("toggle");
+                let mode = if arg.eq_ignore_ascii_case("toggle") {
+                    color_mode().toggled()
+                } else if let Some(mode) = ColorMode::parse(arg) {
+                    mode
+                } else {
+                    self.notice = Some(
+                        "usage: /color terminal|paper|toggle — terminal uses your terminal background"
+                            .to_string(),
+                    );
+                    return true;
+                };
+                set_color_mode(mode);
+                match config::save_color_mode(mode) {
+                    Ok(()) => {
+                        self.notice = Some(format!(
+                            "color mode {} (saved): {}",
+                            mode.as_str(),
+                            match mode {
+                                ColorMode::Terminal =>
+                                    "using terminal foreground/background for the dashboard",
+                                ColorMode::Paper => "using Rudder's white paper canvas",
+                            }
+                        ));
+                    }
+                    Err(error) => {
+                        self.notice = Some(format!("color setting failed: {error}"));
+                    }
+                }
+                self.dirty = true;
                 true
             }
             Some("/web") | Some("/ui") | Some("/board") => {

@@ -1,19 +1,79 @@
 //! Central truecolor theme for the Rudder dashboard.
 //!
-//! Modern LIGHT theme: a pure-white canvas, near-black ink, thin weight (no bold),
-//! restrained teal accent, and quiet status colors tuned to read on white. Every
-//! color the dashboard draws lives here so the palette is one edit away. The legacy
-//! const names (`FOCUS_COLOR`, `INACTIVE_COLOR`, ...) are kept and re-pointed so the
-//! call sites in `render.rs`/`selection.rs` pick up the new look unchanged.
-//!
-//! This mirrors the website + board palette (white paper, #1a1a1a ink, teal accent)
-//! so the whole product reads as one consistent surface.
+//! The default color mode leaves the terminal foreground/background untouched so
+//! Rudder blends with the user's tab bar and terminal theme. A saved `paper` mode
+//! keeps the previous pure-white canvas for users who prefer that look. Accent,
+//! status, and selection colors remain explicit in both modes.
 #![allow(dead_code)]
 use super::*;
 
-// --- Modern light core palette (tuned for a WHITE canvas the app paints itself) ---
-/// The canvas. The app paints this behind everything so the look is the same
-/// regardless of the user's terminal background.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ColorMode {
+    Terminal,
+    Paper,
+}
+
+impl ColorMode {
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match normalize_color_mode(value).as_str() {
+            "terminal" | "term" | "default" | "native" | "transparent" | "terminalbackground"
+            | "terminalbg" | "bg" => Some(Self::Terminal),
+            "paper" | "white" | "light" => Some(Self::Paper),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Terminal => "terminal",
+            Self::Paper => "paper",
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Terminal => "terminal background",
+            Self::Paper => "paper white",
+        }
+    }
+
+    pub(crate) fn toggled(self) -> Self {
+        match self {
+            Self::Terminal => Self::Paper,
+            Self::Paper => Self::Terminal,
+        }
+    }
+}
+
+fn normalize_color_mode(value: &str) -> String {
+    value
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect()
+}
+
+thread_local! {
+    static CURRENT_COLOR_MODE: std::cell::Cell<ColorMode> =
+        const { std::cell::Cell::new(ColorMode::Terminal) };
+}
+
+pub(crate) fn set_color_mode(mode: ColorMode) {
+    CURRENT_COLOR_MODE.with(|current| current.set(mode));
+}
+
+pub(crate) fn color_mode() -> ColorMode {
+    CURRENT_COLOR_MODE.with(std::cell::Cell::get)
+}
+
+pub(crate) fn terminal_background_mode() -> bool {
+    color_mode() == ColorMode::Terminal
+}
+
+// --- Core palette. PAPER is used as the optional paper-mode canvas and as
+// high-contrast text on filled accent badges.
+/// The optional paper-mode canvas.
 pub(crate) const PAPER: Color = Color::Rgb(0xFF, 0xFF, 0xFF);
 /// Primary text: near-black ink (matches the site's #1a1a1a).
 pub(crate) const INK: Color = Color::Rgb(0x1A, 0x1A, 0x1A);
