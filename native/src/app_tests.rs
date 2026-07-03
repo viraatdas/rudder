@@ -4651,6 +4651,27 @@ fn model_picker_accepts_new_claude_families_without_a_release() {
         .any(|(backend, model, _)| *backend == Backend::Claude && *model == "fable"));
     assert!(is_reasoning_alias(Backend::Claude, "fable[1m]"));
     assert!(effort_options_for(Backend::Claude, "fable").contains(&Some(EffortLevel::Max)));
+    assert!(effort_options_for(Backend::Claude, "claude-somenewtier-6")
+        .contains(&Some(EffortLevel::Max)));
+}
+
+#[test]
+fn model_picker_accepts_future_codex_models_without_a_release() {
+    let meta = serde_json::json!({
+        "tool_call": true,
+        "modalities": { "output": ["text"] }
+    });
+    assert!(is_codex_picker_model("gpt-6-codex-preview", &meta));
+    assert!(is_codex_picker_model("gpt-6.1", &meta));
+    assert!(is_codex_picker_model("o5", &meta));
+    assert!(!is_codex_picker_model("gpt-image-2", &meta));
+    assert!(!is_codex_picker_model("gpt-realtime-2", &meta));
+
+    assert!(
+        score_model(Backend::Codex, "gpt-6-codex-preview") > score_model(Backend::Codex, "gpt-5.5")
+    );
+    assert!(effort_options_for(Backend::Codex, "gpt-6.1").contains(&Some(EffortLevel::XHigh)));
+    assert_eq!(backend_for_model("o5"), Backend::Codex);
 }
 
 #[test]

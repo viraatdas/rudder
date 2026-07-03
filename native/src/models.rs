@@ -90,9 +90,16 @@ pub(crate) fn model_supports_reasoning(backend: Backend, model: &str) -> bool {
     }
     let heuristic = match backend {
         Backend::Claude => {
-            model.contains("opus") || model.contains("sonnet") || model.contains("fable")
+            model.contains("opus")
+                || model.contains("sonnet")
+                || model.contains("fable")
+                || (model.starts_with("claude-")
+                    && !model.contains("haiku")
+                    && !model.contains("3-"))
         }
-        Backend::Codex => model.starts_with("gpt-5") || model.contains("codex"),
+        Backend::Codex => {
+            is_gpt_text_model(model) || model.contains("codex") || is_o_series_model(model)
+        }
     };
     // OR the heuristic with the cache rather than letting the cache override it: a
     // stale or wrong models.dev entry (`reasoning: false`) must never REMOVE the
@@ -107,7 +114,9 @@ pub(crate) fn is_reasoning_alias(backend: Backend, model: &str) -> bool {
             model,
             "sonnet" | "sonnet[1m]" | "opus" | "opus[1m]" | "fable" | "fable[1m]"
         ),
-        Backend::Codex => model.starts_with("gpt-5") || model.contains("codex"),
+        Backend::Codex => {
+            is_gpt_text_model(model) || model.contains("codex") || is_o_series_model(model)
+        }
     }
 }
 
@@ -460,14 +469,14 @@ pub(crate) fn model_suggestions_for(backend_filter: Backend, query: &str) -> Vec
     let mut seen = HashSet::new();
     let mut suggestions = Vec::new();
 
-    for (backend, model, detail) in fallback_model_rows() {
-        if backend == backend_filter {
-            push_model_suggestion(&mut suggestions, &mut seen, backend, model, detail);
-        }
-    }
     for (backend, model, detail) in cached_models_dev_rows() {
         if backend == backend_filter {
             push_model_suggestion(&mut suggestions, &mut seen, backend, &model, &detail);
+        }
+    }
+    for (backend, model, detail) in fallback_model_rows() {
+        if backend == backend_filter {
+            push_model_suggestion(&mut suggestions, &mut seen, backend, model, detail);
         }
     }
 
@@ -588,8 +597,12 @@ pub(crate) fn collect_provider_models(
         })
         .collect::<Vec<_>>();
 
-    entries.sort_by(|a, b| score_model(backend, &b.0).cmp(&score_model(backend, &a.0)));
-    for (id, detail) in entries.into_iter().take(8) {
+    entries.sort_by(|a, b| {
+        score_model(backend, &b.0)
+            .cmp(&score_model(backend, &a.0))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    for (id, detail) in entries.into_iter().take(24) {
         rows.push((backend, id, detail));
     }
 }
@@ -614,10 +627,10 @@ pub(crate) fn is_codex_picker_model(id: &str, model: &serde_json::Value) -> bool
         .and_then(serde_json::Value::as_array)
         .is_none_or(|output| output.iter().any(|value| value.as_str() == Some("text")));
     text_output
+        && !is_excluded_openai_text_model(id)
         && !id.contains("deep-research")
         && !id.contains("chat-latest")
-        && !id.contains("pro")
-        && (id.contains("codex") || id.starts_with("gpt-5"))
+        && (id.contains("codex") || is_gpt_text_model(id) || is_o_series_model(id))
 }
 
 pub(crate) fn score_model(backend: Backend, id: &str) -> i32 {
@@ -642,15 +655,79 @@ pub(crate) fn score_model(backend: Backend, id: &str) -> i32 {
             if id.contains("codex") {
                 score += 40;
             }
-            if id.starts_with("gpt-5.5") {
-                score += 35;
-            }
-            if id.starts_with("gpt-5.4") {
-                score += 30;
+            score += gpt_version_score(id);
+            if is_o_series_model(id) {
+                score += 25;
             }
             score
         }
     }
+}
+
+pub(crate) fn is_excluded_openai_text_model(id: &str) -> bool {
+    let lower = id.to_ascii_lowercase();
+    [
+        "embedding",
+        "image",
+        "audio",
+        "tts",
+        "whisper",
+        "transcribe",
+        "translation",
+        "moderation",
+        "rerank",
+        "realtime",
+        "dall-e",
+        "search",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+pub(crate) fn is_gpt_text_model(id: &str) -> bool {
+    id.strip_prefix("gpt-")
+        .and_then(|rest| rest.chars().next())
+        .is_some_and(|ch| ch.is_ascii_digit())
+}
+
+pub(crate) fn is_o_series_model(id: &str) -> bool {
+    id.strip_prefix('o')
+        .and_then(|rest| rest.chars().next())
+        .is_some_and(|ch| ch.is_ascii_digit())
+}
+
+pub(crate) fn gpt_version_score(id: &str) -> i32 {
+    let Some(rest) = id.strip_prefix("gpt-") else {
+        return 0;
+    };
+    let mut major = String::new();
+    let mut chars = rest.chars().peekable();
+    while let Some(ch) = chars.peek().copied() {
+        if ch.is_ascii_digit() {
+            major.push(ch);
+            chars.next();
+        } else {
+            break;
+        }
+    }
+    if major.is_empty() {
+        return 0;
+    }
+    let mut minor = String::new();
+    if matches!(chars.peek(), Some('.') | Some('-')) {
+        chars.next();
+        while let Some(ch) = chars.peek().copied() {
+            if ch.is_ascii_digit() {
+                minor.push(ch);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+    }
+    let major = major.parse::<i32>().unwrap_or(0);
+    let minor = minor.parse::<i32>().unwrap_or(0);
+    20 + major * 20 + minor
 }
 
 pub(crate) fn models_dev_cache_path() -> Option<PathBuf> {
@@ -664,7 +741,7 @@ pub(crate) fn models_dev_cache_path() -> Option<PathBuf> {
 }
 
 pub(crate) fn backend_for_model(model: &str) -> Backend {
-    if model.starts_with("gpt-") || model.contains("codex") {
+    if model.starts_with("gpt-") || model.contains("codex") || is_o_series_model(model) {
         Backend::Codex
     } else {
         Backend::Claude
