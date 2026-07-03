@@ -30,7 +30,7 @@ jobs:
           - key: darwin-x64
             runner: macos-15-intel
           - key: linux-x64
-            runner: ubuntu-24.04
+            runner: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
