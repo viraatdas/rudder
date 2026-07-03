@@ -18,17 +18,49 @@ on:
       - "v*"
 
 jobs:
+  native-artifacts:
+    name: Native ${{ matrix.key }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - key: darwin-arm64
+            runner: macos-15
+          - key: darwin-x64
+            runner: macos-15-intel
+          - key: linux-x64
+            runner: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build native binary
+        run: cargo build --release --manifest-path native/Cargo.toml
+
+      - name: Stage native artifact
+        run: |
+          mkdir -p "native-dist/${{ matrix.key }}"
+          cp target/release/rudder-native "native-dist/${{ matrix.key }}/rudder-native"
+          chmod 755 "native-dist/${{ matrix.key }}/rudder-native"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rudder-native-${{ matrix.key }}
+          path: native-dist/${{ matrix.key }}/rudder-native
+
   publish:
-    # macOS runner so the bundled native binary (dist/native/rudder-native,
-    # built by `prepack`) matches the macOS build currently shipped. See the
-    # cross-platform note in AGENTS.md "Releasing". GitHub macOS runners ship
-    # with a Rust toolchain preinstalled, which the cargo build needs.
-    runs-on: macos-14
+    needs: native-artifacts
+    runs-on: macos-15
     permissions:
       contents: read
       id-token: write # required for npm provenance
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: rudder-native-*
+          path: prebuilt-native
 
       - uses: actions/setup-node@v4
         with:
@@ -66,8 +98,9 @@ jobs:
         run: cargo test --manifest-path native/Cargo.toml
 
       # `npm publish` runs `prepack` (tsc + cargo build --release + copy-native),
-      # so the published dist/ and native binary are always freshly built here.
+      # and copy-native folds the downloaded native artifacts into dist/native.
       - name: Publish to npm
         run: npm publish --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          RUDDER_NATIVE_PREBUILTS: ${{ github.workspace }}/prebuilt-native
