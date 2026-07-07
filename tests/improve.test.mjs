@@ -5,7 +5,7 @@ import { titleKey } from "../dist/improve/state.js";
 import { parseFindingsJson, dedupeAgainstLedger, frictionScore } from "../dist/improve/mine.js";
 import { rankFindings, scoreFinding, targetMetricFor } from "../dist/improve/rank.js";
 import { parseVote } from "../dist/improve/judge.js";
-import { computeMetrics } from "../dist/improve/collect.js";
+import { computeMetrics, runHadMergeConflict } from "../dist/improve/collect.js";
 
 const finding = (over = {}) => ({
   id: "f-test-0",
@@ -104,6 +104,58 @@ test("computeMetrics computes rates over terminal sessions", () => {
   assert.equal(snapshot.verifierMissRate, 0.25);
   assert.equal(snapshot.steerRate, 0.25);
   assert.equal(snapshot.totalTokensIn, 40);
+});
+
+test("runHadMergeConflict sees resolved conflicts, resolver runs, and legacy labels", () => {
+  // Durable marker written by jj.ts and the native TUI.
+  assert.equal(runHadMergeConflict({ status: "merged", hadMergeConflict: true }), true);
+  // Live conflict state still counts.
+  assert.equal(runHadMergeConflict({ status: "merge-conflict" }), true);
+  assert.equal(runHadMergeConflict({ status: "completed", merge: { status: "conflict" } }), true);
+  assert.equal(runHadMergeConflict({ status: "completed", sync: { status: "conflict" } }), true);
+  // Daemon resolver runs carry resolverFor.
+  assert.equal(runHadMergeConflict({ status: "completed", resolverFor: "n2" }), true);
+  // Records written before hadMergeConflict existed: the native resolver labels
+  // (start_conflict_resolution_agent) are the only durable trace.
+  assert.equal(
+    runHadMergeConflict({ status: "merged", taskSummary: "merge conflicts → Objective Create shared data model" }),
+    true,
+  );
+  assert.equal(runHadMergeConflict({ status: "merged", taskSummary: "rebase conflicts → fix auth" }), true);
+  assert.equal(runHadMergeConflict({ status: "merged", task: "Resolve merge conflicts: build auth" }), true);
+  assert.equal(runHadMergeConflict({ status: "completed", task: "Resolve rebase conflicts" }), true);
+  // Clean runs do not count.
+  assert.equal(runHadMergeConflict({ status: "merged", task: "build auth", taskSummary: "build auth" }), false);
+  assert.equal(runHadMergeConflict({ status: "completed", merge: { status: "merged" } }), false);
+  // The label check is anchored: a task ABOUT merge conflicts is not a resolver.
+  assert.equal(
+    runHadMergeConflict({ status: "completed", taskSummary: "investigate why merge conflicts → happen" }),
+    false,
+  );
+});
+
+test("computeMetrics counts conflicts a resolver already fixed", () => {
+  const base = {
+    project: "p",
+    repoRoot: "/tmp/p",
+    runId: "r",
+    task: "t",
+    backend: "claude",
+    status: "completed",
+    createdAt: "",
+    updatedAt: "",
+    steerCount: 0,
+    autoSteerCount: 0,
+    tokensIn: 0,
+    tokensOut: 0,
+    errorExcerpts: [],
+  };
+  const snapshot = computeMetrics("c2", [
+    // Resolved conflict: terminal status merged, live conflict state gone.
+    { ...base, status: "merged", hadMergeConflict: true },
+    { ...base },
+  ]);
+  assert.equal(snapshot.mergeConflictRate, 0.5);
 });
 
 test("frictionScore surfaces the worst sessions first", () => {

@@ -119,6 +119,9 @@ export type SessionRecord = {
   verifierSatisfied?: boolean;
   verifierMissing?: string[];
   mergeStatus?: string;
+  /** True when the run hit an integration conflict at ANY point, even one a
+   * resolver already fixed by collect time (see collect.ts runHadMergeConflict). */
+  hadMergeConflict?: boolean;
   errorExcerpts: string[];
 };
 

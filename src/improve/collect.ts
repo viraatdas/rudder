@@ -74,6 +74,28 @@ async function readRunsRaw(repoRoot: string): Promise<RunRecord[]> {
   return runs.filter((run): run is RunRecord => Boolean(run?.id && run?.status && run?.updatedAt));
 }
 
+/**
+ * Whether a run experienced an integration conflict at ANY point, not just one
+ * still unresolved at collect time. `status`/`merge.status` are LIVE state:
+ * once a resolver or re-merge succeeds they are rewritten to merged, which is
+ * why counting them alone reported mergeConflictRate 0 while resolver-labeled
+ * sessions were everywhere. Reads, in order of reliability: the durable
+ * `hadMergeConflict` marker, the live conflict state, `resolverFor` (the
+ * daemon's resolver runs), and finally the native resolver task labels, which
+ * are the only trace on records written before `hadMergeConflict` existed
+ * (formats set in native/src/main.rs start_conflict_resolution_agent).
+ */
+export function runHadMergeConflict(
+  run: Pick<RunRecord, "status" | "merge" | "sync" | "hadMergeConflict" | "resolverFor" | "task" | "taskSummary">,
+): boolean {
+  if (run.hadMergeConflict) return true;
+  if (run.status === "merge-conflict") return true;
+  if (run.merge?.status === "conflict" || run.sync?.status === "conflict") return true;
+  if (run.resolverFor) return true;
+  if (/^(?:merge|rebase) conflicts → /.test(run.taskSummary ?? "")) return true;
+  return /^Resolve (?:merge|rebase) conflicts(?::|$)/.test(run.task ?? "");
+}
+
 async function sessionFromRun(project: string, run: RunRecord): Promise<SessionRecord> {
   const steerCount = (run.turns ?? []).filter(
     (turn) => turn.source === "steerer" || turn.source === "regoal",
@@ -98,10 +120,11 @@ async function sessionFromRun(project: string, run: RunRecord): Promise<SessionR
     verifierMissing = (verification.missing ?? []).slice(0, 5).map(redactAndTrim);
   }
 
+  const hadMergeConflict = runHadMergeConflict(run);
   const interesting =
     run.status === "failed" ||
     run.status === "cancelled" ||
-    run.status === "merge-conflict" ||
+    hadMergeConflict ||
     verifierSatisfied === false;
 
   return {
@@ -123,6 +146,7 @@ async function sessionFromRun(project: string, run: RunRecord): Promise<SessionR
     verifierSatisfied,
     verifierMissing,
     mergeStatus: run.merge?.status,
+    hadMergeConflict,
     errorExcerpts: interesting ? await readErrorExcerpts(run) : [],
   };
 }
@@ -175,7 +199,7 @@ export function computeMetrics(cycleId: string, sessions: SessionRecord[]): Metr
   const failed = sessions.filter((s) => s.status === "failed").length;
   const cancelled = sessions.filter((s) => s.status === "cancelled").length;
   const conflicts = sessions.filter(
-    (s) => s.status === "merge-conflict" || s.mergeStatus === "conflict",
+    (s) => s.hadMergeConflict || s.status === "merge-conflict" || s.mergeStatus === "conflict",
   ).length;
   const verifierMisses = sessions.filter((s) => s.verifierSatisfied === false).length;
   const steered = sessions.filter((s) => s.steerCount > 0).length;

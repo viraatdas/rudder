@@ -3229,6 +3229,9 @@ fn merge_conflict_run_record_round_trips_actionable_state() {
     assert_eq!(loaded.len(), 1);
     assert_eq!(loaded[0].status, AgentStatus::Done);
     assert!(loaded[0].has_merge_conflict());
+    // Back-compat: a record written before `hadMergeConflict` existed still
+    // restores the durable marker from its live conflict state.
+    assert!(loaded[0].had_merge_conflict);
     assert_eq!(
         loaded[0].merge_conflict_files,
         vec!["src/auth.ts".to_string(), "src/session.ts".to_string()]
@@ -3258,6 +3261,47 @@ fn merge_conflict_run_record_round_trips_actionable_state() {
             .map(|items| items.len()),
         Some(2)
     );
+
+    let _ = fs::remove_dir_all(repo_root);
+}
+
+#[test]
+fn resolved_conflict_keeps_durable_had_merge_conflict_marker() {
+    let repo_root = unique_test_repo("had-merge-conflict-record");
+
+    // A merge conflicts: the live flag and the durable marker are both set.
+    let mut run = test_agent_run("conflicted-run-1", "build auth");
+    run.status = AgentStatus::Done;
+    run.merge_conflict = true;
+    run.had_merge_conflict = true;
+    save_native_run_record(&repo_root, &run).expect("save conflicted record");
+
+    // A resolver succeeds: the live conflict state clears and the run merges,
+    // but the durable marker must survive so telemetry (the improve loop's
+    // mergeConflictRate) still counts the session.
+    let mut loaded = load_persisted_agents(&repo_root);
+    assert_eq!(loaded.len(), 1);
+    let mut run = loaded.remove(0);
+    assert!(run.had_merge_conflict, "conflict history restored on load");
+    run.status = AgentStatus::Merged;
+    run.merge_conflict = false;
+    run.merge_conflict_files.clear();
+    save_native_run_record(&repo_root, &run).expect("save merged record");
+
+    let raw = fs::read_to_string(native_run_dir(&repo_root, "conflicted-run-1").join("run.json"))
+        .expect("read run.json");
+    let value: serde_json::Value = serde_json::from_str(&raw).expect("parse run.json");
+    assert_eq!(value.get("status").and_then(|v| v.as_str()), Some("merged"));
+    assert!(value.get("merge").is_none(), "live conflict state cleared");
+    assert_eq!(
+        value.get("hadMergeConflict").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+
+    let reloaded = load_persisted_agents(&repo_root);
+    assert_eq!(reloaded.len(), 1);
+    assert!(reloaded[0].had_merge_conflict);
+    assert!(!reloaded[0].merge_conflict);
 
     let _ = fs::remove_dir_all(repo_root);
 }
@@ -4613,6 +4657,7 @@ fn test_agent_run(id: &str, task: &str) -> AgentRun {
         merge_conflict: false,
         merge_conflict_operation: ConflictOperation::Merge,
         merge_conflict_files: Vec::new(),
+        had_merge_conflict: false,
     }
 }
 
@@ -5411,6 +5456,7 @@ fn delete_agent_requires_second_d() {
         merge_conflict: false,
         merge_conflict_operation: ConflictOperation::Merge,
         merge_conflict_files: Vec::new(),
+        had_merge_conflict: false,
     });
 
     app.delete_selected_agent();

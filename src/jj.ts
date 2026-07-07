@@ -398,6 +398,7 @@ async function mergeJjRunIntoCurrentWorkspaceLocked(run: RunRecord, allowDirty: 
   }
 
   run.status = "merge-conflict";
+  run.hadMergeConflict = true;
   run.merge = {
     ...run.merge,
     status: "conflict",
@@ -599,6 +600,9 @@ export async function syncRunWorkspace(run: RunRecord, baseBranch: string): Prom
   }
 
   const conflicted = await jjConflictedFiles(run.worktree.path);
+  if (conflicted.length) {
+    run.hadMergeConflict = true;
+  }
   run.sync = {
     ...run.sync,
     status: conflicted.length ? "conflict" : "synced",

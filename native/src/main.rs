@@ -878,6 +878,12 @@ struct AgentRun {
     merge_conflict: bool,
     merge_conflict_operation: ConflictOperation,
     merge_conflict_files: Vec<String>,
+    /// Durable "an integration conflict happened at some point this run" marker.
+    /// Unlike `merge_conflict` (LIVE state, cleared once a resolver succeeds or the
+    /// run is re-goaled), this is never cleared and persists to run.json as
+    /// `hadMergeConflict`, so telemetry (the improve loop's mergeConflictRate) still
+    /// counts conflicts that were auto-resolved before it read the record.
+    had_merge_conflict: bool,
 }
 
 #[derive(Debug)]
@@ -3932,6 +3938,7 @@ impl App {
             merge_conflict: false,
             merge_conflict_operation: ConflictOperation::Merge,
             merge_conflict_files: Vec::new(),
+            had_merge_conflict: false,
         };
 
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
@@ -4102,6 +4109,7 @@ impl App {
             merge_conflict: false,
             merge_conflict_operation: ConflictOperation::Merge,
             merge_conflict_files: Vec::new(),
+            had_merge_conflict: false,
         };
 
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
@@ -4243,6 +4251,7 @@ impl App {
             merge_conflict: false,
             merge_conflict_operation: ConflictOperation::Merge,
             merge_conflict_files: Vec::new(),
+            had_merge_conflict: false,
         };
 
         // INTERACTIVE orchestrator: it never exits and presents its DAG via RUDDER.md, so
@@ -5850,6 +5859,7 @@ impl App {
             merge_conflict: false,
             merge_conflict_operation: ConflictOperation::Merge,
             merge_conflict_files: Vec::new(),
+            had_merge_conflict: false,
         };
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
             Ok(mut terminal) => {
@@ -8797,6 +8807,7 @@ impl App {
                 if let Some(run) = self.agents.get_mut(index) {
                     run.status = AgentStatus::Done;
                     run.merge_conflict = true;
+                    run.had_merge_conflict = true;
                     run.merge_conflict_operation = ConflictOperation::Merge;
                     run.merge_conflict_files = conflicts.clone();
                     run.last_error = Some(format!("resolver left {} conflict(s)", conflicts.len()));
@@ -9592,6 +9603,7 @@ impl App {
                 run.last_error = Some(error.to_string());
                 run.merge_resolver = false;
                 run.merge_conflict = true;
+                run.had_merge_conflict = true;
                 run.merge_conflict_operation = operation;
                 run.merge_conflict_files = conflict_files;
                 let _ = save_native_run_record(&self.cwd, run);
@@ -9820,6 +9832,7 @@ impl App {
             run.merge_resolver = false;
             if was_conflict_resolver {
                 run.merge_conflict = true;
+                run.had_merge_conflict = true;
                 if !unresolved.is_empty() {
                     run.merge_conflict_files = unresolved;
                 }
@@ -10035,6 +10048,7 @@ impl App {
                     // with no conflicts left. Git rebase resolvers keep manual flow.
                     run.merge_resolver = operation == ConflictOperation::Merge;
                     run.merge_conflict = true;
+                    run.had_merge_conflict = true;
                     run.merge_conflict_operation = operation;
                     run.merge_conflict_files = conflicted_files;
                     run.ready_since = None;
@@ -10083,6 +10097,7 @@ impl App {
                     run.status = AgentStatus::Done;
                     run.merge_resolver = false;
                     run.merge_conflict = true;
+                    run.had_merge_conflict = true;
                     run.merge_conflict_operation = operation;
                     run.merge_conflict_files = conflicted_files;
                     run.last_error = Some(error.to_string());

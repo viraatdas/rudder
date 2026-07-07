@@ -339,6 +339,11 @@ export type RunRecord = {
   verification?: VerificationResult;
   merge?: MergeState;
   sync?: SyncState;
+  /** Durable "an integration conflict happened at some point this run" marker.
+   * `merge.status`/`status` only show the LIVE conflict state and are rewritten
+   * once a resolver or re-merge succeeds, so telemetry (the improve loop's
+   * mergeConflictRate) reads this instead. Set on first conflict, never cleared. */
+  hadMergeConflict?: boolean;
 };
 
 export type MergeState = {

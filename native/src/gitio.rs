@@ -272,6 +272,7 @@ pub(crate) fn create_main_agent(
         merge_conflict: false,
         merge_conflict_operation: ConflictOperation::Merge,
         merge_conflict_files: Vec::new(),
+        had_merge_conflict: false,
     }
 }
 
@@ -513,6 +514,13 @@ pub(crate) fn agent_from_run_record(
     let merge_conflict = record_status == Some("merge-conflict")
         || merge_status == Some("conflict")
         || sync_status == Some("conflict");
+    // Durable conflict history: the explicit marker, or (back-compat with records
+    // written before it existed) a still-live conflict state.
+    let had_merge_conflict = record
+        .get("hadMergeConflict")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+        || merge_conflict;
     let conflict_kind = merge_state
         .and_then(|value| value.get("conflictKind"))
         .or_else(|| sync_state.and_then(|value| value.get("conflictKind")))
@@ -603,6 +611,7 @@ pub(crate) fn agent_from_run_record(
         merge_conflict,
         merge_conflict_operation,
         merge_conflict_files,
+        had_merge_conflict,
     })
 }
 
@@ -751,6 +760,10 @@ pub(crate) fn save_native_run_record(repo_root: &Path, run: &AgentRun) -> Result
         "autoSteer": { "count": if run.autosteered { 1 } else { 0 }, "max": 2 },
         "reviewSourceIds": run.review_source_ids,
         "mergeResolver": run.merge_resolver,
+        // Durable conflict history for telemetry: unlike the `merge` object below
+        // (live state, dropped once the conflict resolves), this survives a
+        // successful resolution so mergeConflictRate counts resolved conflicts.
+        "hadMergeConflict": run.had_merge_conflict || run.merge_conflict,
         // Plan node identity for scheduler-launched runs. `nodeId` enters the
         // merged set when this run merges; `planDeps` are the hard-dep node ids
         // this run was launched against (so a restored run keeps its gating).
