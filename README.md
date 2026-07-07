@@ -16,6 +16,11 @@ isolated, reviewable, and easy to merge. It opens a native three-pane dashboard,
 gives every task its own git worktree, and runs real Claude Code or Codex
 processes in the worker pane.
 
+> **AI agents and contributors:** this README is for using Rudder. If you are
+> an AI agent (or a human) working on the Rudder codebase itself, read
+> [`AGENTS.md`](./AGENTS.md) first; it is the engineering reference and the
+> source of truth for architecture, conventions, and release rules.
+
 ## Install
 
 ```bash
@@ -350,6 +355,42 @@ rudder cleanup
 - Trackpad scrolling: confirm your terminal sends scroll events with
   `rudder mouse-test parsed`. Set `RUDDER_WHEEL_SCROLL_ROWS=<n>` to change the
   scroll step, or `RUDDER_MOUSE_DEBUG=1` to inspect routing.
+
+## Continual improvement loop
+
+Rudder improves itself from its own telemetry. Every run already leaves a
+record on disk (`.rudder/runs/`, event logs, verifier results, steer history,
+token usage). The improvement loop, `rudder improve`, is a scheduled local
+batch job (launchd on macOS, not a resident daemon) that:
+
+1. **Collects** recent session telemetry across your registered projects,
+   redacting secrets at the source.
+2. **Mines** it into ranked friction findings (failed runs, user redirects,
+   merge conflicts, verifier misses) using the advisor pattern: a Sonnet
+   executor consults a Fable 5 advisor mid-generation, so most tokens bill at
+   the executor rate.
+3. **Proposes** fixes with headless agents in isolated worktrees of the
+   rudder repo, each briefed with a rich context pack (finding, evidence,
+   surface map, prior failed attempts, repo conventions).
+4. **Judges** each candidate with the repo's full test gates plus a
+   three-lens adversarial LLM panel that fails closed.
+5. **Ships** survivors automatically: rebase onto `origin/main`,
+   `npm version patch`, push main + tag, and the normal tag-driven CI
+   publishes the new version to npm. Later cycles verify the targeted metric
+   actually improved and flag regressions for revert.
+
+```bash
+rudder improve run --dry-run     # see what it would do, propose nothing
+rudder improve schedule install  # nightly cycle at 03:30 via launchd
+rudder improve status            # shipped versions, metrics trend, ledger
+```
+
+Everything stays on your machine, spend is hard-capped per cycle
+(`improve.budgetUsd`, default $5), autonomy is configurable
+(`improve.autonomy`: `observe` | `propose` | `ship`), and `RUDDER_IMPROVE=0`
+disables it. The full harness spec is in
+[`docs/continual-improvement.md`](./docs/continual-improvement.md);
+implementation details live in [`AGENTS.md`](./AGENTS.md) section 15.
 
 ## Building from source
 

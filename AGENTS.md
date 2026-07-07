@@ -1206,3 +1206,88 @@ Recorded so future contributors do not relitigate them:
   copy; no "massively parallel" framing in marketing.
 - **jj is the substrate.** Internally jj (Jujutsu), externally git; global undo via
   `jj op restore`. Never reintroduce the removed "R restart" agent feature.
+
+---
+
+## 15. Continual improvement loop (`rudder improve`)
+
+Status: **BUILT** (2026-07-07) in `src/improve/`; the eval-replay tier is the one
+designed-but-unbuilt stage. Full spec: `docs/continual-improvement.md`. This section is
+the map an agent needs before touching it; the spec is the source of truth for stage
+semantics. Do not re-derive the design from scratch.
+
+### 15.1 Shape
+A scheduled local batch loop that reads Rudder's own telemetry, mines it into ranked
+friction findings, proposes fixes via headless improvement agents (`claude -p
+--dangerously-skip-permissions`) in disposable git worktrees of the rudder checkout,
+gates them with the repo's deterministic test suites, judges them with a three-lens
+adversarial panel, and at `ship` autonomy (the default) pushes the fix to `origin/main`
+with an `npm version patch` tag so the section-11 tag-driven CI publishes the release.
+
+```
+collect → mine → rank → propose (worktree + context pack) → gate (npm ci/check/
+cargo test/npm test) → judge panel (refute-first, fails closed)
+→ ship (rebase → npm version patch → push main + tag) → outcome check next cycles
+```
+
+### 15.2 Decisions (settled; do not relitigate without cause)
+- **Scheduled batch, NOT a resident daemon.** `rudder improve run` under a launchd
+  LaunchAgent (`rudder improve schedule install`, nightly 03:30). Reasons: the work is
+  periodic, a laptop sleeps, batch runs are crash-isolated and resume from a watermark,
+  and the existing board daemon's debuggability problems (docs/observability-plan.md
+  §1.4) argue against a second resident process.
+- **Auto-ship is the default** (user decision, 2026-07-07, superseding the earlier
+  PR-only design): `improve.autonomy` is `observe | propose | ship(default)`. `ship`
+  rebases onto origin/main, re-typechecks, `npm version patch`, and pushes main + tag
+  in one non-forced push (`src/improve/ship.ts`). Guardrails: origin must match
+  `improve.allowedRemote` (viraatdas/rudder), the proposing agent may never touch
+  versions/tags, a failed push deletes the local tag, and a moved main wins (recorded
+  as push-conflict, retried next cycle). `propose` pushes branch `improve/<id>` only.
+- **Advisor pattern for judgment calls** (user decision, 2026-07-07, to conserve
+  usage): mining and judging go through `src/improve/advisor.ts` — executor
+  (`minerModel`/`judgeModel`, default sonnet) + advisor tool (`improve.advisorModel`,
+  default `claude-fable-5`, beta `advisor-tool-2026-03-01`, advisor capped at 2048
+  tokens/consult). Spend metered exactly from `usage.iterations`. Falls back to a
+  plain `callTextModel` call on missing API key, invalid pair, or any advisor error;
+  `advisorModel: ""` disables.
+- **Refute-first judging + outcome verification.** Judges are prompted to refute and
+  fail CLOSED (unparseable vote = reject; budget-exhausted vote = reject). Ship needs
+  zero regression flags AND 2/3 approvals. Later cycles compare each shipped change's
+  target metric before/after (≥7 days, ≥3 snapshots each side) and record
+  confirmed/no-effect/regressed to the ledger.
+- **Redaction at collect time.** `redactTaskSummarySecrets` runs over tasks and event
+  excerpts before anything reaches a model; raw transcripts are never shipped whole.
+- **Hard budget.** `improve.budgetUsd` (default $5) per cycle, checked before every
+  model call; over-budget findings are banked, and an unjudged proposal never ships.
+  Kill switch `RUDDER_IMPROVE=0` or `improve.enabled:false`.
+
+### 15.3 Where things live
+- Module `src/improve/{index,state,collect,mine,rank,advisor,propose,gate,judge,ship,
+  schedule}.ts`, dispatched as `improve` in `src/main.ts`; tests in
+  `tests/improve.test.mjs` (pure logic, no model calls).
+- State under `~/.rudder/improve/`: `cycle.lock` (mkdir lock, 6h stale takeover),
+  `watermark.json` (per-project consumption high-water marks), `metrics.jsonl` (one
+  snapshot per cycle), `ledger.jsonl` (findings/outcomes/rejection memory),
+  `reports/<cycle>.md`, `logs/` (agent + gate output), `worktrees/`.
+- Config: the optional `improve` block on `RudderConfig` (src/types.ts); defaults in
+  `IMPROVE_DEFAULTS` (src/improve/state.ts).
+
+### 15.4 Gotchas (learned building it)
+- **Collect must read run.json RAW** (`readRunsRaw` in collect.ts), never via
+  `state.ts::loadRunRecord`/`listRuns`: that load path fires the background LLM task
+  summarizer, which costs a model call per record AND rewrites run.json, bumping
+  `updatedAt` past the watermark so the same session is re-collected forever.
+- The whole observe path is deterministic under `RUDDER_FAKE_MODEL_OUTPUT` (the
+  advisor wrapper delegates to `callTextModel`, which honors the hook) — use it for
+  smoke tests, never real tokens.
+- `execStep` (state.ts) exists because `util.runCommand` has no timeout; gates and
+  agents must never hang a nightly cycle.
+- The improvement agent's `.rudder-improve-result.json` self-report is read and
+  DELETED before the leftover-commit, so it never lands in history.
+
+### 15.5 Remaining work
+The eval-replay tier (spec §4.6): distill frictional sessions into replayable cases
+under `~/.rudder/improve/evals/`, run candidate vs baseline (deterministic tier via
+`RUDDER_FAKE_MODEL_OUTPUT`/`RUDDER_FAKE_BACKEND=1`, live tier budgeted), and feed
+blind A/B deltas to the judge panel. Plus tractability feedback: outcome entries
+adjusting the static weights in `rank.ts::TRACTABILITY`.

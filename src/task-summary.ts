@@ -466,7 +466,12 @@ export async function llmSummarizeTask(task: string): Promise<string | null> {
   return await summarizeViaClaudeCli(trimmed);
 }
 
-function redactTaskSummarySecrets(value: string): string {
+/**
+ * Redact token/key/secret-shaped values from free text. Exported for the
+ * improvement loop, which must strip secrets from session telemetry before
+ * any model call (docs/continual-improvement.md §3).
+ */
+export function redactTaskSummarySecrets(value: string): string {
   return value
     .split(/\s+/)
     .filter(Boolean)

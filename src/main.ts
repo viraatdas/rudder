@@ -297,6 +297,11 @@ export async function main(): Promise<void> {
     case "gc":
       await runGc({ dryRun: Boolean(parsed.flags.dryRun) });
       return;
+    case "improve": {
+      const { runImprove } = await import("./improve/index.js");
+      await runImprove(parsed);
+      return;
+    }
     case "board":
     case "serve": {
       await runBoard(parsed);
@@ -1022,6 +1027,12 @@ Run management:
   rudder cleanup [--force]        Remove merged run workspaces
   rudder gc [--dry-run]           Prune bounded diagnostics, old binaries, and stale run records
   rudder undo [opId]              Rewind jj to an op id, or the last undo-stack entry (global)
+
+Improvement loop:
+  rudder improve run [--dry-run] [--budget-usd N]   Mine telemetry, propose+judge fixes, ship a release
+  rudder improve status                             Last cycle, shipped versions, ledger tail
+  rudder improve report [date]                      Print a cycle report
+  rudder improve schedule install|uninstall|status  Nightly launchd schedule (macOS)
 
 Planner:
   rudder plan "task"             Decompose a task into a DAG, scaffold empty jj changes, write graph.json
