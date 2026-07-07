@@ -5,7 +5,7 @@ import { titleKey } from "../dist/improve/state.js";
 import { parseFindingsJson, dedupeAgainstLedger, frictionScore } from "../dist/improve/mine.js";
 import { rankFindings, scoreFinding, targetMetricFor } from "../dist/improve/rank.js";
 import { parseVote } from "../dist/improve/judge.js";
-import { computeMetrics, runHadMergeConflict } from "../dist/improve/collect.js";
+import { computeMetrics, parseRunTimestampMs, runHadMergeConflict } from "../dist/improve/collect.js";
 
 const finding = (over = {}) => ({
   id: "f-test-0",
@@ -104,6 +104,25 @@ test("computeMetrics computes rates over terminal sessions", () => {
   assert.equal(snapshot.verifierMissRate, 0.25);
   assert.equal(snapshot.steerRate, 0.25);
   assert.equal(snapshot.totalTokensIn, 40);
+});
+
+test("parseRunTimestampMs rejects sentinel stamps and reads both real formats", () => {
+  // The "1" sentinel from leaked native test fixtures: Date.parse("1") is
+  // 2001-01-01, which produced ~25-year durations that dominated the median.
+  assert.equal(parseRunTimestampMs("1"), undefined);
+  assert.equal(parseRunTimestampMs(""), undefined);
+  assert.equal(parseRunTimestampMs(undefined), undefined);
+  assert.equal(parseRunTimestampMs("not a date"), undefined);
+  // Pre-Rudder and far-future stamps are corrupt, not measurements.
+  assert.equal(parseRunTimestampMs("2001-01-01T00:00:00Z"), undefined);
+  assert.equal(parseRunTimestampMs("2999-01-01T00:00:00Z"), undefined);
+  // ISO strings from the TS writers (util.nowIso).
+  const iso = new Date().toISOString();
+  assert.equal(parseRunTimestampMs(iso), Date.parse(iso));
+  // Epoch-millis strings from the native TUI (now_stamp), unreadable by
+  // Date.parse but a real timestamp format in .rudder/runs.
+  const millis = Date.now() - 60_000;
+  assert.equal(parseRunTimestampMs(String(millis)), millis);
 });
 
 test("runHadMergeConflict sees resolved conflicts, resolver runs, and legacy labels", () => {

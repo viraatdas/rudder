@@ -96,16 +96,37 @@ export function runHadMergeConflict(
   return /^Resolve (?:merge|rebase) conflicts(?::|$)/.test(run.task ?? "");
 }
 
+// Timestamps outside [Rudder's existence, now + a day of clock skew] are
+// sentinel or corrupt stamps, not real run times.
+const EARLIEST_PLAUSIBLE_RUN_MS = Date.parse("2024-01-01T00:00:00Z");
+const MAX_CLOCK_SKEW_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Parse a run timestamp into epoch ms, rejecting implausible values. Run
+ * records carry two formats: ISO strings (the TS writers, util.nowIso) and
+ * epoch-millisecond strings (the native TUI's now_stamp in
+ * native/src/gitio.rs), which Date.parse cannot read. Anything implausible is
+ * rejected rather than letting Date.parse guess: native test fixtures once
+ * leaked run.json records with the sentinel createdAt "1" into a real
+ * .rudder/runs dir, Date.parse("1") is 2001-01-01, and the resulting 25-year
+ * durations dominated medianDurationMs for the whole cycle.
+ */
+export function parseRunTimestampMs(value: string | undefined): number | undefined {
+  if (!value) return undefined;
+  const ms = /^\d+$/.test(value) ? Number(value) : Date.parse(value);
+  if (!Number.isFinite(ms)) return undefined;
+  if (ms < EARLIEST_PLAUSIBLE_RUN_MS || ms > Date.now() + MAX_CLOCK_SKEW_MS) return undefined;
+  return ms;
+}
+
 async function sessionFromRun(project: string, run: RunRecord): Promise<SessionRecord> {
   const steerCount = (run.turns ?? []).filter(
     (turn) => turn.source === "steerer" || turn.source === "regoal",
   ).length;
-  const startedAt = run.process?.startedAt ?? run.createdAt;
-  const endedAt = run.process?.endedAt ?? run.updatedAt;
   let durationMs: number | undefined;
-  const startMs = Date.parse(startedAt ?? "");
-  const endMs = Date.parse(endedAt ?? "");
-  if (Number.isFinite(startMs) && Number.isFinite(endMs) && endMs >= startMs) {
+  const startMs = parseRunTimestampMs(run.process?.startedAt ?? run.createdAt);
+  const endMs = parseRunTimestampMs(run.process?.endedAt ?? run.updatedAt);
+  if (startMs !== undefined && endMs !== undefined && endMs >= startMs) {
     durationMs = endMs - startMs;
   }
 
