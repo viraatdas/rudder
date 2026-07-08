@@ -5,7 +5,13 @@ import { titleKey } from "../dist/improve/state.js";
 import { parseFindingsJson, dedupeAgainstLedger, frictionScore } from "../dist/improve/mine.js";
 import { rankFindings, scoreFinding, targetMetricFor } from "../dist/improve/rank.js";
 import { parseVote } from "../dist/improve/judge.js";
-import { computeMetrics, parseRunTimestampMs, runHadMergeConflict } from "../dist/improve/collect.js";
+import {
+  computeMetrics,
+  parseRunTimestampMs,
+  rawTimestampMs,
+  runHadMergeConflict,
+  watermarkValueMs,
+} from "../dist/improve/collect.js";
 
 const finding = (over = {}) => ({
   id: "f-test-0",
@@ -123,6 +129,24 @@ test("parseRunTimestampMs rejects sentinel stamps and reads both real formats", 
   // Date.parse but a real timestamp format in .rudder/runs.
   const millis = Date.now() - 60_000;
   assert.equal(parseRunTimestampMs(String(millis)), millis);
+});
+
+test("watermark ordering is numeric across the ISO and native-millis formats", () => {
+  // The bug: lexicographic comparison put every ISO string above every
+  // native epoch-millis string, so one ISO-stamped run permanently blinded
+  // collection to a project's native-written runs.
+  const nativeStamp = String(Date.now());
+  const isoEarlier = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+  assert.ok(isoEarlier > nativeStamp, "precondition: the broken lexicographic order");
+  assert.ok(rawTimestampMs(nativeStamp) > rawTimestampMs(isoEarlier), "numeric order is correct");
+
+  // Legacy watermark entries (ISO or millis strings) and new numeric entries
+  // all read back as comparable millis.
+  assert.equal(watermarkValueMs(isoEarlier), Date.parse(isoEarlier));
+  assert.equal(watermarkValueMs(nativeStamp), Number(nativeStamp));
+  assert.equal(watermarkValueMs(1783469219597), 1783469219597);
+  assert.equal(watermarkValueMs(undefined), 0);
+  assert.equal(watermarkValueMs("garbage"), 0);
 });
 
 test("runHadMergeConflict sees resolved conflicts, resolver runs, and legacy labels", () => {

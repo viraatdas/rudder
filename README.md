@@ -165,8 +165,8 @@ scroll the pane.
 
 **In the agents pane:** `j` / `k` or arrows move the selection, `Enter` focuses
 the worker, `m` / `M` / `R` / `r` / `d` act on the selection, `x` stops a running
-agent (keeping its worktree), `g` toggles the nested DAG view, and `o` opens the
-web board.
+agent (keeping its worktree), `c` clears all merged agents from the list (press
+twice to confirm), `g` toggles the nested DAG view, and `o` opens the web board.
 
 ## Commands and Orchestrator Skills
 

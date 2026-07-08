@@ -435,6 +435,9 @@ enum AgentMode {
 }
 
 const MAIN_AGENT_ID: &str = "__main__";
+/// Sentinel occupying `delete_pending` while a `c` clear-merged confirm is
+/// armed. Run ids are numeric strings, so this can never collide with one.
+const CLEAR_MERGED_PENDING: &str = "__clear-merged__";
 
 const MAIN_BOOTSTRAP_PROMPT: &str =
     "Read RUDDER.md if it exists, then briefly tell me what this project does and where its entry points live. After that, wait for instructions.";
@@ -1764,6 +1767,7 @@ impl App {
                     self.stop_agent_at(idx);
                 }
             }
+            KeyCode::Char('c') => self.clear_merged_agents(),
             KeyCode::Char('P') => self.open_main_model_switcher(),
             KeyCode::Char('o') => self.open_web_ui(),
             _ => {}
@@ -5295,7 +5299,7 @@ impl App {
             }
             Some("/help") => {
                 self.notice = Some(
-                    "plain input -> orchestrator/DAG · /run <task> -> one isolated mergeable worker · /ask <text> -> direct main-checkout one-off · /plan <text> -> force orchestrator/DAG · panes: Option-1/2/3 or ^W · keys: j/k select · Enter focus · v diff · m merge · M merge all · R review all · g nest · o web ui · x stop · dd delete · P model — commands: /model /fast /sound /color /main /run /ask /plan /share /usage /goal /cloud /web"
+                    "plain input -> orchestrator/DAG · /run <task> -> one isolated mergeable worker · /ask <text> -> direct main-checkout one-off · /plan <text> -> force orchestrator/DAG · panes: Option-1/2/3 or ^W · keys: j/k select · Enter focus · v diff · m merge · M merge all · R review all · g nest · o web ui · x stop · dd delete · cc clear merged · P model — commands: /model /fast /sound /color /main /run /ask /plan /share /usage /goal /cloud /web"
                         .to_string(),
                 );
                 true
@@ -9196,6 +9200,81 @@ impl App {
                 "deleted agent from dashboard".to_string()
             }
         }));
+        let _ = self.write_rudder_context_timed(None);
+    }
+
+    /// `c` in the agents pane: clear every MERGED agent from the list in one
+    /// action, so finished work stops occupying the pane. Same press-twice
+    /// confirm contract as `d`, reusing `delete_pending` (with a sentinel that
+    /// can never collide with a run id) so any other key cancels it exactly
+    /// like a pending delete. Merged work is already integrated, so removing
+    /// the records and leftover workspaces loses nothing undoable.
+    fn clear_merged_agents(&mut self) {
+        let merged: Vec<usize> = self
+            .agents
+            .iter()
+            .enumerate()
+            .filter(|(_, agent)| {
+                agent.status == AgentStatus::Merged
+                    && !agent.is_main()
+                    && !agent.is_orchestrator()
+            })
+            .map(|(index, _)| index)
+            .collect();
+        if merged.is_empty() {
+            self.delete_pending = None;
+            self.notice = Some("no merged agents to clear".to_string());
+            return;
+        }
+        if self.delete_pending.as_deref() != Some(CLEAR_MERGED_PENDING) {
+            self.delete_pending = Some(CLEAR_MERGED_PENDING.to_string());
+            self.notice = Some(format!(
+                "clear {} merged agent(s) from the list? press c again to confirm · any other key cancels",
+                merged.len()
+            ));
+            return;
+        }
+
+        let mut persist_ledger = false;
+        let mut cleared = 0usize;
+        for index in merged.into_iter().rev() {
+            let run = self.agents.remove(index);
+            let _ = remove_native_run_record(&self.cwd, &run.id);
+            signals::cleanup_run_signals(&run.id);
+            persist_ledger |= self.followups_ingested.remove(&run.id);
+            persist_ledger |= self.completion_summary_pending.remove(&run.id);
+            if let Some(path) = run.worktree_path.as_ref() {
+                // Merged workspaces are integrated leftovers; best-effort removal,
+                // same command the single-delete path uses.
+                let _ = Command::new("git")
+                    .args(["worktree", "remove", "--force"])
+                    .arg(path)
+                    .current_dir(&self.cwd)
+                    .output();
+            }
+            cleared += 1;
+        }
+        if persist_ledger {
+            self.persist_ingested_runs();
+        }
+        // Indices shifted under the rendered rows; drop the click map so a
+        // same-tick click resolves to nothing instead of a neighbor.
+        self.agent_row_map.clear();
+        let last = self.agents.len().saturating_sub(1);
+        self.selected_agent = self.selected_agent.min(last);
+        if !self.agents.is_empty() {
+            let visible = self.visible_agent_indices();
+            if let Some(index) = visible
+                .iter()
+                .copied()
+                .find(|&index| index >= self.selected_agent)
+                .or_else(|| visible.last().copied())
+            {
+                self.selected_agent = index;
+            }
+        }
+        self.delete_pending = None;
+        self.notice = Some(format!("cleared {cleared} merged agent(s)"));
         let _ = self.write_rudder_context_timed(None);
     }
 

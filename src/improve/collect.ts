@@ -36,21 +36,21 @@ export async function collectSessions(
     }
     if (!exists) continue;
 
-    const since = watermark.projects[project.repoRoot] ?? "";
+    const sinceMs = watermarkValueMs(watermark.projects[project.repoRoot]);
     const runs = await readRunsRaw(project.repoRoot);
     const fresh = runs
-      .filter((run) => (run.updatedAt ?? "") > since)
+      .filter((run) => (rawTimestampMs(run.updatedAt) ?? 0) > sinceMs)
       // Skip runs still in flight; their story is not over yet.
       .filter((run) => !["created", "running", "steering", "verifying"].includes(run.status))
-      .sort((a, b) => (a.updatedAt < b.updatedAt ? -1 : 1))
+      .sort((a, b) => (rawTimestampMs(a.updatedAt) ?? 0) - (rawTimestampMs(b.updatedAt) ?? 0))
       .slice(-MAX_SESSIONS_PER_PROJECT);
 
     for (const run of fresh) {
       sessions.push(await sessionFromRun(project.name ?? project.slug ?? project.repoRoot, run));
     }
-    const newest = fresh.at(-1)?.updatedAt;
-    if (newest && newest > (nextWatermark.projects[project.repoRoot] ?? "")) {
-      nextWatermark.projects[project.repoRoot] = newest;
+    const newestMs = rawTimestampMs(fresh.at(-1)?.updatedAt);
+    if (newestMs !== undefined && newestMs > watermarkValueMs(nextWatermark.projects[project.repoRoot])) {
+      nextWatermark.projects[project.repoRoot] = newestMs;
     }
   }
   return { sessions, nextWatermark };
@@ -94,6 +94,30 @@ export function runHadMergeConflict(
   if (run.resolverFor) return true;
   if (/^(?:merge|rebase) conflicts → /.test(run.taskSummary ?? "")) return true;
   return /^Resolve (?:merge|rebase) conflicts(?::|$)/.test(run.task ?? "");
+}
+
+/**
+ * Raw timestamp parse (millis string or ISO), with NO plausibility window.
+ * Used for watermark ordering, where the job is a consistent total order over
+ * whatever stamps actually exist on disk, not measurement quality. The
+ * plausibility-checked parseRunTimestampMs below stays the right tool for
+ * durations. This exists because run.json carries two formats (ISO from the
+ * TS writers, epoch millis from the native TUI) and the previous LEXICOGRAPHIC
+ * comparison ordered every ISO string ("2026-…") above every millis string
+ * ("17834…"): one ISO-stamped run would push the watermark somewhere no
+ * native-written run could ever exceed, permanently blinding collection to
+ * that project's native runs.
+ */
+export function rawTimestampMs(value: string | number | undefined): number | undefined {
+  if (value === undefined || value === "") return undefined;
+  if (typeof value === "number") return Number.isFinite(value) ? value : undefined;
+  const ms = /^\d+$/.test(value) ? Number(value) : Date.parse(value);
+  return Number.isFinite(ms) ? ms : undefined;
+}
+
+/** Read a watermark entry, tolerating the legacy string formats (ISO or millis). */
+export function watermarkValueMs(value: string | number | undefined): number {
+  return rawTimestampMs(value) ?? 0;
 }
 
 // Timestamps outside [Rudder's existence, now + a day of clock skew] are

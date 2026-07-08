@@ -5385,6 +5385,82 @@ fn merging_review_all_row_moves_source_agents_to_merged_section() {
 }
 
 #[test]
+fn clear_merged_requires_second_c_and_removes_only_merged() {
+    let mut app = App::new();
+    let mut merged_a = test_agent_run("run-merged-a", "merged task a");
+    merged_a.status = AgentStatus::Merged;
+    let mut merged_b = test_agent_run("run-merged-b", "merged task b");
+    merged_b.status = AgentStatus::Merged;
+    let running = test_agent_run("run-live", "still running");
+    let mut done = test_agent_run("run-done", "awaiting review");
+    done.status = AgentStatus::Done;
+    app.agents.push(merged_a);
+    app.agents.push(running);
+    app.agents.push(merged_b);
+    app.agents.push(done);
+
+    // First press only arms the confirm; nothing is removed.
+    app.clear_merged_agents();
+    assert_eq!(app.agents.len(), 4);
+    assert_eq!(app.delete_pending.as_deref(), Some(CLEAR_MERGED_PENDING));
+    let notice = app.notice.as_deref().unwrap_or_default();
+    assert!(notice.contains("clear 2 merged agent(s)"));
+    assert!(notice.contains("press c again"));
+
+    // Second press clears exactly the merged agents.
+    app.clear_merged_agents();
+    let ids: Vec<&str> = app.agents.iter().map(|a| a.id.as_str()).collect();
+    assert_eq!(ids, vec!["run-live", "run-done"]);
+    assert!(app.delete_pending.is_none());
+    assert!(app.notice.as_deref().unwrap_or_default().contains("cleared 2 merged agent(s)"));
+}
+
+#[test]
+fn clear_merged_pending_cancels_on_selection_move_like_delete() {
+    let mut app = App::new();
+    let mut merged = test_agent_run("run-merged", "merged task");
+    merged.status = AgentStatus::Merged;
+    app.agents.push(merged);
+    app.agents.push(test_agent_run("run-live", "still running"));
+
+    app.clear_merged_agents();
+    assert_eq!(app.delete_pending.as_deref(), Some(CLEAR_MERGED_PENDING));
+    app.select_next_agent();
+    assert!(app.delete_pending.is_none());
+    // A later `c` starts over at the confirm step; nothing was removed meanwhile.
+    assert_eq!(app.agents.len(), 2);
+}
+
+#[test]
+fn clear_merged_with_none_merged_just_notices() {
+    let mut app = App::new();
+    app.agents.push(test_agent_run("run-live", "still running"));
+
+    app.clear_merged_agents();
+    assert_eq!(app.agents.len(), 1);
+    assert!(app.delete_pending.is_none());
+    assert!(app
+        .notice
+        .as_deref()
+        .unwrap_or_default()
+        .contains("no merged agents to clear"));
+}
+
+#[test]
+fn c_key_in_agents_pane_routes_to_clear_merged() {
+    let mut app = App::new();
+    let mut merged = test_agent_run("run-merged", "merged task");
+    merged.status = AgentStatus::Merged;
+    app.agents.push(merged);
+    app.focus = FocusPane::Agents;
+
+    app.handle_agents_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+    assert_eq!(app.delete_pending.as_deref(), Some(CLEAR_MERGED_PENDING));
+    app.handle_agents_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+    assert!(app.agents.is_empty());
+}
+
+#[test]
 fn delete_prompt_for_worktree_requires_second_d_without_merge_offer() {
     let mut app = App::new();
     let mut run = test_agent_run("run-1", "test task");

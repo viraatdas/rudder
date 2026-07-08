@@ -222,7 +222,12 @@ export async function readJsonl<T>(filePath: string): Promise<T[]> {
 // Watermark: per-project newest run updatedAt already consumed.
 // ---------------------------------------------------------------------------
 
-export type Watermark = { version: 1; projects: Record<string, string> };
+/**
+ * Values are epoch millis going forward; string entries (ISO or millis
+ * strings) are legacy formats from before the watermark was normalized, read
+ * through collect.ts watermarkValueMs.
+ */
+export type Watermark = { version: 1; projects: Record<string, string | number> };
 
 export async function loadWatermark(): Promise<Watermark> {
   const existing = await readJson<Watermark>(watermarkPath());
