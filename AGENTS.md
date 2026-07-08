@@ -1254,9 +1254,16 @@ cargo test/npm test) → judge panel (refute-first, fails closed)
   `advisorModel: ""` disables.
 - **Refute-first judging + outcome verification.** Judges are prompted to refute and
   fail CLOSED (unparseable vote = reject; budget-exhausted vote = reject). Ship needs
-  zero regression flags AND 2/3 approvals. Later cycles compare each shipped change's
-  target metric before/after (≥7 days, ≥3 snapshots each side) and record
-  confirmed/no-effect/regressed to the ledger.
+  zero regression flags, 2/3 approvals, AND a correctness approval (`panelDecision` in
+  judge.ts) — correctness rejections veto because an "approved but doesn't fix it"
+  ship wastes a release and mutes the finding. Later cycles compare each shipped
+  change's target metric before/after (≥7 days, ≥3 snapshots each side) and record
+  confirmed/no-effect/regressed; a no-effect/regressed outcome LIFTS the shipped
+  suppression in dedupe so the finding can resurface.
+- **Hand-shipped fixes must be recorded**: `rudder improve record shipped "<title>"
+  [--version vX.Y.Z]` appends the ledger entry that stops the miner re-proposing an
+  issue already fixed outside the loop. The miner prompt also carries recent ledger
+  history for semantic (paraphrase-proof) dedupe.
 - **Redaction at collect time.** `redactTaskSummarySecrets` runs over tasks and event
   excerpts before anything reaches a model; raw transcripts are never shipped whole.
 - **Hard budget.** `improve.budgetUsd` (default $5) per cycle, checked before every

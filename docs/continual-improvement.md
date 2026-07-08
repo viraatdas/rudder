@@ -225,9 +225,12 @@ coverage), **simplicity** (is there a smaller, more conventional change).
 Every judge is prompted to *refute* the change and returns a structured
 verdict; unparseable output fails closed as a rejection.
 
-Ship condition: **no judge flags a concrete regression AND at least 2/3
-approve.** Gate failures earlier get one revision round with the failure fed
-back to the same agent, then abandon.
+Ship condition: **no judge flags a concrete regression, at least 2/3 approve,
+AND the correctness lens approved** (`panelDecision`). Correctness carries
+veto weight because a shipped-but-ineffective change wastes a release and
+marks the finding shipped, muting it until the outcome check disproves it.
+Simplicity alone is outvotable. Gate failures earlier get one revision round
+with the failure fed back to the same agent, then abandon.
 
 When the eval-replay tier (§4.6) lands, judges additionally get blind A/B
 eval deltas (candidate/baseline randomly labeled per judge). Until then the

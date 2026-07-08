@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { titleKey } from "../dist/improve/state.js";
 import { parseFindingsJson, dedupeAgainstLedger, frictionScore } from "../dist/improve/mine.js";
 import { rankFindings, scoreFinding, targetMetricFor } from "../dist/improve/rank.js";
-import { parseVote } from "../dist/improve/judge.js";
+import { panelDecision, parseVote } from "../dist/improve/judge.js";
 import {
   computeMetrics,
   parseRunTimestampMs,
@@ -54,6 +54,20 @@ test("dedupeAgainstLedger drops shipped titles and remembers rejections", () => 
   assert.equal(dedupeAgainstLedger([finding({ title: "something else entirely" })], shipped).length, 1);
 });
 
+test("a shipped finding resurfaces once its outcome check says no-effect", () => {
+  const key = titleKey("Workers ignore the Depends-on block");
+  const shipped = { titleKey: key, status: "shipped", ts: "", cycleId: "", findingId: "f1", title: "", class: "" };
+  const noEffect = { titleKey: key, status: "outcome", outcome: "no-effect", ts: "", cycleId: "", findingId: "f1", title: "", class: "" };
+  // Shipped alone suppresses.
+  assert.equal(dedupeAgainstLedger([finding({ frequency: 5 })], [shipped]).length, 0);
+  // Shipped + failed outcome behaves like a rejection: resurfaces at frequency >= 2.
+  assert.equal(dedupeAgainstLedger([finding({ frequency: 5 })], [shipped, noEffect]).length, 1);
+  assert.equal(dedupeAgainstLedger([finding({ frequency: 1 })], [shipped, noEffect]).length, 0);
+  // A confirmed outcome keeps the suppression.
+  const confirmed = { ...noEffect, outcome: "confirmed" };
+  assert.equal(dedupeAgainstLedger([finding({ frequency: 5 })], [shipped, confirmed]).length, 0);
+});
+
 test("rankFindings orders by severity x log-frequency x tractability and banks the rest", () => {
   const prompt = finding({ id: "a", title: "prompt issue", class: "prompt", severity: 3, frequency: 3 });
   const perf = finding({ id: "b", title: "perf issue", class: "perf", severity: 3, frequency: 3 });
@@ -80,6 +94,35 @@ test("parseVote parses fenced verdicts and fails closed on garbage", () => {
 
   const rejected = parseVote("correctness", "I cannot decide.");
   assert.equal(rejected.verdict, "reject");
+});
+
+test("panelDecision: regression and correctness rejections veto; simplicity is outvotable", () => {
+  const vote = (lens, verdict, regression = false) => ({ lens, verdict, regression, notes: "" });
+  // Unanimous approve ships.
+  assert.equal(
+    panelDecision([vote("correctness", "approve"), vote("regression-risk", "approve"), vote("simplicity", "approve")]),
+    true,
+  );
+  // Simplicity dissent alone does not block.
+  assert.equal(
+    panelDecision([vote("correctness", "approve"), vote("regression-risk", "approve"), vote("simplicity", "reject")]),
+    true,
+  );
+  // A concrete regression flag vetoes regardless of approvals.
+  assert.equal(
+    panelDecision([vote("correctness", "approve"), vote("regression-risk", "reject", true), vote("simplicity", "approve")]),
+    false,
+  );
+  // A correctness rejection vetoes even with 2/3 approvals (the v2.10.29 case).
+  assert.equal(
+    panelDecision([vote("correctness", "reject"), vote("regression-risk", "approve"), vote("simplicity", "approve")]),
+    false,
+  );
+  // Under 2/3 approvals never ships.
+  assert.equal(
+    panelDecision([vote("correctness", "approve"), vote("regression-risk", "reject"), vote("simplicity", "reject")]),
+    false,
+  );
 });
 
 test("computeMetrics computes rates over terminal sessions", () => {

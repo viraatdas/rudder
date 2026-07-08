@@ -90,9 +90,25 @@ export async function judgePanel(params: {
     votes.push(parseVote(lens, output));
   }
 
+  return { ship: panelDecision(votes), votes };
+}
+
+/**
+ * Ship iff: no judge flags a concrete regression, at least 2/3 approve, AND
+ * the correctness lens approved. Correctness carries veto weight alongside
+ * regression flags: a change the correctness judge rejects "fixes" nothing,
+ * and shipping it both wastes a release and marks the finding shipped, muting
+ * it from future mining until an outcome check disproves it weeks later.
+ * Simplicity alone stays outvotable (a working fix that could be smaller
+ * still ships).
+ */
+export function panelDecision(votes: JudgeVote[]): boolean {
   const anyRegression = votes.some((vote) => vote.regression);
   const approvals = votes.filter((vote) => vote.verdict === "approve").length;
-  return { ship: !anyRegression && approvals >= 2, votes };
+  const correctnessApproved = votes.some(
+    (vote) => vote.lens === "correctness" && vote.verdict === "approve",
+  );
+  return !anyRegression && approvals >= 2 && correctnessApproved;
 }
 
 export function parseVote(lens: string, output: string): JudgeVote {

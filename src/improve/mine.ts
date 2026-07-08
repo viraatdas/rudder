@@ -61,12 +61,24 @@ export async function mineFindings(params: {
   const sample = worst.slice(0, MAX_SESSIONS_IN_PROMPT);
   if (sample.length === 0) return [];
 
+  // Show the miner recent ledger history so it can dedupe SEMANTICALLY:
+  // the mechanical titleKey dedupe below cannot catch a paraphrase of an
+  // already-shipped or already-rejected finding.
+  const recentLedger = params.ledger
+    .filter((entry) => entry.status !== "banked" && entry.status !== "reported")
+    .slice(-15)
+    .map((entry) => `  - [${entry.status}${entry.outcome ? `:${entry.outcome}` : ""}] ${entry.title}`)
+    .join("\n");
+
   const user = [
     "Cycle metrics snapshot:",
     JSON.stringify(params.snapshot),
     "",
     SURFACE_MAP,
     "",
+    recentLedger
+      ? `Already handled by previous cycles (do NOT re-report these or paraphrases of them; a "shipped" fix may simply not be released in the sessions below yet). Only re-report one if you have clearly NEW evidence it persists in the newest sessions:\n${recentLedger}\n`
+      : "",
     `Sessions (worst-first, ${sample.length} of ${params.sessions.length} new):`,
     JSON.stringify(sample, null, 1),
   ].join("\n");
@@ -156,6 +168,12 @@ function normalizeFinding(raw: Record<string, unknown>, cycleId: string, index: 
  * Drop findings the ledger already knows: anything shipped or currently
  * banked under the same title key, and anything previously rejected unless
  * its frequency has at least doubled since the rejection was recorded.
+ *
+ * A "shipped" entry stops suppressing once a later outcome entry for the
+ * same title says the metric did NOT move (no-effect / regressed): the
+ * finding is demonstrably unfixed, and permanent suppression would make it
+ * unminable forever. It then behaves like a rejection (needs doubled
+ * frequency to resurface).
  */
 export function dedupeAgainstLedger(findings: Finding[], ledger: LedgerEntry[]): Finding[] {
   const byKey = new Map<string, LedgerEntry[]>();
@@ -167,13 +185,19 @@ export function dedupeAgainstLedger(findings: Finding[], ledger: LedgerEntry[]):
   return findings.filter((finding) => {
     const history = byKey.get(titleKey(finding.title)) ?? [];
     if (history.length === 0) return true;
-    if (history.some((e) => e.status === "shipped" || e.status === "branch-pushed")) {
+    const failedOutcome = history.some(
+      (e) => e.status === "outcome" && (e.outcome === "no-effect" || e.outcome === "regressed"),
+    );
+    if (
+      !failedOutcome &&
+      history.some((e) => e.status === "shipped" || e.status === "branch-pushed")
+    ) {
       return false;
     }
     const rejected = history.filter(
       (e) => e.status === "judge-rejected" || e.status === "gated-out" || e.status === "agent-failed",
     );
-    if (rejected.length > 0) {
+    if (rejected.length > 0 || failedOutcome) {
       const lastFrequency = extractFrequency(rejected.at(-1)?.detail ?? "");
       return finding.frequency >= Math.max(2, lastFrequency * 2);
     }

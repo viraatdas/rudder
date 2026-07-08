@@ -55,9 +55,49 @@ export async function runImprove(parsed: ImproveArgs): Promise<void> {
     case "schedule":
       await scheduleCommand(parsed.args[1] ?? "status");
       return;
+    case "record":
+      await recordManualEntry(parsed.args.slice(1));
+      return;
     default:
-      throw new Error("Usage: rudder improve [run [--dry-run] [--budget-usd N] | status | report [date] | schedule install|uninstall|status]");
+      throw new Error(
+        "Usage: rudder improve [run [--dry-run] [--budget-usd N] | status | report [date] | schedule install|uninstall|status | record shipped \"<title>\" [--version vX.Y.Z] [--class <class>]]",
+      );
   }
+}
+
+/**
+ * `rudder improve record shipped "<title>" [--version vX.Y.Z] [--class ux]`:
+ * append a manual ledger entry for a HAND-shipped fix, so the miner's dedupe
+ * and the miner prompt know the issue is handled and do not re-propose it.
+ * Without this, fixes shipped outside the loop are invisible to it and get
+ * re-mined from telemetry that predates them.
+ */
+async function recordManualEntry(args: string[]): Promise<void> {
+  const allowed: LedgerEntry["status"][] = ["shipped", "judge-rejected", "banked", "reported"];
+  const status = args[0] as LedgerEntry["status"];
+  const title = args[1] ?? "";
+  if (!allowed.includes(status) || !title.trim()) {
+    throw new Error('Usage: rudder improve record shipped "<title>" [--version vX.Y.Z] [--class <class>]');
+  }
+  const readFlag = (name: string): string | undefined => {
+    const index = args.indexOf(name);
+    if (index >= 0) return args[index + 1];
+    const inline = args.find((arg) => arg.startsWith(`${name}=`));
+    return inline?.slice(name.length + 1);
+  };
+  const entry: LedgerEntry = {
+    ts: new Date().toISOString(),
+    cycleId: "manual",
+    findingId: `manual-${Date.now()}`,
+    titleKey: titleKey(title),
+    title: title.trim(),
+    class: readFlag("--class") ?? "other",
+    status,
+    detail: readFlag("--detail") ?? "recorded manually (hand-shipped fix)",
+    ...(readFlag("--version") ? { version: readFlag("--version") } : {}),
+  };
+  await appendJsonl(ledgerPath(), entry);
+  console.log(`improve: recorded [${entry.status}] ${entry.title}${entry.version ? ` (${entry.version})` : ""}`);
 }
 
 function parseBudgetArg(args: string[]): number | undefined {
