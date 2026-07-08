@@ -887,6 +887,13 @@ struct AgentRun {
     /// `hadMergeConflict`, so telemetry (the improve loop's mergeConflictRate) still
     /// counts conflicts that were auto-resolved before it read the record.
     had_merge_conflict: bool,
+    /// Best-effort cumulative token usage read from the backend's OWN session log
+    /// (claude project jsonl / codex rollout) when a turn completes. Interactive
+    /// PTYs expose no usage stream, so this is the only cost signal a native run
+    /// has; it persists to run.json as `tokens` for telemetry (the improve loop's
+    /// cost accounting reads run.tokens, which the TS __worker path also writes).
+    tokens_in: u64,
+    tokens_out: u64,
 }
 
 #[derive(Debug)]
@@ -3967,6 +3974,8 @@ impl App {
             merge_conflict_operation: ConflictOperation::Merge,
             merge_conflict_files: Vec::new(),
             had_merge_conflict: false,
+            tokens_in: 0,
+            tokens_out: 0,
         };
 
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
@@ -4138,6 +4147,8 @@ impl App {
             merge_conflict_operation: ConflictOperation::Merge,
             merge_conflict_files: Vec::new(),
             had_merge_conflict: false,
+            tokens_in: 0,
+            tokens_out: 0,
         };
 
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
@@ -4280,6 +4291,8 @@ impl App {
             merge_conflict_operation: ConflictOperation::Merge,
             merge_conflict_files: Vec::new(),
             had_merge_conflict: false,
+            tokens_in: 0,
+            tokens_out: 0,
         };
 
         // INTERACTIVE orchestrator: it never exits and presents its DAG via RUDDER.md, so
@@ -5888,6 +5901,8 @@ impl App {
             merge_conflict_operation: ConflictOperation::Merge,
             merge_conflict_files: Vec::new(),
             had_merge_conflict: false,
+            tokens_in: 0,
+            tokens_out: 0,
         };
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
             Ok(mut terminal) => {

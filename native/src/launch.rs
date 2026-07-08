@@ -645,6 +645,8 @@ pub(crate) fn review_all_run(
         merge_conflict_operation: ConflictOperation::Merge,
         merge_conflict_files: Vec::new(),
         had_merge_conflict: false,
+        tokens_in: 0,
+        tokens_out: 0,
     }
 }
 

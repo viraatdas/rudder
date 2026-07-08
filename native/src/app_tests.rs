@@ -3307,6 +3307,177 @@ fn resolved_conflict_keeps_durable_had_merge_conflict_marker() {
 }
 
 #[test]
+fn created_at_to_iso_converts_native_millis_and_passes_iso_through() {
+    // Native records store epoch millis (now_stamp); comparisons against
+    // backend session timestamps need ISO.
+    assert_eq!(created_at_to_iso("0"), "1970-01-01T00:00:00.000Z");
+    assert_eq!(created_at_to_iso("86400000"), "1970-01-02T00:00:00.000Z");
+    // TS-written records already store ISO; pass through unchanged.
+    assert_eq!(
+        created_at_to_iso("2026-07-08T03:57:01.794Z"),
+        "2026-07-08T03:57:01.794Z"
+    );
+}
+
+#[test]
+fn codex_run_usage_reads_rollout_scoped_by_cwd_and_start() {
+    let base = unique_test_repo("codex-run-usage");
+    let sessions_root = base.join("codex-sessions");
+    let day_dir = sessions_root.join("2027/01/01");
+    fs::create_dir_all(&day_dir).expect("create sessions dir");
+    let run_cwd = base.join("workspace");
+    fs::create_dir_all(&run_cwd).expect("create workspace dir");
+
+    // The run's own session: cumulative token_count events; the LAST total wins.
+    fs::write(
+        day_dir.join("rollout-match.jsonl"),
+        format!(
+            concat!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"cwd\":{cwd},\"timestamp\":\"2027-01-01T00:00:10.000Z\",\"id\":\"sess-match\"}}}}\n",
+                "{{\"type\":\"turn_context\",\"payload\":{{\"model\":\"gpt-5.5\"}}}}\n",
+                "{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"total_token_usage\":{{\"input_tokens\":500,\"cached_input_tokens\":100,\"output_tokens\":80,\"reasoning_output_tokens\":10}}}}}}}}\n",
+                "{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"total_token_usage\":{{\"input_tokens\":1000,\"cached_input_tokens\":400,\"output_tokens\":200,\"reasoning_output_tokens\":50}}}}}}}}\n",
+            ),
+            cwd = serde_json::json!(run_cwd.display().to_string()),
+        ),
+    )
+    .expect("write matching rollout");
+    // Another agent's session in a DIFFERENT cwd: never attributed to this run.
+    fs::write(
+        day_dir.join("rollout-other-cwd.jsonl"),
+        concat!(
+            "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"/somewhere/else\",\"timestamp\":\"2027-01-01T00:00:10.000Z\",\"id\":\"sess-other\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":9999,\"cached_input_tokens\":0,\"output_tokens\":9999,\"reasoning_output_tokens\":0}}}}\n",
+        ),
+    )
+    .expect("write other-cwd rollout");
+    // A session in the SAME cwd that started before this run: excluded by start time.
+    fs::write(
+        day_dir.join("rollout-old.jsonl"),
+        format!(
+            concat!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"cwd\":{cwd},\"timestamp\":\"2000-01-01T00:00:00.000Z\",\"id\":\"sess-old\"}}}}\n",
+                "{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"total_token_usage\":{{\"input_tokens\":7777,\"cached_input_tokens\":0,\"output_tokens\":7777,\"reasoning_output_tokens\":0}}}}}}}}\n",
+            ),
+            cwd = serde_json::json!(run_cwd.display().to_string()),
+        ),
+    )
+    .expect("write old rollout");
+
+    let mut run = test_agent_run("codex-usage-run", "build auth");
+    run.backend = Backend::Codex;
+    run.cwd = run_cwd;
+    // Epoch millis for 2026-07-07-ish: after the old session, before the match.
+    run.created_at = "1783300000000".to_string();
+
+    let (input, output) =
+        collect_run_token_usage_in(&run, &base.join("no-claude-projects"), &sessions_root);
+    // Mirrors src/backends.ts accumulateUsage for codex: cached input is a
+    // subset of input_tokens (excluded from billable input); reasoning tokens
+    // bill as output.
+    assert_eq!(input, 600);
+    assert_eq!(output, 250);
+
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
+fn claude_run_usage_sums_assistant_usage_since_run_start() {
+    let base = unique_test_repo("claude-run-usage");
+    let projects_root = base.join("claude-projects");
+    let run_cwd = base.join("workspace");
+    fs::create_dir_all(&run_cwd).expect("create workspace dir");
+    let project_dir = projects_root.join(encode_claude_projects_cwd(&run_cwd));
+    fs::create_dir_all(&project_dir).expect("create project dir");
+    fs::write(
+        project_dir.join("session.jsonl"),
+        concat!(
+            // Before the run started: excluded.
+            "{\"type\":\"assistant\",\"timestamp\":\"2000-01-01T00:00:00.000Z\",\"message\":{\"model\":\"claude-sonnet-5\",\"usage\":{\"input_tokens\":5000,\"output_tokens\":5000}}}\n",
+            "{\"type\":\"assistant\",\"timestamp\":\"2027-01-01T00:00:01.000Z\",\"message\":{\"model\":\"claude-sonnet-5\",\"usage\":{\"input_tokens\":100,\"output_tokens\":20,\"cache_creation_input_tokens\":30,\"cache_read_input_tokens\":50}}}\n",
+            "{\"type\":\"assistant\",\"timestamp\":\"2027-01-01T00:00:02.000Z\",\"message\":{\"model\":\"claude-sonnet-5\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n",
+        ),
+    )
+    .expect("write claude session jsonl");
+
+    let mut run = test_agent_run("claude-usage-run", "build auth");
+    run.cwd = run_cwd;
+    run.created_at = "1783300000000".to_string();
+
+    let (input, output) =
+        collect_run_token_usage_in(&run, &projects_root, &base.join("no-codex-sessions"));
+    // Mirrors src/backends.ts readClaudeUsage: input includes cache
+    // creation/read tokens.
+    assert_eq!(input, 190);
+    assert_eq!(output, 25);
+
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
+fn run_token_usage_persists_to_run_json_and_reloads() {
+    let repo_root = unique_test_repo("token-usage-record");
+    let mut run = test_agent_run("tokens-run-1", "build auth");
+    run.status = AgentStatus::Done;
+
+    // A run with no usage leaves the field ABSENT (matches the TS __worker
+    // path), so telemetry can tell "no data" from a genuine zero.
+    save_native_run_record(&repo_root, &run).expect("save zero-usage record");
+    let raw = fs::read_to_string(native_run_dir(&repo_root, "tokens-run-1").join("run.json"))
+        .expect("read run.json");
+    let value: serde_json::Value = serde_json::from_str(&raw).expect("parse run.json");
+    assert!(value.get("tokens").is_none(), "zero usage omits tokens");
+
+    run.tokens_in = 600;
+    run.tokens_out = 250;
+    save_native_run_record(&repo_root, &run).expect("save usage record");
+    let raw = fs::read_to_string(native_run_dir(&repo_root, "tokens-run-1").join("run.json"))
+        .expect("read run.json");
+    let value: serde_json::Value = serde_json::from_str(&raw).expect("parse run.json");
+    assert_eq!(
+        value.get("tokens").and_then(|t| t.get("input")).and_then(|v| v.as_u64()),
+        Some(600)
+    );
+    assert_eq!(
+        value.get("tokens").and_then(|t| t.get("output")).and_then(|v| v.as_u64()),
+        Some(250)
+    );
+
+    // Reload restores the totals, and a post-reload save (merge, rename) does
+    // not drop them.
+    let mut loaded = load_persisted_agents(&repo_root);
+    assert_eq!(loaded.len(), 1);
+    let reloaded = loaded.remove(0);
+    assert_eq!(reloaded.tokens_in, 600);
+    assert_eq!(reloaded.tokens_out, 250);
+    save_native_run_record(&repo_root, &reloaded).expect("re-save reloaded record");
+    let raw = fs::read_to_string(native_run_dir(&repo_root, "tokens-run-1").join("run.json"))
+        .expect("read run.json");
+    let value: serde_json::Value = serde_json::from_str(&raw).expect("parse run.json");
+    assert_eq!(
+        value.get("tokens").and_then(|t| t.get("input")).and_then(|v| v.as_u64()),
+        Some(600)
+    );
+
+    let _ = fs::remove_dir_all(repo_root);
+}
+
+#[test]
+fn refresh_run_token_usage_never_regresses_a_stored_total() {
+    // The run's cwd is a fresh unique dir, so no real session log can match;
+    // the rescan yields (0, 0) and the stored cumulative totals must survive.
+    let repo_root = unique_test_repo("token-usage-guard");
+    let mut run = test_agent_run("tokens-guard-1", "build auth");
+    run.cwd = repo_root.clone();
+    run.tokens_in = 500;
+    run.tokens_out = 100;
+    refresh_run_token_usage(&mut run);
+    assert_eq!(run.tokens_in, 500);
+    assert_eq!(run.tokens_out, 100);
+    let _ = fs::remove_dir_all(repo_root);
+}
+
+#[test]
 fn legacy_git_run_record_keeps_vcs_git_and_branch() {
     let repo_root = std::env::temp_dir().join(format!(
         "rudder-git-record-test-{}-{}",
@@ -4658,6 +4829,8 @@ fn test_agent_run(id: &str, task: &str) -> AgentRun {
         merge_conflict_operation: ConflictOperation::Merge,
         merge_conflict_files: Vec::new(),
         had_merge_conflict: false,
+        tokens_in: 0,
+        tokens_out: 0,
     }
 }
 
@@ -5566,6 +5739,8 @@ fn delete_agent_requires_second_d() {
         merge_conflict_operation: ConflictOperation::Merge,
         merge_conflict_files: Vec::new(),
         had_merge_conflict: false,
+        tokens_in: 0,
+        tokens_out: 0,
     });
 
     app.delete_selected_agent();

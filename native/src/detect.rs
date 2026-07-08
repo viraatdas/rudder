@@ -29,6 +29,11 @@ pub(crate) fn mark_run_done(run: &mut AgentRun) {
     if run.status != AgentStatus::Done {
         run.status = AgentStatus::Done;
         run.completed_at = Some(Instant::now());
+        // Capture the run's token usage from the backend's own session log at
+        // the moment the turn completes (interactive PTYs expose no usage
+        // stream). Persisted to run.json as `tokens` by save_native_run_record
+        // so telemetry has a cost signal; without this native runs report zero.
+        refresh_run_token_usage(run);
         run.needs_permission = false;
         run.permission_notified = false;
         run.needs_user_input = false;

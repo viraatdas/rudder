@@ -94,21 +94,45 @@ pub(crate) fn encode_claude_projects_cwd(path: &Path) -> String {
         .collect()
 }
 
+/// True when `path` was last modified before `since_iso` (with a small slack for
+/// the whole-second truncation of `system_time_to_iso`): its content cannot hold
+/// events at/after `since_iso`, so usage scans skip reading it entirely.
+pub(crate) fn file_modified_before(path: &Path, since_iso: &str) -> bool {
+    if since_iso.is_empty() {
+        return false;
+    }
+    fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .map(|modified| system_time_to_iso(modified + Duration::from_secs(2)).as_str() < since_iso)
+        .unwrap_or(false)
+}
+
 pub(crate) fn collect_claude_usage(
     repo_root: &Path,
     since_iso: &str,
 ) -> std::collections::BTreeMap<String, ModelUsage> {
-    let mut out: std::collections::BTreeMap<String, ModelUsage> = std::collections::BTreeMap::new();
     let Some(home) = user_home_dir() else {
-        return out;
+        return std::collections::BTreeMap::new();
     };
-    let dir_name = encode_claude_projects_cwd(repo_root);
-    let project_dir = home.join(".claude/projects").join(&dir_name);
+    collect_claude_usage_in(&home.join(".claude/projects"), repo_root, since_iso)
+}
+
+pub(crate) fn collect_claude_usage_in(
+    projects_root: &Path,
+    cwd: &Path,
+    since_iso: &str,
+) -> std::collections::BTreeMap<String, ModelUsage> {
+    let mut out: std::collections::BTreeMap<String, ModelUsage> = std::collections::BTreeMap::new();
+    let dir_name = encode_claude_projects_cwd(cwd);
+    let project_dir = projects_root.join(&dir_name);
     let Ok(entries) = fs::read_dir(&project_dir) else {
         return out;
     };
     for entry in entries.flatten() {
         let path = entry.path();
+        if file_modified_before(&path, since_iso) {
+            continue;
+        }
         if path.extension().map(|e| e == "jsonl").unwrap_or(false) {
             let Ok(content) = fs::read_to_string(&path) else {
                 continue;
@@ -169,18 +193,28 @@ pub(crate) fn collect_codex_usage(
     repo_root: &Path,
     since_iso: &str,
 ) -> std::collections::BTreeMap<String, ModelUsage> {
-    let mut out: std::collections::BTreeMap<String, ModelUsage> = std::collections::BTreeMap::new();
     let Some(home) = user_home_dir() else {
-        return out;
+        return std::collections::BTreeMap::new();
     };
-    let sessions_root = home.join(".codex/sessions");
+    collect_codex_usage_in(&home.join(".codex/sessions"), repo_root, since_iso)
+}
+
+pub(crate) fn collect_codex_usage_in(
+    sessions_root: &Path,
+    cwd: &Path,
+    since_iso: &str,
+) -> std::collections::BTreeMap<String, ModelUsage> {
+    let mut out: std::collections::BTreeMap<String, ModelUsage> = std::collections::BTreeMap::new();
     if !sessions_root.exists() {
         return out;
     }
-    let target_cwd = repo_root.display().to_string();
+    let target_cwd = cwd.display().to_string();
     let mut files = Vec::new();
-    collect_jsonl_files(&sessions_root, &mut files, 4);
+    collect_jsonl_files(sessions_root, &mut files, 4);
     for file in files {
+        if file_modified_before(&file, since_iso) {
+            continue;
+        }
         let Ok(content) = fs::read_to_string(&file) else {
             continue;
         };
@@ -285,6 +319,74 @@ pub(crate) fn collect_codex_usage(
         }
     }
     out
+}
+
+/// Normalize a run record's createdAt for comparison against backend session
+/// timestamps. Native records store epoch millis (`now_stamp`); records written
+/// by the TS orchestrator store ISO already and pass through unchanged.
+pub(crate) fn created_at_to_iso(created_at: &str) -> String {
+    let trimmed = created_at.trim();
+    if let Ok(millis) = trimmed.parse::<u64>() {
+        return system_time_to_iso(UNIX_EPOCH + Duration::from_millis(millis));
+    }
+    trimmed.to_string()
+}
+
+/// Best-effort token totals for ONE run, read from the backend's own session
+/// log scoped by the run's cwd (unique per jj workspace) and creation time.
+/// Interactive PTYs expose no usage stream, so the session log is the only
+/// cost source a native run has. Mirrors the run.tokens semantics of the TS
+/// worker (src/backends.ts accumulateUsage): claude input includes cache
+/// creation/read tokens; codex input is billable input (the cached subset
+/// excluded) and reasoning tokens bill as output. Returns (input, output);
+/// (0, 0) when no session log matches.
+pub(crate) fn collect_run_token_usage(run: &AgentRun) -> (u64, u64) {
+    let Some(home) = user_home_dir() else {
+        return (0, 0);
+    };
+    collect_run_token_usage_in(
+        run,
+        &home.join(".claude/projects"),
+        &home.join(".codex/sessions"),
+    )
+}
+
+pub(crate) fn collect_run_token_usage_in(
+    run: &AgentRun,
+    claude_projects_root: &Path,
+    codex_sessions_root: &Path,
+) -> (u64, u64) {
+    let since = created_at_to_iso(&run.created_at);
+    let mut input = 0u64;
+    let mut output = 0u64;
+    match run.backend {
+        Backend::Claude => {
+            for usage in collect_claude_usage_in(claude_projects_root, &run.cwd, &since).values() {
+                input += usage.input_tokens
+                    + usage.cache_creation_input_tokens
+                    + usage.cache_read_input_tokens;
+                output += usage.output_tokens;
+            }
+        }
+        Backend::Codex => {
+            for usage in collect_codex_usage_in(codex_sessions_root, &run.cwd, &since).values() {
+                input += usage.input_tokens;
+                output += usage.output_tokens;
+            }
+        }
+    }
+    (input, output)
+}
+
+/// One-shot refresh of a run's token accounting at turn completion. Keeps the
+/// larger total (the backend reports cumulative numbers, so a rescan of the same
+/// session can only grow them) so a later pass never regresses a stored figure.
+pub(crate) fn refresh_run_token_usage(run: &mut AgentRun) {
+    let (input, output) = collect_run_token_usage(run);
+    if input + output > run.tokens_in + run.tokens_out {
+        run.tokens_in = input;
+        run.tokens_out = output;
+    }
 }
 
 pub(crate) fn collect_jsonl_files(dir: &Path, out: &mut Vec<PathBuf>, depth_limit: usize) {

@@ -273,6 +273,8 @@ pub(crate) fn create_main_agent(
         merge_conflict_operation: ConflictOperation::Merge,
         merge_conflict_files: Vec::new(),
         had_merge_conflict: false,
+        tokens_in: 0,
+        tokens_out: 0,
     }
 }
 
@@ -546,6 +548,18 @@ pub(crate) fn agent_from_run_record(
     if merge_conflict_files.is_empty() {
         merge_conflict_files = conflict_files_from(sync_state);
     }
+    // Token usage persisted at completion (or by the TS __worker path). Read it
+    // back so a post-reload save (merge, rename) does not drop the cost signal.
+    let tokens_in = record
+        .get("tokens")
+        .and_then(|value| value.get("input"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let tokens_out = record
+        .get("tokens")
+        .and_then(|value| value.get("output"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
     let interactive_orchestrator = record
         .get("interactiveOrchestrator")
         .and_then(serde_json::Value::as_bool)
@@ -612,6 +626,8 @@ pub(crate) fn agent_from_run_record(
         merge_conflict_operation,
         merge_conflict_files,
         had_merge_conflict,
+        tokens_in,
+        tokens_out,
     };
     // A record persisted with the resolver labels ("Resolve merge conflicts: …")
     // and merged out of band (records written before the merge-time restore
@@ -796,6 +812,17 @@ pub(crate) fn save_native_run_record(repo_root: &Path, run: &AgentRun) -> Result
                     "conflictKind": conflict_kind,
                     "conflictedFiles": run.merge_conflict_files,
                 }),
+            );
+        }
+    }
+    // Best-effort token usage captured from the backend's session log at
+    // completion. Like the TS __worker path, a run with no usage leaves the
+    // `tokens` field absent rather than persisting zeros.
+    if run.tokens_in + run.tokens_out > 0 {
+        if let Some(map) = record.as_object_mut() {
+            map.insert(
+                "tokens".to_string(),
+                serde_json::json!({ "input": run.tokens_in, "output": run.tokens_out }),
             );
         }
     }
