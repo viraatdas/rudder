@@ -151,6 +151,7 @@ const AGENT_PANE_HINTS: &[&str] = &[
     "o web ui",
     "x stop",
     "dd delete",
+    "cc clear merged",
     "P model",
 ];
 

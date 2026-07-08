@@ -4670,6 +4670,7 @@ fn render_merge_conflict_modal_lists_files_and_hint() {
 fn agent_pane_hints_include_review_and_merge_all_shortcuts() {
     assert!(AGENT_PANE_HINTS.contains(&"R review all"));
     assert!(AGENT_PANE_HINTS.contains(&"M merge all"));
+    assert!(AGENT_PANE_HINTS.contains(&"cc clear merged"));
 }
 
 #[test]
