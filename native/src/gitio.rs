@@ -559,7 +559,7 @@ pub(crate) fn agent_from_run_record(
                 && matches!(status, AgentStatus::Running | AgentStatus::Stopped)
         });
 
-    Some(AgentRun {
+    let mut run = AgentRun {
         id,
         created_at,
         mode,
@@ -612,7 +612,18 @@ pub(crate) fn agent_from_run_record(
         merge_conflict_operation,
         merge_conflict_files,
         had_merge_conflict,
-    })
+    };
+    // A record persisted with the resolver labels ("Resolve merge conflicts: …")
+    // and merged out of band (records written before the merge-time restore
+    // existed, or a labeled run merged via the CLI while the dashboard was
+    // closed) would otherwise reload with the clobbered title forever: the
+    // restore in mark_agent_and_review_sources_merged only runs at the merge
+    // transition. In-memory only (no disk mutation during a read); conflict
+    // telemetry rides the durable had_merge_conflict marker, not the label.
+    if run.status == AgentStatus::Merged {
+        run.restore_pre_conflict_identity();
+    }
+    Some(run)
 }
 
 pub(crate) fn turns_from_run_record(

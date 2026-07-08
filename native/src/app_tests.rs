@@ -10755,6 +10755,65 @@ fn interactive_orchestrator_flag_survives_save_and_reload() {
 }
 
 #[test]
+fn reload_restores_resolver_relabeled_merged_run_identity() {
+    let repo = unique_test_repo("resolver-label-reload");
+    let mut run = test_agent_run("run-labeled", "Add arbitrary emoji picker");
+    // What start_conflict_resolution_agent leaves behind, persisted as merged
+    // without passing through mark_agent_and_review_sources_merged (records
+    // written before the merge-time restore, or merged via the CLI while the
+    // dashboard was closed).
+    run.task = "Resolve merge conflicts: Add arbitrary emoji picker".to_string();
+    run.task_summary = "merge conflicts \u{2192} Add arbitrary emoji picker".to_string();
+    run.had_merge_conflict = true;
+    run.status = AgentStatus::Merged;
+    save_native_run_record(&repo, &run).expect("save merged labeled run");
+
+    let raw = fs::read_to_string(native_run_dir(&repo, "run-labeled").join("run.json"))
+        .expect("read run.json");
+    let reloaded =
+        agent_from_run_record(&repo, serde_json::from_str(&raw).expect("parse run.json"))
+            .expect("reload run");
+    assert_eq!(reloaded.status, AgentStatus::Merged);
+    assert_eq!(reloaded.task, "Add arbitrary emoji picker");
+    assert_eq!(reloaded.task_summary, "Add arbitrary emoji picker");
+    // Conflict telemetry survives via the durable marker, not the label.
+    assert!(reloaded.had_merge_conflict);
+
+    let _ = fs::remove_dir_all(&repo);
+}
+
+#[test]
+fn reload_keeps_resolver_label_while_conflict_is_live() {
+    let repo = unique_test_repo("resolver-label-live");
+    let mut run = test_agent_run("run-conflicted", "Add arbitrary emoji picker");
+    run.task = "Resolve merge conflicts: Add arbitrary emoji picker".to_string();
+    run.task_summary = "merge conflicts \u{2192} Add arbitrary emoji picker".to_string();
+    run.status = AgentStatus::Done;
+    run.merge_conflict = true;
+    run.had_merge_conflict = true;
+    save_native_run_record(&repo, &run).expect("save conflicted run");
+
+    let raw = fs::read_to_string(native_run_dir(&repo, "run-conflicted").join("run.json"))
+        .expect("read run.json");
+    let reloaded =
+        agent_from_run_record(&repo, serde_json::from_str(&raw).expect("parse run.json"))
+            .expect("reload run");
+    // The conflict is still live: the pane should keep reading as conflict work.
+    assert_eq!(reloaded.status, AgentStatus::Done);
+    assert!(reloaded.merge_conflict);
+    assert_eq!(
+        reloaded.task,
+        "Resolve merge conflicts: Add arbitrary emoji picker"
+    );
+    assert_eq!(
+        reloaded.task_summary,
+        "merge conflicts \u{2192} Add arbitrary emoji picker"
+    );
+
+    let _ = fs::remove_dir_all(&repo);
+}
+
+#[test]
 fn load_persisted_agents_drops_reconcile_planners() {
     let repo = unique_test_repo("load-filter");
     save_native_run_record(&repo, &planner_run("orch-1", false)).expect("save pinned planner");
