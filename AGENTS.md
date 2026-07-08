@@ -1261,7 +1261,7 @@ cargo test/npm test) → judge panel (refute-first, fails closed)
   confirmed/no-effect/regressed; a no-effect/regressed outcome LIFTS the shipped
   suppression in dedupe so the finding can resurface.
 - **Hand-shipped fixes must be recorded**: `rudder improve record shipped "<title>"
-  [--version vX.Y.Z]` appends the ledger entry that stops the miner re-proposing an
+  [--released vX.Y.Z]` appends the ledger entry that stops the miner re-proposing an
   issue already fixed outside the loop. The miner prompt also carries recent ledger
   history for semantic (paraphrase-proof) dedupe.
 - **Redaction at collect time.** `redactTaskSummarySecrets` runs over tasks and event
