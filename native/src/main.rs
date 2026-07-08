@@ -922,6 +922,30 @@ impl AgentRun {
         self.mode == AgentMode::OneOff
     }
 
+    /// Restore a resolver-relabeled run's original identity once its conflict
+    /// is gone. start_conflict_resolution_agent overwrites task/task_summary
+    /// with the resolver labels ("Resolve merge conflicts: …" / "merge
+    /// conflicts → …") so the pane reads as conflict work while it happens,
+    /// but nothing ever put the original back: every run that ever conflicted
+    /// kept the resolver label forever and the merged list lost what each run
+    /// actually did (observed on ALL merged runs of a real project). The
+    /// original task is recovered from the label itself, so this also works
+    /// for records reloaded after a restart. Telemetry keeps its conflict
+    /// evidence through the durable had_merge_conflict marker, not the label.
+    fn restore_pre_conflict_identity(&mut self) {
+        let original = self
+            .task
+            .strip_prefix("Resolve merge conflicts: ")
+            .or_else(|| self.task.strip_prefix("Resolve rebase conflicts: "))
+            .map(str::to_string);
+        if let Some(original) = original {
+            if !original.trim().is_empty() {
+                self.task_summary = summarize_task(&original);
+                self.task = original;
+            }
+        }
+    }
+
     /// Finished worker runs are mergeable if Rudder has any integration handle for
     /// them: legacy git worktree path/branch or jj workspace/change identity.
     fn has_merge_source(&self) -> bool {
@@ -10408,6 +10432,7 @@ What to do\n\
                 run.permission_notified = false;
                 run.needs_user_input = false;
                 run.user_input_notified = false;
+                run.restore_pre_conflict_identity();
                 let _ = save_native_run_record(&self.cwd, run);
             }
         }

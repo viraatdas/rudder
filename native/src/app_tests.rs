@@ -5385,6 +5385,39 @@ fn merging_review_all_row_moves_source_agents_to_merged_section() {
 }
 
 #[test]
+fn merge_restores_resolver_relabeled_run_identity() {
+    let mut app = App::new();
+    let mut run = test_agent_run("run-resolved", "Add arbitrary emoji picker");
+    run.status = AgentStatus::Done;
+    // What start_conflict_resolution_agent leaves behind.
+    run.task = "Resolve merge conflicts: Add arbitrary emoji picker".to_string();
+    run.task_summary = "merge conflicts \u{2192} Add arbitrary emoji picker".to_string();
+    run.had_merge_conflict = true;
+    app.agents.push(run);
+
+    app.mark_agent_and_review_sources_merged(0, Vec::new());
+
+    assert_eq!(app.agents[0].status, AgentStatus::Merged);
+    assert_eq!(app.agents[0].task, "Add arbitrary emoji picker");
+    assert_eq!(app.agents[0].task_summary, "Add arbitrary emoji picker");
+    // Conflict telemetry survives via the durable marker, not the label.
+    assert!(app.agents[0].had_merge_conflict);
+}
+
+#[test]
+fn merge_leaves_unlabeled_run_identity_alone() {
+    let mut app = App::new();
+    let mut run = test_agent_run("run-clean", "Build the settings pane");
+    run.status = AgentStatus::Done;
+    app.agents.push(run);
+
+    app.mark_agent_and_review_sources_merged(0, Vec::new());
+
+    assert_eq!(app.agents[0].task, "Build the settings pane");
+    assert_eq!(app.agents[0].task_summary, summarize_task("Build the settings pane"));
+}
+
+#[test]
 fn clear_merged_requires_second_c_and_removes_only_merged() {
     let mut app = App::new();
     let mut merged_a = test_agent_run("run-merged-a", "merged task a");
