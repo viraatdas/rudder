@@ -2,7 +2,7 @@
 // over the worker WebSocket, then drive the new HTTP message endpoints:
 //   POST /api/rudder/sail/:id/input   -> bytes reach the worker PTY
 //   GET  /api/rudder/sail/:id/output  -> buffered worker output comes back
-import { test } from "node:test";
+import { test as nodeTest } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -17,8 +17,20 @@ import { WebSocket } from "ws";
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, "..");
 const cloudDir = path.join(repoRoot, "cloud");
+
+// The cloud/ subproject has its own build and dependencies (see AGENTS.md
+// section 11). In a checkout where it was never built (a fresh worktree, for
+// example), skip instead of erroring so `npm test` stays green without a
+// network install.
+const cloudReady =
+  fs.existsSync(path.join(cloudDir, "dist", "server.js")) &&
+  fs.existsSync(path.join(cloudDir, "node_modules", "better-sqlite3"));
+const test = cloudReady
+  ? nodeTest
+  : (name, fn) =>
+      nodeTest(name, { skip: "cloud not built (npm --prefix cloud install && npm --prefix cloud run build)" }, fn);
 const require = createRequire(path.join(cloudDir, "package.json"));
-const Database = require("better-sqlite3");
+const Database = cloudReady ? require("better-sqlite3") : null;
 
 const tokenHash = (token) => createHash("sha256").update(token).digest("hex").slice(0, 32);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));

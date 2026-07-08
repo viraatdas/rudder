@@ -642,7 +642,9 @@ It is deterministic via TEST-ONLY env hooks baked into the production code:
 `RUDDER_FAKE_BACKEND=1` (each worker applies `[[FAKE_FILE:..]]` edits from the node prompt
 and exits 0, see `getBackend`/`fakeBackend`), and `RUDDER_AUTO_STEER_DELAY_MS` (shrinks the
 post-pass steering wait). No auth or real model needed. Note: the `cloud/` subproject has its
-own build — `cloud-relay`/`slack` tests need `npm --prefix cloud run build` first.
+own build — `cloud-relay`/`slack` tests need `npm --prefix cloud install` +
+`npm --prefix cloud run build` first, and self-skip (rather than error) when
+those artifacts are absent so `npm test` stays green in a fresh worktree.
 
 Always, before shipping a source change:
 1. `npm run check` (or `npm run build`),
