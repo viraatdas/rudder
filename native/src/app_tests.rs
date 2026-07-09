@@ -11724,3 +11724,223 @@ fn cleanup_old_signals_prunes_without_run_delete() {
     assert_eq!(removed, 1, "one stale signal should be pruned");
     assert!(gone, "stale signal should be removed");
 }
+
+// ---- Paste-collapse in the task draft ("[Pasted #N …]" chips) ----
+
+#[test]
+fn short_single_line_paste_is_not_collapsed() {
+    assert!(!paste_should_collapse("https://example.com/some/path"));
+    let mut input = String::new();
+    let mut cursor = 0;
+    let mut chunks = Vec::new();
+    apply_task_paste(&mut input, &mut cursor, &mut chunks, "just a url");
+    assert_eq!(input, "just a url", "short paste inserts verbatim");
+    assert!(chunks.is_empty(), "no chip is created for a short paste");
+}
+
+#[test]
+fn multiline_paste_collapses_to_a_chip() {
+    assert!(paste_should_collapse("line one\nline two\nline three"));
+    let mut input = "fix the bug in ".to_string();
+    let mut cursor = input.chars().count();
+    let mut chunks = Vec::new();
+    apply_task_paste(
+        &mut input,
+        &mut cursor,
+        &mut chunks,
+        "line one\nline two\nline three",
+    );
+    assert_eq!(input, "fix the bug in [Pasted #1 +3 lines]");
+    assert_eq!(cursor, input.chars().count());
+    assert_eq!(chunks.len(), 1);
+    // A submit expands the chip back to the full pasted text.
+    assert_eq!(
+        expand_pasted_chips(&input, &chunks),
+        "fix the bug in line one\nline two\nline three"
+    );
+}
+
+#[test]
+fn long_single_line_paste_collapses_with_a_char_count() {
+    let long = "x".repeat(250);
+    assert!(paste_should_collapse(&long));
+    let mut input = String::new();
+    let mut cursor = 0;
+    let mut chunks = Vec::new();
+    apply_task_paste(&mut input, &mut cursor, &mut chunks, &long);
+    assert_eq!(input, "[Pasted #1 +250 chars]", "single-line reports chars");
+    assert_eq!(expand_pasted_chips(&input, &chunks), long);
+}
+
+#[test]
+fn re_pasting_toggles_a_chip_open_then_closed() {
+    let pasted = "alpha\nbeta\ngamma";
+    let mut input = "context: ".to_string();
+    let mut cursor = input.chars().count();
+    let mut chunks = Vec::new();
+
+    apply_task_paste(&mut input, &mut cursor, &mut chunks, pasted);
+    assert_eq!(input, "context: [Pasted #1 +3 lines]");
+
+    // Re-paste the SAME content: the chip expands inline to the full text.
+    apply_task_paste(&mut input, &mut cursor, &mut chunks, pasted);
+    assert_eq!(input, "context: alpha\nbeta\ngamma", "chip expanded inline");
+    assert_eq!(cursor, input.chars().count());
+    assert_eq!(chunks.len(), 1, "still one chunk, just toggled");
+
+    // Re-paste again: it re-collapses back to the chip.
+    apply_task_paste(&mut input, &mut cursor, &mut chunks, pasted);
+    assert_eq!(input, "context: [Pasted #1 +3 lines]", "chip re-collapsed");
+
+    // Whether collapsed or expanded, a submit always yields the real text.
+    assert_eq!(
+        expand_pasted_chips(&input, &chunks),
+        "context: alpha\nbeta\ngamma"
+    );
+}
+
+#[test]
+fn editing_a_chip_away_makes_the_next_paste_fresh() {
+    let pasted = "one\ntwo";
+    let mut input = String::new();
+    let mut cursor = 0;
+    let mut chunks = Vec::new();
+
+    apply_task_paste(&mut input, &mut cursor, &mut chunks, pasted);
+    assert_eq!(input, "[Pasted #1 +2 lines]");
+
+    // User deletes the chip text by hand.
+    input.clear();
+    cursor = 0;
+
+    // Re-pasting the same content now inserts a fresh chip (an empty draft resets
+    // numbering to #1) rather than trying to toggle a chip that is no longer present.
+    apply_task_paste(&mut input, &mut cursor, &mut chunks, pasted);
+    assert_eq!(input, "[Pasted #1 +2 lines]");
+    assert_eq!(
+        chunks.len(),
+        1,
+        "stale chunk was dropped when the draft emptied"
+    );
+}
+
+#[test]
+fn two_distinct_pastes_get_sequential_chip_ids() {
+    let mut input = String::new();
+    let mut cursor = 0;
+    let mut chunks = Vec::new();
+    apply_task_paste(&mut input, &mut cursor, &mut chunks, "aaa\nbbb");
+    apply_task_paste(&mut input, &mut cursor, &mut chunks, "ccc\nddd");
+    assert_eq!(input, "[Pasted #1 +2 lines][Pasted #2 +2 lines]");
+    assert_eq!(
+        expand_pasted_chips(&input, &chunks),
+        "aaa\nbbbccc\nddd",
+        "each chip expands to its own content"
+    );
+}
+
+#[test]
+fn handle_paste_into_task_pane_creates_a_chip_and_toggles() {
+    let mut app = App::new();
+    app.focus = FocusPane::Task;
+    let pasted = "def f():\n    return 1\n    # a longer block\n    pass";
+    app.handle_paste(pasted.to_string());
+    assert!(
+        app.task_input.starts_with("[Pasted #1 "),
+        "task draft shows a chip, not the raw block: {:?}",
+        app.task_input
+    );
+    // Re-paste the same content toggles the chip open in the live app.
+    app.handle_paste(pasted.to_string());
+    assert_eq!(app.task_input, pasted, "re-paste expanded the chip inline");
+    assert_eq!(
+        expand_pasted_chips(&app.task_input, &app.pasted_chunks),
+        pasted
+    );
+}
+
+// ---- Model switch retires a still-planning planner ----
+
+#[test]
+fn model_switch_retires_a_planning_orchestrator() {
+    let repo = unique_test_repo("model-switch-retire");
+    let mut app = App::new();
+    app.cwd = repo.clone();
+    app.agents.push(planner_run("orch-1", false));
+    app.planned_nodes = vec![test_planned_node("n0", &[])];
+    app.awaiting_approval = true;
+
+    let note = app.retire_planner_for_model_switch();
+
+    assert!(note.is_some(), "retiring a planner returns a note");
+    assert!(
+        !app.agents.iter().any(|run| run.is_orchestrator()),
+        "the planning orchestrator was retired"
+    );
+    assert!(app.planned_nodes.is_empty(), "the pending plan was cleared");
+    assert!(!app.awaiting_approval, "no longer awaiting approval");
+    assert!(
+        !app.plan_is_active(),
+        "a fresh task now starts a new planner instead of refining"
+    );
+
+    let _ = fs::remove_dir_all(&repo);
+}
+
+#[test]
+fn model_switch_leaves_an_executing_plan_untouched() {
+    let repo = unique_test_repo("model-switch-executing");
+    let mut app = App::new();
+    app.cwd = repo.clone();
+    app.agents.push(planner_run("orch-1", false));
+    // A launched worker node still in flight = an executing plan.
+    let mut worker = test_agent_run("w-1", "do the work");
+    worker.node_id = Some("n0".to_string());
+    worker.status = AgentStatus::Running;
+    app.agents.push(worker);
+
+    let note = app.retire_planner_for_model_switch();
+
+    assert!(note.is_none(), "an executing plan is not disturbed");
+    assert!(
+        app.agents.iter().any(|run| run.is_orchestrator()),
+        "the conductor stays so running workers are not stranded"
+    );
+
+    let _ = fs::remove_dir_all(&repo);
+}
+
+#[test]
+fn set_model_defaults_only_retires_on_a_real_model_change() {
+    let _guard = env_guard();
+    let repo = unique_test_repo("model-switch-gate");
+    let home = repo.join("home");
+    let prior_home = std::env::var_os("RUDDER_HOME");
+    std::env::set_var("RUDDER_HOME", &home);
+
+    let mut app = App::new();
+    app.cwd = repo.clone();
+    app.backend = Backend::Claude;
+    app.model = "sonnet".to_string();
+    app.agents.push(planner_run("orch-1", false));
+
+    // Re-selecting the SAME model must not tear down the planner.
+    app.set_model_defaults(Backend::Claude, "sonnet".to_string(), None);
+    assert!(
+        app.agents.iter().any(|run| run.is_orchestrator()),
+        "an identical model selection leaves the planner in place"
+    );
+
+    // Switching to a DIFFERENT model retires it.
+    app.set_model_defaults(Backend::Claude, "opus".to_string(), None);
+    assert!(
+        !app.agents.iter().any(|run| run.is_orchestrator()),
+        "changing the model retired the planner"
+    );
+
+    match prior_home {
+        Some(value) => std::env::set_var("RUDDER_HOME", value),
+        None => std::env::remove_var("RUDDER_HOME"),
+    }
+    let _ = fs::remove_dir_all(&repo);
+}

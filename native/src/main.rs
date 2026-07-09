@@ -482,6 +482,10 @@ struct App {
     branch: Option<String>,
     task_input: String,
     task_cursor: usize,
+    /// Full text of pastes collapsed into "[Pasted #N …]" chips in `task_input`.
+    /// Lets a re-paste toggle a chip open/closed and lets a submit expand every
+    /// chip back to its real content. Cleared whenever the draft is cleared.
+    pasted_chunks: Vec<PastedChunk>,
     task_history: Vec<String>,
     task_history_index: Option<usize>,
     task_history_draft: String,
@@ -1155,6 +1159,7 @@ impl App {
             branch,
             task_input,
             task_cursor,
+            pasted_chunks: Vec::new(),
             task_history: Vec::new(),
             task_history_index: None,
             task_history_draft: String::new(),
@@ -1509,6 +1514,7 @@ impl App {
         model: String,
         effort: Option<EffortLevel>,
     ) -> Option<String> {
+        let model_changed = self.backend != backend || self.model != model;
         self.backend = backend;
         self.model = model;
         self.effort = effort;
@@ -1519,9 +1525,63 @@ impl App {
             self.fast_mode = false;
             let _ = config::save_fast_mode(false);
         }
-        save_model_defaults(self.backend, &self.model, self.effort)
+        let warning = save_model_defaults(self.backend, &self.model, self.effort)
             .err()
-            .map(|error| format!("config warning: {error}"))
+            .map(|error| format!("config warning: {error}"));
+        // Switching to a DIFFERENT model retires a still-planning planner so the next
+        // task re-plans and launches its agents on the new model (see
+        // `retire_planner_for_model_switch`). Logged to the activity feed rather than
+        // the notice line, which every caller overwrites with the model summary.
+        if model_changed {
+            if let Some(note) = self.retire_planner_for_model_switch() {
+                self.push_activity(note);
+            }
+        }
+        warning
+    }
+
+    /// A model switch (via `/model`, the `P` picker, or `/fast`) retires a planner
+    /// that is still DECOMPOSING — or a plan still AWAITING APPROVAL — and clears the
+    /// pending plan, so the next task re-plans and launches its agents on the newly
+    /// chosen model. An already-EXECUTING plan (worker agents in flight) is left
+    /// untouched: its running agents keep the model they launched with, matching how
+    /// `/fast` leaves running agents alone. Returns a short note when it retired
+    /// something, else `None`.
+    fn retire_planner_for_model_switch(&mut self) -> Option<String> {
+        // Executing plan = any plan-launched worker not yet merged. Do not disturb it;
+        // retiring the conductor mid-flight would strand the running workers.
+        let executing = self
+            .agents
+            .iter()
+            .any(|run| run.node_id.is_some() && run.status != AgentStatus::Merged);
+        if executing {
+            return None;
+        }
+        let planners: Vec<String> = self
+            .agents
+            .iter()
+            .filter(|run| run.is_orchestrator())
+            .map(|run| run.id.clone())
+            .collect();
+        if planners.is_empty() && self.planned_nodes.is_empty() && !self.awaiting_approval {
+            return None;
+        }
+        for id in &planners {
+            self.retire_planner_row(id);
+        }
+        // Drop the pending (unapproved) plan so the next typed task starts a FRESH
+        // planner (plan_is_active() is now false) instead of refining the old model's
+        // proposal. Persist so a restart does not reload the discarded plan.
+        self.planned_nodes.clear();
+        self.plan_review = PlanReviewState::default();
+        self.awaiting_approval = false;
+        self.plan_summary = None;
+        self.persist_plan_queue();
+        Some(format!(
+            "model → {} {}: cleared the planner; next task plans on the new model",
+            self.backend.as_str(),
+            self.model
+        ))
     }
 
     /// The single quit gate: quitting with agents still running needs a second
@@ -2478,6 +2538,7 @@ impl App {
                 self.reset_task_history_navigation();
                 self.task_input.clear();
                 self.task_cursor = 0;
+                self.pasted_chunks.clear();
                 self.picker_index = 0;
             }
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
@@ -2553,6 +2614,7 @@ impl App {
                 self.reset_task_history_navigation();
                 self.task_input.clear();
                 self.task_cursor = 0;
+                self.pasted_chunks.clear();
                 self.picker_index = 0;
             }
             KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -2625,6 +2687,9 @@ impl App {
     fn replace_task_input(&mut self, value: String) {
         self.task_input = value;
         self.task_cursor = self.task_input.chars().count();
+        // The draft is being replaced wholesale (history nav, command prefill); any
+        // paste chips it referenced are gone, so drop their remembered text.
+        self.pasted_chunks.clear();
         self.task_selection = None;
         self.picker_index = 0;
         self.clamp_picker_index();
@@ -2800,7 +2865,15 @@ impl App {
             }
             FocusPane::Task => {
                 self.reset_task_history_navigation();
-                insert_str_at_cursor(&mut self.task_input, &mut self.task_cursor, &text);
+                // Collapse a large paste into a "[Pasted #N …]" chip; re-pasting the
+                // same content toggles it open/closed (expand_pasted_chips restores the
+                // real text on submit).
+                apply_task_paste(
+                    &mut self.task_input,
+                    &mut self.task_cursor,
+                    &mut self.pasted_chunks,
+                    &text,
+                );
                 self.clamp_picker_index();
             }
             FocusPane::Agents => {}
@@ -3595,7 +3668,12 @@ impl App {
     }
 
     fn start_task(&mut self) {
-        let input = self.task_input.trim().to_string();
+        // Expand any collapsed paste chips back to their real content before the draft
+        // is interpreted, so the agent receives the full text whether the user left the
+        // chips collapsed or toggled them open.
+        let input = expand_pasted_chips(&self.task_input, &self.pasted_chunks)
+            .trim()
+            .to_string();
         if input.is_empty() {
             // Empty Enter while a plan awaits approval = approve & launch. This makes
             // the task pane the single plan-mode surface: type to refine, Enter to go.
@@ -3607,6 +3685,7 @@ impl App {
         self.remember_task_history(&input);
         self.task_input.clear();
         self.task_cursor = 0;
+        self.pasted_chunks.clear();
         self.worker_selection = None;
         self.start_task_from_input(&input);
     }

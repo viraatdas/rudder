@@ -281,3 +281,129 @@ pub(crate) fn byte_index_for_char(input: &str, char_index: usize) -> usize {
         .map(|(index, _)| index)
         .unwrap_or(input.len())
 }
+
+/// One collapsed paste in the task draft: the full pasted `text`, remembered
+/// behind a compact `placeholder` chip (e.g. "[Pasted #1 +60 lines]") that sits
+/// inline in the input string. The chip is plain text in the draft, so it renders,
+/// moves, and deletes like any other text; the chunk just lets us expand it back to
+/// the real content when the user re-pastes (toggle) or submits.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PastedChunk {
+    pub id: usize,
+    pub text: String,
+    pub placeholder: String,
+}
+
+/// A pasted string is worth collapsing into a chip when it spans multiple lines or
+/// is long. Short single-line pastes (a URL, a path, a word) insert verbatim so the
+/// chip never gets in the way of ordinary editing.
+pub(crate) fn paste_should_collapse(text: &str) -> bool {
+    text.contains('\n') || text.chars().count() > 200
+}
+
+/// The chip label shown in place of a collapsed paste. Multi-line pastes report
+/// their line count ("+60 lines"); a long single-line paste reports characters
+/// instead of a misleading "+1 lines".
+pub(crate) fn paste_placeholder_label(id: usize, text: &str) -> String {
+    let newlines = text.matches('\n').count();
+    if newlines > 0 {
+        let lines = newlines + 1;
+        format!("[Pasted #{id} +{lines} lines]")
+    } else {
+        let chars = text.chars().count();
+        format!("[Pasted #{id} +{chars} chars]")
+    }
+}
+
+/// The char index at which `needle` first appears in `haystack`, or `None`.
+fn find_char_index(haystack: &str, needle: &str) -> Option<usize> {
+    haystack
+        .find(needle)
+        .map(|byte_index| haystack[..byte_index].chars().count())
+}
+
+/// Replace `len_chars` characters starting at char index `at` with `replacement`,
+/// leaving the cursor at the end of the inserted text.
+fn replace_span(
+    input: &mut String,
+    cursor: &mut usize,
+    at: usize,
+    len_chars: usize,
+    replacement: &str,
+) {
+    let start = byte_index_for_char(input, at);
+    let end = byte_index_for_char(input, at + len_chars);
+    input.replace_range(start..end, replacement);
+    *cursor = at + replacement.chars().count();
+}
+
+/// Apply a paste of `text` to the task draft with paste-collapsing:
+/// - Non-collapsible text inserts verbatim at the cursor.
+/// - New collapsible text becomes a "[Pasted #N …]" chip at the cursor; the full
+///   text is remembered in `chunks`.
+/// - Re-pasting text that already has a chip TOGGLES it in place: a collapsed chip
+///   expands inline to the full text, and an already-expanded one re-collapses. If
+///   the chip was edited away, the re-paste is treated as a brand-new paste.
+pub(crate) fn apply_task_paste(
+    input: &mut String,
+    cursor: &mut usize,
+    chunks: &mut Vec<PastedChunk>,
+    text: &str,
+) {
+    // An empty draft means every prior chip is gone (cleared elsewhere), so start
+    // fresh — this keeps chip numbering at #1 without hunting every draft-clear site.
+    if input.is_empty() {
+        chunks.clear();
+    }
+    if !paste_should_collapse(text) {
+        insert_str_at_cursor(input, cursor, text);
+        return;
+    }
+    if let Some(chunk) = chunks.iter().find(|chunk| chunk.text == text).cloned() {
+        if let Some(at) = find_char_index(input, &chunk.placeholder) {
+            // Collapsed → expand: swap the chip for the full text.
+            replace_span(
+                input,
+                cursor,
+                at,
+                chunk.placeholder.chars().count(),
+                &chunk.text,
+            );
+            return;
+        }
+        if let Some(at) = find_char_index(input, &chunk.text) {
+            // Expanded → collapse: swap the full text back for the chip.
+            replace_span(
+                input,
+                cursor,
+                at,
+                chunk.text.chars().count(),
+                &chunk.placeholder,
+            );
+            return;
+        }
+        // Neither form is present — the chip was edited/deleted. Fall through and
+        // insert a fresh chip for this paste.
+    }
+    let id = chunks.iter().map(|chunk| chunk.id).max().unwrap_or(0) + 1;
+    let placeholder = paste_placeholder_label(id, text);
+    chunks.push(PastedChunk {
+        id,
+        text: text.to_string(),
+        placeholder: placeholder.clone(),
+    });
+    insert_str_at_cursor(input, cursor, &placeholder);
+}
+
+/// Expand every collapsed paste chip in `input` back to its full text, so a
+/// submitted command/task carries the real content whether or not the user
+/// expanded the chips on screen.
+pub(crate) fn expand_pasted_chips(input: &str, chunks: &[PastedChunk]) -> String {
+    let mut out = input.to_string();
+    for chunk in chunks {
+        if out.contains(&chunk.placeholder) {
+            out = out.replace(&chunk.placeholder, &chunk.text);
+        }
+    }
+    out
+}
