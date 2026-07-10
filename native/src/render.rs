@@ -2821,6 +2821,145 @@ pub(crate) fn render_interactive_orchestrator(frame: &mut Frame<'_>, area: Rect,
     }
 }
 
+/// Split for the finished-worker card view: card (objective + what-it-did) on
+/// top, conversation below. Same shape as the interactive orchestrator's split so
+/// the mouse handlers can derive the sub-areas from the pane rect alone.
+pub(crate) fn done_card_areas(area: Rect) -> (Rect, Rect) {
+    let card_h = (area.height / 3).clamp(6, area.height.saturating_sub(6).max(6));
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(card_h), Constraint::Min(1)])
+        .split(area);
+    (chunks[0], chunks[1])
+}
+
+/// The finished-worker card content: status + title, the objective, and the
+/// worker's own completion summary ("what it did"). Pure so tests can assert it.
+pub(crate) fn done_worker_card_lines(run: &AgentRun, focused: bool) -> Vec<Line<'static>> {
+    let title = if run.task_summary.trim().is_empty() {
+        summarize_task(&run.task)
+    } else {
+        run.task_summary.clone()
+    };
+    let mut lines = vec![
+        Line::from(Span::styled(
+            format!("{} · {}", run.status.as_str(), title),
+            pane_text_style(focused),
+        )),
+        Line::from(""),
+        Line::from(Span::styled("Objective", muted_style(focused))),
+    ];
+    for text_line in run.task.lines().take(12) {
+        lines.push(Line::from(Span::styled(
+            text_line.to_string(),
+            pane_text_style(focused),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "What it did",
+        muted_style(focused),
+    )));
+    match run.done_summary.as_deref() {
+        Some(summary) => {
+            for text_line in summary.lines() {
+                lines.push(Line::from(Span::styled(
+                    text_line.to_string(),
+                    pane_text_style(focused),
+                )));
+            }
+        }
+        None => lines.push(Line::from(Span::styled(
+            "(no completion summary was recorded)",
+            muted_style(focused),
+        ))),
+    }
+    lines
+}
+
+/// Two-panel view for a FINISHED worker, mirroring the interactive orchestrator:
+/// the card on top (objective + what it did), the conversation below. The session
+/// stays conversable — typing below resumes it and the card refreshes when the
+/// resumed turn completes.
+pub(crate) fn render_done_worker_card(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    let focused = app.focus == FocusPane::Worker;
+    let (card_area, term_area) = done_card_areas(area);
+
+    let card_lines = app
+        .agents
+        .get(app.selected_agent)
+        .map(|run| done_worker_card_lines(run, focused))
+        .unwrap_or_default();
+    frame.render_widget(
+        Paragraph::new(card_lines)
+            .style(app_style())
+            .block(pane_block("result", focused, app.nav_mode))
+            .wrap(Wrap { trim: false }),
+        card_area,
+    );
+
+    let term_inner = block_inner(term_area);
+    let has_terminal = app
+        .agents
+        .get(app.selected_agent)
+        .is_some_and(|run| run.terminal.is_some());
+    if !has_terminal {
+        // PTY gone (restart): show the resume draft. Enter re-goals the same
+        // session with the typed instruction.
+        let draft = app
+            .agents
+            .get(app.selected_agent)
+            .map(|run| run.worker_input_draft.clone())
+            .unwrap_or_default();
+        let body = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "Session paused. Type a new instruction and press Enter to continue it.",
+                muted_style(focused),
+            )),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("> ", muted_style(focused)),
+                Span::styled(draft, pane_text_style(focused)),
+            ]),
+        ];
+        frame.render_widget(
+            Paragraph::new(body)
+                .style(app_style())
+                .block(pane_block("continue · type + Enter", focused, app.nav_mode))
+                .wrap(Wrap { trim: false }),
+            term_area,
+        );
+        return;
+    }
+    if let Ok(size) = TerminalSize::new(term_inner.height.max(1), term_inner.width.max(1)) {
+        if let Some(run) = app.agents.get_mut(app.selected_agent) {
+            if run.terminal_size != Some(size) {
+                if let Some(terminal) = run.terminal.as_mut() {
+                    if terminal.resize(size).is_ok() {
+                        run.terminal_size = Some(size);
+                    }
+                }
+            }
+        }
+    }
+    let lines = worker_lines(app, term_inner.height as usize, term_inner.width as usize);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(app_style())
+            .block(pane_block(
+                "conversation · type to continue",
+                focused,
+                app.nav_mode,
+            ))
+            .wrap(Wrap { trim: false }),
+        term_area,
+    );
+    if focused {
+        set_worker_cursor(frame, term_inner, app);
+    }
+}
+
 pub(crate) fn render_worker(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let inner = block_inner(area);
     let terminal_size = TerminalSize::new(inner.height.max(1), inner.width.max(1)).ok();
@@ -2854,6 +2993,13 @@ pub(crate) fn render_worker(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         } else {
             render_orchestrator(frame, area, app);
         }
+        return;
+    }
+
+    // A FINISHED worker gets the two-panel card view: objective + what-it-did on
+    // top, the (still conversable) conversation below.
+    if app.selected_done_worker_card_active() {
+        render_done_worker_card(frame, area, app);
         return;
     }
 

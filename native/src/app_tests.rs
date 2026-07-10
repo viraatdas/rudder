@@ -3435,11 +3435,17 @@ fn run_token_usage_persists_to_run_json_and_reloads() {
         .expect("read run.json");
     let value: serde_json::Value = serde_json::from_str(&raw).expect("parse run.json");
     assert_eq!(
-        value.get("tokens").and_then(|t| t.get("input")).and_then(|v| v.as_u64()),
+        value
+            .get("tokens")
+            .and_then(|t| t.get("input"))
+            .and_then(|v| v.as_u64()),
         Some(600)
     );
     assert_eq!(
-        value.get("tokens").and_then(|t| t.get("output")).and_then(|v| v.as_u64()),
+        value
+            .get("tokens")
+            .and_then(|t| t.get("output"))
+            .and_then(|v| v.as_u64()),
         Some(250)
     );
 
@@ -3455,7 +3461,10 @@ fn run_token_usage_persists_to_run_json_and_reloads() {
         .expect("read run.json");
     let value: serde_json::Value = serde_json::from_str(&raw).expect("parse run.json");
     assert_eq!(
-        value.get("tokens").and_then(|t| t.get("input")).and_then(|v| v.as_u64()),
+        value
+            .get("tokens")
+            .and_then(|t| t.get("input"))
+            .and_then(|v| v.as_u64()),
         Some(600)
     );
 
@@ -4831,6 +4840,7 @@ fn test_agent_run(id: &str, task: &str) -> AgentRun {
         merge_conflict_operation: ConflictOperation::Merge,
         merge_conflict_files: Vec::new(),
         had_merge_conflict: false,
+        done_summary: None,
         tokens_in: 0,
         tokens_out: 0,
     }
@@ -5781,7 +5791,10 @@ fn merge_leaves_unlabeled_run_identity_alone() {
     app.mark_agent_and_review_sources_merged(0, Vec::new());
 
     assert_eq!(app.agents[0].task, "Build the settings pane");
-    assert_eq!(app.agents[0].task_summary, summarize_task("Build the settings pane"));
+    assert_eq!(
+        app.agents[0].task_summary,
+        summarize_task("Build the settings pane")
+    );
 }
 
 #[test]
@@ -5812,7 +5825,11 @@ fn clear_merged_requires_second_c_and_removes_only_merged() {
     let ids: Vec<&str> = app.agents.iter().map(|a| a.id.as_str()).collect();
     assert_eq!(ids, vec!["run-live", "run-done"]);
     assert!(app.delete_pending.is_none());
-    assert!(app.notice.as_deref().unwrap_or_default().contains("cleared 2 merged agent(s)"));
+    assert!(app
+        .notice
+        .as_deref()
+        .unwrap_or_default()
+        .contains("cleared 2 merged agent(s)"));
 }
 
 #[test]
@@ -5933,6 +5950,7 @@ fn delete_agent_requires_second_d() {
         merge_conflict_operation: ConflictOperation::Merge,
         merge_conflict_files: Vec::new(),
         had_merge_conflict: false,
+        done_summary: None,
         tokens_in: 0,
         tokens_out: 0,
     });
@@ -6045,6 +6063,168 @@ fn main_agent_blocks_delete_merge_and_rename() {
         .as_deref()
         .unwrap_or_default()
         .contains("main agent"));
+}
+
+#[test]
+fn done_worker_card_shows_objective_and_summary() {
+    let mut run = test_agent_run(
+        "done-1",
+        "Objective: ship the widget\nDone when: tests pass",
+    );
+    run.status = AgentStatus::Done;
+    run.done_summary = Some("Added widget.rs and 4 tests; all green.".to_string());
+    let text = done_worker_card_lines(&run, true)
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("Objective"), "card labels the objective");
+    assert!(text.contains("Objective: ship the widget"));
+    assert!(text.contains("Done when: tests pass"));
+    assert!(text.contains("What it did"));
+    assert!(text.contains("Added widget.rs and 4 tests; all green."));
+
+    // Without a recorded summary the card says so instead of going blank.
+    run.done_summary = None;
+    let text = done_worker_card_lines(&run, true)
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("no completion summary was recorded"));
+}
+
+#[test]
+fn done_worker_card_is_active_only_for_finished_workers() {
+    let mut app = App::new();
+    let mut done = test_agent_run("w-done", "task");
+    done.status = AgentStatus::Done;
+    app.agents.push(done);
+    let mut running = test_agent_run("w-running", "task");
+    running.status = AgentStatus::Running;
+    app.agents.push(running);
+    let mut orch = test_agent_run("orch", "plan");
+    orch.mode = AgentMode::RudderPlan;
+    orch.status = AgentStatus::Done;
+    app.agents.push(orch);
+
+    app.selected_agent = 0;
+    assert!(
+        app.selected_done_worker_card_active(),
+        "done worker gets the card"
+    );
+    app.selected_agent = 1;
+    assert!(
+        !app.selected_done_worker_card_active(),
+        "running worker keeps its PTY view"
+    );
+    app.selected_agent = 2;
+    assert!(
+        !app.selected_done_worker_card_active(),
+        "the orchestrator has its own view"
+    );
+    app.selected_agent = 0;
+    app.worker_view = WorkerView::Diff;
+    assert!(
+        !app.selected_done_worker_card_active(),
+        "diff view is never hijacked"
+    );
+}
+
+#[test]
+fn done_summary_round_trips_through_run_record() {
+    let repo = unique_test_repo("done-summary-roundtrip");
+    let mut run = test_agent_run("ds-1", "build the thing");
+    run.status = AgentStatus::Done;
+    run.done_summary = Some("Implemented the thing across 3 files.".to_string());
+    save_native_run_record(&repo, &run).expect("save run record");
+
+    let loaded = load_persisted_agents(&repo)
+        .into_iter()
+        .find(|r| r.id == "ds-1")
+        .expect("reload run");
+    assert_eq!(
+        loaded.done_summary.as_deref(),
+        Some("Implemented the thing across 3 files."),
+        "doneSummary survives a restart"
+    );
+    let _ = fs::remove_dir_all(&repo);
+}
+
+#[test]
+fn ingest_note_summary_lands_on_the_run() {
+    let repo = unique_test_repo("ingest-summary");
+    let mut app = App::new();
+    app.cwd = repo.clone();
+    let mut run = test_agent_run("w-1", "task");
+    run.status = AgentStatus::Done;
+    app.agents.push(run);
+
+    app.set_run_done_summary(
+        0,
+        &serde_json::json!({ "summary": "  Fixed the flaky test.  " }),
+    );
+    assert_eq!(
+        app.agents[0].done_summary.as_deref(),
+        Some("Fixed the flaky test."),
+        "summary is stored trimmed"
+    );
+    // A note without a summary leaves the existing one alone.
+    app.set_run_done_summary(0, &serde_json::json!({ "followups": [] }));
+    assert_eq!(
+        app.agents[0].done_summary.as_deref(),
+        Some("Fixed the flaky test.")
+    );
+    let _ = fs::remove_dir_all(&repo);
+}
+
+#[cfg(not(windows))]
+#[test]
+fn typing_into_a_finished_worker_reopens_it() {
+    let repo = unique_test_repo("reopen-finished");
+    let mut app = App::new();
+    app.cwd = repo.clone();
+    let command = TerminalCommand::with_args("/bin/sh", ["-lc", "sleep 5"]);
+    let pane = TerminalPane::spawn_shell_or_command(
+        Some(command),
+        TerminalPaneOptions {
+            size: TerminalSize { rows: 5, cols: 40 },
+            cwd: Some(repo.clone()),
+            ..Default::default()
+        },
+    )
+    .expect("spawn fake worker PTY");
+    let mut run = test_agent_run_with_terminal(&app, pane);
+    run.id = "w-done".to_string();
+    run.node_id = Some("n0".to_string());
+    run.status = AgentStatus::Done;
+    app.agents.push(run);
+    app.selected_agent = 0;
+    app.followups_ingested.insert("w-done".to_string());
+
+    app.record_selected_worker_prompt("also add retries to the client".to_string());
+
+    let run = &app.agents[0];
+    assert_eq!(
+        run.status,
+        AgentStatus::Running,
+        "a new instruction re-opens the finished worker"
+    );
+    assert!(
+        !app.followups_ingested.contains("w-done"),
+        "ledger cleared so the NEXT completion re-ingests (card summary refreshes)"
+    );
+    let _ = fs::remove_dir_all(&repo);
 }
 
 #[test]

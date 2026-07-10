@@ -273,6 +273,7 @@ pub(crate) fn create_main_agent(
         merge_conflict_operation: ConflictOperation::Merge,
         merge_conflict_files: Vec::new(),
         had_merge_conflict: false,
+        done_summary: None,
         tokens_in: 0,
         tokens_out: 0,
     }
@@ -626,6 +627,12 @@ pub(crate) fn agent_from_run_record(
         merge_conflict_operation,
         merge_conflict_files,
         had_merge_conflict,
+        done_summary: record
+            .get("doneSummary")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned),
         tokens_in,
         tokens_out,
     };
@@ -791,6 +798,9 @@ pub(crate) fn save_native_run_record(repo_root: &Path, run: &AgentRun) -> Result
         // (live state, dropped once the conflict resolves), this survives a
         // successful resolution so mergeConflictRate counts resolved conflicts.
         "hadMergeConflict": run.had_merge_conflict || run.merge_conflict,
+        // The worker's own completion note summary, shown in the finished-worker
+        // card (objective + what it did) and refreshed on every completion.
+        "doneSummary": run.done_summary,
         // Plan node identity for scheduler-launched runs. `nodeId` enters the
         // merged set when this run merges; `planDeps` are the hard-dep node ids
         // this run was launched against (so a restored run keeps its gating).

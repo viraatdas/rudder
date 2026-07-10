@@ -898,6 +898,13 @@ struct AgentRun {
     /// `hadMergeConflict`, so telemetry (the improve loop's mergeConflictRate) still
     /// counts conflicts that were auto-resolved before it read the record.
     had_merge_conflict: bool,
+    /// The worker's own account of WHAT IT DID, taken from its completion note
+    /// (`rudder done` sidecar / PTY block / diff-backstop summary) each time it
+    /// finishes. Shown in the finished-worker card above the conversation, and
+    /// refreshed on every subsequent completion, so a finished agent reads as
+    /// "objective + what it did" instead of a dead terminal. Persists to run.json
+    /// as `doneSummary`.
+    done_summary: Option<String>,
     /// Best-effort cumulative token usage read from the backend's OWN session log
     /// (claude project jsonl / codex rollout) when a turn completes. Interactive
     /// PTYs expose no usage stream, so this is the only cost signal a native run
@@ -1983,7 +1990,19 @@ impl App {
                 terminal.reset_scrollback();
                 terminal.write_input(&bytes)
             }
-            None => return false,
+            None => {
+                // A FINISHED worker whose PTY is gone (e.g. after a restart) stays
+                // conversable: keys type into the run's draft, and Enter resumes the
+                // same session with the new instruction via the regoal path.
+                if self.selected_done_worker_card_active() {
+                    if let Some(prompt) = self.capture_selected_worker_key(key, true) {
+                        let index = self.selected_agent;
+                        self.regoal_agent_at(index, &prompt);
+                    }
+                    self.dirty = true;
+                }
+                return false;
+            }
         };
         if let Err(error) = result {
             self.set_selected_error(error.to_string());
@@ -2858,7 +2877,20 @@ impl App {
                             terminal.reset_scrollback();
                             terminal.write_input(&bracketed_paste_bytes(&text))
                         }
-                        None => return,
+                        None => {
+                            // Finished worker without a PTY: paste lands in the
+                            // resume draft (Enter sends it via the regoal path).
+                            if self.selected_done_worker_card_active() {
+                                let prompts = self.capture_selected_worker_paste(&text, true);
+                                let joined = prompts.join("\n");
+                                if !joined.trim().is_empty() {
+                                    let index = self.selected_agent;
+                                    self.regoal_agent_at(index, joined.trim());
+                                }
+                                self.dirty = true;
+                            }
+                            return;
+                        }
                     };
                     if let Err(error) = result {
                         self.set_selected_error(error.to_string());
@@ -2959,7 +2991,77 @@ impl App {
             record_agent_prompt(run, prompt, "user");
             let _ = save_native_run_record(&self.cwd, run);
         }
+        // A finished worker stays CONVERSABLE: a new instruction typed into its live
+        // PTY is a new working turn, so flip it back to Running and clear its ingest
+        // ledger — the NEXT completion then re-ingests (follow-ups + card summary
+        // refresh) instead of being skipped as already handled.
+        self.reopen_selected_finished_worker();
         let _ = self.write_rudder_context_timed(None);
+    }
+
+    /// If the selected agent is a FINISHED worker with a live terminal, re-open it:
+    /// status back to Running, ledger cleared so its next completion is ingested
+    /// afresh, and the stale done-sidecar removed (mirrors `regoal_agent_at`'s
+    /// prologue, but for input typed directly into the still-alive session).
+    fn reopen_selected_finished_worker(&mut self) {
+        let Some(run) = self.agents.get(self.selected_agent) else {
+            return;
+        };
+        if run.is_main()
+            || run.is_orchestrator()
+            || run.merge_resolver
+            || run.terminal.is_none()
+            || !matches!(
+                run.status,
+                AgentStatus::Done
+                    | AgentStatus::Merged
+                    | AgentStatus::Stopped
+                    | AgentStatus::Failed
+            )
+        {
+            return;
+        }
+        let id = run.id.clone();
+        let node_id = run.node_id.clone();
+        let run_cwd = run.cwd.clone();
+        let was_ingested = self.followups_ingested.remove(&id);
+        let was_pending = self.completion_summary_pending.remove(&id);
+        if was_ingested || was_pending {
+            self.persist_ingested_runs();
+        }
+        if let Some(node_id) = node_id.as_deref() {
+            let _ = std::fs::remove_file(worker_done_file(&run_cwd, node_id));
+        }
+        let cwd = self.cwd.clone();
+        if let Some(run) = self.agents.get_mut(self.selected_agent) {
+            run.status = AgentStatus::Running;
+            run.completed_at = None;
+            run.ready_since = None;
+            let _ = save_native_run_record(&cwd, run);
+        }
+    }
+
+    /// The finished-worker CARD view is active: the selected agent is a completed /
+    /// merged / stopped / failed worker (not main, not the orchestrator), so the
+    /// worker pane renders objective + what-it-did above the conversation, and the
+    /// session stays conversable.
+    pub(crate) fn selected_done_worker_card_active(&self) -> bool {
+        if self.worker_view != WorkerView::Terminal {
+            return false;
+        }
+        self.agents.get(self.selected_agent).is_some_and(|run| {
+            !run.is_main()
+                && !run.is_orchestrator()
+                && !run.merge_resolver
+                && matches!(run.mode, AgentMode::Execute | AgentMode::OneOff)
+                && matches!(
+                    run.status,
+                    AgentStatus::Done
+                        | AgentStatus::Merged
+                        | AgentStatus::Stopped
+                        | AgentStatus::Failed
+                )
+        })
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
@@ -3000,6 +3102,9 @@ impl App {
                 self.task_selection = None;
                 let worker_inner = if self.selected_interactive_orchestrator_active() {
                     let (_, term_area) = interactive_orchestrator_areas(worker_area);
+                    block_inner(term_area)
+                } else if self.selected_done_worker_card_active() {
+                    let (_, term_area) = done_card_areas(worker_area);
                     block_inner(term_area)
                 } else {
                     block_inner(worker_area)
@@ -3083,6 +3188,22 @@ impl App {
             return false;
         }
 
+        // Finished-worker card view: the card is static text (no selection mapping
+        // to PTY rows), so mouse work targets only the conversation sub-pane.
+        if self.selected_done_worker_card_active() {
+            let (_, term_area) = done_card_areas(worker_area);
+            if rect_contains(term_area, mouse.column, mouse.row) {
+                let term_inner = block_inner(term_area);
+                if self.handle_worker_selection_mouse(mouse, term_inner) {
+                    return true;
+                }
+                if self.write_mouse_to_selected_worker(mouse, term_inner) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
         if self.handle_worker_selection_mouse(mouse, inner) {
             return true;
         }
@@ -3132,6 +3253,9 @@ impl App {
                     self.scroll_plan_review(mouse, inner)
                 } else if self.selected_interactive_orchestrator_active() {
                     self.scroll_interactive_orchestrator(mouse, area)
+                } else if self.selected_done_worker_card_active() {
+                    let (_, term_area) = done_card_areas(area);
+                    self.scroll_selected_worker_or_forward(mouse, block_inner(term_area))
                 } else if self.selected_headless_orchestrator_rendered_view_active() {
                     self.scroll_orchestrator_dag(mouse, inner)
                 } else if self.worker_view == WorkerView::Diff {
@@ -3172,6 +3296,9 @@ impl App {
                 self.scroll_plan_review(mouse, inner)
             } else if self.selected_interactive_orchestrator_active() {
                 self.scroll_interactive_orchestrator(mouse, area)
+            } else if self.selected_done_worker_card_active() {
+                let (_, term_area) = done_card_areas(area);
+                self.scroll_selected_worker_or_forward(mouse, block_inner(term_area))
             } else if self.selected_headless_orchestrator_rendered_view_active() {
                 self.scroll_orchestrator_dag(mouse, inner)
             } else if self.worker_view == WorkerView::Diff {
@@ -4062,6 +4189,7 @@ impl App {
             merge_conflict_operation: ConflictOperation::Merge,
             merge_conflict_files: Vec::new(),
             had_merge_conflict: false,
+            done_summary: None,
             tokens_in: 0,
             tokens_out: 0,
         };
@@ -4235,6 +4363,7 @@ impl App {
             merge_conflict_operation: ConflictOperation::Merge,
             merge_conflict_files: Vec::new(),
             had_merge_conflict: false,
+            done_summary: None,
             tokens_in: 0,
             tokens_out: 0,
         };
@@ -4379,6 +4508,7 @@ impl App {
             merge_conflict_operation: ConflictOperation::Merge,
             merge_conflict_files: Vec::new(),
             had_merge_conflict: false,
+            done_summary: None,
             tokens_in: 0,
             tokens_out: 0,
         };
@@ -6011,6 +6141,7 @@ impl App {
             merge_conflict_operation: ConflictOperation::Merge,
             merge_conflict_files: Vec::new(),
             had_merge_conflict: false,
+            done_summary: None,
             tokens_in: 0,
             tokens_out: 0,
         };
@@ -7668,6 +7799,10 @@ impl App {
             // the agent's next-steps are unstructured, so fall through to the diff-backstop
             // and feed it the agent's own words. This is the freeform-prose recovery.
             let addressed_followups = note.get("followups").is_some();
+            // Keep the worker's own account of what it did on the run, so the
+            // finished-worker card can show "objective + what it did" (and refresh
+            // it on every later completion of the same, re-goaled session).
+            self.set_run_done_summary(index, &note);
             let grew = self.apply_worker_followups(&node_id, &note);
             if grew || addressed_followups {
                 self.mark_run_ingested(run_id);
@@ -7735,6 +7870,25 @@ impl App {
         false
     }
 
+    /// Store the completion note's `summary` on the run (persisted as `doneSummary`)
+    /// so the finished-worker card shows what the agent actually did.
+    fn set_run_done_summary(&mut self, index: usize, note: &serde_json::Value) {
+        let summary = note
+            .get("summary")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        let Some(summary) = summary else {
+            return;
+        };
+        let cwd = self.cwd.clone();
+        if let Some(run) = self.agents.get_mut(index) {
+            run.done_summary = Some(summary);
+            let _ = save_native_run_record(&cwd, run);
+        }
+    }
+
     /// Mark a run's follow-ups as ingested (so it is never re-scanned) and persist the
     /// ledger so a restart does not re-ingest or re-summarize an already-handled worker.
     fn mark_run_ingested(&mut self, run_id: String) {
@@ -7757,12 +7911,15 @@ impl App {
             if !still_wanted {
                 continue;
             }
-            self.mark_run_ingested(result.run_id);
             if let Some(note) = result.note {
+                if let Some(index) = self.agents.iter().position(|run| run.id == result.run_id) {
+                    self.set_run_done_summary(index, &note);
+                }
                 if self.apply_worker_followups(&result.node_id, &note) {
                     grew = true;
                 }
             }
+            self.mark_run_ingested(result.run_id);
         }
         if grew && !self.awaiting_approval {
             self.run_scheduler();
@@ -9492,6 +9649,7 @@ impl App {
             merge_conflict_operation: ConflictOperation::Merge,
             merge_conflict_files: Vec::new(),
             had_merge_conflict: false,
+            done_summary: None,
             tokens_in: 0,
             tokens_out: 0,
         };
@@ -9534,9 +9692,7 @@ impl App {
             .iter()
             .enumerate()
             .filter(|(_, agent)| {
-                agent.status == AgentStatus::Merged
-                    && !agent.is_main()
-                    && !agent.is_orchestrator()
+                agent.status == AgentStatus::Merged && !agent.is_main() && !agent.is_orchestrator()
             })
             .map(|(index, _)| index)
             .collect();
