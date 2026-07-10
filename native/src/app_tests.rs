@@ -4886,6 +4886,97 @@ fn model_picker_accepts_new_claude_families_without_a_release() {
 }
 
 #[test]
+fn model_picker_lists_newest_releases_first_and_drops_dated_duplicates() {
+    let data = serde_json::json!({
+        "anthropic": { "models": {
+            "claude-opus-4-1": { "name": "Claude Opus 4.1", "release_date": "2025-08-05", "tool_call": true },
+            "claude-opus-4-8": { "name": "Opus 4.8", "release_date": "2026-05-28", "tool_call": true },
+            "claude-opus-4-5": { "name": "Claude Opus 4.5 (latest)", "release_date": "2025-11-24", "tool_call": true },
+            "claude-opus-4-5-20251101": { "name": "Claude Opus 4.5", "release_date": "2025-11-24", "tool_call": true },
+            "claude-sonnet-5": { "name": "Sonnet 5", "release_date": "2026-06-29", "tool_call": true },
+            "claude-fable-5": { "name": "Fable 5", "release_date": "2026-06-07", "tool_call": true },
+        }},
+        "openai": { "models": {
+            "gpt-5.5": { "name": "GPT-5.5", "release_date": "2026-04-23", "tool_call": true },
+            "gpt-5.5-pro": { "name": "GPT-5.5 Pro", "release_date": "2026-04-23", "tool_call": true },
+            "gpt-5.3-codex": { "name": "GPT-5.3 Codex", "release_date": "2026-02-05", "tool_call": true },
+            "gpt-5.4": { "name": "GPT-5.4", "release_date": "2026-03-05", "tool_call": true },
+        }},
+    });
+
+    let mut rows = Vec::new();
+    collect_provider_models(&data, "anthropic", Backend::Claude, &mut rows);
+    let claude_ids: Vec<&str> = rows.iter().map(|(_, id, _)| id.as_str()).collect();
+    assert_eq!(
+        claude_ids,
+        vec![
+            "claude-sonnet-5",  // 2026-06-29
+            "claude-fable-5",   // 2026-06-07
+            "claude-opus-4-8",  // 2026-05-28
+            "claude-opus-4-5",  // dated twin suppressed
+            "claude-opus-4-1",
+        ],
+        "newest release first; dated snapshot ids collapse into their (latest) twin"
+    );
+    // Detail carries the human name AND the release date.
+    assert_eq!(rows[0].2, "Sonnet 5 · 2026-06-29");
+
+    let mut rows = Vec::new();
+    collect_provider_models(&data, "openai", Backend::Codex, &mut rows);
+    let codex_ids: Vec<&str> = rows.iter().map(|(_, id, _)| id.as_str()).collect();
+    assert_eq!(
+        codex_ids,
+        vec!["gpt-5.5", "gpt-5.5-pro", "gpt-5.4", "gpt-5.3-codex"],
+        "newest first; the -pro variant sinks below its same-day base model"
+    );
+}
+
+#[test]
+fn model_picker_leads_with_aliases_then_explicit_ids() {
+    let _guard = env_guard();
+    let home = unique_test_repo("model-picker-order");
+    let prior = std::env::var_os("RUDDER_HOME");
+    std::env::set_var("RUDDER_HOME", &home);
+    fs::create_dir_all(&home).unwrap();
+    fs::write(
+        home.join("models-dev.json"),
+        serde_json::json!({
+            "anthropic": { "models": {
+                "claude-sonnet-5": { "name": "Sonnet 5", "release_date": "2026-06-29", "tool_call": true },
+                "claude-opus-4-8": { "name": "Opus 4.8", "release_date": "2026-05-28", "tool_call": true },
+            }},
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let labels: Vec<String> = model_suggestions_for(Backend::Claude, "")
+        .into_iter()
+        .map(|s| s.label)
+        .collect();
+
+    match prior {
+        Some(value) => std::env::set_var("RUDDER_HOME", value),
+        None => std::env::remove_var("RUDDER_HOME"),
+    }
+    let _ = fs::remove_dir_all(&home);
+
+    // Friendly aliases lead (they track the newest release, like the claude
+    // CLI's own picker); explicit ids follow newest-first.
+    let alias_end = labels.iter().position(|l| l == "claude-sonnet-5").unwrap();
+    for alias in ["fable", "sonnet", "opus", "haiku", "fable[1m]"] {
+        let at = labels
+            .iter()
+            .position(|l| l == alias)
+            .unwrap_or_else(|| panic!("{alias} missing from {labels:?}"));
+        assert!(at < alias_end, "{alias} lists before explicit ids: {labels:?}");
+    }
+    let sonnet5 = labels.iter().position(|l| l == "claude-sonnet-5").unwrap();
+    let opus48 = labels.iter().position(|l| l == "claude-opus-4-8").unwrap();
+    assert!(sonnet5 < opus48, "explicit ids stay newest-first: {labels:?}");
+}
+
+#[test]
 fn model_picker_accepts_future_codex_models_without_a_release() {
     let meta = serde_json::json!({
         "tool_call": true,

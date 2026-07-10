@@ -475,12 +475,24 @@ pub(crate) fn model_suggestions_for(backend_filter: Backend, query: &str) -> Vec
     let mut seen = HashSet::new();
     let mut suggestions = Vec::new();
 
+    // Friendly ALIASES first ("fable", "opus[1m]", …): they always track the
+    // newest release of each family, which is how the claude CLI's own /model
+    // picker leads. Explicit ids follow, newest-first from models.dev, for
+    // pinning a specific release; the static id rows are the no-cache safety net.
+    let (alias_rows, id_rows): (Vec<_>, Vec<_>) = fallback_model_rows()
+        .into_iter()
+        .partition(|(_, model, _)| !model.contains('-'));
+    for (backend, model, detail) in alias_rows {
+        if backend == backend_filter {
+            push_model_suggestion(&mut suggestions, &mut seen, backend, model, detail);
+        }
+    }
     for (backend, model, detail) in cached_models_dev_rows() {
         if backend == backend_filter {
             push_model_suggestion(&mut suggestions, &mut seen, backend, &model, &detail);
         }
     }
-    for (backend, model, detail) in fallback_model_rows() {
+    for (backend, model, detail) in id_rows {
         if backend == backend_filter {
             push_model_suggestion(&mut suggestions, &mut seen, backend, model, detail);
         }
@@ -588,29 +600,76 @@ pub(crate) fn collect_provider_models(
             Backend::Claude => is_claude_picker_model(id, model),
             Backend::Codex => is_codex_picker_model(id, model),
         })
+        // A dated snapshot ("claude-opus-4-5-20251101") duplicates its un-dated
+        // (latest) twin in the picker; list the twin only.
+        .filter(|(id, _)| {
+            dated_duplicate_base(id).is_none_or(|base| !models.contains_key(&base))
+        })
         .map(|(id, model)| {
-            let detail = model
+            let name = model
                 .get("name")
                 .and_then(serde_json::Value::as_str)
-                .or_else(|| {
-                    model
-                        .get("release_date")
-                        .and_then(serde_json::Value::as_str)
-                })
-                .unwrap_or("models.dev")
-                .to_string();
-            (id.clone(), detail)
+                .unwrap_or("")
+                .trim();
+            let release = model
+                .get("release_date")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .trim();
+            let detail = match (name.is_empty(), release.is_empty()) {
+                (false, false) => format!("{name} · {release}"),
+                (false, true) => name.to_string(),
+                (true, false) => release.to_string(),
+                (true, true) => "models.dev".to_string(),
+            };
+            (id.clone(), detail, release.to_string())
         })
         .collect::<Vec<_>>();
 
+    // NEWEST FIRST — the order the claude/codex CLIs themselves present models —
+    // then a variant nudge among same-day siblings (codex-tuned up; nano/mini/
+    // pro/chat down), then the family score, then id DESC so an un-dated tie
+    // still leans newest instead of listing 4-1 above 4-8.
     entries.sort_by(|a, b| {
-        score_model(backend, &b.0)
-            .cmp(&score_model(backend, &a.0))
-            .then_with(|| a.0.cmp(&b.0))
+        b.2.cmp(&a.2)
+            .then_with(|| variant_score(backend, &b.0).cmp(&variant_score(backend, &a.0)))
+            .then_with(|| score_model(backend, &b.0).cmp(&score_model(backend, &a.0)))
+            .then_with(|| b.0.cmp(&a.0))
     });
-    for (id, detail) in entries.into_iter().take(24) {
+    for (id, detail, _) in entries.into_iter().take(24) {
         rows.push((backend, id, detail));
     }
+}
+
+/// For a dated snapshot id like "claude-opus-4-5-20251101", the un-dated base id
+/// ("claude-opus-4-5"). None when the id carries no trailing -YYYYMMDD stamp.
+pub(crate) fn dated_duplicate_base(id: &str) -> Option<String> {
+    let (base, stamp) = id.rsplit_once('-')?;
+    if stamp.len() == 8 && stamp.chars().all(|ch| ch.is_ascii_digit()) {
+        return Some(base.to_string());
+    }
+    None
+}
+
+/// Nudge among SAME-RELEASE-DAY siblings: coding-tuned ids float above their
+/// general twin for the codex picker; nano/mini/pro/chat variants sink below
+/// the base model (they are niche picks, not what /model reaches for).
+pub(crate) fn variant_score(backend: Backend, id: &str) -> i32 {
+    if backend == Backend::Claude {
+        return 0;
+    }
+    let lower = id.to_ascii_lowercase();
+    let mut score = 0;
+    if lower.contains("codex") {
+        score += 10;
+    }
+    if ["nano", "mini", "-pro", "chat"]
+        .iter()
+        .any(|needle| lower.contains(needle))
+    {
+        score -= 5;
+    }
+    score
 }
 
 pub(crate) fn is_claude_picker_model(id: &str, model: &serde_json::Value) -> bool {
