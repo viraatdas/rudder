@@ -9394,6 +9394,15 @@ impl App {
         let model = run.model.clone();
         let effort = run.effort;
         let base_change = run.jj_change_id.clone();
+        let source_cwd = run.cwd.clone();
+        // Claude resolves --resume against the CURRENT directory's transcripts; make
+        // sure the source session's transcript actually exists before creating a
+        // workspace we'd abandon on failure. (Codex sessions are global.)
+        if backend == Backend::Claude && claude_transcript_path(&source_cwd, &session_id).is_none()
+        {
+            self.notice = Some("branch failed: no session transcript found to branch".to_string());
+            return;
+        }
 
         let label = format!("branch: {source_summary}");
         // Seed the fork's workspace from the source's CURRENT jj change (jj snapshots
@@ -9407,6 +9416,16 @@ impl App {
         };
         if let Err(error) = self.write_rudder_context_timed(Some(&worktree)) {
             self.notice = Some(format!("context warning: {error}"));
+        }
+        // Stage the source transcript into the fork workspace's project folder so
+        // `--resume <sid> --fork-session` can find the conversation from its new cwd.
+        if backend == Backend::Claude {
+            if let Err(error) =
+                stage_claude_session_for_cwd(&source_cwd, &session_id, &worktree.path)
+            {
+                self.notice = Some(format!("branch failed: {error}"));
+                return;
+            }
         }
 
         let mut command = match backend {
@@ -11684,6 +11703,37 @@ fn claude_transcript_path(cwd: &Path, session_id: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Make a Claude session resumable from `target_cwd`. Claude Code scopes `--resume`
+/// lookup to the CURRENT directory's project folder under ~/.claude/projects, so a
+/// fork spawned in a fresh workspace cannot see the source session ("No conversation
+/// found with session ID"). Copying the transcript into the target's project folder
+/// is enough: `--resume <sid> --fork-session` reads it there and mints a NEW session
+/// for the fork, leaving the original transcript untouched.
+fn stage_claude_session_for_cwd(
+    source_cwd: &Path,
+    session_id: &str,
+    target_cwd: &Path,
+) -> std::result::Result<(), String> {
+    let source = claude_transcript_path(source_cwd, session_id)
+        .ok_or_else(|| "no session transcript found to branch".to_string())?;
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| "HOME is not set".to_string())?;
+    let target_dir = home
+        .join(".claude")
+        .join("projects")
+        .join(encode_claude_project_dir(target_cwd));
+    let target = target_dir.join(format!("{session_id}.jsonl"));
+    if target == source {
+        return Ok(());
+    }
+    std::fs::create_dir_all(&target_dir)
+        .map_err(|error| format!("could not create session dir: {error}"))?;
+    std::fs::copy(&source, &target)
+        .map_err(|error| format!("could not stage session transcript: {error}"))?;
+    Ok(())
 }
 
 /// The model's FINAL response text from its on-disk Claude session transcript: the

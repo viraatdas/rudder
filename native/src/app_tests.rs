@@ -5150,6 +5150,51 @@ fn branch_guards_main_orchestrator_and_sessionless_runs() {
         .contains("no resumable session"));
 }
 
+#[test]
+fn stage_claude_session_copies_the_transcript_to_the_fork_cwd() {
+    let _env = env_guard();
+    let base = unique_test_repo("stage-session");
+    let home = base.join("home");
+    let source_cwd = base.join("source-ws");
+    let target_cwd = base.join("fork-ws");
+    fs::create_dir_all(&source_cwd).unwrap();
+    fs::create_dir_all(&target_cwd).unwrap();
+    let prior_home = std::env::var_os("HOME");
+    std::env::set_var("HOME", &home);
+
+    let sid = "22222222-2222-4222-8222-222222222222";
+    let source_dir = home
+        .join(".claude")
+        .join("projects")
+        .join(encode_claude_project_dir(&source_cwd));
+    fs::create_dir_all(&source_dir).unwrap();
+    fs::write(source_dir.join(format!("{sid}.jsonl")), "{\"a\":1}\n").unwrap();
+
+    // Missing transcript fails with a readable error (no such session id).
+    let missing = stage_claude_session_for_cwd(&source_cwd, "no-such-sid", &target_cwd);
+    assert!(missing.is_err());
+
+    let staged = stage_claude_session_for_cwd(&source_cwd, sid, &target_cwd);
+    assert!(staged.is_ok(), "staging succeeds: {staged:?}");
+    let target = home
+        .join(".claude")
+        .join("projects")
+        .join(encode_claude_project_dir(&target_cwd))
+        .join(format!("{sid}.jsonl"));
+    assert!(
+        target.is_file(),
+        "the transcript is readable from the fork's cwd, so --resume finds it"
+    );
+    // The ORIGINAL transcript is untouched.
+    assert!(source_dir.join(format!("{sid}.jsonl")).is_file());
+
+    match prior_home {
+        Some(value) => std::env::set_var("HOME", value),
+        None => std::env::remove_var("HOME"),
+    }
+    let _ = fs::remove_dir_all(&base);
+}
+
 #[cfg(not(windows))]
 #[test]
 fn branch_spawns_a_new_forked_agent_row() {
@@ -5158,18 +5203,34 @@ fn branch_spawns_a_new_forked_agent_row() {
     let fake = repo.join("fake-claude.sh");
     write_fake_bin(&fake, "#!/bin/sh\nsleep 5\n");
     std::env::set_var("RUDDER_CLAUDE_BIN", &fake);
+    // Claude scopes --resume by cwd; branching requires the source transcript to
+    // exist, so give this session one under an isolated HOME.
+    let home = repo.join("home");
+    let prior_home = std::env::var_os("HOME");
+    std::env::set_var("HOME", &home);
+    let sid = "11111111-1111-4111-8111-111111111111";
+    let project_dir = home
+        .join(".claude")
+        .join("projects")
+        .join(encode_claude_project_dir(&repo));
+    fs::create_dir_all(&project_dir).expect("create fake claude project dir");
+    fs::write(project_dir.join(format!("{sid}.jsonl")), "{}\n").expect("seed transcript");
 
     let mut app = App::new();
     app.cwd = repo.clone();
     let mut source = test_agent_run("src-1", "implement the feature");
     source.task_summary = "implement the feature".to_string();
-    source.session_id = Some("11111111-1111-4111-8111-111111111111".to_string());
+    source.session_id = Some(sid.to_string());
     source.status = AgentStatus::Done;
     source.cwd = repo.clone();
     app.agents.push(source);
     app.selected_agent = 0;
 
     app.branch_selected_agent();
+    match prior_home {
+        Some(value) => std::env::set_var("HOME", value),
+        None => std::env::remove_var("HOME"),
+    }
 
     assert_eq!(app.agents.len(), 2, "a forked agent row was added");
     let fork = &app.agents[1];
