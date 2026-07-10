@@ -150,6 +150,7 @@ const AGENT_PANE_HINTS: &[&str] = &[
     "M merge all",
     "o web ui",
     "x stop",
+    "b branch",
     "dd delete",
     "cc clear merged",
     "P model",
@@ -1866,6 +1867,7 @@ impl App {
                 }
             }
             KeyCode::Char('c') => self.clear_merged_agents(),
+            KeyCode::Char('b') => self.branch_selected_agent(),
             KeyCode::Char('P') => self.open_main_model_switcher(),
             KeyCode::Char('o') => self.open_web_ui(),
             _ => {}
@@ -5444,7 +5446,7 @@ impl App {
             }
             Some("/help") => {
                 self.notice = Some(
-                    "plain input -> orchestrator/DAG · /run <task> -> one isolated mergeable worker · /ask <text> -> direct main-checkout one-off · /plan <text> -> force orchestrator/DAG · panes: Option-1/2/3 or ^W · keys: j/k select · Enter focus · v diff · m merge · M merge all · R review all · g nest · o web ui · x stop · dd delete · cc clear merged · P model — commands: /model /fast /sound /color /main /run /ask /plan /share /usage /goal /cloud /web"
+                    "plain input -> orchestrator/DAG · /run <task> -> one isolated mergeable worker · /ask <text> -> direct main-checkout one-off · /plan <text> -> force orchestrator/DAG · panes: Option-1/2/3 or ^W · keys: j/k select · Enter focus · v diff · m merge · M merge all · R review all · g nest · o web ui · x stop · b branch chat · dd delete · cc clear merged · P model — commands: /model /fast /sound /color /main /run /ask /plan /share /usage /goal /cloud /web"
                         .to_string(),
                 );
                 true
@@ -9347,6 +9349,157 @@ impl App {
                 "deleted agent from dashboard".to_string()
             }
         }));
+        let _ = self.write_rudder_context_timed(None);
+    }
+
+    /// `b` in the agents pane: BRANCH the selected agent's chat. The backend forks
+    /// the conversation (Claude: `--resume <sid> --fork-session`; Codex: `codex
+    /// fork <sid>`) into a brand-new session, so the original chat is left exactly
+    /// where it was, and the fork opens as a NEW agent row in its own jj workspace
+    /// seeded from the original's current change — the forked conversation's
+    /// memory of "the edits so far" matches the files it sees. The user then types
+    /// the new direction into the forked pane.
+    fn branch_selected_agent(&mut self) {
+        let Some(run) = self.agents.get(self.selected_agent) else {
+            self.notice = Some("no agent selected".to_string());
+            return;
+        };
+        if run.is_main() || run.is_orchestrator() {
+            self.notice = Some("branch works on worker agents, not main/orchestrator".to_string());
+            return;
+        }
+        // Codex runs only learn their session id at completion; for a live branch,
+        // fall back to the newest recorded Codex session for that workspace.
+        let session_id = run
+            .session_id
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                (run.backend == Backend::Codex)
+                    .then(|| latest_codex_session_id_for_cwd(&run.cwd))
+                    .flatten()
+            });
+        let Some(session_id) = session_id else {
+            self.notice = Some("no resumable session to branch yet".to_string());
+            return;
+        };
+
+        let source_task = run.task.clone();
+        let source_summary = if run.task_summary.trim().is_empty() {
+            summarize_task(&run.task)
+        } else {
+            run.task_summary.clone()
+        };
+        let backend = run.backend;
+        let model = run.model.clone();
+        let effort = run.effort;
+        let base_change = run.jj_change_id.clone();
+
+        let label = format!("branch: {source_summary}");
+        // Seed the fork's workspace from the source's CURRENT jj change (jj snapshots
+        // the source working copy in the process), so files match the forked memory.
+        let worktree = match prepare_jj_workspace_at(&self.cwd, &label, base_change.as_deref()) {
+            Ok(worktree) => worktree,
+            Err(error) => {
+                self.notice = Some(format!("branch failed: {error}"));
+                return;
+            }
+        };
+        if let Err(error) = self.write_rudder_context_timed(Some(&worktree)) {
+            self.notice = Some(format!("context warning: {error}"));
+        }
+
+        let mut command = match backend {
+            Backend::Claude => claude_fork_command(&model, effort, &session_id),
+            Backend::Codex => codex_fork_command(&model, effort, &session_id),
+        };
+        signals::augment_worker_command(&mut command, backend, AgentMode::Execute, &worktree.id);
+        let options = TerminalPaneOptions {
+            size: TerminalSize::default(),
+            cwd: Some(worktree.path.clone()),
+            ..TerminalPaneOptions::default()
+        };
+
+        let created_at = now_stamp();
+        let mut run = AgentRun {
+            id: worktree.id.clone(),
+            created_at: created_at.clone(),
+            mode: AgentMode::Execute,
+            task: format!("Branch of: {source_task}"),
+            task_summary: truncate_chars(&label, 56),
+            current_prompt: String::new(),
+            turns: Vec::new(),
+            last_user_input_at: created_at,
+            backend,
+            model,
+            effort,
+            status: AgentStatus::Running,
+            cwd: worktree.path.clone(),
+            worktree_branch: worktree.branch.clone(),
+            worktree_path: worktree.path_is_worktree.then_some(worktree.path.clone()),
+            workspace_name: worktree.workspace_name.clone(),
+            jj_change_id: worktree.jj_change_id.clone(),
+            // The fork mints its own fresh session id (Claude --fork-session prints
+            // it; Codex records it under the fork's cwd, discovered at completion).
+            session_id: None,
+            terminal: None,
+            terminal_size: None,
+            review_terminal: None,
+            review_size: None,
+            review_error: None,
+            last_output_at: Instant::now(),
+            completed_at: None,
+            autosteered: false,
+            interactive_orchestrator: false,
+            needs_permission: false,
+            permission_notified: false,
+            needs_user_input: false,
+            user_input_notified: false,
+            last_error: None,
+            worker_input_draft: String::new(),
+            worker_input_cursor: 0,
+            worker_input_is_prompt: false,
+            last_drain_at: None,
+            review_source_ids: Vec::new(),
+            deps: Vec::new(),
+            soft_deps: Vec::new(),
+            node_id: None,
+            reconcile_planner: false,
+            plan_stream: None,
+            last_worker_input_at: None,
+            ready_since: None,
+            merge_resolver: false,
+            merge_conflict: false,
+            merge_conflict_operation: ConflictOperation::Merge,
+            merge_conflict_files: Vec::new(),
+            had_merge_conflict: false,
+            tokens_in: 0,
+            tokens_out: 0,
+        };
+
+        match TerminalPane::spawn_shell_or_command(Some(command), options) {
+            Ok(mut terminal) => {
+                let _ = terminal.drain_output();
+                run.terminal = Some(terminal);
+                self.notice = Some(format!(
+                    "branched {source_summary}; type the new direction in the forked pane"
+                ));
+            }
+            Err(error) => {
+                run.status = AgentStatus::Failed;
+                run.last_error = Some(error.to_string());
+                self.notice = Some(format!("branch failed to start: {error}"));
+            }
+        }
+
+        self.agents.push(run);
+        self.selected_agent = self.agents.len().saturating_sub(1);
+        self.delete_pending = None;
+        self.focus = FocusPane::Worker;
+        self.worker_view = WorkerView::Terminal;
+        if let Some(run) = self.agents.get(self.selected_agent) {
+            let _ = save_native_run_record(&self.cwd, run);
+        }
         let _ = self.write_rudder_context_timed(None);
     }
 

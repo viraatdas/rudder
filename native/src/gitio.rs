@@ -1042,6 +1042,18 @@ impl WorktreeInfo {
 /// fall back to git: if the shim is unavailable or fails, this surfaces a clear
 /// error to the caller.
 pub(crate) fn prepare_jj_workspace(cwd: &Path, task: &str) -> Result<WorktreeInfo> {
+    prepare_jj_workspace_at(cwd, task, None)
+}
+
+/// Like `prepare_jj_workspace`, but when `base_change` is given the new workspace's
+/// working copy is parented on that jj change (via `__launch-node --base`), so the
+/// run starts from another run's current edits instead of the repo's default base.
+/// Used by branch/fork so the forked chat's file state matches its conversation.
+pub(crate) fn prepare_jj_workspace_at(
+    cwd: &Path,
+    task: &str,
+    base_change: Option<&str>,
+) -> Result<WorktreeInfo> {
     let repo = dashboard_root(cwd);
     if !is_git_repo(&repo) {
         return Ok(WorktreeInfo::current(cwd.to_path_buf()));
@@ -1050,14 +1062,19 @@ pub(crate) fn prepare_jj_workspace(cwd: &Path, task: &str) -> Result<WorktreeInf
     let id = new_run_id(task);
     let rudder = locate_rudder_cli()
         .context("rudder CLI not found on PATH; cannot create a jj workspace for the run")?;
-    let output = Command::new(&rudder)
+    let mut launch = Command::new(&rudder);
+    launch
         .arg("__launch-node")
         .arg("--repo")
         .arg(&repo)
         .arg("--task")
         .arg(task)
         .arg("--node")
-        .arg(&id)
+        .arg(&id);
+    if let Some(base) = base_change.map(str::trim).filter(|base| !base.is_empty()) {
+        launch.arg("--base").arg(base);
+    }
+    let output = launch
         .current_dir(&repo)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

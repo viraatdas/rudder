@@ -143,6 +143,58 @@ pub(crate) fn claude_resume_command(run: &AgentRun, session_id: &str) -> Termina
     TerminalCommand::with_args(claude_program(), args).with_env("CLAUDE_CODE_NO_FLICKER", "0")
 }
 
+/// BRANCH a Claude chat: resume the source session but `--fork-session` so the
+/// continuation gets a NEW session id and the original conversation is left
+/// exactly where it was. The forked pane opens interactive with the full prior
+/// context; the user types the new direction as its next turn.
+pub(crate) fn claude_fork_command(
+    model: &str,
+    effort: Option<EffortLevel>,
+    session_id: &str,
+) -> TerminalCommand {
+    let mut args: Vec<String> = vec![
+        "--permission-mode".to_string(),
+        "bypassPermissions".to_string(),
+    ];
+    if !model.trim().is_empty() {
+        args.push("--model".to_string());
+        args.push(model.to_string());
+    }
+    if let Some(effort) = effort {
+        args.push("--effort".to_string());
+        args.push(effort.as_str().to_string());
+    }
+    args.push("--resume".to_string());
+    args.push(session_id.to_string());
+    args.push("--fork-session".to_string());
+    TerminalCommand::with_args(claude_program(), args).with_env("CLAUDE_CODE_NO_FLICKER", "0")
+}
+
+/// BRANCH a Codex chat: `codex fork <session-id>` copies the conversation into a
+/// brand-new session (the original stays untouched) and opens it interactive.
+/// Same worker flags as `codex_resume_command`'s Execute arm — a branched run is
+/// always a worker, never a planner.
+pub(crate) fn codex_fork_command(
+    model: &str,
+    effort: Option<EffortLevel>,
+    session_id: &str,
+) -> TerminalCommand {
+    let mut args = vec![
+        "--no-alt-screen".to_string(),
+        "--enable".to_string(),
+        "goals".to_string(),
+        "--dangerously-bypass-approvals-and-sandbox".to_string(),
+    ];
+    push_codex_rudder_config_overrides(&mut args, effort);
+    if !model.trim().is_empty() {
+        args.push("-m".to_string());
+        args.push(model.to_string());
+    }
+    args.push("fork".to_string());
+    args.push(session_id.to_string());
+    TerminalCommand::with_args(codex_program(), args).with_env("CODEX_RUDDER_SCROLLBACK_SAFE", "1")
+}
+
 pub(crate) fn codex_resume_command(run: &AgentRun, session_id: &str) -> TerminalCommand {
     let mut args = Vec::new();
     match run.mode {

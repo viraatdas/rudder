@@ -4671,6 +4671,7 @@ fn agent_pane_hints_include_review_and_merge_all_shortcuts() {
     assert!(AGENT_PANE_HINTS.contains(&"R review all"));
     assert!(AGENT_PANE_HINTS.contains(&"M merge all"));
     assert!(AGENT_PANE_HINTS.contains(&"cc clear merged"));
+    assert!(AGENT_PANE_HINTS.contains(&"b branch"));
 }
 
 #[test]
@@ -5063,6 +5064,137 @@ fn resume_commands_reuse_saved_session_ids() {
         .args
         .iter()
         .any(|arg| arg == "019e297b-12fe-79e2-a8f8-33ba41e5fdd4"));
+}
+
+#[test]
+fn fork_commands_branch_the_session_without_touching_the_original() {
+    // Builds commands via claude_program()/codex_program(); serialize against
+    // bin-injecting tests.
+    let _env = env_guard();
+
+    // Claude branches by resuming WITH --fork-session (new session id minted).
+    let claude = claude_fork_command("opus", Some(EffortLevel::High), "sid-claude");
+    assert_eq!(claude.program, "claude");
+    assert!(claude
+        .args
+        .windows(2)
+        .any(|w| w[0] == "--resume" && w[1] == "sid-claude"));
+    assert!(
+        claude.args.iter().any(|arg| arg == "--fork-session"),
+        "--fork-session is what keeps the ORIGINAL session untouched"
+    );
+    assert!(claude
+        .args
+        .windows(2)
+        .any(|w| w[0] == "--model" && w[1] == "opus"));
+
+    // Codex has a first-class fork subcommand.
+    let codex = codex_fork_command("gpt-test", None, "sid-codex");
+    assert_eq!(codex.program, "codex");
+    assert!(codex
+        .args
+        .windows(2)
+        .any(|w| w[0] == "fork" && w[1] == "sid-codex"));
+    assert!(
+        !codex.args.iter().any(|arg| arg == "resume"),
+        "fork must not resume in place"
+    );
+    assert!(codex
+        .args
+        .windows(2)
+        .any(|w| w[0] == "-m" && w[1] == "gpt-test"));
+    // Same worker profile as a normal Execute run.
+    assert!(codex
+        .args
+        .iter()
+        .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox"));
+}
+
+#[test]
+fn branch_guards_main_orchestrator_and_sessionless_runs() {
+    let mut app = App::new();
+
+    // Main agent: refused.
+    let mut main = test_agent_run(MAIN_AGENT_ID, "main branch");
+    main.mode = AgentMode::Main;
+    app.agents.push(main);
+    app.selected_agent = 0;
+    app.branch_selected_agent();
+    assert_eq!(app.agents.len(), 1, "no fork row was created for main");
+    assert!(app
+        .notice
+        .as_deref()
+        .unwrap_or_default()
+        .contains("branch works on worker agents"));
+
+    // Orchestrator: refused.
+    app.agents.push(planner_run("orch-1", false));
+    app.selected_agent = 1;
+    app.branch_selected_agent();
+    assert_eq!(
+        app.agents.len(),
+        2,
+        "no fork row was created for the planner"
+    );
+
+    // Claude worker with NO session id: nothing to fork yet.
+    let worker = test_agent_run("w-1", "some work");
+    app.agents.push(worker);
+    app.selected_agent = 2;
+    app.branch_selected_agent();
+    assert_eq!(app.agents.len(), 3, "no fork row without a session");
+    assert!(app
+        .notice
+        .as_deref()
+        .unwrap_or_default()
+        .contains("no resumable session"));
+}
+
+#[cfg(not(windows))]
+#[test]
+fn branch_spawns_a_new_forked_agent_row() {
+    let _env = env_guard();
+    let repo = unique_test_repo("branch-fork");
+    let fake = repo.join("fake-claude.sh");
+    write_fake_bin(&fake, "#!/bin/sh\nsleep 5\n");
+    std::env::set_var("RUDDER_CLAUDE_BIN", &fake);
+
+    let mut app = App::new();
+    app.cwd = repo.clone();
+    let mut source = test_agent_run("src-1", "implement the feature");
+    source.task_summary = "implement the feature".to_string();
+    source.session_id = Some("11111111-1111-4111-8111-111111111111".to_string());
+    source.status = AgentStatus::Done;
+    source.cwd = repo.clone();
+    app.agents.push(source);
+    app.selected_agent = 0;
+
+    app.branch_selected_agent();
+
+    assert_eq!(app.agents.len(), 2, "a forked agent row was added");
+    let fork = &app.agents[1];
+    assert_eq!(fork.mode, AgentMode::Execute);
+    assert!(fork.task.starts_with("Branch of: "));
+    assert!(fork.task_summary.starts_with("branch: "));
+    assert_eq!(fork.backend, Backend::Claude);
+    assert_eq!(fork.status, AgentStatus::Running);
+    assert!(
+        fork.session_id.is_none(),
+        "the fork mints its own session id; it must NOT reuse the source's"
+    );
+    // The ORIGINAL run is untouched.
+    let source = &app.agents[0];
+    assert_eq!(source.status, AgentStatus::Done);
+    assert_eq!(
+        source.session_id.as_deref(),
+        Some("11111111-1111-4111-8111-111111111111")
+    );
+    // The fork is selected and focused so the user can type the new direction.
+    assert_eq!(app.selected_agent, 1);
+    assert_eq!(app.focus, FocusPane::Worker);
+
+    std::env::remove_var("RUDDER_CLAUDE_BIN");
+    let _ = fs::remove_dir_all(&repo);
 }
 
 #[cfg(not(windows))]
