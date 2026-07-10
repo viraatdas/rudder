@@ -671,6 +671,11 @@ struct App {
     migration_resumes_attempted: bool,
     rename_input: Option<String>,
     rename_cursor: usize,
+    /// True while the rename box still holds the untouched current name as a
+    /// preview: the first typed character wipes it so the user retypes from
+    /// scratch (Finder-style "prefill is selected"). Any edit/nav key instead
+    /// keeps the name and clears this, so editing-in-place still works.
+    rename_prefilled: bool,
     diff_summary_cache: HashMap<String, (Instant, Option<String>)>,
     dirty: bool,
     last_tab_emoji: Option<char>,
@@ -1257,6 +1262,7 @@ impl App {
             migration_resumes_attempted: false,
             rename_input: None,
             rename_cursor: 0,
+            rename_prefilled: false,
             diff_summary_cache: HashMap::new(),
             dirty: true,
             last_tab_emoji: None,
@@ -4953,11 +4959,15 @@ impl App {
         };
         self.rename_cursor = current.chars().count();
         self.rename_input = Some(current);
+        // Show the current name as a selected-style preview; the first typed
+        // character clears it and the user retypes from the first character.
+        self.rename_prefilled = true;
     }
 
     fn cancel_rename(&mut self) {
         self.rename_input = None;
         self.rename_cursor = 0;
+        self.rename_prefilled = false;
     }
 
     fn commit_rename(&mut self) {
@@ -4965,6 +4975,7 @@ impl App {
             return;
         };
         self.rename_cursor = 0;
+        self.rename_prefilled = false;
         let trimmed = new_name.trim();
         let Some(run) = self.agents.get_mut(self.selected_agent) else {
             return;
@@ -4992,6 +5003,8 @@ impl App {
                 return true;
             }
             KeyCode::Backspace => {
+                // Editing the prefilled name keeps it (only a typed char wipes it).
+                self.rename_prefilled = false;
                 if self.rename_cursor > 0 {
                     let chars: Vec<char> = input.chars().collect();
                     let new_cursor = self.rename_cursor - 1;
@@ -5006,19 +5019,34 @@ impl App {
                 }
             }
             KeyCode::Left => {
+                self.rename_prefilled = false;
                 if self.rename_cursor > 0 {
                     self.rename_cursor -= 1;
                 }
             }
             KeyCode::Right => {
+                self.rename_prefilled = false;
                 let len = input.chars().count();
                 if self.rename_cursor < len {
                     self.rename_cursor += 1;
                 }
             }
-            KeyCode::Home => self.rename_cursor = 0,
-            KeyCode::End => self.rename_cursor = input.chars().count(),
+            KeyCode::Home => {
+                self.rename_prefilled = false;
+                self.rename_cursor = 0;
+            }
+            KeyCode::End => {
+                self.rename_prefilled = false;
+                self.rename_cursor = input.chars().count();
+            }
             KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                // First keystroke on the untouched preview clears it so the user
+                // types the new name from the first character.
+                if self.rename_prefilled {
+                    input.clear();
+                    self.rename_cursor = 0;
+                    self.rename_prefilled = false;
+                }
                 let chars: Vec<char> = input.chars().collect();
                 let mut next = String::new();
                 for (i, c) in chars.iter().enumerate() {

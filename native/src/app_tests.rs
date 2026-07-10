@@ -5854,6 +5854,78 @@ fn main_agent_blocks_delete_merge_and_rename() {
         .contains("main agent"));
 }
 
+fn type_rename_char(app: &mut App, ch: char) {
+    app.handle_rename_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::empty()));
+}
+
+#[test]
+fn rename_first_keystroke_clears_the_prefilled_name() {
+    let mut app = App::new();
+    let mut run = test_agent_run("a1", "old task name");
+    run.task_summary = "old name".to_string();
+    app.agents.push(run);
+    app.selected_agent = 0;
+
+    app.start_rename_selected_agent();
+    // Box opens prefilled with the current name as a preview.
+    assert_eq!(app.rename_input.as_deref(), Some("old name"));
+    assert!(app.rename_prefilled, "the preview starts selected/pristine");
+
+    // The first typed character wipes the preview and starts from char one.
+    type_rename_char(&mut app, 'x');
+    assert_eq!(app.rename_input.as_deref(), Some("x"));
+    assert_eq!(app.rename_cursor, 1);
+    assert!(!app.rename_prefilled, "no longer pristine after typing");
+
+    type_rename_char(&mut app, 'y');
+    assert_eq!(
+        app.rename_input.as_deref(),
+        Some("xy"),
+        "subsequent chars append"
+    );
+
+    app.commit_rename();
+    assert_eq!(app.agents[0].task_summary, "xy");
+}
+
+#[test]
+fn rename_backspace_edits_the_prefilled_name_in_place() {
+    let mut app = App::new();
+    let mut run = test_agent_run("a1", "old task name");
+    run.task_summary = "hello".to_string();
+    app.agents.push(run);
+    app.selected_agent = 0;
+
+    app.start_rename_selected_agent();
+    // Backspace means "edit this name", not "retype from scratch": the name
+    // survives and only the last character is removed.
+    app.handle_rename_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::empty()));
+    assert_eq!(app.rename_input.as_deref(), Some("hell"));
+    assert!(!app.rename_prefilled);
+
+    // A char now appends to the edited name rather than wiping it.
+    type_rename_char(&mut app, 'p');
+    assert_eq!(app.rename_input.as_deref(), Some("hellp"));
+}
+
+#[test]
+fn rename_arrow_key_keeps_the_prefilled_name_for_in_place_edit() {
+    let mut app = App::new();
+    let mut run = test_agent_run("a1", "old task name");
+    run.task_summary = "abc".to_string();
+    app.agents.push(run);
+    app.selected_agent = 0;
+
+    app.start_rename_selected_agent();
+    // Moving the cursor is an edit gesture: the name stays and the next char
+    // inserts at the cursor instead of clearing everything.
+    app.handle_rename_key(KeyEvent::new(KeyCode::Home, KeyModifiers::empty()));
+    assert!(!app.rename_prefilled);
+    assert_eq!(app.rename_cursor, 0);
+    type_rename_char(&mut app, 'Z');
+    assert_eq!(app.rename_input.as_deref(), Some("Zabc"));
+}
+
 #[test]
 fn merge_cleanup_preserves_main_agent() {
     let mut app = App::new();
