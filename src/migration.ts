@@ -127,7 +127,9 @@ async function classify(record: RunRecord): Promise<MigrationCandidate | null> {
     return null;
   }
   const worktreePath = record.worktree?.path;
-  if (!worktreePath) {
+  // Main/orchestrator/cloud-command records point at the repo root even though
+  // they are not isolated workers. Only migrate real workspaces.
+  if (!record.worktree?.enabled || !worktreePath) {
     return null;
   }
   const worktreeExists = await pathExists(worktreePath);

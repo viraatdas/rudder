@@ -313,6 +313,7 @@ rudder cloud                 # onload the current workspace or start a worker
 rudder cloud list            # list cloud workers
 rudder cloud logs <id>       # worker status
 rudder cloud onload [runId]  # upload the current workspace (or one run)
+rudder cloud workspace attach # migrate all live isolated agents into one cloud workspace
 rudder sail <name>           # short alias for starting a cloud worker
 ```
 
@@ -326,6 +327,15 @@ Cloud comes in two shapes: a **sail** is an ephemeral, task-scoped worker (it go
 when the task is done; idle sails pause and can resume), while a **workspace** is a
 persistent, volume-backed dev environment you can come back to. Both restore the same
 workspace snapshot.
+
+You can also tell the live orchestrator: "take the current agents and run them on
+Rudder Cloud." Rudder freezes the local worker PTYs first, then migrates every live
+isolated workspace. Claude sessions resume from their transcript when available;
+Codex and missing-session workers restart from a context-rich handoff over the existing
+diff. The explicit fleet-migration snapshot includes all inherited environment variables
+(except OS/Rudder control variables),
+agent auth/config, shell and cloud CLI configuration, and project `.env*` files (including
+nested package dotenv files) in each restored worker workspace.
 
 Cloud workers use Fly Machines by default. To use your own server over SSH (Docker over
 SSH; bring-your-own-compute can be stopped but not paused/resumed):

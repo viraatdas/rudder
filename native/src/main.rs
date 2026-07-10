@@ -6035,6 +6035,7 @@ impl App {
             "list",
             "ls",
             "onload",
+            "workspace",
             "sail",
             "launch",
             "pause",
@@ -6064,6 +6065,123 @@ impl App {
 
     fn cloud_command_args_with_fly(&self, args: &[&str]) -> Vec<String> {
         self.cloud_command_args(args.to_vec())
+    }
+
+    fn migrate_current_agents_to_cloud(&mut self) {
+        let indices = self
+            .agents
+            .iter()
+            .enumerate()
+            .filter(|(_, run)| {
+                run.status == AgentStatus::Running
+                    && run.has_merge_source()
+                    && !run.is_orchestrator()
+                    && !run.is_main()
+                    && !run.is_oneoff()
+                    && !is_cloud_agent(run)
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if indices.is_empty() {
+            self.notice = Some("no live isolated agents to migrate to Rudder Cloud".to_string());
+            return;
+        }
+
+        let mut labels = Vec::new();
+        let mut run_ids = Vec::new();
+        for index in indices {
+            let run = &mut self.agents[index];
+            if run.backend == Backend::Codex
+                && run
+                    .session_id
+                    .as_deref()
+                    .is_none_or(|session| session.trim().is_empty())
+            {
+                run.session_id = latest_codex_session_id_for_cwd(&run.cwd);
+            }
+            run.terminal = None;
+            run.review_terminal = None;
+            run.needs_permission = false;
+            run.permission_notified = false;
+            run.needs_user_input = false;
+            run.user_input_notified = false;
+            // Keep the record nonterminal. The cloud migration planner selects
+            // running workspaces and the cloud dashboard resumes from this state.
+            run.status = AgentStatus::Running;
+            labels.push(run.node_id.clone().unwrap_or_else(|| run.id.clone()));
+            run_ids.push(run.id.clone());
+            let _ = save_native_run_record(&self.cwd, run);
+        }
+
+        let count = labels.len();
+        self.push_activity(format!(
+            "cloud migration: paused {count} agent(s) ({})",
+            labels.join(", ")
+        ));
+        let cloud_label = format!("cloud migrate {count} agents");
+        self.start_rudder_cli_command(
+            &cloud_label,
+            vec![
+                "cloud".to_string(),
+                "workspace".to_string(),
+                "attach".to_string(),
+            ],
+        );
+        if let Some(cloud_run) = self.agents.last_mut() {
+            if cloud_run.task == cloud_label {
+                cloud_run.review_source_ids = run_ids;
+            }
+        }
+        if self
+            .agents
+            .last()
+            .is_some_and(|run| run.task == cloud_label && run.status == AgentStatus::Failed)
+        {
+            self.restore_running_agents();
+            self.notice = Some("cloud migration failed to start; local agents resumed".to_string());
+            return;
+        }
+        self.notice = Some(format!(
+            "migrating {count} agent(s) to Rudder Cloud with workspaces, sessions, auth, and project environment"
+        ));
+        let _ = self.write_rudder_context_timed(None);
+    }
+
+    fn recover_failed_cloud_migrations(&mut self) {
+        let failed = self
+            .agents
+            .iter_mut()
+            .filter(|run| {
+                run.status == AgentStatus::Failed
+                    && run.task.starts_with("cloud migrate ")
+                    && !run.review_source_ids.is_empty()
+            })
+            .flat_map(|run| std::mem::take(&mut run.review_source_ids))
+            .collect::<Vec<_>>();
+        if failed.is_empty() {
+            return;
+        }
+        let mut resumed = 0usize;
+        for run_id in failed {
+            let Some(index) = self.agents.iter().position(|run| run.id == run_id) else {
+                continue;
+            };
+            let entry = MigratedAgent {
+                run_id: run_id.clone(),
+                session_id: self.agents[index].session_id.clone().unwrap_or_default(),
+                worktree_path: self.agents[index].cwd.clone(),
+                fresh_prompt: Some(format!(
+                    "Cloud migration failed. Continue the original task locally from the existing workspace: {}",
+                    self.agents[index].task
+                )),
+            };
+            if self.spawn_claude_resume_for(index, &entry) {
+                resumed += 1;
+            }
+        }
+        self.notice = Some(format!(
+            "cloud migration failed; resumed {resumed} local agent(s)"
+        ));
     }
 
     fn start_rudder_cli_command(&mut self, label: &str, args: Vec<String>) {
@@ -6531,6 +6649,10 @@ impl App {
     }
 
     fn handle_orchestrator_skill_marker(&mut self, marker: &str) {
+        if marker == "RUDDER_CLOUD_MIGRATE" {
+            self.migrate_current_agents_to_cloud();
+            return;
+        }
         if let Some(rest) = marker.strip_prefix("RUDDER_MODEL") {
             let rest = rest.trim();
             if rest.is_empty() {
@@ -11295,6 +11417,8 @@ What to do\n\
             }
         }
 
+        self.recover_failed_cloud_migrations();
+
         // The INITIAL planner run is KEPT as the pinned orchestrator (no removal),
         // so its index stays stable. A RECONCILE planner is transient and removed by
         // the APPEND path. Process highest-index first so a reconcile removal never
@@ -12166,6 +12290,7 @@ fn is_orchestrator_skill_marker(line: &str) -> bool {
         "RUDDER_HELP",
         "RUDDER_LOGIN",
         "RUDDER_CLOUD",
+        "RUDDER_CLOUD_MIGRATE",
         "RUDDER_REVIEW_ALL",
         "RUDDER_MERGE_ALL",
         "RUDDER_MERGE",

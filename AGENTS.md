@@ -520,12 +520,19 @@ workspaces. Worker-to-control-plane auth uses a separate `RUDDER_WORKER_TOKEN`
 `createSnapshot` stages the repo (via `git ls-files`) + a small set of HOME paths +
 metadata, packaged as a `.tgz` (`repo/`, `home/`, `env/cloud-env.json`,
 `manifest.json`) and stored to S3 at `snapshots/{accountId}/{date}/{uuid}.tgz`
-(AES256, 1-hour presigned URLs). It deliberately EXCLUDES secrets and bulk: `.ssh`,
-`.gnupg`, keychains, `.env*`, key files, and `.cache`/`node_modules`/worktrees. On
+(AES256, 1-hour presigned URLs). Ordinary snapshots deliberately EXCLUDE secrets and
+bulk: `.ssh`, `.gnupg`, keychains, `.env*`, key files, and
+`.cache`/`node_modules`/worktrees. Explicit multi-agent `cloud workspace attach`
+migration is the exception for project `.env*` files: it copies repo and nested-package
+dotenv files into the staged repo and every migrated worker workspace. On
 macOS it extracts Claude OAuth tokens from the Keychain into `.claude/.credentials.json`
 so the worker can authenticate. Env capture is allow-listed (`*_API_KEY`/`*_TOKEN`/
 `*_SECRET` plus `RUDDER_CLOUD_ENV_VARS`) and excludes `PATH`/`HOME`/`USER`/shell/Rudder
 internals.
+Explicit multi-agent migration calls `captureCloudEnv(true)`, which captures every inherited
+process variable except the blocklist; ordinary snapshots retain the credential/suffix
+allowlist. Variables exported only inside a child agent PTY cannot flow back to the parent,
+so the dotenv overlay is the durable source for those project-specific values.
 
 ### 9.5 Control plane (`cloud/src/server.ts`)
 A plain Node `http` server (no framework). Dependencies: `better-auth` +
@@ -925,7 +932,10 @@ The planner UX went through several iterations; these are the settled decisions 
   markers consumed from `RUDDER.md`. Marker controls include add/replan (`RUDDER_ADD_TASK`,
   `RUDDER_REPLAN`), per-worker control (`RUDDER_MERGE`, `RUDDER_STOP`, `RUDDER_RESUME`,
   `RUDDER_REGOAL`, `RUDDER_INJECT`), and broad actions (`RUDDER_REVIEW_ALL`, `RUDDER_MERGE_ALL`,
-  `RUDDER_AUTOMERGE`).
+  `RUDDER_AUTOMERGE`, `RUDDER_CLOUD_MIGRATE`). `RUDDER_CLOUD_MIGRATE` freezes live
+  isolated worker PTYs while leaving their records `running`, then launches `rudder cloud
+  workspace attach`; this avoids local/cloud duplicate execution and keeps the records
+  eligible for `findMigrationCandidates`.
 
   `RUDDER_RESUME <node-or-run-id> <claude|codex> <model> [effort] [direction]` is the
   provider/model-aware continuation primitive. It preserves the run's jj workspace and

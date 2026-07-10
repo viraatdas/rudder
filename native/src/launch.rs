@@ -84,8 +84,8 @@ const ORCHESTRATOR_SKILLS: &[OrchestratorSkill] = &[
     OrchestratorSkill {
         slug: "rudder-cloud",
         name: "rudder-cloud",
-        description: "Use when the user asks for Rudder Cloud login, list, onload, byoc, or other cloud actions.",
-        body: "For login, write RUDDER_LOGIN on its own line in RUDDER.md. For other cloud actions, write RUDDER_CLOUD <args> on one line, for example RUDDER_CLOUD list or RUDDER_CLOUD onload. Rudder consumes the marker and starts the corresponding Rudder Cloud command pane.",
+        description: "Use when the user asks for Rudder Cloud login, list, migration of current agents, onload, byoc, or other cloud actions.",
+        body: "Read RUDDER.md first. When the user asks to take, move, migrate, or run the CURRENT/ACTIVE AGENTS on Rudder Cloud, write RUDDER_CLOUD_MIGRATE on its own line. That action freezes every live isolated worker, snapshots its workspace/session/project environment, and resumes the fleet in one cloud workspace; do not use onload for this because onload transfers only one selected run. For login, write RUDDER_LOGIN. For other cloud actions, write RUDDER_CLOUD <args>, for example RUDDER_CLOUD list. Rudder consumes the marker and starts the corresponding Rudder Cloud command pane.",
     },
     OrchestratorSkill {
         slug: "rudder-monitor-work",

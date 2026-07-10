@@ -80,6 +80,7 @@ type SnapshotManifest = {
   };
   migratedAgents?: number;
   capturedEnvVars?: number;
+  projectEnvFiles?: number;
 };
 
 type SnapshotOptions = {
@@ -1282,6 +1283,9 @@ async function createSnapshot(repoRoot: string, requestedHomePaths: string[], op
   const homeStage = path.join(stageDir, "home");
   await ensureDir(repoStage);
   await copyRepoFiles(repoRoot, repoStage);
+  const projectEnvFiles = options.migration
+    ? await copyProjectEnvFiles(repoRoot, repoStage)
+    : 0;
   const rudderState = options.includeRudderState ? await copyRudderState(repoRoot, repoStage) : undefined;
 
   const homePaths = normalizeHomePaths(requestedHomePaths);
@@ -1301,7 +1305,7 @@ async function createSnapshot(repoRoot: string, requestedHomePaths: string[], op
     includedHomePaths.push("~/.claude/.credentials.json (keychain)");
   }
 
-  const capturedEnv = captureCloudEnv();
+  const capturedEnv = captureCloudEnv(Boolean(options.migration));
   let capturedEnvCount = 0;
   if (Object.keys(capturedEnv).length > 0) {
     await ensureDir(path.join(stageDir, "env"));
@@ -1338,6 +1342,7 @@ async function createSnapshot(repoRoot: string, requestedHomePaths: string[], op
     ...(rudderState ? { rudderState } : {}),
     ...(migratedAgentsCount > 0 ? { migratedAgents: migratedAgentsCount } : {}),
     ...(capturedEnvCount > 0 ? { capturedEnvVars: capturedEnvCount } : {}),
+    ...(projectEnvFiles > 0 ? { projectEnvFiles } : {}),
   };
   await writeJson(path.join(stageDir, "manifest.json"), manifest);
 
@@ -1401,13 +1406,15 @@ const CLOUD_ENV_BLOCKLIST = new Set([
   "RUDDER_CLOUD_URL",
   "RUDDER_SNAPSHOT_URL",
   "RUDDER_CLOUD_TOKEN",
+  "RUDDER_CLOUD_ENV_VARS",
+  "RUDDER_CLOUD_ENV_BLOCKLIST",
   "RUDDER_TASK",
   "RUDDER_REPO_NAME",
   "RUDDER_ACCOUNT_ID",
   "RUDDER_HANDOFF_PATH",
 ]);
 
-function captureCloudEnv(): Record<string, string> {
+export function captureCloudEnv(includeAll = false): Record<string, string> {
   const extra = (process.env.RUDDER_CLOUD_ENV_VARS || "")
     .split(",")
     .map((name) => name.trim())
@@ -1425,7 +1432,8 @@ function captureCloudEnv(): Record<string, string> {
     if (blocked.has(name)) {
       continue;
     }
-    const matches = CLOUD_ENV_DEFAULT_NAMES.has(name)
+    const matches = includeAll
+      || CLOUD_ENV_DEFAULT_NAMES.has(name)
       || CLOUD_ENV_SUFFIX_PATTERNS.some((pattern) => pattern.test(name))
       || extra.includes(name);
     if (!matches) {
@@ -1457,6 +1465,12 @@ async function stageMigratedAgents(
     const worktreeDest = path.join(worktreesStage, candidate.runId);
     await ensureDir(worktreeDest);
     await copyWorktreeFiles(candidate.worktreePath, worktreeDest, repoRoot);
+    await copyProjectEnvFiles(candidate.worktreePath, worktreeDest);
+    if (path.resolve(candidate.worktreePath) !== path.resolve(repoRoot)) {
+      // Ignored dotenv files do not normally exist in a jj workspace. Overlay
+      // the source repo's project environment into every migrated worker.
+      await copyProjectEnvFiles(repoRoot, worktreeDest);
+    }
     let sessionJsonlSnapshotPath: string | undefined;
     if (hasSession) {
       const jsonlDest = path.join(sessionsStage, `${candidate.runId}.jsonl`);
@@ -1514,6 +1528,41 @@ async function copyWorktreeFiles(worktreePath: string, target: string, _repoRoot
     await ensureDir(path.dirname(dest));
     await fsp.cp(source, dest, { dereference: false, force: true });
   }
+}
+
+/** Copy project dotenv files only for explicit multi-agent workspace migration. */
+export async function copyProjectEnvFiles(sourceRoot: string, targetRoot: string): Promise<number> {
+  let copied = 0;
+  const ignoredDirs = new Set([".git", ".jj", ".rudder", ".rudder-worktrees", "node_modules"]);
+  async function walk(current: string): Promise<void> {
+    const entries = await fsp.readdir(current, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      if (entry.isDirectory()) {
+        if (!ignoredDirs.has(entry.name)) {
+          await walk(path.join(current, entry.name));
+        }
+        continue;
+      }
+      if (!entry.isFile() || !/^\.env(?:\..+)?$/.test(entry.name)) {
+        continue;
+      }
+      const source = path.join(current, entry.name);
+      const relative = path.relative(sourceRoot, source);
+      const target = path.join(targetRoot, relative);
+      if (!isInside(sourceRoot, source) || !isInside(targetRoot, target)) {
+        continue;
+      }
+      const stat = await fsp.stat(source).catch(() => null);
+      if (!stat || stat.size > MAX_HOME_SECRET_SCAN_BYTES) {
+        continue;
+      }
+      await ensureDir(path.dirname(target));
+      await fsp.cp(source, target, { force: true });
+      copied += 1;
+    }
+  }
+  await walk(sourceRoot);
+  return copied;
 }
 
 async function copyRudderState(repoRoot: string, repoStage: string): Promise<{ runs: number; files: string[] }> {
@@ -1671,6 +1720,7 @@ async function shouldIncludeSnapshotPath(candidate: string): Promise<boolean> {
   const normalized = path.resolve(candidate);
   const parts = normalized.split(path.sep).map((part) => part.toLowerCase());
   const basename = path.basename(normalized).toLowerCase();
+  const explicitAwsCredentials = normalized === path.join(os.homedir(), ".aws", "credentials");
   if (basename.startsWith("._")) {
     return false;
   }
@@ -1687,6 +1737,9 @@ async function shouldIncludeSnapshotPath(candidate: string): Promise<boolean> {
   }
   const stat = await fsp.lstat(normalized).catch(() => null);
   if (!stat || !stat.isFile() || stat.size > MAX_HOME_SECRET_SCAN_BYTES) {
+    return true;
+  }
+  if (explicitAwsCredentials) {
     return true;
   }
   const text = await fsp.readFile(normalized, "utf8").catch(() => "");

@@ -3541,6 +3541,18 @@ fn cloud_command_defaults_to_generated_cloud_worker() {
         vec!["cloud".to_string(), "list".to_string()]
     );
     assert_eq!(
+        app.cloud_command_args(vec!["workspace", "attach"]),
+        vec![
+            "cloud".to_string(),
+            "workspace".to_string(),
+            "attach".to_string()
+        ]
+    );
+    assert!(
+        !cloud_args_start_worker(&["workspace", "attach"]),
+        "workspace migration bypasses the scratch/onload launch modal"
+    );
+    assert_eq!(
         app.cloud_command_args(vec!["visualization"]),
         vec!["cloud".to_string(), "visualization".to_string()]
     );
@@ -3665,6 +3677,74 @@ fn cloud_prompt_upload_without_selected_run_is_not_scratch() {
             args: vec!["cloud".to_string(), "onload".to_string()],
         })
     );
+}
+
+#[cfg(not(windows))]
+#[test]
+fn cloud_fleet_migration_quiesces_only_live_isolated_workers() {
+    let _env = env_guard();
+    let repo = unique_test_repo("cloud-fleet-migrate");
+    let worktree = repo.join("worker");
+    fs::create_dir_all(&worktree).unwrap();
+    let fake_rudder = repo.join("rudder");
+    write_fake_bin(&fake_rudder, "#!/bin/sh\nsleep 5\n");
+    let old_path = std::env::var_os("PATH").unwrap_or_default();
+    let path =
+        std::env::join_paths(std::iter::once(repo.clone()).chain(std::env::split_paths(&old_path)))
+            .unwrap();
+    std::env::set_var("PATH", path);
+
+    let mut app = App::new();
+    app.cwd = repo.clone();
+    let mut orchestrator = test_agent_run("orch", "coordinate");
+    orchestrator.mode = AgentMode::RudderPlan;
+    orchestrator.interactive_orchestrator = true;
+    app.agents.push(orchestrator);
+
+    let terminal = TerminalPane::spawn_shell_or_command(
+        Some(TerminalCommand::with_args("/bin/sh", ["-lc", "sleep 5"])),
+        TerminalPaneOptions::default(),
+    )
+    .expect("spawn worker terminal");
+    let mut worker = test_agent_run_with_terminal(&app, terminal);
+    worker.id = "worker-1".to_string();
+    worker.node_id = Some("n0".to_string());
+    worker.cwd = worktree.clone();
+    worker.worktree_path = Some(worktree);
+    worker.workspace_name = Some("rudder-worker-1".to_string());
+    app.agents.push(worker);
+
+    app.migrate_current_agents_to_cloud();
+
+    let worker = app.agents.iter().find(|run| run.id == "worker-1").unwrap();
+    assert!(
+        worker.terminal.is_none(),
+        "local PTY is frozen before snapshot"
+    );
+    assert_eq!(
+        worker.status,
+        AgentStatus::Running,
+        "record remains migratable"
+    );
+    let orchestrator = app.agents.iter().find(|run| run.id == "orch").unwrap();
+    assert_eq!(orchestrator.status, AgentStatus::Running);
+    let cloud = app.agents.last().expect("cloud migration command row");
+    assert!(cloud.task.contains("cloud migrate 1 agents"));
+    assert!(cloud.terminal.is_some());
+    let record: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(native_run_dir(&repo, "worker-1").join("run.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        record.get("status").and_then(|value| value.as_str()),
+        Some("running")
+    );
+
+    for run in &mut app.agents {
+        run.terminal = None;
+    }
+    std::env::set_var("PATH", old_path);
+    let _ = fs::remove_dir_all(repo);
 }
 
 #[test]
@@ -8105,6 +8185,7 @@ fn orchestrator_prompts_include_global_monitoring_contract() {
     assert!(claude_prompt.contains("RUDDER_REVIEW_ALL"));
     assert!(claude_prompt.contains("RUDDER_RUN <task>"));
     assert!(claude_prompt.contains("RUDDER_RESUME <node-or-run-id>"));
+    assert!(claude_prompt.contains("RUDDER_CLOUD_MIGRATE"));
     assert!(claude_prompt.contains("RUDDER_MAIN <prompt>"));
 
     let codex_prompt = codex_orchestrator_prompt("monitor the current threads");
@@ -8115,6 +8196,7 @@ fn orchestrator_prompts_include_global_monitoring_contract() {
     assert!(codex_prompt.contains("Active as live or waiting only"));
     assert!(codex_prompt.contains("RUDDER_RUN <task>"));
     assert!(codex_prompt.contains("RUDDER_RESUME <node-or-run-id>"));
+    assert!(codex_prompt.contains("RUDDER_CLOUD_MIGRATE"));
     assert!(codex_prompt.contains("monitor the current threads"));
 }
 

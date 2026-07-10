@@ -176,7 +176,7 @@ pub(crate) fn cloud_args_start_worker(args: &[&str]) -> bool {
         Some(
             "help" | "login" | "list" | "ls" | "status" | "runtime" | "setup" | "setup-byoc"
             | "setup-vm" | "setup-fly" | "bootstrap" | "pause" | "resume" | "stop" | "logs"
-            | "onload" | "byoc" | "vm" | "byo-vm",
+            | "onload" | "workspace" | "byoc" | "vm" | "byo-vm",
         ) => false,
         Some(_) => true,
     }
@@ -191,6 +191,10 @@ pub(crate) fn cloud_agent_label(args: &[String]) -> String {
             .get(2)
             .map(|id| format!("cloud onload {id}"))
             .unwrap_or_else(|| "cloud onload".to_string()),
+        Some("workspace") => match args.get(2).map(String::as_str) {
+            Some("attach") | None => "cloud migrate agents".to_string(),
+            Some(action) => format!("cloud workspace {action}"),
+        },
         Some("launch") => "cloud launch".to_string(),
         Some("pause" | "resume" | "stop" | "status" | "logs") => args
             .get(2)
