@@ -140,9 +140,13 @@ export async function postSlackMessage(params: {
 export type SlackCommand =
   | { action: "list" }
   | { action: "help" }
+  | { action: "repos" }
+  | { action: "launch"; repo: string; task: string }
   | { action: "talk"; id: string; message: string }
   | { action: "output"; id: string }
   | { action: "stop"; id: string }
+  | { action: "pause"; id: string }
+  | { action: "resume"; id: string }
   | { action: "thread-reply"; message: string };
 
 // Parse an @mention / slash-command body into an instruction. Bot user mentions
@@ -160,6 +164,16 @@ export function parseSlackCommand(rawText: string, opts: { inThread: boolean }):
   if (lower === "help" || lower === "?") {
     return { action: "help" };
   }
+  if (lower === "repos" || lower === "repositories" || lower === "snapshots") {
+    return { action: "repos" };
+  }
+  // `launch <repo> <task…>` — start a brand-new cloud agent from the repo's most
+  // recent snapshot. Matched before the generic id-first fallback so `run rudder
+  // fix the tests` never reads "rudder" as an instance id.
+  const launchMatch = text.match(/^(?:launch|run|start)\s+(\S+)\s+([\s\S]+)$/i);
+  if (launchMatch) {
+    return { action: "launch", repo: launchMatch[1], task: launchMatch[2].trim() };
+  }
   const talkMatch = text.match(/^(?:talk|tell|send|msg)\s+(\S+)\s+([\s\S]+)$/i);
   if (talkMatch) {
     return { action: "talk", id: talkMatch[1], message: talkMatch[2].trim() };
@@ -171,6 +185,14 @@ export function parseSlackCommand(rawText: string, opts: { inThread: boolean }):
   const stopMatch = text.match(/^(?:stop|kill|cancel)\s+(\S+)$/i);
   if (stopMatch) {
     return { action: "stop", id: stopMatch[1] };
+  }
+  const pauseMatch = text.match(/^pause\s+(\S+)$/i);
+  if (pauseMatch) {
+    return { action: "pause", id: pauseMatch[1] };
+  }
+  const resumeMatch = text.match(/^(?:resume|wake)\s+(\S+)$/i);
+  if (resumeMatch) {
+    return { action: "resume", id: resumeMatch[1] };
   }
   // `@rudder cloud-foo do the thing` — first token is an instance id.
   const idFirst = text.match(/^(cloud-[a-z0-9-]+|[a-z0-9]{6,})\s+([\s\S]+)$/i);
@@ -187,11 +209,17 @@ export const SLACK_HELP_TEXT = [
   "*Rudder Cloud* — talk to your cloud agents right here.",
   "",
   "• Reply in an instance's thread to send a message to that agent.",
+  "• `launch <repo> <task>` — start a new cloud agent from the repo's latest snapshot",
+  "• `repos` — show repos with a snapshot ready to launch from",
   "• `list` — show running cloud instances",
   "• `talk <id> <message>` — send a message to an instance",
   "• `output <id>` — show an instance's latest output",
+  "• `pause <id>` / `resume <id>` — suspend or wake an instance",
   "• `stop <id>` — stop an instance",
   "",
-  "Spin up a fresh instance from your terminal — it auto-announces here:",
+  "Talking to a paused instance wakes it automatically and delivers your",
+  "message once it reconnects.",
+  "",
+  "You can also spin one up from your terminal — it auto-announces here:",
   "```\nrudder cloud \"fix the failing tests\"\n```",
 ].join("\n");

@@ -287,6 +287,27 @@ const findSailBySlackThread = database.prepare("select * from rudder_sails where
 const listRunningSails = database.prepare(
   "select * from rudder_sails where status in ('queued','running','paused') order by updated_at desc limit 100",
 );
+// Newest stored snapshot for a repo, across sails AND workspaces — this is what a
+// Slack `launch <repo> <task>` boots from (there is no terminal to upload a fresh
+// snapshot, so the last thing pushed up for that repo is the base).
+const latestSailSnapshotForRepo = database.prepare(`
+  select snapshot_key, account_id, updated_at from rudder_sails
+  where repo_name = ? and snapshot_key is not null
+  order by updated_at desc limit 1
+`);
+const latestWorkspaceSnapshotForRepo = database.prepare(`
+  select snapshot_key, account_id, updated_at from rudder_workspaces
+  where repo_name = ? and snapshot_key is not null
+  order by updated_at desc limit 1
+`);
+const listSailSnapshotRepos = database.prepare(`
+  select repo_name, max(updated_at) as updated_at from rudder_sails
+  where repo_name is not null and snapshot_key is not null group by repo_name
+`);
+const listWorkspaceSnapshotRepos = database.prepare(`
+  select repo_name, max(updated_at) as updated_at from rudder_workspaces
+  where repo_name is not null and snapshot_key is not null group by repo_name
+`);
 const insertWorkspace = database.prepare(`
   insert into rudder_workspaces (
     id, account_id, workspace_key, repo_name, status, machine_id, machine_state,
@@ -639,6 +660,10 @@ function attachWorker(kind: ChannelKind, id: string, ws: WebSocket): void {
   channel.buffer = [];
   channel.bufferBytes = 0;
   broadcastStatus(channel, "worker-connected");
+  // Deliver any Slack messages that were queued while this sail was asleep.
+  if (kind === "sail") {
+    flushPendingSlackInputs(id);
+  }
 
   ws.on("message", (data, isBinary) => {
     if (isBinary && data instanceof Buffer) {
@@ -1827,11 +1852,20 @@ async function handleWorkspaceApi(req: IncomingMessage, res: ServerResponse, url
   sendJson(res, 404, { error: "not found" });
 }
 
-async function createSail(accountId: string, body: Json, preferredId?: string): Promise<Sail> {
+async function createSail(
+  accountId: string,
+  body: Json,
+  preferredId?: string,
+  existingSnapshotKey?: string,
+): Promise<Sail> {
   const runtime = sailRuntimeFromBody(body);
   ensureCloudRuntimeConfigured(runtime);
   const now = new Date().toISOString();
-  const snapshot = await storeSnapshot(accountId, body);
+  // Slack-launched sails reuse an already-stored snapshot (there is no terminal
+  // to upload a fresh one from); everything else uploads as before.
+  const snapshot = existingSnapshotKey
+    ? { key: existingSnapshotKey }
+    : await storeSnapshot(accountId, body);
   const id = preferredId || uniqueSailId(stringField(body, "name"));
   const workerToken = `rdrw_${randomBytes(32).toString("base64url")}`;
   const task = stringField(body, "task");
@@ -3035,6 +3069,80 @@ async function handleSlackEvents(req: IncomingMessage, res: ServerResponse): Pro
   });
 }
 
+// Newest snapshot stored for a repo (sails and workspaces both count) — the base a
+// Slack `launch` boots from. Returns the owning account so the new sail lands in
+// the same account that uploaded the snapshot.
+function latestSnapshotForRepo(repoName: string): { key: string; accountId: string } | null {
+  const rows = [
+    latestSailSnapshotForRepo.get(repoName),
+    latestWorkspaceSnapshotForRepo.get(repoName),
+  ].filter((row): row is Record<string, unknown> => Boolean(row));
+  rows.sort((a, b) => String(b.updated_at || "").localeCompare(String(a.updated_at || "")));
+  const newest = rows[0];
+  if (!newest) {
+    return null;
+  }
+  return { key: String(newest.snapshot_key), accountId: String(newest.account_id) };
+}
+
+function listSnapshotRepoSummaries(): { repo: string; updatedAt: string }[] {
+  const merged = new Map<string, string>();
+  const rows = [
+    ...(listSailSnapshotRepos.all() as Record<string, unknown>[]),
+    ...(listWorkspaceSnapshotRepos.all() as Record<string, unknown>[]),
+  ];
+  for (const row of rows) {
+    const repo = String(row.repo_name || "");
+    const at = String(row.updated_at || "");
+    if (!repo) {
+      continue;
+    }
+    const prev = merged.get(repo);
+    if (!prev || at > prev) {
+      merged.set(repo, at);
+    }
+  }
+  return [...merged.entries()]
+    .map(([repo, updatedAt]) => ({ repo, updatedAt }))
+    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+}
+
+// Messages sent from Slack to a sleeping instance: the machine is woken and the
+// message is delivered once its worker WS reconnects. Bounded per sail so a sail
+// that never comes back cannot hoard memory.
+const pendingSlackInputs = new Map<string, { message: string; threadTs?: string }[]>();
+
+function queuePendingSlackInput(sailId: string, message: string, threadTs?: string): void {
+  const queue = pendingSlackInputs.get(sailId) ?? [];
+  queue.push({ message, threadTs });
+  while (queue.length > 20) {
+    queue.shift();
+  }
+  pendingSlackInputs.set(sailId, queue);
+}
+
+function flushPendingSlackInputs(sailId: string): void {
+  const queue = pendingSlackInputs.get(sailId);
+  if (!queue || queue.length === 0) {
+    return;
+  }
+  pendingSlackInputs.delete(sailId);
+  // Give the resumed agent PTY a beat to be ready before typing into it.
+  setTimeout(() => {
+    for (const item of queue) {
+      const delivered = sendInputToChannel("sail", sailId, item.message, true);
+      if (delivered) {
+        scheduleOutputEcho(sailId, item.threadTs);
+      } else if (item.threadTs) {
+        void postToSlack(
+          `*${sailId}* reconnected but did not accept the queued message; send it again.`,
+          item.threadTs,
+        );
+      }
+    }
+  }, 3000);
+}
+
 async function processSlackEvent(event: Record<string, unknown>): Promise<void> {
   const type = String(event.type || "");
   // Ignore anything the bot itself posted, and edits/joins/etc.
@@ -3115,6 +3223,77 @@ async function processSlackEvent(event: Record<string, unknown>): Promise<void> 
       await postToSlack(`🛑 Stopping *${command.id}*.`, replyThread);
       return;
     }
+    case "pause":
+    case "resume": {
+      const row = findSailById.get(command.id) as Record<string, unknown> | undefined;
+      const accountId = row ? String(row.account_id) : "";
+      const sail = accountId ? getAccountSail(command.id, accountId) : null;
+      if (!sail) {
+        await postToSlack(`No instance \`${command.id}\`.`, replyThread);
+        return;
+      }
+      try {
+        await mutateSail(sail, accountId, command.action);
+        await postToSlack(
+          command.action === "pause" ? `⏸️ Paused *${command.id}*.` : `▶️ Waking *${command.id}*.`,
+          replyThread,
+        );
+      } catch (error) {
+        await postToSlack(
+          `${command.action} failed: ${error instanceof Error ? error.message : String(error)}`,
+          replyThread,
+        );
+      }
+      return;
+    }
+    case "repos": {
+      const repos = listSnapshotRepoSummaries();
+      if (repos.length === 0) {
+        await postToSlack(
+          "No repo snapshots yet. Run `rudder cloud` from a repo once to upload one.",
+          replyThread,
+        );
+        return;
+      }
+      const lines = repos
+        .slice(0, 20)
+        .map((r) => `• *${r.repo}* — snapshot from ${r.updatedAt.slice(0, 10) || "unknown"}`);
+      await postToSlack(
+        `*Launchable repos*\n${lines.join("\n")}\nStart one with \`launch <repo> <task>\`.`,
+        replyThread,
+      );
+      return;
+    }
+    case "launch": {
+      const found = latestSnapshotForRepo(command.repo);
+      if (!found) {
+        await postToSlack(
+          `No snapshot for *${command.repo}*. Run \`rudder cloud\` from that repo once, or say \`repos\` to see what's launchable.`,
+          replyThread,
+        );
+        return;
+      }
+      try {
+        const sail = await createSail(
+          found.accountId,
+          { runtime: "fly", task: command.task, repoName: command.repo },
+          undefined,
+          found.key,
+        );
+        // createSail already announces the new instance as its own thread root;
+        // this reply just closes the loop on the command itself.
+        await postToSlack(
+          `🚀 Launching *${sail.id}* on *${command.repo}* — ${command.task}`,
+          replyThread,
+        );
+      } catch (error) {
+        await postToSlack(
+          `Launch failed: ${error instanceof Error ? error.message : String(error)}`,
+          replyThread,
+        );
+      }
+      return;
+    }
     case "talk":
     case "thread-reply": {
       const targetId = command.action === "talk" ? command.id : String(threadSail?.id || "");
@@ -3131,6 +3310,32 @@ async function processSlackEvent(event: Record<string, unknown>): Promise<void> 
       const ownThread = optionalString(sailRow?.slack_thread_ts) ?? replyThread;
       const delivered = sendInputToChannel("sail", targetId, message, true);
       if (!delivered) {
+        // The instance is asleep (idle-suspended) or its worker dropped. For a
+        // live-able Fly sail, wake the machine and deliver the message once its
+        // worker reconnects — this is what makes 24/7 Slack control feel always-on.
+        const accountId = sailRow ? String(sailRow.account_id) : "";
+        const sail = accountId ? getAccountSail(targetId, accountId) : null;
+        const wakeable = sail?.runtime === "fly"
+          && Boolean(sail.machineId)
+          && sail.status !== "completed"
+          && sail.status !== "failed";
+        if (sail && wakeable) {
+          queuePendingSlackInput(targetId, message, ownThread);
+          try {
+            await mutateSail(sail, accountId, "resume");
+            await postToSlack(
+              `⏰ *${targetId}* was asleep — waking it; your message will be delivered when it reconnects.`,
+              replyThread,
+            );
+          } catch (error) {
+            pendingSlackInputs.delete(targetId);
+            await postToSlack(
+              `*${targetId}* is not connected and could not be woken: ${error instanceof Error ? error.message : String(error)}`,
+              replyThread,
+            );
+          }
+          return;
+        }
         await postToSlack(`*${targetId}* is not connected right now.`, replyThread);
         return;
       }

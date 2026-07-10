@@ -105,3 +105,29 @@ test("parseSlackCommand treats bare thread messages as replies", () => {
     message: "keep going",
   });
 });
+
+test("parseSlackCommand handles launch/repos/pause/resume", () => {
+  assert.deepEqual(parseSlackCommand("<@U123> launch rudder fix the failing tests", { inThread: false }), {
+    action: "launch",
+    repo: "rudder",
+    task: "fix the failing tests",
+  });
+  // `run <repo> <task>` must NOT be swallowed by the id-first talk fallback.
+  assert.deepEqual(parseSlackCommand("run i2message add retry logic to sync", { inThread: false }), {
+    action: "launch",
+    repo: "i2message",
+    task: "add retry logic to sync",
+  });
+  assert.deepEqual(parseSlackCommand("repos", { inThread: false }), { action: "repos" });
+  assert.deepEqual(parseSlackCommand("snapshots", { inThread: false }), { action: "repos" });
+  assert.deepEqual(parseSlackCommand("pause cloud-foo", { inThread: false }), { action: "pause", id: "cloud-foo" });
+  assert.deepEqual(parseSlackCommand("resume cloud-foo", { inThread: false }), { action: "resume", id: "cloud-foo" });
+  assert.deepEqual(parseSlackCommand("wake cloud-foo", { inThread: false }), { action: "resume", id: "cloud-foo" });
+});
+
+test("help text advertises the launch-from-Slack commands", async () => {
+  const { SLACK_HELP_TEXT } = await import(slackModuleUrl.href);
+  assert.match(SLACK_HELP_TEXT, /launch <repo> <task>/);
+  assert.match(SLACK_HELP_TEXT, /repos/);
+  assert.match(SLACK_HELP_TEXT, /pause <id>/);
+});
