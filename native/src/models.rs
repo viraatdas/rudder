@@ -602,9 +602,7 @@ pub(crate) fn collect_provider_models(
         })
         // A dated snapshot ("claude-opus-4-5-20251101") duplicates its un-dated
         // (latest) twin in the picker; list the twin only.
-        .filter(|(id, _)| {
-            dated_duplicate_base(id).is_none_or(|base| !models.contains_key(&base))
-        })
+        .filter(|(id, _)| dated_duplicate_base(id).is_none_or(|base| !models.contains_key(&base)))
         .map(|(id, model)| {
             let name = model
                 .get("name")

@@ -4910,10 +4910,10 @@ fn model_picker_lists_newest_releases_first_and_drops_dated_duplicates() {
     assert_eq!(
         claude_ids,
         vec![
-            "claude-sonnet-5",  // 2026-06-29
-            "claude-fable-5",   // 2026-06-07
-            "claude-opus-4-8",  // 2026-05-28
-            "claude-opus-4-5",  // dated twin suppressed
+            "claude-sonnet-5", // 2026-06-29
+            "claude-fable-5",  // 2026-06-07
+            "claude-opus-4-8", // 2026-05-28
+            "claude-opus-4-5", // dated twin suppressed
             "claude-opus-4-1",
         ],
         "newest release first; dated snapshot ids collapse into their (latest) twin"
@@ -4969,11 +4969,17 @@ fn model_picker_leads_with_aliases_then_explicit_ids() {
             .iter()
             .position(|l| l == alias)
             .unwrap_or_else(|| panic!("{alias} missing from {labels:?}"));
-        assert!(at < alias_end, "{alias} lists before explicit ids: {labels:?}");
+        assert!(
+            at < alias_end,
+            "{alias} lists before explicit ids: {labels:?}"
+        );
     }
     let sonnet5 = labels.iter().position(|l| l == "claude-sonnet-5").unwrap();
     let opus48 = labels.iter().position(|l| l == "claude-opus-4-8").unwrap();
-    assert!(sonnet5 < opus48, "explicit ids stay newest-first: {labels:?}");
+    assert!(
+        sonnet5 < opus48,
+        "explicit ids stay newest-first: {labels:?}"
+    );
 }
 
 #[test]
