@@ -1829,6 +1829,19 @@ pub(crate) fn write_rudder_context(
     agents: &[AgentRun],
     pending: Option<&WorktreeInfo>,
 ) -> Result<()> {
+    write_rudder_context_with_history(repo_root, agents, pending, &[])
+}
+
+/// `recent_instructions` is the tail of the user's task history (newest last):
+/// every agent workspace mirrors this file, so a freshly spawned `/run` worker
+/// opens with a one-page digest of the session — what the user has been asking
+/// for and (via each agent's `did=` line) what actually got done.
+pub(crate) fn write_rudder_context_with_history(
+    repo_root: &Path,
+    agents: &[AgentRun],
+    pending: Option<&WorktreeInfo>,
+    recent_instructions: &[String],
+) -> Result<()> {
     ensure_gitignore_contains(repo_root, "RUDDER.md")?;
     ensure_gitignore_contains(repo_root, RUDDER_SHARED_CONTEXT_FILE)?;
     // Worktrees now live INSIDE the project at <repo>/.rudder-worktrees; ignore them in the
@@ -1875,6 +1888,21 @@ pub(crate) fn write_rudder_context(
             append_agent_context_line(&mut body, agent);
         }
     }
+    // SESSION MEMORY: the user's recent instructions, newest first. Combined with
+    // the `did=` summaries above, a brand-new agent opens knowing what this
+    // session has been about without inheriting any other agent's full chat.
+    let instructions = recent_instructions
+        .iter()
+        .rev()
+        .filter(|instruction| !instruction.trim_start().starts_with('/'))
+        .take(10)
+        .collect::<Vec<_>>();
+    if !instructions.is_empty() {
+        body.push_str("\n## Recent user instructions (newest first)\n");
+        for instruction in instructions {
+            body.push_str(&format!("- {}\n", preview_text(instruction, 200)));
+        }
+    }
     body.push_str(
         "\nRead this file before making changes so you know what other Rudder agents are doing. If RUDDER_SHARED.md exists beside it, read that too; it is Rudder's gitignored file for user-shared credentials, API tokens, private URLs, and other local context that must survive model compaction.\n",
     );
@@ -1899,6 +1927,14 @@ fn append_agent_context_line(body: &mut String, agent: &AgentRun) {
     } else {
         String::new()
     };
+    // The worker's own account of what it did (its completion note). This is what
+    // turns the roster into session memory: a new agent sees not just WHO ran,
+    // but what each finished run actually produced.
+    let did = agent
+        .done_summary
+        .as_deref()
+        .map(|summary| format!(" did=\"{}\"", preview_text(summary, 200)))
+        .unwrap_or_default();
     let node = agent.node_id.as_deref().unwrap_or("-");
     let waiting = agent_waiting_label(agent);
     let deps = agent_deps_label(agent);
@@ -1908,7 +1944,7 @@ fn append_agent_context_line(body: &mut String, agent: &AgentRun) {
         ""
     };
     body.push_str(&format!(
-        "- {} node={} mode={} status={}{} backend={} model={} cwd={}{}{} task=\"{}\"{}\n",
+        "- {} node={} mode={} status={}{} backend={} model={} cwd={}{}{} task=\"{}\"{}{}\n",
         agent.id,
         node,
         agent.mode.as_str(),
@@ -1920,7 +1956,8 @@ fn append_agent_context_line(body: &mut String, agent: &AgentRun) {
         deps,
         merge_state,
         preview_text(&agent.task, 140),
-        current_prompt
+        current_prompt,
+        did
     ));
 }
 

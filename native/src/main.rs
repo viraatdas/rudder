@@ -1379,7 +1379,8 @@ impl App {
 
     fn write_rudder_context_timed(&mut self, pending: Option<&WorktreeInfo>) -> Result<()> {
         let started = Instant::now();
-        let result = write_rudder_context(&self.cwd, &self.agents, pending);
+        let result =
+            write_rudder_context_with_history(&self.cwd, &self.agents, pending, &self.task_history);
         let duration = started.elapsed();
         self.record_perf_duration("write_rudder_context", duration);
         self.log_perf_duration_over(

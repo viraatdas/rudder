@@ -8040,6 +8040,43 @@ fn write_rudder_context_includes_global_job_snapshot() {
 }
 
 #[test]
+fn rudder_context_carries_session_memory_for_new_agents() {
+    let repo = unique_test_repo("context-session-memory");
+    let mut done = test_agent_run("run-done", "Objective: add retries to the sync client");
+    done.status = AgentStatus::Done;
+    done.done_summary = Some("Added exponential backoff to sync.ts and 6 tests.".to_string());
+    let history = vec![
+        "/model claude opus".to_string(), // commands are noise, not instructions
+        "add retries to the sync client".to_string(),
+        "also cover the timeout path".to_string(),
+    ];
+
+    write_rudder_context_with_history(&repo, &[done], None, &history)
+        .expect("write RUDDER.md with history");
+    let text = fs::read_to_string(repo.join("RUDDER.md")).expect("read RUDDER.md");
+
+    // A new agent sees what each finished run actually DID…
+    assert!(
+        text.contains("did=\"Added exponential backoff to sync.ts and 6 tests.\""),
+        "done summary rides the roster line: {text}"
+    );
+    // …and what the user has been asking for, newest first, commands filtered.
+    let section = text
+        .split("## Recent user instructions (newest first)")
+        .nth(1)
+        .expect("instructions section");
+    let timeout_at = section.find("also cover the timeout path").unwrap();
+    let retries_at = section.find("add retries to the sync client").unwrap();
+    assert!(timeout_at < retries_at, "newest instruction first");
+    assert!(
+        !section.contains("/model"),
+        "slash commands are filtered out"
+    );
+
+    let _ = fs::remove_dir_all(&repo);
+}
+
+#[test]
 fn orchestrator_prompts_include_global_monitoring_contract() {
     let claude_prompt = orchestrator_system_prompt();
     assert!(claude_prompt.contains("Global job snapshot"));
