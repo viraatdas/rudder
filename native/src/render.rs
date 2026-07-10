@@ -3242,25 +3242,42 @@ pub(crate) fn worker_lines(app: &mut App, height: usize, width: usize) -> Vec<Li
     let focused = app.focus == FocusPane::Worker;
     let run_id = run.id.clone();
     let Some(terminal) = run.terminal.as_mut() else {
-        return vec![
+        let title = if run.task_summary.trim().is_empty() {
+            summarize_task(&run.task)
+        } else {
+            run.task_summary.clone()
+        };
+        let mut lines = vec![
             Line::from(Span::styled(
-                format!("{}  {}", run.status.as_str(), short_task(&run.task)),
+                format!("{}  {}", run.status.as_str(), title),
                 pane_text_style(true),
             )),
             Line::from(""),
-            Line::from(Span::styled(
-                if matches!(run.mode, AgentMode::Plan | AgentMode::RudderPlan) {
-                    "This read-only planner is not running."
-                } else {
-                    "This agent is not running."
-                },
-                muted_style(true),
-            )),
-            Line::from(Span::styled(
-                run.cwd.display().to_string(),
-                muted_style(true),
-            )),
         ];
+        // The FULL objective/prompt, one Line per source line. The surrounding
+        // Paragraph wraps long lines to the pane width, so a completed agent's
+        // objective is fully readable here (it used to be short_task's 26 chars,
+        // which made finished work unreviewable after its terminal was gone).
+        for text_line in run.task.lines() {
+            lines.push(Line::from(Span::styled(
+                text_line.to_string(),
+                pane_text_style(true),
+            )));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            if matches!(run.mode, AgentMode::Plan | AgentMode::RudderPlan) {
+                "This read-only planner is not running."
+            } else {
+                "This agent is not running."
+            },
+            muted_style(true),
+        )));
+        lines.push(Line::from(Span::styled(
+            run.cwd.display().to_string(),
+            muted_style(true),
+        )));
+        return lines;
     };
 
     let selection = app

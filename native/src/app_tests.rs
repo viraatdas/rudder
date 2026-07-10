@@ -5986,6 +5986,43 @@ fn main_agent_blocks_delete_merge_and_rename() {
         .contains("main agent"));
 }
 
+#[test]
+fn not_running_worker_pane_shows_the_full_objective() {
+    let mut app = App::new();
+    let long_task = format!(
+        "Objective: {}\nDone when: every acceptance check in the plan passes and the diff is reviewed.",
+        "implement the entire telemetry ingestion pipeline including watermarks, redaction, and ranking "
+            .repeat(3)
+    );
+    let mut run = test_agent_run("done-1", &long_task);
+    run.status = AgentStatus::Done;
+    run.terminal = None;
+    app.agents.push(run);
+    app.selected_agent = 0;
+
+    let lines = worker_lines(&mut app, 40, 120);
+    let text = lines
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    // The FULL objective is present — not short_task's 26-char cut.
+    assert!(
+        text.contains("watermarks, redaction, and ranking"),
+        "full task body is rendered: {text}"
+    );
+    assert!(
+        text.contains("Done when: every acceptance check"),
+        "later lines of the objective survive too"
+    );
+    assert!(text.contains("This agent is not running."));
+}
+
 fn type_rename_char(app: &mut App, ch: char) {
     app.handle_rename_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::empty()));
 }
