@@ -108,8 +108,8 @@ const ORCHESTRATOR_SKILLS: &[OrchestratorSkill] = &[
     OrchestratorSkill {
         slug: "rudder-worker-control",
         name: "rudder-worker-control",
-        description: "Use when the user asks to control a specific running worker process.",
-        body: "Use node ids such as n0/n1 when available; otherwise use run ids. Write exactly one control line to RUDDER.md: RUDDER_STOP <node-or-run-id> to stop a worker, RUDDER_REGOAL <node-or-run-id> <new goal> to resume/re-goal it, RUDDER_INJECT <node-or-run-id> <message> to send a note into its live terminal, or RUDDER_MERGE <node-or-run-id> to merge one completed worker. Never target the orchestrator with these markers.",
+        description: "Use when the user asks to control, pause, resume, re-goal, or change the model of a worker.",
+        body: "Read RUDDER.md first and resolve phrases such as 'current task' or 'all running tasks' to the live node ids. Use node ids such as n0/n1 when available; otherwise use run ids. Write one or more control lines to RUDDER.md: RUDDER_STOP <node-or-run-id> pauses a worker while preserving its workspace; RUDDER_RESUME <node-or-run-id> <claude|codex> <model> [low|medium|high|xhigh|max|auto] [new direction] resumes it in the same workspace on that model; RUDDER_REGOAL <node-or-run-id> <new goal> resumes it without changing model; RUDDER_INJECT <node-or-run-id> <message> sends a note into its live terminal; RUDDER_MERGE <node-or-run-id> merges one completed worker. For 'pause and resume on model X', write STOP then RESUME for every matching live worker. Never target the orchestrator with these markers.",
     },
     OrchestratorSkill {
         slug: "rudder-help",

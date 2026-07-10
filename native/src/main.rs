@@ -6639,6 +6639,17 @@ impl App {
             self.notice = Some("RUDDER_REGOAL requires <node-or-run-id> <goal>".to_string());
             return;
         }
+        if let Some(rest) = marker.strip_prefix("RUDDER_RESUME ") {
+            self.resume_agent_for_marker(rest.trim());
+            return;
+        }
+        if marker == "RUDDER_RESUME" {
+            self.notice = Some(
+                "RUDDER_RESUME requires <node-or-run-id> <provider> <model> [effort] [direction]"
+                    .to_string(),
+            );
+            return;
+        }
         if let Some(rest) = marker.strip_prefix("RUDDER_INJECT ") {
             self.inject_agent_for_marker(rest.trim());
             return;
@@ -6741,6 +6752,28 @@ impl App {
         };
         if !self.regoal_agent_at(index, goal) {
             self.notice = Some(format!("could not re-goal {token}"));
+        }
+    }
+
+    fn resume_agent_for_marker(&mut self, rest: &str) {
+        let Some(spec) = parse_worker_resume_spec(rest) else {
+            self.notice = Some(
+                "RUDDER_RESUME requires <node-or-run-id> <provider> <model> [effort] [direction]"
+                    .to_string(),
+            );
+            return;
+        };
+        let Some(index) = self.agent_index_for_token(&spec.target) else {
+            self.notice = Some(format!("RUDDER_RESUME target not found: {}", spec.target));
+            return;
+        };
+        let direction = if spec.direction.trim().is_empty() {
+            "Continue the current task from the existing workspace. Inspect `jj diff` first, preserve useful prior work, and finish the original objective."
+        } else {
+            spec.direction.as_str()
+        };
+        if !self.retarget_agent_at(index, spec.backend, &spec.model, spec.effort, direction) {
+            self.notice = Some(format!("could not resume {}", spec.target));
         }
     }
 
@@ -10193,7 +10226,55 @@ impl App {
     // stop primitive below already has a keybinding.
     #[allow(dead_code)]
     fn regoal_agent_at(&mut self, index: usize, new_goal: &str) -> bool {
+        self.restart_agent_at(index, new_goal, None)
+    }
+
+    fn retarget_agent_at(
+        &mut self,
+        index: usize,
+        backend: Backend,
+        model: &str,
+        effort: Option<EffortLevel>,
+        new_goal: &str,
+    ) -> bool {
+        self.restart_agent_at(index, new_goal, Some((backend, model.to_string(), effort)))
+    }
+
+    fn restart_agent_at(
+        &mut self,
+        index: usize,
+        new_goal: &str,
+        target: Option<(Backend, String, Option<EffortLevel>)>,
+    ) -> bool {
         let cwd_default = self.cwd.clone();
+        let retargeted = target.is_some();
+        if let Some((backend, model, effort)) = target {
+            let Some(run) = self.agents.get_mut(index) else {
+                return false;
+            };
+            if run.is_main() || run.is_orchestrator() {
+                return false;
+            }
+            let provider_changed = run.backend != backend;
+            run.backend = backend;
+            run.model = model;
+            run.effort = effort;
+            if provider_changed {
+                // Backend session ids are provider-specific. Keep the workspace and
+                // start a context-carrying session on the requested provider.
+                run.session_id = None;
+            } else if backend == Backend::Codex
+                && run
+                    .session_id
+                    .as_deref()
+                    .is_none_or(|session| session.trim().is_empty())
+            {
+                // Interactive Codex runs discover their id from the rollout log. A
+                // STOP immediately followed by RESUME can happen before normal
+                // completion captures it, so recover it here to preserve the chat.
+                run.session_id = latest_codex_session_id_for_cwd(&run.cwd);
+            }
+        }
         // A re-goaled worker reuses its run id but will do NEW work and file a NEW report.
         // Clear its ingest ledger + any in-flight backstop so that second completion is
         // ingested afresh instead of being skipped as "already handled".
@@ -10310,7 +10391,18 @@ impl App {
                     run.last_worker_input_at = Some(Instant::now());
                     let _ = save_native_run_record(&cwd_default, run);
                 }
-                self.push_activity(format!("re-goaled {node_label}: {}", short_task(new_goal)));
+                if retargeted {
+                    let backend_label = self.agents[index].backend.as_str().to_string();
+                    let model_label = self.agents[index].model.clone();
+                    self.push_activity(format!(
+                        "resumed {node_label} on {} {}: {}",
+                        backend_label,
+                        model_label,
+                        short_task(new_goal)
+                    ));
+                } else {
+                    self.push_activity(format!("re-goaled {node_label}: {}", short_task(new_goal)));
+                }
                 self.mirror_graph();
                 true
             }
@@ -11540,6 +11632,44 @@ fn split_marker_target_payload(value: &str) -> Option<(&str, &str)> {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct WorkerResumeSpec {
+    target: String,
+    backend: Backend,
+    model: String,
+    effort: Option<EffortLevel>,
+    direction: String,
+}
+
+fn parse_worker_resume_spec(value: &str) -> Option<WorkerResumeSpec> {
+    let parts = value.split_whitespace().collect::<Vec<_>>();
+    if parts.len() < 3 {
+        return None;
+    }
+    let backend = provider_backend(parts[1])?;
+    let model = parts[2].trim();
+    if model.is_empty() {
+        return None;
+    }
+    let mut direction_start = 3;
+    let effort = match parts.get(3).copied() {
+        Some(value)
+            if value.eq_ignore_ascii_case("auto") || EffortLevel::parse(value).is_some() =>
+        {
+            direction_start = 4;
+            parse_effort_arg(value)
+        }
+        _ => default_effort_for(backend, model),
+    };
+    Some(WorkerResumeSpec {
+        target: parts[0].to_string(),
+        backend,
+        model: model.to_string(),
+        effort,
+        direction: parts[direction_start..].join(" "),
+    })
+}
+
 fn run_mouse_test(mode: &str) -> Result<()> {
     match mode {
         "raw" => run_mouse_test_raw(),
@@ -12040,6 +12170,7 @@ fn is_orchestrator_skill_marker(line: &str) -> bool {
         "RUDDER_MERGE_ALL",
         "RUDDER_MERGE",
         "RUDDER_STOP",
+        "RUDDER_RESUME",
         "RUDDER_REGOAL",
         "RUDDER_INJECT",
         "RUDDER_AUTOMERGE",

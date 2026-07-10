@@ -4393,6 +4393,27 @@ fn stop_agent_frees_slot_and_keeps_workspace_for_undo() {
 }
 
 #[test]
+fn worker_resume_marker_parses_model_effort_and_direction() {
+    let parsed = parse_worker_resume_spec(
+        "n2 codex gpt-5.6 max finish the current task using the existing diff",
+    )
+    .expect("valid resume marker");
+    assert_eq!(parsed.target, "n2");
+    assert_eq!(parsed.backend, Backend::Codex);
+    assert_eq!(parsed.model, "gpt-5.6");
+    assert_eq!(parsed.effort, Some(EffortLevel::Max));
+    assert_eq!(
+        parsed.direction,
+        "finish the current task using the existing diff"
+    );
+
+    let defaulted = parse_worker_resume_spec("run-1 claude sonnet").unwrap();
+    assert_eq!(defaulted.backend, Backend::Claude);
+    assert!(defaulted.direction.is_empty());
+    assert!(parse_worker_resume_spec("n2 unknown model").is_none());
+}
+
+#[test]
 fn overlapping_files_finds_shared_paths() {
     let a = vec!["src/app.js".to_string(), "README.md".to_string()];
     let b = vec!["src/app.js".to_string(), "src/auth.js".to_string()];
@@ -8083,6 +8104,7 @@ fn orchestrator_prompts_include_global_monitoring_contract() {
     assert!(claude_prompt.contains("wait for current Claude/Codex jobs"));
     assert!(claude_prompt.contains("RUDDER_REVIEW_ALL"));
     assert!(claude_prompt.contains("RUDDER_RUN <task>"));
+    assert!(claude_prompt.contains("RUDDER_RESUME <node-or-run-id>"));
     assert!(claude_prompt.contains("RUDDER_MAIN <prompt>"));
 
     let codex_prompt = codex_orchestrator_prompt("monitor the current threads");
@@ -8092,6 +8114,7 @@ fn orchestrator_prompts_include_global_monitoring_contract() {
     assert!(codex_prompt.contains("Completed local Rudder agents"));
     assert!(codex_prompt.contains("Active as live or waiting only"));
     assert!(codex_prompt.contains("RUDDER_RUN <task>"));
+    assert!(codex_prompt.contains("RUDDER_RESUME <node-or-run-id>"));
     assert!(codex_prompt.contains("monitor the current threads"));
 }
 
@@ -8168,6 +8191,70 @@ fn orchestrator_control_marker_can_stop_worker() {
     assert!(!text.contains("RUDDER_STOP"));
     assert!(text.contains("before") && text.contains("after"));
 
+    let _ = fs::remove_dir_all(&repo);
+}
+
+#[cfg(not(windows))]
+#[test]
+fn orchestrator_can_pause_and_resume_worker_on_another_model() {
+    let _env = env_guard();
+    let repo = unique_test_repo("orch-resume-model-marker");
+    let worker_bin = repo.join("fake-codex.sh");
+    write_fake_bin(&worker_bin, "#!/bin/sh\nsleep 5\n");
+    std::env::set_var("RUDDER_CODEX_BIN", &worker_bin);
+    fs::write(
+        repo.join("RUDDER.md"),
+        "before\nRUDDER_STOP n0\nRUDDER_RESUME n0 codex gpt-5.6 max finish with the existing diff\nafter\n",
+    )
+    .unwrap();
+
+    let mut app = App::new();
+    app.cwd = repo.clone();
+    app.interactive_orchestrator = true;
+    let mut orch = test_agent_run("orch-1", "plan it");
+    orch.cwd = repo.clone();
+    orch.mode = AgentMode::RudderPlan;
+    orch.backend = Backend::Claude;
+    orch.autosteered = false;
+    orch.interactive_orchestrator = true;
+    orch.status = AgentStatus::Running;
+    app.agents.push(orch);
+
+    let mut worker = test_agent_run("run-1", "do node");
+    worker.cwd = repo.clone();
+    worker.node_id = Some("n0".to_string());
+    worker.backend = Backend::Claude;
+    worker.model = "sonnet".to_string();
+    worker.session_id = Some("claude-session".to_string());
+    worker.status = AgentStatus::Running;
+    app.agents.push(worker);
+
+    app.scan_orchestrator_skill_markers();
+
+    let worker = app
+        .agents
+        .iter_mut()
+        .find(|run| run.node_id.as_deref() == Some("n0"))
+        .expect("worker row");
+    assert_eq!(worker.status, AgentStatus::Running);
+    assert_eq!(worker.backend, Backend::Codex);
+    assert_eq!(worker.model, "gpt-5.6");
+    assert_eq!(worker.effort, Some(EffortLevel::Max));
+    assert_eq!(worker.current_prompt, "finish with the existing diff");
+    assert!(worker.terminal.is_some(), "worker was relaunched");
+    assert_ne!(
+        worker.session_id.as_deref(),
+        Some("claude-session"),
+        "provider-specific session id is not reused"
+    );
+    worker.terminal = None;
+
+    let text = fs::read_to_string(repo.join("RUDDER.md")).unwrap();
+    assert!(!text.contains("RUDDER_STOP"));
+    assert!(!text.contains("RUDDER_RESUME"));
+    assert!(text.contains("before") && text.contains("after"));
+
+    std::env::remove_var("RUDDER_CODEX_BIN");
     let _ = fs::remove_dir_all(&repo);
 }
 

@@ -923,9 +923,17 @@ The planner UX went through several iterations; these are the settled decisions 
   The bottom task bar remains available; the interactive orchestrator skills are an additional
   control path generated under `.claude/skills/rudder-*`, with one-shot `RUDDER_*` control
   markers consumed from `RUDDER.md`. Marker controls include add/replan (`RUDDER_ADD_TASK`,
-  `RUDDER_REPLAN`), per-worker control (`RUDDER_MERGE`, `RUDDER_STOP`, `RUDDER_REGOAL`,
-  `RUDDER_INJECT`), and broad actions (`RUDDER_REVIEW_ALL`, `RUDDER_MERGE_ALL`,
+  `RUDDER_REPLAN`), per-worker control (`RUDDER_MERGE`, `RUDDER_STOP`, `RUDDER_RESUME`,
+  `RUDDER_REGOAL`, `RUDDER_INJECT`), and broad actions (`RUDDER_REVIEW_ALL`, `RUDDER_MERGE_ALL`,
   `RUDDER_AUTOMERGE`).
+
+  `RUDDER_RESUME <node-or-run-id> <claude|codex> <model> [effort] [direction]` is the
+  provider/model-aware continuation primitive. It preserves the run's jj workspace and
+  identity. Same-provider retargets resume the existing backend session with the new model;
+  cross-provider retargets clear the provider-specific session id and start a fresh worker
+  with a handoff that tells it to inspect and continue the existing diff. The generated
+  `rudder-worker-control` skill maps natural-language pause/resume/model-switch requests to
+  ordered `RUDDER_STOP` + `RUDDER_RESUME` markers for each matching live node.
 
 ### 14.4b Per-agent done/idle detection: official signals, scrape as fallback (`native/src/signals.rs`)
 The native TUI runs workers as INTERACTIVE `claude`/`codex` in a PTY (they idle between

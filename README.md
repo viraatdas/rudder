@@ -253,6 +253,13 @@ sweeping change ("rewrite this in Rust instead") and the plan re-plans around th
 already done. The queued plan survives a restart, so quitting mid-plan resumes where you
 left off.
 
+The orchestrator also handles worker operations in natural language. For example, tell it
+"pause the current tasks and resume them on Codex gpt-5.6 at max effort." It resolves the
+live node ids from `RUDDER.md`, pauses each matching worker without deleting its jj
+workspace, and resumes it on the requested provider/model. A same-provider switch keeps
+the agent conversation; a provider switch keeps the workspace and starts a fresh session
+with a handoff to inspect and continue the existing diff.
+
 ## Worktrees and merging
 
 Planned worker tasks run in their own git worktrees under `.rudder-worktrees/`
