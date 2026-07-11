@@ -208,6 +208,8 @@ effort means Rudder passes no override.
 Your last provider, model, and effort are saved in `~/.rudder/config.json` and
 reused next time. Rudder refreshes model metadata from
 `https://models.dev/api.json` and falls back to local caches when offline.
+The native Codex picker also reads `~/.codex/models_cache.json`, so account-specific
+models such as the GPT-5.6 Sol/Terra/Luna family appear as soon as Codex exposes them.
 
 ## One-Off and Planning
 

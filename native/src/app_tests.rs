@@ -5103,6 +5103,27 @@ fn model_picker_accepts_future_codex_models_without_a_release() {
 }
 
 #[test]
+fn model_picker_reads_new_codex_family_from_local_cache_in_native_order() {
+    let cache = serde_json::json!({
+        "models": [
+            {"slug":"gpt-5.6-sol","display_name":"GPT-5.6-Sol","description":"Frontier","visibility":"list"},
+            {"slug":"gpt-5.6-terra","display_name":"GPT-5.6-Terra","description":"Balanced","visibility":"list"},
+            {"slug":"gpt-5.6-luna","display_name":"GPT-5.6-Luna","description":"Fast","visibility":"list"},
+            {"slug":"codex-auto-review","display_name":"Internal"},
+            {"slug":"gpt-image-2","display_name":"Image"},
+            {"slug":"gpt-hidden","display_name":"Hidden","visibility":"hide"}
+        ]
+    });
+    let rows = collect_codex_local_rows(&cache);
+    let labels = rows
+        .iter()
+        .map(|(_, model, _)| model.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(labels, vec!["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]);
+    assert!(rows[0].2.contains("GPT-5.6-Sol"));
+}
+
+#[test]
 fn merge_generated_rudder_md_collapses_duplicates_and_is_idempotent() {
     // Two generated blocks (prior corruption) + a stray orphan marker collapse
     // to exactly one fresh block; orchestrator content around them survives.

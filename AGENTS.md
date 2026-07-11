@@ -595,6 +595,9 @@ functional but less battle-tested than the local dashboard; treat it as beta.
   - Claude project models (`collectClaudeProjectModels`).
   `discoverModelOptions(backend, default)` merges these; callers fall back to
   `fallbackModelOptions`.
+- `native/src/models.rs` mirrors the same discovery for the dashboard picker. Codex
+  rows read `~/.codex/models_cache.json` before models.dev so new account-specific
+  families (for example GPT-5.6 Sol/Terra/Luna) appear immediately in Codex's own order.
 - `src/effort.ts`: `EffortLevel = low | medium | high | xhigh | max` and the
   per-backend mapping (Claude uses `effort`, Codex uses `reasoningEffort`).
 - **`/fast` (v2.5.0, decided):** the fast preset is the FLAGSHIP model at LOW

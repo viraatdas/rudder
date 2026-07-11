@@ -487,6 +487,13 @@ pub(crate) fn model_suggestions_for(backend_filter: Backend, query: &str) -> Vec
             push_model_suggestion(&mut suggestions, &mut seen, backend, model, detail);
         }
     }
+    // Codex's own cache is the authoritative account-specific list and often
+    // receives new model families before models.dev. Keep its native ordering.
+    if backend_filter == Backend::Codex {
+        for (backend, model, detail) in cached_codex_local_rows() {
+            push_model_suggestion(&mut suggestions, &mut seen, backend, &model, &detail);
+        }
+    }
     for (backend, model, detail) in cached_models_dev_rows() {
         if backend == backend_filter {
             push_model_suggestion(&mut suggestions, &mut seen, backend, &model, &detail);
@@ -499,6 +506,54 @@ pub(crate) fn model_suggestions_for(backend_filter: Backend, query: &str) -> Vec
     }
 
     rank_suggestions(suggestions, query)
+}
+
+pub(crate) fn cached_codex_local_rows() -> Vec<(Backend, String, String)> {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return Vec::new();
+    };
+    let Ok(raw) = fs::read_to_string(home.join(".codex").join("models_cache.json")) else {
+        return Vec::new();
+    };
+    let Ok(data) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return Vec::new();
+    };
+    collect_codex_local_rows(&data)
+}
+
+pub(crate) fn collect_codex_local_rows(data: &serde_json::Value) -> Vec<(Backend, String, String)> {
+    data.get("models")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|model| {
+            let slug = model.get("slug")?.as_str()?.trim();
+            if slug.is_empty()
+                || slug == "codex-auto-review"
+                || model.get("visibility").and_then(serde_json::Value::as_str) == Some("hide")
+                || is_excluded_openai_text_model(slug)
+            {
+                return None;
+            }
+            let display = model
+                .get("display_name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .trim();
+            let description = model
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .trim();
+            let detail = match (display.is_empty(), description.is_empty()) {
+                (false, false) => format!("{display} · {description}"),
+                (false, true) => display.to_string(),
+                (true, false) => description.to_string(),
+                (true, true) => "local Codex cache".to_string(),
+            };
+            Some((Backend::Codex, slug.to_string(), detail))
+        })
+        .collect()
 }
 
 pub(crate) fn effort_suggestions_for(
