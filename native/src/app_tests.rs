@@ -653,7 +653,6 @@ fn web_steer_running_worker_injects_and_persists_a_user_turn() {
     run.id = "web-running-worker".to_string();
     run.node_id = Some("n-running".to_string());
     run.needs_user_input = true;
-    run.user_input_notified = true;
     app.agents.push(run);
 
     let _ = app.deliver_steer_request("n-running", "focus on the failing parser test");
@@ -869,7 +868,7 @@ fn detects_busy_lines() {
 }
 
 #[test]
-fn idle_chrome_is_strong_done_signal() {
+fn idle_chrome_is_recognized_for_prompt_input() {
     // Claude's footer when idle at prompt
     let lines: Vec<String> = vec![
         "Edited 3 files".to_string(),
@@ -883,7 +882,7 @@ fn idle_chrome_is_strong_done_signal() {
 }
 
 #[test]
-fn codex_idle_chrome_marks_done() {
+fn codex_idle_chrome_is_recognized_for_prompt_input() {
     let lines: Vec<String> = vec![
         "Verification passed:".to_string(),
         String::new(),
@@ -901,7 +900,7 @@ fn codex_idle_chrome_marks_done() {
 }
 
 #[test]
-fn busy_blocks_done_even_with_prompt_visible() {
+fn busy_chrome_blocks_prompt_input_even_with_prompt_visible() {
     let lines: Vec<String> = vec![
         "> ".to_string(),
         "* Thinking... (3s · esc to interrupt)".to_string(),
@@ -3156,6 +3155,44 @@ fn jj_run_record_writes_vcs_jj_and_workspace_fields() {
 }
 
 #[test]
+fn native_save_preserves_launch_and_clean_merge_metadata() {
+    let repo = unique_test_repo("native-record-merge-metadata");
+    let run_dir = native_run_dir(&repo, "merged-run");
+    fs::create_dir_all(&run_dir).unwrap();
+    fs::write(
+        run_dir.join("run.json"),
+        serde_json::json!({
+            "id": "merged-run",
+            "status": "merged",
+            "task": "ship it",
+            "targetBranch": "main",
+            "baseCommit": "base-a",
+            "merge": {
+                "status": "merged",
+                "operationId": "op-before",
+                "mergeChangeId": "change-after"
+            },
+            "verification": { "satisfied": true }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let mut run = test_agent_run("merged-run", "ship it");
+    run.status = AgentStatus::Merged;
+
+    save_native_run_record(&repo, &run).expect("save merged native record");
+
+    let value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(run_dir.join("run.json")).unwrap()).unwrap();
+    assert_eq!(value["targetBranch"], "main");
+    assert_eq!(value["baseCommit"], "base-a");
+    assert_eq!(value["merge"]["status"], "merged");
+    assert_eq!(value["merge"]["operationId"], "op-before");
+    assert_eq!(value["merge"]["mergeChangeId"], "change-after");
+    assert_eq!(value["verification"]["satisfied"], true);
+}
+
+#[test]
 fn run_record_round_trips_merge_resolver_flag() {
     let repo_root = std::env::temp_dir().join(format!(
         "rudder-resolver-record-test-{}-{}",
@@ -3292,7 +3329,12 @@ fn resolved_conflict_keeps_durable_had_merge_conflict_marker() {
         .expect("read run.json");
     let value: serde_json::Value = serde_json::from_str(&raw).expect("parse run.json");
     assert_eq!(value.get("status").and_then(|v| v.as_str()), Some("merged"));
-    assert!(value.get("merge").is_none(), "live conflict state cleared");
+    assert_eq!(
+        value.pointer("/merge/status").and_then(|v| v.as_str()),
+        Some("merged"),
+        "live conflict fields clear while durable integration evidence remains"
+    );
+    assert!(value.pointer("/merge/conflictedFiles").is_none());
     assert_eq!(
         value.get("hadMergeConflict").and_then(|v| v.as_bool()),
         Some(true)
@@ -4294,15 +4336,6 @@ fn orchestrator_pane_mouse_drag_selects_visible_text() {
 }
 
 #[test]
-fn parse_worker_done_block_extracts_last_block() {
-    let out = "chatter\nRUDDER_DONE_START\n{\"summary\":\"did x\",\"followups\":[{\"title\":\"t\"}]}\nRUDDER_DONE_END\ntrailing";
-    let note = parse_worker_done_block(out).expect("parsed");
-    assert_eq!(note["summary"], "did x");
-    assert_eq!(note["followups"][0]["title"], "t");
-    assert!(parse_worker_done_block("no block here").is_none());
-}
-
-#[test]
 fn auto_expand_grows_dag_from_in_scope_followups() {
     let mut app = App::new();
     app.cwd = std::env::temp_dir();
@@ -4342,84 +4375,6 @@ fn auto_expand_grows_dag_from_in_scope_followups() {
         "duplicate title is skipped"
     );
     assert_eq!(app.planned_nodes.len(), 1);
-}
-
-#[test]
-fn auto_expand_ingests_rudder_done_block_from_worker_pty() {
-    // FULL TUI-side communication pathway against a REAL PTY: a finished worker
-    // echoes a RUDDER_DONE block to stdout; the conductor scrapes its scrollback,
-    // parses the note, and GROWS the DAG with the in-scope follow-up (scope:out is
-    // recorded, not injected). Exercises the whole glue that the piecewise unit
-    // tests skip: maybe_ingest_worker_followups -> ingest_worker_followups (PTY
-    // snapshot) -> parse_worker_done_block -> apply_worker_followups, + idempotency.
-    let json = "{\"summary\":\"built auth module\",\"interfaces\":\"added login()\",\"followups\":[{\"title\":\"wire login into router\",\"why\":\"login needs a caller\",\"scope\":\"in\"},{\"title\":\"document the auth flow\",\"scope\":\"out\"}]}";
-    let block = format!("RUDDER_DONE_START\n{json}\nRUDDER_DONE_END");
-    let command = TerminalCommand::with_args("sh", ["-lc", "printf '%s\\n' \"$BLOCK\""])
-        .with_env("BLOCK", block);
-    let mut pane = TerminalPane::spawn_shell_or_command(
-        Some(command),
-        TerminalPaneOptions {
-            size: TerminalSize {
-                rows: 12,
-                cols: 240,
-            },
-            scrollback_lines: 200,
-            ..Default::default()
-        },
-    )
-    .expect("spawn test pty");
-    // Drive the PTY to completion, draining its output into the scrollback.
-    let mut exited = false;
-    for _ in 0..400 {
-        let _ = pane.drain_output();
-        if matches!(pane.try_wait(), Ok(Some(_))) {
-            for _ in 0..64 {
-                let had = !pane.drain_output().is_empty();
-                if !had {
-                    break;
-                }
-            }
-            exited = true;
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
-    assert!(exited, "worker pty exited");
-    assert!(
-        pane.output_log_snapshot().contains("RUDDER_DONE_END"),
-        "the done block reached the scrollback: {:?}",
-        pane.output_log_snapshot()
-    );
-
-    let repo = unique_test_repo("pty-done-ingest");
-    let mut app = App::new();
-    app.cwd = repo.clone();
-    // Hold scheduling so the grown node is not actually launched (no real worker
-    // spawn in a unit test); we only assert the DAG GREW.
-    app.awaiting_approval = true;
-    let mut worker = test_agent_run_with_terminal(&app, pane);
-    worker.id = "worker-done-1".to_string();
-    worker.node_id = Some("n0".to_string());
-    worker.mode = AgentMode::Execute;
-    worker.status = AgentStatus::Done;
-    app.agents = vec![worker];
-
-    app.maybe_ingest_worker_followups();
-
-    assert_eq!(
-        app.planned_nodes.len(),
-        1,
-        "only the in-scope follow-up is injected"
-    );
-    assert_eq!(app.planned_nodes[0].title, "wire login into router");
-    assert!(
-        app.followups_ingested.contains("worker-done-1"),
-        "the finished worker is marked ingested once"
-    );
-    // Idempotent: a second pass over the same Done worker adds nothing.
-    app.maybe_ingest_worker_followups();
-    assert_eq!(app.planned_nodes.len(), 1, "ingest is once-per-worker");
-    let _ = fs::remove_dir_all(&repo);
 }
 
 #[test]
@@ -4470,6 +4425,90 @@ fn stop_agent_frees_slot_and_keeps_workspace_for_undo() {
     // A stopped node never enters the merged set, so hard dependents stay blocked.
     assert!(!app.merged_node_ids().contains(&"n0".to_string()));
     assert!(app.activity_log.iter().any(|l| l.contains("stopped n0")));
+}
+
+#[cfg(unix)]
+#[test]
+fn external_stop_request_kills_native_pty_and_stays_cancelled() {
+    let repo = unique_test_repo("external-native-stop");
+    let mut app = App::new();
+    app.cwd = repo.clone();
+    let mut run = test_agent_run("native-stop", "long worker");
+    run.cwd = repo.clone();
+    run.status = AgentStatus::Running;
+    run.terminal = Some(
+        TerminalPane::spawn_shell_or_command(
+            Some(TerminalCommand::with_args(
+                "/bin/sh",
+                ["-c", "while :; do sleep 1; done"],
+            )),
+            TerminalPaneOptions {
+                cwd: Some(repo.clone()),
+                ..TerminalPaneOptions::default()
+            },
+        )
+        .expect("spawn native worker"),
+    );
+    let pid = run
+        .terminal
+        .as_ref()
+        .and_then(TerminalPane::child_process_id)
+        .expect("child pid");
+    save_native_run_record(&repo, &run).expect("persist native worker pid");
+    let value: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(native_run_dir(&repo, &run.id).join("run.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        value
+            .pointer("/process/controllerPid")
+            .and_then(|v| v.as_u64()),
+        Some(pid as u64),
+        "CLI stop needs the native PTY process group"
+    );
+    app.agents.push(run);
+    fs::write(stop_request_path(&repo, "native-stop"), "{}").unwrap();
+
+    app.consume_stop_requests();
+
+    assert_eq!(app.agents[0].status, AgentStatus::Stopped);
+    assert!(app.agents[0].terminal.is_none());
+    assert!(!stop_requested(&repo, "native-stop"));
+    let alive = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
+    assert!(!alive, "the PTY process group is terminated and reaped");
+}
+
+#[test]
+fn unfocused_completed_worker_exit_cannot_be_downgraded_to_failed() {
+    let repo = unique_test_repo("done-exit-stays-done");
+    let mut app = App::new();
+    app.cwd = repo.clone();
+    app.agents.push(test_agent_run("focused", "other"));
+    let mut done = test_agent_run("done", "finished turn");
+    done.cwd = repo.clone();
+    done.status = AgentStatus::Done;
+    done.last_drain_at = Some(Instant::now());
+    done.terminal = Some(
+        TerminalPane::spawn_shell_or_command(
+            Some(TerminalCommand::with_args("/bin/sh", ["-c", "exit 9"])),
+            TerminalPaneOptions {
+                cwd: Some(repo),
+                ..TerminalPaneOptions::default()
+            },
+        )
+        .expect("spawn exiting worker"),
+    );
+    app.agents.push(done);
+    app.selected_agent = 0;
+    std::thread::sleep(Duration::from_millis(30));
+
+    app.poll_agents();
+
+    assert_eq!(
+        app.agents[1].status,
+        AgentStatus::Done,
+        "process exit after turn completion is not a new failure"
+    );
 }
 
 #[test]
@@ -4920,9 +4959,7 @@ fn test_agent_run(id: &str, task: &str) -> AgentRun {
         autosteered: false,
         interactive_orchestrator: false,
         needs_permission: false,
-        permission_notified: false,
         needs_user_input: false,
-        user_input_notified: false,
         last_error: None,
         worker_input_draft: String::new(),
         worker_input_cursor: 0,
@@ -4935,7 +4972,6 @@ fn test_agent_run(id: &str, task: &str) -> AgentRun {
         reconcile_planner: false,
         plan_stream: None,
         last_worker_input_at: None,
-        ready_since: None,
         merge_resolver: false,
         merge_conflict: false,
         merge_conflict_operation: ConflictOperation::Merge,
@@ -6148,9 +6184,7 @@ fn delete_agent_requires_second_d() {
         autosteered: false,
         interactive_orchestrator: false,
         needs_permission: false,
-        permission_notified: false,
         needs_user_input: false,
-        user_input_notified: false,
         last_error: None,
         worker_input_draft: String::new(),
         worker_input_cursor: 0,
@@ -6163,7 +6197,6 @@ fn delete_agent_requires_second_d() {
         reconcile_planner: false,
         plan_stream: None,
         last_worker_input_at: None,
-        ready_since: None,
         merge_resolver: false,
         merge_conflict: false,
         merge_conflict_operation: ConflictOperation::Merge,
@@ -7503,6 +7536,11 @@ fn poll_loop_consumes_the_official_done_signal_for_a_live_worker() {
         return; // no HOME in this env; signal path is unavailable
     };
     let _ = std::fs::remove_file(&sig);
+    let wiring = crate::signals::prepare_worker_signals("sig-worker-itest", Backend::Claude);
+    assert!(
+        wiring.claude_settings.is_some(),
+        "signal wiring is required"
+    );
 
     let mut app = App::new();
     app.cwd = std::env::temp_dir();
@@ -7556,8 +7594,8 @@ fn poll_loop_consumes_the_official_done_signal_for_a_live_worker() {
 fn wired_worker_waits_for_the_signal_and_ignores_idle_chrome() {
     // The premature-review bug: with official signals wired (its hook config on
     // disk), a mid-turn idle screen — claude's "shift+tab to cycle" footer, which
-    // the scrape treats as done — must NOT flip the worker to review past
-    // READY_GRACE. Only the Stop-hook/notify signal (or process exit) may.
+    // the old scrape treated as done — must NOT flip the worker to review.
+    // Only the Stop-hook/notify signal (or process exit) may.
     let _env = env_guard();
     let home = unique_test_repo("sig-wait-home");
     let prior_home = std::env::var_os("RUDDER_HOME");
@@ -7595,9 +7633,7 @@ fn wired_worker_waits_for_the_signal_and_ignores_idle_chrome() {
     app.agents.push(run);
     app.selected_agent = 0;
 
-    // Poll past READY_GRACE (3.2s). Without the fix the idle chrome would mark it
-    // done; with the fix the wired worker waits for the signal.
-    let deadline = Instant::now() + Duration::from_millis(4500);
+    let deadline = Instant::now() + Duration::from_millis(500);
     while Instant::now() < deadline {
         app.poll_agents();
         assert_eq!(
@@ -8062,7 +8098,7 @@ fn write_rudder_context_preserves_orchestrator_plan_block() {
     )
     .unwrap();
 
-    write_rudder_context(&repo, &[], None).expect("write RUDDER.md");
+    write_rudder_context_with_history(&repo, &[], None, &[]).expect("write RUDDER.md");
     let text = fs::read_to_string(repo.join("RUDDER.md")).unwrap();
 
     assert!(text.contains("<!-- RUDDER_GENERATED_START -->"));
@@ -8087,7 +8123,7 @@ fn write_rudder_context_mirrors_shared_context_to_worktree() {
         workspace_name: None,
         jj_change_id: None,
     };
-    write_rudder_context(&repo, &[], Some(&pending)).expect("write RUDDER.md");
+    write_rudder_context_with_history(&repo, &[], Some(&pending), &[]).expect("write RUDDER.md");
 
     let root_shared = fs::read_to_string(repo.join("RUDDER_SHARED.md")).unwrap();
     let workspace_shared = fs::read_to_string(workspace.join("RUDDER_SHARED.md")).unwrap();
@@ -8114,7 +8150,7 @@ fn write_rudder_context_redacts_secret_values_in_agent_previews() {
     agent.cwd = repo.clone();
     agent.current_prompt = "keep using APIFY_TOKEN=abc1234567 for the ingest".to_string();
 
-    write_rudder_context(&repo, &[agent], None).expect("write RUDDER.md");
+    write_rudder_context_with_history(&repo, &[agent], None, &[]).expect("write RUDDER.md");
     let text = fs::read_to_string(repo.join("RUDDER.md")).unwrap();
 
     assert!(text.contains("APIFY_TOKEN=[redacted]"));
@@ -8163,7 +8199,8 @@ fn write_rudder_context_includes_global_job_snapshot() {
         jj_change_id: None,
     };
 
-    write_rudder_context(&repo, &[running, done, merged], Some(&pending)).expect("write RUDDER.md");
+    write_rudder_context_with_history(&repo, &[running, done, merged], Some(&pending), &[])
+        .expect("write RUDDER.md");
     let text = fs::read_to_string(repo.join("RUDDER.md")).unwrap();
 
     assert!(text.contains("## Global job snapshot"));
@@ -9378,7 +9415,12 @@ fn self_launch_marker_is_inert_without_flag_or_gate() {
 #[test]
 fn only_interactive_worker_modes_want_signals() {
     use crate::signals::worker_wants_signals;
-    for mode in [AgentMode::Execute, AgentMode::Main, AgentMode::ReviewAll] {
+    for mode in [
+        AgentMode::Execute,
+        AgentMode::Main,
+        AgentMode::ReviewAll,
+        AgentMode::OneOff,
+    ] {
         assert!(
             worker_wants_signals(Backend::Claude, mode),
             "{mode:?} is an interactive worker"

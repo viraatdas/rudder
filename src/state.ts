@@ -135,6 +135,10 @@ export function outputPath(repoRoot: string, runId: string): string {
   return path.join(runDir(repoRoot, runId), "output.txt");
 }
 
+export function stopRequestPath(repoRoot: string, runId: string): string {
+  return path.join(runDir(repoRoot, runId), "stop-request.json");
+}
+
 export function agentContextPath(repoRoot: string): string {
   return path.join(repoRoot, "RUDDER.md");
 }

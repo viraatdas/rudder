@@ -53,7 +53,7 @@ plus a worker image, used only when a task is handed off to the cloud.
 │   ├── src/main.rs        the App state machine + domain types + entry/run loop
 │   ├── src/render.rs      ratatui rendering: panes, prompts, layout, styles
 │   ├── src/selection.rs   mouse->coordinate mapping, selection, clipboard, cells
-│   ├── src/detect.rs      worker-output heuristics (idle/permission/prompt) — FALLBACK only
+│   ├── src/detect.rs      worker-output heuristics for permission/prompt UX (not completion)
 │   ├── src/signals.rs     official completion signals (Claude Stop hook / Codex notify) — PRIMARY
 │   ├── src/models.rs      model/effort tables, model picker, suggestion ranking
 │   ├── src/launch.rs      agent launch/resume command building, review-all runs
@@ -957,7 +957,7 @@ The planner UX went through several iterations; these are the settled decisions 
   `rudder-worker-control` skill maps natural-language pause/resume/model-switch requests to
   ordered `RUDDER_STOP` + `RUDDER_RESUME` markers for each matching live node.
 
-### 14.4b Per-agent done/idle detection: official signals, scrape as fallback (`native/src/signals.rs`)
+### 14.4b Per-agent done/idle detection: official signals only (`native/src/signals.rs`)
 The native TUI runs workers as INTERACTIVE `claude`/`codex` in a PTY (they idle between
 turns instead of exiting), so "is this turn done?" can't use process-exit. The robust answer
 is each backend's OWN lifecycle signal, NOT scraping its TUI chrome:
@@ -970,9 +970,9 @@ is each backend's OWN lifecycle signal, NOT scraping its TUI chrome:
 Both write `<rudder_home>/signals/<run_id>.json` = `{"state":"done"|"input"}`. The poll loop's
 interactive arm (`try_wait` Ok(None)) reads this as AUTHORITATIVE: `done` → `mark_run_done`
 (one-shot, cleared on consume so a later turn re-fires); `input` → `needs_user_input`. The
-`detect.rs` chrome-scrape (`terminal_looks_ready_for_input_from_lines`, idle-chrome string
-matching) is now ONLY the FALLBACK when no signal exists (older CLI versions / hooks off), so
-the change is strictly additive — worst case is today's behaviour. `augment_worker_command`
+`detect.rs` still recognizes permission and user-input prompts for ergonomics, but terminal
+chrome is never a completion source. Missing hook wiring fails visibly instead of leaving a
+worker stuck or guessing that a mid-tool lull is done. `augment_worker_command`
 wires this at the worker spawn sites (Execute/Main/ReviewAll/restart); headless planner modes
 (`-p` / `codex exec`) keep process-exit. Both hooks are validated live against the real CLIs
 (claude 2.x `Stop`, codex `agent-turn-complete`). The daemon/DAG path (`src/backends.ts`)
@@ -981,11 +981,9 @@ already used official signals: `claude -p --output-format stream-json` and `code
 
 **The wiring INVARIANT (v2.5.0, learned the hard way):** every path that (re)spawns a
 worker process MUST call `signals::augment_worker_command`. The per-run hook config file
-persists across spawns, so `worker_has_config()` stays true and the poll loop SUPPRESSES
-the scrape fallback and waits for the official signal — a relaunch that forgets the
-wiring produces a worker stuck "running" forever (until `reconcile_orphaned_runs` on
-restart). Three paths have been bitten: the conflict-resolver respawn (fixed e027f32),
-then migration-resume and re-goal (fixed 2.5.0). When adding a spawn path, wire it.
+persists across spawns. A relaunch that forgets the wiring is a lifecycle error, not a
+different detection mode. Three paths have been bitten: the conflict-resolver respawn,
+migration-resume, and re-goal. When adding a spawn path, wire it.
 Signal hygiene: hook writes are ATOMIC (`printf > tmp && mv`, v2.6.x) so the poll loop
 never reads a torn JSON, and `cleanup_run_signals` removes a run's three signal files on
 agent delete.
@@ -1018,27 +1016,25 @@ Automatic local routing misclassified too many ordinary requests. A FRESH task
   returns `OneOff` for it; leads `Bucket::ORDER`).
 ### 14.5 Conductor capabilities (BUILT vs PLANNED)
 - **Auto-expand from completion** (BUILT). A finished worker reports via **`rudder
-  done`**, and `maybe_ingest_worker_followups` → `ingest_worker_followups` →
+  done`** report, and `maybe_ingest_worker_followups` → `ingest_worker_followups` →
   `apply_worker_followups` grows the DAG from its recommended follow-ups. The report
-  travels back over **three channels of decreasing robustness**, read in order so a
-  real interactive Claude/Codex agent's report is not lost to terminal rendering:
+  travels back through one machine-readable channel:
   1. **Sidecar file (authoritative).** The launcher sets `RUDDER_DONE_FILE =
      <workspace>/.rudder/done/<node>.json` on the worker; `rudder done` writes the JSON
      note there (atomic temp+rename, `surfaces.writeCompletionNoteFile`). The conductor
      reads it straight off disk — it never passes through the agent's TUI, so it
      survives any boxing/truncation/wrapping. Keyed by node id; under the gitignored
      `.rudder/` so jj never merges it.
-  2. **PTY-scrape (fallback).** `parse_worker_done_block` scans the worker's scrollback
-     for the last `RUDDER_DONE_START..END` block (ANSI-stripped). The tail is flushed
-     before reading so an unfocused worker that printed-and-exited isn't missed.
-  3. **Haiku backstop (final).** If neither channel yielded structured follow-ups —
+  2. **Haiku backstop.** If no sidecar yielded structured follow-ups —
      including a FREEFORM prose report (`{summary: raw}` with no `followups` field) —
      `spawn_completion_backstop` runs a one-shot haiku summarizer over the worker's
      `jj_diff_text` (≤16k chars) to reconstruct the note, feeding it the agent's own
      prose. Cleanly-Done workers only (a Failed/Stopped worker's note is read but not
      backstopped, since its half-finished diff invites noise). The run is held
      `pending` (not ingested) until the summarizer returns, so it is never re-spawned.
-  An explicit empty `followups: []` is TRUSTED (no backstop). Guards in
+  `rudder done` enriches the report; it does not determine completion. Backend lifecycle
+  hooks or process exit finalize the turn automatically. An explicit empty
+  `followups: []` is TRUSTED (no backstop). Guards in
   `apply_worker_followups`: dedupe by normalized title (`followup_title_exists` checks
   queued + running), `MAX_FOLLOWUP_DEPTH = 3` via `followup_gen`, `MAX_PLAN_TASKS = 100`
   cap, soft-by-default deps (hard only with explicit deps), `scope:"out"`

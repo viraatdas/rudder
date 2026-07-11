@@ -590,6 +590,13 @@ impl TerminalPane {
     pub fn try_wait(&mut self) -> Result<Option<portable_pty::ExitStatus>> {
         self.child.try_wait().context("failed to poll child status")
     }
+
+    /// Explicitly terminate and reap the PTY process group. Lifecycle callers
+    /// use this instead of relying on Drop so the state transition and process
+    /// teardown happen in a visible, deterministic order.
+    pub fn terminate_and_wait(&mut self) {
+        self.terminate_child();
+    }
 }
 
 impl StyledTerminalCell {

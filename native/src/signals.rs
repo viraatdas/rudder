@@ -3,9 +3,7 @@
 //! Instead of SCRAPING a worker's PTY chrome to GUESS when a turn ended (the
 //! fragile string heuristics in `detect.rs`), we wire each backend's OWN
 //! lifecycle hooks to write a tiny signal file that the poll loop reads as the
-//! AUTHORITATIVE done/idle source. The PTY scrape stays only as a fallback for
-//! older CLI versions or when hooks are unavailable, so this is strictly additive
-//! (worst case = today's behaviour).
+//! AUTHORITATIVE done/idle source. Rudder never guesses completion from terminal chrome.
 //!
 //! - **Claude Code** (`code.claude.com/docs/en/hooks`): a `Stop` hook fires when
 //!   the turn ends; a `Notification` hook with matcher `idle_prompt` fires when it
@@ -59,10 +57,8 @@ pub(crate) fn signal_path(run_id: &str) -> Option<PathBuf> {
 }
 
 /// Whether official-signal hooks were wired for this run (its `--settings` /
-/// notify config file exists on disk). When true the poll loop must WAIT for the
-/// Stop hook / notify and NOT let the PTY-scrape flip the worker to review
-/// mid-turn; when false (older CLI / hooks unavailable) the scrape is the only
-/// completion source and stays active.
+/// notify config file exists on disk). Interactive workers without this wiring
+/// fail visibly instead of guessing completion from terminal output.
 pub(crate) fn worker_has_config(run_id: &str, backend: Backend) -> bool {
     let Some(dir) = signals_dir() else {
         return false;
@@ -74,8 +70,7 @@ pub(crate) fn worker_has_config(run_id: &str, backend: Backend) -> bool {
     file.exists()
 }
 
-/// Read the latest signal a worker wrote, if any. Returns None when no signal
-/// file exists (caller falls back to the PTY-scrape heuristics).
+/// Read the latest signal a worker wrote, if any.
 pub(crate) fn read_signal(run_id: &str) -> Option<SignalState> {
     let body = std::fs::read_to_string(signal_path(run_id)?).ok()?;
     parse_signal_state(&body)
@@ -205,14 +200,13 @@ pub(crate) fn worker_wants_signals(backend: Backend, mode: AgentMode) -> bool {
     let _ = backend;
     matches!(
         mode,
-        AgentMode::Execute | AgentMode::Main | AgentMode::ReviewAll
+        AgentMode::Execute | AgentMode::Main | AgentMode::ReviewAll | AgentMode::OneOff
     )
 }
 
 /// Write the per-run hook config files (clearing any stale signal from a prior
 /// turn so it can't be misread as this turn's completion) and return the launch
-/// wiring. Best-effort: on any IO failure the worker simply runs without signals
-/// and the PTY-scrape fallback takes over.
+/// wiring. The poll loop surfaces config-generation failure as a lifecycle error.
 pub(crate) fn prepare_worker_signals(run_id: &str, backend: Backend) -> WorkerSignals {
     let Some(dir) = signals_dir() else {
         return WorkerSignals::default();
@@ -269,7 +263,7 @@ fn set_executable(_path: &Path) {}
 /// Claude gets `--settings <file>` (Stop + idle Notification hooks); Codex gets a
 /// trailing `-c notify=["<script>"]` that OVERRIDES the earlier `notify=[]` baked
 /// by `push_codex_rudder_config_overrides` (last `-c` wins). No-op for non-worker
-/// modes or when config generation failed (PTY-scrape fallback then applies).
+/// modes. Config-generation failure is surfaced by the poll loop.
 pub(crate) fn augment_worker_command(
     command: &mut TerminalCommand,
     backend: Backend,

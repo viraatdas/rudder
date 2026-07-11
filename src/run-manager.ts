@@ -22,6 +22,7 @@ import {
   resolveRun,
   runDir,
   saveRunRecord,
+  stopRequestPath,
 } from "./state.js";
 import type { BackendId, EffortLevel, JsonValue, MergeStrategy, RunRecord, RudderEvent, VerificationResult } from "./types.js";
 import {
@@ -59,6 +60,7 @@ import {
   runCommand,
   shortenHome,
   textFromAssistantMessage,
+  writeJson,
 } from "./util.js";
 import { taskDisplayLabel } from "./task-summary.js";
 import { captureSharedContextFromInput, redactSharedSecretValues, SHARED_CONTEXT_FILE, syncSharedContextToWorkspaces } from "./surfaces.js";
@@ -1007,6 +1009,11 @@ export async function stopRun(runId: string, options?: { silent?: boolean }): Pr
   if (!run) {
     throw new Error(`Run not found: ${runId}`);
   }
+  // The native dashboard owns interactive PTYs in another process. Record the
+  // stop intent first so its poll loop observes cancellation before child-exit
+  // handling can classify our SIGTERM/SIGKILL as a failure. Headless workers
+  // also tolerate the marker; it is removed by the native owner when present.
+  await writeJson(stopRequestPath(repoRoot, runId), { requestedAt: nowIso() });
   await interruptWorkerAttempt(repoRoot, run);
   run.status = "cancelled";
   run.process = {

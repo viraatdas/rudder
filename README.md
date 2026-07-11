@@ -295,6 +295,9 @@ rudder sync <runId>
 rudder cleanup
 ```
 
+`rudder stop` records a durable cancellation request and terminates the native PTY process
+group. Cancellation is terminal: a resulting signal exit cannot be relabeled as a failure.
+
 ## Review
 
 Press `v` on an agent to toggle a review of its worktree, showing the run's diff.

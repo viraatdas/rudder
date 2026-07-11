@@ -252,9 +252,7 @@ pub(crate) fn create_main_agent(
         autosteered: false,
         interactive_orchestrator: false,
         needs_permission: false,
-        permission_notified: false,
         needs_user_input: false,
-        user_input_notified: false,
         last_error: None,
         worker_input_draft: String::new(),
         worker_input_cursor: 0,
@@ -267,7 +265,6 @@ pub(crate) fn create_main_agent(
         reconcile_planner: false,
         plan_stream: None,
         last_worker_input_at: None,
-        ready_since: None,
         merge_resolver: false,
         merge_conflict: false,
         merge_conflict_operation: ConflictOperation::Merge,
@@ -355,6 +352,18 @@ pub(crate) fn load_persisted_agents(repo_root: &Path) -> Vec<AgentRun> {
         true
     });
     agents
+}
+
+pub(crate) fn stop_request_path(repo_root: &Path, run_id: &str) -> PathBuf {
+    native_run_dir(repo_root, run_id).join("stop-request.json")
+}
+
+pub(crate) fn stop_requested(repo_root: &Path, run_id: &str) -> bool {
+    stop_request_path(repo_root, run_id).is_file()
+}
+
+pub(crate) fn clear_stop_request(repo_root: &Path, run_id: &str) {
+    let _ = fs::remove_file(stop_request_path(repo_root, run_id));
 }
 
 pub(crate) fn agent_from_run_record(
@@ -603,9 +612,7 @@ pub(crate) fn agent_from_run_record(
         autosteered,
         interactive_orchestrator,
         needs_permission: false,
-        permission_notified: false,
         needs_user_input: false,
-        user_input_notified: false,
         last_error: None,
         worker_input_draft: String::new(),
         worker_input_cursor: 0,
@@ -621,7 +628,6 @@ pub(crate) fn agent_from_run_record(
         reconcile_planner,
         plan_stream: None,
         last_worker_input_at: None,
-        ready_since: None,
         merge_resolver,
         merge_conflict,
         merge_conflict_operation,
@@ -723,10 +729,25 @@ pub(crate) fn save_native_run_record(repo_root: &Path, run: &AgentRun) -> Result
     let run_dir = native_run_dir(repo_root, &run.id);
     fs::create_dir_all(&run_dir)?;
     let record_path = run_dir.join("run.json");
-    let target_branch = current_branch_at(repo_root).unwrap_or_else(|| "HEAD".to_string());
-    let base_commit = git_output(repo_root, ["rev-parse", "HEAD"])
-        .map(|value| value.trim().to_string())
-        .unwrap_or_default();
+    let existing_record = fs::read_to_string(&record_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+    let target_branch = existing_record
+        .get("targetBranch")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| current_branch_at(repo_root).unwrap_or_else(|| "HEAD".to_string()));
+    let base_commit = existing_record
+        .get("baseCommit")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| {
+            git_output(repo_root, ["rev-parse", "HEAD"])
+                .map(|value| value.trim().to_string())
+                .unwrap_or_default()
+        });
     let now = now_stamp();
     let turns = run
         .turns
@@ -808,6 +829,30 @@ pub(crate) fn save_native_run_record(repo_root: &Path, run: &AgentRun) -> Result
         "planDeps": run.deps,
         "session": run.session_id.as_ref().map(|sid| serde_json::json!({ "nativeSessionId": sid })),
     });
+    // Native and TS commands share run.json. Preserve fields owned by the TS
+    // merge/undo/verifier layers instead of replacing the document with the
+    // native projection on every UI transition.
+    if let (Some(record_map), Some(existing_map)) =
+        (record.as_object_mut(), existing_record.as_object())
+    {
+        for (key, value) in existing_map {
+            record_map
+                .entry(key.clone())
+                .or_insert_with(|| value.clone());
+        }
+    }
+    if let Some(pid) = run
+        .terminal
+        .as_ref()
+        .and_then(TerminalPane::child_process_id)
+    {
+        record["process"] = serde_json::json!({
+            "pid": pid,
+            "controllerPid": pid,
+            "backendPid": pid,
+            "owner": "native-pty",
+        });
+    }
     if run.merge_conflict {
         let conflict_kind = if run.merge_conflict_operation == ConflictOperation::Rebase {
             "rebase"
@@ -823,6 +868,34 @@ pub(crate) fn save_native_run_record(repo_root: &Path, run: &AgentRun) -> Result
                     "conflictedFiles": run.merge_conflict_files,
                 }),
             );
+        }
+    } else if run.status == AgentStatus::Merged {
+        let mut merge = existing_record
+            .get("merge")
+            .cloned()
+            .filter(serde_json::Value::is_object)
+            .unwrap_or_else(|| serde_json::json!({}));
+        merge["status"] = serde_json::json!("merged");
+        if let Some(map) = merge.as_object_mut() {
+            map.remove("conflictKind");
+            map.remove("conflictedFiles");
+        }
+        record["merge"] = merge;
+    } else if let Some(map) = record.as_object_mut() {
+        // A live conflict is the only non-terminal integration state native
+        // owns. Do not retain an old conflict object after re-goal/retry.
+        if map
+            .get("merge")
+            .and_then(|value| value.get("status"))
+            .and_then(serde_json::Value::as_str)
+            == Some("conflict")
+        {
+            map.remove("merge");
+        }
+    }
+    if run.terminal.is_none() && run.status != AgentStatus::Running {
+        if let Some(map) = record.as_object_mut() {
+            map.remove("process");
         }
     }
     // Best-effort token usage captured from the backend's session log at
@@ -1822,14 +1895,6 @@ pub(crate) fn worktree_path(repo_root: &Path, run_id: &str, task: &str) -> PathB
 pub(crate) fn worktree_dir_name(run_id: &str, task: &str) -> String {
     let task_slug = slugify(task, "task");
     format!("{}-{}", task_slug, worktree_unique_suffix(run_id))
-}
-
-pub(crate) fn write_rudder_context(
-    repo_root: &Path,
-    agents: &[AgentRun],
-    pending: Option<&WorktreeInfo>,
-) -> Result<()> {
-    write_rudder_context_with_history(repo_root, agents, pending, &[])
 }
 
 /// `recent_instructions` is the tail of the user's task history (newest last):

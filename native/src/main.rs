@@ -79,25 +79,8 @@ const MAX_EVENTS_PER_FRAME: usize = 64;
 /// is cheap; the expensive part is flushing a full terminal draw. Briefly defer
 /// scroll-triggered paints so queued wheel deltas collapse into fewer flushes.
 const SCROLL_DRAW_DEFER: Duration = Duration::from_millis(8);
-/// After this brief output lull, re-check the screen for the idle prompt even if the
-/// agent is still emitting cursor-blink/animation repaints (which would otherwise
-/// keep it looking busy forever).
+/// After this brief output lull, re-check the screen for permission/user-input prompts.
 const READY_EVAL_LULL: Duration = Duration::from_millis(900);
-/// Once an agent has looked ready-for-input (idle chrome, not busy) continuously for
-/// this long, declare the turn complete. Independent of output-silence, so an idle
-/// TUI that keeps repainting is still detected as done.
-///
-/// This window must outlast the longest spinner GAP a still-working interactive agent
-/// can show. Execution agents run as interactive TUIs (not `claude -p`), and their
-/// footer chrome ("bypass permissions on (shift+tab to cycle)", the "> " prompt) is
-/// drawn persistently — even mid-turn — so the ONLY thing distinguishing busy from
-/// idle is the spinner's "esc to interrupt" line. Between steps (model done streaming
-/// a chunk, about to call a tool, waiting on a slow tool) that spinner can briefly
-/// vanish; a short grace would read that lull as "done" and, because post-completion
-/// agent output does not reopen a finished agent, leave it stuck in review while still
-/// working. Keep this comfortably longer than those gaps; the busy-spinner reopen
-/// below is the backstop if a false completion still slips through.
-const READY_GRACE: Duration = Duration::from_millis(3200);
 // Dashboard colors now live in `theme.rs` (FOCUS_COLOR, INACTIVE_COLOR, ...),
 // re-exported above so call sites are unchanged.
 const DEFAULT_WHEEL_SCROLL_ROWS: u16 = 3;
@@ -848,9 +831,7 @@ struct AgentRun {
     /// `autosteered` once a plan is captured.
     interactive_orchestrator: bool,
     needs_permission: bool,
-    permission_notified: bool,
     needs_user_input: bool,
-    user_input_notified: bool,
     last_error: Option<String>,
     worker_input_draft: String,
     worker_input_cursor: usize,
@@ -882,12 +863,6 @@ struct AgentRun {
     /// vs incidental repaint (e.g. a resize when the pane is focused). Without this,
     /// highlighting a finished agent flips it from done back to in-progress.
     last_worker_input_at: Option<Instant>,
-    /// When the agent FIRST looked ready-for-input (idle chrome present, not busy) in
-    /// the current turn. Completion is declared once it stays ready for a short grace
-    /// window, independent of output-silence — so a TUI that repaints while idle
-    /// (cursor blink/animation) is still detected as done. Reset when it looks busy
-    /// again or starts a new turn.
-    ready_since: Option<Instant>,
     /// True when this row is currently an AI merge-conflict resolver (its jj merge
     /// recorded a conflict and an agent is resolving it in place). When it finishes
     /// with no conflicts left, the merge is finalized (the node flips to Merged so
@@ -929,8 +904,8 @@ struct TaskSummaryResult {
 }
 
 /// Result of the completion-note BACKSTOP: a one-shot summarizer reconstructed a report
-/// (or not) for a worker that finished without filing one. `note` is the same JSON shape
-/// `parse_worker_done_block` yields; `None` when the summarizer failed or had nothing.
+/// (or not) for a worker that finished without filing one. `note` is the completion-note
+/// JSON shape; `None` when the summarizer failed or had nothing.
 #[derive(Debug)]
 struct CompletionSummaryResult {
     run_id: String,
@@ -2252,9 +2227,7 @@ impl App {
         if let Some(run) = self.agents.get_mut(self.selected_agent) {
             if run.needs_permission || run.needs_user_input {
                 run.needs_permission = false;
-                run.permission_notified = false;
                 run.needs_user_input = false;
-                run.user_input_notified = false;
                 self.dirty = true;
             }
         }
@@ -3052,7 +3025,6 @@ impl App {
         if let Some(run) = self.agents.get_mut(self.selected_agent) {
             run.status = AgentStatus::Running;
             run.completed_at = None;
-            run.ready_since = None;
             let _ = save_native_run_record(&cwd, run);
         }
     }
@@ -3940,11 +3912,8 @@ impl App {
             run.last_user_input_at = now;
             run.last_worker_input_at = Some(Instant::now());
             run.last_output_at = Instant::now();
-            run.ready_since = None;
             run.needs_permission = false;
-            run.permission_notified = false;
             run.needs_user_input = false;
-            run.user_input_notified = false;
             let _ = save_native_run_record(&self.cwd, run);
         }
         self.selected_agent = index;
@@ -4183,9 +4152,7 @@ impl App {
             autosteered: true,
             interactive_orchestrator: false,
             needs_permission: false,
-            permission_notified: false,
             needs_user_input: false,
-            user_input_notified: false,
             last_error: None,
             worker_input_draft: String::new(),
             worker_input_cursor: 0,
@@ -4199,7 +4166,6 @@ impl App {
             reconcile_planner: true,
             plan_stream: None,
             last_worker_input_at: None,
-            ready_since: None,
             merge_resolver: false,
             merge_conflict: false,
             merge_conflict_operation: ConflictOperation::Merge,
@@ -4308,14 +4274,13 @@ impl App {
         // the echoed block in the PTY). The path lives inside the worker's own gitignored
         // .rudder dir: writable under either backend's (here unsandboxed) Bash tool, and
         // never snapshotted into the merge. The env propagates to the `rudder done`
-        // subprocess the agent spawns. The PTY-scrape stays as a fallback.
+        // subprocess the agent spawns. A missing report is reconstructed from the diff.
         if let Some(id) = node_id.as_deref() {
             let done_file = worker_done_file(&worktree.path, id);
             command = command.with_env("RUDDER_DONE_FILE", done_file.to_string_lossy().to_string());
         }
         // Official completion signal: wire the backend's own Stop hook (Claude) /
-        // notify (Codex) so it deterministically reports turn-end, instead of
-        // relying on the PTY-scrape heuristics. Keyed by the run id the poll loop
+        // notify (Codex) so it deterministically reports turn-end. Keyed by the run id the poll loop
         // reads. See signals.rs.
         signals::augment_worker_command(&mut command, backend, AgentMode::Execute, &worktree.id);
         let options = TerminalPaneOptions {
@@ -4358,9 +4323,7 @@ impl App {
             autosteered: false,
             interactive_orchestrator: false,
             needs_permission: false,
-            permission_notified: false,
             needs_user_input: false,
-            user_input_notified: false,
             last_error: None,
             worker_input_draft: String::new(),
             worker_input_cursor: 0,
@@ -4373,7 +4336,6 @@ impl App {
             reconcile_planner: false,
             plan_stream: None,
             last_worker_input_at: None,
-            ready_since: None,
             merge_resolver: false,
             merge_conflict: false,
             merge_conflict_operation: ConflictOperation::Merge,
@@ -4506,9 +4468,7 @@ impl App {
             autosteered: true,
             interactive_orchestrator: interactive_planner,
             needs_permission: false,
-            permission_notified: false,
             needs_user_input: false,
-            user_input_notified: false,
             last_error: None,
             worker_input_draft: String::new(),
             worker_input_cursor: 0,
@@ -4521,7 +4481,6 @@ impl App {
             reconcile_planner: false,
             plan_stream: None,
             last_worker_input_at: None,
-            ready_since: None,
             merge_resolver: false,
             merge_conflict: false,
             merge_conflict_operation: ConflictOperation::Merge,
@@ -4881,9 +4840,7 @@ impl App {
                 run.autosteered = true;
                 run.interactive_orchestrator = false;
                 run.needs_permission = false;
-                run.permission_notified = false;
                 run.needs_user_input = false;
-                run.user_input_notified = false;
                 run.last_error = None;
                 let _ = save_native_run_record(&cwd, run);
                 true
@@ -5315,7 +5272,6 @@ impl App {
                 run.completed_at = None;
                 run.last_output_at = Instant::now();
                 run.needs_permission = false;
-                run.permission_notified = false;
                 run.last_error = None;
                 if !bootstrap.is_empty() {
                     let now = now_stamp();
@@ -5446,9 +5402,7 @@ impl App {
                     && !orchestrator_interactive;
                 run.interactive_orchestrator = orchestrator_interactive;
                 run.needs_permission = false;
-                run.permission_notified = false;
                 run.needs_user_input = false;
-                run.user_input_notified = false;
                 run.last_error = None;
                 self.focus = FocusPane::Worker;
                 self.worker_view = WorkerView::Terminal;
@@ -6120,9 +6074,7 @@ impl App {
             run.terminal = None;
             run.review_terminal = None;
             run.needs_permission = false;
-            run.permission_notified = false;
             run.needs_user_input = false;
-            run.user_input_notified = false;
             // Keep the record nonterminal. The cloud migration planner selects
             // running workspaces and the cloud dashboard resumes from this state.
             run.status = AgentStatus::Running;
@@ -6257,9 +6209,7 @@ impl App {
             autosteered: true,
             interactive_orchestrator: false,
             needs_permission: false,
-            permission_notified: false,
             needs_user_input: false,
-            user_input_notified: false,
             last_error: None,
             worker_input_draft: String::new(),
             worker_input_cursor: 0,
@@ -6272,7 +6222,6 @@ impl App {
             reconcile_planner: false,
             plan_stream: None,
             last_worker_input_at: None,
-            ready_since: None,
             merge_resolver: false,
             merge_conflict: false,
             merge_conflict_operation: ConflictOperation::Merge,
@@ -7458,9 +7407,7 @@ impl App {
                 run.interactive_orchestrator = true;
                 run.autosteered = false;
                 run.needs_permission = false;
-                run.permission_notified = false;
                 run.needs_user_input = false;
-                run.user_input_notified = false;
                 run.last_error = None;
                 let _ = save_native_run_record(&cwd, run);
                 self.push_activity("conductor live again: resumed after rebase".to_string());
@@ -7763,9 +7710,7 @@ impl App {
                             source: "user".to_string(),
                         });
                         run.last_user_input_at = now;
-                        run.ready_since = None;
                         run.needs_user_input = false;
-                        run.user_input_notified = false;
                         let _ = save_native_run_record(&cwd, run);
                     }
                     self.push_activity(format!("steered {label}: {instruction}"));
@@ -7918,14 +7863,13 @@ impl App {
         }
     }
 
-    /// Recover the finishing worker's completion note over the file channel (preferred)
-    /// or the PTY-scrape fallback, and append its in-scope follow-ups (deduped, depth- and
-    /// cap-guarded). If NEITHER channel produced a note, fall back to the BACKSTOP: spawn a
+    /// Recover the finishing worker's completion note from its sidecar and append its
+    /// in-scope follow-ups (deduped, depth- and cap-guarded). If no note was filed, spawn a
     /// one-shot summarizer over the worker's diff so a silent agent still advances the plan
     /// (the run is held `pending`, not marked ingested, until that result lands). Returns
     /// true only when a node was added synchronously here.
     fn ingest_worker_followups(&mut self, index: usize) -> bool {
-        let (run_id, node_id, sidecar_note, output, cwd, task, is_complete) = {
+        let (run_id, node_id, sidecar_note, cwd, task, is_complete) = {
             let Some(run) = self.agents.get_mut(index) else {
                 return false;
             };
@@ -7942,36 +7886,17 @@ impl App {
                 .then(|| worker_done_file(&run.cwd, &node_id))
                 .and_then(|path| std::fs::read_to_string(path).ok())
                 .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
-            // FALLBACK channel: scrape the echoed RUDDER_DONE block from the PTY. Flush
-            // the tail first (a worker that printed-and-exited while UNFOCUSED may have
-            // been marked Done by the cheap try_wait path without a final drain). We mark
-            // the run ingested below (once, no retry), so this is the last chance.
-            if sidecar_note.is_none() {
-                if let Some(terminal) = run.terminal.as_mut() {
-                    for _ in 0..16 {
-                        if terminal.drain_output().is_empty() {
-                            break;
-                        }
-                    }
-                }
-            }
-            let output = run
-                .terminal
-                .as_ref()
-                .map(|t| t.output_log_snapshot().to_string())
-                .unwrap_or_default();
             (
                 run.id.clone(),
                 node_id,
                 sidecar_note,
-                output,
                 run.cwd.clone(),
                 run.task_summary.clone(),
                 is_complete,
             )
         };
 
-        if let Some(note) = sidecar_note.or_else(|| parse_worker_done_block(&output)) {
+        if let Some(note) = sidecar_note {
             // A note came through a direct channel. If the agent ADDRESSED follow-ups at
             // all (a `followups` array, even empty), trust it: apply what is there and we
             // are done (an empty list is a deliberate "nothing further"). If the note never
@@ -8863,9 +8788,7 @@ impl App {
                 continue;
             }
             run.needs_permission = false;
-            run.permission_notified = false;
             run.needs_user_input = false;
-            run.user_input_notified = false;
             // CRITICAL: clear the autosteer flag now that the plan is approved.
             // The completion router in `poll_agents` (and `evaluate_completed_plan`
             // itself) only treats a Done RudderPlan run as a freshly-captured plan
@@ -9825,9 +9748,7 @@ impl App {
             autosteered: false,
             interactive_orchestrator: false,
             needs_permission: false,
-            permission_notified: false,
             needs_user_input: false,
-            user_input_notified: false,
             last_error: None,
             worker_input_draft: String::new(),
             worker_input_cursor: 0,
@@ -9840,7 +9761,6 @@ impl App {
             reconcile_planner: false,
             plan_stream: None,
             last_worker_input_at: None,
-            ready_since: None,
             merge_resolver: false,
             merge_conflict: false,
             merge_conflict_operation: ConflictOperation::Merge,
@@ -10535,11 +10455,8 @@ impl App {
                     run.session_id = new_session;
                     run.completed_at = None;
                     run.last_output_at = Instant::now();
-                    run.ready_since = None;
                     run.needs_permission = false;
-                    run.permission_notified = false;
                     run.needs_user_input = false;
-                    run.user_input_notified = false;
                     run.last_error = None;
                     run.merge_resolver = false;
                     run.merge_conflict = false;
@@ -10631,13 +10548,15 @@ impl App {
             } else {
                 Vec::new()
             };
+            if let Some(terminal) = run.terminal.as_mut() {
+                terminal.terminate_and_wait();
+            }
             run.terminal = None;
             run.review_terminal = None;
-            run.status = if was_conflict_resolver {
-                AgentStatus::Done
-            } else {
-                AgentStatus::Stopped
-            };
+            // User cancellation is absorbing. Integration conflict remains a
+            // separate durable fact, so a stopped resolver can still be resumed
+            // without lying that the process completed successfully.
+            run.status = AgentStatus::Stopped;
             run.completed_at = Some(Instant::now());
             run.merge_resolver = false;
             if was_conflict_resolver {
@@ -10648,9 +10567,7 @@ impl App {
                 }
             }
             run.needs_permission = false;
-            run.permission_notified = false;
             run.needs_user_input = false;
-            run.user_input_notified = false;
             let _ = save_native_run_record(&cwd, run);
             (
                 run.node_id.clone().unwrap_or_else(|| run.id.clone()),
@@ -10667,6 +10584,28 @@ impl App {
         self.push_activity(format!("stopped {label}"));
         self.mirror_graph();
         true
+    }
+
+    fn consume_stop_requests(&mut self) {
+        let requested: Vec<usize> = self
+            .agents
+            .iter()
+            .enumerate()
+            .filter(|(_, run)| {
+                run.status == AgentStatus::Running && stop_requested(&self.cwd, &run.id)
+            })
+            .map(|(index, _)| index)
+            .collect();
+        for index in requested {
+            let run_id = self.agents[index].id.clone();
+            self.stop_agent_at(index);
+            clear_stop_request(&self.cwd, &run_id);
+        }
+        for run in &self.agents {
+            if run.status != AgentStatus::Running && stop_requested(&self.cwd, &run.id) {
+                clear_stop_request(&self.cwd, &run.id);
+            }
+        }
     }
 
     /// AUTONOMOUS DRIFT (2c): predict cross-agent collisions and act WITHOUT a confirm
@@ -10849,9 +10788,7 @@ impl App {
                     run.completed_at = None;
                     run.last_output_at = Instant::now();
                     run.needs_permission = false;
-                    run.permission_notified = false;
                     run.needs_user_input = false;
-                    run.user_input_notified = false;
                     run.last_error = None;
                     // Track jj merge resolvers so the poll loop finalizes the merge
                     // (flip the node to Merged, unblock children) once they finish
@@ -10861,7 +10798,6 @@ impl App {
                     run.had_merge_conflict = true;
                     run.merge_conflict_operation = operation;
                     run.merge_conflict_files = conflicted_files;
-                    run.ready_since = None;
                     run.task = if original_task.is_empty() {
                         if operation == ConflictOperation::Rebase {
                             "Resolve rebase conflicts".to_string()
@@ -11137,9 +11073,7 @@ What to do\n\
                 run.merge_conflict = false;
                 run.merge_conflict_files.clear();
                 run.needs_permission = false;
-                run.permission_notified = false;
                 run.needs_user_input = false;
-                run.user_input_notified = false;
                 run.restore_pre_conflict_identity();
                 if let Some(node_id) = run.node_id.clone() {
                     merged_node_ids.push(node_id);
@@ -11161,6 +11095,9 @@ What to do\n\
         let poll_started = Instant::now();
         self.poll_task_summary_workers();
         self.poll_completion_summary_workers();
+        // Cross-process CLI stop requests are authoritative and must be consumed
+        // before try_wait can observe the resulting signal as a failed process.
+        self.consume_stop_requests();
 
         if self.last_cloud_check.elapsed() >= Duration::from_secs(2) {
             let cloud = read_cloud_summary();
@@ -11196,6 +11133,7 @@ What to do\n\
         let mut drain_perf: Vec<(Duration, serde_json::Value)> = Vec::new();
         for (index, run) in self.agents.iter_mut().enumerate() {
             let mut changed = false;
+            let is_orchestrator = run.is_orchestrator();
             let Some(terminal) = run.terminal.as_mut() else {
                 continue;
             };
@@ -11213,23 +11151,23 @@ What to do\n\
             if !due_to_drain {
                 // Skip the heavy drain+parse on unfocused panes; still keep
                 // liveness signal cheap via try_wait below.
-                if let Ok(Some(status)) = terminal.try_wait() {
-                    if status.success() {
-                        mark_run_done(run);
-                        if run.mode == AgentMode::RudderPlan && run.autosteered {
-                            completed_rudder_plans.push(index);
+                if run.status == AgentStatus::Running {
+                    if let Ok(Some(status)) = terminal.try_wait() {
+                        if status.success() {
+                            mark_run_done(run);
+                            if run.mode == AgentMode::RudderPlan && run.autosteered {
+                                completed_rudder_plans.push(index);
+                            }
+                        } else {
+                            run.status = AgentStatus::Failed;
+                            run.completed_at = Some(Instant::now());
+                            run.needs_permission = false;
+                            run.needs_user_input = false;
                         }
-                    } else {
-                        run.status = AgentStatus::Failed;
-                        run.completed_at = Some(Instant::now());
-                        run.needs_permission = false;
-                        run.permission_notified = false;
-                        run.needs_user_input = false;
-                        run.user_input_notified = false;
+                        let _ = save_native_run_record(&repo_root, run);
+                        any_dirty = true;
+                        context_dirty = true;
                     }
-                    let _ = save_native_run_record(&repo_root, run);
-                    any_dirty = true;
-                    context_dirty = true;
                 }
                 continue;
             }
@@ -11291,28 +11229,21 @@ What to do\n\
                     if user_started_new_turn || resumed_work {
                         run.status = AgentStatus::Running;
                         run.completed_at = None;
-                        run.ready_since = None;
                         changed = true;
                     }
                 }
             }
             if run.status == AgentStatus::Running {
-                // Evaluate the screen when there is activity, when we are already
-                // tracking readiness, or after a brief output lull. The lull (not a
-                // full 4s silence) is key: an idle agent whose TUI keeps repainting
-                // (cursor blink/animation) still gets re-checked, so completion no
-                // longer depends on output going fully silent.
+                // Evaluate the screen after activity or a brief lull to surface
+                // permission and user-input prompts. Completion never comes from
+                // terminal chrome; only backend lifecycle signals or process exit.
                 let lull = run.last_output_at.elapsed() >= READY_EVAL_LULL;
-                let visible_lines = if had_output
-                    || run.needs_permission
-                    || run.needs_user_input
-                    || run.ready_since.is_some()
-                    || lull
-                {
-                    Some(terminal.visible_lines_snapshot())
-                } else {
-                    None
-                };
+                let visible_lines =
+                    if had_output || run.needs_permission || run.needs_user_input || lull {
+                        Some(terminal.visible_lines_snapshot())
+                    } else {
+                        None
+                    };
                 let previous_needs_permission = run.needs_permission;
                 let previous_needs_user_input = run.needs_user_input;
                 let needs_permission = visible_lines
@@ -11323,17 +11254,11 @@ What to do\n\
                 // status label) but DO NOT ring: only entering review pings (see
                 // mark_run_done). Previously these rang on every detector flicker,
                 // which fired a ping whenever you selected a waiting agent.
-                if needs_permission {
-                    run.permission_notified = true;
-                }
                 let needs_user_input = !needs_permission
                     && visible_lines
                         .as_ref()
                         .is_some_and(|lines| terminal_needs_user_input_from_lines(lines));
                 run.needs_user_input = needs_user_input;
-                if needs_user_input {
-                    run.user_input_notified = true;
-                }
                 if run.needs_permission != previous_needs_permission
                     || run.needs_user_input != previous_needs_user_input
                 {
@@ -11343,7 +11268,6 @@ What to do\n\
                     Ok(Some(status)) => {
                         // Process exit is the most reliable signal: done if it
                         // succeeded, failed otherwise.
-                        run.ready_since = None;
                         if status.success() {
                             mark_run_done(run);
                             changed = true;
@@ -11351,9 +11275,7 @@ What to do\n\
                             run.status = AgentStatus::Failed;
                             run.completed_at = Some(Instant::now());
                             run.needs_permission = false;
-                            run.permission_notified = false;
                             run.needs_user_input = false;
-                            run.user_input_notified = false;
                             changed = true;
                         };
                     }
@@ -11363,85 +11285,54 @@ What to do\n\
                         //
                         // AUTHORITATIVE: the backend's own completion signal (Claude `Stop`
                         // hook / Codex `notify`, wired in signals.rs). When present it is
-                        // deterministic — no PTY-scrape guessing — so it wins. A "done"
+                        // deterministic and does not guess from terminal chrome. A "done"
                         // signal is one-shot (cleared on consume) so a later turn of the
                         // same live agent re-fires cleanly; an "input" signal marks the
-                        // waiting state. The scrape below is the FALLBACK for older CLI
-                        // versions or when hooks are unavailable.
-                        let signal = (!run.is_orchestrator())
+                        // waiting state.
+                        let signal = (!is_orchestrator)
                             .then(|| signals::read_signal(&run.id))
                             .flatten();
                         match signal {
                             Some(signals::SignalState::Done) => {
                                 signals::clear_signal(&run.id);
-                                run.ready_since = None;
                                 mark_run_done(run);
                                 changed = true;
                             }
                             Some(signals::SignalState::Input) => {
-                                run.ready_since = None;
                                 if !run.needs_user_input {
                                     run.needs_user_input = true;
-                                    run.user_input_notified = true;
                                     changed = true;
                                 }
                             }
-                            None if signals::worker_has_config(&run.id, run.backend) => {
-                                // Official signals ARE wired for this worker but none has
-                                // arrived yet: the turn has not ended. WAIT for the Stop
-                                // hook / notify — do NOT let the chrome-scrape flip it to
-                                // review during a mid-turn idle lull (the premature-review
-                                // bug). Completion comes only from the signal or process exit.
-                                run.ready_since = None;
-                            }
                             None => {
-                                // FALLBACK (no hooks wired — older CLI version): declare
-                                // completion once the screen has looked ready-for-input
-                                // continuously for READY_GRACE. Tracking the ready window
-                                // (not output-silence) makes this robust against a TUI that
-                                // repaints while idle. Headless planners (RudderPlan) are
-                                // excluded: their stdout is raw JSONL, not idle-chrome, and
-                                // complete via process exit only.
-                                let ready = !run.is_orchestrator()
-                                    && visible_lines.as_ref().is_some_and(|lines| {
-                                        terminal_looks_ready_for_input_from_lines(
-                                            run.backend,
-                                            lines,
-                                        )
-                                    });
-                                if ready {
-                                    let since = *run.ready_since.get_or_insert_with(Instant::now);
-                                    if since.elapsed() >= READY_GRACE {
-                                        run.ready_since = None;
-                                        mark_run_done(run);
-                                        changed = true;
-                                    }
-                                } else if visible_lines.is_some() {
-                                    // Screen is readable and NOT idle (busy or a
-                                    // prompt/permission): reset the window.
-                                    run.ready_since = None;
+                                if !is_orchestrator
+                                    && !signals::worker_has_config(&run.id, run.backend)
+                                {
+                                    terminal.terminate_and_wait();
+                                    run.status = AgentStatus::Failed;
+                                    run.completed_at = Some(Instant::now());
+                                    run.last_error = Some(
+                                        "worker lifecycle hooks were not installed; refusing to guess completion from terminal output"
+                                            .to_string(),
+                                    );
+                                    changed = true;
                                 }
                             }
                         }
                     }
                     Err(error) => {
-                        run.ready_since = None;
                         run.status = AgentStatus::Failed;
                         run.completed_at = Some(Instant::now());
                         run.last_error = Some(error.to_string());
                         run.needs_permission = false;
-                        run.permission_notified = false;
                         run.needs_user_input = false;
-                        run.user_input_notified = false;
                         changed = true;
                     }
                 }
             } else {
                 let had_waiting_state = run.needs_permission || run.needs_user_input;
                 run.needs_permission = false;
-                run.permission_notified = false;
                 run.needs_user_input = false;
-                run.user_input_notified = false;
                 if had_waiting_state {
                     changed = true;
                 }
@@ -11643,9 +11534,7 @@ What to do\n\
                 run.terminal = None;
                 run.status = AgentStatus::Running;
                 run.needs_permission = false;
-                run.permission_notified = false;
                 run.needs_user_input = false;
-                run.user_input_notified = false;
                 run.completed_at = None;
                 let _ = save_native_run_record(&self.cwd, run);
             }
@@ -12281,16 +12170,6 @@ fn reconcile_plan_queue_with_agents(snapshot: &mut PlanQueueSnapshot, agents: &[
 fn load_plan_queue(cwd: &Path) -> Option<PlanQueueSnapshot> {
     let raw = std::fs::read_to_string(cwd.join(".rudder").join("plan-queue.json")).ok()?;
     serde_json::from_str::<PlanQueueSnapshot>(&raw).ok()
-}
-
-fn parse_worker_done_block(output: &str) -> Option<serde_json::Value> {
-    const START: &str = "RUDDER_DONE_START";
-    const END: &str = "RUDDER_DONE_END";
-    let clean = strip_ansi_for_plan(output).replace('\r', "");
-    let start = clean.rfind(START)?;
-    let after = &clean[start + START.len()..];
-    let end = after.find(END)?;
-    serde_json::from_str(after[..end].trim()).ok()
 }
 
 /// True if any line of `output` is EXACTLY `RUDDER_APPROVE_PLAN` once ANSI escapes and

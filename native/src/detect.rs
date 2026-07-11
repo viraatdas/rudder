@@ -35,9 +35,7 @@ pub(crate) fn mark_run_done(run: &mut AgentRun) {
         // so telemetry has a cost signal; without this native runs report zero.
         refresh_run_token_usage(run);
         run.needs_permission = false;
-        run.permission_notified = false;
         run.needs_user_input = false;
-        run.user_input_notified = false;
         // The ONLY ping: a task entering review. Done == the review bucket, and this
         // branch fires exactly once per Running->Done transition (selection/repaint
         // never reaches here), so it rings once per agent. A genuine reopen->recomplete
