@@ -339,6 +339,18 @@ async function mergeJjRunIntoCurrentWorkspaceLocked(run: RunRecord, allowDirty: 
   }
   ensureJjRepo(run.repoRoot);
   ensureJjRepo(run.worktree.path);
+  // A resolver edits the already-created merge change in place. Once its
+  // conflicts are gone, finalize that transaction instead of creating a second
+  // merge change on top of it.
+  if (run.merge?.status === "conflict" && run.merge.mergeChangeId) {
+    const remaining = await jjConflictedFiles(run.repoRoot);
+    if (remaining.length > 0) {
+      run.merge = { ...run.merge, status: "conflict", conflictedFiles: remaining };
+      await saveRunRecord(run);
+      return run;
+    }
+    return await finalizeJjIntegration(run, run.merge.mergeChangeId);
+  }
   // Rudder writes its own files (.rudder/ is already filtered by jjStatus; RUDDER.md
   // and DECISIONS.md are the live coordination surfaces) into the main workspace
   // continuously, so they must not count as "dirty" and block a merge.
@@ -386,15 +398,8 @@ async function mergeJjRunIntoCurrentWorkspaceLocked(run: RunRecord, allowDirty: 
   }
 
   if (merge.conflictedFiles.length === 0) {
-    run.status = "merged";
-    run.merge = {
-      ...run.merge,
-      status: "merged",
-      mergeChangeId: merge.mergeChangeId,
-      operationId: merge.opId || run.merge?.operationId,
-    };
-    await saveRunRecord(run);
-    return run;
+    run.merge = { ...run.merge, operationId: merge.opId || run.merge?.operationId };
+    return await finalizeJjIntegration(run, merge.mergeChangeId);
   }
 
   run.status = "merge-conflict";
@@ -409,6 +414,75 @@ async function mergeJjRunIntoCurrentWorkspaceLocked(run: RunRecord, allowDirty: 
   };
   await saveRunRecord(run);
   return run;
+}
+
+async function finalizeJjIntegration(run: RunRecord, mergeChangeId: string): Promise<RunRecord> {
+  const targetBookmark = await integrationBookmark(run.repoRoot, run.targetBranch);
+  await createBookmark(run.repoRoot, targetBookmark, mergeChangeId);
+  await exportToGit(run.repoRoot);
+  const localCommit = await gitRevision(run.repoRoot, targetBookmark);
+  const pushed = localCommit
+    ? await remoteContainsCommit(run.repoRoot, targetBookmark, localCommit)
+    : false;
+  run.status = "merged";
+  run.merge = {
+    ...run.merge,
+    status: "merged",
+    targetBranch: targetBookmark,
+    mergeChangeId,
+    localCommit: localCommit || undefined,
+    pushed,
+    pushedAt: pushed ? new Date().toISOString() : undefined,
+    conflictedFiles: undefined,
+    conflictKind: undefined,
+    error: undefined,
+  };
+  await saveRunRecord(run);
+  return run;
+}
+
+export async function closestLocalBookmark(repoRoot: string): Promise<string> {
+  const result = await runCommand(
+    "jj",
+    ["log", "--no-graph", "-r", "heads(::@ & bookmarks())", "-T", "bookmarks ++ \"\\n\""],
+    { cwd: repoRoot, allowFailure: true },
+  );
+  if (result.code !== 0) return "";
+  const names = result.stdout
+    .split(/\s+/)
+    .map((name) => name.trim().replace(/\*$/, ""))
+    .filter((name) => name && !name.includes("@"));
+  return names.find((name) => name === "main")
+    ?? names.find((name) => name === "master")
+    ?? names[0]
+    ?? "";
+}
+
+async function integrationBookmark(repoRoot: string, recordedTarget: string): Promise<string> {
+  const candidate = recordedTarget.trim();
+  if (candidate && candidate !== "HEAD" && !/^[a-z]{12,}$/i.test(candidate) && !/^[0-9a-f]{12,}$/i.test(candidate)) {
+    return candidate;
+  }
+  return (await closestLocalBookmark(repoRoot)) || "main";
+}
+
+async function gitRevision(repoRoot: string, ref: string): Promise<string> {
+  const result = await runCommand("git", ["rev-parse", ref], { cwd: repoRoot, allowFailure: true });
+  return result.code === 0 ? result.stdout.trim() : "";
+}
+
+async function remoteContainsCommit(repoRoot: string, bookmark: string, commit: string): Promise<boolean> {
+  const remote = `origin/${bookmark}`;
+  const exists = await runCommand("git", ["rev-parse", "--verify", remote], {
+    cwd: repoRoot,
+    allowFailure: true,
+  });
+  if (exists.code !== 0) return false;
+  const contains = await runCommand("git", ["merge-base", "--is-ancestor", commit, remote], {
+    cwd: repoRoot,
+    allowFailure: true,
+  });
+  return contains.code === 0;
 }
 
 /**
@@ -491,7 +565,7 @@ export async function undoLast(repoRoot: string): Promise<void> {
  * opening a diff review, and before a PR.
  */
 export async function exportToGit(repoRoot: string): Promise<void> {
-  await runCommand("jj", ["git", "export"], { cwd: repoRoot, allowFailure: true });
+  await runCommand("jj", ["git", "export"], { cwd: repoRoot });
 }
 
 export async function createBookmark(repoRoot: string, name: string, atChangeId: string): Promise<void> {

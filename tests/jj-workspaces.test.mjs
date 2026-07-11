@@ -137,7 +137,11 @@ test("jj merge captures merge.operationId and merges cleanly", async (t) => {
   assert.equal(merged.status, "merged");
   assert.equal(merged.merge?.status, "merged");
   assert.equal(merged.merge?.operationId, "opmerge99");
+  assert.equal(merged.merge?.targetBranch, "main");
+  assert.equal(merged.merge?.pushed, false);
   assert.match(await readLog(env.log), /\|new @ sourcechange -m rudder: merge jj work/);
+  assert.match(await readLog(env.log), /\|bookmark create main -r targetchange/);
+  assert.match(await readLog(env.log), /\|git export/);
 });
 
 test("jj merge records conflicted files and mergeChangeId on conflict", async (t) => {
@@ -170,6 +174,70 @@ test("jj merge records conflicted files and mergeChangeId on conflict", async (t
   assert.equal(merged.merge?.status, "conflict");
   assert.deepEqual(merged.merge?.conflictedFiles, ["src/a.ts"]);
   assert.equal(merged.merge?.operationId, "opconflict");
+});
+
+test("resolved jj conflict finalizes the existing merge change without stacking another merge", async (t) => {
+  const env = await setupFakeJj(t);
+  const workspace = path.join(env.temp, "resolved-conflict-workspace");
+  await fsp.mkdir(path.join(workspace, ".jj"), { recursive: true });
+  process.env.JJ_SOURCE_WORKSPACE = workspace;
+  process.env.JJ_SOURCE_CHANGE = "sourcechange";
+  process.env.JJ_TARGET_CHANGE = "mergechange";
+  process.env.JJ_OP_ID = "opconflict";
+  process.env.JJ_STATUS_OUTPUT = "The working copy has no changes.\n";
+  process.env.JJ_RESOLVE_LIST = "Conflict in src/a.ts\n";
+
+  const run = await createRunRecord({
+    id: "run-resolved-conflict",
+    repoRoot: env.repo,
+    task: "resolve jj work",
+    backend: "claude",
+    targetBranch: "main",
+    baseCommit: "basechange",
+    vcs: "jj",
+    useWorktree: true,
+    worktreePath: workspace,
+    worktreeWorkspaceName: "rudder-run-resolved-conflict",
+  });
+
+  const conflicted = await mergeJjRunIntoCurrentWorkspace(run);
+  assert.equal(conflicted.status, "merge-conflict");
+  process.env.JJ_RESOLVE_LIST = "";
+  const merged = await mergeJjRunIntoCurrentWorkspace(conflicted);
+
+  assert.equal(merged.status, "merged");
+  assert.equal(merged.merge?.mergeChangeId, "mergechange");
+  const log = await readLog(env.log);
+  assert.equal(log.match(/\|new /g)?.length, 1, log);
+  assert.match(log, /\|bookmark create main -r mergechange/);
+  assert.match(log, /\|git export/);
+});
+
+test("jj export failure never records a run as merged", async (t) => {
+  const env = await setupFakeJj(t);
+  const workspace = path.join(env.temp, "export-failure-workspace");
+  await fsp.mkdir(path.join(workspace, ".jj"), { recursive: true });
+  process.env.JJ_SOURCE_WORKSPACE = workspace;
+  process.env.JJ_STATUS_OUTPUT = "The working copy has no changes.\n";
+  process.env.JJ_RESOLVE_LIST = "";
+  process.env.JJ_EXPORT_FAIL = "1";
+
+  const run = await createRunRecord({
+    id: "run-export-failure",
+    repoRoot: env.repo,
+    task: "fail export",
+    backend: "claude",
+    targetBranch: "main",
+    baseCommit: "basechange",
+    vcs: "jj",
+    useWorktree: true,
+    worktreePath: workspace,
+    worktreeWorkspaceName: "rudder-run-export-failure",
+  });
+
+  await assert.rejects(() => mergeJjRunIntoCurrentWorkspace(run), /git export exploded/);
+  const persisted = JSON.parse(await fsp.readFile(path.join(env.repo, ".rudder", "runs", run.id, "run.json"), "utf8"));
+  assert.notEqual(persisted.status, "merged");
 });
 
 test("jj merge refuses when the integration workspace already has unresolved conflicts", async (t) => {
@@ -267,6 +335,7 @@ async function setupFakeJj(t) {
     JJ_OP_STALE_ONCE: process.env.JJ_OP_STALE_ONCE,
     JJ_OP_FAIL: process.env.JJ_OP_FAIL,
     JJ_NEW_FAIL: process.env.JJ_NEW_FAIL,
+    JJ_EXPORT_FAIL: process.env.JJ_EXPORT_FAIL,
   };
 
   process.env.PATH = `${bin}:${process.env.PATH ?? ""}`;
@@ -286,6 +355,7 @@ async function setupFakeJj(t) {
   delete process.env.JJ_OP_STALE_ONCE;
   delete process.env.JJ_OP_FAIL;
   delete process.env.JJ_NEW_FAIL;
+  delete process.env.JJ_EXPORT_FAIL;
 
   t.after(async () => {
     for (const [key, value] of Object.entries(oldEnv)) {
@@ -358,6 +428,9 @@ case "\${1:-}" in
     exit 0
     ;;
   log)
+    case "$*" in
+      *heads*bookmarks*) echo "main"; exit 0 ;;
+    esac
     if [ -n "\${JJ_SOURCE_WORKSPACE:-}" ]; then
       current_pwd=$(pwd -P)
       source_pwd=$(cd "\${JJ_SOURCE_WORKSPACE}" && pwd -P)
@@ -394,6 +467,18 @@ case "\${1:-}" in
     fi
     : > "\${MARK}.merged"
     exit 0
+    ;;
+  bookmark)
+    exit 0
+    ;;
+  git)
+    if [ "\${2:-}" = "export" ]; then
+      if [ "\${JJ_EXPORT_FAIL:-0}" = "1" ]; then
+        echo "git export exploded" >&2
+        exit 42
+      fi
+      exit 0
+    fi
     ;;
   resolve)
     if [ "\${2:-}" = "--list" ]; then

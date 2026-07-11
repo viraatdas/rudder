@@ -9204,15 +9204,28 @@ impl App {
                 run.merge_resolver = false;
             }
             if conflicts.is_empty() {
-                let sources = self.agents[index].review_source_ids.clone();
-                if !self.agents[index].is_main() {
-                    self.mark_agent_and_review_sources_merged(index, sources);
+                match self.merge_agent_at(index) {
+                    Ok(()) => {
+                        finalized_any = true;
+                        self.notice = Some(format!(
+                            "resolved conflict and integrated {} locally",
+                            short_task(&label)
+                        ));
+                    }
+                    Err(error) => {
+                        if let Some(run) = self.agents.get_mut(index) {
+                            run.status = AgentStatus::Done;
+                            run.merge_conflict = true;
+                            run.had_merge_conflict = true;
+                            run.last_error = Some(error.to_string());
+                            let _ = save_native_run_record(&self.cwd, run);
+                        }
+                        self.notice = Some(format!(
+                            "resolved files but integration failed for {}: {error}",
+                            short_task(&label)
+                        ));
+                    }
                 }
-                finalized_any = true;
-                self.notice = Some(format!(
-                    "resolved conflict and merged {}",
-                    short_task(&label)
-                ));
             } else {
                 // Conflicts still remain: drop back to manual. CRUCIALLY, skip it from
                 // auto-merge — otherwise (resolver flag now cleared, status still Done) the
@@ -10986,6 +10999,17 @@ What to do\n\
                     if !remaining.is_empty() {
                         self.pending_jj_conflict = Some(remaining);
                         anyhow::bail!("jj merge created conflicts");
+                    }
+                    // The mechanical edits only clean the existing jj merge change.
+                    // Re-enter the TS merge transaction so it moves the bookmark,
+                    // exports to Git, and records durable integration evidence.
+                    match run_rudder_jj_command(&self.cwd, "merge", &run_id, "merge") {
+                        JjCliOutcome::Ok => {}
+                        JjCliOutcome::Conflict { files } => {
+                            self.pending_jj_conflict = Some(files);
+                            anyhow::bail!("jj merge still has conflicts after automatic resolution");
+                        }
+                        JjCliOutcome::Failed { error } => anyhow::bail!(error),
                     }
                 }
                 JjCliOutcome::Failed { error } => anyhow::bail!(error),

@@ -40,6 +40,7 @@ import {
 } from "./git.js";
 import {
   createRunJjWorkspace,
+  closestLocalBookmark,
   currentJjChangeId,
   ensureColocated,
   ensureJj,
@@ -873,7 +874,9 @@ async function baseRevision(repoRoot: string): Promise<string> {
 }
 
 async function targetRevision(repoRoot: string): Promise<string> {
-  return (await currentJjChangeId(repoRoot)) || (await currentBranch(repoRoot));
+  const branch = await currentBranch(repoRoot);
+  if (branch && branch !== "HEAD") return branch;
+  return (await closestLocalBookmark(repoRoot)) || "main";
 }
 
 function effortForBackend(backend: BackendId, config: Awaited<ReturnType<typeof loadConfig>>): EffortLevel | undefined {

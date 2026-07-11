@@ -234,8 +234,10 @@ Implemented in `src/run-manager.ts`.
      `jj new <into> <node>` to merge the run's change into the current change `@`.
      jj records any conflict in the merge change (`jj resolve --list`) rather than
      blocking; sets `MergeState.mergeChangeId` and `run.status` to `merged` or
-     `merge-conflict`. After a clean merge, `run-manager` calls
-     `exportToGit` (`jj git export`) so the colocated git refs stay current.
+     `merge-conflict`. A clean integration moves the target bookmark to the merge
+     change, requires `exportToGit` (`jj git export`) to succeed, and records the
+     exported Git commit plus whether `origin/<bookmark>` contains it. A resolver
+     finalizes that existing merge change instead of creating another merge on top.
    - `syncRunWorkspace(run, baseBranch)` (`jj.ts`): `jj rebase -s <node> -o <trunk>`
      (jj records conflicts in place, never blocks; no rebase-in-progress dance).
    - `removeRunWorkspace(run)` (`jj.ts`): `jj workspace forget <name>` + rm dir.

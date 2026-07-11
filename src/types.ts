@@ -355,6 +355,11 @@ export type MergeState = {
   conflictedFiles?: string[];
   operationId?: string;
   mergeChangeId?: string;
+  /** Git commit exported for the integrated jj change. */
+  localCommit?: string;
+  /** Whether the configured remote bookmark contains localCommit. */
+  pushed?: boolean;
+  pushedAt?: string;
   error?: string;
 };
 
