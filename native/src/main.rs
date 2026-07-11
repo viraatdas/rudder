@@ -495,6 +495,14 @@ struct App {
     /// into live agents as their hard deps merge and parallelism slots free.
     /// Rendered in the Todo section. A new completed plan replaces the queue.
     planned_nodes: Vec<PlannedNode>,
+    /// Durable facts for the active plan. Queue membership is not sufficient: a
+    /// crash can happen after a worker run is persisted but before the shrunken
+    /// queue is saved, and presentation cleanup may delete merged run rows.
+    plan_launched_node_ids: HashSet<String>,
+    plan_merged_node_ids: HashSet<String>,
+    /// A plan file is accepted only after an explicit new planning turn arms
+    /// capture. An empty queue/all-merged fleet is never evidence of a new plan.
+    plan_capture_armed: bool,
     /// Editable projection of `planned_nodes` while an approval-gated plan is being
     /// reviewed in the worker pane. Draft edits are committed back to
     /// `planned_nodes` only after validation, so an invalid dependency edit cannot
@@ -1135,11 +1143,12 @@ impl App {
         // Restore the approval-gate queue (queued nodes + gate state) so a mid-plan restart
         // resumes the plan instead of silently losing it. awaiting_approval is restored
         // TOGETHER with the queue, so the scheduler never launches an un-approved plan.
-        let restored_queue = if cfg!(test) {
+        let mut restored_queue = if cfg!(test) {
             PlanQueueSnapshot::default()
         } else {
             load_plan_queue(&cwd).unwrap_or_default()
         };
+        reconcile_plan_queue_with_agents(&mut restored_queue, &agents);
         let restored_plan_review = if restored_queue.awaiting_approval {
             PlanReviewState::from_planned_nodes(&restored_queue.planned_nodes)
         } else {
@@ -1178,6 +1187,9 @@ impl App {
             task_history_draft: String::new(),
             agents,
             planned_nodes: restored_queue.planned_nodes,
+            plan_launched_node_ids: restored_queue.launched_node_ids,
+            plan_merged_node_ids: restored_queue.merged_node_ids,
+            plan_capture_armed: restored_queue.capture_armed,
             plan_review: restored_plan_review,
             planned_origin: restored_queue.planned_origin,
             plan_request: restored_queue.plan_request,
@@ -1588,6 +1600,9 @@ impl App {
         // planner (plan_is_active() is now false) instead of refining the old model's
         // proposal. Persist so a restart does not reload the discarded plan.
         self.planned_nodes.clear();
+        self.plan_launched_node_ids.clear();
+        self.plan_merged_node_ids.clear();
+        self.plan_capture_armed = false;
         self.plan_review = PlanReviewState::default();
         self.awaiting_approval = false;
         self.plan_summary = None;
@@ -4422,6 +4437,9 @@ impl App {
         self.planned_origin = input.to_string();
         self.plan_summary = None;
         self.planned_nodes.clear();
+        self.plan_launched_node_ids.clear();
+        self.plan_merged_node_ids.clear();
+        self.plan_capture_armed = true;
         self.awaiting_approval = false;
         self.plan_review = PlanReviewState::default();
         self.persist_plan_queue();
@@ -6481,7 +6499,7 @@ impl App {
     /// `interactive_orchestrator` flag is authoritative for persisted rows; the App
     /// env setting only chooses the mode for fresh launches.
     fn maybe_capture_orchestrator_plan(&mut self) {
-        if self.refining || self.rebasing || self.awaiting_approval {
+        if !self.plan_capture_armed || self.refining || self.rebasing || self.awaiting_approval {
             return;
         }
         // Only capture a FRESH plan: nothing pending and no live/unmerged workers.
@@ -6508,6 +6526,9 @@ impl App {
         let nodes = self.planned_nodes_from_fresh_tasks(&tasks);
         let count = nodes.len();
         self.planned_nodes = nodes;
+        self.plan_launched_node_ids.clear();
+        self.plan_merged_node_ids.clear();
+        self.plan_capture_armed = false;
         if let Some(origin) = self.running_interactive_orchestrator_task() {
             self.plan_request = origin.clone();
             self.planned_origin = origin;
@@ -7073,6 +7094,9 @@ impl App {
         let nodes = self.planned_nodes_from_fresh_tasks(&tasks);
         let count = nodes.len();
         self.planned_nodes = nodes;
+        self.plan_launched_node_ids.clear();
+        self.plan_merged_node_ids.clear();
+        self.plan_capture_armed = false;
         // Keep planned_origin anchored to the ORIGINAL request so refine rounds (whose
         // run.task is a composite "revise this" prompt) do not overwrite it; worker
         // launch prompts and further refinements stay tied to what the user asked for.
@@ -8147,6 +8171,9 @@ impl App {
     fn persist_plan_queue(&self) {
         let snapshot = PlanQueueSnapshot {
             planned_nodes: self.planned_nodes.clone(),
+            launched_node_ids: self.plan_launched_node_ids.clone(),
+            merged_node_ids: self.plan_merged_node_ids.clone(),
+            capture_armed: self.plan_capture_armed,
             planned_origin: self.planned_origin.clone(),
             plan_request: self.plan_request.clone(),
             plan_summary: self.plan_summary.clone(),
@@ -8863,11 +8890,14 @@ impl App {
     /// Node ids of agents that have reached Merged. These satisfy hard deps and
     /// unblock dependents on the next scheduler pass.
     fn merged_node_ids(&self) -> Vec<String> {
-        self.agents
-            .iter()
-            .filter(|run| run.status == AgentStatus::Merged)
-            .filter_map(|run| run.node_id.clone())
-            .collect()
+        let mut ids = self.plan_merged_node_ids.clone();
+        ids.extend(
+            self.agents
+                .iter()
+                .filter(|run| run.status == AgentStatus::Merged)
+                .filter_map(|run| run.node_id.clone()),
+        );
+        ids.into_iter().collect()
     }
 
     /// Count of currently-running agents that were launched from a planned node.
@@ -9385,6 +9415,11 @@ impl App {
                 break;
             };
             let node = self.planned_nodes.remove(position);
+            // Persist the dequeue and at-most-once launch fact together BEFORE
+            // spawning. A crash after the worker record is written can therefore
+            // never resurrect this node from an older queue snapshot.
+            self.plan_launched_node_ids.insert(node.id.clone());
+            self.persist_plan_queue();
             let title = node.title.clone();
             let depends_on = self.dependency_context(&node);
             let prompt = planned_node_worker_prompt(&planner_task, &node, &depends_on);
@@ -9459,9 +9494,14 @@ impl App {
         }
         let merged = self.merged_node_ids();
         let plan_ids = self.known_plan_node_ids();
-        self.planned_nodes
-            .iter()
-            .position(|node| node.is_ready(&merged, &plan_ids))
+        self.planned_nodes.iter().position(|node| {
+            !self.plan_launched_node_ids.contains(&node.id)
+                && !self
+                    .agents
+                    .iter()
+                    .any(|run| run.node_id.as_deref() == Some(node.id.as_str()))
+                && node.is_ready(&merged, &plan_ids)
+        })
     }
 
     /// Every node id that belongs to the active plan: ids still queued in
@@ -9475,6 +9515,7 @@ impl App {
             .map(|node| node.id.clone())
             .collect();
         ids.extend(self.agents.iter().filter_map(|run| run.node_id.clone()));
+        ids.extend(self.plan_launched_node_ids.iter().cloned());
         ids
     }
 
@@ -11084,6 +11125,7 @@ What to do\n\
             }
         }
 
+        let mut merged_node_ids = Vec::new();
         for merge_index in merge_indices {
             if let Some(run) = self.agents.get_mut(merge_index) {
                 run.terminal = None;
@@ -11099,8 +11141,15 @@ What to do\n\
                 run.needs_user_input = false;
                 run.user_input_notified = false;
                 run.restore_pre_conflict_identity();
+                if let Some(node_id) = run.node_id.clone() {
+                    merged_node_ids.push(node_id);
+                }
                 let _ = save_native_run_record(&self.cwd, run);
             }
+        }
+        if !merged_node_ids.is_empty() {
+            self.plan_merged_node_ids.extend(merged_node_ids);
+            self.persist_plan_queue();
         }
         let _ = self.write_rudder_context_timed(None);
         // A merge is a meaningful node transition (-> merged); mirror it so the
@@ -12199,6 +12248,12 @@ struct PlanQueueSnapshot {
     #[serde(default)]
     planned_nodes: Vec<PlannedNode>,
     #[serde(default)]
+    launched_node_ids: HashSet<String>,
+    #[serde(default)]
+    merged_node_ids: HashSet<String>,
+    #[serde(default)]
+    capture_armed: bool,
+    #[serde(default)]
     planned_origin: String,
     #[serde(default)]
     plan_request: String,
@@ -12206,6 +12261,21 @@ struct PlanQueueSnapshot {
     plan_summary: Option<String>,
     #[serde(default)]
     awaiting_approval: bool,
+}
+
+fn reconcile_plan_queue_with_agents(snapshot: &mut PlanQueueSnapshot, agents: &[AgentRun]) {
+    for run in agents {
+        let Some(node_id) = run.node_id.as_ref() else {
+            continue;
+        };
+        snapshot.launched_node_ids.insert(node_id.clone());
+        if run.status == AgentStatus::Merged {
+            snapshot.merged_node_ids.insert(node_id.clone());
+        }
+    }
+    snapshot
+        .planned_nodes
+        .retain(|node| !snapshot.launched_node_ids.contains(&node.id));
 }
 
 fn load_plan_queue(cwd: &Path) -> Option<PlanQueueSnapshot> {

@@ -6726,10 +6726,38 @@ fn scheduler_respects_parallelism_cap() {
     );
     // A slot frees (one finishes): the next ready node may launch.
     app.agents[0].status = AgentStatus::Done;
-    assert!(
-        app.next_node_to_launch(2).is_some(),
-        "a freed slot lets a waiting node launch"
+    let position = app
+        .next_node_to_launch(2)
+        .expect("a freed slot lets a waiting node launch");
+    assert_eq!(
+        app.planned_nodes[position].id, "n2",
+        "the scheduler must not relaunch queued copies of existing nodes"
     );
+}
+
+#[test]
+fn startup_reconciles_queued_nodes_with_persisted_runs() {
+    let mut snapshot = PlanQueueSnapshot {
+        planned_nodes: vec![
+            test_planned_node("n0", &[]),
+            test_planned_node("n1", &["n0"]),
+        ],
+        ..PlanQueueSnapshot::default()
+    };
+    let agents = vec![node_agent("n0", AgentStatus::Merged)];
+
+    reconcile_plan_queue_with_agents(&mut snapshot, &agents);
+
+    assert_eq!(
+        snapshot
+            .planned_nodes
+            .iter()
+            .map(|node| node.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["n1"]
+    );
+    assert!(snapshot.launched_node_ids.contains("n0"));
+    assert!(snapshot.merged_node_ids.contains("n0"));
 }
 
 #[test]
@@ -6805,7 +6833,7 @@ fn plan_review_saves_inline_edits_and_blocks_invalid_deps() {
 }
 
 #[test]
-fn fresh_interactive_plan_ignores_historical_merged_nodes_and_remaps_ids() {
+fn explicitly_armed_interactive_plan_remaps_historical_node_ids() {
     let repo = unique_test_repo("fresh-plan-after-merged");
     fs::write(
         orchestrator_plan_path(&repo),
@@ -6816,6 +6844,7 @@ fn fresh_interactive_plan_ignores_historical_merged_nodes_and_remaps_ids() {
     app.cwd = repo;
     app.plan_request = "old request".to_string();
     app.planned_origin = "old request".to_string();
+    app.plan_capture_armed = true;
     app.agents.push(node_agent("n0", AgentStatus::Merged));
     let mut orch = planner_run("orch-new", false);
     orch.task = "new request".to_string();
@@ -6838,6 +6867,37 @@ fn fresh_interactive_plan_ignores_historical_merged_nodes_and_remaps_ids() {
         app.planned_nodes[1].deps,
         vec!["n0-2".to_string()],
         "intra-plan deps remap with the renamed root"
+    );
+}
+
+#[test]
+fn completed_dag_does_not_recapture_a_stale_rudder_plan() {
+    let repo = unique_test_repo("stale-plan-after-complete");
+    fs::write(
+        orchestrator_plan_path(&repo),
+        "RUDDER_PLAN_TASKS_START\n{\"tasks\":[{\"id\":\"n0\",\"title\":\"old root\",\"prompt\":\"p\",\"goal\":\"g\",\"success\":\"s\",\"deps\":[]}]}\nRUDDER_PLAN_TASKS_END\nRUDDER_APPROVE_PLAN\n",
+    )
+    .unwrap();
+    let mut app = App::new();
+    app.cwd = repo;
+    app.agents.push(node_agent("n0", AgentStatus::Merged));
+    let mut orch = planner_run("orch-old", false);
+    orch.interactive_orchestrator = true;
+    orch.status = AgentStatus::Running;
+    app.agents.push(orch);
+
+    app.maybe_capture_orchestrator_plan();
+    app.scan_orchestrator_markers();
+
+    assert!(!app.awaiting_approval);
+    assert!(app.planned_nodes.is_empty());
+    assert_eq!(
+        app.agents
+            .iter()
+            .filter(|run| run.node_id.as_deref() == Some("n0"))
+            .count(),
+        1,
+        "a consumed plan must never create a duplicate worker"
     );
 }
 
@@ -11693,6 +11753,7 @@ fn interactive_orchestrator_flag_survives_save_and_reload() {
     let mut app = App::new();
     app.cwd = repo.clone();
     app.interactive_orchestrator = false;
+    app.plan_capture_armed = true;
     let mut running = reloaded;
     running.status = AgentStatus::Running;
     app.agents.push(running);

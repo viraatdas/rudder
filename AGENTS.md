@@ -793,9 +793,14 @@ and runs them as a fleet. This section is the map of that orchestrator.
   reads it back for scheduling. They are mutually-exclusive schedulers, not duplicates —
   one runtime for live panes (Rust), one for headless/web (TS).
 
-**The scheduler: queue, gates, cadence.** `planned_nodes` IS the queue (the Todo
-section); a node is "launched" when `run_scheduler` removes it and spawns a worker
-(`AgentRun`, `Running`). `run_scheduler` runs on approval and on the
+**The scheduler: queue, ledger, gates, cadence.** `planned_nodes` is the pending queue
+(the Todo section), while `plan_launched_node_ids` and `plan_merged_node_ids` are the
+durable at-most-once facts for the active plan. A launch records the node id and persists
+the shrunken queue in one snapshot *before* spawning the worker. Startup reconciles any
+older queue snapshot against persisted `AgentRun.node_id` records, so the crash window
+between run creation and queue persistence cannot relaunch a node. Presentation cleanup
+may delete merged rows without deleting the plan's completion facts. `run_scheduler` runs
+on approval and on the
 `SCHEDULER_TICK_INTERVAL = 8`-poll-tick cadence (~260 ms), and a node leaves the queue
 only when **three gates** all pass: (1) **approval** — nothing launches while
 `awaiting_approval`; (2) **readiness** — `next_node_to_launch` picks the first node
@@ -805,8 +810,9 @@ counts satisfied, so dangling deps never deadlock; soft deps never gate); (3)
 `orchestrator.maxParallel`, default 1000). At most `MAX_LAUNCH_PER_TICK = 2` start per
 pass (each launch synchronously shells a jj-workspace setup, so launches are spread to
 keep the UI responsive); readiness is recomputed before each pick. `next_node_to_launch`
-is a **pure decision** (no side effects), which is why scheduling is deterministic and
-unit-testable without spawning PTYs. A merge flips a node to `Merged`, which satisfies
+is a **pure decision** and rejects any id already present in the durable launch ledger or
+an agent row, which is why scheduling is deterministic and unit-testable without spawning
+PTYs. A merge flips a node to `Merged`, which satisfies
 its children's hard deps so they launch on the next tick — that ripple is how the DAG
 flows. Stopping a node (`stop_agent_at`, `x`) keeps its jj workspace, frees its slot
 (`Stopped` is not counted), and never enters the merged set (hard children stay blocked).
@@ -862,7 +868,10 @@ user only ever talks to Rudder; the planner can never go off and implement on it
    updates in place (no wipe).
 5. **Approve → launch.** Empty-Enter → `approve_planned_queue` → `run_scheduler` dispatches
    ready nodes (todo → running), each in its own jj workspace. The queued plan + gate state
-   persist to `.rudder/plan-queue.json`, so a mid-plan restart resumes instead of losing it.
+   plus launched/merged node ledgers persist to `.rudder/plan-queue.json`, so a mid-plan
+   restart resumes without losing or duplicating work. Interactive plan-file capture is
+   explicitly armed only by a fresh planning turn; an empty queue/all-merged fleet never
+   causes an old `RUDDER_PLAN_TASKS` block to be interpreted as a new request.
    **Worker context at launch:** each worker gets its own checkout (hard-dep parents already
    merged into its base), `RUDDER.md` (the live agent roster) + `DECISIONS.md`, and a launch
    prompt carrying `Objective:` + `Done when:`, the original request, the node prompt, and a
