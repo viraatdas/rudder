@@ -449,8 +449,10 @@ corresponding one-shot `RUDDER_*` control markers from `RUDDER.md`.
 `v` opens a review pane showing the run's `jj diff` (`ensure_review_diff`). The old
 Hunk (`hunk diff --watch`) integration was removed in favor of native jj diff
 inspection. `R` (review-all) creates an aggregate Codex agent over all completed
-worktrees; `M` (merge-all) opens a confirmation to merge them. Review-all spins up a
-dedicated agent whose task is a `/review` over the combined diff.
+jj workspaces; `M` (merge-all) opens a confirmation to merge them. Review-all creates
+a jj aggregate change, combines each source revision into it, and runs a dedicated
+agent whose task is a `/review` over the combined diff. Native no longer creates or
+integrates Git worktree branches.
 
 ### Tests
 `native/src/app_tests.rs` holds the dashboard tests (320, plus one `#[ignore]`d live
@@ -1112,9 +1114,9 @@ Automatic local routing misclassified too many ordinary requests. A FRESH task
 - **`rudder done [--node <id>] '<json>'`** — `{summary, interfaces, followups:[{title,
   why, scope}]}` from stdin or args. `parseCompletionNoteArg` (`src/surfaces.ts`)
   accepts a bare object, a fenced ```json block, and falls back to `{summary: raw}` for
-  prose/arrays/primitives. Writes ALL THREE completion channels: the sidecar file at
-  `$RUDDER_DONE_FILE` (authoritative), a human bullet in `DECISIONS.md`, and the
-  `RUDDER_DONE` stdout block (legacy scrape). Records only; no jj. See §14.5 for how the
+  prose/arrays/primitives. Writes two durable completion channels: the sidecar file at
+  `$RUDDER_DONE_FILE` (authoritative) and a human bullet in `DECISIONS.md`. There is no
+  PTY-scrape channel. Records only; no jj. See §14.5 for how the
   conductor consumes them.
 
 ### 14.7 Merge model

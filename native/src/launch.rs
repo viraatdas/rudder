@@ -707,7 +707,10 @@ pub(crate) fn review_all_prompt(
     sources: &[ReviewAllSource],
     premerge: &ReviewAllPremerge,
 ) -> String {
-    let aggregate_branch = worktree.branch.as_deref().unwrap_or("current branch");
+    let aggregate_change = worktree
+        .jj_change_id
+        .as_deref()
+        .unwrap_or("current jj change");
     let source_lines = sources
         .iter()
         .enumerate()
@@ -718,62 +721,62 @@ pub(crate) fn review_all_prompt(
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|| "(unknown worktree path)".to_string());
             format!(
-                "{}. {} ({})\n   branch: {}\n   worktree: {}\n   task: {}",
+                "{}. {} ({})\n   jj revision: {}\n   worktree: {}\n   task: {}",
                 index + 1,
                 source.summary,
                 source.id,
-                source.branch,
+                source.revision,
                 path,
                 truncate_chars(&source.task, 220)
             )
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let merged = if premerge.merged_branches.is_empty() {
+    let merged = if premerge.merged_revisions.is_empty() {
         "- none yet".to_string()
     } else {
         premerge
-            .merged_branches
+            .merged_revisions
             .iter()
-            .map(|branch| format!("- {branch}"))
+            .map(|revision| format!("- {revision}"))
             .collect::<Vec<_>>()
             .join("\n")
     };
-    let remaining = if premerge.remaining_branches.is_empty() {
+    let remaining = if premerge.remaining_revisions.is_empty() {
         "- none".to_string()
     } else {
         premerge
-            .remaining_branches
+            .remaining_revisions
             .iter()
-            .map(|branch| format!("- {branch}"))
+            .map(|revision| format!("- {revision}"))
             .collect::<Vec<_>>()
             .join("\n")
     };
     let stopped = match (
-        premerge.stopped_branch.as_deref(),
+        premerge.stopped_revision.as_deref(),
         premerge.stopped_error.as_deref(),
     ) {
-        (Some(branch), Some(error)) => {
-            format!("Rudder stopped while merging `{branch}`:\n{error}")
+        (Some(revision), Some(error)) => {
+            format!("Rudder stopped while combining `{revision}`:\n{error}")
         }
-        _ => "No merge conflict was detected while building the aggregate branch.".to_string(),
+        _ => "No conflict was detected while building the aggregate jj change.".to_string(),
     };
 
     format!(
         "/review Review the combined Rudder agent worktree changes against `{target_ref}`.\n\
 \n\
-You are the Rudder review-all integration agent. You are running on an aggregate worktree branch that is meant to become one reviewed merge back into main.\n\
+You are the Rudder review-all integration agent. You are running in an aggregate jj workspace that will become one reviewed integration.\n\
 \n\
 Aggregate worktree\n\
 - path: {path}\n\
-- branch: {aggregate_branch}\n\
+- jj change: {aggregate_change}\n\
 - target/base ref: {target_ref}\n\
 \n\
 Source worktrees included in this review\n\
 {source_lines}\n\
 \n\
 Pre-merge state\n\
-Already merged into this aggregate branch:\n\
+Already combined into this aggregate change:\n\
 {merged}\n\
 \n\
 Still not fully merged:\n\
@@ -782,15 +785,15 @@ Still not fully merged:\n\
 {stopped}\n\
 \n\
 Instructions\n\
-1. Run `git status` first. If a merge is in progress, resolve the conflicts, `git add` the resolutions, and commit the merge.\n\
-2. Merge every branch listed under \"Still not fully merged\" into this aggregate branch, in the listed order. Resolve conflicts carefully.\n\
-3. Run the Codex `/review` flow on the combined diff against `{target_ref}`. If the slash command is unavailable, perform an equivalent code review using `git diff {target_ref}...HEAD`.\n\
+1. Run `jj status` and `jj resolve --list` first. Resolve conflicts by editing files; do not use `git add` or create commits.\n\
+2. If a revision remains under \"Still not fully merged\", report it; Rudder stopped before stacking another change on a conflict.\n\
+3. Run the Codex `/review` flow on `jj diff --from {target_ref}`. If the slash command is unavailable, perform an equivalent review manually.\n\
 4. Fix real review findings directly in this aggregate worktree. Do not edit the original source worktrees.\n\
 5. Run the relevant tests/checks for the files touched. If a check cannot run, say exactly why.\n\
-6. Do not check out `{target_ref}` and do not merge into `{target_ref}` yourself. When the aggregate branch is ready, stop and say: `Rudder review-all branch is ready; press m on this row to merge to main.`\n",
+6. Do not run jj commit/new/squash or Git branch/merge commands. When the aggregate change is ready, stop and say: `Rudder review-all change is ready; press m on this row to integrate it.`\n",
         target_ref = target_ref,
         path = worktree.path.display(),
-        aggregate_branch = aggregate_branch,
+        aggregate_change = aggregate_change,
         source_lines = source_lines,
         merged = merged,
         remaining = remaining,

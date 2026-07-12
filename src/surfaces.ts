@@ -278,12 +278,6 @@ export async function appendDecision(
   await appendDecisionsEntry(repoRoot, entry);
 }
 
-// Markers wrapping the JSON a worker's `rudder done` echoes to stdout, so the TUI
-// brain can parse the completion note out of the worker's PTY scrollback (the same
-// way it parses RUDDER_PLAN_TASKS). Kept here so both sides agree on the shape.
-export const RUDDER_DONE_START = "RUDDER_DONE_START";
-export const RUDDER_DONE_END = "RUDDER_DONE_END";
-
 /** One piece of follow-up work a finishing agent recommends. `scope: "out"` marks
  *  work outside the agent's lane (recorded but not auto-injected by the brain). */
 export type FollowupProposal = {
@@ -295,8 +289,8 @@ export type FollowupProposal = {
 };
 
 /** A worker's structured end-of-task report: what it did, the interfaces it
- *  created/assumed, and follow-up work it recommends. Appended to DECISIONS.md and
- *  echoed (RUDDER_DONE markers) so siblings AND the orchestrator pick it up. */
+ *  created/assumed, and follow-up work it recommends. Persisted to the completion
+ *  sidecar and DECISIONS.md so the orchestrator and siblings can consume it. */
 export type CompletionNote = {
   node?: string;
   summary?: string;
@@ -333,8 +327,8 @@ export function parseCompletionNoteArg(raw: string): CompletionNote {
  *  report survives however that UI boxes/truncates/wraps the echoed block in the PTY.
  *  The launcher sets RUDDER_DONE_FILE to <workspace>/.rudder/done/<node>.json and the
  *  orchestrator reads that exact path on completion. Atomic (temp + rename) so the reader
- *  never sees a partial file. Best-effort: returns false on any error (the DECISIONS.md
- *  and stdout channels still carry the note). */
+ *  never sees a partial file. Best-effort: returns false on any error (DECISIONS.md
+ *  still carries the human-readable note). */
 export async function writeCompletionNoteFile(
   doneFile: string,
   note: CompletionNote,
@@ -351,9 +345,8 @@ export async function writeCompletionNoteFile(
 }
 
 /** Append a worker's completion note to DECISIONS.md as human-legible bullets (so
- *  siblings re-reading DECISIONS.md and the board both see it). The orchestrator
- *  also reads the same note from the RUDDER_DONE block `rudder done` echoes to
- *  stdout. No jj management - just an append, exactly like appendDecision. */
+ *  siblings re-reading DECISIONS.md and the board both see it). No jj management;
+ *  this is an append exactly like appendDecision. */
 export async function appendCompletionNote(
   repoRoot: string,
   note: CompletionNote,

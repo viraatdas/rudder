@@ -198,21 +198,6 @@ fn write_config_atomically(path: &Path, config: &serde_json::Value) -> Result<()
     Ok(())
 }
 
-pub(crate) fn config_merge_strategy(config: &serde_json::Value) -> MergeStrategy {
-    config
-        .get("mergeStrategy")
-        .and_then(serde_json::Value::as_str)
-        .map(MergeStrategy::parse)
-        .unwrap_or(MergeStrategy::Merge)
-}
-
-pub(crate) fn merge_strategy() -> MergeStrategy {
-    load_rudder_config()
-        .as_ref()
-        .map(config_merge_strategy)
-        .unwrap_or(MergeStrategy::Merge)
-}
-
 /// Read `orchestrator.maxParallel` from the config, clamped to a sane range.
 /// Falls back to `DEFAULT_MAX_PARALLEL` when unset or out of range.
 pub(crate) fn config_max_parallel(config: &serde_json::Value) -> usize {

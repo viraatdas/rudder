@@ -785,27 +785,6 @@ fn worktree_dir_name_leads_with_task_slug() {
 }
 
 #[test]
-fn worktrees_live_inside_the_project_not_the_parent() {
-    // Worktrees must stay WITHIN the project so a planner/agent confined to the
-    // project never reads outside it (the source of the out-of-project permission
-    // prompt). They used to land in repo_root.parent()/.rudder-worktrees.
-    let repo = std::path::Path::new("/Users/viraat/Documents/rudder");
-    let wt = worktree_path(repo, "1779-build-thing-4029", "build a thing");
-    assert!(
-        wt.starts_with(repo),
-        "worktree is inside the project: {wt:?}"
-    );
-    assert!(
-        wt.to_string_lossy().contains("/rudder/.rudder-worktrees/"),
-        "under the project's gitignored .rudder-worktrees: {wt:?}"
-    );
-    assert!(
-        !wt.starts_with("/Users/viraat/Documents/.rudder-worktrees"),
-        "never the parent directory: {wt:?}"
-    );
-}
-
-#[test]
 fn parses_main_worktree_from_porcelain() {
     let output = "\
 worktree /repo/feature\n\
@@ -820,17 +799,6 @@ branch refs/heads/main\n";
         main_worktree_from_porcelain(output),
         Some(PathBuf::from("/repo/main"))
     );
-}
-
-#[test]
-fn merge_strategy_defaults_to_merge_and_parses_rebase() {
-    let missing = serde_json::json!({});
-    let rebase = serde_json::json!({ "mergeStrategy": "rebase" });
-    let invalid = serde_json::json!({ "mergeStrategy": "squash" });
-
-    assert_eq!(config_merge_strategy(&missing), MergeStrategy::Merge);
-    assert_eq!(config_merge_strategy(&rebase), MergeStrategy::Rebase);
-    assert_eq!(config_merge_strategy(&invalid), MergeStrategy::Merge);
 }
 
 #[test]
@@ -5868,11 +5836,11 @@ fn review_all_starts_codex_aggregate_agent() {
     let mut app = App::new();
     let mut first = test_agent_run("run-1", "first task");
     first.status = AgentStatus::Done;
-    first.worktree_branch = Some("rudder/first".to_string());
+    first.jj_change_id = Some("rudder/first".to_string());
     first.worktree_path = Some(app.cwd.join("worktree-1"));
     let mut second = test_agent_run("run-2", "second task");
     second.status = AgentStatus::Done;
-    second.worktree_branch = Some("rudder/second".to_string());
+    second.jj_change_id = Some("rudder/second".to_string());
     second.worktree_path = Some(app.cwd.join("worktree-2"));
     app.agents.push(first);
     app.agents.push(second);
@@ -5902,17 +5870,82 @@ fn review_all_starts_codex_aggregate_agent() {
         .is_some_and(|notice| notice.contains("Codex review-all")));
 }
 
+#[cfg(not(windows))]
+#[test]
+fn review_all_premerge_combines_real_jj_changes() {
+    let repo = unique_test_repo("review-all-real-jj");
+    let run = |program: &str, args: &[&str], cwd: &Path| {
+        let output = Command::new(program)
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{program} {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    run("git", &["init", "-b", "main"], &repo);
+    run("git", &["config", "user.email", "test@example.com"], &repo);
+    run("git", &["config", "user.name", "Rudder Test"], &repo);
+    fs::write(repo.join("base.txt"), "base\n").unwrap();
+    run("git", &["add", "base.txt"], &repo);
+    run("git", &["commit", "-m", "base"], &repo);
+    run("jj", &["git", "init", "--colocate", "."], &repo);
+
+    let first = prepare_jj_workspace_at(&repo, "review source one", None).unwrap();
+    fs::write(first.path.join("one.txt"), "one\n").unwrap();
+    let first_revision = jj_workspace_change_id(&first.path).unwrap();
+    let second = prepare_jj_workspace_at(&repo, "review source two", None).unwrap();
+    fs::write(second.path.join("two.txt"), "two\n").unwrap();
+    let second_revision = jj_workspace_change_id(&second.path).unwrap();
+    let aggregate = prepare_jj_workspace_at(&repo, "review aggregate", None).unwrap();
+    let sources = vec![
+        ReviewAllSource {
+            id: "one".to_string(),
+            revision: first_revision,
+            task: "one".to_string(),
+            summary: "one".to_string(),
+            worktree_path: Some(first.path),
+        },
+        ReviewAllSource {
+            id: "two".to_string(),
+            revision: second_revision,
+            task: "two".to_string(),
+            summary: "two".to_string(),
+            worktree_path: Some(second.path),
+        },
+    ];
+
+    let result = premerge_review_all_sources(&aggregate.path, &sources);
+
+    assert_eq!(result.merged_revisions.len(), 2);
+    assert!(result.stopped_revision.is_none());
+    assert_eq!(
+        fs::read_to_string(aggregate.path.join("one.txt")).unwrap(),
+        "one\n"
+    );
+    assert_eq!(
+        fs::read_to_string(aggregate.path.join("two.txt")).unwrap(),
+        "two\n"
+    );
+    assert!(jj_workspace_change_id(&aggregate.path).is_some());
+    let _ = fs::remove_dir_all(repo);
+}
+
 #[test]
 fn review_all_ignores_oneoff_agents_even_if_they_have_workspace_fields() {
     let mut app = App::new();
     let mut oneoff = test_agent_run("oneoff-1", "quick question");
     oneoff.mode = AgentMode::OneOff;
     oneoff.status = AgentStatus::Done;
-    oneoff.worktree_branch = Some("rudder/oneoff".to_string());
+    oneoff.jj_change_id = Some("rudder/oneoff".to_string());
     oneoff.worktree_path = Some(app.cwd.join("oneoff-worktree"));
     let mut run = test_agent_run("run-1", "test task");
     run.status = AgentStatus::Done;
-    run.worktree_branch = Some("rudder/test".to_string());
+    run.jj_change_id = Some("rudder/test".to_string());
     run.worktree_path = Some(app.cwd.join("worktree"));
     app.agents.push(oneoff);
     app.agents.push(run);
@@ -5929,7 +5962,7 @@ fn review_all_can_be_triggered_from_nav_mode() {
     let mut app = App::new();
     let mut run = test_agent_run("run-1", "test task");
     run.status = AgentStatus::Done;
-    run.worktree_branch = Some("rudder/test".to_string());
+    run.jj_change_id = Some("rudder/test".to_string());
     run.worktree_path = Some(app.cwd.join("worktree"));
     app.agents.push(run);
     app.selected_agent = 0;
@@ -5948,7 +5981,7 @@ fn review_all_command_starts_codex_review_agent() {
     let mut app = App::new();
     let mut run = test_agent_run("run-1", "test task");
     run.status = AgentStatus::Done;
-    run.worktree_branch = Some("rudder/test".to_string());
+    run.jj_change_id = Some("rudder/test".to_string());
     run.worktree_path = Some(app.cwd.join("worktree"));
     app.agents.push(run);
 
@@ -5977,7 +6010,7 @@ fn review_all_claimed_sources_are_not_merge_all_ready() {
     let mut app = App::new();
     let mut source = test_agent_run("run-1", "source task");
     source.status = AgentStatus::Done;
-    source.worktree_branch = Some("rudder/source".to_string());
+    source.jj_change_id = Some("rudder/source".to_string());
     source.worktree_path = Some(app.cwd.join("source"));
     let mut review = test_agent_run("review-1", "review all");
     review.mode = AgentMode::ReviewAll;
@@ -6002,10 +6035,10 @@ fn merging_review_all_row_moves_source_agents_to_merged_section() {
     let mut app = App::new();
     let mut first = test_agent_run("run-1", "first task");
     first.status = AgentStatus::Done;
-    first.worktree_branch = Some("rudder/first".to_string());
+    first.jj_change_id = Some("rudder/first".to_string());
     let mut second = test_agent_run("run-2", "second task");
     second.status = AgentStatus::Done;
-    second.worktree_branch = Some("rudder/second".to_string());
+    second.jj_change_id = Some("rudder/second".to_string());
     let mut review = test_agent_run("review-1", "review all");
     review.mode = AgentMode::ReviewAll;
     review.status = AgentStatus::Done;

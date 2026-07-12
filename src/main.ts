@@ -37,7 +37,7 @@ import {
   watchRun,
   workerRun,
 } from "./run-manager.js";
-import { appendCompletionNote, appendDecision, appendSharedContext, parseCompletionNoteArg, RUDDER_DONE_END, RUDDER_DONE_START, SHARED_CONTEXT_FILE, syncSharedContextToWorkspaces, writeCompletionNoteFile } from "./surfaces.js";
+import { appendCompletionNote, appendDecision, appendSharedContext, parseCompletionNoteArg, SHARED_CONTEXT_FILE, syncSharedContextToWorkspaces, writeCompletionNoteFile } from "./surfaces.js";
 import type { CompletionNote } from "./surfaces.js";
 import type { BackendId } from "./types.js";
 import { commandExists, isTty, MissingToolError, newRunId, runCommand } from "./util.js";
@@ -900,13 +900,12 @@ async function readPipedStdin(timeoutMs = 3000): Promise<string> {
 /** `rudder done [--node <id>] ['<json>']`: a worker's end-of-task report. Accepts
  *  a CompletionNote JSON via stdin (piped) or as the joined args; a non-JSON arg
  *  is treated as a freeform summary. The note travels back to the orchestrator over
- *  THREE channels of decreasing robustness so a real Claude/Codex worker's report is
+ *  two durable channels so a real Claude/Codex worker's report is
  *  not lost to terminal rendering:
  *    1. RUDDER_DONE_FILE (set by the launcher to <workspace>/.rudder/done/<node>.json):
  *       a machine-readable JSON drop the orchestrator reads straight off disk. This is
  *       the authoritative channel - it never passes through the agent's TUI.
  *    2. DECISIONS.md: a human-legible bullet siblings re-read.
- *    3. The RUDDER_DONE block echoed to stdout: the legacy PTY-scrape fallback.
  *  Never manages jj - just records, like `rudder remember`. */
 async function runDone(parsed: Parsed): Promise<void> {
   const repoRoot = findRepoRoot();
@@ -928,9 +927,8 @@ async function runDone(parsed: Parsed): Promise<void> {
   if (doneFile) {
     await writeCompletionNoteFile(doneFile, note);
   }
-  // (2) human-legible record + (3) PTY-scrape fallback.
+  // (2) Human-legible record for sibling agents and review history.
   await appendCompletionNote(repoRoot, note, node || "worker");
-  process.stdout.write(`${RUDDER_DONE_START}\n${JSON.stringify(note)}\n${RUDDER_DONE_END}\n`);
 }
 
 async function runPlan(task: string): Promise<void> {

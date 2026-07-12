@@ -4194,7 +4194,6 @@ pub(crate) fn wrapped_row_count(line_width: usize, width: usize) -> usize {
 
 /// Largest valid scroll offset (lines from the top) for a list of `content_rows`
 /// drawn in a `visible_height`-row viewport. Zero when everything fits.
-#[allow(dead_code)]
 pub(crate) fn orchestrator_dag_max_scroll(content_rows: usize, visible_height: usize) -> usize {
     content_rows.saturating_sub(visible_height)
 }

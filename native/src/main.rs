@@ -397,21 +397,6 @@ impl AgentStatus {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum MergeStrategy {
-    Merge,
-    Rebase,
-}
-
-impl MergeStrategy {
-    fn parse(value: &str) -> Self {
-        match value {
-            "rebase" => Self::Rebase,
-            _ => Self::Merge,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AgentMode {
     Execute,
     Plan,
@@ -767,7 +752,7 @@ enum MergeIntent {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ReviewAllSource {
     id: String,
-    branch: String,
+    revision: String,
     task: String,
     summary: String,
     worktree_path: Option<PathBuf>,
@@ -775,10 +760,10 @@ struct ReviewAllSource {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct ReviewAllPremerge {
-    merged_branches: Vec<String>,
-    stopped_branch: Option<String>,
+    merged_revisions: Vec<String>,
+    stopped_revision: Option<String>,
     stopped_error: Option<String>,
-    remaining_branches: Vec<String>,
+    remaining_revisions: Vec<String>,
 }
 
 struct MergeConflictPrompt {
@@ -961,13 +946,9 @@ impl AgentRun {
         }
     }
 
-    /// Finished worker runs are mergeable if Rudder has any integration handle for
-    /// them: legacy git worktree path/branch or jj workspace/change identity.
+    /// Finished worker runs are mergeable only with a durable jj workspace/change.
     fn has_merge_source(&self) -> bool {
-        self.worktree_path.is_some()
-            || self.worktree_branch.is_some()
-            || self.workspace_name.is_some()
-            || self.jj_change_id.is_some()
+        self.worktree_path.is_some() || self.workspace_name.is_some() || self.jj_change_id.is_some()
     }
 
     fn has_merge_conflict(&self) -> bool {
@@ -2408,10 +2389,10 @@ impl App {
             .filter(|run| !run.is_oneoff())
             .filter(|run| !claimed.contains(&run.id))
             .filter_map(|run| {
-                let branch = run.worktree_branch.clone()?;
+                let revision = run.jj_change_id.clone()?;
                 Some(ReviewAllSource {
                     id: run.id.clone(),
-                    branch,
+                    revision,
                     task: run.task.clone(),
                     summary: if run.task_summary.trim().is_empty() {
                         short_task(&run.task)
@@ -2437,13 +2418,16 @@ impl App {
         let worktree = WorktreeInfo {
             id: new_run_id("review all"),
             path: self.cwd.join(".rudder-review-all-test"),
-            branch: Some("rudder/test-review-all".to_string()),
+            branch: None,
             path_is_worktree: true,
-            workspace_name: None,
-            jj_change_id: None,
+            workspace_name: Some("rudder-test-review-all".to_string()),
+            jj_change_id: Some("review-change".to_string()),
         };
         let premerge = ReviewAllPremerge {
-            merged_branches: sources.iter().map(|source| source.branch.clone()).collect(),
+            merged_revisions: sources
+                .iter()
+                .map(|source| source.revision.clone())
+                .collect(),
             ..ReviewAllPremerge::default()
         };
         let prompt = review_all_prompt(
@@ -2464,12 +2448,6 @@ impl App {
 
     #[cfg(not(test))]
     fn start_review_all_agent(&mut self, sources: Vec<ReviewAllSource>) -> Result<()> {
-        for source in &sources {
-            if let Some(run) = self.agents.iter().find(|run| run.id == source.id) {
-                commit_pending_changes_for_run(run)?;
-            }
-        }
-
         let target_ref = current_branch_at(&self.cwd)
             .or_else(|| {
                 git_output(&self.cwd, ["rev-parse", "HEAD"])
@@ -2477,8 +2455,10 @@ impl App {
                     .map(|value| value.trim().to_string())
             })
             .unwrap_or_else(|| "HEAD".to_string());
-        let worktree = prepare_worktree(&self.cwd, "review all completed worktrees")?;
+        let mut worktree =
+            prepare_jj_workspace_at(&self.cwd, "review all completed worktrees", None)?;
         let premerge = premerge_review_all_sources(&worktree.path, &sources);
+        worktree.jj_change_id = jj_workspace_change_id(&worktree.path);
         let prompt = review_all_prompt(&target_ref, &worktree, &sources, &premerge);
         let session_id = mint_session_id_for(Backend::Codex);
         let mut command = agent_command(
@@ -9935,29 +9915,13 @@ impl App {
             self.notice = Some("selected agent has no workspace to merge".to_string());
             return;
         }
-        let pending = run
-            .worktree_path
-            .as_ref()
-            .map(|p| count_uncommitted_changes(p))
-            .unwrap_or(0);
-        let summary = if run.task_summary.trim().is_empty() {
-            short_task(&run.task)
-        } else {
-            run.task_summary.trim().to_string()
-        };
         self.delete_pending = None;
         self.merge_confirm = Some(MergeConfirmation {
             intent: MergeIntent::Selected {
                 id: run.id.clone(),
                 task: run.task.clone(),
             },
-            detail: (pending > 0).then(|| {
-                format!(
-                    "{pending} uncommitted file{plural} will be auto-committed as \"{summary}\".",
-                    plural = if pending == 1 { "" } else { "s" },
-                    summary = truncate_chars(&summary, 48),
-                )
-            }),
+            detail: None,
         });
         self.conflict_prompt = None;
         // The modal carries the question and the keys; a parallel notice would
@@ -10005,29 +9969,10 @@ impl App {
             return;
         }
 
-        let mut pending_total = 0usize;
-        let mut pending_runs = 0usize;
-        for run in &ready_runs {
-            if let Some(p) = run.worktree_path.as_ref() {
-                let c = count_uncommitted_changes(p);
-                if c > 0 {
-                    pending_total += c;
-                    pending_runs += 1;
-                }
-            }
-        }
         let ids: Vec<String> = ready_runs.iter().map(|r| r.id.clone()).collect();
         let count = ids.len();
         let labels = merge_all_labels(&ready_runs);
-        let mut detail_parts = vec![format!("Ready: {}", summarize_labels(&labels, 6))];
-        if pending_total > 0 {
-            detail_parts.push(format!(
-                "{pending_total} uncommitted file{p1} across {pending_runs} worktree{p2} will be auto-committed",
-                p1 = if pending_total == 1 { "" } else { "s" },
-                p2 = if pending_runs == 1 { "" } else { "s" },
-            ));
-        }
-        let detail = detail_parts.join(" · ");
+        let detail = format!("Ready: {}", summarize_labels(&labels, 6));
 
         let _ = count;
         self.delete_pending = None;
@@ -10072,7 +10017,7 @@ impl App {
                         "resolve the rebase conflicts in the worktree, then run git rebase --continue"
                             .to_string()
                     } else {
-                        "resolve the merge conflicts manually, then commit".to_string()
+                        "resolve the jj conflicts manually, then press m to finalize".to_string()
                     });
                 }
                 _ => {}
@@ -10195,7 +10140,7 @@ impl App {
         let mut conflict_root = self.cwd.clone();
         // jj runs report their conflicted files through pending_jj_conflict (jj
         // records conflicts in the change, not as git unmerged paths). Prefer
-        // those; fall back to git's unmerged paths for legacy git-worktree runs.
+        // those; the git query remains only for rebase conflict reporting.
         let jj_conflicts = self.pending_jj_conflict.take();
         let mut conflicts = jj_conflicts.unwrap_or_else(|| conflicted_files(&self.cwd));
         if conflicts.is_empty() {
@@ -10281,7 +10226,6 @@ impl App {
     /// success. Never re-goals the main agent or the orchestrator.
     // Wired by the autonomous drift-fix (2c) and conductor chat routing (2d); the
     // stop primitive below already has a keybinding.
-    #[allow(dead_code)]
     fn regoal_agent_at(&mut self, index: usize, new_goal: &str) -> bool {
         self.restart_agent_at(index, new_goal, None)
     }
@@ -10918,9 +10862,7 @@ What to do\n\
         ))
     }
 
-    /// A run is jj-isolated when it carries a jj workspace name or change id. New
-    /// runs are always jj; only pre-existing git-worktree runs (a git branch and
-    /// no jj workspace, e.g. the review-all aggregate) take the legacy git path.
+    /// A run is mergeable when it carries a jj workspace name or change id.
     fn run_is_jj(run: &AgentRun) -> bool {
         run.workspace_name.is_some() || run.jj_change_id.is_some()
     }
@@ -10939,7 +10881,6 @@ What to do\n\
         let is_jj = Self::run_is_jj(run);
         let review_source_ids = run.review_source_ids.clone();
         let run_id = run.id.clone();
-        let worktree_branch = run.worktree_branch.clone();
 
         if is_jj {
             if let Some(run) = self.agents.get_mut(index) {
@@ -10993,21 +10934,9 @@ What to do\n\
                 }
             }
         } else {
-            let Some(branch) = worktree_branch else {
-                anyhow::bail!("selected agent is not in a worktree");
-            };
-            commit_pending_changes_for_run(&self.agents[index])?;
-            match merge_strategy() {
-                MergeStrategy::Merge => {
-                    git_status_command(&self.cwd, &["merge", "--no-ff", &branch])?;
-                }
-                MergeStrategy::Rebase => {
-                    let base_branch =
-                        current_branch_at(&self.cwd).unwrap_or_else(|| "HEAD".to_string());
-                    rebase_worktree_onto_base(&self.cwd, &run.cwd, &base_branch)?;
-                    git_status_command(&self.cwd, &["merge", "--ff-only", &branch])?;
-                }
-            }
+            anyhow::bail!(
+                "this run predates Rudder's jj workspace model; restart it before integrating"
+            );
         }
         // Successful merge: keep the agent's row in the dashboard but flip it
         // to Merged so it appears in a dedicated section. Keep the worktree

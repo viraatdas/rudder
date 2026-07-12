@@ -812,9 +812,8 @@ pub(crate) fn save_native_run_record(repo_root: &Path, run: &AgentRun) -> Result
         })
         .collect::<Vec<_>>();
     // A run isolated in a jj workspace carries a workspace name. Those records
-    // declare `vcs:"jj"` so the TS merge/sync path routes through jj. Legacy
-    // git-worktree runs (a branch but no jj workspace, e.g. the review-all
-    // aggregate) stay `vcs:"git"` for back-compat.
+    // declare `vcs:"jj"` so the TS merge/sync path routes through jj. Old
+    // git-worktree records retain `vcs:"git"` for readable history only.
     let is_jj_run = run.workspace_name.is_some() || run.jj_change_id.is_some();
     let mut worktree = serde_json::json!({
         "enabled": run.worktree_path.is_some(),
@@ -829,7 +828,7 @@ pub(crate) fn save_native_run_record(repo_root: &Path, run: &AgentRun) -> Result
                 map.insert("jjChangeId".to_string(), serde_json::json!(change_id));
             }
         } else if let Some(branch) = run.worktree_branch.as_ref() {
-            // Only legacy git runs keep a branch field; jj runs omit it.
+            // Preserve the branch field only when rewriting an old record.
             map.insert("branch".to_string(), serde_json::json!(branch));
         }
     }
@@ -1284,56 +1283,6 @@ pub(crate) fn prepare_jj_workspace_at(
     })
 }
 
-// Live in the bin (start_review_all_agent, main.rs), but reachable only through
-// `fn main`'s event loop. In `--test` builds `fn main` is not a root, so this looks
-// unused; allow it so `cargo test` stays warning-free without deleting live code.
-#[allow(dead_code)]
-pub(crate) fn prepare_worktree(cwd: &Path, task: &str) -> Result<WorktreeInfo> {
-    let repo = dashboard_root(cwd);
-    if !is_git_repo(&repo) {
-        return Ok(WorktreeInfo::current(cwd.to_path_buf()));
-    }
-
-    let id = new_run_id(task);
-    let base_commit = git_output(&repo, ["rev-parse", "main"])
-        .or_else(|_| git_output(&repo, ["rev-parse", "HEAD"]))?;
-    let task_slug = slugify(task, "task");
-    let branch = format!("rudder/{}-{}", task_slug, worktree_unique_suffix(&id));
-    let path = worktree_path(&repo, &id, task);
-    let parent = path
-        .parent()
-        .context("worktree target has no parent directory")?;
-    fs::create_dir_all(parent)?;
-
-    let _ = Command::new("git")
-        .args(["branch", &branch, base_commit.trim()])
-        .current_dir(&repo)
-        .output();
-    let output = Command::new("git")
-        .args(["worktree", "add"])
-        .arg(&path)
-        .arg(&branch)
-        .current_dir(&repo)
-        .output()?;
-    if !output.status.success() {
-        let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        anyhow::bail!(if message.is_empty() {
-            "git worktree add failed".to_string()
-        } else {
-            message
-        });
-    }
-
-    Ok(WorktreeInfo {
-        id,
-        path,
-        branch: Some(branch),
-        path_is_worktree: true,
-        workspace_name: None,
-        jj_change_id: None,
-    })
-}
-
 pub(crate) fn repo_root(cwd: &Path) -> PathBuf {
     git_output(cwd, ["rev-parse", "--show-toplevel"])
         .map(|root| PathBuf::from(root.trim()))
@@ -1396,104 +1345,76 @@ pub(crate) fn git_output_args(cwd: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-pub(crate) fn git_status_command(cwd: &Path, args: &[&str]) -> Result<()> {
-    let output = Command::new("git").args(args).current_dir(cwd).output()?;
-    if output.status.success() {
-        return Ok(());
-    }
-    let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    anyhow::bail!(if message.is_empty() {
-        "git command failed".to_string()
-    } else {
-        message
-    });
-}
-
-pub(crate) fn rebase_worktree_onto_base(
-    repo_root: &Path,
-    worktree_path: &Path,
-    base_branch: &str,
-) -> Result<()> {
-    let base_ref = resolve_rebase_base_ref(repo_root, base_branch)?;
-    git_status_command(worktree_path, &["rebase", &base_ref])
-        .with_context(|| format!("rebase onto {base_ref} failed"))
-}
-
-pub(crate) fn resolve_rebase_base_ref(repo_root: &Path, base_branch: &str) -> Result<String> {
-    let branch = base_branch.trim();
-    if branch.is_empty() || branch == "HEAD" {
-        return current_commit_at(repo_root);
-    }
-
-    if ref_exists(repo_root, branch) {
-        return Ok(branch.to_string());
-    }
-
-    let mut fetched = false;
-    if git_status_command(repo_root, &["remote", "get-url", "origin"]).is_ok() {
-        fetched = git_status_command(repo_root, &["fetch", "origin", branch]).is_ok();
-    }
-
-    let remote_ref = format!("refs/remotes/origin/{branch}");
-    if ref_exists(repo_root, &remote_ref) {
-        return Ok(remote_ref);
-    }
-    if fetched && ref_exists(repo_root, "FETCH_HEAD") {
-        return Ok("FETCH_HEAD".to_string());
-    }
-    current_commit_at(repo_root)
-}
-
-pub(crate) fn current_commit_at(cwd: &Path) -> Result<String> {
-    git_output(cwd, ["rev-parse", "HEAD"]).map(|value| value.trim().to_string())
-}
-
-pub(crate) fn ref_exists(repo_root: &Path, reference: &str) -> bool {
-    let verify = format!("{reference}^{{commit}}");
-    git_output_args(repo_root, &["rev-parse", "--verify", &verify]).is_ok()
-}
-
-pub(crate) fn commit_pending_changes_for_run(run: &AgentRun) -> Result<()> {
-    if !has_git_changes(&run.cwd) {
-        return Ok(());
-    }
-
-    git_status_command(&run.cwd, &["add", "-A"])?;
-    let headline = if run.task_summary.trim().is_empty() {
-        short_task(&run.task)
-    } else {
-        run.task_summary.trim().to_string()
-    };
-    let message = if run.task.trim() == headline.trim() {
-        headline
-    } else {
-        format!("{headline}\n\n{}", run.task.trim())
-    };
-    git_status_command(&run.cwd, &["commit", "-m", &message])?;
-    Ok(())
-}
-
-#[cfg(not(test))]
 pub(crate) fn premerge_review_all_sources(
     cwd: &Path,
     sources: &[ReviewAllSource],
 ) -> ReviewAllPremerge {
     let mut premerge = ReviewAllPremerge::default();
     for (index, source) in sources.iter().enumerate() {
-        match git_status_command(cwd, &["merge", "--no-ff", &source.branch]) {
-            Ok(()) => premerge.merged_branches.push(source.branch.clone()),
-            Err(error) => {
-                premerge.stopped_branch = Some(source.branch.clone());
-                premerge.stopped_error = Some(error.to_string());
-                premerge.remaining_branches = sources[index..]
+        let output = Command::new("jj")
+            .args([
+                "new",
+                "@",
+                source.revision.as_str(),
+                "-m",
+                "rudder: review-all aggregate",
+            ])
+            .current_dir(cwd)
+            .stdin(Stdio::null())
+            .output();
+        match output {
+            Ok(output) if output.status.success() => {
+                premerge.merged_revisions.push(source.revision.clone());
+                let conflicts = jj_unresolved_conflicts(cwd);
+                if !conflicts.is_empty() {
+                    premerge.stopped_revision = Some(source.revision.clone());
+                    premerge.stopped_error = Some(format!(
+                        "aggregate change has conflicts in {}",
+                        conflicts.join(", ")
+                    ));
+                    premerge.remaining_revisions = sources[index + 1..]
+                        .iter()
+                        .map(|item| item.revision.clone())
+                        .collect();
+                    break;
+                }
+            }
+            Ok(output) => {
+                premerge.stopped_revision = Some(source.revision.clone());
+                premerge.stopped_error =
+                    Some(String::from_utf8_lossy(&output.stderr).trim().to_string());
+                premerge.remaining_revisions = sources[index..]
                     .iter()
-                    .map(|item| item.branch.clone())
+                    .map(|item| item.revision.clone())
+                    .collect();
+                break;
+            }
+            Err(error) => {
+                premerge.stopped_revision = Some(source.revision.clone());
+                premerge.stopped_error = Some(error.to_string());
+                premerge.remaining_revisions = sources[index..]
+                    .iter()
+                    .map(|item| item.revision.clone())
                     .collect();
                 break;
             }
         }
     }
     premerge
+}
+
+pub(crate) fn jj_workspace_change_id(cwd: &Path) -> Option<String> {
+    let output = Command::new("jj")
+        .args(["log", "--no-graph", "-r", "@", "-T", "change_id"])
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 pub(crate) fn conflicted_files(cwd: &Path) -> Vec<String> {
@@ -1924,48 +1845,6 @@ pub(crate) fn completion_sound_path() -> Option<PathBuf> {
     }
 
     candidates.into_iter().find(|path| path.is_file())
-}
-
-pub(crate) fn has_git_changes(cwd: &Path) -> bool {
-    git_output(cwd, ["status", "--short"])
-        .map(|status| !status.trim().is_empty())
-        .unwrap_or(false)
-}
-
-pub(crate) fn count_uncommitted_changes(cwd: &Path) -> usize {
-    git_output(cwd, ["status", "--short"])
-        .map(|status| {
-            status
-                .lines()
-                .filter(|line| !line.trim().is_empty())
-                .count()
-        })
-        .unwrap_or(0)
-}
-
-// Called only by prepare_worktree (above), so it shares the same `fn main`-only
-// reachability and the same test-build dead-code false positive.
-#[allow(dead_code)]
-pub(crate) fn worktree_path(repo_root: &Path, run_id: &str, task: &str) -> PathBuf {
-    // Worktrees live INSIDE the project (gitignored .rudder-worktrees/), not in the parent
-    // directory. This keeps every Rudder path within the project boundary, so a planner or
-    // agent confined to the project never reads outside it — which is what triggered
-    // Claude's "allow reading outside the project?" permission prompt.
-    let repo_name = format!(
-        "{}-{}",
-        slugify(
-            repo_root
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("repo"),
-            "repo"
-        ),
-        short_hash(&repo_root.display().to_string())
-    );
-    repo_root
-        .join(".rudder-worktrees")
-        .join(repo_name)
-        .join(worktree_dir_name(run_id, task))
 }
 
 pub(crate) fn worktree_dir_name(run_id: &str, task: &str) -> String {
