@@ -3721,7 +3721,12 @@ pub(crate) fn render_suggestions(frame: &mut Frame<'_>, task_area: Rect, app: &A
         return;
     }
 
-    let visible_count = suggestions.len().min(8);
+    let visible_count = suggestions
+        .len()
+        .min(task_area.y.saturating_sub(2).min(10) as usize);
+    if visible_count == 0 {
+        return;
+    }
     let height = (visible_count as u16).saturating_add(2);
     if task_area.y < height {
         return;
@@ -3735,6 +3740,15 @@ pub(crate) fn render_suggestions(frame: &mut Frame<'_>, task_area: Rect, app: &A
 
     let selected_index = app.picker_index.min(suggestions.len().saturating_sub(1));
     let offset = selected_index.saturating_sub(visible_count.saturating_sub(1));
+    let max_label_width = area.width.saturating_sub(8).min(32) as usize;
+    let label_width = suggestions
+        .iter()
+        .skip(offset)
+        .take(visible_count)
+        .map(|suggestion| suggestion.label.chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(max_label_width);
     let items = suggestions
         .iter()
         .skip(offset)
@@ -3748,9 +3762,10 @@ pub(crate) fn render_suggestions(frame: &mut Frame<'_>, task_area: Rect, app: &A
             } else {
                 app_style()
             };
+            let label = truncate_chars(&suggestion.label, label_width);
             ListItem::new(Line::from(vec![
                 Span::styled(marker, style),
-                Span::styled(suggestion.label.clone(), style),
+                Span::styled(format!("{label:<label_width$}"), style),
                 Span::raw("  "),
                 Span::styled(suggestion.detail.clone(), muted_style(true)),
             ]))
@@ -3758,10 +3773,19 @@ pub(crate) fn render_suggestions(frame: &mut Frame<'_>, task_area: Rect, app: &A
         .collect::<Vec<_>>();
 
     let title = if app.task_input.starts_with("/model") {
-        " model "
+        model_picker_title(
+            &app.task_input,
+            selected_index.saturating_add(1),
+            suggestions.len(),
+        )
     } else {
-        " commands "
+        format!(
+            " commands · {}/{} ",
+            selected_index.saturating_add(1),
+            suggestions.len()
+        )
     };
+    let title = truncate_chars(&title, area.width.saturating_sub(4) as usize);
     let list = List::new(items).style(app_style()).block(
         Block::default()
             .title(title)
@@ -3772,6 +3796,24 @@ pub(crate) fn render_suggestions(frame: &mut Frame<'_>, task_area: Rect, app: &A
 
     frame.render_widget(Clear, area);
     frame.render_widget(list, area);
+}
+
+pub(crate) fn model_picker_title(input: &str, selected: usize, total: usize) -> String {
+    let rest = input
+        .trim_start()
+        .strip_prefix("/model")
+        .unwrap_or_default();
+    let trailing_space = rest.ends_with(char::is_whitespace);
+    let parts = rest.split_whitespace().collect::<Vec<_>>();
+    let step = match parts.as_slice() {
+        [] => "provider".to_string(),
+        [provider] if !trailing_space => format!("provider · {provider}"),
+        [provider] => format!("{provider} · model"),
+        [provider, model] if !trailing_space => format!("{provider} · model · {model}"),
+        [provider, model] => format!("{provider} · {model} · effort"),
+        [provider, model, ..] => format!("{provider} · {model} · effort"),
+    };
+    format!(" model · {step} · {selected}/{total} ")
 }
 
 pub(crate) fn render_merge_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {

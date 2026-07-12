@@ -201,10 +201,11 @@ Merged rows show the target branch, jj/Git revision, and whether the remote cont
 
 ## Models
 
-Use `/model [provider] [model] [effort]` in the task input. Claude offers
-aliases like `sonnet`, `opus`, `haiku` (and the `[1m]` long-context variants);
-Codex offers `gpt-5.5`, `gpt-5.4-codex`, and other discovered models. `auto`
-effort means Rudder passes no override.
+Use `/model [provider] [model] [effort]` in the task input. Claude offers the
+same current aliases as Claude Code (`opus`, `fable`, `sonnet`, and `haiku`);
+the picker labels context windows such as Opus's 1M context without inventing a
+different model name. Codex offers `gpt-5.5`, `gpt-5.4-codex`, and other
+discovered models. `auto` effort means Rudder passes no override.
 
 Your last provider, model, and effort are saved in `~/.rudder/config.json` and
 reused next time. Rudder refreshes model metadata from

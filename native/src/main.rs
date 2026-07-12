@@ -2751,7 +2751,11 @@ impl App {
         self.reset_task_history_navigation();
         match suggestion.action {
             SuggestionAction::Insert(value) => {
+                let is_model_picker = value.starts_with("/model");
                 self.replace_task_input(value);
+                if is_model_picker {
+                    self.select_current_model_picker_choice();
+                }
             }
             SuggestionAction::RunCommand(value) => {
                 self.task_input.clear();
@@ -2761,10 +2765,12 @@ impl App {
             }
             SuggestionAction::ChooseModelProvider(backend) => {
                 self.replace_task_input(format!("/model {} ", backend.as_str()));
+                self.select_current_model_picker_choice();
                 self.notice = Some(format!("pick a {} model", backend.as_str()));
             }
             SuggestionAction::ChooseModel { backend, model } => {
                 self.replace_task_input(format!("/model {} {} ", backend.as_str(), model));
+                self.select_current_model_picker_choice();
                 self.notice = Some(format!("pick effort for {model}"));
             }
             SuggestionAction::SetModel {
@@ -2819,6 +2825,16 @@ impl App {
         } else {
             self.picker_index = self.picker_index.min(len - 1);
         }
+    }
+
+    fn select_current_model_picker_choice(&mut self) {
+        let suggestions = suggestions_for(self);
+        self.picker_index = suggestions
+            .iter()
+            .position(|suggestion| {
+                is_current_model_suggestion(suggestion, self.backend, &self.model, self.effort)
+            })
+            .unwrap_or(0);
     }
 
     fn handle_paste(&mut self, text: String) {
@@ -5357,6 +5373,7 @@ impl App {
             return;
         }
         self.replace_task_input("/model ".to_string());
+        self.select_current_model_picker_choice();
         self.focus = FocusPane::Task;
         self.notice = Some("pick a model for main".to_string());
     }

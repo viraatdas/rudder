@@ -142,12 +142,48 @@ pub(crate) fn suggestions_for(app: &App) -> Vec<Suggestion> {
     }
 
     if input.starts_with("/model") {
-        return model_provider_or_model_suggestions(
-            input.strip_prefix("/model").unwrap_or_default(),
-        );
+        let mut suggestions =
+            model_provider_or_model_suggestions(input.strip_prefix("/model").unwrap_or_default());
+        mark_current_model_suggestions(&mut suggestions, app.backend, &app.model, app.effort);
+        return suggestions;
     }
 
     rank_suggestions(command_suggestions(), input.trim_start_matches('/'))
+}
+
+pub(crate) fn mark_current_model_suggestions(
+    suggestions: &mut [Suggestion],
+    current_backend: Backend,
+    current_model: &str,
+    current_effort: Option<EffortLevel>,
+) {
+    for suggestion in suggestions {
+        if is_current_model_suggestion(suggestion, current_backend, current_model, current_effort)
+            && !suggestion.detail.ends_with("· current")
+        {
+            suggestion.detail.push_str(" · current");
+        }
+    }
+}
+
+pub(crate) fn is_current_model_suggestion(
+    suggestion: &Suggestion,
+    current_backend: Backend,
+    current_model: &str,
+    current_effort: Option<EffortLevel>,
+) -> bool {
+    match &suggestion.action {
+        SuggestionAction::ChooseModelProvider(backend) => *backend == current_backend,
+        SuggestionAction::ChooseModel { backend, model } => {
+            *backend == current_backend && model == current_model
+        }
+        SuggestionAction::SetModel {
+            backend,
+            model,
+            effort,
+        } => *backend == current_backend && model == current_model && *effort == current_effort,
+        _ => false,
+    }
 }
 
 pub(crate) fn rank_suggestions(suggestions: Vec<Suggestion>, query: &str) -> Vec<Suggestion> {
@@ -581,13 +617,10 @@ pub(crate) fn effort_suggestions_for(
 
 pub(crate) fn fallback_model_rows() -> Vec<(Backend, &'static str, &'static str)> {
     vec![
-        (Backend::Claude, "fable", "most capable model"),
-        (Backend::Claude, "fable[1m]", "most capable · large context"),
-        (Backend::Claude, "sonnet", "default strong model"),
-        (Backend::Claude, "sonnet[1m]", "large context"),
-        (Backend::Claude, "opus", "strongest reasoning"),
-        (Backend::Claude, "opus[1m]", "large context"),
-        (Backend::Claude, "haiku", "fast model"),
+        (Backend::Claude, "opus", "1M context · complex tasks"),
+        (Backend::Claude, "fable", "hard, long-running tasks"),
+        (Backend::Claude, "sonnet", "efficient routine tasks"),
+        (Backend::Claude, "haiku", "fastest quick answers"),
         (Backend::Claude, "claude-sonnet-4-6", "explicit id"),
         (Backend::Codex, "gpt-5.5", "latest"),
         (Backend::Codex, "gpt-5.4-codex", "coding"),
@@ -669,11 +702,24 @@ pub(crate) fn collect_provider_models(
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("")
                 .trim();
-            let detail = match (name.is_empty(), release.is_empty()) {
-                (false, false) => format!("{name} · {release}"),
-                (false, true) => name.to_string(),
-                (true, false) => release.to_string(),
-                (true, true) => "models.dev".to_string(),
+            let context = model
+                .get("limit")
+                .and_then(|limit| limit.get("context"))
+                .and_then(serde_json::Value::as_u64)
+                .map(format_context_window);
+            let detail = [
+                (!name.is_empty()).then(|| name.to_string()),
+                context,
+                (!release.is_empty()).then(|| release.to_string()),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" · ");
+            let detail = if detail.is_empty() {
+                "models.dev".to_string()
+            } else {
+                detail
             };
             (id.clone(), detail, release.to_string())
         })
@@ -691,6 +737,16 @@ pub(crate) fn collect_provider_models(
     });
     for (id, detail, _) in entries.into_iter().take(24) {
         rows.push((backend, id, detail));
+    }
+}
+
+pub(crate) fn format_context_window(tokens: u64) -> String {
+    if tokens >= 1_000_000 && tokens.is_multiple_of(1_000_000) {
+        format!("{}M context", tokens / 1_000_000)
+    } else if tokens >= 1_000 && tokens.is_multiple_of(1_000) {
+        format!("{}K context", tokens / 1_000)
+    } else {
+        format!("{tokens} context")
     }
 }
 

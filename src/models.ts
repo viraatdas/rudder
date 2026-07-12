@@ -142,7 +142,7 @@ async function discoverClaudeModelsDev(): Promise<ModelOption[]> {
   return entries.map(([id, model]) => ({
     label: id,
     value: id,
-    detail: model.name || prettyClaudeModel(id),
+    detail: modelDetail(model, prettyClaudeModel(id)),
   }));
 }
 
@@ -277,13 +277,10 @@ function isUsableTextModel(id: string, model: ModelsDevModel): boolean {
 
 function claudeCodeAliasOptions(): ModelOption[] {
   return [
-    { label: "fable", value: "fable", detail: "most capable model" },
-    { label: "fable[1m]", value: "fable[1m]", detail: "most capable · large context" },
-    { label: "sonnet", value: "sonnet" },
-    { label: "sonnet[1m]", value: "sonnet[1m]" },
-    { label: "opus", value: "opus" },
-    { label: "opus[1m]", value: "opus[1m]" },
-    { label: "haiku", value: "haiku" },
+    { label: "opus", value: "opus", detail: "1M context · complex tasks" },
+    { label: "fable", value: "fable", detail: "hard, long-running tasks" },
+    { label: "sonnet", value: "sonnet", detail: "efficient routine tasks" },
+    { label: "haiku", value: "haiku", detail: "fastest quick answers" },
   ];
 }
 
@@ -615,14 +612,21 @@ function recencyScore(model: ModelsDevModel): number {
 }
 
 function shortModelDetail(model: ModelsDevModel): string {
+  return modelDetail(model, "");
+}
+
+function modelDetail(model: ModelsDevModel, fallbackName: string): string {
   const parts: string[] = [];
-  if (model.name) {
-    parts.push(model.name);
+  if (model.name || fallbackName) {
+    parts.push(model.name || fallbackName);
   }
   if (model.limit?.context) {
-    parts.push(formatNumber(model.limit.context));
+    parts.push(`${formatNumber(model.limit.context)} context`);
   }
-  return parts.join("  ");
+  if (model.release_date) {
+    parts.push(model.release_date);
+  }
+  return parts.join(" · ");
 }
 
 function formatNumber(value: number): string {
@@ -630,7 +634,7 @@ function formatNumber(value: number): string {
     return `${Math.round(value / 100_000) / 10}M`;
   }
   if (value >= 1_000) {
-    return `${Math.round(value / 1000)}k`;
+    return `${Math.round(value / 1000)}K`;
   }
   return String(value);
 }

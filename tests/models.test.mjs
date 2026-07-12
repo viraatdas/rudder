@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { discoverModelOptions } from "../dist/models.js";
+import { discoverModelOptions, fallbackModelOptions } from "../dist/models.js";
 
 async function withTempRudderHome(t) {
   const root = await fsp.mkdtemp(path.join(os.tmpdir(), "rudder-models-"));
@@ -80,4 +80,14 @@ test("model discovery merges account-specific OpenAI and Anthropic model APIs ah
   const cache = JSON.parse(await fsp.readFile(path.join(rudderHome, "models-dev.json"), "utf8"));
   assert.ok(cache.openai.models["gpt-6-codex-preview"], "OpenAI API model is written for native task pane");
   assert.ok(cache.anthropic.models["claude-oracle-6-20260703"], "Anthropic API model is written for native task pane");
+});
+
+test("Claude fallback choices mirror Claude Code without synthetic 1m aliases", () => {
+  const options = fallbackModelOptions("claude");
+  assert.deepEqual(
+    options.map((option) => option.value),
+    [undefined, "opus", "fable", "sonnet", "haiku"],
+  );
+  assert.match(options.find((option) => option.value === "opus")?.detail ?? "", /1M context/);
+  assert.ok(!options.some((option) => option.value?.includes("[1m]")));
 });

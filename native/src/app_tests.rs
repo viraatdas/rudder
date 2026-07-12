@@ -3846,6 +3846,59 @@ fn model_picker_uses_ranked_provider_and_effort_matches() {
 }
 
 #[test]
+fn model_picker_title_shows_selection_path_and_position() {
+    assert_eq!(
+        model_picker_title("/model", 1, 2),
+        " model · provider · 1/2 "
+    );
+    assert_eq!(
+        model_picker_title("/model claude ", 2, 9),
+        " model · claude · model · 2/9 "
+    );
+    assert_eq!(
+        model_picker_title("/model claude fable ", 3, 6),
+        " model · claude · fable · effort · 3/6 "
+    );
+}
+
+#[test]
+fn model_picker_marks_and_preselects_the_current_choice() {
+    let mut app = App::new();
+    app.backend = Backend::Claude;
+    app.model = "fable".to_string();
+    app.effort = Some(EffortLevel::High);
+    app.task_input = "/model claude ".to_string();
+    app.select_current_model_picker_choice();
+
+    let suggestions = suggestions_for(&app);
+    assert_eq!(suggestions[app.picker_index].label, "fable");
+    assert!(suggestions[app.picker_index].detail.ends_with("· current"));
+
+    app.task_input = "/model claude fable ".to_string();
+    app.select_current_model_picker_choice();
+    let suggestions = suggestions_for(&app);
+    assert_eq!(suggestions[app.picker_index].label, "high");
+    assert!(suggestions[app.picker_index].detail.ends_with("· current"));
+}
+
+#[test]
+fn model_picker_render_is_scannable_and_has_no_synthetic_claude_variants() {
+    let mut app = App::new();
+    app.backend = Backend::Claude;
+    app.model = "fable".to_string();
+    app.focus = FocusPane::Task;
+    app.task_input = "/model claude ".to_string();
+    app.task_cursor = app.task_input.chars().count();
+    app.select_current_model_picker_choice();
+
+    let screen = render_screen(&mut app, 100, 40);
+    assert!(screen.contains("model · claude · model"), "{screen}");
+    assert!(screen.contains("fable"), "{screen}");
+    assert!(screen.contains("current"), "{screen}");
+    assert!(!screen.contains("[1m]"), "{screen}");
+}
+
+#[test]
 fn task_history_walks_backward_forward_and_restores_draft() {
     let history = vec![
         "first task".to_string(),
@@ -4979,11 +5032,15 @@ fn model_picker_accepts_new_claude_families_without_a_release() {
             > score_model(Backend::Claude, "haiku")
     );
 
-    // The curated aliases include fable, and it gets the full effort ladder.
+    // The curated aliases mirror Claude Code. Context is a capability label,
+    // not a synthetic second model name; manually typed legacy aliases still work.
     let rows = fallback_model_rows();
     assert!(rows
         .iter()
         .any(|(backend, model, _)| *backend == Backend::Claude && *model == "fable"));
+    assert!(!rows
+        .iter()
+        .any(|(backend, model, _)| *backend == Backend::Claude && model.contains("[1m]")));
     assert!(is_reasoning_alias(Backend::Claude, "fable[1m]"));
     assert!(effort_options_for(Backend::Claude, "fable").contains(&Some(EffortLevel::Max)));
     assert!(effort_options_for(Backend::Claude, "claude-somenewtier-6")
@@ -4999,7 +5056,7 @@ fn model_picker_lists_newest_releases_first_and_drops_dated_duplicates() {
             "claude-opus-4-5": { "name": "Claude Opus 4.5 (latest)", "release_date": "2025-11-24", "tool_call": true },
             "claude-opus-4-5-20251101": { "name": "Claude Opus 4.5", "release_date": "2025-11-24", "tool_call": true },
             "claude-sonnet-5": { "name": "Sonnet 5", "release_date": "2026-06-29", "tool_call": true },
-            "claude-fable-5": { "name": "Fable 5", "release_date": "2026-06-07", "tool_call": true },
+            "claude-fable-5": { "name": "Fable 5", "release_date": "2026-06-07", "tool_call": true, "limit": { "context": 1000000 } },
         }},
         "openai": { "models": {
             "gpt-5.5": { "name": "GPT-5.5", "release_date": "2026-04-23", "tool_call": true },
@@ -5025,6 +5082,8 @@ fn model_picker_lists_newest_releases_first_and_drops_dated_duplicates() {
     );
     // Detail carries the human name AND the release date.
     assert_eq!(rows[0].2, "Sonnet 5 · 2026-06-29");
+    assert_eq!(rows[1].2, "Fable 5 · 1M context · 2026-06-07");
+    assert_eq!(format_context_window(200_000), "200K context");
 
     let mut rows = Vec::new();
     collect_provider_models(&data, "openai", Backend::Codex, &mut rows);
@@ -5069,7 +5128,7 @@ fn model_picker_leads_with_aliases_then_explicit_ids() {
     // Friendly aliases lead (they track the newest release, like the claude
     // CLI's own picker); explicit ids follow newest-first.
     let alias_end = labels.iter().position(|l| l == "claude-sonnet-5").unwrap();
-    for alias in ["fable", "sonnet", "opus", "haiku", "fable[1m]"] {
+    for alias in ["opus", "fable", "sonnet", "haiku"] {
         let at = labels
             .iter()
             .position(|l| l == alias)
