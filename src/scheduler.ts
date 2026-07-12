@@ -159,7 +159,7 @@ export function undeliveredJudgeEdges(graph: RudderGraph): GraphEdge[] {
 /**
  * Whether a node is a fan-out variant: the `from` of at least one judge edge.
  * Such a node is never merged on its own; the judge node it feeds produces the
- * winning implementation and merges that. Used to skip variants in auto-merge.
+ * winning implementation and merges that. Used to skip variants during integration.
  */
 export function isJudgedVariant(graph: RudderGraph, id: string): boolean {
   return Object.values(graph.edges).some((edge) => edge.type === "judge" && edge.from === id);
@@ -642,7 +642,7 @@ export function withSchedulerLock<T>(repoRoot: string, fn: () => Promise<T>): Pr
  * One scheduler tick. Recompute each scheduled node's status from its run.json,
  * read orchestrator config, hold if at capacity or over budget, else launch the
  * selectable ready nodes and deliver undelivered soft diffs. A node that just
- * reached completed (review) auto-merges when reviewGate==="auto".
+ * reached completed (review) integrates automatically.
  *
  * Public entry point: serialized against all other scheduler ops for this repo.
  * Internal callers that already hold the lock use `scheduleTickCore` directly.
@@ -653,11 +653,11 @@ export function scheduleTick(repoRoot: string, bus: RudderBus): Promise<void> {
 
 async function scheduleTickCore(repoRoot: string, bus: RudderBus): Promise<void> {
   const config = await loadConfig();
-  const orchestrator = config.orchestrator ?? { maxParallel: 1000, reviewGate: "manual" as const };
+  const orchestrator = config.orchestrator ?? { maxParallel: 1000 };
   const maxParallel = orchestrator.maxParallel ?? 1000;
   const budgetTokens = orchestrator.budget?.maxTokens;
 
-  // Recompute statuses from run.json and surface review/auto-merge transitions.
+  // Recompute statuses from run.json and surface review/integration transitions.
   const graph = await readGraph(repoRoot);
   let runningCount = 0;
   let tokensSpent = 0;
@@ -757,15 +757,13 @@ async function scheduleTickCore(repoRoot: string, bus: RudderBus): Promise<void>
     await renderLiveRudderMd(repoRoot).catch(() => undefined);
   }
 
-  // Auto-merge review nodes when the gate is auto. Skip fan-out variants (nodes
+  // Integrate review nodes. Skip fan-out variants (nodes
   // that feed a judge node via a judge edge): only the judge node merges; the
   // variants end in review, superseded by the judge's choice.
-  if (orchestrator.reviewGate === "auto") {
-    const fresh = await readGraph(repoRoot);
-    for (const node of Object.values(fresh.nodes)) {
-      if (node.status === "review" && !node.supersededBy && !isJudgedVariant(fresh, node.id)) {
-        await mergeNodeIntoIntegration(repoRoot, node, bus);
-      }
+  const fresh = await readGraph(repoRoot);
+  for (const node of Object.values(fresh.nodes)) {
+    if (node.status === "review" && !node.supersededBy && !isJudgedVariant(fresh, node.id)) {
+      await mergeNodeIntoIntegration(repoRoot, node, bus);
     }
   }
 
@@ -816,7 +814,7 @@ async function scheduleTickCore(repoRoot: string, bus: RudderBus): Promise<void>
 
 /**
  * Called by the daemon when a run.json changes. Projects the owning node's
- * status: completed -> review (auto-merge if configured); failed/cancelled ->
+ * status: completed -> review then integration; failed/cancelled ->
  * node.failed + propagate blocked to hard dependents. Then ticks the scheduler.
  */
 export function onRunTransition(repoRoot: string, runId: string, bus: RudderBus): Promise<void> {
@@ -863,11 +861,10 @@ async function onRunTransitionCore(repoRoot: string, runId: string, bus: RudderB
     bus.publish({ ts: nowIso(), runId, nodeId: node.id, type: "node.review" });
     await renderLiveRudderMd(repoRoot).catch(() => undefined);
 
-    const config = await loadConfig();
-    // A fan-out variant never auto-merges: it only feeds the judge node, which
+    // A fan-out variant never integrates directly: it only feeds the judge node, which
     // is what eventually merges. Let scheduleTick deliver the variant diff and
     // launch the judge once all variants have reached review.
-    if (config.orchestrator?.reviewGate === "auto" && !isJudgedVariant(graph, node.id)) {
+    if (!isJudgedVariant(graph, node.id)) {
       const fresh = await readGraph(repoRoot);
       const refreshed = fresh.nodes[node.id];
       if (refreshed) {

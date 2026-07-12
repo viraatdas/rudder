@@ -631,7 +631,7 @@ test("updateGraph never replaces an unreadable existing graph with an empty DAG"
 // projectNodeStatus: daemon-owned terminal statuses are sticky against the
 // worker's run.json (which only ever reaches "completed", never "merged").
 // Regression: without stickiness a merged node re-projects to "review" every
-// tick, auto-merge re-fires on an already-merged change, and the node thrashes
+// tick, integration re-fires on an already-merged change, and the node thrashes
 // review<->merged and never settles as done.
 // ---------------------------------------------------------------------------
 

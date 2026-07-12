@@ -185,7 +185,7 @@ running, Rudder also exposes matching project skills; the orchestrator can write
 | `/main` or `/m` | Start a new main-branch agent |
 | `/review-all` | Combine completed worktrees and start a Codex review-all agent |
 | `/merge-all` | Merge all completed worktrees |
-| `/automerge` | Toggle automatic clean merges (persists across sessions; shown in the agents pane header) |
+| `/verify` | Re-run the final repository checks after every DAG node is integrated |
 | `/color terminal\|paper` | Choose the native dashboard color mode; `terminal` uses your terminal foreground/background, `paper` restores the white canvas |
 | `/login` | Browser login for Rudder Cloud |
 | `/cloud` | Onload the current workspace or start a fresh cloud worker |
@@ -195,8 +195,9 @@ running, Rudder also exposes matching project skills; the orchestrator can write
 Finding a DAG task's worker: every plan node id (`n0`, `n1`, …) appears on the
 orchestrator DAG row, on the matching worker's row in the agents pane (`run n1`),
 and in the worker pane title, so the three panes cross-reference by id. A finished
-worker shows `done · needs merge` until it merges (with `m`, `M`, or auto-merge);
-only merged nodes unblock their dependents.
+Planned DAG workers integrate automatically after completion; manually started
+workers remain ready for `m`/`M`. Only locally merged nodes unblock dependents.
+Merged rows show the target branch, jj/Git revision, and whether the remote contains it.
 
 ## Models
 

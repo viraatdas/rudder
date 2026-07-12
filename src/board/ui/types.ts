@@ -11,6 +11,8 @@ export type RunStatus =
   | "completed"
   | "failed"
   | "cancelled"
+  | "orphaned"
+  | "migrated"
   | "merge-conflict"
   | "merged";
 

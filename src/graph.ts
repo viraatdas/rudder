@@ -391,7 +391,7 @@ export function projectNodeStatus(node: TaskNode, run?: RunRecord): NodeStatus {
   // merge state lives in graph.json, owned by the daemon). So once the daemon
   // has merged a node, or blocked it on a merge conflict / handed it to a
   // resolver, the run.json stays "completed" forever. Without this guard the
-  // next tick re-projects merged -> review, auto-merge fires again on an
+  // next tick re-projects merged -> review, integration fires again on an
   // already-merged change, and the node thrashes review<->merged, never settling
   // as done. `blocked` is likewise daemon-owned (failed-parent propagation or a
   // held merge conflict) and must not be re-projected back to review.
@@ -410,11 +410,13 @@ function nodeStatusFromRunStatus(runStatus: RunStatus, fallback: NodeStatus): No
     case "running":
     case "steering":
     case "verifying":
+    case "migrated":
       return "running";
     case "completed":
       return "review";
     case "failed":
     case "cancelled":
+    case "orphaned":
       return "failed";
     case "merged":
       return "merged";

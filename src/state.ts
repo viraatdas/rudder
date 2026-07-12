@@ -195,13 +195,13 @@ export function defaultConfig(): RudderConfig {
       acpx: { model: "gpt-5.5" },
     },
     board: { port: DEFAULT_BOARD_PORT },
-    orchestrator: { maxParallel: 1000, reviewGate: "manual" },
+    orchestrator: { maxParallel: 1000 },
   };
 }
 
 function normalizeConfig(existing: RudderConfig): RudderConfig {
   const defaults = defaultConfig();
-  return {
+  const normalized: RudderConfig = {
     ...defaults,
     ...existing,
     mergeStrategy: parseMergeStrategy(existing.mergeStrategy),
@@ -224,10 +224,13 @@ function normalizeConfig(existing: RudderConfig): RudderConfig {
     },
     orchestrator: {
       maxParallel: existing.orchestrator?.maxParallel ?? defaults.orchestrator?.maxParallel ?? 1000,
-      reviewGate: existing.orchestrator?.reviewGate ?? defaults.orchestrator?.reviewGate ?? "manual",
       ...(existing.orchestrator?.budget ? { budget: existing.orchestrator.budget } : {}),
     },
   };
+  // Remove the retired merge gate instead of carrying a dead feature flag
+  // forward through the top-level config spread.
+  Reflect.deleteProperty(normalized, "autoMerge");
+  return normalized;
 }
 
 function parseMergeStrategy(value: unknown): MergeStrategy {

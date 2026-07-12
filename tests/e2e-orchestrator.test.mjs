@@ -73,10 +73,9 @@ async function makeWorkspace(t) {
   await fsp.mkdir(home, { recursive: true });
 
   // `version: 1` is REQUIRED: loadConfig ignores a config without it and silently
-  // falls back to defaults (reviewGate "manual"), which would never auto-merge.
   await fsp.writeFile(
     path.join(home, "config.json"),
-    JSON.stringify({ version: 1, orchestrator: { reviewGate: "auto", maxParallel: 2 } }),
+    JSON.stringify({ version: 1, orchestrator: { maxParallel: 2 } }),
   );
   // Non-empty auth store so `maybeOnboard` short-circuits in the subprocess.
   await fsp.writeFile(

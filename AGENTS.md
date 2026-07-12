@@ -61,6 +61,7 @@ plus a worker image, used only when a task is handed off to the cloud.
 │   ├── src/gitio.rs       git/worktree/run-record persistence + fs helpers
 │   ├── src/cloudio.rs     cloud command plumbing + Codex session-log scanning
 │   ├── src/usage.rs       token-usage accounting, pricing, date helpers
+│   ├── src/lifecycle.rs   integration evidence + final repository-check discovery
 │   ├── src/config.rs      ~/.rudder config + model defaults + update notices
 │   ├── src/textedit.rs    input editing (drafts, history, cursor/word ops)
 │   ├── src/keys.rs        key/mouse event -> terminal byte encoding
@@ -257,7 +258,9 @@ Implemented in `src/run-manager.ts`.
 The important shapes:
 - `RunRecord`: the full per-run document. Status union is
   `created | running | steering | verifying | completed | failed | cancelled |
-  merge-conflict | merged`. Holds
+  orphaned | migrated | merge-conflict | merged`. Native also persists a
+  `lifecyclePhase` (`working`, `verifying`, `integrating`, `resolving`,
+  `merged-locally`, `pushed`, `orphaned`, or `cloud-owned`). Holds
   `worktree{enabled,path,branch?,workspaceName?,jjChangeId?}`,
   `vcs:"jj"|"git"`, `process{pid,...}`, `turns[]`, `autoSteer`,
   `session{nativeSessionId,...}`, `terminal{kind:"tmux",...}`, `verification`,
@@ -353,7 +356,7 @@ that *reads* `App` state, so changing scheduling behavior means changing the sta
 they read (e.g. `stop_agent_at` sets a node `Stopped`, which the next tick observes).
 Exactly three things trigger a mutation: (a) your keystrokes (`handle_key`/
 `handle_mouse`), (b) the heartbeat (`poll_agents` → on its tick cadence:
-`run_scheduler`, `maybe_ingest_worker_followups`, `maybe_auto_merge`,
+`run_scheduler`, `maybe_ingest_worker_followups`, `integrate_ready_plan_nodes`,
 `finalize_merge_resolvers`, `maybe_handle_drift`), and (c) background results drained
 from mpsc channels. Work that must not block the UI (the haiku task-summary and
 completion-note summarizers, cloud status) runs on background threads that COMPUTE and
@@ -439,7 +442,7 @@ slash commands, plan refinements, and empty-Enter approval. When the interactive
 Claude orchestrator is running, it can also edit the DAG in `RUDDER.md` and use
 generated project skills under `.claude/skills/rudder-*` for dashboard actions
 (`model`, `main`, `goal`, `usage`, `cloud/login`, `review-all`, `merge-all`,
-`automerge`, `plan/run/ask`, and DAG editing/approval). Rudder consumes the
+`plan/run/ask`, and DAG editing/approval). Rudder consumes the
 corresponding one-shot `RUDDER_*` control markers from `RUDDER.md`.
 
 ### Review and merge-all
@@ -945,8 +948,8 @@ The planner UX went through several iterations; these are the settled decisions 
   control path generated under `.claude/skills/rudder-*`, with one-shot `RUDDER_*` control
   markers consumed from `RUDDER.md`. Marker controls include add/replan (`RUDDER_ADD_TASK`,
   `RUDDER_REPLAN`), per-worker control (`RUDDER_MERGE`, `RUDDER_STOP`, `RUDDER_RESUME`,
-  `RUDDER_REGOAL`, `RUDDER_INJECT`), and broad actions (`RUDDER_REVIEW_ALL`, `RUDDER_MERGE_ALL`,
-  `RUDDER_AUTOMERGE`, `RUDDER_CLOUD_MIGRATE`). `RUDDER_CLOUD_MIGRATE` freezes live
+  `RUDDER_REGOAL`, `RUDDER_INJECT`), and broad actions (`RUDDER_REVIEW_ALL`,
+  `RUDDER_MERGE_ALL`, `RUDDER_CLOUD_MIGRATE`). `RUDDER_CLOUD_MIGRATE` freezes live
   isolated worker PTYs while leaving their records `running`, then launches `rudder cloud
   workspace attach`; this avoids local/cloud duplicate execution and keeps the records
   eligible for `findMigrationCandidates`.
@@ -1012,7 +1015,7 @@ Automatic local routing misclassified too many ordinary requests. A FRESH task
   worktree, NO `node_id`), with `oneoff_prompt` (no `/goal`, no `rudder done`,
   "edit directly; escalate to the planner if it's big") + bypassPermissions tools.
   Keys forward to its PTY. It is explicitly excluded from selected merge /
-  merge-all / review-all, and implicitly excluded from auto-merge / graph-mirror /
+  merge-all / review-all, and implicitly excluded from plan integration / graph-mirror /
   scheduler by `node_id`/Execute gates; `mark_run_done` just marks it Done (no
   merge). It lives in its own **`Bucket::OneOff`** list section (`status_bucket`
   returns `OneOff` for it; leads `Bucket::ORDER`).
@@ -1044,9 +1047,9 @@ Automatic local routing misclassified too many ordinary requests. A FRESH task
   (`followups_ingested`) is persisted to `.rudder/ingestion-ledger.json` and reloaded
   on startup so a restart never re-ingests/re-summarizes a handled worker; re-goaling a
   worker clears its entry so its NEXT report is ingested. CRITICAL ORDERING: ingest runs
-  BEFORE `maybe_auto_merge` in the poll loop — a candidate is only ingested while still
-  `Done`, and auto-merge flips `Done → Merged`, so merging first would drop follow-ups
-  under `/automerge`. Every grow is logged to `activity_log`.
+  BEFORE `integrate_ready_plan_nodes` in the poll loop — a candidate is only ingested
+  while still `Done`, and integration flips `Done → Merged`, so integrating first would
+  drop follow-ups. Every grow is logged to `activity_log`.
 - **Reconcile** (BUILT). Typing a task post-launch injects ONE node
   (`reconcile_injection` → `evaluate_completed_reconcile`).
 - **Steering** (BUILT: `stop_agent_at` wired to `x`; conductor markers route to
@@ -1074,7 +1077,7 @@ Automatic local routing misclassified too many ordinary requests. A FRESH task
   `diff_plan` (id-join, title-overlap fallback) and applies build-forward, AUTONOMOUSLY:
   **MERGED = baseline** (untouched, referenced as satisfied deps), **RUNNING =
   keep / re-goal (objective changed) / stop (dropped, workspace kept)**, **TODO =
-  replaced**. `maybe_auto_merge` is suppressed while `rebasing` so the zones stay stable.
+  replaced**. Plan integration is suppressed while `rebasing` so the zones stay stable.
   The diff is logged to `activity_log` (`+N added · M re-goaled · K stopped · J kept`);
   undo rides the jj op-log. A planner that emits no block leaves the current plan intact.
 
@@ -1115,26 +1118,30 @@ Automatic local routing misclassified too many ordinary requests. A FRESH task
   conductor consumes them.
 
 ### 14.7 Merge model
-Manual by default (`m`/`M`); a hard-dep child launches only once its parent reaches
-`Merged`. `/automerge` = hands-free. Clean merge is mechanical jj (`jj new`); a
+Planned DAG nodes integrate automatically; manually started runs use `m`/`M`. A
+hard-dep child launches only once its parent reaches `Merged`. Clean merge is
+mechanical jj (`jj new`); a
 conflict spawns the AI resolver (`start_conflict_resolution_agent` →
 `finalize_merge_resolvers`, jj-worded prompt). Undo via `rudder undo` (op-log). See
 section 5 / `src/jj.ts` for the run-level merge plumbing.
 
-**Merge-state legibility + durability (v2.4.0–v2.6.x, decided):**
-- `/automerge` PERSISTS (`autoMerge` key in `~/.rudder/config.json`,
-  `initial_auto_merge`) and is always visible: the agents-pane header shows
-  `auto-merge`/`manual merge`, the orchestrator header shows `auto-merge` when on.
-  Losing the toggle on restart silently stalled mid-flight plans at merge gates.
-- A CONFLICTED merge keeps the run `Done` (review bucket, `done · needs merge`),
-  parked in `auto_merge_skip` — it is finished work awaiting integration, and the
-  old flip-to-`Stopped` buried it in "closed" looking cancelled. Same rule on
+**Merge-state legibility + durability:**
+- There is no auto-merge feature flag or retry-skip ledger. Planned work always
+  integrates; a durable conflict state is the blocker until it is resolved.
+- A CONFLICTED merge keeps the run `Done` (review bucket) because it is finished
+  work awaiting integration. Same rule on
   reload: a run.json with `status:"merge-conflict"` loads as `Done`, not Stopped
   (`agent_status_from_record`).
-- `auto_merge_skip` PERSISTS (`.rudder/auto-merge-skip.json`) so a restart cannot
-  re-merge a known-conflicted run and respawn resolvers uninvited. Cleared per-id
-  on successful merge / re-goal; never blanket-cleared on `/automerge` toggle
-  (that re-creates the resolver-stacking loop).
+- Integrated rows persist the jj merge change, target bookmark, exported Git commit,
+  and whether `origin/<bookmark>` contains that commit. Native refreshes the remote
+  containment state locally and renders `merged locally` versus `pushed`.
+- Once every launched DAG node is integrated, the final gate runs `jj resolve --list`,
+  `git diff --check`, discovered npm `check`/`test` scripts, and Cargo workspace tests.
+  Its durable state is stored in `plan-queue.json`, rendered by the orchestrator, and
+  mirrored into `RUDDER.md`; `/verify` reruns a failed gate.
+- A persisted `running` row with no native PTY becomes `orphaned` on restart instead
+  of being blindly relaunched. A successful fleet handoff becomes `migrated` /
+  `cloud-owned`, so local restart cannot duplicate cloud execution.
 - A merge REFUSES to start when the integration workspace `@` already has
   unresolved conflicts (`mergeJjRunIntoCurrentWorkspace` guard, unconditional even
   under `--allow-dirty`) — merging onto a conflicted `@` nests conflicts.
@@ -1183,7 +1190,7 @@ editing files directly. The rules:
 - **DECISIONS.md** appends are a SINGLE `appendFile`/append call per entry
   (O_APPEND): concurrent writers can interleave entry ORDER but cannot tear an
   entry. Keep it that way — never split an entry across two appends.
-- **`.rudder` ledgers** (ingestion-ledger, followup-gen, auto-merge-skip, plan
+- **`.rudder` ledgers** (ingestion-ledger, followup-gen, plan
   queue) are single-writer BY ASSUMPTION: one dashboard per checkout
   (`runPolicy.sameCheckout: "single-active"`). Two concurrent TUIs on one repo
   would last-writer-win each other's ledgers; that is out of contract.

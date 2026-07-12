@@ -89,7 +89,6 @@ export type RudderConfig = {
   };
   orchestrator?: {
     maxParallel: number;
-    reviewGate: "auto" | "manual";
     budget?: {
       maxTokens?: number;
     };
@@ -138,6 +137,8 @@ export type RunStatus =
   | "completed"
   | "failed"
   | "cancelled"
+  | "orphaned"
+  | "migrated"
   | "merge-conflict"
   | "merged";
 

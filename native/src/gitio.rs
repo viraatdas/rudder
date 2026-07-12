@@ -241,6 +241,7 @@ pub(crate) fn create_main_agent(
         worktree_path: None,
         workspace_name: None,
         jj_change_id: None,
+        integration: IntegrationEvidence::default(),
         session_id: None,
         terminal: None,
         terminal_size: None,
@@ -461,6 +462,7 @@ pub(crate) fn agent_from_run_record(
         .and_then(|value| value.as_str())
         .filter(|value| !value.trim().is_empty())
         .map(ToOwned::to_owned);
+    let integration = integration_evidence_from_record(&record);
     let session_id = record
         .get("session")
         .and_then(|value| value.get("nativeSessionId"))
@@ -601,6 +603,7 @@ pub(crate) fn agent_from_run_record(
         worktree_path,
         workspace_name,
         jj_change_id,
+        integration,
         session_id,
         terminal: None,
         terminal_size: None,
@@ -711,7 +714,53 @@ pub(crate) fn agent_status_from_record(status: Option<&str>) -> AgentStatus {
         // than Stopped, which buried it in "closed" looking cancelled.
         Some("merge-conflict") => AgentStatus::Done,
         Some("cancelled") => AgentStatus::Stopped,
+        Some("orphaned") => AgentStatus::Orphaned,
+        Some("migrated") => AgentStatus::Migrated,
         _ => AgentStatus::Stopped,
+    }
+}
+
+pub(crate) fn integration_evidence_from_record(record: &serde_json::Value) -> IntegrationEvidence {
+    let merge = record.get("merge");
+    let text = |field: &str| {
+        merge
+            .and_then(|value| value.get(field))
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(ToOwned::to_owned)
+    };
+    IntegrationEvidence {
+        phase: match record
+            .get("lifecyclePhase")
+            .and_then(serde_json::Value::as_str)
+        {
+            Some("integrating") => IntegrationPhase::Integrating,
+            Some("resolving") => IntegrationPhase::Resolving,
+            Some("pushed") => IntegrationPhase::Pushed,
+            Some("merged-local") | Some("merged-locally") => IntegrationPhase::MergedLocal,
+            _ if merge
+                .and_then(|value| value.get("pushed"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false) =>
+            {
+                IntegrationPhase::Pushed
+            }
+            _ if merge
+                .and_then(|value| value.get("status"))
+                .and_then(serde_json::Value::as_str)
+                == Some("merged") =>
+            {
+                IntegrationPhase::MergedLocal
+            }
+            _ => IntegrationPhase::Pending,
+        },
+        bookmark: text("targetBranch"),
+        merge_change_id: text("mergeChangeId"),
+        git_commit: text("localCommit"),
+        pushed: merge
+            .and_then(|value| value.get("pushed"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
     }
 }
 
@@ -722,6 +771,8 @@ pub(crate) fn run_record_status(status: AgentStatus) -> &'static str {
         AgentStatus::Merged => "merged",
         AgentStatus::Failed => "failed",
         AgentStatus::Stopped => "cancelled",
+        AgentStatus::Orphaned => "orphaned",
+        AgentStatus::Migrated => "migrated",
     }
 }
 
@@ -790,6 +841,7 @@ pub(crate) fn save_native_run_record(repo_root: &Path, run: &AgentRun) -> Result
     let mut record = serde_json::json!({
         "id": run.id,
         "status": record_status,
+        "lifecyclePhase": run.lifecycle_label(),
         "vcs": if is_jj_run { "jj" } else { "git" },
         "mode": run.mode.as_str(),
         // Whether this RudderPlan row is a TRANSIENT reconcile planner (vs the pinned
@@ -879,6 +931,22 @@ pub(crate) fn save_native_run_record(repo_root: &Path, run: &AgentRun) -> Result
         if let Some(map) = merge.as_object_mut() {
             map.remove("conflictKind");
             map.remove("conflictedFiles");
+            if let Some(bookmark) = run.integration.bookmark.as_ref() {
+                map.insert("targetBranch".to_string(), serde_json::json!(bookmark));
+            }
+            if let Some(change) = run.integration.merge_change_id.as_ref() {
+                map.insert("mergeChangeId".to_string(), serde_json::json!(change));
+            }
+            if let Some(commit) = run.integration.git_commit.as_ref() {
+                map.insert("localCommit".to_string(), serde_json::json!(commit));
+            }
+            map.insert(
+                "pushed".to_string(),
+                serde_json::json!(run.integration.pushed),
+            );
+            if run.integration.pushed && !map.contains_key("pushedAt") {
+                map.insert("pushedAt".to_string(), serde_json::json!(now));
+            }
         }
         record["merge"] = merge;
     } else if let Some(map) = record.as_object_mut() {
@@ -946,7 +1014,7 @@ const RUDDER_JJ_CLI_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Outcome of shelling out to a `rudder merge`/`rudder sync` jj run.
 pub(crate) enum JjCliOutcome {
-    Ok,
+    Ok { integration: IntegrationEvidence },
     Conflict { files: Vec<String> },
     Failed { error: String },
 }
@@ -1050,7 +1118,15 @@ pub(crate) fn run_rudder_jj_command(
         .and_then(|value| value.get("status"))
         .and_then(serde_json::Value::as_str);
     match status {
-        Some("merged") | Some("synced") => JjCliOutcome::Ok,
+        Some("merged") | Some("synced") => {
+            let record = fs::read_to_string(native_run_dir(repo_root, run_id).join("run.json"))
+                .ok()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                .unwrap_or_else(|| serde_json::json!({}));
+            JjCliOutcome::Ok {
+                integration: integration_evidence_from_record(&record),
+            }
+        }
         Some("conflict") => {
             let files = state
                 .as_ref()
@@ -1906,6 +1982,7 @@ pub(crate) fn write_rudder_context_with_history(
     agents: &[AgentRun],
     pending: Option<&WorktreeInfo>,
     recent_instructions: &[String],
+    final_gate: Option<(FinalGateStatus, Option<&str>)>,
 ) -> Result<()> {
     ensure_gitignore_contains(repo_root, "RUDDER.md")?;
     ensure_gitignore_contains(repo_root, RUDDER_SHARED_CONTEXT_FILE)?;
@@ -1915,6 +1992,21 @@ pub(crate) fn write_rudder_context_with_history(
     ensure_gitignore_contains(repo_root, ".rudder-worktrees/")?;
     let mut body = String::from("# Rudder-Specific Context\n\nThis file is generated by Rudder. It is not user-authored repo documentation. Use it to coordinate with other Rudder agents in this checkout.\n\n");
     append_global_job_snapshot(&mut body, agents, pending);
+    if let Some((status, summary)) = final_gate {
+        body.push_str("\n## Final plan verification\n");
+        body.push_str(&format!(
+            "- status={}{}\n",
+            match status {
+                FinalGateStatus::Idle => "waiting",
+                FinalGateStatus::Running => "running",
+                FinalGateStatus::Passed => "passed",
+                FinalGateStatus::Failed => "failed",
+            },
+            summary
+                .map(|value| format!(" summary=\"{}\"", preview_text(value, 240)))
+                .unwrap_or_default()
+        ));
+    }
     body.push_str("\n## Active local Rudder agents\n");
     let live_agents = agents
         .iter()
@@ -2003,17 +2095,32 @@ fn append_agent_context_line(body: &mut String, agent: &AgentRun) {
     let node = agent.node_id.as_deref().unwrap_or("-");
     let waiting = agent_waiting_label(agent);
     let deps = agent_deps_label(agent);
-    let merge_state = if agent.status == AgentStatus::Done && agent_is_mergeable_worker(agent) {
-        " merge=needs-merge"
-    } else {
-        ""
+    let merge_state = match agent.status {
+        AgentStatus::Done if agent_is_mergeable_worker(agent) => " integration=ready".to_string(),
+        AgentStatus::Merged => format!(
+            " integration={} jj={} branch={} git={} remote={}",
+            agent.integration.phase.as_str(),
+            agent
+                .integration
+                .merge_change_id
+                .as_deref()
+                .unwrap_or("unknown"),
+            agent.integration.bookmark.as_deref().unwrap_or("unknown"),
+            agent.integration.git_commit.as_deref().unwrap_or("unknown"),
+            if agent.integration.pushed {
+                "pushed"
+            } else {
+                "not-pushed"
+            }
+        ),
+        _ => String::new(),
     };
     body.push_str(&format!(
         "- {} node={} mode={} status={}{} backend={} model={} cwd={}{}{} task=\"{}\"{}{}\n",
         agent.id,
         node,
         agent.mode.as_str(),
-        agent.status.as_str(),
+        agent.lifecycle_label(),
         waiting,
         agent.backend.as_str(),
         agent.model,
@@ -2027,13 +2134,15 @@ fn append_agent_context_line(body: &mut String, agent: &AgentRun) {
 }
 
 fn agent_is_live_for_context(agent: &AgentRun) -> bool {
-    agent.status == AgentStatus::Running || agent.needs_permission || agent.needs_user_input
+    matches!(agent.status, AgentStatus::Running | AgentStatus::Migrated)
+        || agent.needs_permission
+        || agent.needs_user_input
 }
 
 fn agent_is_completed_for_context(agent: &AgentRun) -> bool {
     matches!(
         agent.status,
-        AgentStatus::Merged | AgentStatus::Failed | AgentStatus::Stopped
+        AgentStatus::Merged | AgentStatus::Failed | AgentStatus::Stopped | AgentStatus::Orphaned
     )
 }
 
@@ -2089,6 +2198,14 @@ fn append_global_job_snapshot(
         .iter()
         .filter(|agent| agent.status == AgentStatus::Stopped)
         .count();
+    let orphaned = agents
+        .iter()
+        .filter(|agent| agent.status == AgentStatus::Orphaned)
+        .count();
+    let migrated = agents
+        .iter()
+        .filter(|agent| agent.status == AgentStatus::Migrated)
+        .count();
     let merge_ready = agents
         .iter()
         .filter(|agent| agent.status == AgentStatus::Done && agent_is_mergeable_worker(agent))
@@ -2104,16 +2221,16 @@ fn append_global_job_snapshot(
 
     body.push_str("## Global job snapshot\n");
     body.push_str(&format!(
-        "- totals: total={} running={} waiting={} done={} merged={} failed={} stopped={} pending-starts={}\n",
-        total, running, waiting, done, merged, failed, stopped, pending_count
+        "- totals: total={} running={} cloud-owned={} waiting={} done={} merged={} failed={} stopped={} orphaned={} pending-starts={}\n",
+        total, running, migrated, waiting, done, merged, failed, stopped, orphaned, pending_count
     ));
     body.push_str(&format!(
-        "- active-now: running={} waiting={} review-ready={} merge-ready={} pending-starts={}\n",
-        running, waiting, done, merge_ready, pending_count
+        "- active-now: running={} cloud-owned={} waiting={} review-ready={} merge-ready={} pending-starts={}\n",
+        running, migrated, waiting, done, merge_ready, pending_count
     ));
     body.push_str(&format!(
-        "- completed: merged={} failed={} stopped={}\n",
-        merged, failed, stopped
+        "- completed: merged={} failed={} stopped={} orphaned={}\n",
+        merged, failed, stopped, orphaned
     ));
     body.push_str(&format!("- backends: claude={} codex={}\n", claude, codex));
     body.push_str(&format!(

@@ -121,6 +121,8 @@ pub(crate) fn status_color(status: AgentStatus) -> Color {
         AgentStatus::Done | AgentStatus::Merged => ST_MERGED,
         AgentStatus::Failed => ST_FAILED,
         AgentStatus::Stopped => MUTED,
+        AgentStatus::Orphaned => FAILED_COLOR,
+        AgentStatus::Migrated => ACCENT,
     }
 }
 

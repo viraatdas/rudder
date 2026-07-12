@@ -344,9 +344,9 @@ pub(crate) fn command_suggestions() -> Vec<Suggestion> {
             action: SuggestionAction::RunCommand("/merge-all".to_string()),
         },
         Suggestion {
-            label: "/automerge".to_string(),
-            detail: "toggle auto-merge: clean finished nodes merge + unblock children".to_string(),
-            action: SuggestionAction::RunCommand("/automerge".to_string()),
+            label: "/verify".to_string(),
+            detail: "rerun the final all-integrated repository checks".to_string(),
+            action: SuggestionAction::RunCommand("/verify".to_string()),
         },
         Suggestion {
             label: "/color terminal|paper".to_string(),

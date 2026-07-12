@@ -64,6 +64,8 @@ mod theme;
 use crate::theme::*;
 mod perf;
 use crate::perf::*;
+mod lifecycle;
+use crate::lifecycle::*;
 mod plan_stream;
 
 mod signals;
@@ -376,6 +378,8 @@ enum AgentStatus {
     Merged,
     Failed,
     Stopped,
+    Orphaned,
+    Migrated,
 }
 
 impl AgentStatus {
@@ -386,6 +390,8 @@ impl AgentStatus {
             Self::Merged => "merged",
             Self::Failed => "failed",
             Self::Stopped => "stopped",
+            Self::Orphaned => "orphaned",
+            Self::Migrated => "migrated",
         }
     }
 }
@@ -502,6 +508,10 @@ struct App {
     /// printed AFTER the RUDDER_PLAN_TASKS block. Shown under the DAG so the user
     /// knows what the planner assumed and what to discuss/refine.
     plan_summary: Option<String>,
+    final_gate_status: FinalGateStatus,
+    final_gate_summary: Option<String>,
+    final_gate_tx: mpsc::Sender<FinalGateResult>,
+    final_gate_rx: mpsc::Receiver<FinalGateResult>,
     /// True while the orchestrator is RE-PLANNING in response to refinement feedback
     /// (between relaunch and the revised DAG being captured). It lets plan detection
     /// run even though `awaiting_approval` is still true (so the refined plan is
@@ -513,7 +523,7 @@ struct App {
     /// waiting for its revised DAG. Like `refining` it lets plan detection run even
     /// though a plan is already active (post-approval, nodes launched), but it routes
     /// capture to `evaluate_completed_rebase` (build-forward diff/apply) instead of
-    /// `evaluate_completed_plan`. Suppresses `maybe_auto_merge` while set so the zones
+    /// `evaluate_completed_plan`. Suppresses integration while set so the zones
     /// stay stable until the diff is applied. Cleared the moment the rebase lands or fails.
     rebasing: bool,
     /// Set alongside `rebasing` when the rebase was triggered on the LIVE INTERACTIVE
@@ -523,18 +533,11 @@ struct App {
     /// rebase evaluator to re-spawn the interactive conductor (resuming the same session)
     /// once the diff lands or fails, so the user never loses the conversation.
     rebase_restore_interactive: bool,
-    /// When true, a plan node that finishes cleanly (review, no conflict) is merged
-    /// automatically so its children unblock and the DAG drains hands-free. Toggled
-    /// by `/automerge`. Default OFF: review-before-merge stays the norm.
-    auto_merge: bool,
     /// Whether Claude Code's native fast mode is on for NEW agents (toggled by `/fast`).
     /// Display/UX mirror of the persisted `fastMode` config flag; the authoritative
     /// value injected into a worker's `--settings` is read from config at launch.
     /// Claude-only — Codex has no equivalent (its `/fast` just uses low reasoning effort).
     fast_mode: bool,
-    /// Agent ids auto-merge has already hit a conflict on; skipped on later passes so
-    /// it does not retry (and spam) every tick. The user resolves + merges manually.
-    auto_merge_skip: Vec<String>,
     /// Localhost URL of the live web board (http://127.0.0.1:PORT), passed in by the
     /// Node parent via RUDDER_BOARD_URL when the in-process board daemon is running.
     /// None when launched without a board. Surfaced in the agents pane + opened by
@@ -638,6 +641,9 @@ struct App {
     cloud_connected: bool,
     cloud_runtime: Option<String>,
     last_cloud_check: Instant,
+    /// Refreshes whether each locally integrated Git commit is contained by its
+    /// origin tracking branch. This is local-only and never performs a fetch.
+    last_remote_state_check: Instant,
     /// Throttle for the web-board steer inbox poll (.rudder/steer/*.json): checked
     /// ~once/sec from poll_agents so a browser "steer" reaches the right agent's PTY.
     last_steer_poll: Instant,
@@ -817,6 +823,7 @@ struct AgentRun {
     /// jj change id captured when the run's workspace was created. Used to route
     /// merge/sync through jj for new (vcs:jj) runs.
     jj_change_id: Option<String>,
+    integration: IntegrationEvidence,
     session_id: Option<String>,
     terminal: Option<TerminalPane>,
     terminal_size: Option<TerminalSize>,
@@ -1101,14 +1108,6 @@ impl App {
         } else {
             load_ingested_runs(&cwd)
         };
-        // Restore the conflict-skip list alongside the auto_merge toggle: with the
-        // toggle persisted but the skip list not, a restart's first tick would
-        // re-merge a known-conflicted run and re-spawn an uninvited AI resolver.
-        let auto_merge_skip = if cfg!(test) {
-            Vec::new()
-        } else {
-            load_auto_merge_skip(&cwd)
-        };
         // Restore the auto-expansion depth map so MAX_FOLLOWUP_DEPTH survives a restart.
         let followup_gen = if cfg!(test) {
             HashMap::new()
@@ -1124,6 +1123,10 @@ impl App {
             load_plan_queue(&cwd).unwrap_or_default()
         };
         reconcile_plan_queue_with_agents(&mut restored_queue, &agents);
+        if restored_queue.final_gate_status == FinalGateStatus::Running {
+            restored_queue.final_gate_status = FinalGateStatus::Idle;
+            restored_queue.final_gate_summary = None;
+        }
         let restored_plan_review = if restored_queue.awaiting_approval {
             PlanReviewState::from_planned_nodes(&restored_queue.planned_nodes)
         } else {
@@ -1142,6 +1145,7 @@ impl App {
         let session_started_iso = load_or_init_session_started(&cwd);
         let (task_summary_tx, task_summary_rx) = mpsc::channel();
         let (completion_summary_tx, completion_summary_rx) = mpsc::channel();
+        let (final_gate_tx, final_gate_rx) = mpsc::channel();
         let branch = current_branch_at(&cwd);
         let _ = signals::cleanup_old_signals(Duration::from_secs(7 * 24 * 60 * 60));
         let perf = PerfLogger::new();
@@ -1169,23 +1173,18 @@ impl App {
             planned_origin: restored_queue.planned_origin,
             plan_request: restored_queue.plan_request,
             plan_summary: restored_queue.plan_summary,
+            final_gate_status: restored_queue.final_gate_status,
+            final_gate_summary: restored_queue.final_gate_summary,
+            final_gate_tx,
+            final_gate_rx,
             refining: false,
             rebasing: false,
             rebase_restore_interactive: false,
-            // Restore the persisted /automerge default (tests always start OFF so
-            // merge-gating assertions stay deterministic). Losing the toggle on
-            // restart silently stalled mid-flight plans at every merge gate.
-            auto_merge: if cfg!(test) {
-                false
-            } else {
-                initial_auto_merge()
-            },
             fast_mode: if cfg!(test) {
                 false
             } else {
                 config::fast_mode_enabled()
             },
-            auto_merge_skip,
             board_url: if cfg!(test) {
                 None
             } else {
@@ -1239,6 +1238,7 @@ impl App {
             cloud_connected: cloud.connected,
             cloud_runtime: cloud.runtime,
             last_cloud_check: Instant::now(),
+            last_remote_state_check: Instant::now(),
             last_steer_poll: Instant::now(),
             last_heartbeat_emit: Instant::now(),
             cloud_workspace: None,
@@ -1366,8 +1366,15 @@ impl App {
 
     fn write_rudder_context_timed(&mut self, pending: Option<&WorktreeInfo>) -> Result<()> {
         let started = Instant::now();
-        let result =
-            write_rudder_context_with_history(&self.cwd, &self.agents, pending, &self.task_history);
+        let final_gate = (self.final_gate_status != FinalGateStatus::Idle)
+            .then_some((self.final_gate_status, self.final_gate_summary.as_deref()));
+        let result = write_rudder_context_with_history(
+            &self.cwd,
+            &self.agents,
+            pending,
+            &self.task_history,
+            final_gate,
+        );
         let duration = started.elapsed();
         self.record_perf_duration("write_rudder_context", duration);
         self.log_perf_duration_over(
@@ -1577,6 +1584,8 @@ impl App {
         self.planned_nodes.clear();
         self.plan_launched_node_ids.clear();
         self.plan_merged_node_ids.clear();
+        self.final_gate_status = FinalGateStatus::Idle;
+        self.final_gate_summary = None;
         self.plan_capture_armed = false;
         self.plan_review = PlanReviewState::default();
         self.awaiting_approval = false;
@@ -2918,7 +2927,7 @@ impl App {
         }
         if matches!(
             run.status,
-            AgentStatus::Done | AgentStatus::Merged | AgentStatus::Stopped
+            AgentStatus::Done | AgentStatus::Merged | AgentStatus::Stopped | AgentStatus::Orphaned
         ) {
             return true;
         }
@@ -3047,6 +3056,7 @@ impl App {
                     AgentStatus::Done
                         | AgentStatus::Merged
                         | AgentStatus::Stopped
+                        | AgentStatus::Orphaned
                         | AgentStatus::Failed
                 )
         })
@@ -4018,7 +4028,10 @@ impl App {
             // hard dep whose node is not Merged).
             if matches!(
                 run.status,
-                AgentStatus::Merged | AgentStatus::Failed | AgentStatus::Stopped
+                AgentStatus::Merged
+                    | AgentStatus::Failed
+                    | AgentStatus::Stopped
+                    | AgentStatus::Orphaned
             ) {
                 continue;
             }
@@ -4141,6 +4154,7 @@ impl App {
             worktree_path: None,
             workspace_name: None,
             jj_change_id: None,
+            integration: IntegrationEvidence::default(),
             session_id,
             terminal: None,
             terminal_size: None,
@@ -4312,6 +4326,7 @@ impl App {
             worktree_path: worktree.path_is_worktree.then_some(worktree.path.clone()),
             workspace_name: worktree.workspace_name.clone(),
             jj_change_id: worktree.jj_change_id.clone(),
+            integration: IntegrationEvidence::default(),
             session_id,
             terminal: None,
             terminal_size: None,
@@ -4401,6 +4416,8 @@ impl App {
         self.planned_nodes.clear();
         self.plan_launched_node_ids.clear();
         self.plan_merged_node_ids.clear();
+        self.final_gate_status = FinalGateStatus::Idle;
+        self.final_gate_summary = None;
         self.plan_capture_armed = true;
         self.awaiting_approval = false;
         self.plan_review = PlanReviewState::default();
@@ -4457,6 +4474,7 @@ impl App {
             worktree_path: None,
             workspace_name: None,
             jj_change_id: None,
+            integration: IntegrationEvidence::default(),
             session_id,
             terminal: None,
             terminal_size: None,
@@ -4636,7 +4654,7 @@ impl App {
     /// (baseline — build forward), which is RUNNING (keep/re-goal/stop), and which is
     /// TODO (replace freely). Sets `rebasing` so `maybe_detect_plan_ready` routes the
     /// revised DAG to `evaluate_completed_rebase` (a build-forward diff/apply), and
-    /// `maybe_auto_merge` is suppressed until the diff lands. Autonomous + logged.
+    /// plan integration is suppressed until the diff lands. Autonomous + logged.
     fn start_plan_rebase(&mut self, input: &str) {
         // A refine/rebase is already in flight: relaunching the orchestrator now would kill
         // the in-flight planner and race its capture (same guard refine_plan has).
@@ -4698,7 +4716,7 @@ impl App {
             ),
         };
         // Mark the rebase in flight BEFORE relaunch so the poll loop routes the revised
-        // block to evaluate_completed_rebase and holds auto-merge steady.
+        // block to evaluate_completed_rebase and holds plan integration steady.
         self.rebasing = true;
         if let Some(run) = self.agents.get_mut(index) {
             if resume {
@@ -4857,17 +4875,13 @@ impl App {
         launched
     }
 
-    /// On startup, reconcile in-flight runs persisted as Running whose work is actually
-    /// FINISHED, so a rudder restart UNFREEZES a stuck board instead of resurrecting the
-    /// dead processes in their stuck state. The motivating case: a merge-conflict resolver
-    /// that resolved cleanly but, under an older binary, never got its completion signal
-    /// wired — so it was persisted `Running` forever and its node never merged, blocking
-    /// every child. Here, any resolver with no live PTY whose jj workspace has no unresolved
-    /// conflicts is marked Done; the next poll tick's finalize_merge_resolvers then merges it
-    /// and unblocks its children. Runs BEFORE restore_running_agents so these finished
-    /// resolvers are not pointlessly resumed as live claude sessions.
+    /// On startup, classify persisted Running records without a native PTY. A clean
+    /// merge resolver is complete; every other row is an orphan and remains visible
+    /// for an explicit resume. Blindly relaunching all such rows can duplicate a task
+    /// whose previous controller is still alive or whose last turn already completed.
     fn reconcile_orphaned_runs(&mut self) {
         let mut reconciled = 0usize;
+        let mut orphaned = 0usize;
         for run in self.agents.iter_mut() {
             if run.terminal.is_some() || run.status != AgentStatus::Running {
                 continue;
@@ -4877,11 +4891,18 @@ impl App {
                 mark_run_done(run);
                 let _ = save_native_run_record(&self.cwd, run);
                 reconciled += 1;
+            } else {
+                run.status = AgentStatus::Orphaned;
+                run.last_error = Some(
+                    "orphaned run: native PTY/controller is gone; resume explicitly".to_string(),
+                );
+                let _ = save_native_run_record(&self.cwd, run);
+                orphaned += 1;
             }
         }
-        if reconciled > 0 {
+        if reconciled > 0 || orphaned > 0 {
             self.notice = Some(format!(
-                "reconciled {reconciled} finished merge(s) from last session"
+                "startup recovery: {reconciled} finished merge(s), {orphaned} orphaned run(s) need explicit resume"
             ));
             // finalize_merge_resolvers (poll loop) merges these and unblocks children; nudge
             // the scheduler + board so the unfreeze is visible immediately on restart.
@@ -5606,24 +5627,13 @@ impl App {
                 self.request_merge_all_ready();
                 true
             }
-            Some("/automerge") => {
-                self.auto_merge = !self.auto_merge;
-                // Persist the toggle so the next session starts in the same mode; a
-                // forgotten OFF default used to stall restarted plans at merge gates.
-                let _ = save_auto_merge(self.auto_merge);
-                if self.auto_merge {
-                    // Do NOT blanket-clear auto_merge_skip here: a node parked there by the
-                    // conflict-resolver (resolver finished with conflicts still left) would
-                    // be un-skipped and immediately re-merged -> re-conflict -> re-spawn a
-                    // resolver every tick, the exact stacking loop the skip prevents. Skip
-                    // entries are already cleared per-id on a successful merge / re-goal.
+            Some("/verify") => {
+                self.final_gate_status = FinalGateStatus::Idle;
+                self.final_gate_summary = None;
+                self.maybe_start_final_gate();
+                if self.final_gate_status == FinalGateStatus::Idle {
                     self.notice = Some(
-                        "auto-merge ON (saved as default): clean finished nodes merge themselves and unblock children; conflicts still pause for you".to_string(),
-                    );
-                    self.maybe_auto_merge();
-                } else {
-                    self.notice = Some(
-                        "auto-merge OFF (saved as default): merge finished nodes yourself with m / M".to_string(),
+                        "verification waits until every planned node is integrated".to_string(),
                     );
                 }
                 true
@@ -6099,7 +6109,7 @@ impl App {
         );
         if let Some(cloud_run) = self.agents.last_mut() {
             if cloud_run.task == cloud_label {
-                cloud_run.review_source_ids = run_ids;
+                cloud_run.review_source_ids = run_ids.clone();
             }
         }
         if self
@@ -6110,6 +6120,13 @@ impl App {
             self.restore_running_agents();
             self.notice = Some("cloud migration failed to start; local agents resumed".to_string());
             return;
+        }
+        for run_id in &run_ids {
+            if let Some(run) = self.agents.iter_mut().find(|run| &run.id == run_id) {
+                run.status = AgentStatus::Migrated;
+                run.last_error = None;
+                let _ = save_native_run_record(&self.cwd, run);
+            }
         }
         self.notice = Some(format!(
             "migrating {count} agent(s) to Rudder Cloud with workspaces, sessions, auth, and project environment"
@@ -6198,6 +6215,7 @@ impl App {
             worktree_path: None,
             workspace_name: None,
             jj_change_id: None,
+            integration: IntegrationEvidence::default(),
             session_id: None,
             terminal: None,
             terminal_size: None,
@@ -6477,6 +6495,8 @@ impl App {
         self.planned_nodes = nodes;
         self.plan_launched_node_ids.clear();
         self.plan_merged_node_ids.clear();
+        self.final_gate_status = FinalGateStatus::Idle;
+        self.final_gate_summary = None;
         self.plan_capture_armed = false;
         if let Some(origin) = self.running_interactive_orchestrator_task() {
             self.plan_request = origin.clone();
@@ -6703,10 +6723,6 @@ impl App {
             }
             return;
         }
-        if let Some(rest) = marker.strip_prefix("RUDDER_AUTOMERGE") {
-            self.apply_automerge_marker(rest.trim());
-            return;
-        }
         if let Some(rest) = marker.strip_prefix("RUDDER_MERGE ") {
             self.merge_agent_for_marker(rest.trim());
             return;
@@ -6754,7 +6770,7 @@ impl App {
             "RUDDER_USAGE" => self.show_usage_summary(),
             "RUDDER_HELP" => {
                 self.notice = Some(
-                    "skills: model, main, goal, monitor, add/replan, merge/stop/regoal/inject, usage, cloud, review-all, automerge"
+                    "skills: model, main, goal, monitor, add/replan, merge/stop/regoal/inject, usage, cloud, review-all"
                         .to_string(),
                 );
             }
@@ -6893,29 +6909,6 @@ impl App {
         }
     }
 
-    fn apply_automerge_marker(&mut self, value: &str) {
-        let next = match value {
-            "on" | "true" | "1" => true,
-            "off" | "false" | "0" => false,
-            "toggle" | "" => !self.auto_merge,
-            _ => {
-                self.notice = Some("RUDDER_AUTOMERGE expects on, off, or toggle".to_string());
-                return;
-            }
-        };
-        self.auto_merge = next;
-        let _ = save_auto_merge(self.auto_merge);
-        if self.auto_merge {
-            self.notice = Some(
-                "auto-merge ON: clean finished nodes merge themselves and unblock children"
-                    .to_string(),
-            );
-            self.maybe_auto_merge();
-        } else {
-            self.notice = Some("auto-merge OFF: merge finished nodes manually".to_string());
-        }
-    }
-
     fn evaluate_completed_plan(&mut self, index: usize) {
         // A REBASE in flight must NEVER reach the initial-plan REPLACE path (it would wipe
         // the running plan's todo queue and re-gate the fleet); evaluate_completed_rebase
@@ -7045,6 +7038,8 @@ impl App {
         self.planned_nodes = nodes;
         self.plan_launched_node_ids.clear();
         self.plan_merged_node_ids.clear();
+        self.final_gate_status = FinalGateStatus::Idle;
+        self.final_gate_summary = None;
         self.plan_capture_armed = false;
         // Keep planned_origin anchored to the ORIGINAL request so refine rounds (whose
         // run.task is a composite "revise this" prompt) do not overwrite it; worker
@@ -7181,6 +7176,8 @@ impl App {
             }
 
             self.planned_nodes.push(node);
+            self.final_gate_status = FinalGateStatus::Idle;
+            self.final_gate_summary = None;
             appended += 1;
         }
 
@@ -8051,26 +8048,6 @@ impl App {
         }
     }
 
-    /// Persist the auto-merge skip list to `.rudder/auto-merge-skip.json` (atomic). The
-    /// /automerge toggle itself is persisted (initial_auto_merge), so a skip list that
-    /// dies with the process lets a restart's first maybe_auto_merge tick re-merge a
-    /// known-conflicted run and re-spawn an AI resolver uninvited. Best-effort; bounded
-    /// by plan size.
-    fn persist_auto_merge_skip(&self) {
-        let Ok(json) = serde_json::to_string(&self.auto_merge_skip) else {
-            return;
-        };
-        let dir = self.cwd.join(".rudder");
-        if std::fs::create_dir_all(&dir).is_err() {
-            return;
-        }
-        let path = dir.join("auto-merge-skip.json");
-        let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
-        if std::fs::write(&tmp, json).is_ok() {
-            let _ = std::fs::rename(&tmp, &path);
-        }
-    }
-
     /// Persist the auto-expansion DEPTH map to `.rudder/followup-gen.json` (atomic) so the
     /// MAX_FOLLOWUP_DEPTH cap survives a restart. Without this, reopening Rudder mid-plan
     /// resets every node's depth to 0 and an auto-expansion chain could grow further than
@@ -8102,6 +8079,8 @@ impl App {
             planned_origin: self.planned_origin.clone(),
             plan_request: self.plan_request.clone(),
             plan_summary: self.plan_summary.clone(),
+            final_gate_status: self.final_gate_status,
+            final_gate_summary: self.final_gate_summary.clone(),
             awaiting_approval: self.awaiting_approval,
         };
         let Ok(json) = serde_json::to_string(&snapshot) else {
@@ -8596,7 +8575,12 @@ impl App {
             let dead: Vec<String> = self
                 .agents
                 .iter()
-                .filter(|r| matches!(r.status, AgentStatus::Failed | AgentStatus::Stopped))
+                .filter(|r| {
+                    matches!(
+                        r.status,
+                        AgentStatus::Failed | AgentStatus::Stopped | AgentStatus::Orphaned
+                    )
+                })
                 .filter_map(|r| r.node_id.clone())
                 .collect();
             let unknown: Vec<&str> = explicit
@@ -8625,6 +8609,8 @@ impl App {
             self.followup_gen.insert(node.id.clone(), gen + 1);
             self.persist_followup_gen();
             self.planned_nodes.push(node);
+            self.final_gate_status = FinalGateStatus::Idle;
+            self.final_gate_summary = None;
             added += 1;
         }
         if added > 0 {
@@ -8952,6 +8938,8 @@ impl App {
                 AgentStatus::Done => "review",
                 AgentStatus::Merged => "merged",
                 AgentStatus::Failed | AgentStatus::Stopped => "failed",
+                AgentStatus::Orphaned => "orphaned",
+                AgentStatus::Migrated => "cloud-owned",
             };
             let mut deps: Vec<serde_json::Value> = run
                 .deps
@@ -9074,17 +9062,14 @@ impl App {
     /// free. A node is ready when all its hard deps are merged (or reference ids
     /// absent from the plan, treated as satisfied so the DAG never deadlocks).
     /// Soft deps never gate. Runs on a coarse tick and after a plan is queued.
-    /// When auto-merge is on, merge every plan node that has finished cleanly (in
+    /// Integrate every plan node that has finished cleanly (in
     /// review, not main, not already skipped for a conflict) so its hard children
-    /// unblock. A node that conflicts is recorded in `auto_merge_skip` and left for
-    /// the user (press m to resolve + merge); auto-merge stops at the first conflict
-    /// this pass to avoid cascading on a broken base. After merging, drain the
+    /// unblock. A recorded conflict itself prevents another attempt until it is
+    /// resolved; integration stops at the first conflict to avoid stacking changes.
+    /// After merging, drain the
     /// scheduler so newly-ready children launch.
-    fn maybe_auto_merge(&mut self) {
-        if !self.auto_merge {
-            return;
-        }
-        // Hold auto-merge steady while a structural rebase is in flight: merging would
+    fn integrate_ready_plan_nodes(&mut self) {
+        // Hold integration steady while a structural rebase is in flight: merging would
         // shift a RUNNING node into the MERGED zone mid-diff and the build-forward apply
         // would compute its zones against a moving target. Resume once the rebase lands.
         if self.rebasing {
@@ -9112,7 +9097,6 @@ impl App {
                     && !run.is_main()
                     && !run.merge_resolver
                     && !run.has_merge_conflict()
-                    && !self.auto_merge_skip.contains(&run.id)
             });
             let Some(index) = next else { break };
             let id = self.agents[index].id.clone();
@@ -9147,10 +9131,6 @@ impl App {
                             "conflict in {} — AI resolver integrating it",
                             short_task(&label)
                         ));
-                    } else {
-                        // Resolver did not start; do not retry every tick.
-                        self.auto_merge_skip.push(id);
-                        self.persist_auto_merge_skip();
                     }
                     break; // one conflict at a time
                 }
@@ -9162,8 +9142,11 @@ impl App {
             // since that one still needs the user's attention).
             if !conflicted {
                 self.notice = Some(match merged_labels.as_slice() {
-                    [only] => format!("auto-merged {only} · dependents unblocked"),
-                    many => format!("auto-merged {} nodes · dependents unblocked", many.len()),
+                    [only] => format!("integrated {only} locally · dependents unblocked"),
+                    many => format!(
+                        "integrated {} nodes locally · dependents unblocked",
+                        many.len()
+                    ),
                 });
             }
             self.run_scheduler();
@@ -9227,15 +9210,8 @@ impl App {
                     }
                 }
             } else {
-                // Conflicts still remain: drop back to manual. CRUCIALLY, skip it from
-                // auto-merge — otherwise (resolver flag now cleared, status still Done) the
-                // next maybe_auto_merge tick re-merges, re-conflicts, and re-spawns a
-                // resolver every tick, stacking jj merge changes forever. Cleared again on a
-                // successful manual merge / re-goal (see merge_agent_at, regoal_agent_at).
-                if !self.auto_merge_skip.contains(&id) {
-                    self.auto_merge_skip.push(id.clone());
-                    self.persist_auto_merge_skip();
-                }
+                // Conflicts still remain. The durable merge_conflict state itself keeps
+                // the integration scheduler from retrying until the user resolves it.
                 if let Some(run) = self.agents.get_mut(index) {
                     run.status = AgentStatus::Done;
                     run.merge_conflict = true;
@@ -9748,6 +9724,7 @@ impl App {
             worktree_path: worktree.path_is_worktree.then_some(worktree.path.clone()),
             workspace_name: worktree.workspace_name.clone(),
             jj_change_id: worktree.jj_change_id.clone(),
+            integration: IntegrationEvidence::default(),
             // The fork mints its own fresh session id (Claude --fork-session prints
             // it; Codex records it under the fork's cwd, discovered at completion).
             session_id: None,
@@ -10042,17 +10019,7 @@ impl App {
         let ids: Vec<String> = ready_runs.iter().map(|r| r.id.clone()).collect();
         let count = ids.len();
         let labels = merge_all_labels(&ready_runs);
-        let skipped_count = ready_runs
-            .iter()
-            .filter(|run| self.auto_merge_skip.contains(&run.id))
-            .count();
-
         let mut detail_parts = vec![format!("Ready: {}", summarize_labels(&labels, 6))];
-        if skipped_count > 0 {
-            detail_parts.push(format!(
-                "{skipped_count} parked by auto-merge after conflict; merge-all will retry and pause on any conflict"
-            ));
-        }
         if pending_total > 0 {
             detail_parts.push(format!(
                 "{pending_total} uncommitted file{p1} across {pending_runs} worktree{p2} will be auto-committed",
@@ -10280,9 +10247,8 @@ impl App {
             if let Some(run) = self.agents.get_mut(index) {
                 // The WORK is finished; only its integration conflicted. Keep the run
                 // Done (review bucket) so it still reads as merge-able — flipping it to
-                // Stopped buried it in "closed" looking cancelled. Park it in the
-                // auto-merge skip list so auto-merge does not re-conflict every tick;
-                // a successful merge or re-goal clears the skip.
+                // Stopped buried it in "closed" looking cancelled. The explicit
+                // conflict state prevents automatic integration from retrying it.
                 run.status = AgentStatus::Done;
                 run.last_error = Some(error.to_string());
                 run.merge_resolver = false;
@@ -10291,11 +10257,6 @@ impl App {
                 run.merge_conflict_operation = operation;
                 run.merge_conflict_files = conflict_files;
                 let _ = save_native_run_record(&self.cwd, run);
-                let id = self.agents[index].id.clone();
-                if !self.auto_merge_skip.contains(&id) {
-                    self.auto_merge_skip.push(id);
-                    self.persist_auto_merge_skip();
-                }
             }
         }
         let operation_label = if operation == ConflictOperation::Rebase {
@@ -10392,12 +10353,6 @@ impl App {
             // previous turn's note before it has written a new one.
             if let Some(node_id) = node_id.as_deref() {
                 let _ = std::fs::remove_file(worker_done_file(&run_cwd, node_id));
-            }
-            // A re-goaled run is no longer a conflict to skip; let it auto-merge again.
-            let before = self.auto_merge_skip.len();
-            self.auto_merge_skip.retain(|x| x != &id);
-            if self.auto_merge_skip.len() != before {
-                self.persist_auto_merge_skip();
             }
         }
         let (command, deliver_after, new_session, size, cwd, node_label) = {
@@ -10807,6 +10762,11 @@ impl App {
                     // (flip the node to Merged, unblock children) once they finish
                     // with no conflicts left. Git rebase resolvers keep manual flow.
                     run.merge_resolver = operation == ConflictOperation::Merge;
+                    run.integration.phase = if operation == ConflictOperation::Merge {
+                        IntegrationPhase::Resolving
+                    } else {
+                        IntegrationPhase::Pending
+                    };
                     run.merge_conflict = true;
                     run.had_merge_conflict = true;
                     run.merge_conflict_operation = operation;
@@ -10971,7 +10931,7 @@ What to do\n\
             anyhow::bail!("no selected agent");
         };
         // Already merged: a confirm prompt acted on a stale snapshot and an intervening
-        // auto-merge already merged this run. Re-running `rudder merge` would create a
+        // plan integration already merged this run. Re-running `rudder merge` would create a
         // spurious second merge. No-op instead.
         if run.status == AgentStatus::Merged {
             return Ok(());
@@ -10979,16 +10939,23 @@ What to do\n\
         let is_jj = Self::run_is_jj(run);
         let review_source_ids = run.review_source_ids.clone();
         let run_id = run.id.clone();
+        let worktree_branch = run.worktree_branch.clone();
 
         if is_jj {
+            if let Some(run) = self.agents.get_mut(index) {
+                run.integration.phase = IntegrationPhase::Integrating;
+                let _ = save_native_run_record(&self.cwd, run);
+            }
             // jj runs merge through the TS `rudder merge <id>` command, which
             // routes to mergeJjRunIntoCurrentWorkspace and captures op-log for
             // `rudder undo`. The command records its outcome in run.json and
             // exits 0 even on conflict, so classify by the recorded state.
-            let run_id = run.id.clone();
             match run_rudder_jj_command(&self.cwd, "merge", &run_id, "merge") {
-                JjCliOutcome::Ok => {}
+                JjCliOutcome::Ok { integration } => {
+                    self.agents[index].integration = integration;
+                }
                 JjCliOutcome::Conflict { files } => {
+                    self.agents[index].integration.phase = IntegrationPhase::Pending;
                     // Before falling back to a multi-minute LLM resolver, auto-resolve the
                     // MECHANICAL conflicts directly in jj (package.json/.gitignore union,
                     // regenerable lock files). These collide on nearly every parallel
@@ -11004,21 +10971,32 @@ What to do\n\
                     // Re-enter the TS merge transaction so it moves the bookmark,
                     // exports to Git, and records durable integration evidence.
                     match run_rudder_jj_command(&self.cwd, "merge", &run_id, "merge") {
-                        JjCliOutcome::Ok => {}
-                        JjCliOutcome::Conflict { files } => {
-                            self.pending_jj_conflict = Some(files);
-                            anyhow::bail!("jj merge still has conflicts after automatic resolution");
+                        JjCliOutcome::Ok { integration } => {
+                            self.agents[index].integration = integration;
                         }
-                        JjCliOutcome::Failed { error } => anyhow::bail!(error),
+                        JjCliOutcome::Conflict { files } => {
+                            self.agents[index].integration.phase = IntegrationPhase::Pending;
+                            self.pending_jj_conflict = Some(files);
+                            anyhow::bail!(
+                                "jj merge still has conflicts after automatic resolution"
+                            );
+                        }
+                        JjCliOutcome::Failed { error } => {
+                            self.agents[index].integration.phase = IntegrationPhase::Pending;
+                            anyhow::bail!(error)
+                        }
                     }
                 }
-                JjCliOutcome::Failed { error } => anyhow::bail!(error),
+                JjCliOutcome::Failed { error } => {
+                    self.agents[index].integration.phase = IntegrationPhase::Pending;
+                    anyhow::bail!(error)
+                }
             }
         } else {
-            let Some(branch) = run.worktree_branch.clone() else {
+            let Some(branch) = worktree_branch else {
                 anyhow::bail!("selected agent is not in a worktree");
             };
-            commit_pending_changes_for_run(run)?;
+            commit_pending_changes_for_run(&self.agents[index])?;
             match merge_strategy() {
                 MergeStrategy::Merge => {
                     git_status_command(&self.cwd, &["merge", "--no-ff", &branch])?;
@@ -11040,7 +11018,7 @@ What to do\n\
             // Merged run is excluded from the follow-up candidate set, so a MANUAL merge
             // (m/M) racing ahead of the cadence-bound maybe_ingest_worker_followups would
             // otherwise drop its follow-ups permanently. Idempotent via the guards (the
-            // auto-merge path already ingested on an earlier tick → this is a no-op there).
+            // plan integration path already ingested on an earlier tick; this is a no-op there).
             let should_ingest = self.agents.get(index).is_some_and(|r| {
                 r.node_id.is_some()
                     && matches!(r.mode, AgentMode::Execute)
@@ -11052,14 +11030,6 @@ What to do\n\
                 self.ingest_worker_followups(index);
             }
             self.mark_agent_and_review_sources_merged(index, review_source_ids);
-        }
-        // A successful merge clears any prior conflict-skip for this run, so it can
-        // auto-merge again if it ever returns to review (and does not stay permanently
-        // un-auto-merged for the session).
-        let before = self.auto_merge_skip.len();
-        self.auto_merge_skip.retain(|x| x != &run_id);
-        if self.auto_merge_skip.len() != before {
-            self.persist_auto_merge_skip();
         }
         Ok(())
     }
@@ -11091,6 +11061,11 @@ What to do\n\
                 run.terminal = None;
                 run.review_terminal = None;
                 run.status = AgentStatus::Merged;
+                run.integration.phase = if run.integration.pushed {
+                    IntegrationPhase::Pushed
+                } else {
+                    IntegrationPhase::MergedLocal
+                };
                 run.worktree_branch = None;
                 run.completed_at = Some(Instant::now());
                 run.merge_resolver = false;
@@ -11119,9 +11094,15 @@ What to do\n\
         let poll_started = Instant::now();
         self.poll_task_summary_workers();
         self.poll_completion_summary_workers();
+        self.poll_final_gate();
         // Cross-process CLI stop requests are authoritative and must be consumed
         // before try_wait can observe the resulting signal as a failed process.
         self.consume_stop_requests();
+
+        if self.last_remote_state_check.elapsed() >= Duration::from_secs(5) {
+            self.refresh_remote_integration_state();
+            self.last_remote_state_check = Instant::now();
+        }
 
         if self.last_cloud_check.elapsed() >= Duration::from_secs(2) {
             let cloud = read_cloud_summary();
@@ -11443,22 +11424,19 @@ What to do\n\
         // a finishing agent's recommended follow-ups become new planned nodes,
         // surfaced in the activity log. Autonomous, no confirm.
         //
-        // This MUST run before auto-merge: a candidate is ingested only while its status
-        // is still Done, and maybe_auto_merge flips Done -> Merged. If merge ran first, an
-        // auto-merged node would never be ingested and the plan would stop growing under
-        // /automerge. Ingesting first reads the sidecar/PTY while the worker (and its
+        // This MUST run before integration: a candidate is ingested only while its status
+        // is still Done, and integration flips Done -> Merged. If merge ran first, an
+        // integrated node would never be ingested. Ingesting first reads the sidecar/PTY while the worker (and its
         // workspace) are intact, then merge unblocks its children on the same tick.
         if self.scheduler_tick % SCHEDULER_TICK_INTERVAL == 0 {
             self.maybe_ingest_worker_followups();
         }
-        // When auto-merge is on, merge clean finished nodes on the same cadence so
-        // their children unblock and the chain flows without manual m/M. Runs even
+        // Integrate clean finished plan nodes on the same cadence so their children
+        // unblock and the chain flows without manual m/M. Runs even
         // when the queue is empty (to merge the final nodes), but not at the gate.
-        if self.auto_merge
-            && !self.awaiting_approval
-            && self.scheduler_tick % SCHEDULER_TICK_INTERVAL == 0
-        {
-            self.maybe_auto_merge();
+        if !self.awaiting_approval && self.scheduler_tick % SCHEDULER_TICK_INTERVAL == 0 {
+            self.integrate_ready_plan_nodes();
+            self.maybe_start_final_gate();
         }
         // Finalize any AI merge-conflict resolver that just finished (auto-spawned or
         // started manually with y): a clean workspace flips the node to Merged and
@@ -11888,7 +11866,6 @@ fn run(terminal: &mut Tui) -> Result<()> {
     // an older binary) BEFORE trying to resume anything, so a restart makes the board progress
     // instead of resurrecting dead processes in their stuck state.
     app.reconcile_orphaned_runs();
-    app.restore_running_agents();
     // Reconcile graph.json with the restored in-memory state on startup so the board does
     // not show stale "planned" nodes from a previous session (and reflects the restored
     // plan queue / reloaded agents). last_mirror_signature is None here, so this runs once.
@@ -12031,15 +12008,6 @@ fn load_ingested_runs(cwd: &Path) -> HashSet<String> {
         .unwrap_or_default()
 }
 
-/// Load the persisted auto-merge skip list (run ids parked after a merge conflict)
-/// written by `persist_auto_merge_skip`. Missing/corrupt file => empty list.
-fn load_auto_merge_skip(cwd: &Path) -> Vec<String> {
-    std::fs::read_to_string(cwd.join(".rudder").join("auto-merge-skip.json"))
-        .ok()
-        .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
-        .unwrap_or_default()
-}
-
 fn load_followup_gen(cwd: &Path) -> HashMap<String, u8> {
     std::fs::read_to_string(cwd.join(".rudder").join("followup-gen.json"))
         .ok()
@@ -12173,6 +12141,10 @@ struct PlanQueueSnapshot {
     #[serde(default)]
     plan_summary: Option<String>,
     #[serde(default)]
+    final_gate_status: FinalGateStatus,
+    #[serde(default)]
+    final_gate_summary: Option<String>,
+    #[serde(default)]
     awaiting_approval: bool,
 }
 
@@ -12271,7 +12243,6 @@ fn is_orchestrator_skill_marker(line: &str) -> bool {
         "RUDDER_RESUME",
         "RUDDER_REGOAL",
         "RUDDER_INJECT",
-        "RUDDER_AUTOMERGE",
         "RUDDER_ADD_TASK",
         "RUDDER_REPLAN",
         "RUDDER_PLAN",

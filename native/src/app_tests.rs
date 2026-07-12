@@ -3170,7 +3170,10 @@ fn native_save_preserves_launch_and_clean_merge_metadata() {
             "merge": {
                 "status": "merged",
                 "operationId": "op-before",
-                "mergeChangeId": "change-after"
+                "mergeChangeId": "change-after",
+                "targetBranch": "main",
+                "localCommit": "abc123def456",
+                "pushed": false
             },
             "verification": { "satisfied": true }
         })
@@ -3179,6 +3182,13 @@ fn native_save_preserves_launch_and_clean_merge_metadata() {
     .unwrap();
     let mut run = test_agent_run("merged-run", "ship it");
     run.status = AgentStatus::Merged;
+    run.integration = IntegrationEvidence {
+        phase: IntegrationPhase::MergedLocal,
+        bookmark: Some("main".to_string()),
+        merge_change_id: Some("change-after".to_string()),
+        git_commit: Some("abc123def456".to_string()),
+        pushed: false,
+    };
 
     save_native_run_record(&repo, &run).expect("save merged native record");
 
@@ -3189,7 +3199,18 @@ fn native_save_preserves_launch_and_clean_merge_metadata() {
     assert_eq!(value["merge"]["status"], "merged");
     assert_eq!(value["merge"]["operationId"], "op-before");
     assert_eq!(value["merge"]["mergeChangeId"], "change-after");
+    assert_eq!(value["merge"]["localCommit"], "abc123def456");
+    assert_eq!(value["merge"]["pushed"], false);
+    assert_eq!(value["lifecyclePhase"], "merged-locally");
     assert_eq!(value["verification"]["satisfied"], true);
+
+    let reloaded = agent_from_run_record(&repo, value).expect("reload merged record");
+    assert_eq!(reloaded.integration.bookmark.as_deref(), Some("main"));
+    assert_eq!(
+        reloaded.integration.git_commit.as_deref(),
+        Some("abc123def456")
+    );
+    assert_eq!(reloaded.integration.phase, IntegrationPhase::MergedLocal);
 }
 
 #[test]
@@ -3765,8 +3786,8 @@ fn cloud_fleet_migration_quiesces_only_live_isolated_workers() {
     );
     assert_eq!(
         worker.status,
-        AgentStatus::Running,
-        "record remains migratable"
+        AgentStatus::Migrated,
+        "successful handoff is cloud-owned rather than locally runnable"
     );
     let orchestrator = app.agents.iter().find(|run| run.id == "orch").unwrap();
     assert_eq!(orchestrator.status, AgentStatus::Running);
@@ -3779,7 +3800,7 @@ fn cloud_fleet_migration_quiesces_only_live_isolated_workers() {
     .unwrap();
     assert_eq!(
         record.get("status").and_then(|value| value.as_str()),
-        Some("running")
+        Some("migrated")
     );
 
     for run in &mut app.agents {
@@ -4684,17 +4705,6 @@ fn orchestrator_chat_renders_cursor_block() {
 }
 
 #[test]
-fn automerge_command_toggles_the_flag() {
-    let mut app = App::new();
-    app.cwd = std::env::temp_dir();
-    assert!(!app.auto_merge, "auto-merge defaults off");
-    assert!(app.handle_command("/automerge"));
-    assert!(app.auto_merge, "first /automerge turns it on");
-    assert!(app.handle_command("/automerge"));
-    assert!(!app.auto_merge, "second /automerge turns it off");
-}
-
-#[test]
 fn finished_agent_does_not_reopen_on_repaint() {
     // The flicker: highlighting a done agent triggers a resize/repaint -> output,
     // which previously flipped done -> in-progress. Output with no user input
@@ -4948,6 +4958,7 @@ fn test_agent_run(id: &str, task: &str) -> AgentRun {
         worktree_path: None,
         workspace_name: None,
         jj_change_id: None,
+        integration: IntegrationEvidence::default(),
         session_id: None,
         terminal: None,
         terminal_size: None,
@@ -5244,7 +5255,7 @@ fn ctrl_c_confirms_before_quitting_and_y_does_not_confirm() {
 fn esc_dismisses_the_notice_without_being_consumed() {
     let mut app = App::new();
     app.focus = FocusPane::Agents;
-    app.notice = Some("auto-merge ON".to_string());
+    app.notice = Some("integrating plan nodes".to_string());
     assert!(!app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty())));
     assert!(app.notice.is_none());
 }
@@ -5264,7 +5275,7 @@ fn notice_style_colors_errors_and_pending_confirms() {
         Some(RUNNING_COLOR)
     );
     assert_eq!(
-        notice_style("auto-merged 2 nodes · dependents unblocked", true).fg,
+        notice_style("integrated 2 nodes locally · dependents unblocked", true).fg,
         muted_style(true).fg
     );
 }
@@ -5284,7 +5295,10 @@ fn merged_status_is_distinct_and_labeled() {
     let mut run = test_agent_run("run-1", "test task");
     run.status = AgentStatus::Merged;
 
-    assert_eq!(agent_status_label(&run), "[x] merged");
+    assert_eq!(agent_status_label(&run), "merged locally");
+    run.integration.pushed = true;
+    run.integration.phase = IntegrationPhase::Pushed;
+    assert_eq!(agent_status_label(&run), "pushed");
 }
 
 #[test]
@@ -5788,7 +5802,6 @@ fn merge_all_confirmation_names_ready_nodes_and_logs_action() {
     second.status = AgentStatus::Done;
     second.node_id = Some("n2".to_string());
     second.worktree_path = Some(app.cwd.join("worktree-2"));
-    app.auto_merge_skip.push("run-2".to_string());
     app.agents.push(first);
     app.agents.push(second);
 
@@ -5800,7 +5813,6 @@ fn merge_all_confirmation_names_ready_nodes_and_logs_action() {
         .and_then(|confirm| confirm.detail.as_deref())
         .unwrap_or_default();
     assert!(detail.contains("Ready: n1, n2"));
-    assert!(detail.contains("parked by auto-merge"));
     assert!(app
         .activity_log
         .iter()
@@ -6173,6 +6185,7 @@ fn delete_agent_requires_second_d() {
         worktree_path: None,
         workspace_name: None,
         jj_change_id: None,
+        integration: IntegrationEvidence::default(),
         session_id: None,
         terminal: None,
         terminal_size: None,
@@ -7755,6 +7768,78 @@ fn restart_reconciles_finished_merge_resolver_to_done() {
     );
 }
 
+#[test]
+fn restart_marks_uncontrolled_running_record_orphaned_instead_of_relaunching() {
+    let repo = unique_test_repo("orphaned-running-record");
+    let mut app = App::new();
+    app.cwd = repo.clone();
+    let mut run = test_agent_run("lost-controller", "finish the migration");
+    run.cwd = repo.clone();
+    run.status = AgentStatus::Running;
+    run.terminal = None;
+    app.agents.push(run);
+
+    app.reconcile_orphaned_runs();
+
+    assert_eq!(app.agents[0].status, AgentStatus::Orphaned);
+    assert!(app.agents[0]
+        .last_error
+        .as_deref()
+        .is_some_and(|error| error.contains("resume explicitly")));
+    let record: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(native_run_dir(&repo, "lost-controller").join("run.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(record["status"], "orphaned");
+    assert_eq!(record["lifecyclePhase"], "orphaned");
+    let _ = fs::remove_dir_all(repo);
+}
+
+#[test]
+fn final_gate_discovers_repository_checks_and_persists_result() {
+    let repo = unique_test_repo("final-gate-checks");
+    fs::write(
+        repo.join("package.json"),
+        r#"{"scripts":{"check":"tsc --noEmit","test":"node --test"}}"#,
+    )
+    .unwrap();
+    fs::write(repo.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+    let labels = verification_commands(&repo)
+        .into_iter()
+        .map(|command| command.label)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        labels,
+        vec![
+            "jj conflicts",
+            "git diff --check",
+            "npm run check",
+            "npm test",
+            "cargo test --workspace"
+        ]
+    );
+
+    let mut app = App::new();
+    app.cwd = repo.clone();
+    app.final_gate_status = FinalGateStatus::Running;
+    app.final_gate_tx
+        .send(FinalGateResult {
+            passed: true,
+            summary: "all integrated · checks passed: test".to_string(),
+        })
+        .unwrap();
+    app.poll_final_gate();
+    assert_eq!(app.final_gate_status, FinalGateStatus::Passed);
+    let queue: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(repo.join(".rudder/plan-queue.json")).unwrap())
+            .unwrap();
+    assert_eq!(queue["final_gate_status"], "passed");
+    let context = fs::read_to_string(repo.join("RUDDER.md")).unwrap();
+    assert!(context.contains("## Final plan verification"));
+    assert!(context.contains("status=passed"));
+    let _ = fs::remove_dir_all(repo);
+}
+
 #[cfg(not(windows))]
 #[test]
 fn selected_agent_row_renders_a_visible_marker() {
@@ -7817,13 +7902,12 @@ fn agents_pane_scrolls_to_follow_the_selection() {
 }
 
 #[test]
-fn auto_merge_waits_for_an_active_resolver() {
+fn plan_integration_waits_for_an_active_resolver() {
     // Integration through the shared jj workspace is serial: a Done node must NOT be merged
     // while a merge-conflict resolver is mid-flight in the same workspace, or the new merge
     // would stack on top of the in-progress resolution and corrupt both. The guard returns
     // before any merge is attempted (so this is deterministic — no `rudder merge` subprocess).
     let mut app = App::new();
-    app.auto_merge = true;
     let mut ready = test_agent_run("ready", "feature");
     ready.node_id = Some("n1".to_string());
     ready.status = AgentStatus::Done;
@@ -7833,7 +7917,7 @@ fn auto_merge_waits_for_an_active_resolver() {
     resolver.merge_resolver = true;
     app.agents = vec![ready, resolver];
 
-    app.maybe_auto_merge();
+    app.integrate_ready_plan_nodes();
 
     assert_eq!(
         app.agents[0].status,
@@ -8098,7 +8182,7 @@ fn write_rudder_context_preserves_orchestrator_plan_block() {
     )
     .unwrap();
 
-    write_rudder_context_with_history(&repo, &[], None, &[]).expect("write RUDDER.md");
+    write_rudder_context_with_history(&repo, &[], None, &[], None).expect("write RUDDER.md");
     let text = fs::read_to_string(repo.join("RUDDER.md")).unwrap();
 
     assert!(text.contains("<!-- RUDDER_GENERATED_START -->"));
@@ -8123,7 +8207,8 @@ fn write_rudder_context_mirrors_shared_context_to_worktree() {
         workspace_name: None,
         jj_change_id: None,
     };
-    write_rudder_context_with_history(&repo, &[], Some(&pending), &[]).expect("write RUDDER.md");
+    write_rudder_context_with_history(&repo, &[], Some(&pending), &[], None)
+        .expect("write RUDDER.md");
 
     let root_shared = fs::read_to_string(repo.join("RUDDER_SHARED.md")).unwrap();
     let workspace_shared = fs::read_to_string(workspace.join("RUDDER_SHARED.md")).unwrap();
@@ -8150,7 +8235,7 @@ fn write_rudder_context_redacts_secret_values_in_agent_previews() {
     agent.cwd = repo.clone();
     agent.current_prompt = "keep using APIFY_TOKEN=abc1234567 for the ingest".to_string();
 
-    write_rudder_context_with_history(&repo, &[agent], None, &[]).expect("write RUDDER.md");
+    write_rudder_context_with_history(&repo, &[agent], None, &[], None).expect("write RUDDER.md");
     let text = fs::read_to_string(repo.join("RUDDER.md")).unwrap();
 
     assert!(text.contains("APIFY_TOKEN=[redacted]"));
@@ -8199,18 +8284,18 @@ fn write_rudder_context_includes_global_job_snapshot() {
         jj_change_id: None,
     };
 
-    write_rudder_context_with_history(&repo, &[running, done, merged], Some(&pending), &[])
+    write_rudder_context_with_history(&repo, &[running, done, merged], Some(&pending), &[], None)
         .expect("write RUDDER.md");
     let text = fs::read_to_string(repo.join("RUDDER.md")).unwrap();
 
     assert!(text.contains("## Global job snapshot"));
     assert!(text.contains(
-        "- totals: total=4 running=1 waiting=1 done=1 merged=1 failed=0 stopped=0 pending-starts=1"
+        "- totals: total=4 running=1 cloud-owned=0 waiting=1 done=1 merged=1 failed=0 stopped=0 orphaned=0 pending-starts=1"
     ));
     assert!(text.contains(
-        "- active-now: running=1 waiting=1 review-ready=1 merge-ready=1 pending-starts=1"
+        "- active-now: running=1 cloud-owned=0 waiting=1 review-ready=1 merge-ready=1 pending-starts=1"
     ));
-    assert!(text.contains("- completed: merged=1 failed=0 stopped=0"));
+    assert!(text.contains("- completed: merged=1 failed=0 stopped=0 orphaned=0"));
     assert!(text.contains("- backends: claude=2 codex=1"));
     assert!(text.contains("- ready-to-act: review-ready=1 merge-ready=1"));
     assert!(text.contains("## Active local Rudder agents"));
@@ -8223,7 +8308,7 @@ fn write_rudder_context_includes_global_job_snapshot() {
         .split("## Ready local Rudder agents")
         .next()
         .unwrap();
-    assert!(active_section.contains("run-codex node=n1 mode=execute status=running waiting=user-input backend=codex model=gpt-5.1-codex-max"));
+    assert!(active_section.contains("run-codex node=n1 mode=execute status=working waiting=user-input backend=codex model=gpt-5.1-codex-max"));
     assert!(active_section.contains("deps=hard=[n0] soft=[n2]"));
     assert!(!active_section.contains("run-claude"));
     assert!(!active_section.contains("run-merged"));
@@ -8234,16 +8319,17 @@ fn write_rudder_context_includes_global_job_snapshot() {
         .split("## Completed local Rudder agents")
         .next()
         .unwrap();
-    assert!(ready_section.contains("run-claude node=n3 mode=execute status=done backend=claude"));
-    assert!(ready_section.contains("merge=needs-merge"));
+    assert!(
+        ready_section.contains("run-claude node=n3 mode=execute status=verifying backend=claude")
+    );
+    assert!(ready_section.contains("integration=ready"));
     assert!(!ready_section.contains("run-merged"));
     let completed_section = text
         .split("## Completed local Rudder agents")
         .nth(1)
         .unwrap();
-    assert!(
-        completed_section.contains("run-merged node=n4 mode=execute status=merged backend=claude")
-    );
+    assert!(completed_section
+        .contains("run-merged node=n4 mode=execute status=merged-locally backend=claude"));
     assert!(text.contains("status=starting backend=pending model=pending"));
     let worker_text = fs::read_to_string(repo.join("codex-worktree").join("RUDDER.md"))
         .expect("running workspace RUDDER.md");
@@ -8270,7 +8356,7 @@ fn rudder_context_carries_session_memory_for_new_agents() {
         "also cover the timeout path".to_string(),
     ];
 
-    write_rudder_context_with_history(&repo, &[done], None, &history)
+    write_rudder_context_with_history(&repo, &[done], None, &history, None)
         .expect("write RUDDER.md with history");
     let text = fs::read_to_string(repo.join("RUDDER.md")).expect("read RUDDER.md");
 
@@ -8321,16 +8407,11 @@ fn orchestrator_prompts_include_global_monitoring_contract() {
 #[test]
 fn orchestrator_skill_markers_are_consumed_once() {
     let repo = unique_test_repo("orch-skill-markers");
-    fs::write(
-        repo.join("RUDDER.md"),
-        "before\nRUDDER_AUTOMERGE on\nRUDDER_HELP\nafter\n",
-    )
-    .unwrap();
+    fs::write(repo.join("RUDDER.md"), "before\nRUDDER_HELP\nafter\n").unwrap();
 
     let mut app = App::new();
     app.cwd = repo.clone();
     app.interactive_orchestrator = true;
-    app.auto_merge = false;
     let mut orch = test_agent_run("orch-1", "plan it");
     orch.cwd = repo.clone();
     orch.mode = AgentMode::RudderPlan;
@@ -8342,14 +8423,12 @@ fn orchestrator_skill_markers_are_consumed_once() {
 
     app.scan_orchestrator_skill_markers();
 
-    assert!(app.auto_merge, "automerge marker toggled state");
     assert!(app
         .notice
         .as_deref()
         .unwrap_or_default()
         .contains("skills:"));
     let text = fs::read_to_string(repo.join("RUDDER.md")).unwrap();
-    assert!(!text.contains("RUDDER_AUTOMERGE"));
     assert!(!text.contains("RUDDER_HELP"));
     assert!(text.contains("before") && text.contains("after"));
 
@@ -8599,7 +8678,7 @@ fn fresh_interactive_orchestrator_clears_stale_plan_markers() {
     std::env::set_var("RUDDER_CLAUDE_BIN", &fake);
     fs::write(
         orchestrator_plan_path(&repo),
-        "before\nRUDDER_PLAN_TASKS_START\n{\"tasks\":[{\"id\":\"old\",\"title\":\"old\",\"prompt\":\"p\",\"goal\":\"g\",\"success\":\"s\",\"deps\":[]}]}\nRUDDER_PLAN_TASKS_END\n\nRUDDER_APPROVE_PLAN\nRUDDER_AUTOMERGE on\nRUDDER_MERGE_ALL\nafter\n",
+        "before\nRUDDER_PLAN_TASKS_START\n{\"tasks\":[{\"id\":\"old\",\"title\":\"old\",\"prompt\":\"p\",\"goal\":\"g\",\"success\":\"s\",\"deps\":[]}]}\nRUDDER_PLAN_TASKS_END\n\nRUDDER_APPROVE_PLAN\nRUDDER_MERGE_ALL\nafter\n",
     )
     .unwrap();
 
@@ -8615,7 +8694,6 @@ fn fresh_interactive_orchestrator_clears_stale_plan_markers() {
     assert!(!text.contains("RUDDER_PLAN_TASKS_START"));
     assert!(!text.contains("RUDDER_PLAN_TASKS_END"));
     assert!(!output_has_approve_marker(&text));
-    assert!(!text.contains("RUDDER_AUTOMERGE"));
     assert!(!text.contains("RUDDER_MERGE_ALL"));
     assert!(text.contains("before") && text.contains("after"));
 
@@ -11696,18 +11774,17 @@ fn classify_new_direction_reads_live_plan_titles() {
 }
 
 #[test]
-fn rebasing_suppresses_auto_merge() {
+fn rebasing_suppresses_plan_integration() {
     let mut app = App::new();
     app.cwd = std::env::temp_dir();
-    app.auto_merge = true;
     app.rebasing = true;
-    // A clean Done node would normally be auto-merged; the rebase guard holds it.
+    // A clean Done node would normally be integrated; the rebase guard holds it.
     app.agents.push(node_agent("n0", AgentStatus::Done));
-    app.maybe_auto_merge();
+    app.integrate_ready_plan_nodes();
     assert_eq!(
         app.agents[0].status,
         AgentStatus::Done,
-        "auto-merge is suppressed while a rebase is in flight"
+        "plan integration is suppressed while a rebase is in flight"
     );
 }
 
@@ -12338,8 +12415,8 @@ fn conductor_live_run_drains_dag_with_fake_workers() {
     let mut app = App::new();
     app.cwd = repo.clone();
     app.backend = Backend::Codex;
-    app.auto_merge = false; // merge has its own tests; we simulate the merge event here
-                            // Seed a 2-node plan: a root + a child that HARD-depends on it.
+    // Merge has its own tests; this harness simulates each integration event.
+    // Seed a 2-node plan: a root + a child that HARD-depends on it.
     app.planned_nodes = vec![titled_planned_node("setup", "scaffold the project"), {
         let mut n = titled_planned_node("feature", "build the feature");
         n.deps = vec!["setup".to_string()];
@@ -12460,41 +12537,6 @@ fn conductor_live_run_drains_dag_with_fake_workers() {
         "the auto-grown follow-up node was scheduled into a worker"
     );
     assert!(drained, "the whole DAG drained within the tick budget");
-
-    let _ = fs::remove_dir_all(&repo);
-}
-
-#[test]
-fn auto_merge_skip_round_trips_through_persistence() {
-    // auto_merge is a persisted default, so the skip list must survive a restart with
-    // it: a fresh App that loses the list would re-merge a known-conflicted run on the
-    // first maybe_auto_merge tick and re-spawn an AI resolver uninvited.
-    let repo = unique_test_repo("automerge-skip");
-    let mut app = App::new();
-    app.cwd = repo.clone();
-    // Missing file => empty list (fresh repo, corrupt file fallback).
-    assert!(load_auto_merge_skip(&repo).is_empty());
-
-    app.auto_merge_skip.push("run-conflicted-a".to_string());
-    app.auto_merge_skip.push("run-conflicted-b".to_string());
-    app.persist_auto_merge_skip();
-    assert_eq!(
-        load_auto_merge_skip(&repo),
-        vec![
-            "run-conflicted-a".to_string(),
-            "run-conflicted-b".to_string()
-        ],
-        "skip list round-trips through .rudder/auto-merge-skip.json"
-    );
-
-    // A successful merge / re-goal clears an id; the persisted copy must follow.
-    app.auto_merge_skip.retain(|id| id != "run-conflicted-a");
-    app.persist_auto_merge_skip();
-    assert_eq!(
-        load_auto_merge_skip(&repo),
-        vec!["run-conflicted-b".to_string()],
-        "clearing a skip entry persists too"
-    );
 
     let _ = fs::remove_dir_all(&repo);
 }

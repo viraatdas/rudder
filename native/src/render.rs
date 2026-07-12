@@ -309,6 +309,11 @@ pub(crate) fn push_agent_row_with_trailing<'a>(
         model_line.extend(model_tail);
         lines.push(ListItem::new(Line::from(model_line)));
     }
+    if let Some(detail) = integration_detail(agent) {
+        let mut integration_line = cont_prefix.to_vec();
+        integration_line.extend([Span::raw("  "), Span::styled(detail, muted_style(focused))]);
+        lines.push(ListItem::new(Line::from(integration_line)));
+    }
     if let Some(summary) = diff {
         let mut diff_line = cont_prefix.to_vec();
         diff_line.extend([
@@ -420,7 +425,10 @@ pub(crate) fn status_bucket(agent: &AgentRun) -> Bucket {
         AgentStatus::Running => Bucket::InProgress,
         AgentStatus::Done => Bucket::Review,
         AgentStatus::Merged => Bucket::Done,
-        AgentStatus::Failed | AgentStatus::Stopped => Bucket::Closed,
+        AgentStatus::Failed
+        | AgentStatus::Stopped
+        | AgentStatus::Orphaned
+        | AgentStatus::Migrated => Bucket::Closed,
     }
 }
 
@@ -1026,7 +1034,9 @@ pub(crate) fn orchestrator_task_status(app: &App, node_id: &str) -> OrchTaskStat
         let status = match run.status {
             AgentStatus::Merged => OrchTaskStatus::Done,
             AgentStatus::Done => OrchTaskStatus::Review,
-            AgentStatus::Failed | AgentStatus::Stopped => OrchTaskStatus::Failed,
+            AgentStatus::Failed | AgentStatus::Stopped | AgentStatus::Orphaned => {
+                OrchTaskStatus::Failed
+            }
             _ => OrchTaskStatus::Running,
         };
         if best.as_ref().is_none_or(|b| rank(&status) >= rank(b)) {
@@ -1194,14 +1204,8 @@ pub(crate) fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             Span::styled("agents ", pane_text_style(focused)),
             Span::styled(run_count.to_string(), accent_style(focused)),
             Span::styled(" runs", pane_text_style(focused)),
-            // Merge mode is global state the user otherwise has to remember, so
-            // surface it here permanently (the orchestrator header shows it too).
             Span::styled("  ·  ", muted_style(focused)),
-            if app.auto_merge {
-                Span::styled("auto-merge", accent_style(focused))
-            } else {
-                Span::styled("manual merge", muted_style(focused))
-            },
+            Span::styled("plan integration automatic", accent_style(focused)),
         ])),
         ListItem::new(Line::default()),
     ];
@@ -2015,9 +2019,14 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
     };
 
     let phase = orchestrator_phase_for_app(app, agent);
-    let phase_label = match &phase {
-        OrchestratorPhase::Planning => "plan mode".to_string(),
-        OrchestratorPhase::PlanReady(tasks) => format!("plan · {} tasks", tasks.len()),
+    let phase_label = match app.final_gate_status {
+        FinalGateStatus::Running => "all integrated · verifying".to_string(),
+        FinalGateStatus::Passed => "all integrated · checks passed".to_string(),
+        FinalGateStatus::Failed => "all integrated · checks failed".to_string(),
+        FinalGateStatus::Idle => match &phase {
+            OrchestratorPhase::Planning => "plan mode".to_string(),
+            OrchestratorPhase::PlanReady(tasks) => format!("plan · {} tasks", tasks.len()),
+        },
     };
     // The model + version doing the planning, shown on the header so it is always clear
     // which agent/version is in plan mode (e.g. "Claude Code · opus[1m]").
@@ -2038,8 +2047,8 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // Header: ◆ ORCHESTRATOR · phase · <backend · model> [· auto-merge].
-    let mut header_spans = vec![
+    // Header: ◆ ORCHESTRATOR · phase · <backend · model>.
+    let header_spans = vec![
         Span::styled(
             format!("{ORCH_MARK} ORCHESTRATOR"),
             Style::default().fg(ACCENT),
@@ -2049,10 +2058,6 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
         Span::styled("  ·  ", muted_style(focused)),
         Span::styled(model_label, Style::default().fg(ACCENT)),
     ];
-    if app.auto_merge {
-        header_spans.push(Span::styled("  ·  ", muted_style(focused)));
-        header_spans.push(Span::styled("auto-merge", Style::default().fg(ACCENT)));
-    }
     let header: Vec<Line<'static>> = vec![Line::from(header_spans)];
 
     // Chat input (pinned at the bottom when focused): the follow-up being composed,
@@ -4254,23 +4259,48 @@ pub(crate) fn agent_status_label(agent: &AgentRun) -> &'static str {
         && agent.status == AgentStatus::Running
     {
         "plan mode"
+    } else if agent.status == AgentStatus::Merged && agent.integration.pushed {
+        "pushed"
     } else if agent.status == AgentStatus::Merged {
-        "[x] merged"
+        "merged locally"
+    } else if agent.integration.phase == IntegrationPhase::Integrating {
+        "integrating"
     } else if agent.has_merge_conflict() && agent.status == AgentStatus::Running {
         "resolving conflict"
     } else if agent.has_merge_conflict() && agent.status == AgentStatus::Done {
         "merge conflict · press m"
     } else if agent.status == AgentStatus::Done && agent_awaits_merge(agent) {
-        // "done" alone read as terminal, but a workspace run is NOT integrated (and
-        // does not unblock its dependents) until it merges. Say what is missing.
-        "done · needs merge"
+        "verifying · ready to integrate"
     } else {
-        agent.status.as_str()
+        agent.lifecycle_label()
     }
 }
 
+fn integration_detail(agent: &AgentRun) -> Option<String> {
+    if agent.integration.phase == IntegrationPhase::Pending
+        && agent.integration.bookmark.is_none()
+        && agent.integration.merge_change_id.is_none()
+    {
+        return None;
+    }
+    let bookmark = agent.integration.bookmark.as_deref().unwrap_or("HEAD");
+    let revision = agent
+        .integration
+        .git_commit
+        .as_deref()
+        .or(agent.integration.merge_change_id.as_deref())
+        .map(short_hash)
+        .unwrap_or_else(|| "pending".to_string());
+    let remote = if agent.integration.pushed {
+        "remote contains commit"
+    } else {
+        "not pushed"
+    };
+    Some(format!("{bookmark} @ {revision} · {remote}"))
+}
+
 /// A finished run that still has a workspace to integrate: it sits in the review
-/// bucket until merged (m / M / auto-merge), and hard-dependent nodes stay gated
+/// bucket until merged (m / M for manual runs; automatic for DAG nodes), and hard-dependent nodes stay gated
 /// on it. Main, one-off, and planner runs never merge.
 pub(crate) fn agent_awaits_merge(agent: &AgentRun) -> bool {
     agent.status == AgentStatus::Done

@@ -99,7 +99,7 @@ All sources already exist; the loop only reads them.
 | Verifier output | `<repo>/.rudder/runs/<id>/verifier.json` | `satisfied:false`, `missing[]` = the contract failed the user |
 | Completion notes | `DECISIONS.md`, done sidecar files | what agents said they did vs what the diff shows |
 | Steering | `.rudder/steer/` queue, `RUDDER_REGOAL`/`RUDDER_INJECT` markers in activity | every user redirect is a "Rudder got it wrong" vote |
-| Activity log | `activity.jsonl` | conductor actions: drift nudges, auto-merges, rebase diffs |
+| Activity log | `activity.jsonl` | conductor actions: drift nudges, integrations, rebase diffs |
 | Graph history | `.rudder/graph.json`, plan-queue, ingestion ledger | DAG shape vs outcome: which plans stalled, which fan-ins conflicted |
 | Token usage | usage accounting (`native/src/usage.rs` data) | cost per task class, cost regressions |
 | Crashes | daemon/worker logs once observability P2.2/P2.3 land | silent failures |
