@@ -774,17 +774,6 @@ fn web_steer_done_worker_regoals_the_same_row() {
 }
 
 #[test]
-fn worktree_dir_name_leads_with_task_slug() {
-    let name = worktree_dir_name(
-        "1779248379804-add-dark-and-light-mode-56991",
-        "Add dark and light mode",
-    );
-
-    assert!(name.starts_with("add-dark-and-light-mode-"));
-    assert!(!name.starts_with("1779248379804"));
-}
-
-#[test]
 fn parses_main_worktree_from_porcelain() {
     let output = "\
 worktree /repo/feature\n\

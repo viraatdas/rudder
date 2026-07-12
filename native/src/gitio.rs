@@ -1847,11 +1847,6 @@ pub(crate) fn completion_sound_path() -> Option<PathBuf> {
     candidates.into_iter().find(|path| path.is_file())
 }
 
-pub(crate) fn worktree_dir_name(run_id: &str, task: &str) -> String {
-    let task_slug = slugify(task, "task");
-    format!("{}-{}", task_slug, worktree_unique_suffix(run_id))
-}
-
 /// `recent_instructions` is the tail of the user's task history (newest last):
 /// every agent workspace mirrors this file, so a freshly spawned `/run` worker
 /// opens with a one-page digest of the session — what the user has been asking
@@ -2659,8 +2654,4 @@ pub(crate) fn short_hash(value: &str) -> String {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     value.hash(&mut hasher);
     format!("{:010x}", hasher.finish())[..10].to_string()
-}
-
-pub(crate) fn worktree_unique_suffix(run_id: &str) -> String {
-    short_hash(run_id).chars().take(8).collect()
 }
