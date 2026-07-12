@@ -5884,43 +5884,57 @@ fn review_all_premerge_combines_real_jj_changes() {
     run("git", &["commit", "-m", "base"], &repo);
     run("jj", &["git", "init", "--colocate", "."], &repo);
 
-    let first = prepare_jj_workspace_at(&repo, "review source one", None).unwrap();
-    fs::write(first.path.join("one.txt"), "one\n").unwrap();
-    let first_revision = jj_workspace_change_id(&first.path).unwrap();
-    let second = prepare_jj_workspace_at(&repo, "review source two", None).unwrap();
-    fs::write(second.path.join("two.txt"), "two\n").unwrap();
-    let second_revision = jj_workspace_change_id(&second.path).unwrap();
-    let aggregate = prepare_jj_workspace_at(&repo, "review aggregate", None).unwrap();
+    let first_path = repo.with_extension("review-one");
+    let second_path = repo.with_extension("review-two");
+    let aggregate_path = repo.with_extension("review-aggregate");
+    let add_workspace = |path: &Path, name: &str| {
+        let path_arg = path.to_string_lossy().to_string();
+        run(
+            "jj",
+            &["workspace", "add", &path_arg, "--name", name, "-r", "@"],
+            &repo,
+        );
+    };
+    add_workspace(&first_path, "review-one");
+    fs::write(first_path.join("one.txt"), "one\n").unwrap();
+    let first_revision = jj_workspace_change_id(&first_path).unwrap();
+    add_workspace(&second_path, "review-two");
+    fs::write(second_path.join("two.txt"), "two\n").unwrap();
+    let second_revision = jj_workspace_change_id(&second_path).unwrap();
+    add_workspace(&aggregate_path, "review-aggregate");
     let sources = vec![
         ReviewAllSource {
             id: "one".to_string(),
             revision: first_revision,
             task: "one".to_string(),
             summary: "one".to_string(),
-            worktree_path: Some(first.path),
+            worktree_path: Some(first_path.clone()),
         },
         ReviewAllSource {
             id: "two".to_string(),
             revision: second_revision,
             task: "two".to_string(),
             summary: "two".to_string(),
-            worktree_path: Some(second.path),
+            worktree_path: Some(second_path.clone()),
         },
     ];
 
-    let result = premerge_review_all_sources(&aggregate.path, &sources);
+    let result = premerge_review_all_sources(&aggregate_path, &sources);
 
     assert_eq!(result.merged_revisions.len(), 2);
     assert!(result.stopped_revision.is_none());
     assert_eq!(
-        fs::read_to_string(aggregate.path.join("one.txt")).unwrap(),
+        fs::read_to_string(aggregate_path.join("one.txt")).unwrap(),
         "one\n"
     );
     assert_eq!(
-        fs::read_to_string(aggregate.path.join("two.txt")).unwrap(),
+        fs::read_to_string(aggregate_path.join("two.txt")).unwrap(),
         "two\n"
     );
-    assert!(jj_workspace_change_id(&aggregate.path).is_some());
+    assert!(jj_workspace_change_id(&aggregate_path).is_some());
+    let _ = fs::remove_dir_all(first_path);
+    let _ = fs::remove_dir_all(second_path);
+    let _ = fs::remove_dir_all(aggregate_path);
     let _ = fs::remove_dir_all(repo);
 }
 
