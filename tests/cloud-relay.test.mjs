@@ -159,5 +159,111 @@ test("input is injected into the worker and output is read back", async (t) => {
   const noAuth = await fetch(`${base}/api/rudder/sail/${sailId}/output`);
   assert.notEqual(noAuth.status, 200);
 
+  // A workspace heartbeat proves the machine is alive, but must not count as
+  // user activity or revive a workspace after the user has stopped it.
+  const workspaceId = "workspace-relay-test";
+  const workspaceToken = "rdrw_test_workspace_token";
+  const oldActivity = "2024-01-01T00:00:00.000Z";
+  const workspaceDb = new Database(dbPath);
+  workspaceDb.prepare(`
+    insert into rudder_workspaces (
+      id, account_id, workspace_key, repo_name, status, machine_id, machine_state,
+      worker_token_hash, last_activity_at, created_at, updated_at
+    ) values (?,?,?,?,?,?,?,?,?,?,?)
+  `).run(
+    workspaceId, accountId, "workspace-key", "repo", "running", "machine-current", "started",
+    tokenHash(workspaceToken), oldActivity, now, now,
+  );
+  workspaceDb.close();
+
+  const heartbeatHeaders = {
+    authorization: `Bearer ${workspaceToken}`,
+    "content-type": "application/json",
+  };
+  const heartbeat = await fetch(`${base}/api/rudder/workspace/${workspaceId}/heartbeat`, {
+    method: "POST",
+    headers: heartbeatHeaders,
+    body: JSON.stringify({ state: "running", machineId: "machine-current" }),
+  });
+  assert.equal(heartbeat.status, 200);
+  const heartbeatDb = new Database(dbPath);
+  let workspaceRow = heartbeatDb.prepare(
+    "select status, last_activity_at, last_heartbeat_at from rudder_workspaces where id = ?",
+  ).get(workspaceId);
+  assert.equal(workspaceRow.last_activity_at, oldActivity, "heartbeat preserves the idle clock");
+  assert.ok(workspaceRow.last_heartbeat_at, "heartbeat still updates liveness");
+  heartbeatDb.prepare("update rudder_workspaces set status = 'stopped' where id = ?").run(workspaceId);
+  heartbeatDb.close();
+
+  const lateHeartbeat = await fetch(`${base}/api/rudder/workspace/${workspaceId}/heartbeat`, {
+    method: "POST",
+    headers: heartbeatHeaders,
+    body: JSON.stringify({ state: "failed", machineId: "machine-current" }),
+  });
+  assert.equal(lateHeartbeat.status, 200);
+  const stoppedDb = new Database(dbPath);
+  workspaceRow = stoppedDb.prepare("select status from rudder_workspaces where id = ?").get(workspaceId);
+  assert.equal(workspaceRow.status, "stopped", "late worker exit cannot overwrite a manual stop");
+  stoppedDb.prepare("update rudder_workspaces set status = 'running' where id = ?").run(workspaceId);
+  stoppedDb.close();
+
+  // Attach before the worker is online. Resize and keystrokes must survive the
+  // reconnect and arrive once, in order, when the worker connects.
+  const clientWs = new WebSocket(`ws://127.0.0.1:${port}/api/rudder/workspace/${workspaceId}/attach`, {
+    headers: { authorization: `Bearer ${cliToken}` },
+  });
+  clientWs.binaryType = "nodebuffer";
+  await new Promise((resolve, reject) => {
+    clientWs.once("open", resolve);
+    clientWs.once("error", reject);
+  });
+  clientWs.send(JSON.stringify({ type: "resize", cols: 100, rows: 40 }));
+  clientWs.send(Buffer.from("buffered-keystroke", "utf8"), { binary: true });
+
+  const workspaceReceived = [];
+  const workerWs = new WebSocket(`ws://127.0.0.1:${port}/api/rudder/workspace/${workspaceId}/worker`, {
+    headers: {
+      authorization: `Bearer ${workspaceToken}`,
+      "x-rudder-machine-id": "machine-current",
+    },
+  });
+  workerWs.binaryType = "nodebuffer";
+  workerWs.on("message", (data, isBinary) => {
+    workspaceReceived.push({ text: Buffer.from(data).toString("utf8"), isBinary });
+  });
+  await new Promise((resolve, reject) => {
+    workerWs.once("open", resolve);
+    workerWs.once("error", reject);
+  });
+  await waitFor(() => workspaceReceived.some((item) => item.text.includes("buffered-keystroke")));
+  assert.ok(workspaceReceived.some((item) => !item.isBinary && item.text.includes('"resize"')));
+  assert.ok(workspaceReceived.some((item) => item.isBinary && item.text === "buffered-keystroke"));
+
+  // Historical PTY output is sent as one bounded replay frame instead of
+  // thousands of per-write WebSocket frames.
+  for (let index = 0; index < 320; index += 1) {
+    workerWs.send(Buffer.alloc(1024, index % 255), { binary: true });
+  }
+  await sleep(200);
+  const replayFrames = [];
+  const replayClient = new WebSocket(`ws://127.0.0.1:${port}/api/rudder/workspace/${workspaceId}/attach`, {
+    headers: { authorization: `Bearer ${cliToken}` },
+  });
+  replayClient.binaryType = "nodebuffer";
+  replayClient.on("message", (data, isBinary) => {
+    if (isBinary) replayFrames.push(Buffer.from(data));
+  });
+  await new Promise((resolve, reject) => {
+    replayClient.once("open", resolve);
+    replayClient.once("error", reject);
+  });
+  await waitFor(() => replayFrames.length > 0);
+  await sleep(100);
+  assert.equal(replayFrames.length, 1, "replay is coalesced into one frame");
+  assert.ok(replayFrames[0].length <= 256 * 1024, "replay stays within its byte budget");
+
   ws.close();
+  clientWs.close();
+  replayClient.close();
+  workerWs.close();
 });

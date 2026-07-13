@@ -1337,3 +1337,18 @@ under `~/.rudder/improve/evals/`, run candidate vs baseline (deterministic tier 
 `RUDDER_FAKE_MODEL_OUTPUT`/`RUDDER_FAKE_BACKEND=1`, live tier budgeted), and feed
 blind A/B deltas to the judge panel. Plus tractability feedback: outcome entries
 adjusting the static weights in `rank.ts::TRACTABILITY`.
+
+---
+
+## 16. Cloud operations discoveries
+
+- Workspace heartbeats are liveness signals, not user activity. Never advance
+  `last_activity_at` from a periodic worker heartbeat; idle shutdown must be based on
+  attach/input/control activity while still requiring zero live clients.
+- A manual stop is a desired-state boundary. Late worker heartbeats and final exit
+  reports must not move a `stopped` workspace back to `running` or `failed`.
+- Terminal replay must be byte-bounded and coalesced. Replaying every historical PTY
+  chunk separately caused more than 10,000 WebSocket frames for a single attach and
+  made local keystroke echo take over a second.
+- Fly volumes are billed while unattached. Workspace deletion/GC must retain enough
+  state to retry a failed volume deletion and must not lose orphan volume ids.

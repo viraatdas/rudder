@@ -372,9 +372,10 @@ const updateWorkspaceHeartbeat = database.prepare(`
       machine_id = coalesce(@machineId, machine_id),
       machine_state = @machineState,
       last_heartbeat_at = @lastHeartbeatAt,
-      last_activity_at = @lastActivityAt,
       updated_at = @updatedAt
   where id = @id
+    and status <> 'stopped'
+    and (@machineId is null or machine_id is null or machine_id = @machineId)
 `);
 const getSetting = database.prepare("select value from rudder_settings where key = ?");
 const upsertSetting = database.prepare(`
@@ -494,12 +495,19 @@ const server = http.createServer(async (req, res) => {
 const SAIL_ATTACH_PATH_RE = /^\/api\/rudder\/sail\/([^/]+)\/(worker|attach)$/;
 const WORKSPACE_ATTACH_PATH_RE = /^\/api\/rudder\/workspace\/([^/]+)\/(worker|attach)$/;
 const REPLAY_BUFFER_BYTES = 256 * 1024;
+const PENDING_INPUT_BYTES = 64 * 1024;
+const MAX_SOCKET_BUFFER_BYTES = 1024 * 1024;
+const SOCKET_PING_MS = 30_000;
 
 type Channel = {
   worker?: WebSocket;
   clients: Set<WebSocket>;
+  controller?: WebSocket;
   buffer: Buffer[];
   bufferBytes: number;
+  pendingInput: Buffer[];
+  pendingInputBytes: number;
+  latestResize?: string;
 };
 
 type ChannelKind = "sail" | "workspace";
@@ -592,6 +600,14 @@ function handleWorkspaceUpgrade(
       destroyUpgrade(socket, 401);
       return;
     }
+    const machineId = typeof req.headers["x-rudder-machine-id"] === "string"
+      ? req.headers["x-rudder-machine-id"]
+      : undefined;
+    const expectedMachineId = optionalString(workspaceRow.machine_id);
+    if (machineId && expectedMachineId && machineId !== expectedMachineId) {
+      destroyUpgrade(socket, 409);
+      return;
+    }
     wss.handleUpgrade(req, socket, head, (ws) => attachWorker("workspace", workspaceId, ws));
     return;
   }
@@ -613,6 +629,7 @@ function destroyUpgrade(socket: Duplex, status: number): void {
   const reason = status === 401 ? "Unauthorized"
     : status === 403 ? "Forbidden"
     : status === 404 ? "Not Found"
+    : status === 409 ? "Conflict"
     : "Internal Server Error";
   try {
     socket.write(`HTTP/1.1 ${status} ${reason}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
@@ -630,7 +647,13 @@ function getChannel(kind: ChannelKind, id: string): Channel {
   const map = channelMap(kind);
   let channel = map.get(id);
   if (!channel) {
-    channel = { clients: new Set(), buffer: [], bufferBytes: 0 };
+    channel = {
+      clients: new Set(),
+      buffer: [],
+      bufferBytes: 0,
+      pendingInput: [],
+      pendingInputBytes: 0,
+    };
     map.set(id, channel);
   }
   return channel;
@@ -659,6 +682,8 @@ function attachWorker(kind: ChannelKind, id: string, ws: WebSocket): void {
   channel.worker = ws;
   channel.buffer = [];
   channel.bufferBytes = 0;
+  enableSocketLiveness(ws);
+  flushPendingClientState(channel);
   broadcastStatus(channel, "worker-connected");
   // Deliver any Slack messages that were queued while this sail was asleep.
   if (kind === "sail") {
@@ -666,12 +691,13 @@ function attachWorker(kind: ChannelKind, id: string, ws: WebSocket): void {
   }
 
   ws.on("message", (data, isBinary) => {
+    if (channel.worker !== ws) {
+      return;
+    }
     if (isBinary && data instanceof Buffer) {
       pushBuffer(channel, data);
       for (const client of channel.clients) {
-        if (client.readyState === WebSocket.OPEN) {
-          client.send(data, { binary: true });
-        }
+        sendSocket(client, data, true);
       }
       return;
     }
@@ -682,9 +708,10 @@ function attachWorker(kind: ChannelKind, id: string, ws: WebSocket): void {
   });
 
   ws.on("close", () => {
-    if (channel.worker === ws) {
-      channel.worker = undefined;
+    if (channel.worker !== ws) {
+      return;
     }
+    channel.worker = undefined;
     broadcastStatus(channel, "worker-disconnected");
     disposeChannelIfEmpty(kind, id);
   });
@@ -694,48 +721,76 @@ function attachWorker(kind: ChannelKind, id: string, ws: WebSocket): void {
 function attachClient(kind: ChannelKind, id: string, ws: WebSocket): void {
   const channel = getChannel(kind, id);
   channel.clients.add(ws);
+  channel.controller = ws;
+  enableSocketLiveness(ws);
   if (kind === "workspace") {
     touchWorkspaceActivity(id);
   }
 
-  ws.send(JSON.stringify({
+  sendSocket(ws, JSON.stringify({
     type: "status",
-    state: channel.worker ? "worker-connected" : "worker-waiting",
+    state: isOpen(channel.worker) ? "worker-connected" : "worker-waiting",
+    control: "active",
   }));
-  for (const chunk of channel.buffer) {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(chunk, { binary: true });
-    }
+  if (channel.bufferBytes > 0) {
+    sendSocket(ws, Buffer.concat(channel.buffer, channel.bufferBytes), true);
   }
 
   ws.on("message", (data, isBinary) => {
-    const worker = channel.worker;
-    if (!worker || worker.readyState !== WebSocket.OPEN) {
+    if (channel.controller !== ws) {
+      sendSocket(ws, JSON.stringify({ type: "status", state: "read-only" }));
       return;
     }
+    const worker = channel.worker;
     if (isBinary && data instanceof Buffer) {
-      worker.send(data, { binary: true });
+      if (isOpen(worker)) {
+        sendSocket(worker, data, true);
+      } else {
+        pushPendingInput(channel, data);
+        sendSocket(ws, JSON.stringify({ type: "status", state: "input-buffered" }));
+      }
       if (kind === "workspace") {
         touchWorkspaceActivity(id);
       }
       return;
     }
     if (data instanceof Buffer) {
-      worker.send(data.toString("utf8"));
+      const text = data.toString("utf8");
+      if (isResizeMessage(text)) {
+        channel.latestResize = text;
+      }
+      if (isOpen(worker)) {
+        sendSocket(worker, text);
+      }
     }
   });
 
   ws.on("close", () => {
     channel.clients.delete(ws);
+    if (channel.controller === ws) {
+      channel.controller = Array.from(channel.clients).reverse().find(isOpen);
+      if (channel.controller) {
+        sendSocket(channel.controller, JSON.stringify({
+          type: "status",
+          state: "controller-promoted",
+          control: "active",
+        }));
+      }
+    }
     disposeChannelIfEmpty(kind, id);
   });
   ws.on("error", () => undefined);
 }
 
 function pushBuffer(channel: Channel, chunk: Buffer): void {
+  if (chunk.length >= REPLAY_BUFFER_BYTES) {
+    channel.buffer = [chunk.subarray(chunk.length - REPLAY_BUFFER_BYTES)];
+    channel.bufferBytes = REPLAY_BUFFER_BYTES;
+    return;
+  }
   channel.buffer.push(chunk);
   channel.bufferBytes += chunk.length;
-  while (channel.bufferBytes > REPLAY_BUFFER_BYTES && channel.buffer.length > 1) {
+  while (channel.bufferBytes > REPLAY_BUFFER_BYTES && channel.buffer.length > 0) {
     const dropped = channel.buffer.shift();
     if (dropped) {
       channel.bufferBytes -= dropped.length;
@@ -743,20 +798,88 @@ function pushBuffer(channel: Channel, chunk: Buffer): void {
   }
 }
 
+function pushPendingInput(channel: Channel, chunk: Buffer): void {
+  const remaining = PENDING_INPUT_BYTES - channel.pendingInputBytes;
+  if (remaining <= 0) {
+    return;
+  }
+  const accepted = chunk.length <= remaining ? chunk : chunk.subarray(0, remaining);
+  channel.pendingInput.push(Buffer.from(accepted));
+  channel.pendingInputBytes += accepted.length;
+}
+
+function flushPendingClientState(channel: Channel): void {
+  const worker = channel.worker;
+  if (!isOpen(worker)) {
+    return;
+  }
+  if (channel.latestResize) {
+    sendSocket(worker, channel.latestResize);
+  }
+  for (const chunk of channel.pendingInput) {
+    sendSocket(worker, chunk, true);
+  }
+  channel.pendingInput = [];
+  channel.pendingInputBytes = 0;
+}
+
+function isResizeMessage(text: string): boolean {
+  try {
+    const value = JSON.parse(text) as { type?: unknown };
+    return value?.type === "resize";
+  } catch {
+    return false;
+  }
+}
+
+function isOpen(ws: WebSocket | undefined): ws is WebSocket {
+  return Boolean(ws && ws.readyState === WebSocket.OPEN);
+}
+
+function sendSocket(ws: WebSocket | undefined, data: string | Buffer, binary = false): boolean {
+  if (!isOpen(ws)) {
+    return false;
+  }
+  if (ws.bufferedAmount > MAX_SOCKET_BUFFER_BYTES) {
+    ws.terminate();
+    return false;
+  }
+  if (binary) {
+    ws.send(data, { binary: true });
+  } else {
+    ws.send(data);
+  }
+  return true;
+}
+
+function enableSocketLiveness(ws: WebSocket): void {
+  let alive = true;
+  ws.on("pong", () => { alive = true; });
+  const timer = setInterval(() => {
+    if (!alive || ws.readyState !== WebSocket.OPEN) {
+      clearInterval(timer);
+      if (ws.readyState !== WebSocket.CLOSED) {
+        ws.terminate();
+      }
+      return;
+    }
+    alive = false;
+    try { ws.ping(); } catch { ws.terminate(); }
+  }, SOCKET_PING_MS);
+  timer.unref?.();
+  ws.once("close", () => clearInterval(timer));
+}
+
 function forwardTextToClients(channel: Channel, text: string): void {
   for (const client of channel.clients) {
-    if (client.readyState === WebSocket.OPEN) {
-      client.send(text);
-    }
+    sendSocket(client, text);
   }
 }
 
 function broadcastStatus(channel: Channel, state: string): void {
   const payload = JSON.stringify({ type: "status", state });
   for (const client of channel.clients) {
-    if (client.readyState === WebSocket.OPEN) {
-      client.send(payload);
-    }
+    sendSocket(client, payload);
   }
 }
 
@@ -795,6 +918,12 @@ function instanceHasLiveWorker(kind: ChannelKind, id: string): boolean {
 }
 
 function touchWorkspaceActivity(workspaceId: string): void {
+  const previous = workspaceActivityWrites.get(workspaceId) ?? 0;
+  const nowMs = Date.now();
+  if (nowMs - previous < 1_000) {
+    return;
+  }
+  workspaceActivityWrites.set(workspaceId, nowMs);
   try {
     const now = new Date().toISOString();
     updateWorkspaceActivity.run({ id: workspaceId, lastActivityAt: now, updatedAt: now });
@@ -802,6 +931,8 @@ function touchWorkspaceActivity(workspaceId: string): void {
     // ignore
   }
 }
+
+const workspaceActivityWrites = new Map<string, number>();
 
 server.listen(port, () => {
   console.log(`rudder cloud listening on ${baseURL}`);
@@ -835,7 +966,7 @@ async function sweepIdleWorkspaces(): Promise<void> {
     if (!workspace.machineId) {
       continue;
     }
-    if (workspaceChannels.get(workspace.id)?.clients.size) {
+    if (Array.from(workspaceChannels.get(workspace.id)?.clients ?? []).some(isOpen)) {
       continue;
     }
     const last = workspace.lastActivityAt ?? workspace.lastHeartbeatAt ?? workspace.updatedAt;
@@ -2730,6 +2861,9 @@ async function mutateWorkspace(workspace: Workspace, action: string): Promise<Wo
     machineState: action === "stop" || action === "pause" ? machine.state ?? null : started.machineState,
     updatedAt: now,
   });
+  if (action === "resume") {
+    updateWorkspaceActivity.run({ id: workspace.id, lastActivityAt: now, updatedAt: now });
+  }
   const next = findWorkspaceById.get(workspace.id) as Record<string, unknown> | undefined;
   return next ? rowToWorkspace(next) : { ...workspace, status, machineState: machine.state };
 }
@@ -2743,15 +2877,25 @@ async function handleWorkspaceHeartbeat(req: IncomingMessage, res: ServerRespons
   requireWorkerBearer(req, row);
   const body = await readJsonBody(req);
   const state = stringField(body, "state");
+  const machineId = stringField(body, "machineId");
+  const expectedMachineId = optionalString(row.machine_id);
+  if (machineId && expectedMachineId && machineId !== expectedMachineId) {
+    sendJson(res, 409, { error: "stale workspace machine" });
+    return;
+  }
+  const currentStatus = String(row.status) as WorkspaceStatus;
+  if (currentStatus === "stopped") {
+    sendJson(res, 200, { ok: true, status: currentStatus, ignored: true });
+    return;
+  }
   const status: WorkspaceStatus = state === "failed" ? "failed" : "running";
   const now = new Date().toISOString();
   updateWorkspaceHeartbeat.run({
     id: workspaceId,
     status,
-    machineId: stringField(body, "machineId") ?? null,
+    machineId: machineId ?? null,
     machineState: state || status,
     lastHeartbeatAt: now,
-    lastActivityAt: now,
     updatedAt: now,
   });
   sendJson(res, 200, { ok: true, status });
@@ -2779,7 +2923,10 @@ function listAccountWorkspaces(accountId: string): Workspace[] {
 
 function annotateWorkspaceClients(workspace: Workspace): Workspace & { clientCount: number } {
   const channel = workspaceChannels.get(workspace.id);
-  return { ...workspace, clientCount: channel ? channel.clients.size : 0 };
+  const clientCount = channel
+    ? Array.from(channel.clients).filter(isOpen).length
+    : 0;
+  return { ...workspace, clientCount };
 }
 
 function getAccountWorkspace(id: string, accountId: string): Workspace | null {

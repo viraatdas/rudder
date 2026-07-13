@@ -9,6 +9,7 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import { WebSocket } from "ws";
 import pty from "node-pty";
 
@@ -111,13 +112,20 @@ let wsReadyPromise = connect();
 let lastReportedState = "running";
 let exited = false;
 let heartbeatTimer = setInterval(reportHeartbeat, 30000);
+const inputDecoder = new StringDecoder("utf8");
+const pendingOutput = [];
+let pendingOutputBytes = 0;
+const MAX_PENDING_OUTPUT_BYTES = 256 * 1024;
 reportHeartbeat();
 
 term.onData((data) => {
   process.stdout.write(data);
+  const chunk = Buffer.from(data, "utf8");
   const socket = ws;
   if (socket && socket.readyState === WebSocket.OPEN) {
-    socket.send(Buffer.from(data, "utf8"), { binary: true });
+    socket.send(chunk, { binary: true });
+  } else {
+    bufferPendingOutput(chunk);
   }
 });
 
@@ -154,12 +162,16 @@ function connect() {
   return new Promise((resolve) => {
     let connected = false;
     const socket = new WebSocket(wsUrl, {
-      headers: { authorization: `Bearer ${workerToken}` },
+      headers: {
+        authorization: `Bearer ${workerToken}`,
+        ...(flyMachineId ? { "x-rudder-machine-id": flyMachineId } : {}),
+      },
     });
     socket.binaryType = "nodebuffer";
     socket.on("open", () => {
       connected = true;
       ws = socket;
+      try { socket._socket?.setNoDelay?.(true); } catch { /* ignore */ }
       socket.send(JSON.stringify({
         type: "hello",
         cols: term.cols,
@@ -167,6 +179,7 @@ function connect() {
         sessionKind,
         sessionId,
       }));
+      flushPendingOutput(socket);
       resolve(socket);
     });
     socket.on("message", (data, isBinary) => {
@@ -174,7 +187,7 @@ function connect() {
         return;
       }
       if (isBinary && Buffer.isBuffer(data)) {
-        term.write(data.toString("utf8"));
+        term.write(inputDecoder.write(data));
         return;
       }
       const text = Buffer.isBuffer(data) ? data.toString("utf8") : String(data);
@@ -195,6 +208,29 @@ function connect() {
       }
     });
   });
+}
+
+function bufferPendingOutput(chunk) {
+  if (chunk.length >= MAX_PENDING_OUTPUT_BYTES) {
+    pendingOutput.length = 0;
+    pendingOutput.push(chunk.subarray(chunk.length - MAX_PENDING_OUTPUT_BYTES));
+    pendingOutputBytes = MAX_PENDING_OUTPUT_BYTES;
+    return;
+  }
+  pendingOutput.push(chunk);
+  pendingOutputBytes += chunk.length;
+  while (pendingOutputBytes > MAX_PENDING_OUTPUT_BYTES && pendingOutput.length > 1) {
+    pendingOutputBytes -= pendingOutput.shift().length;
+  }
+}
+
+function flushPendingOutput(socket) {
+  if (pendingOutputBytes === 0 || socket.readyState !== WebSocket.OPEN) {
+    return;
+  }
+  socket.send(Buffer.concat(pendingOutput, pendingOutputBytes), { binary: true });
+  pendingOutput.length = 0;
+  pendingOutputBytes = 0;
 }
 
 function handleControl(text) {

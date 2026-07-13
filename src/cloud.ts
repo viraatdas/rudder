@@ -594,22 +594,22 @@ async function onload(args: string[], options: CloudCommandOptions): Promise<voi
 }
 
 async function logs(args: string[], options: CloudCommandOptions): Promise<void> {
-  const sailId = args[0];
-  if (!sailId) {
+  const workerId = args[0];
+  if (!workerId) {
     throw new Error("Usage: rudder cloud logs <id>");
   }
   const client = await cloudClient({ requireToken: true });
-  const result = await client.request<JsonValue>("/api/rudder/sail", { method: "GET" });
-  const sails = Array.isArray(result)
-    ? result
-    : result && typeof result === "object" && !Array.isArray(result) && Array.isArray((result as Record<string, JsonValue>).sails)
-      ? (result as Record<string, JsonValue>).sails as JsonValue[]
-      : [];
-  const match = sails.find((item) =>
-    item && typeof item === "object" && !Array.isArray(item) && (item as Record<string, JsonValue>).id === sailId
+  const [sailResult, workspaceResult] = await Promise.all([
+    client.request<JsonValue>("/api/rudder/sail", { method: "GET" }),
+    client.request<JsonValue>("/api/rudder/workspace", { method: "GET" }),
+  ]);
+  const sails = collectionFromResult(sailResult, "sails");
+  const workspaces = collectionFromResult(workspaceResult, "workspaces");
+  const match = [...sails, ...workspaces].find((item) =>
+    item && typeof item === "object" && !Array.isArray(item) && (item as Record<string, JsonValue>).id === workerId
   );
   if (!match) {
-    throw new Error(`Cloud worker not found: ${sailId}`);
+    throw new Error(`Cloud worker not found: ${workerId}`);
   }
   if (options.json) {
     printJson(match);
@@ -618,6 +618,17 @@ async function logs(args: string[], options: CloudCommandOptions): Promise<void>
   console.log("Cloud log streaming is not available yet.");
   console.log("Worker status:");
   printSailList([match]);
+}
+
+function collectionFromResult(result: JsonValue, key: "sails" | "workspaces"): JsonValue[] {
+  if (Array.isArray(result)) {
+    return result;
+  }
+  if (result && typeof result === "object" && !Array.isArray(result)) {
+    const collection = (result as Record<string, JsonValue>)[key];
+    return Array.isArray(collection) ? collection : [];
+  }
+  return [];
 }
 
 async function listSails(options: CloudCommandOptions): Promise<void> {
@@ -1905,7 +1916,7 @@ async function workspaceCommand(args: string[], options: CloudCommandOptions): P
     return;
   }
   if (sub === "status") {
-    await workspaceStatus(options);
+    await workspaceStatus(rest, options);
     return;
   }
   if (sub === "stop" || sub === "pause" || sub === "resume") {
@@ -2190,7 +2201,7 @@ async function workspaceShare(options: CloudCommandOptions): Promise<void> {
   console.log("They must already be logged in to Rudder Cloud with their own account (run `rudder cloud login` if not).");
 }
 
-async function workspaceStatus(options: CloudCommandOptions): Promise<void> {
+async function workspaceStatus(args: string[], options: CloudCommandOptions): Promise<void> {
   if (process.env.RUDDER_OFFLINE === "1") {
     if (options.json) {
       printJson({ offline: true, workspace: null });
@@ -2199,7 +2210,10 @@ async function workspaceStatus(options: CloudCommandOptions): Promise<void> {
     }
     return;
   }
-  const workspace = await lookupWorkspaceForRepo(options).catch((error) => {
+  const explicitId = args[0];
+  const workspace = await (explicitId
+    ? lookupWorkspaceById(explicitId)
+    : lookupWorkspaceForRepo(options)).catch((error) => {
     if (!options.json) {
       console.warn(`Could not reach Rudder Cloud: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -2240,6 +2254,18 @@ async function workspaceStatus(options: CloudCommandOptions): Promise<void> {
   }
 }
 
+async function lookupWorkspaceById(id: string): Promise<Record<string, JsonValue> | null> {
+  const client = await cloudClient({ requireToken: true });
+  const result = await client.request<JsonValue>("/api/rudder/workspace", { method: "GET" });
+  const match = collectionFromResult(result, "workspaces").find((item) =>
+    item && typeof item === "object" && !Array.isArray(item)
+      && (item as Record<string, JsonValue>).id === id
+  );
+  return match && typeof match === "object" && !Array.isArray(match)
+    ? match as Record<string, JsonValue>
+    : null;
+}
+
 function computeIdleMinutes(lastActivityAt: string | undefined): number | null {
   if (!lastActivityAt) {
     return null;
@@ -2265,7 +2291,15 @@ async function workspaceMutate(action: "pause" | "resume" | "stop", args: string
     method: "POST",
     body: {} as JsonValue,
   });
-  await printResult(result, options);
+  if (options.json) {
+    printJson(result);
+    return;
+  }
+  const record = result && typeof result === "object" && !Array.isArray(result)
+    ? result as Record<string, JsonValue>
+    : {};
+  const status = typeof record.status === "string" ? record.status : action;
+  console.log(`Workspace ${id} ${status}.`);
 }
 
 async function workspaceList(options: CloudCommandOptions): Promise<void> {
@@ -2314,7 +2348,7 @@ async function runAttach(target: AttachTarget, options: CloudCommandOptions): Pr
     let opened = false;
     let cleaned = false;
     let firstFrameRendered = false;
-    let result: AttachResult = "exited";
+    let result: AttachResult = "failed";
 
     const splashAllowed = isInteractive && !options.json && !options.quietBanner;
     const splash = splashAllowed ? new AttachSplash(stdout, target.label) : null;
@@ -2556,15 +2590,11 @@ async function runAttach(target: AttachTarget, options: CloudCommandOptions): Pr
           if (message.state === "worker-waiting") {
             splash.setStatus(`Waiting for cloud worker · ${target.label}`);
           } else if (message.state === "worker-connected") {
-            // Hand off the splash as soon as the server reports the worker
-            // is connected. Waiting for the first BINARY PTY frame can add
-            // 3-6s on warm restart because the worker may not flush until
-            // after its first render. The binary-frame path below still
-            // calls handoff() as a safety net if we never see this status.
-            firstFrameRendered = true;
-            splash.handoff();
+            splash.setStatus(`Cloud worker connected · ${target.label}`);
             sendResize();
             setTimeout(sendResize, 150);
+          } else if (message.state === "input-buffered") {
+            splash.setStatus(`Reconnecting cloud input · ${target.label}`);
           }
         } else if (!options.json && !options.quietBanner) {
           if (message.state === "worker-disconnected") {
