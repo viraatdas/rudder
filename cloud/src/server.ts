@@ -2592,14 +2592,17 @@ async function reuseOrRestartWorkspace(
   // or fingerprint mismatch (user's local state changed). Need a fresh
   // snapshot from the CLI. Also destroy + recreate the volume so the user
   // sees their new repo state instead of the cached one on the old disk.
-  if (workspace.volumeId) {
-    await destroyWorkspaceVolume(workspace.volumeId);
-  }
   if (workspace.machineId && machine && machine.state !== "destroyed" && machine.state !== "destroying") {
     await flyRequest<FlyMachine>(
       `/v1/apps/${encodeURIComponent(flyAppName)}/machines/${encodeURIComponent(workspace.machineId)}?force=true`,
       { method: "DELETE" },
-    ).catch(() => null);
+    );
+  }
+  // A Fly volume cannot be deleted while its machine is attached. Delete the
+  // machine first, then wait for detachment; if cleanup still fails, keep the
+  // old volume id in SQLite and abort instead of creating an untracked volume.
+  if (workspace.volumeId) {
+    await destroyWorkspaceVolume(workspace.volumeId);
   }
   if (!snapshotInput) {
     throw badRequest("snapshot is required to (re)create this workspace");
@@ -2824,14 +2827,28 @@ async function createWorkspaceVolumeNamed(name: string, region: string): Promise
 
 async function destroyWorkspaceVolume(volumeId: string): Promise<void> {
   if (!flyApiToken || !flyAppName) {
-    return;
+    throw new Error("Fly is not configured; cannot destroy workspace volume");
   }
-  await flyRequest<FlyVolume>(
-    `/v1/apps/${encodeURIComponent(flyAppName)}/volumes/${encodeURIComponent(volumeId)}`,
-    { method: "DELETE" },
-  ).catch((error) => {
-    console.warn(`destroy volume ${volumeId} failed: ${error instanceof Error ? error.message : String(error)}`);
-  });
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= 12; attempt += 1) {
+    try {
+      await flyRequest<FlyVolume>(
+        `/v1/apps/${encodeURIComponent(flyAppName)}/volumes/${encodeURIComponent(volumeId)}`,
+        { method: "DELETE" },
+      );
+      return;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (/not found|404/i.test(message)) {
+        return;
+      }
+      lastError = error;
+      if (attempt < 12) {
+        await sleep(1_000);
+      }
+    }
+  }
+  throw new Error(`destroy volume ${volumeId} failed: ${lastError instanceof Error ? lastError.message : String(lastError)}`);
 }
 
 async function mutateWorkspace(workspace: Workspace, action: string): Promise<Workspace> {
