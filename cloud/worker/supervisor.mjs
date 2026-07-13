@@ -33,6 +33,7 @@ if (!sessionId) {
 
 if (alreadyStaged()) {
   console.log(`Rudder worker re-using staged workspace`);
+  restoreSelectedHome();
   chdirToStagedWorkdir();
 } else {
   // Fly Machines disks are ephemeral across stop+start, so the staged marker
@@ -348,12 +349,7 @@ function stageSnapshot(downloadUrl) {
   sh(`curl -fsSL ${shQuote(downloadUrl)} -o snapshot.tgz`);
   fs.mkdirSync("unpacked", { recursive: true });
   sh("tar -xzf snapshot.tgz -C unpacked");
-  if (fs.existsSync("unpacked/home")) {
-    console.log("Restoring selected HOME config...");
-    const home = os.homedir() || process.env.HOME || "/root";
-    shSoft(`cp -R unpacked/home/. ${shQuote(home + "/")} 2>/dev/null`);
-    shSoft(`find ${shQuote(home)} -name '._*' -delete 2>/dev/null`);
-  }
+  restoreSelectedHome();
   let workdir;
   if (fs.existsSync("unpacked/repo")) {
     workdir = path.join("/workspace", repoName);
@@ -372,6 +368,39 @@ function stageSnapshot(downloadUrl) {
     sh('git commit -qm "rudder cloud baseline" || true');
   }
   stageMigratedAgents(workdir);
+}
+
+function restoreSelectedHome() {
+  const source = "/workspace/unpacked/home";
+  if (!fs.existsSync(source)) {
+    return;
+  }
+  console.log("Restoring selected HOME config...");
+  const home = os.homedir() || process.env.HOME || "/root";
+  fs.mkdirSync(home, { recursive: true });
+  for (const entry of fs.readdirSync(source)) {
+    const destination = path.join(home, entry);
+    fs.cpSync(path.join(source, entry), destination, {
+      recursive: true,
+      force: true,
+      preserveTimestamps: true,
+    });
+    removeAppleDoubleFiles(destination);
+  }
+}
+
+function removeAppleDoubleFiles(directory) {
+  if (!fs.existsSync(directory) || !fs.statSync(directory).isDirectory()) {
+    return;
+  }
+  for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+    const entryPath = path.join(directory, entry.name);
+    if (entry.name.startsWith("._")) {
+      fs.rmSync(entryPath, { recursive: true, force: true });
+    } else if (entry.isDirectory()) {
+      removeAppleDoubleFiles(entryPath);
+    }
+  }
 }
 
 function stageMigratedAgents(workdir) {
