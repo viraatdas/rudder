@@ -2675,19 +2675,34 @@ async function warmRestartWorkspaceMachine(params: {
   snapshotKey: string;
 }): Promise<FlyMachine | null> {
   ensureFlyConfigured();
-  // Don't update env. Fly's machine update POST replaces the machine and
-  // breaks the start. Just start it. Fly machine disks are ephemeral across
-  // stop+start, so the supervisor's alreadyStaged() marker is missing on cold
-  // boot and it will re-download the snapshot. The supervisor refreshes its
-  // own pre-signed URL via GET /api/rudder/workspace/:id/snapshot-url, which
-  // means the stale env URL is no longer a problem on warm restart.
+  // Refresh the image while preserving the complete existing machine config,
+  // including env and mounts. Persistent workspaces otherwise stay pinned to
+  // the worker image digest they were originally created with forever.
   void params.snapshotKey;
   try {
+    await refreshWorkspaceMachineImage(params.machineId);
     return await startFlyMachine(params.machineId, `workspace ${params.machineId}`);
   } catch (error) {
     console.warn(`warm restart ${params.machineId}: start failed: ${error instanceof Error ? error.message : String(error)}`);
     throw error;
   }
+}
+
+async function refreshWorkspaceMachineImage(machineId: string): Promise<void> {
+  const machine = await flyRequest<FlyMachine>(
+    `/v1/apps/${encodeURIComponent(flyAppName)}/machines/${encodeURIComponent(machineId)}`,
+    { method: "GET" },
+  );
+  if (!machine.config || machine.config.image === flyWorkerImage) {
+    return;
+  }
+  await flyRequest<FlyMachine>(
+    `/v1/apps/${encodeURIComponent(flyAppName)}/machines/${encodeURIComponent(machineId)}`,
+    {
+      method: "POST",
+      body: { config: { ...machine.config, image: flyWorkerImage } },
+    },
+  );
 }
 
 async function startFlyMachine(machineId: string, label: string): Promise<FlyMachine> {
@@ -2862,6 +2877,7 @@ async function mutateWorkspace(workspace: Workspace, action: string): Promise<Wo
       { method: "POST", body: { signal: "SIGTERM", timeout: "10s" } },
     );
   } else if (action === "resume") {
+    await refreshWorkspaceMachineImage(workspace.machineId);
     machine = await startFlyMachine(workspace.machineId, `workspace ${workspace.id}`);
   } else {
     throw badRequest(`unsupported workspace action: ${action}`);
