@@ -2693,9 +2693,12 @@ async function refreshWorkspaceMachineImage(machineId: string): Promise<void> {
     `/v1/apps/${encodeURIComponent(flyAppName)}/machines/${encodeURIComponent(machineId)}`,
     { method: "GET" },
   );
-  if (!machine.config || machine.config.image === flyWorkerImage) {
+  if (!machine.config) {
     return;
   }
+  // Re-submit even when the configured tag text is unchanged. Fly resolves a
+  // mutable tag such as `latest` when the machine config is updated, not when
+  // an already-created machine is merely started.
   await flyRequest<FlyMachine>(
     `/v1/apps/${encodeURIComponent(flyAppName)}/machines/${encodeURIComponent(machineId)}`,
     {
