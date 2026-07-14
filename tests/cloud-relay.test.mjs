@@ -241,10 +241,20 @@ test("input is injected into the worker and output is read back", async (t) => {
 
   // Historical PTY output is sent as one bounded replay frame instead of
   // thousands of per-write WebSocket frames.
+  // clientWs is the live controller and receives every forwarded worker frame,
+  // so use its byte count to know when the relay has ingested all 320 chunks —
+  // a fixed sleep races under parallel-suite load and live frames then leak
+  // into the replay count below.
+  let liveBytes = 0;
+  const countLiveBytes = (data, isBinary) => {
+    if (isBinary) liveBytes += data.length;
+  };
+  clientWs.on("message", countLiveBytes);
   for (let index = 0; index < 320; index += 1) {
     workerWs.send(Buffer.alloc(1024, index % 255), { binary: true });
   }
-  await sleep(200);
+  await waitFor(() => liveBytes >= 320 * 1024, { timeout: 15000 });
+  clientWs.off("message", countLiveBytes);
   const replayFrames = [];
   const replayClient = new WebSocket(`ws://127.0.0.1:${port}/api/rudder/workspace/${workspaceId}/attach`, {
     headers: { authorization: `Bearer ${cliToken}` },
@@ -266,4 +276,173 @@ test("input is injected into the worker and output is read back", async (t) => {
   clientWs.close();
   replayClient.close();
   workerWs.close();
+});
+
+test("secrets vault round trip and latency-probe relay", async (t) => {
+  const port = await freePort();
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "rudder-cloud-test-"));
+  const dbPath = path.join(dataDir, "state.sqlite");
+  const base = `http://127.0.0.1:${port}`;
+
+  const child = spawn(process.execPath, [path.join(cloudDir, "dist", "server.js")], {
+    env: {
+      ...process.env,
+      PORT: String(port),
+      BETTER_AUTH_URL: base,
+      BETTER_AUTH_SECRET: "test-secret-test-secret",
+      RUDDER_CLOUD_DATA_DIR: dataDir,
+      RUDDER_CLOUD_DB: dbPath,
+      RUDDER_CLOUD_PERSIST_STATE: "0",
+      RUDDER_S3_BUCKET: "",
+      SLACK_BOT_TOKEN: "",
+      RUDDER_SECRETS_KEY: Buffer.alloc(32, 7).toString("base64"),
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let serverLog = "";
+  child.stdout.on("data", (d) => { serverLog += d.toString(); });
+  child.stderr.on("data", (d) => { serverLog += d.toString(); });
+  t.after(async () => {
+    child.kill("SIGKILL");
+    try { fs.rmSync(dataDir, { recursive: true, force: true }); } catch { /* ignore */ }
+  });
+
+  await waitFor(async () => {
+    const res = await fetch(`${base}/health`).catch(() => null);
+    return res && res.ok;
+  });
+  await waitFor(() => fs.existsSync(dbPath));
+  await sleep(150);
+
+  const cliToken = "rdr_test_cli_token2";
+  const workerToken = "rdrw_test_worker_token2";
+  const workspaceId = "workspace-secrets-test";
+  const accountId = "acct-secrets";
+  const now = new Date().toISOString();
+  const db = new Database(dbPath);
+  db.pragma("journal_mode = WAL");
+  db.prepare(
+    "insert or replace into rudder_tokens (token_hash, account_id, email, created_at, last_used_at) values (?,?,?,?,?)",
+  ).run(tokenHash(cliToken), accountId, "test@example.com", now, now);
+  db.prepare(`
+    insert into rudder_workspaces (
+      id, account_id, workspace_key, repo_name, status, machine_id, machine_state,
+      worker_token_hash, last_activity_at, created_at, updated_at
+    ) values (?,?,?,?,?,?,?,?,?,?,?)
+  `).run(
+    workspaceId, accountId, "workspace-secrets-key", "repo", "running", "machine-1", "started",
+    tokenHash(workerToken), now, now, now,
+  );
+  db.close();
+
+  const authHeaders = { authorization: `Bearer ${cliToken}`, "content-type": "application/json" };
+
+  // health advertises the vault
+  const health = await (await fetch(`${base}/health`)).json();
+  assert.equal(health.secrets, true, "vault configured");
+
+  // PUT env + file secrets, then list (metadata only, never values).
+  const putEnv = await fetch(`${base}/api/rudder/secrets/item`, {
+    method: "PUT",
+    headers: authHeaders,
+    body: JSON.stringify({
+      name: "ANTHROPIC_API_KEY",
+      kind: "env",
+      valueBase64: Buffer.from("sk-ant-test-value").toString("base64"),
+    }),
+  });
+  assert.equal(putEnv.status, 200, `put env (log: ${serverLog})`);
+  const putFile = await fetch(`${base}/api/rudder/secrets/item`, {
+    method: "PUT",
+    headers: authHeaders,
+    body: JSON.stringify({
+      name: "~/.claude/.credentials.json",
+      kind: "file",
+      filePath: "~/.claude/.credentials.json",
+      valueBase64: Buffer.from('{"token":"abc"}').toString("base64"),
+    }),
+  });
+  assert.equal(putFile.status, 200);
+  // Blocked path parts are refused server-side.
+  const putBlocked = await fetch(`${base}/api/rudder/secrets/item`, {
+    method: "PUT",
+    headers: authHeaders,
+    body: JSON.stringify({
+      name: "~/.ssh/id_rsa",
+      kind: "file",
+      valueBase64: Buffer.from("nope").toString("base64"),
+    }),
+  });
+  assert.equal(putBlocked.status, 400, "refuses .ssh paths");
+
+  const listRes = await fetch(`${base}/api/rudder/secrets`, { headers: authHeaders });
+  assert.equal(listRes.status, 200);
+  const listBody = await listRes.json();
+  assert.equal(listBody.secrets.length, 2);
+  assert.ok(!JSON.stringify(listBody).includes("sk-ant-test-value"), "list never leaks values");
+
+  // Worker fetch decrypts with the worker bearer.
+  const workerRes = await fetch(`${base}/api/rudder/workspace/${workspaceId}/secrets`, {
+    headers: { authorization: `Bearer ${workerToken}` },
+  });
+  assert.equal(workerRes.status, 200);
+  const workerBody = await workerRes.json();
+  assert.equal(workerBody.env.ANTHROPIC_API_KEY, "sk-ant-test-value");
+  assert.equal(workerBody.files.length, 1);
+  assert.equal(
+    Buffer.from(workerBody.files[0].contentBase64, "base64").toString("utf8"),
+    '{"token":"abc"}',
+  );
+  // Account CLI tokens must NOT work on the worker endpoint and vice versa.
+  const wrongBearer = await fetch(`${base}/api/rudder/workspace/${workspaceId}/secrets`, {
+    headers: { authorization: `Bearer ${cliToken}` },
+  });
+  assert.notEqual(wrongBearer.status, 200);
+
+  // DELETE removes and bumps the version.
+  const del = await fetch(`${base}/api/rudder/secrets/item?name=ANTHROPIC_API_KEY`, {
+    method: "DELETE",
+    headers: authHeaders,
+  });
+  assert.equal(del.status, 200);
+  const afterDelete = await (await fetch(`${base}/api/rudder/secrets`, { headers: authHeaders })).json();
+  assert.equal(afterDelete.secrets.length, 1);
+
+  // Latency probe: a client "probe" text frame relays to the worker, whose
+  // "probe-reply" relays back — mirroring supervisor.mjs handleControl.
+  const workerWs = new WebSocket(`ws://127.0.0.1:${port}/api/rudder/workspace/${workspaceId}/worker`, {
+    headers: { authorization: `Bearer ${workerToken}`, "x-rudder-machine-id": "machine-1" },
+  });
+  workerWs.binaryType = "nodebuffer";
+  workerWs.on("message", (data, isBinary) => {
+    if (isBinary) return;
+    let payload = null;
+    try { payload = JSON.parse(Buffer.from(data).toString("utf8")); } catch { return; }
+    if (payload?.type === "probe") {
+      workerWs.send(JSON.stringify({ type: "probe-reply", id: payload.id ?? null }));
+    }
+  });
+  await new Promise((resolve, reject) => {
+    workerWs.once("open", resolve);
+    workerWs.once("error", reject);
+  });
+
+  const clientWs = new WebSocket(`ws://127.0.0.1:${port}/api/rudder/workspace/${workspaceId}/attach`, {
+    headers: { authorization: `Bearer ${cliToken}` },
+  });
+  clientWs.binaryType = "nodebuffer";
+  const replies = [];
+  clientWs.on("message", (data, isBinary) => {
+    if (isBinary) return;
+    try { replies.push(JSON.parse(Buffer.from(data).toString("utf8"))); } catch { /* ignore */ }
+  });
+  await new Promise((resolve, reject) => {
+    clientWs.once("open", resolve);
+    clientWs.once("error", reject);
+  });
+  clientWs.send(JSON.stringify({ type: "probe", id: 42 }));
+  await waitFor(() => replies.some((reply) => reply.type === "probe-reply" && reply.id === 42));
+
+  workerWs.close();
+  clientWs.close();
 });

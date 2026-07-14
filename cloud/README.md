@@ -85,6 +85,7 @@ FLY_API_TOKEN=<fly token>
 FLY_APP_NAME=<existing fly machines app>
 FLY_REGION=iad
 RUDDER_WORKER_IMAGE=<registry image for cloud/worker/Dockerfile>
+RUDDER_SECRETS_KEY=<32 random bytes, base64 — enables the secrets vault>
 SLACK_BOT_TOKEN=<xoxb- bot token, enables the Slack control surface>
 SLACK_SIGNING_SECRET=<verifies inbound Slack events>
 RUDDER_SLACK_CHANNEL=C0B78TDLM5G
@@ -97,6 +98,15 @@ simply disabled. See "Slack — the shared main panel" below.
 Machines runtime. BYOC runs still require `RUDDER_S3_BUCKET` and
 `RUDDER_WORKER_IMAGE` so the control plane can store a snapshot and print a
 worker command for the user's server.
+
+`RUDDER_SECRETS_KEY` is the KEK for the per-account secrets vault
+(`rudder cloud secrets ...`). Generate with `openssl rand -base64 32` and set
+it via `flyctl secrets set`. **Back it up out-of-band**: losing it makes all
+stored vault ciphertext unreadable (recovery = re-run `rudder cloud secrets
+sync` from a laptop that still has the credentials). When unset, the vault
+endpoints return 503 and clients fall back to carrying credentials inside
+workspace snapshots (the legacy behavior, also forceable with
+`RUDDER_CLOUD_LEGACY_SNAPSHOT_SECRETS=1` on the client).
 
 Current hosted control plane:
 

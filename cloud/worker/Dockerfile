@@ -19,6 +19,17 @@ RUN apt-get update \
     python3 build-essential \
   && rm -rf /var/lib/apt/lists/*
 
+# GitHub CLI: clone-mode workspaces wire git credentials via `gh auth setup-git`
+# using the vault-delivered ~/.config/gh, and agents get `gh pr create`.
+RUN set -eux; \
+    curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+      -o /usr/share/keyrings/githubcli-archive-keyring.gpg; \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+      > /etc/apt/sources.list.d/github-cli.list; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends gh; \
+    rm -rf /var/lib/apt/lists/*
+
 RUN npm install -g \
     @anthropic-ai/claude-code@latest \
     @openai/codex@latest \

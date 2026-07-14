@@ -457,6 +457,7 @@ export type CloudAuthState = {
   token: string;
   cloudUrl: string;
   defaultRuntime?: "fly" | "byo-vm";
+  defaultRegion?: string;
   byocSshHost?: string;
   accountId?: string;
   email?: string;

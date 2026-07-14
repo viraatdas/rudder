@@ -1,6 +1,7 @@
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import fs from "node:fs/promises";
 import http, { type IncomingMessage, type ServerResponse } from "node:http";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
@@ -11,6 +12,7 @@ import { GetObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import type { Duplex } from "node:stream";
 import { WebSocket, WebSocketServer } from "ws";
+import { createSecretsVault, SecretsVaultError, type SecretItemInput, type SecretsVault } from "./secrets.js";
 import {
   formatOutputForSlack,
   parseSlackCommand,
@@ -76,6 +78,9 @@ type Workspace = {
   snapshotFingerprint?: string;
   region?: string;
   volumeId?: string;
+  sourceKind?: "snapshot" | "git-clone";
+  repoUrl?: string;
+  gitRef?: string;
   lastActivityAt?: string;
   lastHeartbeatAt?: string;
   createdAt: string;
@@ -236,6 +241,23 @@ ensureColumn("rudder_sails", "slack_thread_ts", "text");
 ensureColumn("rudder_workspaces", "region", "text");
 ensureColumn("rudder_workspaces", "snapshot_fingerprint", "text");
 ensureColumn("rudder_workspaces", "volume_id", "text");
+ensureColumn("rudder_workspaces", "source_kind", "text");
+ensureColumn("rudder_workspaces", "repo_url", "text");
+ensureColumn("rudder_workspaces", "git_ref", "text");
+
+// Secrets vault: initialized lazily so a missing RUDDER_SECRETS_KEY only
+// breaks the vault endpoints, not the rest of the control plane.
+const secretsKeyBase64 = (process.env.RUDDER_SECRETS_KEY || "").trim();
+let secretsVaultInstance: SecretsVault | null = null;
+function secretsVault(): SecretsVault {
+  if (!secretsKeyBase64) {
+    throw new SecretsVaultError(503, "secrets vault is not configured on this control plane (RUDDER_SECRETS_KEY missing)");
+  }
+  if (!secretsVaultInstance) {
+    secretsVaultInstance = createSecretsVault(database, secretsKeyBase64);
+  }
+  return secretsVaultInstance;
+}
 
 const insertToken = database.prepare(`
   insert or replace into rudder_tokens (token_hash, account_id, email, created_at, last_used_at)
@@ -312,10 +334,12 @@ const insertWorkspace = database.prepare(`
   insert into rudder_workspaces (
     id, account_id, workspace_key, repo_name, status, machine_id, machine_state,
     snapshot_key, snapshot_fingerprint, region, volume_id, worker_token_hash,
+    source_kind, repo_url, git_ref,
     last_activity_at, last_heartbeat_at, created_at, updated_at
   ) values (
     @id, @accountId, @workspaceKey, @repoName, @status, @machineId, @machineState,
     @snapshotKey, @snapshotFingerprint, @region, @volumeId, @workerTokenHash,
+    @sourceKind, @repoUrl, @gitRef,
     @lastActivityAt, @lastHeartbeatAt, @createdAt, @updatedAt
   )
 `);
@@ -388,7 +412,11 @@ let authProviderFingerprint = providerFingerprint();
 let auth: ReturnType<typeof createBetterAuth> = createBetterAuth();
 let authHandler = toNodeHandler(auth.handler);
 
-const server = http.createServer(async (req, res) => {
+// noDelay: keystroke/echo frames relayed between attach clients and workers
+// are a few bytes each; they must never sit in the kernel buffer waiting for
+// piggyback ACKs. Node >=18 defaults accepted sockets to noDelay, but make it
+// explicit so the relay's latency floor doesn't hinge on a runtime default.
+const server = http.createServer({ noDelay: true }, async (req, res) => {
   res.once("finish", () => {
     schedulePersistDatabase();
   });
@@ -406,6 +434,7 @@ const server = http.createServer(async (req, res) => {
         fly: Boolean(flyApiToken && flyAppName && flyWorkerImage),
         byoVm: Boolean(snapshotBucket && flyWorkerImage),
         state: Boolean(snapshotBucket && persistStateToS3),
+        secrets: Boolean(secretsKeyBase64),
         auth: configuredProviders(),
       });
       return;
@@ -474,6 +503,10 @@ const server = http.createServer(async (req, res) => {
       await handleSlackEvents(req, res);
       return;
     }
+    if (url.pathname.startsWith("/api/rudder/secrets")) {
+      await handleSecretsApi(req, res, url);
+      return;
+    }
     if (url.pathname.startsWith("/api/rudder/sail")) {
       await handleSailApi(req, res, url);
       return;
@@ -527,6 +560,12 @@ const wss = new WebSocketServer({
 });
 
 server.on("upgrade", (req: IncomingMessage, socket: Duplex, head: Buffer) => {
+  // Both the attach client and the worker dial into this relay, so both relay
+  // hops are accepted sockets that pass through here. Disable Nagle on each so
+  // single-keystroke frames forward immediately in both directions.
+  if (socket instanceof net.Socket) {
+    try { socket.setNoDelay(true); } catch { /* ignore */ }
+  }
   try {
     const url = new URL(req.url || "/", baseURL);
     const sailMatch = SAIL_ATTACH_PATH_RE.exec(url.pathname);
@@ -1850,6 +1889,12 @@ async function handleSailApi(req: IncomingMessage, res: ServerResponse, url: URL
     return;
   }
 
+  const workerSecretsMatch = url.pathname.match(/^\/api\/rudder\/sail\/([^/]+)\/secrets$/);
+  if (req.method === "GET" && workerSecretsMatch) {
+    await handleWorkerSecrets(req, res, findSailById.get(workerSecretsMatch[1]) as Record<string, unknown> | undefined);
+    return;
+  }
+
   const authContext = requireBearer(req);
   if (req.method === "GET" && url.pathname === "/api/rudder/sail") {
     await refreshAccountSails(authContext.accountId);
@@ -1927,7 +1972,109 @@ async function handleSailApi(req: IncomingMessage, res: ServerResponse, url: URL
   sendJson(res, 404, { error: "not found" });
 }
 
+function parseSecretItem(body: Json): SecretItemInput {
+  const record = (body && typeof body === "object" && !Array.isArray(body) ? body : {}) as JsonRecord;
+  const name = typeof record.name === "string" ? record.name.trim() : "";
+  const kind = record.kind === "file" ? "file" : record.kind === "env" ? "env" : undefined;
+  const valueBase64 = typeof record.valueBase64 === "string" ? record.valueBase64 : "";
+  if (!name || !kind || !valueBase64) {
+    throw new SecretsVaultError(400, "name, kind (env|file) and valueBase64 are required");
+  }
+  return {
+    name,
+    kind,
+    filePath: typeof record.filePath === "string" ? record.filePath : undefined,
+    value: Buffer.from(valueBase64, "base64"),
+    source: typeof record.source === "string" ? record.source : undefined,
+  };
+}
+
+const MAX_SECRETS_BULK_BODY_BYTES = 64 * 1024 * 1024;
+
+async function handleSecretsApi(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
+  const authContext = requireBearer(req);
+  if (req.method === "GET" && url.pathname === "/api/rudder/secrets") {
+    const { secrets, version } = secretsVault().list(authContext.accountId);
+    sendJson(res, 200, { secrets: secrets as unknown as Json, secretsVersion: version });
+    return;
+  }
+  if (req.method === "PUT" && url.pathname === "/api/rudder/secrets/item") {
+    const body = await readJsonBody(req, 4 * 1024 * 1024);
+    const saved = secretsVault().put(authContext.accountId, parseSecretItem(body));
+    // Persist immediately: a secret acknowledged to the client must survive a
+    // control-plane crash, not wait out the 750ms debounce window.
+    await persistDatabaseToS3();
+    sendJson(res, 200, { ok: true, secret: saved as unknown as Json });
+    return;
+  }
+  if (req.method === "DELETE" && url.pathname === "/api/rudder/secrets/item") {
+    const name = (url.searchParams.get("name") || "").trim();
+    if (!name) {
+      sendJson(res, 400, { error: "name is required" });
+      return;
+    }
+    const removed = secretsVault().remove(authContext.accountId, name);
+    await persistDatabaseToS3();
+    sendJson(res, removed ? 200 : 404, removed ? { ok: true } : { error: "secret not found" });
+    return;
+  }
+  if (req.method === "POST" && url.pathname === "/api/rudder/secrets/bulk") {
+    const body = await readJsonBody(req, MAX_SECRETS_BULK_BODY_BYTES);
+    const items = body && typeof body === "object" && !Array.isArray(body) && Array.isArray((body as JsonRecord).items)
+      ? ((body as JsonRecord).items as Json[])
+      : [];
+    const results: Json[] = [];
+    for (const item of items) {
+      try {
+        const saved = secretsVault().put(authContext.accountId, parseSecretItem(item));
+        results.push({ name: saved.name, ok: true });
+      } catch (error) {
+        const parsedName = item && typeof item === "object" && !Array.isArray(item) && typeof (item as JsonRecord).name === "string"
+          ? String((item as JsonRecord).name)
+          : "<invalid>";
+        results.push({
+          name: parsedName,
+          ok: false,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+    await persistDatabaseToS3();
+    sendJson(res, 200, { results });
+    return;
+  }
+  sendJson(res, 404, { error: "not found" });
+}
+
+// Worker-authenticated secrets fetch: the supervisor calls this at every boot
+// (rootfs is ephemeral) with its rdrw_ bearer, before spawning the agent.
+// Secret values are deliberately NOT placed in Fly machine env/config, which
+// is readable via the Fly API.
+async function handleWorkerSecrets(
+  req: IncomingMessage,
+  res: ServerResponse,
+  row: Record<string, unknown> | undefined,
+): Promise<void> {
+  if (!row) {
+    sendJson(res, 404, { error: "not found" });
+    return;
+  }
+  requireWorkerBearer(req, row);
+  if (!secretsKeyBase64) {
+    // Vault not configured: boot proceeds on legacy snapshot credentials.
+    sendJson(res, 200, { version: 0, env: {}, files: [] });
+    return;
+  }
+  sendJson(res, 200, secretsVault().exportForWorker(String(row.account_id)) as unknown as Json);
+}
+
 async function handleWorkspaceApi(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
+  const workerSecretsMatch = url.pathname.match(/^\/api\/rudder\/workspace\/([^/]+)\/secrets$/);
+  if (req.method === "GET" && workerSecretsMatch) {
+    await handleWorkerSecrets(req, res, findWorkspaceById.get(workerSecretsMatch[1]) as Record<string, unknown> | undefined);
+    return;
+  }
+
   const heartbeatMatch = url.pathname.match(/^\/api\/rudder\/workspace\/([^/]+)\/heartbeat$/);
   if (req.method === "POST" && heartbeatMatch) {
     await handleWorkspaceHeartbeat(req, res, heartbeatMatch[1]);
@@ -1948,9 +2095,12 @@ async function handleWorkspaceApi(req: IncomingMessage, res: ServerResponse, url
     return;
   }
   if (req.method === "GET" && url.pathname === "/api/rudder/workspace/lookup") {
-    const key = url.searchParams.get("key");
+    const repo = url.searchParams.get("repo");
+    const key = repo && REPO_SLUG_RE.test(repo.trim().replace(/\.git$/, ""))
+      ? workspaceKeyForRepo(repo.trim().replace(/\.git$/, ""))
+      : url.searchParams.get("key");
     if (!key) {
-      sendJson(res, 400, { error: "key is required" });
+      sendJson(res, 400, { error: "key or repo is required" });
       return;
     }
     const row = findWorkspaceByKey.get(authContext.accountId, key) as
@@ -1966,6 +2116,12 @@ async function handleWorkspaceApi(req: IncomingMessage, res: ServerResponse, url
   if (req.method === "POST" && url.pathname === "/api/rudder/workspace/attach") {
     const body = await readJsonBody(req, MAX_SNAPSHOT_BODY_BYTES);
     const result = await ensureWorkspaceForAttach(authContext.accountId, body);
+    sendJson(res, 200, result);
+    return;
+  }
+  if (req.method === "POST" && url.pathname === "/api/rudder/workspace/create") {
+    const body = await readJsonBody(req, 1024 * 1024);
+    const result = await ensureCloneWorkspace(authContext.accountId, body);
     sendJson(res, 200, result);
     return;
   }
@@ -2449,6 +2605,9 @@ async function createWorkspace(
     region,
     volumeId: null,
     workerTokenHash: tokenHash(workerToken),
+    sourceKind: "snapshot",
+    repoUrl: null,
+    gitRef: null,
     lastActivityAt: now,
     lastHeartbeatAt: null,
     createdAt: now,
@@ -2499,6 +2658,84 @@ async function createWorkspace(
   return { ...result, isNew: true } as unknown as JsonRecord;
 }
 
+const REPO_SLUG_RE = /^[\w.-]+\/[\w.-]+$/;
+
+// Clone-based workspaces are keyed by repo identity instead of the local
+// checkout path. The "gh:" prefix keeps the keyspace disjoint from the
+// 32-hex path-hash keys snapshot workspaces use.
+function workspaceKeyForRepo(slug: string): string {
+  return `gh:${createHash("sha256").update(`github.com/${slug.toLowerCase()}`).digest("hex").slice(0, 29)}`;
+}
+
+async function ensureCloneWorkspace(accountId: string, body: Json): Promise<JsonRecord> {
+  ensureCloudRuntimeConfigured("fly");
+  const repo = (stringField(body, "repo") ?? "").trim().replace(/\.git$/, "");
+  if (!REPO_SLUG_RE.test(repo)) {
+    throw badRequest("repo must look like owner/name");
+  }
+  const branch = stringField(body, "branch")?.trim() || undefined;
+  const workspaceKey = workspaceKeyForRepo(repo);
+  const existingRow = findWorkspaceByKey.get(accountId, workspaceKey) as Record<string, unknown> | undefined;
+  const repoName = repo.split("/")[1];
+  if (existingRow) {
+    return await reuseOrRestartWorkspace(rowToWorkspace(existingRow), body, repoName);
+  }
+  const repoUrl = `https://github.com/${repo}.git`;
+  const region = sanitizeRegion(stringField(body, "region"));
+  const now = new Date().toISOString();
+  const id = uniqueWorkspaceId(repoName);
+  const workerToken = `rdrw_${randomBytes(32).toString("base64url")}`;
+  insertWorkspace.run({
+    id,
+    accountId,
+    workspaceKey,
+    repoName,
+    status: "queued",
+    machineId: null,
+    machineState: null,
+    snapshotKey: null,
+    snapshotFingerprint: null,
+    region,
+    volumeId: null,
+    workerTokenHash: tokenHash(workerToken),
+    sourceKind: "git-clone",
+    repoUrl,
+    gitRef: branch ?? null,
+    lastActivityAt: now,
+    lastHeartbeatAt: null,
+    createdAt: now,
+    updatedAt: now,
+  });
+  const regionToUse = region ?? flyRegion;
+  const volume = await createWorkspaceVolume(id, regionToUse);
+  updateWorkspaceVolume.run({
+    id,
+    volumeId: volume.id ?? null,
+    region: regionToUse,
+    updatedAt: new Date().toISOString(),
+  });
+  const machine = await createFlyWorkspaceMachine({
+    workspaceId: id,
+    accountId,
+    workerToken,
+    repoName,
+    region: regionToUse,
+    volumeId: volume.id,
+    gitRemote: repoUrl,
+    gitRef: branch,
+  });
+  const started = workspaceStartResult(machine.state);
+  updateWorkspaceMachine.run({
+    id,
+    status: started.status,
+    machineId: machine.id ?? null,
+    machineState: started.machineState,
+    updatedAt: new Date().toISOString(),
+  });
+  const next = findWorkspaceById.get(id) as Record<string, unknown> | undefined;
+  return { ...(next ? rowToWorkspace(next) : { id, accountId, workspaceKey }), isNew: true } as unknown as JsonRecord;
+}
+
 async function reuseOrRestartWorkspace(
   workspace: Workspace,
   body: Json,
@@ -2540,9 +2777,12 @@ async function reuseOrRestartWorkspace(
     return { ...(next ? rowToWorkspace(next) : workspace), isNew: false } as unknown as JsonRecord;
   }
 
+  const isClone = workspace.sourceKind === "git-clone";
   const incomingFingerprint = stringField(body, "snapshotFingerprint") ?? null;
   const snapshotInput = objectField(body, "snapshot");
-  const fingerprintMatches = Boolean(
+  // Clone workspaces have no snapshot to compare: the repo's source of truth
+  // is origin, so a stopped machine is always warm-restartable.
+  const fingerprintMatches = isClone || Boolean(
     incomingFingerprint
       && workspace.snapshotFingerprint
       && incomingFingerprint === workspace.snapshotFingerprint,
@@ -2560,12 +2800,12 @@ async function reuseOrRestartWorkspace(
     && machine.id
     && (machine.state === "stopped" || machine.state === "suspended")
     && fingerprintMatches
-    && workspace.snapshotKey
+    && (workspace.snapshotKey || isClone)
     && workspace.status !== "failed"
   ) {
     const restarted = await warmRestartWorkspaceMachine({
       machineId: machine.id,
-      snapshotKey: workspace.snapshotKey,
+      snapshotKey: workspace.snapshotKey ?? "",
     }).catch((error) => {
       console.warn(`warm restart failed for ${workspace.id}: ${error instanceof Error ? error.message : String(error)}`);
       return null;
@@ -2597,6 +2837,11 @@ async function reuseOrRestartWorkspace(
       `/v1/apps/${encodeURIComponent(flyAppName)}/machines/${encodeURIComponent(workspace.machineId)}?force=true`,
       { method: "DELETE" },
     );
+  }
+  // Clone workspaces recreate by re-cloning from origin — no snapshot upload.
+  // Keep a surviving volume: the staged clone on it short-circuits re-staging.
+  if (isClone) {
+    return await recreateCloneWorkspaceMachine(workspace, repoName);
   }
   // A Fly volume cannot be deleted while its machine is attached. Delete the
   // machine first, then wait for detachment; if cleanup still fails, keep the
@@ -2645,6 +2890,57 @@ async function reuseOrRestartWorkspace(
     region: regionToUse,
     volumeId: newVolumeId,
   });
+  const started = workspaceStartResult(fresh.state);
+  updateWorkspaceMachine.run({
+    id: workspace.id,
+    status: started.status,
+    machineId: fresh.id ?? null,
+    machineState: started.machineState,
+    updatedAt: new Date().toISOString(),
+  });
+  updateWorkspaceActivity.run({ id: workspace.id, lastActivityAt: now, updatedAt: now });
+  const next = findWorkspaceById.get(workspace.id) as Record<string, unknown> | undefined;
+  return { ...(next ? rowToWorkspace(next) : workspace), isNew: true } as unknown as JsonRecord;
+}
+
+async function recreateCloneWorkspaceMachine(
+  workspace: Workspace,
+  repoName: string | undefined,
+): Promise<JsonRecord> {
+  const now = new Date().toISOString();
+  const regionToUse = workspace.region ?? flyRegion;
+  const workerToken = `rdrw_${randomBytes(32).toString("base64url")}`;
+  updateWorkspaceWorkerToken.run({ id: workspace.id, workerTokenHash: tokenHash(workerToken), updatedAt: now });
+  const createMachine = (volumeId: string | undefined) => createFlyWorkspaceMachine({
+    workspaceId: workspace.id,
+    accountId: workspace.accountId,
+    workerToken,
+    repoName: repoName ?? workspace.repoName,
+    region: regionToUse,
+    volumeId,
+    gitRemote: workspace.repoUrl,
+    gitRef: workspace.gitRef,
+  });
+  let fresh: FlyMachine;
+  try {
+    fresh = await createMachine(workspace.volumeId);
+  } catch (error) {
+    // The recorded volume may itself be gone (destroyed out-of-band). Create a
+    // replacement and retry once; the worker re-clones onto the fresh disk.
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`clone machine create for ${workspace.id} failed (${message}); retrying with a fresh volume`);
+    const volume = await createWorkspaceVolumeNamed(
+      workspaceVolumeName(workspace.id, String(Date.now()).slice(-6)),
+      regionToUse,
+    );
+    updateWorkspaceVolume.run({
+      id: workspace.id,
+      volumeId: volume.id ?? null,
+      region: regionToUse,
+      updatedAt: new Date().toISOString(),
+    });
+    fresh = await createMachine(volume.id);
+  }
   const started = workspaceStartResult(fresh.state);
   updateWorkspaceMachine.run({
     id: workspace.id,
@@ -2751,11 +3047,13 @@ function workspaceStartResult(state: string | undefined): { status: WorkspaceSta
 async function createFlyWorkspaceMachine(params: {
   workspaceId: string;
   accountId: string;
-  snapshotUrl: string;
+  snapshotUrl?: string;
   workerToken: string;
   repoName?: string;
   region?: string;
   volumeId?: string;
+  gitRemote?: string;
+  gitRef?: string;
 }): Promise<FlyMachine> {
   ensureFlyConfigured();
   const config: JsonRecord = {
@@ -2765,7 +3063,11 @@ async function createFlyWorkspaceMachine(params: {
       RUDDER_ACCOUNT_ID: params.accountId,
       RUDDER_CLOUD_URL: baseURL,
       RUDDER_WORKER_TOKEN: params.workerToken,
-      RUDDER_SNAPSHOT_URL: params.snapshotUrl,
+      // Clone-mode machines get the (public) remote/ref here; the git token
+      // itself arrives via the vault at boot, never via Fly machine config.
+      ...(params.snapshotUrl ? { RUDDER_SNAPSHOT_URL: params.snapshotUrl } : {}),
+      ...(params.gitRemote ? { RUDDER_GIT_REMOTE: params.gitRemote } : {}),
+      ...(params.gitRef ? { RUDDER_GIT_REF: params.gitRef } : {}),
       RUDDER_REPO_NAME: params.repoName || "",
     },
     guest: {
@@ -2984,6 +3286,9 @@ function rowToWorkspace(row: unknown): Workspace {
     snapshotFingerprint: optionalString(value.snapshot_fingerprint),
     region: optionalString(value.region),
     volumeId: optionalString(value.volume_id),
+    sourceKind: (optionalString(value.source_kind) as "snapshot" | "git-clone" | undefined) ?? "snapshot",
+    repoUrl: optionalString(value.repo_url),
+    gitRef: optionalString(value.git_ref),
     lastActivityAt: optionalString(value.last_activity_at),
     lastHeartbeatAt: optionalString(value.last_heartbeat_at),
     createdAt: String(value.created_at),

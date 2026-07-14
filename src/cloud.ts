@@ -44,6 +44,7 @@ type CloudCommandOptions = {
   sshHost?: string;
   noAttach?: boolean;
   quietBanner?: boolean;
+  latencyProbe?: boolean;
 };
 
 type LoginStartResponse = {
@@ -85,6 +86,9 @@ type SnapshotManifest = {
 
 type SnapshotOptions = {
   includeRudderState?: boolean;
+  // False once the account has vault secrets: the snapshot then carries only
+  // the working tree, never home-dir credentials or captured env vars.
+  includeCredentials?: boolean;
   migration?: {
     repoName: string;
     plan: MigrationPlan;
@@ -190,6 +194,13 @@ const BULKY_HOME_BASENAME_PATTERNS = [
 ];
 
 export async function runCloudCommand(command: string, args: string[], options: CloudCommandOptions = {}): Promise<void> {
+  // Hidden diagnostic flag: measure keystroke round-trip latency instead of
+  // starting an interactive attach. Parsed here because main.ts forwards
+  // unknown flags through as positional args.
+  if (args.includes("--latency-probe")) {
+    args = args.filter((arg) => arg !== "--latency-probe");
+    options = { ...options, latencyProbe: true };
+  }
   const subcommand = args[0] ?? "";
   const rest = args.slice(1);
 
@@ -296,6 +307,12 @@ export async function runCloudCommand(command: string, args: string[], options: 
       throw new Error("Usage: rudder cloud setup byoc | rudder cloud setup fly");
     case "runtime":
       await runtime(rest, options);
+      return;
+    case "region":
+      await configureRegion(rest, options);
+      return;
+    case "secrets":
+      await secretsCommand(rest, options);
       return;
     default:
       // A bare `rudder cloud "<text>"` / `rudder sail "<text>"` is the documented
@@ -1299,29 +1316,32 @@ async function createSnapshot(repoRoot: string, requestedHomePaths: string[], op
     : 0;
   const rudderState = options.includeRudderState ? await copyRudderState(repoRoot, repoStage) : undefined;
 
-  const homePaths = normalizeHomePaths(requestedHomePaths);
+  const includeCredentials = options.includeCredentials !== false;
   const includedHomePaths: string[] = [];
-  for (const homePath of homePaths) {
-    const copied = await copyHomePath(homePath, homeStage);
-    if (copied) {
-      includedHomePaths.push(shortenHome(homePath));
-    }
-  }
-
-  // On macOS, Claude Code stores its OAuth token in the Keychain rather than
-  // ~/.claude/.credentials.json, so the home-paths copy above doesn't pick it
-  // up. Extract it from the Keychain and stage it as a credentials file so
-  // the cloud worker boots already logged in.
-  if (await stageClaudeKeychainCredentials(homeStage)) {
-    includedHomePaths.push("~/.claude/.credentials.json (keychain)");
-  }
-
-  const capturedEnv = captureCloudEnv(Boolean(options.migration));
   let capturedEnvCount = 0;
-  if (Object.keys(capturedEnv).length > 0) {
-    await ensureDir(path.join(stageDir, "env"));
-    await writeJson(path.join(stageDir, "env", "cloud-env.json"), capturedEnv as unknown as JsonValue);
-    capturedEnvCount = Object.keys(capturedEnv).length;
+  if (includeCredentials) {
+    const homePaths = normalizeHomePaths(requestedHomePaths);
+    for (const homePath of homePaths) {
+      const copied = await copyHomePath(homePath, homeStage);
+      if (copied) {
+        includedHomePaths.push(shortenHome(homePath));
+      }
+    }
+
+    // On macOS, Claude Code stores its OAuth token in the Keychain rather than
+    // ~/.claude/.credentials.json, so the home-paths copy above doesn't pick it
+    // up. Extract it from the Keychain and stage it as a credentials file so
+    // the cloud worker boots already logged in.
+    if (await stageClaudeKeychainCredentials(homeStage)) {
+      includedHomePaths.push("~/.claude/.credentials.json (keychain)");
+    }
+
+    const capturedEnv = captureCloudEnv(Boolean(options.migration));
+    if (Object.keys(capturedEnv).length > 0) {
+      await ensureDir(path.join(stageDir, "env"));
+      await writeJson(path.join(stageDir, "env", "cloud-env.json"), capturedEnv as unknown as JsonValue);
+      capturedEnvCount = Object.keys(capturedEnv).length;
+    }
   }
 
   let migratedAgentsCount = 0;
@@ -1679,12 +1699,14 @@ function normalizeHomePaths(requested: string[]): string[] {
   return paths;
 }
 
-async function stageClaudeKeychainCredentials(homeStage: string): Promise<boolean> {
+// On macOS, Claude Code keeps its OAuth token in the Keychain instead of
+// ~/.claude/.credentials.json. Read it so cloud workspaces boot logged in.
+async function readClaudeKeychainCredentials(): Promise<string | null> {
   if (process.platform !== "darwin") {
-    return false;
+    return null;
   }
   if (!commandExists("security")) {
-    return false;
+    return null;
   }
   const result = await runCommand(
     "security",
@@ -1692,15 +1714,23 @@ async function stageClaudeKeychainCredentials(homeStage: string): Promise<boolea
     { allowFailure: true },
   );
   if (result.code !== 0) {
-    return false;
+    return null;
   }
   const payload = result.stdout.trim();
   if (!payload || !payload.startsWith("{")) {
-    return false;
+    return null;
   }
   try {
     JSON.parse(payload);
   } catch {
+    return null;
+  }
+  return payload;
+}
+
+async function stageClaudeKeychainCredentials(homeStage: string): Promise<boolean> {
+  const payload = await readClaudeKeychainCredentials();
+  if (!payload) {
     return false;
   }
   const targetDir = path.join(homeStage, ".claude");
@@ -1911,6 +1941,10 @@ async function workspaceCommand(args: string[], options: CloudCommandOptions): P
     await workspaceAttach(rest, options);
     return;
   }
+  if (sub === "create") {
+    await workspaceCreate(rest, options);
+    return;
+  }
   if (sub === "share") {
     await workspaceShare(options);
     return;
@@ -1927,7 +1961,372 @@ async function workspaceCommand(args: string[], options: CloudCommandOptions): P
     await workspaceList(options);
     return;
   }
-  throw new Error("Usage: rudder cloud workspace [attach [id]|share|status|pause|resume|stop|list]");
+  throw new Error("Usage: rudder cloud workspace [attach [id|owner/repo]|create <owner/repo>|share|status|pause|resume|stop|list]");
+}
+
+const GITHUB_SLUG_RE = /^[\w.-]+\/[\w.-]+$/;
+
+async function githubSlugFromOrigin(repoRoot: string): Promise<string | null> {
+  const result = await runCommand("git", ["remote", "get-url", "origin"], {
+    cwd: repoRoot,
+    allowFailure: true,
+  });
+  if (result.code !== 0) {
+    return null;
+  }
+  const match = result.stdout.trim().match(/github\.com[:/]([\w.-]+\/[\w.-]+?)(?:\.git)?$/);
+  return match ? match[1] : null;
+}
+
+// Cloud-native workspace: the worker clones the repo from GitHub directly —
+// full history, real origin remote, no local-directory upload.
+async function workspaceCreate(args: string[], options: CloudCommandOptions): Promise<void> {
+  const slug = (args[0] ?? "").trim().replace(/\.git$/, "");
+  if (!GITHUB_SLUG_RE.test(slug)) {
+    throw new Error("Usage: rudder cloud workspace create <owner/repo> [--branch <name>] [--region <code>]");
+  }
+  let branch: string | undefined;
+  let region: string | undefined;
+  for (let i = 1; i < args.length; i += 1) {
+    const arg = args[i] ?? "";
+    if (arg === "--branch") branch = args[++i];
+    else if (arg.startsWith("--branch=")) branch = arg.slice("--branch=".length);
+    else if (arg === "--region") region = args[++i];
+    else if (arg.startsWith("--region=")) region = arg.slice("--region=".length);
+    else throw new Error(`Unknown option: ${arg}`);
+  }
+  const client = await cloudClient({ requireToken: true });
+  // Preflight: private clones and pushes need GitHub credentials from the vault.
+  try {
+    const secretsResult = await client.request<CloudSecretsListResponse>("/api/rudder/secrets", { method: "GET" });
+    const secrets = secretsResult?.secrets ?? [];
+    const hasGitCreds = secrets.some((secret) =>
+      (secret.kind === "file" && secret.name.startsWith("~/.config/gh/"))
+      || (secret.kind === "env" && (secret.name === "GITHUB_TOKEN" || secret.name === "GH_TOKEN")));
+    if (!hasGitCreds && !options.json) {
+      process.stderr.write(
+        "Warning: no GitHub credentials in the cloud vault; private repos will fail to clone. Run `rudder cloud secrets sync` first.\n",
+      );
+    }
+  } catch {
+    // Old server or unconfigured vault; the worker will report clone failures.
+  }
+  if (!options.json) {
+    process.stderr.write(`Creating cloud workspace for ${slug}...\n`);
+  }
+  const effectiveRegion = region ?? await explicitCloudRegion();
+  const result = await client.request<JsonValue>("/api/rudder/workspace/create", {
+    method: "POST",
+    body: {
+      repo: slug,
+      ...(branch ? { branch } : {}),
+      ...(effectiveRegion ? { region: effectiveRegion } : {}),
+    },
+  });
+  await attachToWorkspaceResult(result, options);
+}
+
+async function workspaceAttachByRepo(slug: string, options: CloudCommandOptions): Promise<void> {
+  const normalized = slug.trim().replace(/\.git$/, "");
+  const client = await cloudClient({ requireToken: true });
+  try {
+    await client.request<JsonValue>(
+      `/api/rudder/workspace/lookup?repo=${encodeURIComponent(normalized)}`,
+      { method: "GET" },
+    );
+  } catch {
+    throw new Error(
+      `No cloud workspace for ${normalized}. Create one with \`rudder cloud workspace create ${normalized}\`.`,
+    );
+  }
+  // The create endpoint reuses/warm-restarts an existing clone workspace.
+  const result = await client.request<JsonValue>("/api/rudder/workspace/create", {
+    method: "POST",
+    body: { repo: normalized },
+  });
+  await attachToWorkspaceResult(result, options);
+}
+
+type CloudSecretMetadata = {
+  name: string;
+  kind: "env" | "file";
+  filePath?: string;
+  sizeBytes: number;
+  sha256: string;
+  source?: string;
+  updatedAt: string;
+};
+
+type CloudSecretsListResponse = {
+  secrets?: CloudSecretMetadata[];
+  secretsVersion?: number;
+};
+
+const MAX_SECRET_VALUE_BYTES = 1024 * 1024;
+
+async function secretsCommand(args: string[], options: CloudCommandOptions): Promise<void> {
+  const sub = args[0] ?? "";
+  const rest = args.slice(1);
+  switch (sub) {
+    case "set":
+      await secretsSet(rest, options);
+      return;
+    case "list":
+    case "ls":
+      await secretsList(options);
+      return;
+    case "rm":
+    case "remove":
+    case "delete":
+      await secretsRm(rest, options);
+      return;
+    case "sync":
+      await secretsSync(options);
+      return;
+    default:
+      throw new Error(
+        "Usage: rudder cloud secrets [set <NAME> [value] | set --file <~/path> [source] | list | rm <NAME> | sync]",
+      );
+  }
+}
+
+// Convert an absolute or ~-prefixed path into the canonical tilde form the
+// vault stores file secrets under. Only paths inside $HOME are allowed.
+function toTildePath(input: string): string {
+  const trimmed = input.trim();
+  const resolved = path.resolve(expandHome(trimmed));
+  const home = os.homedir();
+  if (!isInside(home, resolved) || resolved === home) {
+    throw new Error(`File secrets must live inside your home directory: ${input}`);
+  }
+  return `~/${path.relative(home, resolved).split(path.sep).join("/")}`;
+}
+
+async function readStdinAll(): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of process.stdin) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+async function secretsSet(args: string[], options: CloudCommandOptions): Promise<void> {
+  const client = await cloudClient({ requireToken: true });
+  if (args[0] === "--file") {
+    const target = args[1];
+    if (!target) {
+      throw new Error("Usage: rudder cloud secrets set --file <~/path> [localSourcePath]");
+    }
+    const tildePath = toTildePath(target);
+    const sourcePath = path.resolve(expandHome(args[2] ?? target));
+    const content = await fsp.readFile(sourcePath);
+    if (content.length > MAX_SECRET_VALUE_BYTES) {
+      throw new Error(`${sourcePath} is ${content.length} bytes; file secrets are capped at ${MAX_SECRET_VALUE_BYTES}`);
+    }
+    await client.request<JsonValue>("/api/rudder/secrets/item", {
+      method: "PUT",
+      body: {
+        name: tildePath,
+        kind: "file",
+        filePath: tildePath,
+        valueBase64: content.toString("base64"),
+        source: "manual",
+      },
+    });
+    if (options.json) {
+      printJson({ ok: true, name: tildePath, kind: "file" });
+    } else {
+      console.log(`Stored file secret ${tildePath} (${content.length} bytes). Takes effect on next workspace boot.`);
+    }
+    return;
+  }
+  const name = args[0];
+  if (!name) {
+    throw new Error("Usage: rudder cloud secrets set <NAME> [value] (or pipe the value on stdin)");
+  }
+  let value = args[1];
+  if (value === undefined) {
+    value = process.stdin.isTTY
+      ? await promptSecret(`Value for ${name}`)
+      : (await readStdinAll()).replace(/\r?\n$/, "");
+  }
+  if (!value) {
+    throw new Error(`No value provided for ${name}.`);
+  }
+  if (Buffer.byteLength(value, "utf8") > MAX_SECRET_VALUE_BYTES) {
+    throw new Error(`Value for ${name} exceeds the ${MAX_SECRET_VALUE_BYTES}-byte cap`);
+  }
+  await client.request<JsonValue>("/api/rudder/secrets/item", {
+    method: "PUT",
+    body: {
+      name,
+      kind: "env",
+      valueBase64: Buffer.from(value, "utf8").toString("base64"),
+      source: "manual",
+    },
+  });
+  if (options.json) {
+    printJson({ ok: true, name, kind: "env" });
+  } else {
+    console.log(`Stored env secret ${name}. Takes effect on next workspace boot.`);
+  }
+}
+
+async function secretsList(options: CloudCommandOptions): Promise<void> {
+  const client = await cloudClient({ requireToken: true });
+  const result = await client.request<CloudSecretsListResponse>("/api/rudder/secrets", { method: "GET" });
+  const secrets = result?.secrets ?? [];
+  if (options.json) {
+    printJson(result as JsonValue);
+    return;
+  }
+  if (secrets.length === 0) {
+    console.log("No cloud secrets stored. Run `rudder cloud secrets sync` to import your local credentials.");
+    return;
+  }
+  const nameWidth = Math.max(4, ...secrets.map((secret) => secret.name.length));
+  console.log(`${"NAME".padEnd(nameWidth)}  KIND  SIZE      UPDATED`);
+  for (const secret of secrets) {
+    const size = `${secret.sizeBytes}B`.padEnd(8);
+    console.log(`${secret.name.padEnd(nameWidth)}  ${secret.kind.padEnd(4)}  ${size}  ${secret.updatedAt}`);
+  }
+  console.log(`\n${secrets.length} secret(s). Values are never shown; rotate with \`rudder cloud secrets set\`.`);
+}
+
+async function secretsRm(args: string[], options: CloudCommandOptions): Promise<void> {
+  const name = args[0];
+  if (!name) {
+    throw new Error("Usage: rudder cloud secrets rm <NAME|~/path>");
+  }
+  const client = await cloudClient({ requireToken: true });
+  const normalized = name.startsWith("~") || name.startsWith("/") ? toTildePath(name) : name;
+  await client.request<JsonValue>(`/api/rudder/secrets/item?name=${encodeURIComponent(normalized)}`, {
+    method: "DELETE",
+  });
+  if (options.json) {
+    printJson({ ok: true, name: normalized });
+  } else {
+    console.log(`Removed cloud secret ${normalized}.`);
+  }
+}
+
+async function collectHomeSecretFiles(): Promise<Array<{ tildePath: string; absolute: string; size: number }>> {
+  const home = os.homedir();
+  const out: Array<{ tildePath: string; absolute: string; size: number }> = [];
+  const walk = async (target: string): Promise<void> => {
+    const stat = await fsp.lstat(target).catch(() => null);
+    if (!stat) {
+      return;
+    }
+    if (stat.isSymbolicLink()) {
+      return;
+    }
+    if (stat.isDirectory()) {
+      if (!(await shouldIncludeSnapshotPath(target))) {
+        return;
+      }
+      const entries = await fsp.readdir(target).catch(() => [] as string[]);
+      for (const entry of entries) {
+        await walk(path.join(target, entry));
+      }
+      return;
+    }
+    if (!stat.isFile() || !(await shouldIncludeSnapshotPath(target))) {
+      return;
+    }
+    out.push({
+      tildePath: `~/${path.relative(home, target).split(path.sep).join("/")}`,
+      absolute: target,
+      size: stat.size,
+    });
+  };
+  for (const root of normalizeHomePaths([])) {
+    await walk(root);
+  }
+  return out;
+}
+
+// One-time (re-runnable) import of the credentials that used to ride inside
+// every workspace snapshot: the DEFAULT_HOME_PATHS allowlist, the macOS
+// Keychain Claude token, and the captured env vars.
+async function secretsSync(options: CloudCommandOptions): Promise<void> {
+  const client = await cloudClient({ requireToken: true });
+  const items: JsonValue[] = [];
+  const skipped: Array<{ name: string; reason: string }> = [];
+
+  for (const file of await collectHomeSecretFiles()) {
+    if (file.size === 0) {
+      continue;
+    }
+    if (file.size > MAX_SECRET_VALUE_BYTES) {
+      skipped.push({ name: file.tildePath, reason: `${file.size} bytes exceeds the per-secret cap` });
+      continue;
+    }
+    const content = await fsp.readFile(file.absolute).catch(() => null);
+    if (!content) {
+      skipped.push({ name: file.tildePath, reason: "unreadable" });
+      continue;
+    }
+    items.push({
+      name: file.tildePath,
+      kind: "file",
+      filePath: file.tildePath,
+      valueBase64: content.toString("base64"),
+      source: "sync",
+    });
+  }
+
+  // Keychain read can pop a macOS auth dialog, so only attempt it when a
+  // human is at the terminal to answer it.
+  if (isTty()) {
+    const keychainPayload = await readClaudeKeychainCredentials();
+    if (keychainPayload) {
+      items.push({
+        name: "~/.claude/.credentials.json",
+        kind: "file",
+        filePath: "~/.claude/.credentials.json",
+        valueBase64: Buffer.from(keychainPayload + "\n", "utf8").toString("base64"),
+        source: "sync",
+      });
+    }
+  }
+
+  for (const [name, value] of Object.entries(captureCloudEnv())) {
+    items.push({
+      name,
+      kind: "env",
+      valueBase64: Buffer.from(value, "utf8").toString("base64"),
+      source: "sync",
+    });
+  }
+
+  if (items.length === 0) {
+    throw new Error("Found nothing to sync: no allowlisted credential files or matching env vars.");
+  }
+
+  const response = await client.request<{ results?: Array<{ name: string; ok: boolean; error?: string }> }>(
+    "/api/rudder/secrets/bulk",
+    { method: "POST", body: { items } as JsonValue },
+  );
+  const results = response?.results ?? [];
+  const stored = results.filter((entry) => entry.ok);
+  const failed = results.filter((entry) => !entry.ok);
+
+  if (options.json) {
+    printJson({ stored: stored.length, failed, skipped } as unknown as JsonValue);
+    return;
+  }
+  console.log(`Synced ${stored.length} secret(s) to the cloud vault:`);
+  for (const entry of stored) {
+    console.log(`  ${entry.name}`);
+  }
+  for (const entry of failed) {
+    console.log(`  FAILED ${entry.name}: ${entry.error ?? "unknown error"}`);
+  }
+  for (const entry of skipped) {
+    console.log(`  SKIPPED ${entry.name}: ${entry.reason}`);
+  }
+  console.log("\nNew cloud workspaces will now boot with these secrets; snapshots stop carrying local credentials.");
 }
 
 function computeWorkspaceKey(repoRoot: string): string {
@@ -1935,33 +2334,62 @@ function computeWorkspaceKey(repoRoot: string): string {
   return createHash("sha256").update(normalized).digest("hex").slice(0, 32);
 }
 
-let cachedFlyRegion: string | undefined;
-async function detectFlyRegion(baseUrl: string): Promise<string | undefined> {
-  if (process.env.RUDDER_CLOUD_REGION) {
-    return process.env.RUDDER_CLOUD_REGION.trim().toLowerCase();
+// Worker placement policy: with the single-region relay in the middle of every
+// attach, echo latency = RTT(client↔relay) + RTT(relay↔worker), so the worker
+// belongs NEXT TO THE RELAY, not next to the user. We therefore only send a
+// region when the user explicitly asked for one (env var or `rudder cloud
+// region <code>`); otherwise the server places the worker in its own region.
+async function explicitCloudRegion(): Promise<string | undefined> {
+  const envRegion = process.env.RUDDER_CLOUD_REGION?.trim().toLowerCase();
+  if (envRegion) {
+    return envRegion;
   }
-  if (cachedFlyRegion) {
-    return cachedFlyRegion;
-  }
-  try {
-    const response = await fetch(`${baseUrl.replace(/\/$/, "")}/health`, { method: "GET" });
-    const requestId = response.headers.get("fly-request-id");
-    if (requestId) {
-      // Fly request-id format: <ulid>-<region>
-      const dash = requestId.lastIndexOf("-");
-      const region = dash > 0 ? requestId.slice(dash + 1).trim().toLowerCase() : "";
-      if (region && region.length <= 6 && /^[a-z]+$/.test(region)) {
-        cachedFlyRegion = region;
-        return region;
-      }
-    }
-  } catch {
-    // ignore — server will fall back to its default region
-  }
-  return undefined;
+  const state = await loadCloudAuth().catch(() => null);
+  return state?.defaultRegion?.trim().toLowerCase() || undefined;
 }
 
-async function computeSnapshotFingerprint(repoRoot: string, _requestedHomePaths: string[]): Promise<string> {
+async function configureRegion(args: string[], options: CloudCommandOptions): Promise<void> {
+  const value = (args[0] ?? "").trim().toLowerCase();
+  const state = await loadCloudAuth();
+  if (!state) {
+    throw new Error("Not logged in to Rudder Cloud. Run `rudder login` first.");
+  }
+  if (!value) {
+    const current = state.defaultRegion ?? "";
+    if (options.json) {
+      printJson({ region: current || null });
+    } else if (current) {
+      console.log(`Cloud worker region override: ${current} (run \`rudder cloud region clear\` to let the server choose).`);
+    } else {
+      console.log("No region override set: workers are placed next to the relay for lowest typing latency.");
+    }
+    return;
+  }
+  if (value === "clear" || value === "none" || value === "auto") {
+    await saveCloudAuth({ ...state, defaultRegion: undefined, updatedAt: nowIso() });
+    if (options.json) {
+      printJson({ ok: true, region: null });
+    } else {
+      console.log("Cleared region override; the server will place workers next to the relay.");
+    }
+    return;
+  }
+  if (!/^[a-z]{3,6}$/.test(value)) {
+    throw new Error(`Invalid Fly region code: ${value}`);
+  }
+  await saveCloudAuth({ ...state, defaultRegion: value, updatedAt: nowIso() });
+  if (options.json) {
+    printJson({ ok: true, region: value });
+  } else {
+    console.log(`Cloud worker region override set to ${value}. Note: placing workers away from the relay increases typing latency.`);
+  }
+}
+
+async function computeSnapshotFingerprint(
+  repoRoot: string,
+  _requestedHomePaths: string[],
+  vaultActive = false,
+): Promise<string> {
   const hash = createHash("sha256");
   // Repo state: HEAD commit + the porcelain dirty file list. Two attaches
   // from the same repo at the same commit with no edits should produce the
@@ -1974,6 +2402,13 @@ async function computeSnapshotFingerprint(repoRoot: string, _requestedHomePaths:
   });
   if (status.code === 0) {
     hash.update(`repo:status:${status.stdout}\n`);
+  }
+  // With the vault active the snapshot carries no credentials, so credential
+  // changes must NOT change the fingerprint: a mismatch triggers the
+  // destructive destroy+recreate path server-side, and rotation already takes
+  // effect on the next boot via the supervisor's vault fetch.
+  if (vaultActive) {
+    return hash.digest("hex").slice(0, 32);
   }
   // macOS Keychain claude credentials: hash content so re-logging in
   // invalidates the cache but a steady-state user keeps it.
@@ -1995,9 +2430,28 @@ async function computeSnapshotFingerprint(repoRoot: string, _requestedHomePaths:
   return hash.digest("hex").slice(0, 32);
 }
 
+// True when the account has vault secrets on this control plane, meaning
+// snapshots should stop carrying local credentials. Any failure (old server,
+// vault unconfigured, network) degrades to legacy snapshot behavior.
+async function accountHasVaultSecrets(client: CloudClient): Promise<boolean> {
+  if (process.env.RUDDER_CLOUD_LEGACY_SNAPSHOT_SECRETS === "1") {
+    return false;
+  }
+  try {
+    const result = await client.request<CloudSecretsListResponse>("/api/rudder/secrets", { method: "GET" });
+    return (result?.secrets ?? []).length > 0;
+  } catch {
+    return false;
+  }
+}
+
 async function workspaceAttach(args: string[], options: CloudCommandOptions): Promise<void> {
   const explicitId = args[0];
   if (explicitId) {
+    if (explicitId.includes("/")) {
+      await workspaceAttachByRepo(explicitId, options);
+      return;
+    }
     await workspaceAttachById(explicitId, options);
     return;
   }
@@ -2010,13 +2464,38 @@ async function workspaceAttach(args: string[], options: CloudCommandOptions): Pr
     process.stderr.write(`Resolving cloud workspace for ${repoName}...\n`);
   }
 
+  // Prefer an existing cloud-native (clone-based) workspace for this repo's
+  // origin over uploading a snapshot of the local directory.
+  const originSlug = await githubSlugFromOrigin(repoRoot);
+  if (originSlug && isTty() && !options.json) {
+    const cloneWorkspace = await client.request<JsonValue>(
+      `/api/rudder/workspace/lookup?repo=${encodeURIComponent(originSlug)}`,
+      { method: "GET" },
+    ).catch(() => null);
+    if (cloneWorkspace) {
+      const useClone = await promptConfirm(
+        `A cloud-native workspace for ${originSlug} exists. Attach it instead of uploading a local snapshot?`,
+        true,
+      );
+      if (useClone) {
+        const result = await client.request<JsonValue>("/api/rudder/workspace/create", {
+          method: "POST",
+          body: { repo: originSlug },
+        });
+        await attachToWorkspaceResult(result, options);
+        return;
+      }
+    }
+  }
+
   // Kick off the non-interactive work in parallel. planAgentMigration can
   // call promptConfirm for a TTY prompt, so we serialize it AFTER the
   // parallel work resolves to avoid garbled stdout during the prompt.
-  const [region, fingerprint] = await Promise.all([
-    detectFlyRegion(client.baseUrl).catch(() => undefined),
-    computeSnapshotFingerprint(repoRoot, options.homePaths ?? []),
+  const [region, vaultActive] = await Promise.all([
+    explicitCloudRegion(),
+    accountHasVaultSecrets(client),
   ]);
+  const fingerprint = await computeSnapshotFingerprint(repoRoot, options.homePaths ?? [], vaultActive);
   const migrationPlan = await planAgentMigration(repoRoot, options);
   const mustUploadSnapshot = Boolean(migrationPlan && migrationPlan.migrated.length > 0);
   const baseBody: Record<string, JsonValue> = {
@@ -2046,6 +2525,7 @@ async function workspaceAttach(args: string[], options: CloudCommandOptions): Pr
     }
     const snapshot = await createSnapshot(repoRoot, options.homePaths ?? [], {
       includeRudderState: true,
+      includeCredentials: !vaultActive,
       migration: migrationPlan ? { repoName, plan: migrationPlan } : undefined,
     });
     try {
@@ -2338,7 +2818,8 @@ async function runAttach(target: AttachTarget, options: CloudCommandOptions): Pr
 
   const stdin = process.stdin;
   const stdout = process.stdout;
-  const isInteractive = Boolean(stdin.isTTY && stdout.isTTY);
+  const probeMode = Boolean(options.latencyProbe);
+  const isInteractive = Boolean(stdin.isTTY && stdout.isTTY) && !probeMode;
 
   return await new Promise<AttachResult>((resolve, reject) => {
     const socket = new WebSocket(wsUrl, {
@@ -2462,6 +2943,84 @@ async function runAttach(target: AttachTarget, options: CloudCommandOptions): Pr
     };
     process.once("SIGINT", onSigint);
 
+    // --latency-probe state: transport samples resolve on a `probe-reply`
+    // control frame from the worker (pure WS relay round trip); echo samples
+    // resolve on the next binary frame after sending a printable keystroke
+    // (full pipeline including the remote TUI render).
+    const probeReplies = new Map<number, (at: number) => void>();
+    let probeEchoWaiter: ((at: number) => void) | null = null;
+    let probeSeq = 0;
+
+    const runLatencyProbe = async (): Promise<void> => {
+      const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+      const SAMPLES = 20;
+      const transport: number[] = [];
+      const echo: number[] = [];
+      // Let the remote dashboard finish its initial redraw burst so spinner
+      // frames don't get mistaken for keystroke echoes.
+      await sleep(750);
+      for (let i = 0; i < SAMPLES; i += 1) {
+        if (socket.readyState !== WebSocket.OPEN) break;
+        const id = ++probeSeq;
+        const sentAt = performance.now();
+        const repliedAt = await new Promise<number | null>((resolveReply) => {
+          const timer = setTimeout(() => {
+            probeReplies.delete(id);
+            resolveReply(null);
+          }, 2000);
+          probeReplies.set(id, (at) => {
+            clearTimeout(timer);
+            probeReplies.delete(id);
+            resolveReply(at);
+          });
+          socket.send(JSON.stringify({ type: "probe", id }));
+        });
+        if (repliedAt !== null) transport.push(repliedAt - sentAt);
+        await sleep(100);
+      }
+      for (let i = 0; i < SAMPLES; i += 1) {
+        if (socket.readyState !== WebSocket.OPEN) break;
+        const sentAt = performance.now();
+        const echoedAt = await new Promise<number | null>((resolveFrame) => {
+          const timer = setTimeout(() => {
+            probeEchoWaiter = null;
+            resolveFrame(null);
+          }, 2000);
+          probeEchoWaiter = (at) => {
+            clearTimeout(timer);
+            probeEchoWaiter = null;
+            resolveFrame(at);
+          };
+          socket.send(Buffer.from("a"), { binary: true });
+        });
+        if (echoedAt !== null) echo.push(echoedAt - sentAt);
+        // Undo the probe keystroke so the remote input box is left untouched.
+        socket.send(Buffer.from("\x7f"), { binary: true });
+        await sleep(250);
+      }
+      const stats = (values: number[]): string => {
+        if (values.length === 0) return "no samples (timed out)";
+        const sorted = [...values].sort((a, b) => a - b);
+        const at = (q: number) => sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))] ?? 0;
+        const max = sorted[sorted.length - 1] ?? 0;
+        return `p50 ${at(0.5).toFixed(1)}ms  p95 ${at(0.95).toFixed(1)}ms  max ${max.toFixed(1)}ms  (${sorted.length}/${SAMPLES} samples)`;
+      };
+      const report = [
+        "",
+        `Latency probe · ${target.label}`,
+        `  transport RTT  ${stats(transport)}`,
+        `  keystroke echo ${stats(echo)}`,
+        "",
+      ].join("\n");
+      if (options.json) {
+        process.stdout.write(`${JSON.stringify({ target: target.label, transportMs: transport, echoMs: echo })}\n`);
+      } else {
+        process.stderr.write(report);
+      }
+      result = "exited";
+      try { socket.close(1000, "probe-done"); } catch { /* ignore */ }
+    };
+
     socket.on("open", () => {
       opened = true;
       // Disable Nagle on the underlying TCP socket so single keystrokes don't
@@ -2505,13 +3064,30 @@ async function runAttach(target: AttachTarget, options: CloudCommandOptions): Pr
           // ignore
         }
       }
-      stdin.resume();
-      stdin.on("data", onStdin);
+      if (!probeMode) {
+        stdin.resume();
+        stdin.on("data", onStdin);
+      }
       stdout.on("resize", onResize);
     });
 
     socket.on("message", (data, isBinary) => {
       if (isBinary && Buffer.isBuffer(data)) {
+        if (probeMode) {
+          // Frames are timing signals here, not screen content: the first one
+          // marks the dashboard as live (start probing), later ones resolve a
+          // pending keystroke-echo sample.
+          if (!firstFrameRendered) {
+            firstFrameRendered = true;
+            void runLatencyProbe().catch((err: unknown) => {
+              process.stderr.write(`Latency probe failed: ${err instanceof Error ? err.message : String(err)}\n`);
+              try { socket.close(1000, "probe-failed"); } catch { /* ignore */ }
+            });
+            return;
+          }
+          probeEchoWaiter?.(performance.now());
+          return;
+        }
         if (!firstFrameRendered) {
           firstFrameRendered = true;
           splash?.handoff();
@@ -2561,7 +3137,13 @@ async function runAttach(target: AttachTarget, options: CloudCommandOptions): Pr
       if (!payload || typeof payload !== "object") {
         return;
       }
-      const message = payload as { type?: string; state?: string; code?: number };
+      const message = payload as { type?: string; state?: string; code?: number; id?: number };
+      if (message.type === "probe-reply") {
+        if (typeof message.id === "number") {
+          probeReplies.get(message.id)?.(performance.now());
+        }
+        return;
+      }
       if (message.type === "exit") {
         result = message.code === 0 ? "exited" : "failed";
         if (typeof process.exitCode !== "number" && message.code !== undefined) {
@@ -2762,8 +3344,12 @@ Usage:
       print the copy/paste setup for the whole flow
   rudder cloud slack [manifest]
       print Slack setup (one thread per instance in the shared channel)
-  rudder cloud workspace [attach [id]|share|status [--json]|pause <id>|resume <id>|stop <id>|list]
-      shared cloud workspace for this repo
+  rudder cloud workspace [attach [id|owner/repo]|create <owner/repo>|share|status [--json]|pause <id>|resume <id>|stop <id>|list]
+      shared cloud workspace for this repo; \`create\` clones from GitHub (cloud-native, no local upload)
+  rudder cloud secrets [set <NAME> [value]|set --file <~/path>|list|rm <NAME>|sync]
+      manage the encrypted cloud secrets vault; \`sync\` imports your local credentials once
+  rudder cloud region [<fly-region>|clear]
+      override worker placement (default: next to the relay for lowest typing latency)
   rudder cloud bootstrap <id>
   rudder cloud runtime [fly|byoc]
   rudder cloud setup-byoc <ssh-host>   compatibility alias

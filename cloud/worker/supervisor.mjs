@@ -18,6 +18,8 @@ const sailId = (process.env.RUDDER_SAIL_ID || "").trim();
 const workspaceId = (process.env.RUDDER_WORKSPACE_ID || "").trim();
 const workerToken = (process.env.RUDDER_WORKER_TOKEN || "").trim();
 const snapshotUrl = (process.env.RUDDER_SNAPSHOT_URL || "").trim();
+const gitRemote = (process.env.RUDDER_GIT_REMOTE || "").trim();
+const gitRef = (process.env.RUDDER_GIT_REF || "").trim();
 const repoName = (process.env.RUDDER_REPO_NAME || "repo").trim() || "repo";
 const task = process.env.RUDDER_TASK || "";
 const flyMachineId = (process.env.FLY_MACHINE_ID || "").trim();
@@ -31,10 +33,31 @@ if (!sessionId) {
   process.exit(2);
 }
 
+// Vault secrets come FIRST: $HOME lives on the ephemeral rootfs, so credential
+// files must be re-written on every boot (cold or warm restart alike), and git
+// credentials must exist before a clone-mode workspace can reach its remote.
+// Values are fetched over the worker's authenticated channel instead of Fly
+// machine env, which is readable via the Fly API.
+const vaultSecrets = await fetchVaultSecrets();
+if (vaultSecrets) {
+  writeVaultFiles(vaultSecrets.files);
+  configureGitCredentials(vaultSecrets);
+}
+
 if (alreadyStaged()) {
   console.log(`Rudder worker re-using staged workspace`);
   restoreSelectedHome();
   chdirToStagedWorkdir();
+  if (gitRemote) {
+    // Volume-backed clone persists across restarts; refresh remote refs so the
+    // agent starts from a current view of origin.
+    shSoft("git fetch --all -q");
+  }
+} else if (gitRemote) {
+  // Cloud-native workspace: clone straight from the git remote — full history,
+  // real origin, no snapshot upload involved.
+  stageGitClone(gitRemote, gitRef);
+  markStaged();
 } else {
   // Fly Machines disks are ephemeral across stop+start, so the staged marker
   // is missing on every cold boot. Try fetching a freshly signed snapshot URL
@@ -83,6 +106,9 @@ const args = isWorkspaceMode
 const childEnv = {
   ...process.env,
   ...capturedEnv,
+  // Vault env overrides snapshot-captured env: the vault is rotatable and
+  // fresher than whatever was frozen into the snapshot at attach time.
+  ...(vaultSecrets?.env ?? {}),
   TERM: "xterm-256color",
   COLORTERM: "truecolor",
   RUDDER_HEADLESS: "0",
@@ -260,6 +286,19 @@ function handleControl(text) {
     } catch {
       // ignore
     }
+    return;
+  }
+  if (payload.type === "probe") {
+    // Latency probe: reply immediately so `rudder cloud attach --latency-probe`
+    // can measure the pure transport round trip, excluding the TUI render path.
+    const socket = ws;
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      try {
+        socket.send(JSON.stringify({ type: "probe-reply", id: payload.id ?? null }));
+      } catch {
+        // ignore
+      }
+    }
   }
 }
 
@@ -340,6 +379,101 @@ async function freshSnapshotUrl() {
     console.warn(`snapshot-url refresh failed: ${error?.message || error}`);
     return null;
   }
+}
+
+async function fetchVaultSecrets() {
+  if (!cloudUrl || !sessionId || !workerToken) {
+    return null;
+  }
+  const url = `${cloudUrl.replace(/\/$/, "")}/api/rudder/${sessionKind}/${encodeURIComponent(sessionId)}/secrets`;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      const res = await fetch(url, { headers: { authorization: `Bearer ${workerToken}` } });
+      if (res.ok) {
+        const data = await res.json();
+        const env = data && typeof data.env === "object" && data.env && !Array.isArray(data.env) ? data.env : {};
+        const files = Array.isArray(data?.files) ? data.files : [];
+        if (Object.keys(env).length > 0 || files.length > 0) {
+          console.log(`Loaded ${Object.keys(env).length} env and ${files.length} file secret(s) from the cloud vault.`);
+        }
+        return { version: Number(data?.version) || 0, env, files };
+      }
+      console.warn(`vault secrets fetch: HTTP ${res.status}`);
+      if (res.status === 401 || res.status === 403 || res.status === 404) {
+        break;
+      }
+    } catch (error) {
+      console.warn(`vault secrets fetch failed: ${error?.message || error}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1000 * (attempt + 1)));
+  }
+  console.warn("Continuing WITHOUT vault secrets; legacy snapshot credentials (if any) still apply.");
+  return null;
+}
+
+function writeVaultFiles(files) {
+  const home = os.homedir() || process.env.HOME || "/root";
+  for (const file of files || []) {
+    if (typeof file?.path !== "string" || typeof file?.contentBase64 !== "string") {
+      continue;
+    }
+    if (!file.path.startsWith("~/")) {
+      continue;
+    }
+    const segments = file.path.slice(2).split("/");
+    if (segments.some((part) => part === "" || part === "." || part === "..")) {
+      continue;
+    }
+    const target = path.join(home, ...segments);
+    try {
+      fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
+      fs.writeFileSync(target, Buffer.from(file.contentBase64, "base64"), { mode: file.mode || 0o600 });
+    } catch (error) {
+      console.warn(`vault file ${file.path}: ${error?.message || error}`);
+    }
+  }
+}
+
+function configureGitCredentials(vault) {
+  const home = os.homedir() || process.env.HOME || "/root";
+  const ghHosts = path.join(home, ".config", "gh", "hosts.yml");
+  if (fs.existsSync(ghHosts)) {
+    // Wire git's credential helper through gh; also gives the agent `gh pr create`.
+    shSoft("command -v gh >/dev/null 2>&1 && gh auth setup-git 2>/dev/null");
+    return;
+  }
+  const token = vault?.env?.GITHUB_TOKEN || vault?.env?.GH_TOKEN || "";
+  if (!token) {
+    if (gitRemote) {
+      console.warn("No GitHub credentials in the vault; private clones/pushes will fail. Run `rudder cloud secrets sync` locally.");
+    }
+    return;
+  }
+  try {
+    // $HOME is ephemeral rootfs, so this token never outlives the boot.
+    fs.writeFileSync(path.join(home, ".git-credentials"), `https://x-access-token:${token}@github.com\n`, { mode: 0o600 });
+    shSoft("git config --global credential.helper store");
+  } catch (error) {
+    console.warn(`git credential setup failed: ${error?.message || error}`);
+  }
+}
+
+function stageGitClone(remote, ref) {
+  fs.mkdirSync("/workspace", { recursive: true });
+  process.chdir("/workspace");
+  const workdir = path.join("/workspace", repoName);
+  console.log(`Cloning ${remote}${ref ? ` (${ref})` : ""}...`);
+  try {
+    sh(`git clone ${ref ? `--branch ${shQuote(ref)} ` : ""}${shQuote(remote)} ${shQuote(workdir)}`);
+  } catch (error) {
+    console.error(`git clone failed: ${error?.message || error}`);
+    reportDone("failed", 2);
+    process.exit(2);
+  }
+  process.chdir(workdir);
+  // Only set identity when the vault didn't already deliver a .gitconfig.
+  shSoft('git config user.email >/dev/null 2>&1 || git config user.email "rudder-cloud@local"');
+  shSoft('git config user.name >/dev/null 2>&1 || git config user.name "Rudder Cloud"');
 }
 
 function stageSnapshot(downloadUrl) {
