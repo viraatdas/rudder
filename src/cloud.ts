@@ -2601,7 +2601,8 @@ async function attachToWorkspaceResult(result: JsonValue, options: CloudCommandO
     printJson(record);
     return;
   }
-  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+  // The latency probe is non-interactive by design; it must not be gated on a TTY.
+  if (!options.latencyProbe && (!process.stdin.isTTY || !process.stdout.isTTY)) {
     process.stderr.write(`Workspace ${workspaceId} is ready. Run \`rudder cloud workspace attach\` from a TTY to take over.\n`);
     return;
   }
@@ -2614,7 +2615,7 @@ async function attachToWorkspaceResult(result: JsonValue, options: CloudCommandO
 async function workspaceAttachById(workspaceId: string, options: CloudCommandOptions): Promise<void> {
   if (options.json) {
     printJson({ id: workspaceId, attaching: true });
-  } else if (!process.stdin.isTTY || !process.stdout.isTTY) {
+  } else if (!options.latencyProbe && (!process.stdin.isTTY || !process.stdout.isTTY)) {
     process.stderr.write(`Workspace ${workspaceId}: attach requires a TTY.\n`);
     return;
   }
@@ -3067,6 +3068,19 @@ async function runAttach(target: AttachTarget, options: CloudCommandOptions): Pr
       if (!probeMode) {
         stdin.resume();
         stdin.on("data", onStdin);
+      } else {
+        // A worker that never boots would otherwise hang the probe forever:
+        // there is no TTY and no human to Ctrl+C it.
+        const firstFrameDeadline = setTimeout(() => {
+          if (!firstFrameRendered) {
+            process.stderr.write(
+              "Latency probe timed out waiting for the first remote frame (worker did not boot?).\n",
+            );
+            result = "failed";
+            try { socket.close(1000, "probe-timeout"); } catch { /* ignore */ }
+          }
+        }, 120_000);
+        firstFrameDeadline.unref?.();
       }
       stdout.on("resize", onResize);
     });
