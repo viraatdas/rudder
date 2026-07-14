@@ -9,6 +9,7 @@
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use anyhow::{anyhow, Context, Result};
@@ -17,6 +18,12 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize};
 const DEFAULT_ROWS: u16 = 24;
 const DEFAULT_COLS: u16 = 80;
 const DEFAULT_SCROLLBACK_LINES: usize = 2_000;
+
+/// Callback invoked by a pane's reader thread each time it hands fresh PTY bytes
+/// to the output channel, so the main event loop can wake and drain/redraw them
+/// immediately instead of waiting for its next poll tick. The closure is expected
+/// to coalesce (cheap, idempotent) — it may fire once per 8KB read burst.
+pub type PtyOutputWaker = Arc<dyn Fn() + Send + Sync>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TerminalSize {
@@ -133,6 +140,9 @@ pub struct TerminalPane {
     output_log: String,
     output_log_limit: usize,
     live_screen_only: bool,
+    /// Optional waker shared with the reader thread. Kept behind a mutex so the
+    /// app can install it after the pane is spawned (see [`set_output_waker`]).
+    output_waker: Arc<Mutex<Option<PtyOutputWaker>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -198,6 +208,8 @@ impl TerminalPane {
             .take_writer()
             .context("failed to open PTY writer")?;
         let (output_tx, output_rx) = mpsc::channel();
+        let output_waker: Arc<Mutex<Option<PtyOutputWaker>>> = Arc::new(Mutex::new(None));
+        let reader_waker = Arc::clone(&output_waker);
         let reader_thread = thread::Builder::new()
             .name("rudder-pty-reader".to_string())
             .spawn(move || {
@@ -208,6 +220,16 @@ impl TerminalPane {
                         Ok(n) => {
                             if output_tx.send(buf[..n].to_vec()).is_err() {
                                 break;
+                            }
+                            // Nudge the main event loop so freshly-arrived bytes are
+                            // drained and drawn immediately, instead of waiting up to a
+                            // full tick. The waker itself coalesces, so firing per read
+                            // burst is cheap; a poisoned lock just skips the wake and
+                            // falls back to the tick cadence.
+                            if let Ok(guard) = reader_waker.lock() {
+                                if let Some(waker) = guard.as_ref() {
+                                    waker();
+                                }
                             }
                         }
                         // A transient interruption (e.g. EINTR from a signal) is NOT
@@ -246,7 +268,17 @@ impl TerminalPane {
             output_log: String::new(),
             output_log_limit: 200_000,
             live_screen_only: options.live_screen_only,
+            output_waker,
         })
+    }
+
+    /// Install (or replace) the waker the reader thread fires after each output
+    /// send. Called by the app right after spawning a pane so PTY output wakes the
+    /// main loop; panes never given a waker simply fall back to the tick cadence.
+    pub fn set_output_waker(&self, waker: PtyOutputWaker) {
+        if let Ok(mut guard) = self.output_waker.lock() {
+            *guard = Some(waker);
+        }
     }
 
     pub fn write_input(&mut self, bytes: &[u8]) -> Result<()> {
@@ -905,6 +937,42 @@ mod tests {
             .collect();
 
         assert_eq!(lines, vec!["red", "plain"]);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn output_waker_fires_when_child_produces_output() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let woken = Arc::new(AtomicBool::new(false));
+        // Delay the child's first output so the waker is reliably installed before
+        // any bytes arrive (otherwise a fast `echo` could send + check the waker
+        // slot while it is still None, and the test would flake).
+        let pane = TerminalPane::spawn_shell_or_command(
+            Some(TerminalCommand::with_args(
+                "/bin/sh",
+                ["-lc", "sleep 0.2; echo hi"],
+            )),
+            TerminalPaneOptions::default(),
+        )
+        .expect("spawn test pty");
+
+        let woken_for_waker = Arc::clone(&woken);
+        let waker: PtyOutputWaker = Arc::new(move || {
+            woken_for_waker.store(true, Ordering::SeqCst);
+        });
+        pane.set_output_waker(waker);
+
+        // The reader thread should fire the waker once the child's output arrives.
+        let mut fired = false;
+        for _ in 0..100 {
+            if woken.load(Ordering::SeqCst) {
+                fired = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(fired, "waker was not invoked after child produced output");
     }
 
     #[test]

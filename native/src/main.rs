@@ -30,9 +30,17 @@ use ratatui::{
     Frame, Terminal,
 };
 use rudder_native::pty_terminal::{
-    StyledTerminalCell, TerminalCommand, TerminalCursor, TerminalPane, TerminalPaneOptions,
-    TerminalSize,
+    PtyOutputWaker, StyledTerminalCell, TerminalCommand, TerminalCursor, TerminalPane,
+    TerminalPaneOptions, TerminalSize,
 };
+
+/// A single message the main event loop selects on. Either a terminal input
+/// event read off stdin by a dedicated reader thread, or a nudge from a PTY
+/// reader thread signalling that fresh child output is ready to drain.
+enum LoopSignal {
+    Term(Event),
+    PtyOutput,
+}
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
 
@@ -453,6 +461,10 @@ struct App {
     /// When true, the agents pane renders a topological dependency tree (nest view)
     /// instead of the flat main/worktrees/merged sections. Toggled with `g`.
     nest_view: bool,
+    /// Waker installed on every PTY pane so child output wakes the main event loop
+    /// immediately (see `run`). `None` until `run` builds it; panes spawned while it
+    /// is `None` (e.g. during construction) fall back to the tick cadence.
+    pty_output_waker: Option<PtyOutputWaker>,
     cwd: PathBuf,
     branch: Option<String>,
     task_input: String,
@@ -1137,6 +1149,7 @@ impl App {
             leader_pending: false,
             worker_view: WorkerView::Terminal,
             nest_view: false,
+            pty_output_waker: None,
             cwd,
             branch,
             task_input,
@@ -1296,6 +1309,17 @@ impl App {
 
     fn mark_dirty(&mut self) {
         self.dirty = true;
+    }
+
+    /// Install the main-loop waker on a freshly-spawned pane so its child output
+    /// wakes the event loop immediately. No-op until `run` has built the waker.
+    /// Takes the waker field by reference (not `&self`) so call sites that already
+    /// hold a mutable borrow of `self.agents` can still pass it as a disjoint
+    /// field borrow.
+    fn attach_output_waker(waker: &Option<PtyOutputWaker>, pane: &TerminalPane) {
+        if let Some(waker) = waker {
+            pane.set_output_waker(waker.clone());
+        }
     }
 
     fn take_dirty(&mut self) -> bool {
@@ -2484,6 +2508,7 @@ impl App {
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
             Ok(mut terminal) => {
                 let _ = terminal.drain_output();
+                Self::attach_output_waker(&self.pty_output_waker, &terminal);
                 run.terminal = Some(terminal);
             }
             Err(error) => {
@@ -4189,6 +4214,7 @@ impl App {
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
             Ok(mut terminal) => {
                 let _ = terminal.drain_output();
+                Self::attach_output_waker(&self.pty_output_waker, &terminal);
                 run.terminal = Some(terminal);
                 self.notice = Some("reconciling added task into the plan".to_string());
             }
@@ -4360,6 +4386,7 @@ impl App {
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
             Ok(mut terminal) => {
                 let _ = terminal.drain_output();
+                Self::attach_output_waker(&self.pty_output_waker, &terminal);
                 run.terminal = Some(terminal);
             }
             Err(error) => {
@@ -4526,6 +4553,7 @@ impl App {
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
             Ok(mut terminal) => {
                 let _ = terminal.drain_output();
+                Self::attach_output_waker(&self.pty_output_waker, &terminal);
                 run.terminal = Some(terminal);
                 self.notice = Some("planner started".to_string());
             }
@@ -4836,6 +4864,7 @@ impl App {
         let launched = match TerminalPane::spawn_shell_or_command(Some(command), options) {
             Ok(mut terminal) => {
                 let _ = terminal.drain_output();
+                Self::attach_output_waker(&self.pty_output_waker, &terminal);
                 run.terminal = Some(terminal);
                 // Record the follow-up as a turn; KEEP run.task (the original label)
                 // and run.session_id (so the next refine can resume the same session;
@@ -5045,6 +5074,7 @@ impl App {
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
             Ok(mut terminal) => {
                 let _ = terminal.drain_output();
+                Self::attach_output_waker(&self.pty_output_waker, &terminal);
                 run.terminal = Some(terminal);
                 run.status = AgentStatus::Running;
                 run.completed_at = None;
@@ -5281,6 +5311,7 @@ impl App {
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
             Ok(mut terminal) => {
                 let _ = terminal.drain_output();
+                Self::attach_output_waker(&self.pty_output_waker, &terminal);
                 let run = &mut self.agents[main_index];
                 run.cwd = cwd;
                 run.terminal = Some(terminal);
@@ -5346,6 +5377,7 @@ impl App {
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
             Ok(mut terminal) => {
                 let _ = terminal.drain_output();
+                Self::attach_output_waker(&self.pty_output_waker, &terminal);
                 run.terminal = Some(terminal);
                 run.status = AgentStatus::Running;
                 run.session_id = session_id;
@@ -5411,6 +5443,7 @@ impl App {
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
             Ok(mut terminal) => {
                 let _ = terminal.drain_output();
+                Self::attach_output_waker(&self.pty_output_waker, &terminal);
                 run.terminal = Some(terminal);
                 run.status = AgentStatus::Running;
                 run.session_id = session_id;
@@ -6249,6 +6282,7 @@ impl App {
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
             Ok(mut terminal) => {
                 let _ = terminal.drain_output();
+                Self::attach_output_waker(&self.pty_output_waker, &terminal);
                 run.terminal = Some(terminal);
                 self.notice = Some(format!("opened {label}"));
             }
@@ -7392,6 +7426,7 @@ impl App {
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
             Ok(mut terminal) => {
                 let _ = terminal.drain_output();
+                Self::attach_output_waker(&self.pty_output_waker, &terminal);
                 run.terminal = Some(terminal);
                 run.status = AgentStatus::Running;
                 run.completed_at = None;
@@ -9518,6 +9553,7 @@ impl App {
             match TerminalPane::spawn_shell_or_command(Some(command), options) {
                 Ok(mut terminal) => {
                     let _ = terminal.drain_output();
+                    Self::attach_output_waker(&self.pty_output_waker, &terminal);
                     run.review_terminal = Some(terminal);
                     run.review_error = None;
                     self.notice = Some("opening review".to_string());
@@ -9761,6 +9797,7 @@ impl App {
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
             Ok(mut terminal) => {
                 let _ = terminal.drain_output();
+                Self::attach_output_waker(&self.pty_output_waker, &terminal);
                 run.terminal = Some(terminal);
                 self.notice = Some(format!(
                     "branched {source_summary}; type the new direction in the forked pane"
@@ -10374,6 +10411,7 @@ impl App {
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
             Ok(mut terminal) => {
                 let _ = terminal.drain_output();
+                Self::attach_output_waker(&self.pty_output_waker, &terminal);
                 if let Some(text) = &deliver_after {
                     let _ = terminal.write_input(format!("{text}\r").as_bytes());
                 }
@@ -10701,6 +10739,7 @@ impl App {
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
             Ok(mut terminal) => {
                 let _ = terminal.drain_output();
+                Self::attach_output_waker(&self.pty_output_waker, &terminal);
                 let now = now_stamp();
                 if let Some(run) = self.agents.get_mut(index) {
                     run.cwd = resolver_cwd.clone();
@@ -11806,7 +11845,63 @@ fn restore_terminal(terminal: &mut Tui) -> Result<()> {
 }
 
 fn run(terminal: &mut Tui) -> Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
     let mut app = App::new();
+
+    // The main loop selects on ONE channel fed by two kinds of source:
+    //   * a dedicated stdin reader thread that forwards terminal input events, and
+    //   * every PTY reader thread, which nudges the loop when fresh child output is
+    //     ready to drain.
+    // This replaces the old `event::poll(timeout)` block so child output wakes the
+    // loop immediately instead of waiting up to a full tick. `signal_tx` stays live
+    // in this scope for the whole run, so `recv_timeout` never sees Disconnected
+    // spuriously — the loop is driven by its explicit shutdown paths.
+    let (signal_tx, signal_rx) = mpsc::channel::<LoopSignal>();
+
+    // Coalescing waker. A read burst flips `pty_output_pending` false->true and,
+    // ONLY on that transition, enqueues a single `PtyOutput` signal — bounding
+    // channel traffic to one message per drain cycle. The main loop clears the flag
+    // at the TOP of each iteration (before poll_agents drains), so a byte arriving
+    // mid-drain re-arms the waker and schedules a fresh wake: no lost-wake race.
+    let pty_output_pending = Arc::new(AtomicBool::new(false));
+    {
+        let waker_tx = signal_tx.clone();
+        let pending = Arc::clone(&pty_output_pending);
+        let waker: PtyOutputWaker = Arc::new(move || {
+            if pending
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                // A send error just means the loop is gone; nothing to do.
+                let _ = waker_tx.send(LoopSignal::PtyOutput);
+            }
+        });
+        app.pty_output_waker = Some(waker);
+    }
+
+    // Dedicated blocking reader for terminal input. `event::read` blocks until an
+    // event is available and forwards each one to the loop. At shutdown this thread
+    // is parked inside `event::read`; we intentionally do NOT join it — process exit
+    // reaps it. A send error (loop dropped its receiver) or a read error ends it.
+    {
+        let term_tx = signal_tx.clone();
+        thread::Builder::new()
+            .name("rudder-term-reader".to_string())
+            .spawn(move || loop {
+                match event::read() {
+                    Ok(ev) => {
+                        if term_tx.send(LoopSignal::Term(ev)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            })
+            .ok();
+    }
+
     app.resume_migrated_agents();
     // Unfreeze finished-but-stuck in-flight work (e.g. merge resolvers that completed under
     // an older binary) BEFORE trying to resume anything, so a restart makes the board progress
@@ -11819,11 +11914,14 @@ fn run(terminal: &mut Tui) -> Result<()> {
 
     loop {
         let frame_started = Instant::now();
+        // Reset the PTY-output waker BEFORE poll_agents drains, so a byte arriving
+        // mid-drain re-arms it and enqueues a fresh wake instead of being lost.
+        pty_output_pending.store(false, Ordering::Release);
         // poll_agents flips app.dirty when any state mutates (PTY bytes,
         // status change, cloud info, etc).
         app.poll_agents();
         app.refresh_tab_title();
-        if drain_ready_events(&mut app, MAX_EVENTS_PER_FRAME)? {
+        if drain_ready_events(&mut app, MAX_EVENTS_PER_FRAME, &signal_rx)? {
             app.shutdown();
             break;
         }
@@ -11867,15 +11965,36 @@ fn run(terminal: &mut Tui) -> Result<()> {
         };
         let poll_timeout = app.scroll_draw_poll_timeout(poll_timeout);
         let active_us_before_block = frame_started.elapsed().as_micros() as u64;
-        if event::poll(poll_timeout)? {
-            if handle_event(&mut app, event::read()?) {
+        // Block until a terminal event, a PTY-output nudge, or the tick backstop.
+        // TICK_RATE/STREAM_TICK_RATE still bound worst-case latency for state that
+        // does not signal (cloud polling, timers); PtyOutput just wakes us sooner.
+        match signal_rx.recv_timeout(poll_timeout) {
+            Ok(LoopSignal::Term(ev)) => {
+                if handle_event(&mut app, ev) {
+                    app.shutdown();
+                    break;
+                }
+                let shutdown = drain_ready_events(
+                    &mut app,
+                    MAX_EVENTS_PER_FRAME.saturating_sub(1),
+                    &signal_rx,
+                )?;
+                if shutdown {
+                    app.shutdown();
+                    return Ok(());
+                }
+            }
+            // Fresh child output: nothing to do here — the loop wraps back to
+            // poll_agents, which drains it. The wake itself is the point.
+            Ok(LoopSignal::PtyOutput) => {}
+            // Backstop tick elapsed with no signal.
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            // The term reader and every waker sender are gone AND our own sender
+            // was dropped — cannot happen while `signal_tx` lives, but shut down
+            // cleanly rather than spin if it ever does.
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
                 app.shutdown();
                 break;
-            }
-            let shutdown = drain_ready_events(&mut app, MAX_EVENTS_PER_FRAME.saturating_sub(1))?;
-            if shutdown {
-                app.shutdown();
-                return Ok(());
             }
         }
         let frame_duration = frame_started.elapsed();
@@ -11894,23 +12013,33 @@ fn run(terminal: &mut Tui) -> Result<()> {
     Ok(())
 }
 
-fn drain_ready_events(app: &mut App, max_events: usize) -> Result<bool> {
+fn drain_ready_events(
+    app: &mut App,
+    max_events: usize,
+    signal_rx: &mpsc::Receiver<LoopSignal>,
+) -> Result<bool> {
     let mut drained_events = 0_usize;
-    for _ in 0..max_events {
-        if !event::poll(Duration::ZERO)? {
-            break;
+    while drained_events < max_events {
+        match signal_rx.try_recv() {
+            Ok(LoopSignal::Term(ev)) => {
+                if handle_event(app, ev) {
+                    app.perf.log(
+                        "event_drain",
+                        serde_json::json!({
+                            "count": drained_events + 1,
+                            "phase": "ready",
+                        }),
+                    );
+                    return Ok(true);
+                }
+                drained_events += 1;
+            }
+            // A PTY-output nudge here is a no-op — the main loop wraps back to
+            // poll_agents to drain it. Skip WITHOUT charging the input budget, so
+            // MAX_EVENTS_PER_FRAME still bounds only real input events.
+            Ok(LoopSignal::PtyOutput) => continue,
+            Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
         }
-        if handle_event(app, event::read()?) {
-            app.perf.log(
-                "event_drain",
-                serde_json::json!({
-                    "count": drained_events + 1,
-                    "phase": "ready",
-                }),
-            );
-            return Ok(true);
-        }
-        drained_events += 1;
     }
     if drained_events > 1 {
         app.perf.log(
