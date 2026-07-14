@@ -80,6 +80,17 @@ mod signals;
 use crate::plan_stream::*;
 
 const TICK_RATE: Duration = Duration::from_millis(33);
+/// How long injected text sits in a live agent's input box before the deferred
+/// CR submits it. Long enough that Claude's Ink paste detection has closed its
+/// burst window; short enough to be imperceptible.
+const ENTER_SUBMIT_DELAY: Duration = Duration::from_millis(150);
+
+/// A deferred Enter for text injected into a live agent TUI (see
+/// `App::pending_enters`).
+struct PendingEnter {
+    run_id: String,
+    due: Instant,
+}
 /// Faster event-loop tick used only while a planner is actively streaming, so the
 /// orchestrator's live transcript appears in finer increments (snappier streaming)
 /// instead of being batched into 33ms bursts.
@@ -465,6 +476,12 @@ struct App {
     /// immediately (see `run`). `None` until `run` builds it; panes spawned while it
     /// is `None` (e.g. during construction) fall back to the tick cadence.
     pty_output_waker: Option<PtyOutputWaker>,
+    /// Deferred Enter presses for text injected into a live agent TUI. Claude's
+    /// Ink input treats a text+CR burst arriving in one read as a single paste
+    /// and swallows the CR (the prompt fills but never submits), so injection
+    /// sites write the text as a bracketed paste and queue the CR here; it is
+    /// flushed as a separate write once ENTER_SUBMIT_DELAY has passed.
+    pending_enters: Vec<PendingEnter>,
     cwd: PathBuf,
     branch: Option<String>,
     task_input: String,
@@ -1150,6 +1167,7 @@ impl App {
             worker_view: WorkerView::Terminal,
             nest_view: false,
             pty_output_waker: None,
+            pending_enters: Vec::new(),
             cwd,
             branch,
             task_input,
@@ -3908,6 +3926,39 @@ impl App {
         self.start_rudder_plan_task(input);
     }
 
+    /// Queue a deferred Enter for `run_id`, flushed by `flush_pending_enters`
+    /// once ENTER_SUBMIT_DELAY has passed. Injected text and its submitting CR
+    /// must be separate writes with a gap, or Claude's paste detection absorbs
+    /// the CR into the paste and the prompt sits unsubmitted.
+    fn queue_enter_for(&mut self, run_id: &str) {
+        self.pending_enters.push(PendingEnter {
+            run_id: run_id.to_string(),
+            due: Instant::now() + ENTER_SUBMIT_DELAY,
+        });
+    }
+
+    fn flush_pending_enters(&mut self) {
+        if self.pending_enters.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let mut remaining: Vec<PendingEnter> = Vec::new();
+        for pending in std::mem::take(&mut self.pending_enters) {
+            if pending.due > now {
+                remaining.push(pending);
+                continue;
+            }
+            if let Some(run) = self.agents.iter_mut().find(|run| run.id == pending.run_id) {
+                if let Some(terminal) = run.terminal.as_mut() {
+                    let _ = terminal.write_input(b"\r");
+                    run.last_worker_input_at = Some(Instant::now());
+                    self.dirty = true;
+                }
+            }
+        }
+        self.pending_enters = remaining;
+    }
+
     fn send_to_interactive_orchestrator(&mut self, input: &str) -> bool {
         let Some(index) = self.agents.iter().position(|run| {
             self.is_interactive_orchestrator_run(run)
@@ -3916,22 +3967,20 @@ impl App {
         }) else {
             return false;
         };
+        let run_id = self.agents[index].id.clone();
         let write_result = {
             let Some(terminal) = self.agents[index].terminal.as_mut() else {
                 return false;
             };
             terminal.reset_scrollback();
-            terminal.write_input(input.as_bytes()).and_then(|()| {
-                terminal.write_input(
-                    &terminal_bytes_for_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
-                        .unwrap_or_else(|| b"\r".to_vec()),
-                )
-            })
+            // Text only; the submitting CR is deferred (see queue_enter_for).
+            terminal.write_input(&bracketed_paste_bytes(input))
         };
         if let Err(error) = write_result {
             self.notice = Some(format!("could not send to orchestrator: {error}"));
             return false;
         }
+        self.queue_enter_for(&run_id);
         let now = now_stamp();
         if let Some(run) = self.agents.get_mut(index) {
             run.current_prompt = input.to_string();
@@ -5247,9 +5296,11 @@ impl App {
             // straight into the live PTY so they don't have to re-focus and
             // type it themselves.
             if !override_prompt.is_empty() {
+                let mut queued_run_id: Option<String> = None;
                 if let Some(run) = self.agents.get_mut(main_index) {
                     if let Some(terminal) = run.terminal.as_mut() {
-                        let _ = terminal.write_input(format!("{override_prompt}\r").as_bytes());
+                        // Text only; the submitting CR is deferred (see queue_enter_for).
+                        let _ = terminal.write_input(&bracketed_paste_bytes(override_prompt));
                         let now = now_stamp();
                         run.turns.push(AgentTurn {
                             ts: now.clone(),
@@ -5257,7 +5308,11 @@ impl App {
                             source: "user".to_string(),
                         });
                         run.last_user_input_at = now;
+                        queued_run_id = Some(run.id.clone());
                     }
+                }
+                if let Some(run_id) = queued_run_id {
+                    self.queue_enter_for(&run_id);
                 }
             }
             self.focus = FocusPane::Worker;
@@ -10567,6 +10622,10 @@ impl App {
     /// picks it up on its next turn). Returns false if there is no live terminal
     /// (the caller can fall back to re-goal-via-resume).
     fn live_inject_at(&mut self, index: usize, text: &str) -> bool {
+        let run_id = match self.agents.get(index) {
+            Some(run) => run.id.clone(),
+            None => return false,
+        };
         let result = match self
             .agents
             .get_mut(index)
@@ -10574,13 +10633,8 @@ impl App {
         {
             Some(terminal) => {
                 terminal.reset_scrollback();
-                if text.contains('\n') {
-                    let mut payload = bracketed_paste_bytes(text);
-                    payload.push(b'\r');
-                    terminal.write_input(&payload)
-                } else {
-                    terminal.write_input(format!("{text}\r").as_bytes())
-                }
+                // Text only; the submitting CR is deferred (see queue_enter_for).
+                terminal.write_input(&bracketed_paste_bytes(text))
             }
             None => return false,
         };
@@ -10588,6 +10642,7 @@ impl App {
             if let Some(run) = self.agents.get_mut(index) {
                 run.last_worker_input_at = Some(Instant::now());
             }
+            self.queue_enter_for(&run_id);
             self.dirty = true;
             true
         } else {
@@ -11176,6 +11231,7 @@ What to do\n\
 
     fn poll_agents(&mut self) {
         let poll_started = Instant::now();
+        self.flush_pending_enters();
         self.poll_task_summary_workers();
         self.poll_completion_summary_workers();
         self.poll_final_gate();

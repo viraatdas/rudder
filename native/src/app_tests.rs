@@ -9180,6 +9180,11 @@ fn task_input_routes_to_live_orchestrator_after_launch() {
     app.agents.push(worker);
 
     app.start_task_from_input("what is happening?");
+    // The submitting CR is deferred (paste-detection guard); force it due and flush.
+    for pending in &mut app.pending_enters {
+        pending.due = Instant::now() - Duration::from_millis(1);
+    }
+    app.flush_pending_enters();
 
     let mut captured = String::new();
     for _ in 0..40 {
@@ -9191,7 +9196,7 @@ fn task_input_routes_to_live_orchestrator_after_launch() {
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
-    assert_eq!(captured, "what is happening?");
+    assert_eq!(captured, "\u{1b}[200~what is happening?\u{1b}[201~");
     assert_eq!(app.selected_agent, 0, "the conductor stays selected");
     assert_eq!(app.notice.as_deref(), Some("sent to orchestrator"));
 
@@ -9206,7 +9211,7 @@ fn task_input_sends_enter_key_to_live_orchestrator() {
     let capture = repo.join("orchestrator-bytes.bin");
     let ready = repo.join("orchestrator-ready");
     let script = format!(
-        "stty raw -echo; : > {}; dd bs=1 count=4 of={} 2>/dev/null; sleep 1",
+        "stty raw -echo; : > {}; dd bs=1 count=16 of={} 2>/dev/null; sleep 1",
         shell_single_quote(&ready.to_string_lossy()),
         shell_single_quote(&capture.to_string_lossy())
     );
@@ -9249,18 +9254,23 @@ fn task_input_sends_enter_key_to_live_orchestrator() {
     app.agents.push(worker);
 
     app.start_task_from_input("go!");
+    // The submitting CR is deferred (paste-detection guard); force it due and flush.
+    for pending in &mut app.pending_enters {
+        pending.due = Instant::now() - Duration::from_millis(1);
+    }
+    app.flush_pending_enters();
 
     let mut captured = Vec::new();
     for _ in 0..40 {
         if let Ok(bytes) = fs::read(&capture) {
             captured = bytes;
-            if captured.len() >= 4 {
+            if captured.len() >= 16 {
                 break;
             }
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
-    assert_eq!(captured, b"go!\r");
+    assert_eq!(captured, b"\x1b[200~go!\x1b[201~\r");
     assert_eq!(app.notice.as_deref(), Some("sent to orchestrator"));
 
     let _ = fs::remove_dir_all(&repo);
@@ -9350,7 +9360,7 @@ fn completed_plan_status_question_still_goes_to_old_conductor() {
     let capture = repo.join("orchestrator-input.bin");
     let ready = repo.join("orchestrator-ready");
     let script = format!(
-        "stty raw -echo; : > {}; dd bs=1 count=20 of={} 2>/dev/null; sleep 1",
+        "stty raw -echo; : > {}; dd bs=1 count=32 of={} 2>/dev/null; sleep 1",
         shell_single_quote(&ready.to_string_lossy()),
         shell_single_quote(&capture.to_string_lossy())
     );
@@ -9393,18 +9403,23 @@ fn completed_plan_status_question_still_goes_to_old_conductor() {
     app.agents.push(completed);
 
     app.start_task_from_input("what is the status?");
+    // The submitting CR is deferred (paste-detection guard); force it due and flush.
+    for pending in &mut app.pending_enters {
+        pending.due = Instant::now() - Duration::from_millis(1);
+    }
+    app.flush_pending_enters();
 
     let mut captured = Vec::new();
     for _ in 0..40 {
         if let Ok(bytes) = fs::read(&capture) {
             captured = bytes;
-            if captured.len() >= 20 {
+            if captured.len() >= 32 {
                 break;
             }
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
-    assert_eq!(captured, b"what is the status?\r");
+    assert_eq!(captured, b"\x1b[200~what is the status?\x1b[201~\r");
     assert_eq!(app.selected_agent, 0, "the old conductor stays selected");
     assert_eq!(app.notice.as_deref(), Some("sent to orchestrator"));
 
@@ -12989,4 +13004,34 @@ fn set_model_defaults_only_retires_on_a_real_model_change() {
         None => std::env::remove_var("RUDDER_HOME"),
     }
     let _ = fs::remove_dir_all(&repo);
+}
+
+#[test]
+fn pending_enters_flush_after_delay_and_drop_dead_runs() {
+    let mut app = App::new();
+    // A run that no longer exists and one with no terminal: both entries must
+    // drain without panicking once due, and never resurrect.
+    app.agents.push(test_agent_run("run-alive", "task"));
+    app.queue_enter_for("run-alive");
+    app.queue_enter_for("run-gone");
+    assert_eq!(app.pending_enters.len(), 2);
+
+    // Not yet due: nothing drains.
+    app.flush_pending_enters();
+    assert_eq!(
+        app.pending_enters.len(),
+        2,
+        "entries within ENTER_SUBMIT_DELAY are retained"
+    );
+
+    // Force both due and flush: entries drain even when the run is gone or has
+    // no terminal (the CR is simply dropped, not retried forever).
+    for pending in &mut app.pending_enters {
+        pending.due = Instant::now() - Duration::from_millis(1);
+    }
+    app.flush_pending_enters();
+    assert!(
+        app.pending_enters.is_empty(),
+        "due entries drain regardless of run/terminal state"
+    );
 }
