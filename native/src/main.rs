@@ -5400,6 +5400,83 @@ impl App {
         self.dirty = true;
     }
 
+    /// `/restore claude|codex <session-id>`: reopen an existing CLI conversation
+    /// in a new agent pane with all permissions bypassed (claude:
+    /// `--permission-mode bypassPermissions`, codex:
+    /// `--dangerously-bypass-approvals-and-sandbox`). Continues the SAME session
+    /// in place (no fork), in the current checkout.
+    fn start_restore_task(&mut self, backend: Backend, session_id: &str) {
+        let session_id = session_id.trim().to_string();
+        if session_id.is_empty() {
+            self.notice = Some("usage: /restore claude|codex <session-id>".to_string());
+            return;
+        }
+        // Claude scopes --resume lookup to the current directory's project folder
+        // under ~/.claude/projects; find the transcript anywhere on disk and stage
+        // it into this checkout when it was recorded elsewhere. (Codex sessions
+        // are global, so no staging is needed.)
+        if backend == Backend::Claude {
+            if claude_transcript_path(&self.cwd, &session_id).is_none() {
+                self.notice = Some(format!(
+                    "no Claude session transcript found for {session_id} under ~/.claude/projects"
+                ));
+                return;
+            }
+            if let Err(error) = stage_claude_session_for_cwd(&self.cwd, &session_id, &self.cwd) {
+                self.notice = Some(format!("restore failed: {error}"));
+                return;
+            }
+        }
+        let model = self.model.clone();
+        let effort = self.effort;
+        let short_id: String = session_id.chars().take(8).collect();
+        let mut run = create_oneoff_agent(
+            &self.cwd,
+            backend,
+            &model,
+            effort,
+            &format!("Restore {} session {session_id}", backend.as_str()),
+        );
+        run.session_id = Some(session_id.clone());
+        let mut command = match backend {
+            Backend::Claude => claude_resume_command(&run, &session_id),
+            Backend::Codex => codex_resume_command(&run, &session_id),
+        };
+        // Re-wire completion hooks like every other (re)spawn path; without this
+        // the run would sit "running" forever waiting for a signal the resumed
+        // process was never configured to send.
+        signals::augment_worker_command(&mut command, backend, run.mode, &run.id);
+        let options = TerminalPaneOptions {
+            size: run.terminal_size.unwrap_or_default(),
+            cwd: Some(self.cwd.clone()),
+            ..TerminalPaneOptions::default()
+        };
+        match TerminalPane::spawn_shell_or_command(Some(command), options) {
+            Ok(mut terminal) => {
+                let _ = terminal.drain_output();
+                Self::attach_output_waker(&self.pty_output_waker, &terminal);
+                run.terminal = Some(terminal);
+                run.status = AgentStatus::Running;
+                run.last_output_at = Instant::now();
+                self.notice = Some(format!(
+                    "restored {} session {short_id}… with permissions bypassed",
+                    backend.as_str()
+                ));
+            }
+            Err(error) => {
+                run.status = AgentStatus::Failed;
+                run.last_error = Some(error.to_string());
+                self.notice = Some(format!("restore failed to start: {error}"));
+            }
+        }
+        let _ = save_native_run_record(&self.cwd, &run);
+        self.agents.push(run);
+        self.selected_agent = self.agents.len().saturating_sub(1);
+        self.focus = FocusPane::Worker;
+        self.worker_view = WorkerView::Terminal;
+        self.dirty = true;
+    }
+
     fn open_main_model_switcher(&mut self) {
         if !self.selected_is_main() {
             return;
@@ -5558,6 +5635,28 @@ impl App {
                 }
                 true
             }
+            Some("/restore") => {
+                // Reopen an existing claude/codex CLI conversation in a new agent
+                // pane, continuing the SAME session with all permissions bypassed.
+                let args = parts.collect::<Vec<_>>();
+                match args.as_slice() {
+                    [provider, session_id] => match Backend::parse(&provider.to_ascii_lowercase()) {
+                        Some(backend) => self.start_restore_task(backend, session_id),
+                        None => {
+                            self.notice = Some(format!(
+                                "unknown provider {provider}; usage: /restore claude|codex <session-id>"
+                            ));
+                        }
+                    },
+                    _ => {
+                        self.notice = Some(
+                            "usage: /restore claude|codex <session-id> — reopen that conversation in a new pane with permissions bypassed"
+                                .to_string(),
+                        );
+                    }
+                }
+                true
+            }
             Some("/ask") => {
                 // The escape hatch from the orchestrator default: a one-off
                 // conversational agent in the main checkout, no DAG.
@@ -5600,7 +5699,7 @@ impl App {
             }
             Some("/help") => {
                 self.notice = Some(
-                    "plain input -> orchestrator/DAG · /run <task> -> one isolated mergeable worker · /ask <text> -> direct main-checkout one-off · /plan <text> -> force orchestrator/DAG · panes: Option-1/2/3 or ^W · keys: j/k select · Enter focus · v diff · m merge · M merge all · R review all · g nest · o web ui · x stop · b branch chat · dd delete · cc clear merged · P model — commands: /model /fast /sound /color /main /run /ask /plan /share /usage /goal /cloud /web"
+                    "plain input -> orchestrator/DAG · /run <task> -> one isolated mergeable worker · /ask <text> -> direct main-checkout one-off · /plan <text> -> force orchestrator/DAG · panes: Option-1/2/3 or ^W · keys: j/k select · Enter focus · v diff · m merge · M merge all · R review all · g nest · o web ui · x stop · b branch chat · dd delete · cc clear merged · P model — commands: /model /fast /sound /color /main /run /ask /plan /restore /share /usage /goal /cloud /web"
                         .to_string(),
                 );
                 true

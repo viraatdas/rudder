@@ -345,6 +345,11 @@ pub(crate) fn command_suggestions() -> Vec<Suggestion> {
             action: SuggestionAction::Insert("/plan ".to_string()),
         },
         Suggestion {
+            label: "/restore <claude|codex> <session-id>".to_string(),
+            detail: "reopen an existing CLI conversation in a new pane, permissions bypassed".to_string(),
+            action: SuggestionAction::Insert("/restore ".to_string()),
+        },
+        Suggestion {
             label: "/main".to_string(),
             detail: "spawn a main-branch agent (uses current model)".to_string(),
             action: SuggestionAction::RunCommand("/main".to_string()),
