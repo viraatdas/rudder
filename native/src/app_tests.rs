@@ -13035,3 +13035,18 @@ fn pending_enters_flush_after_delay_and_drop_dead_runs() {
         "due entries drain regardless of run/terminal state"
     );
 }
+
+#[test]
+fn final_gate_treats_clean_jj_resolve_list_as_passing() {
+    use crate::lifecycle::verification_passed;
+    // jj resolve --list on a conflict-free tree: NON-ZERO exit, empty stdout.
+    // This is the success case and must pass (was the "No conflicts found at this
+    // revision" false failure showing up as status=failed in every RUDDER.md).
+    assert!(verification_passed(true, false, ""));
+    assert!(verification_passed(true, false, "\n  \n"));
+    // Real conflicts: jj lists them on stdout -> must fail.
+    assert!(!verification_passed(true, true, "src/a.rs    2-sided conflict\n"));
+    // Exit-code commands (git diff --check, npm test) judge on exit status only.
+    assert!(verification_passed(false, true, "anything on stdout is fine"));
+    assert!(!verification_passed(false, false, ""));
+}

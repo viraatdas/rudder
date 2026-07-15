@@ -55,6 +55,21 @@ pub(crate) struct VerificationCommand {
     pub(crate) require_empty_stdout: bool,
 }
 
+/// Whether a verification command counts as passing. Commands whose real signal
+/// is "empty stdout == clean" (notably `jj resolve --list`) exit NON-ZERO in the
+/// clean case — jj prints "No conflicts found at this revision" to stderr and
+/// returns non-zero — so they MUST be judged on stdout, not the exit code.
+/// Judging that command on its exit status made the final gate report
+/// "jj conflicts failed: No conflicts found at this revision" exactly when the
+/// tree was conflict-free, so the gate could never go green.
+pub(crate) fn verification_passed(require_empty_stdout: bool, exit_success: bool, stdout: &str) -> bool {
+    if require_empty_stdout {
+        stdout.trim().is_empty()
+    } else {
+        exit_success
+    }
+}
+
 pub(crate) fn verification_commands(cwd: &Path) -> Vec<VerificationCommand> {
     let mut commands = vec![
         VerificationCommand {
@@ -195,25 +210,34 @@ impl App {
                     .current_dir(&cwd)
                     .output();
                 match output {
-                    Ok(output)
-                        if output.status.success()
-                            && (!command.require_empty_stdout
-                                || String::from_utf8_lossy(&output.stdout).trim().is_empty()) =>
-                    {
-                        passed.push(command.label);
-                    }
                     Ok(output) => {
-                        let detail = String::from_utf8_lossy(if output.stderr.is_empty() {
-                            &output.stdout
+                        let stdout = String::from_utf8_lossy(&output.stdout);
+                        if verification_passed(
+                            command.require_empty_stdout,
+                            output.status.success(),
+                            &stdout,
+                        ) {
+                            passed.push(command.label);
                         } else {
-                            &output.stderr
-                        });
-                        let detail = truncate_chars(detail.trim(), 1200);
-                        let _ = tx.send(FinalGateResult {
-                            passed: false,
-                            summary: format!("{} failed: {detail}", command.label),
-                        });
-                        return;
+                            // For an empty-stdout check the meaningful detail is the
+                            // stdout (the conflict list); otherwise prefer stderr.
+                            let detail_owned = if command.require_empty_stdout {
+                                stdout.trim().to_string()
+                            } else {
+                                let stderr = String::from_utf8_lossy(&output.stderr);
+                                if stderr.trim().is_empty() {
+                                    stdout.trim().to_string()
+                                } else {
+                                    stderr.trim().to_string()
+                                }
+                            };
+                            let detail = truncate_chars(&detail_owned, 1200);
+                            let _ = tx.send(FinalGateResult {
+                                passed: false,
+                                summary: format!("{} failed: {detail}", command.label),
+                            });
+                            return;
+                        }
                     }
                     Err(error) => {
                         let _ = tx.send(FinalGateResult {
