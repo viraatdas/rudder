@@ -484,6 +484,10 @@ struct App {
     /// sites write the text as a bracketed paste and queue the CR here; it is
     /// flushed as a separate write once ENTER_SUBMIT_DELAY has passed.
     pending_enters: Vec<PendingEnter>,
+    /// Injected tasks waiting to be folded into the active plan, one at a time.
+    /// Without this, rapid injections each spawned their own RudderPlan planner
+    /// and the agent pane filled with 5+ concurrent "planning" rows.
+    pending_reconcile_inputs: Vec<String>,
     cwd: PathBuf,
     branch: Option<String>,
     task_input: String,
@@ -1172,6 +1176,7 @@ impl App {
             nest_view: false,
             pty_output_waker: None,
             pending_enters: Vec::new(),
+            pending_reconcile_inputs: Vec::new(),
             cwd,
             branch,
             task_input,
@@ -1561,6 +1566,18 @@ impl App {
         if self.fast_mode {
             self.fast_mode = false;
             let _ = config::save_fast_mode(false);
+        }
+        // Reflect the switch on the LEFT pane for EVERY switch path. The main
+        // agent row renders its own run.model; only the `/model` command used to
+        // update it, so `/fast` and the `P` picker left the row showing the old
+        // model. Update all main rows here (the one chokepoint every path calls).
+        let model_now = self.model.clone();
+        let cwd_now = self.cwd.clone();
+        for run in self.agents.iter_mut().filter(|run| run.is_main()) {
+            run.backend = backend;
+            run.model = model_now.clone();
+            run.effort = effort;
+            let _ = save_native_run_record(&cwd_now, run);
         }
         let warning = save_model_defaults(self.backend, &self.model, self.effort)
             .err()
@@ -4207,7 +4224,44 @@ impl App {
     /// exactly one new node with inferred deps. The poll loop routes that planner's
     /// completion to `evaluate_completed_reconcile`, which APPENDS the node to
     /// `planned_nodes` (never replaces) and schedules it if the session is running.
+    /// True while an injection-coordinator (reconcile) planner is mid-flight.
+    fn reconcile_planner_running(&self) -> bool {
+        self.agents
+            .iter()
+            .any(|run| run.reconcile_planner && run.status == AgentStatus::Running)
+    }
+
+    /// Start the next queued injection once the current reconcile planner has
+    /// finished, so injections fold into the plan one at a time instead of
+    /// spawning a pane full of concurrent planners. Called from the poll loop.
+    fn maybe_start_queued_reconcile(&mut self) {
+        if self.pending_reconcile_inputs.is_empty() || self.reconcile_planner_running() {
+            return;
+        }
+        if !self.plan_is_active() {
+            // The plan ended (or was retired) while injections were queued; a
+            // fresh plan path owns new input now, so drop the stale queue.
+            self.pending_reconcile_inputs.clear();
+            return;
+        }
+        let next = self.pending_reconcile_inputs.remove(0);
+        self.reconcile_injection(&next);
+    }
+
     fn reconcile_injection(&mut self, input: &str) {
+        // Serialize injection-coordinators: only one reconcile planner runs at a
+        // time. Queue anything that arrives while one is in flight and drain it
+        // via maybe_start_queued_reconcile when the current one finishes.
+        if self.reconcile_planner_running() {
+            self.pending_reconcile_inputs.push(input.to_string());
+            self.notice = Some(format!(
+                "queued \"{}\" — folding it into the plan after the current one ({} waiting)",
+                short_task(input),
+                self.pending_reconcile_inputs.len()
+            ));
+            self.dirty = true;
+            return;
+        }
         let frontier = self.plan_frontier();
         let model = self.model.clone();
         let backend = self.backend;
@@ -11327,6 +11381,7 @@ What to do\n\
     fn poll_agents(&mut self) {
         let poll_started = Instant::now();
         self.flush_pending_enters();
+        self.maybe_start_queued_reconcile();
         self.poll_task_summary_workers();
         self.poll_completion_summary_workers();
         self.poll_final_gate();
