@@ -1483,6 +1483,36 @@ pub(crate) fn jj_diff_text(cwd: &Path, max_chars: usize) -> String {
     }
 }
 
+/// Best-effort: set a jj workspace's working-copy change description to reflect
+/// the agent's status, so `jj log` reads like a live coordination board
+/// (`rudder[n3]: fix memory leak [done]`) instead of "(no description set)".
+/// No-op for non-jj runs (the main agent, legacy git worktrees) and on any error
+/// — a description update must never disturb the run.
+pub(crate) fn describe_workspace_status(run: &AgentRun, status: &str) {
+    if run.workspace_name.is_none() {
+        return;
+    }
+    let label = run
+        .node_id
+        .as_deref()
+        .filter(|id| !id.trim().is_empty())
+        .map(|id| format!("rudder[{id}]"))
+        .unwrap_or_else(|| "rudder".to_string());
+    let task = run.task_summary.trim();
+    let task = if task.is_empty() { run.task.trim() } else { task };
+    let summary: String = task.chars().take(72).collect();
+    let message = if summary.trim().is_empty() {
+        format!("{label} [{status}]")
+    } else {
+        format!("{label}: {summary} [{status}]")
+    };
+    let _ = Command::new("jj")
+        .args(["describe", "-m", &message])
+        .current_dir(&run.cwd)
+        .stdin(Stdio::null())
+        .output();
+}
+
 pub(crate) fn jj_unresolved_conflicts(cwd: &Path) -> Vec<String> {
     let Ok(output) = Command::new("jj")
         .args(["resolve", "--list"])
@@ -1938,7 +1968,7 @@ pub(crate) fn write_rudder_context_with_history(
         "\nRead this file before making changes so you know what other Rudder agents are doing. If RUDDER_SHARED.md exists beside it, read that too; it is Rudder's gitignored file for user-shared credentials, API tokens, private URLs, and other local context that must survive model compaction.\n",
     );
     body.push_str(
-        "\n## Version control\n\nThis repo uses jj (Jujutsu), colocated with git. Each agent works in its own jj workspace; jj is authoritative. Inspect changes with `jj status` / `jj diff`. Do not run commit/branch/merge commands yourself; Rudder snapshots and integrates your working copy.\n",
+        "\n## Version control\n\nThis repo uses jj (Jujutsu), colocated with git. Each agent works in its own jj workspace; jj is authoritative. Inspect changes with `jj status` / `jj diff`. Run `jj log` to see every agent's workspace and its description — Rudder sets each workspace's change description to what that agent is doing and its status (e.g. `rudder[n3]: fix memory leak [done]`), so read them to see where sibling work is and avoid stepping on the same files. Do not run commit/branch/merge commands yourself; Rudder snapshots and integrates your working copy.\n",
     );
     {
         // One lock per write batch at the repo root (the TS side locks the same

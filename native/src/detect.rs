@@ -45,6 +45,10 @@ pub(crate) fn mark_run_done(run: &mut AgentRun) {
         if !run.is_pinned_planner() {
             play_completion_sound();
         }
+        // Reflect the transition in the workspace's jj description so `jj log`
+        // (and any agent reading it) sees this node reach review. Best-effort,
+        // jj runs only; skipped for the main agent and in tests (no workspace).
+        describe_workspace_status(run, "done");
     }
 }
 

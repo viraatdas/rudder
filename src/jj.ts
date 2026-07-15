@@ -289,17 +289,34 @@ export async function createNodeWorkspace(params: {
       cwd: params.repoRoot,
       allowFailure: true,
     });
-    if (withRevision.code === 0) {
-      return { workspaceName, path: targetPath };
+    if (withRevision.code !== 0) {
+      // Older jj without `workspace add -r`: add, then edit onto the change.
+      await runCommand("jj", baseArgs, { cwd: params.repoRoot });
+      await runCommand("jj", ["edit", params.atChangeId], { cwd: targetPath, allowFailure: true });
     }
-    // Older jj without `workspace add -r`: add, then edit onto the change.
+  } else {
     await runCommand("jj", baseArgs, { cwd: params.repoRoot });
-    await runCommand("jj", ["edit", params.atChangeId], { cwd: targetPath, allowFailure: true });
-    return { workspaceName, path: targetPath };
   }
-
-  await runCommand("jj", baseArgs, { cwd: params.repoRoot });
+  // Describe the workspace's OWN working-copy change (@) so `jj log` shows what
+  // this agent is doing instead of "(no description set)". Rudder agents read
+  // each other's jj descriptions to coordinate; RUDDER.md stays the aggregate
+  // human snapshot. Best-effort — a missing description must never fail a launch.
+  await runCommand("jj", ["describe", "-m", workspaceDescription(params, "running")], {
+    cwd: targetPath,
+    allowFailure: true,
+  });
   return { workspaceName, path: targetPath };
+}
+
+/** jj working-copy description for a Rudder agent's workspace. */
+function workspaceDescription(
+  params: { nodeId?: string; task?: string },
+  status: string,
+): string {
+  const label = params.nodeId ? `rudder[${params.nodeId}]` : "rudder";
+  const task = (params.task ?? "").trim().replace(/\s+/g, " ");
+  const summary = task.length > 72 ? `${task.slice(0, 71)}…` : task;
+  return summary ? `${label}: ${summary} [${status}]` : `${label} [${status}]`;
 }
 
 /**
