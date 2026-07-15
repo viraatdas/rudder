@@ -701,6 +701,27 @@ pub(crate) fn review_all_run(
     }
 }
 
+/// Prompt for the per-node review agent that runs in a finished node's OWN jj
+/// workspace before Rudder auto-merges it. It reviews the node's working-copy
+/// diff with the installed `thermonuclear` skill, fixes findings in place, then
+/// stops — Rudder integrates the (now reviewed + fixed) change.
+pub(crate) fn node_review_prompt(node_label: &str) -> String {
+    format!(
+        "/thermonuclear Review and fix this node's work before it merges.\n\
+\n\
+You are the Rudder per-node review agent for: {node_label}\n\
+You are running in the node's own jj workspace; its uncommitted working-copy change IS the work to review.\n\
+\n\
+Instructions\n\
+1. Run `jj diff` to see exactly what this node changed.\n\
+2. Run the `thermonuclear` code-review skill (the installed review plugin) over that diff — invoke `/thermonuclear` or the skill, whichever your CLI exposes. If it is unavailable, perform an equivalent thorough review manually.\n\
+3. Fix real findings directly in this working copy. Keep the change scoped to this node's task; do not expand it.\n\
+4. Run the relevant tests/checks for the files you touched. If a check cannot run, say exactly why.\n\
+5. Do NOT run jj/git commit/new/merge/branch commands — Rudder snapshots and integrates this change. When the review is clean, stop and say the node is reviewed.\n",
+        node_label = node_label
+    )
+}
+
 pub(crate) fn review_all_prompt(
     target_ref: &str,
     worktree: &WorktreeInfo,

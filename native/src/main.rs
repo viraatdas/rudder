@@ -509,6 +509,16 @@ struct App {
     /// queue is saved, and presentation cleanup may delete merged run rows.
     plan_launched_node_ids: HashSet<String>,
     plan_merged_node_ids: HashSet<String>,
+    /// Per-node auto-review gate. When enabled, a finished plan node is reviewed
+    /// (thermonuclear skill, auto-fix in its own workspace) before it auto-merges.
+    /// `node_review_enabled` defaults on (RUDDER_NODE_REVIEW=0 or `/autoreview off`
+    /// disables). `reviewed_nodes` are node ids that passed review (eligible to
+    /// merge); `node_reviewers` maps a live reviewer run id -> the node id it
+    /// reviews. Both are in-memory: a restart drops in-flight reviewers and
+    /// re-reviews any still-unmerged node, which is harmless.
+    node_review_enabled: bool,
+    reviewed_nodes: HashSet<String>,
+    node_reviewers: HashMap<String, String>,
     /// A plan file is accepted only after an explicit new planning turn arms
     /// capture. An empty queue/all-merged fleet is never evidence of a new plan.
     plan_capture_armed: bool,
@@ -1189,6 +1199,11 @@ impl App {
             planned_nodes: restored_queue.planned_nodes,
             plan_launched_node_ids: restored_queue.launched_node_ids,
             plan_merged_node_ids: restored_queue.merged_node_ids,
+            node_review_enabled: std::env::var("RUDDER_NODE_REVIEW")
+                .map(|value| value.trim() != "0")
+                .unwrap_or(true),
+            reviewed_nodes: HashSet::new(),
+            node_reviewers: HashMap::new(),
             plan_capture_armed: restored_queue.capture_armed,
             plan_review: restored_plan_review,
             planned_origin: restored_queue.planned_origin,
@@ -1629,6 +1644,10 @@ impl App {
         self.planned_nodes.clear();
         self.plan_launched_node_ids.clear();
         self.plan_merged_node_ids.clear();
+        // Node ids (n0, n1, …) are reused across plans, so review state must not
+        // carry over — a new plan's n0 must not inherit an old n0's reviewed flag.
+        self.reviewed_nodes.clear();
+        self.node_reviewers.clear();
         self.final_gate_status = FinalGateStatus::Idle;
         self.final_gate_summary = None;
         self.plan_capture_armed = false;
@@ -4570,6 +4589,10 @@ impl App {
         self.planned_nodes.clear();
         self.plan_launched_node_ids.clear();
         self.plan_merged_node_ids.clear();
+        // Node ids (n0, n1, …) are reused across plans, so review state must not
+        // carry over — a new plan's n0 must not inherit an old n0's reviewed flag.
+        self.reviewed_nodes.clear();
+        self.node_reviewers.clear();
         self.final_gate_status = FinalGateStatus::Idle;
         self.final_gate_summary = None;
         self.plan_capture_armed = true;
@@ -6762,6 +6785,10 @@ impl App {
         self.planned_nodes = nodes;
         self.plan_launched_node_ids.clear();
         self.plan_merged_node_ids.clear();
+        // Node ids (n0, n1, …) are reused across plans, so review state must not
+        // carry over — a new plan's n0 must not inherit an old n0's reviewed flag.
+        self.reviewed_nodes.clear();
+        self.node_reviewers.clear();
         self.final_gate_status = FinalGateStatus::Idle;
         self.final_gate_summary = None;
         self.plan_capture_armed = false;
@@ -7305,6 +7332,10 @@ impl App {
         self.planned_nodes = nodes;
         self.plan_launched_node_ids.clear();
         self.plan_merged_node_ids.clear();
+        // Node ids (n0, n1, …) are reused across plans, so review state must not
+        // carry over — a new plan's n0 must not inherit an old n0's reviewed flag.
+        self.reviewed_nodes.clear();
+        self.node_reviewers.clear();
         self.final_gate_status = FinalGateStatus::Idle;
         self.final_gate_summary = None;
         self.plan_capture_armed = false;
@@ -9393,6 +9424,143 @@ impl App {
         }
     }
 
+    /// If per-node review is on and no reviewer is in flight, start one for a
+    /// finished-but-unreviewed plan node. Serialized (one at a time) so a plan
+    /// doesn't fan out N expensive review agents at once. The reviewer runs the
+    /// thermonuclear skill in the node's OWN workspace and fixes findings in
+    /// place; `integrate_ready_plan_nodes` won't merge the node until it's marked
+    /// reviewed by `finalize_node_reviews`.
+    fn maybe_start_node_review(&mut self) {
+        if !self.node_review_enabled || !self.node_reviewers.is_empty() {
+            return;
+        }
+        let claimed = self.review_all_claimed_source_ids();
+        let candidate = self.agents.iter().position(|run| {
+            run.status == AgentStatus::Done
+                && !run.is_main()
+                && !run.merge_resolver
+                && !run.has_merge_conflict()
+                && run.workspace_name.is_some()
+                && !claimed.contains(&run.id)
+                && run
+                    .node_id
+                    .as_deref()
+                    .is_some_and(|node_id| !self.reviewed_nodes.contains(node_id))
+        });
+        if let Some(index) = candidate {
+            self.spawn_node_reviewer(index);
+        }
+    }
+
+    fn spawn_node_reviewer(&mut self, index: usize) {
+        let (node_id, node_label, cwd) = {
+            let Some(run) = self.agents.get(index) else {
+                return;
+            };
+            let Some(node_id) = run.node_id.clone() else {
+                return;
+            };
+            let label = if run.task_summary.trim().is_empty() {
+                short_task(&run.task)
+            } else {
+                run.task_summary.trim().to_string()
+            };
+            (node_id, label, run.cwd.clone())
+        };
+        let (backend, model, effort) = self.review_agent_profile();
+        let prompt = node_review_prompt(&node_label);
+        let mut run = create_oneoff_agent(
+            &self.cwd,
+            backend,
+            model,
+            Some(effort),
+            &format!("thermonuclear review: {node_label}"),
+        );
+        // The reviewer runs in the NODE's workspace and edits its change in place;
+        // node_id stays None so the scheduler never treats the reviewer as a plan
+        // worker. It is transient — removed by finalize_node_reviews when done.
+        run.cwd = cwd.clone();
+        run.mode = AgentMode::ReviewAll;
+        let reviewer_id = run.id.clone();
+        let session_id = mint_session_id_for(backend);
+        run.session_id = session_id.clone();
+        let mut command = agent_command(
+            backend,
+            model,
+            Some(effort),
+            &prompt,
+            AgentMode::ReviewAll,
+            session_id.as_deref(),
+        );
+        signals::augment_worker_command(&mut command, backend, AgentMode::ReviewAll, &reviewer_id);
+        let options = TerminalPaneOptions {
+            size: TerminalSize::default(),
+            cwd: Some(cwd),
+            ..TerminalPaneOptions::default()
+        };
+        match TerminalPane::spawn_shell_or_command(Some(command), options) {
+            Ok(mut terminal) => {
+                let _ = terminal.drain_output();
+                Self::attach_output_waker(&self.pty_output_waker, &terminal);
+                run.terminal = Some(terminal);
+                run.status = AgentStatus::Running;
+                run.last_output_at = Instant::now();
+                self.node_reviewers.insert(reviewer_id, node_id);
+                self.agents.push(run);
+                self.notice = Some(format!("reviewing {node_label} (thermonuclear) before merge"));
+                self.dirty = true;
+            }
+            Err(error) => {
+                // Fail open: never block the DAG on a reviewer that won't start.
+                self.reviewed_nodes.insert(node_id);
+                self.notice =
+                    Some(format!("review could not start ({error}); merging {node_label} unreviewed"));
+            }
+        }
+    }
+
+    /// Mark nodes reviewed once their reviewer reaches a terminal state and drop
+    /// the transient reviewer row. Fail open: a Failed/Stopped reviewer still
+    /// marks the node reviewed, so a broken review never permanently blocks the
+    /// node or its dependents.
+    fn finalize_node_reviews(&mut self) {
+        if self.node_reviewers.is_empty() {
+            return;
+        }
+        let tracked: Vec<(String, String)> = self
+            .node_reviewers
+            .iter()
+            .map(|(reviewer_id, node_id)| (reviewer_id.clone(), node_id.clone()))
+            .collect();
+        let mut changed = false;
+        for (reviewer_id, node_id) in tracked {
+            let terminal = self.agents.iter().any(|run| {
+                run.id == reviewer_id
+                    && matches!(
+                        run.status,
+                        AgentStatus::Done | AgentStatus::Failed | AgentStatus::Stopped
+                    )
+            });
+            if !terminal {
+                continue;
+            }
+            self.node_reviewers.remove(&reviewer_id);
+            self.reviewed_nodes.insert(node_id);
+            if let Some(pos) = self.agents.iter().position(|run| run.id == reviewer_id) {
+                let removed = self.agents.remove(pos);
+                let _ = remove_native_run_record(&self.cwd, &removed.id);
+                signals::cleanup_run_signals(&removed.id);
+            }
+            changed = true;
+        }
+        if changed {
+            let last = self.agents.len().saturating_sub(1);
+            self.selected_agent = self.selected_agent.min(last);
+            self.agent_row_map.clear();
+            self.dirty = true;
+        }
+    }
+
     fn integrate_ready_plan_nodes(&mut self) {
         // Hold integration steady while a structural rebase is in flight: merging would
         // shift a RUNNING node into the MERGED zone mid-diff and the build-forward apply
@@ -9413,6 +9581,9 @@ impl App {
         {
             return;
         }
+        // Per-node review gate: start a reviewer for a finished, unreviewed node.
+        // Nodes only pass the merge predicate below once they're marked reviewed.
+        self.maybe_start_node_review();
         let mut merged_labels: Vec<String> = Vec::new();
         let mut conflicted = false;
         loop {
@@ -9422,6 +9593,11 @@ impl App {
                     && !run.is_main()
                     && !run.merge_resolver
                     && !run.has_merge_conflict()
+                    && (!self.node_review_enabled
+                        || run
+                            .node_id
+                            .as_deref()
+                            .is_some_and(|node_id| self.reviewed_nodes.contains(node_id)))
             });
             let Some(index) = next else { break };
             let id = self.agents[index].id.clone();
@@ -11730,6 +11906,8 @@ What to do\n\
         // unblock and the chain flows without manual m/M. Runs even
         // when the queue is empty (to merge the final nodes), but not at the gate.
         if !self.awaiting_approval && self.scheduler_tick % SCHEDULER_TICK_INTERVAL == 0 {
+            // Mark nodes whose reviewer just finished, so integrate can merge them.
+            self.finalize_node_reviews();
             self.integrate_ready_plan_nodes();
             self.maybe_start_final_gate();
         }

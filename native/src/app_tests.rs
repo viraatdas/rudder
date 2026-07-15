@@ -13073,3 +13073,49 @@ fn forget_jj_workspace_refuses_paths_outside_rudder_worktrees() {
     assert!(!ok_path.exists(), "an in-tree workspace directory is removed");
     let _ = std::fs::remove_dir_all(&repo);
 }
+
+#[test]
+fn finalize_node_reviews_marks_reviewed_and_fails_open() {
+    let mut app = App::new();
+    // A finished reviewer tracked against node n0.
+    let mut reviewer = test_agent_run("rev-1", "thermonuclear review: n0");
+    reviewer.mode = AgentMode::ReviewAll;
+    reviewer.status = AgentStatus::Done;
+    app.agents.push(reviewer);
+    app.node_reviewers.insert("rev-1".to_string(), "n0".to_string());
+
+    app.finalize_node_reviews();
+    assert!(app.reviewed_nodes.contains("n0"), "node marked reviewed -> eligible to merge");
+    assert!(!app.agents.iter().any(|r| r.id == "rev-1"), "transient reviewer row removed");
+    assert!(app.node_reviewers.is_empty());
+
+    // Fail open: a Failed reviewer must still mark the node reviewed so a broken
+    // review never permanently blocks the node (and its dependents).
+    let mut reviewer2 = test_agent_run("rev-2", "thermonuclear review: n1");
+    reviewer2.mode = AgentMode::ReviewAll;
+    reviewer2.status = AgentStatus::Failed;
+    app.agents.push(reviewer2);
+    app.node_reviewers.insert("rev-2".to_string(), "n1".to_string());
+    app.finalize_node_reviews();
+    assert!(app.reviewed_nodes.contains("n1"), "failed review fails open");
+}
+
+#[test]
+fn maybe_start_node_review_respects_disable_and_serializes() {
+    let mut app = App::new();
+    app.node_review_enabled = false;
+    let mut node = test_agent_run("run-n0", "task");
+    node.node_id = Some("n0".to_string());
+    node.status = AgentStatus::Done;
+    node.workspace_name = Some("rudder-n0".to_string());
+    app.agents.push(node);
+    app.maybe_start_node_review();
+    assert!(app.node_reviewers.is_empty(), "disabled: no reviewer spawned");
+
+    // Enabled but a reviewer already tracked -> serialize (no second spawn).
+    app.node_review_enabled = true;
+    app.node_reviewers.insert("rev-x".to_string(), "n9".to_string());
+    let before = app.agents.len();
+    app.maybe_start_node_review();
+    assert_eq!(app.agents.len(), before, "one reviewer at a time");
+}
