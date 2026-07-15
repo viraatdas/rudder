@@ -13147,3 +13147,26 @@ fn gc_orphan_workspaces_protects_live_and_reaps_orphans() {
     std::env::remove_var("RUDDER_WORKTREE_GC_GRACE_SECS");
     let _ = std::fs::remove_dir_all(&repo);
 }
+
+#[test]
+fn approve_marker_in_file_is_consumed_without_a_running_orchestrator() {
+    // Regression: the hardened file-approval channel used to be gated on a
+    // RUNNING interactive orchestrator, so a RUDDER_APPROVE_PLAN written just
+    // before the orchestrator exited/idled stranded the plan forever.
+    let repo = unique_test_repo("approve-no-orch");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("RUDDER.md"), "the plan\nRUDDER_APPROVE_PLAN\n").unwrap();
+
+    let mut app = App::new();
+    app.cwd = repo.clone();
+    app.awaiting_approval = true;
+    app.planned_nodes.clear(); // empty -> degenerate approve clears the gate, no spawn
+
+    app.scan_orchestrator_markers();
+    assert!(
+        !app.awaiting_approval,
+        "a file approval marker must be consumed with no running orchestrator"
+    );
+
+    let _ = std::fs::remove_dir_all(&repo);
+}

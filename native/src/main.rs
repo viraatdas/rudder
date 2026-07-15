@@ -6877,15 +6877,19 @@ impl App {
         if !self.awaiting_approval || self.refining || self.rebasing {
             return;
         }
-        if !self.has_running_interactive_orchestrator() {
-            return;
-        }
-        // PRIMARY: the orchestrator wrote the approval into its plan file.
+        // PRIMARY (hardened file channel): the plan is already persisted, so a
+        // `RUDDER_APPROVE_PLAN` line in the plan file approves it even if the
+        // orchestrator PTY has since exited, idled out of Running, or was launched
+        // headless. The old code gated this whole scan on a *running interactive*
+        // orchestrator, so a marker written just before the orchestrator's turn
+        // ended was stranded forever and the plan never launched (silent stall).
         let file_approved = std::fs::read_to_string(orchestrator_plan_path(&self.cwd))
             .map(|text| output_has_approve_marker(&text))
             .unwrap_or(false);
-        // FALLBACK: the marker was printed into the orchestrator PTY.
+        // FALLBACK (lossy PTY channel): only meaningful while an interactive
+        // orchestrator is still running, since it reads that PTY's live output.
         let pty_approved = !file_approved
+            && self.has_running_interactive_orchestrator()
             && self
                 .agents
                 .iter()
