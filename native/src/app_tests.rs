@@ -13119,3 +13119,31 @@ fn maybe_start_node_review_respects_disable_and_serializes() {
     app.maybe_start_node_review();
     assert_eq!(app.agents.len(), before, "one reviewer at a time");
 }
+
+#[test]
+fn gc_orphan_workspaces_protects_live_and_reaps_orphans() {
+    let repo = unique_test_repo("gc-orphans");
+    let group = repo.join(".rudder-worktrees").join("proj");
+    let live_dir = group.join("live-node");
+    let orphan_dir = group.join("orphan-node");
+    std::fs::create_dir_all(&live_dir).unwrap();
+    std::fs::create_dir_all(&orphan_dir).unwrap();
+    // grace=0 so idle-past-grace is always true in the test
+    std::env::set_var("RUDDER_WORKTREE_GC_GRACE_SECS", "0");
+
+    let mut app = App::new();
+    app.cwd = repo.clone();
+    // A live agent owns live_dir; orphan_dir is owned by nobody.
+    let mut live = test_agent_run("run-live", "task");
+    live.status = AgentStatus::Running;
+    live.worktree_path = Some(live_dir.clone());
+    app.agents.push(live);
+
+    app.gc_orphan_workspaces();
+
+    assert!(live_dir.exists(), "a live agent's workspace must never be reaped");
+    assert!(!orphan_dir.exists(), "an orphan workspace dir is removed");
+
+    std::env::remove_var("RUDDER_WORKTREE_GC_GRACE_SECS");
+    let _ = std::fs::remove_dir_all(&repo);
+}

@@ -9424,6 +9424,97 @@ impl App {
         }
     }
 
+    /// Sweep ORPHANED jj workspaces — ones under `.rudder-worktrees` (or in jj's
+    /// registry) that no live agent row owns, e.g. after rows were cleared or a
+    /// plan was collapsed on reload. `gc_merged_workspaces` only reaches merged
+    /// ROWS; without this, orphans pile up on disk (observed: 4.1 GB / 10 dirs).
+    /// Safe by construction: it never touches a path owned by any current agent
+    /// row, never touches `default` or a dir outside `.rudder-worktrees`, waits
+    /// out the grace window, and skips while a resolver/rebase churns the op log.
+    fn gc_orphan_workspaces(&mut self) {
+        if self.rebasing
+            || self
+                .agents
+                .iter()
+                .any(|run| run.merge_resolver && run.status == AgentStatus::Running)
+        {
+            return;
+        }
+        let grace = Duration::from_secs(
+            std::env::var("RUDDER_WORKTREE_GC_GRACE_SECS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(3600),
+        );
+        let now = std::time::SystemTime::now();
+        let repo = self.cwd.clone();
+        // Everything a live agent row owns is off-limits (its own checkout path,
+        // or the main checkout for rows without a workspace).
+        let live_paths: HashSet<PathBuf> = self
+            .agents
+            .iter()
+            .map(|run| run.worktree_path.clone().unwrap_or_else(|| run.cwd.clone()))
+            .collect();
+        let live_names: HashSet<String> =
+            self.agents.iter().filter_map(|run| run.workspace_name.clone()).collect();
+
+        // 1) Forget registry entries jj still lists that no live row owns.
+        if let Ok(output) = Command::new("jj")
+            .args(["workspace", "list"])
+            .current_dir(&repo)
+            .stdin(std::process::Stdio::null())
+            .output()
+        {
+            if output.status.success() {
+                for line in String::from_utf8_lossy(&output.stdout).lines() {
+                    let name = line.split(':').next().unwrap_or("").trim();
+                    if name.is_empty() || name == "default" || live_names.contains(name) {
+                        continue;
+                    }
+                    let _ = Command::new("jj")
+                        .args(["workspace", "forget", name])
+                        .current_dir(&repo)
+                        .stdin(std::process::Stdio::null())
+                        .output();
+                }
+            }
+        }
+
+        // 2) Remove orphan directories under .rudder-worktrees/<group>/<node> that
+        // no live row owns and that have sat idle past the grace window.
+        let root = repo.join(".rudder-worktrees");
+        let mut removed = 0usize;
+        if let Ok(groups) = fs::read_dir(&root) {
+            for group in groups.flatten() {
+                let Ok(entries) = fs::read_dir(group.path()) else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if !path.is_dir() || live_paths.contains(&path) {
+                        continue;
+                    }
+                    let idle = fs::metadata(&path)
+                        .and_then(|meta| meta.modified())
+                        .ok()
+                        .and_then(|mtime| now.duration_since(mtime).ok())
+                        .map(|age| age >= grace)
+                        .unwrap_or(false);
+                    if idle && fs::remove_dir_all(&path).is_ok() {
+                        removed += 1;
+                    }
+                }
+            }
+        }
+        if removed > 0 {
+            self.notice = Some(format!(
+                "reclaimed {removed} orphaned workspace{} from disk",
+                if removed == 1 { "" } else { "s" }
+            ));
+            self.dirty = true;
+        }
+    }
+
     /// If per-node review is on and no reviewer is in flight, start one for a
     /// finished-but-unreviewed plan node. Serialized (one at a time) so a plan
     /// doesn't fan out N expensive review agents at once. The reviewer runs the
@@ -11572,6 +11663,7 @@ What to do\n\
 
         if self.last_worktree_gc.elapsed() >= Duration::from_secs(60) {
             self.gc_merged_workspaces();
+            self.gc_orphan_workspaces();
             self.last_worktree_gc = Instant::now();
         }
 
