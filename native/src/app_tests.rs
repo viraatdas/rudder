@@ -5882,6 +5882,7 @@ fn selected_oneoff_agent_cannot_be_merged() {
 #[test]
 fn review_all_starts_codex_aggregate_agent() {
     let mut app = App::new();
+    app.backend = Backend::Codex; // review_agent_profile keys off the plan backend
     let mut first = test_agent_run("run-1", "first task");
     first.status = AgentStatus::Done;
     first.jj_change_id = Some("rudder/first".to_string());
@@ -5907,7 +5908,7 @@ fn review_all_starts_codex_aggregate_agent() {
         review.review_source_ids,
         vec!["run-1".to_string(), "run-2".to_string()]
     );
-    assert!(review.task.contains("/review"));
+    assert!(review.task.contains("/thermonuclear"));
     assert!(review.task.contains("rudder/first"));
     assert!(review.task.contains("rudder/second"));
     assert_eq!(app.focus, FocusPane::Worker);
@@ -5915,7 +5916,7 @@ fn review_all_starts_codex_aggregate_agent() {
     assert!(app
         .notice
         .as_deref()
-        .is_some_and(|notice| notice.contains("Codex review-all")));
+        .is_some_and(|notice| notice.contains("review-all")));
 }
 
 #[cfg(not(windows))]
@@ -6041,6 +6042,7 @@ fn review_all_can_be_triggered_from_nav_mode() {
 #[test]
 fn review_all_command_starts_codex_review_agent() {
     let mut app = App::new();
+    app.backend = Backend::Codex; // review_agent_profile keys off the plan backend
     let mut run = test_agent_run("run-1", "test task");
     run.status = AgentStatus::Done;
     run.jj_change_id = Some("rudder/test".to_string());
@@ -8415,7 +8417,7 @@ fn write_rudder_context_includes_global_job_snapshot() {
         .next()
         .unwrap();
     assert!(
-        ready_section.contains("run-claude node=n3 mode=execute status=verifying backend=claude")
+        ready_section.contains("run-claude node=n3 mode=execute status=review backend=claude")
     );
     assert!(ready_section.contains("integration=ready"));
     assert!(!ready_section.contains("run-merged"));
@@ -13049,4 +13051,25 @@ fn final_gate_treats_clean_jj_resolve_list_as_passing() {
     // Exit-code commands (git diff --check, npm test) judge on exit status only.
     assert!(verification_passed(false, true, "anything on stdout is fine"));
     assert!(!verification_passed(false, false, ""));
+}
+
+#[test]
+fn forget_jj_workspace_refuses_paths_outside_rudder_worktrees() {
+    use crate::gitio::forget_jj_workspace;
+    // The safety guard must refuse anything not under .rudder-worktrees so a bad
+    // or empty record can never delete the main checkout or an unrelated tree.
+    let repo = unique_test_repo("forget-guard");
+    std::fs::create_dir_all(&repo).unwrap();
+    let danger = repo.join("src"); // NOT under .rudder-worktrees
+    std::fs::create_dir_all(&danger).unwrap();
+    let err = forget_jj_workspace(&repo, "rudder-x", &danger);
+    assert!(err.is_err(), "must refuse a path outside .rudder-worktrees");
+    assert!(danger.exists(), "the refused directory must be left untouched");
+    // A path under .rudder-worktrees is allowed (jj forget is best-effort; the
+    // dir removal is what we assert).
+    let ok_path = repo.join(".rudder-worktrees").join("proj").join("node-abc");
+    std::fs::create_dir_all(&ok_path).unwrap();
+    let _ = forget_jj_workspace(&repo, "rudder-y", &ok_path);
+    assert!(!ok_path.exists(), "an in-tree workspace directory is removed");
+    let _ = std::fs::remove_dir_all(&repo);
 }

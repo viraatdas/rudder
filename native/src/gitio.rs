@@ -1513,6 +1513,38 @@ pub(crate) fn describe_workspace_status(run: &AgentRun, status: &str) {
         .output();
 }
 
+/// Tear down a closed/merged jj workspace: forget it from jj's registry AND
+/// remove its on-disk directory (a full working-copy checkout). The interactive
+/// `dd` delete used to run `git worktree remove` here, which fails on a jj
+/// workspace and leaked both the directory and the registry entry.
+///
+/// SAFETY: only ever removes a directory that sits under `.rudder-worktrees`.
+/// A record with a bad/empty path can never delete the main checkout or an
+/// unrelated tree — the function refuses and returns an error instead.
+pub(crate) fn forget_jj_workspace(repo_root: &Path, workspace_name: &str, path: &Path) -> Result<()> {
+    let under_rudder = path
+        .components()
+        .any(|component| component.as_os_str() == ".rudder-worktrees");
+    if !under_rudder {
+        anyhow::bail!(
+            "refusing to remove a workspace outside .rudder-worktrees: {}",
+            path.display()
+        );
+    }
+    // Forget from jj first (best-effort: a workspace jj already dropped is fine).
+    if !workspace_name.trim().is_empty() {
+        let _ = Command::new("jj")
+            .args(["workspace", "forget", workspace_name])
+            .current_dir(repo_root)
+            .stdin(Stdio::null())
+            .output();
+    }
+    if path.exists() {
+        fs::remove_dir_all(path)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn jj_unresolved_conflicts(cwd: &Path) -> Vec<String> {
     let Ok(output) = Command::new("jj")
         .args(["resolve", "--list"])

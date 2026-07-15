@@ -763,7 +763,7 @@ pub(crate) fn review_all_prompt(
     };
 
     format!(
-        "/review Review the combined Rudder agent worktree changes against `{target_ref}`.\n\
+        "/thermonuclear Review the combined Rudder agent worktree changes against `{target_ref}`.\n\
 \n\
 You are the Rudder review-all integration agent. You are running in an aggregate jj workspace that will become one reviewed integration.\n\
 \n\
@@ -787,7 +787,7 @@ Still not fully merged:\n\
 Instructions\n\
 1. Run `jj status` and `jj resolve --list` first. Resolve conflicts by editing files; do not use `git add` or create commits.\n\
 2. If a revision remains under \"Still not fully merged\", report it; Rudder stopped before stacking another change on a conflict.\n\
-3. Run the Codex `/review` flow on `jj diff --from {target_ref}`. If the slash command is unavailable, perform an equivalent review manually.\n\
+3. Run the `thermonuclear` code-review skill (the installed review plugin) over `jj diff --from {target_ref}` — invoke it as `/thermonuclear` or via the skill, whichever your CLI exposes. If it is unavailable, perform an equivalent thorough review manually.\n\
 4. Fix real review findings directly in this aggregate worktree. Do not edit the original source worktrees.\n\
 5. Run the relevant tests/checks for the files touched. If a check cannot run, say exactly why.\n\
 6. Do not run jj commit/new/squash or Git branch/merge commands. When the aggregate change is ready, stop and say: `Rudder review-all change is ready; press m on this row to integrate it.`\n",

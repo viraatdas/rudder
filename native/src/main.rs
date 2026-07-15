@@ -115,8 +115,10 @@ const SLOW_DRAW_THRESHOLD: Duration = Duration::from_millis(33);
 const SLOW_PTY_DRAIN_THRESHOLD: Duration = Duration::from_millis(10);
 const SLOW_SCROLL_THRESHOLD: Duration = Duration::from_millis(5);
 const SLOW_LINE_RENDER_THRESHOLD: Duration = Duration::from_millis(5);
-const REVIEW_ALL_MODEL: &str = "gpt-5.5";
-const REVIEW_ALL_EFFORT: EffortLevel = EffortLevel::XHigh;
+// The Codex-side code-review profile (Claude plans review on Opus/Medium — see
+// `review_agent_profile`). Review runs the installed `thermonuclear` skill.
+const REVIEW_ALL_MODEL: &str = "gpt-5.6";
+const REVIEW_ALL_EFFORT: EffortLevel = EffortLevel::High;
 const TASK_SUMMARY_MODEL: &str = "claude-haiku-4-5-20251001";
 /// Default cap on how many plan-launched agents may run at once. Overridable via
 /// `orchestrator.maxParallel` in ~/.rudder/config.json. This is what makes nodes
@@ -658,6 +660,8 @@ struct App {
     /// Refreshes whether each locally integrated Git commit is contained by its
     /// origin tracking branch. This is local-only and never performs a fetch.
     last_remote_state_check: Instant,
+    /// Cadence gate for the merged-workspace GC sweep (gc_merged_workspaces).
+    last_worktree_gc: Instant,
     /// Throttle for the web-board steer inbox poll (.rudder/steer/*.json): checked
     /// ~once/sec from poll_agents so a browser "steer" reaches the right agent's PTY.
     last_steer_poll: Instant,
@@ -1251,6 +1255,7 @@ impl App {
             cloud_runtime: cloud.runtime,
             last_cloud_check: Instant::now(),
             last_remote_state_check: Instant::now(),
+            last_worktree_gc: Instant::now(),
             last_steer_poll: Instant::now(),
             last_heartbeat_emit: Instant::now(),
             cloud_workspace: None,
@@ -2478,14 +2483,31 @@ impl App {
             &sources,
             &premerge,
         );
-        let run = review_all_run(worktree, prompt, sources, None);
+        let (review_backend, review_model, review_effort) = self.review_agent_profile();
+        let mut run = review_all_run(worktree, prompt, sources, None);
+        run.backend = review_backend;
+        run.model = review_model.to_string();
+        run.effort = Some(review_effort);
         self.agents.push(run);
         self.selected_agent = self.agents.len().saturating_sub(1);
         self.delete_pending = None;
         self.worker_selection = None;
         self.worker_view = WorkerView::Terminal;
         self.focus = FocusPane::Worker;
-        self.notice = Some("started Codex review-all merge agent".to_string());
+        self.notice = Some("started review-all merge agent".to_string());
+    }
+
+    /// Deterministic model for the code-review agent, chosen by the plan's
+    /// backend: Claude plans review on Opus (medium effort), Codex plans review
+    /// on gpt-5.6 (high effort). The review itself runs the installed
+    /// `thermonuclear` review skill (see `review_all_prompt`). Keeping this
+    /// deterministic makes review cost and behavior predictable instead of
+    /// pinning every review to one heavy model.
+    fn review_agent_profile(&self) -> (Backend, &'static str, EffortLevel) {
+        match self.backend {
+            Backend::Claude => (Backend::Claude, "opus", EffortLevel::Medium),
+            Backend::Codex => (Backend::Codex, REVIEW_ALL_MODEL, REVIEW_ALL_EFFORT),
+        }
     }
 
     #[cfg(not(test))]
@@ -2502,18 +2524,19 @@ impl App {
         let premerge = premerge_review_all_sources(&worktree.path, &sources);
         worktree.jj_change_id = jj_workspace_change_id(&worktree.path);
         let prompt = review_all_prompt(&target_ref, &worktree, &sources, &premerge);
-        let session_id = mint_session_id_for(Backend::Codex);
+        let (review_backend, review_model, review_effort) = self.review_agent_profile();
+        let session_id = mint_session_id_for(review_backend);
         let mut command = agent_command(
-            Backend::Codex,
-            REVIEW_ALL_MODEL,
-            Some(REVIEW_ALL_EFFORT),
+            review_backend,
+            review_model,
+            Some(review_effort),
             &prompt,
             AgentMode::ReviewAll,
             session_id.as_deref(),
         );
         signals::augment_worker_command(
             &mut command,
-            Backend::Codex,
+            review_backend,
             AgentMode::ReviewAll,
             &worktree.id,
         );
@@ -2523,6 +2546,10 @@ impl App {
             ..TerminalPaneOptions::default()
         };
         let mut run = review_all_run(worktree, prompt, sources, session_id);
+        // Keep the row's shown model honest with what actually spawned.
+        run.backend = review_backend;
+        run.model = review_model.to_string();
+        run.effort = Some(review_effort);
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
             Ok(mut terminal) => {
                 let _ = terminal.drain_output();
@@ -2553,8 +2580,9 @@ impl App {
                 .get(self.selected_agent)
                 .map(|run| run.review_source_ids.len())
                 .unwrap_or(0);
+            let (_, review_model, _) = self.review_agent_profile();
             self.notice = Some(format!(
-                "started Codex {REVIEW_ALL_MODEL} review-all for {count} worktree{}; press m on that row when done",
+                "started {review_model} thermonuclear review-all for {count} worktree{}; press m on that row when done",
                 if count == 1 { "" } else { "s" }
             ));
         }
@@ -9254,6 +9282,63 @@ impl App {
     /// resolved; integration stops at the first conflict to avoid stacking changes.
     /// After merging, drain the
     /// scheduler so newly-ready children launch.
+    /// Reclaim disk from MERGED nodes' jj workspaces. Each agent runs in a full
+    /// working-copy checkout under `.rudder-worktrees`; once a node is merged its
+    /// code lives in main, so the checkout is pure redundancy. We keep it for a
+    /// short grace window (default 1h, `RUDDER_WORKTREE_GC_GRACE_SECS`) so a
+    /// just-merged node stays re-goalable, then this sweep forgets the workspace
+    /// and removes the directory. Only MERGED, non-main jj runs whose checkout
+    /// has been idle past the grace are touched; the merged row stays in the
+    /// dashboard with its workspace path nulled. Capped per sweep so a large
+    /// backlog (e.g. the piles already on disk) drains without a UI stall.
+    fn gc_merged_workspaces(&mut self) {
+        const MAX_PER_SWEEP: usize = 3;
+        let grace = Duration::from_secs(
+            std::env::var("RUDDER_WORKTREE_GC_GRACE_SECS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(3600),
+        );
+        let now = std::time::SystemTime::now();
+        let repo = self.cwd.clone();
+        let mut cleaned = 0usize;
+        for run in self.agents.iter_mut() {
+            if cleaned >= MAX_PER_SWEEP {
+                break;
+            }
+            if run.status != AgentStatus::Merged || run.is_main() {
+                continue;
+            }
+            let (Some(name), Some(path)) = (run.workspace_name.clone(), run.worktree_path.clone())
+            else {
+                continue;
+            };
+            // Grace: only sweep once the checkout has been idle past the window.
+            // The dir mtime survives restarts, unlike an in-memory timestamp.
+            let idle_long_enough = std::fs::metadata(&path)
+                .and_then(|meta| meta.modified())
+                .ok()
+                .and_then(|mtime| now.duration_since(mtime).ok())
+                .map(|age| age >= grace)
+                .unwrap_or(false);
+            if !idle_long_enough {
+                continue;
+            }
+            if forget_jj_workspace(&repo, &name, &path).is_ok() {
+                run.worktree_path = None;
+                let _ = save_native_run_record(&repo, run);
+                cleaned += 1;
+            }
+        }
+        if cleaned > 0 {
+            self.notice = Some(format!(
+                "reclaimed {cleaned} merged workspace{} from disk",
+                if cleaned == 1 { "" } else { "s" }
+            ));
+            self.dirty = true;
+        }
+    }
+
     fn integrate_ready_plan_nodes(&mut self) {
         // Hold integration steady while a structural rebase is in flight: merging would
         // shift a RUNNING node into the MERGED zone mid-diff and the build-forward apply
@@ -9764,21 +9849,31 @@ impl App {
             self.persist_ingested_runs();
         }
         let worktree_error = run.worktree_path.as_ref().and_then(|path| {
-            let output = Command::new("git")
-                .args(["worktree", "remove", "--force"])
-                .arg(path)
-                .current_dir(&self.cwd)
-                .output()
-                .ok()?;
-            if output.status.success() {
-                None
+            if run.workspace_name.is_some() {
+                // jj workspace: forget the registry entry AND remove the checkout.
+                // `git worktree remove` (used here before) fails on a jj workspace
+                // and leaked both the directory and jj's workspace list.
+                forget_jj_workspace(&self.cwd, run.workspace_name.as_deref().unwrap_or(""), path)
+                    .err()
+                    .map(|error| format!("failed to remove jj workspace: {error}"))
             } else {
-                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                Some(if stderr.is_empty() {
-                    "failed to remove worktree".to_string()
+                // Legacy git-worktree run.
+                let output = Command::new("git")
+                    .args(["worktree", "remove", "--force"])
+                    .arg(path)
+                    .current_dir(&self.cwd)
+                    .output()
+                    .ok()?;
+                if output.status.success() {
+                    None
                 } else {
-                    format!("failed to remove worktree: {stderr}")
-                })
+                    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                    Some(if stderr.is_empty() {
+                        "failed to remove worktree".to_string()
+                    } else {
+                        format!("failed to remove worktree: {stderr}")
+                    })
+                }
             }
         });
         let last = self.agents.len().saturating_sub(1);
@@ -11242,6 +11337,11 @@ What to do\n\
         if self.last_remote_state_check.elapsed() >= Duration::from_secs(5) {
             self.refresh_remote_integration_state();
             self.last_remote_state_check = Instant::now();
+        }
+
+        if self.last_worktree_gc.elapsed() >= Duration::from_secs(60) {
+            self.gc_merged_workspaces();
+            self.last_worktree_gc = Instant::now();
         }
 
         if self.last_cloud_check.elapsed() >= Duration::from_secs(2) {
