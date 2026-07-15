@@ -1139,6 +1139,10 @@ fn push_orchestrator_row<'a>(
         orchestrator_phase_for_app(app, agent),
         OrchestratorPhase::Planning
     ) && agent.status == AgentStatus::Running;
+    // The plan is decomposed and waiting for the user to approve it before any
+    // node launches. Surface that on the left panel in the attention color so
+    // "it's asking for approval" is obvious without opening the plan.
+    let awaiting = app.awaiting_approval && agent.is_orchestrator() && !planning;
     let badge = if planning { app.spinner_glyph() } else { BADGE };
     let (role, phase) = if planning {
         let backend = match agent.backend {
@@ -1146,16 +1150,29 @@ fn push_orchestrator_row<'a>(
             Backend::Codex => "Codex",
         };
         ("plan mode", format!("{backend} · researching the plan"))
+    } else if awaiting {
+        ("awaiting approval", "press Enter on this row to launch the plan".to_string())
     } else {
         ("orchestrator", orchestrator_phase_label(app, agent))
     };
+    let row_accent = if awaiting { RUNNING_COLOR } else { ACCENT };
+    let role_style = if awaiting {
+        Style::default().fg(RUNNING_COLOR).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(ACCENT)
+    };
+    let phase_style = if awaiting {
+        Style::default().fg(RUNNING_COLOR).add_modifier(Modifier::BOLD)
+    } else {
+        muted_style(focused)
+    };
     lines.push(ListItem::new(Line::from(vec![
         Span::raw("  "),
-        Span::styled(badge, Style::default().fg(ACCENT)),
+        Span::styled(badge, Style::default().fg(row_accent)),
         Span::raw(" "),
-        Span::styled(role, Style::default().fg(ACCENT)),
+        Span::styled(role, role_style),
         Span::raw("  "),
-        Span::styled(phase, muted_style(focused)),
+        Span::styled(phase, phase_style),
     ])));
     record_agent_rows(row_start, lines.len(), index);
 }
