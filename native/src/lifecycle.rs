@@ -132,7 +132,11 @@ impl AgentRun {
         } else {
             match self.status {
                 AgentStatus::Running => "working",
-                AgentStatus::Done => "verifying",
+                // Done == the review bucket (the board calls it "review", the
+                // completion path calls it "a task entering review"). The old
+                // "verifying" label read as active work when the agent had in
+                // fact finished and was awaiting review/merge.
+                AgentStatus::Done => "review",
                 AgentStatus::Failed => "failed",
                 AgentStatus::Stopped => "cancelled",
                 AgentStatus::Orphaned => "orphaned",
