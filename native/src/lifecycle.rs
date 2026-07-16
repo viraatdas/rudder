@@ -254,7 +254,13 @@ impl App {
             }
             let _ = tx.send(FinalGateResult {
                 passed: true,
-                summary: format!("all integrated · checks passed: {}", passed.join(", ")),
+                // Be explicit about scope: these are LOCAL checks only. "passed"
+                // must not read as "shipped" — the plan can be fully merged and
+                // green here while still unpushed and undeployed (see Ship status).
+                summary: format!(
+                    "LOCAL checks passed ({}) — merged locally only, NOT pushed or deployed; see Ship status",
+                    passed.join(", ")
+                ),
             });
         });
     }
