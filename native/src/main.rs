@@ -2538,14 +2538,30 @@ impl App {
 
     /// Deterministic model for the code-review agent, chosen by the plan's
     /// backend: Claude plans review on Opus (medium effort), Codex plans review
-    /// on gpt-5.6 (high effort). The review itself runs the installed
-    /// `thermonuclear` review skill (see `review_all_prompt`). Keeping this
-    /// deterministic makes review cost and behavior predictable instead of
-    /// pinning every review to one heavy model.
-    fn review_agent_profile(&self) -> (Backend, &'static str, EffortLevel) {
+    /// on gpt-5.5 (high effort) by default. Override per backend with
+    /// `RUDDER_REVIEW_MODEL_CLAUDE` / `RUDDER_REVIEW_MODEL_CODEX` — e.g. set the
+    /// Codex one to `gpt-5.6` on workers whose Codex is authed with an API key
+    /// that can reach it (gpt-5.6 400s on ChatGPT-account Codex auth). The review
+    /// itself runs the installed `thermonuclear` skill (see `review_all_prompt`).
+    fn review_agent_profile(&self) -> (Backend, String, EffortLevel) {
+        let env_override = |key: &str| {
+            std::env::var(key)
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        };
         match self.backend {
-            Backend::Claude => (Backend::Claude, "opus", EffortLevel::Medium),
-            Backend::Codex => (Backend::Codex, REVIEW_ALL_MODEL, REVIEW_ALL_EFFORT),
+            Backend::Claude => (
+                Backend::Claude,
+                env_override("RUDDER_REVIEW_MODEL_CLAUDE").unwrap_or_else(|| "opus".to_string()),
+                EffortLevel::Medium,
+            ),
+            Backend::Codex => (
+                Backend::Codex,
+                env_override("RUDDER_REVIEW_MODEL_CODEX")
+                    .unwrap_or_else(|| REVIEW_ALL_MODEL.to_string()),
+                REVIEW_ALL_EFFORT,
+            ),
         }
     }
 
@@ -2567,7 +2583,7 @@ impl App {
         let session_id = mint_session_id_for(review_backend);
         let mut command = agent_command(
             review_backend,
-            review_model,
+            &review_model,
             Some(review_effort),
             &prompt,
             AgentMode::ReviewAll,
@@ -2587,7 +2603,7 @@ impl App {
         let mut run = review_all_run(worktree, prompt, sources, session_id);
         // Keep the row's shown model honest with what actually spawned.
         run.backend = review_backend;
-        run.model = review_model.to_string();
+        run.model = review_model;
         run.effort = Some(review_effort);
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
             Ok(mut terminal) => {
@@ -9570,7 +9586,7 @@ impl App {
         let mut run = create_oneoff_agent(
             &self.cwd,
             backend,
-            model,
+            &model,
             Some(effort),
             &format!("thermonuclear review: {node_label}"),
         );
@@ -9584,7 +9600,7 @@ impl App {
         run.session_id = session_id.clone();
         let mut command = agent_command(
             backend,
-            model,
+            &model,
             Some(effort),
             &prompt,
             AgentMode::ReviewAll,
