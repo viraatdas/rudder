@@ -12067,6 +12067,22 @@ What to do\n\
             let _ = self.write_rudder_context_timed(None);
         }
 
+        // Live diff pane: the loop above drains each agent's MAIN terminal but not
+        // its review_terminal, so the `jj diff` watch loop's every-2s output never
+        // reached the grid and `v` looked frozen. Drain the selected agent's review
+        // pane here whenever the Diff view is open so it refreshes as the agent edits.
+        if self.worker_view == WorkerView::Diff {
+            if let Some(review) = self
+                .agents
+                .get_mut(self.selected_agent)
+                .and_then(|run| run.review_terminal.as_mut())
+            {
+                if !review.drain_output().is_empty() {
+                    any_dirty = true;
+                }
+            }
+        }
+
         if any_dirty {
             self.dirty = true;
         }
