@@ -514,11 +514,10 @@ struct App {
     plan_merged_node_ids: HashSet<String>,
     /// Per-node auto-review gate. When enabled, a finished plan node is reviewed
     /// (thermonuclear skill, auto-fix in its own workspace) before it auto-merges.
-    /// `node_review_enabled` defaults on (RUDDER_NODE_REVIEW=0 or `/autoreview off`
-    /// disables). `reviewed_nodes` are node ids that passed review (eligible to
-    /// merge); `node_reviewers` maps a live reviewer run id -> the node id it
-    /// reviews. Both are in-memory: a restart drops in-flight reviewers and
-    /// re-reviews any still-unmerged node, which is harmless.
+    /// OFF by default — this automatic review is deliberately disabled pending a
+    /// better design; opt in with `RUDDER_NODE_REVIEW=1`. `reviewed_nodes` are
+    /// node ids that passed review (eligible to merge); `node_reviewers` maps a
+    /// live reviewer run id -> the node id it reviews.
     node_review_enabled: bool,
     reviewed_nodes: HashSet<String>,
     node_reviewers: HashMap<String, String>,
@@ -1202,9 +1201,14 @@ impl App {
             planned_nodes: restored_queue.planned_nodes,
             plan_launched_node_ids: restored_queue.launched_node_ids,
             plan_merged_node_ids: restored_queue.merged_node_ids,
+            // OFF by default: the automatic per-node review is disabled pending a
+            // better design. Opt in explicitly with RUDDER_NODE_REVIEW=1.
             node_review_enabled: std::env::var("RUDDER_NODE_REVIEW")
-                .map(|value| value.trim() != "0")
-                .unwrap_or(true),
+                .map(|value| {
+                    let value = value.trim();
+                    value == "1" || value.eq_ignore_ascii_case("true")
+                })
+                .unwrap_or(false),
             reviewed_nodes: HashSet::new(),
             node_reviewers: HashMap::new(),
             plan_capture_armed: restored_queue.capture_armed,
