@@ -344,10 +344,11 @@ churn, so it was left whole.
 ### The run loop and the single-thread mutation model
 `run()` (in `main.rs`) is the whole engine: one thread, one owned `App`. Each
 iteration it (1) calls `poll_agents()` (the heartbeat), (2) redraws if `dirty`, then
-(3) blocks on `event::poll(timeout)` for input. The timeout adapts: `TICK_RATE` =
-33 ms normally, `STREAM_TICK_RATE` = 11 ms while a planner is streaming (so the live
-transcript lands ~3x sooner). Up to `MAX_EVENTS_PER_FRAME` = 64 queued events drain
-per frame.
+(3) blocks for a terminal-input or PTY-output channel signal, with `TICK_RATE` = 33 ms
+as a timer backstop. PTY reader threads wake the loop immediately when child output
+arrives, so planner streaming does not require a faster polling cadence. Animation-only
+spinner redraws are capped at 100 ms. Up to `MAX_EVENTS_PER_FRAME` = 64 queued events
+drain per frame.
 
 **Single-writer invariant.** `App` is mutated ONLY from this loop, via `&mut self`
 methods, so mutation is serialized: no locks, no races. There is no separate

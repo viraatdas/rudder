@@ -442,7 +442,14 @@ pub(crate) fn rudder_plan_output_for_run(run: &AgentRun) -> String {
     // The orchestrator streams JSON events now, so its raw PTY output_log is NDJSON,
     // not plan text. `plan_stream` reconstructs the assistant text (and, for a refine,
     // exposes only the CURRENT turn so a stale prior block is not re-captured). Prefer
-    // it whenever present; the raw/codex-session path is a pre-ingest fallback only.
+    // it whenever present; the raw PTY path is a pre-ingest fallback only.
+    //
+    // IMPORTANT: this helper is used by render and heartbeat code. It must stay purely
+    // in-memory. Codex's durable-session recovery walks ~/.codex/sessions and parses
+    // JSONL; putting that fallback here made every spinner redraw repeat the full tree
+    // scan until the first assistant text arrived (and after restored sessions), driving
+    // the dashboard to a full CPU core. Recovery belongs only in one-shot completion
+    // handling (`evaluate_completed_plan`).
     if let Some(stream) = run.plan_stream.as_ref() {
         // OFFICIAL capture: a real plan-mode `ExitPlanMode` plan is the authoritative
         // text — it carries the RUDDER_PLAN_TASKS block even when the plan was written
@@ -455,18 +462,60 @@ pub(crate) fn rudder_plan_output_for_run(run: &AgentRun) -> String {
             return stream.parse_text().to_string();
         }
     }
-    let mut output = run
+    let output = run
         .terminal
         .as_ref()
         .map(|terminal| terminal.output_log_snapshot().to_string())
         .unwrap_or_default();
-    if let Some(session_output) = latest_codex_rudder_plan_output(run) {
-        if !output.is_empty() {
-            output.push('\n');
-        }
-        output.push_str(&session_output);
-    }
     output
+}
+
+/// Parsed projection of a planner's current in-memory output. The live stream can be
+/// inspected many times between PTY bytes (polling, agents-pane labels, worker render),
+/// so parsing its JSON DAG at each inspection is unnecessary work. `Some(cache)` on an
+/// `AgentRun` also records a negative parse: while the planner is still thinking, callers
+/// reuse `tasks: None` instead of reparsing the same incomplete text every heartbeat.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RudderPlanOutputCache {
+    pub(crate) tasks: Option<Vec<RudderPlanTask>>,
+    pub(crate) summary: Option<String>,
+}
+
+pub(crate) fn parse_rudder_plan_output_cache(output: &str) -> RudderPlanOutputCache {
+    let tasks = extract_rudder_plan_tasks(output)
+        .ok()
+        .filter(|tasks| !tasks.is_empty());
+    let summary = extract_rudder_plan_summary(output);
+    RudderPlanOutputCache { tasks, summary }
+}
+
+/// Return parsed tasks from the per-run cache. The uncached fallback exists for restored
+/// legacy rows and tests whose raw PTY was populated before `poll_agents` had a chance to
+/// build a PlanStreamState; it is still in-memory and never scans Codex session files.
+pub(crate) fn rudder_plan_tasks_for_run(run: &AgentRun) -> Option<Vec<RudderPlanTask>> {
+    if let Some(cache) = run.plan_output_cache.as_ref() {
+        return cache.tasks.clone();
+    }
+    parse_rudder_plan_output_cache(&rudder_plan_output_for_run(run)).tasks
+}
+
+pub(crate) fn rudder_plan_summary_for_run(run: &AgentRun) -> Option<String> {
+    if let Some(cache) = run.plan_output_cache.as_ref() {
+        return cache.summary.clone();
+    }
+    parse_rudder_plan_output_cache(&rudder_plan_output_for_run(run)).summary
+}
+
+/// Slow, one-shot completion recovery for Codex planners whose PTY ring lost the final
+/// block. This is deliberately separate from `rudder_plan_output_for_run`: it walks the
+/// durable Codex session tree and therefore must never be called from render or heartbeat
+/// detection. Completion evaluators call it at most once for a finished planner.
+pub(crate) fn recover_completed_codex_rudder_plan_output(run: &AgentRun) -> String {
+    let output = rudder_plan_output_for_run(run);
+    if extract_rudder_plan_tasks(&output).is_ok_and(|tasks| !tasks.is_empty()) {
+        return output;
+    }
+    latest_codex_rudder_plan_output(run).unwrap_or(output)
 }
 
 /// Upper bound on tasks accepted from ONE plan block. This is NOT a feature limit

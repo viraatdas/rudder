@@ -91,10 +91,9 @@ struct PendingEnter {
     run_id: String,
     due: Instant,
 }
-/// Faster event-loop tick used only while a planner is actively streaming, so the
-/// orchestrator's live transcript appears in finer increments (snappier streaming)
-/// instead of being batched into 33ms bursts.
-const STREAM_TICK_RATE: Duration = Duration::from_millis(11);
+/// Animation-only redraw cadence. Real PTY output wakes the loop immediately; this
+/// interval only advances the idle spinner.
+const SPINNER_FRAME_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_EVENTS_PER_FRAME: usize = 64;
 /// Trackpad wheel bursts can deliver many tiny scroll events. The handler itself
 /// is cheap; the expensive part is flushing a full terminal draw. Briefly defer
@@ -138,16 +137,11 @@ const MAX_LAUNCH_PER_TICK: usize = 2;
 /// growing the DAG, so a chain of agents proposing follow-ups can't run away.
 const MAX_FOLLOWUP_DEPTH: u8 = 3;
 /// Braille spinner frames for the orchestrator "planning" phase (and, as a nice
-/// touch, running agents' status badge). Advances one frame per poll tick so it
-/// animates while the planner decomposes the task.
+/// touch, running agents' status badge).
 pub(crate) const SPINNER_FRAMES: [&str; 10] = [
     "\u{280B}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283C}", "\u{2834}", "\u{2826}", "\u{2827}",
     "\u{2807}", "\u{280F}",
 ];
-/// Poll ticks per visible spinner frame. The frame counter advances every tick (~33ms),
-/// which spins too fast to read; showing each glyph for this many ticks slows it to a
-/// calmer ~100ms/frame.
-pub(crate) const SPINNER_TICKS_PER_FRAME: usize = 3;
 const AGENT_PANE_HINTS: &[&str] = &[
     "j/k move",
     "Enter focus",
@@ -606,9 +600,9 @@ struct App {
     /// Tick counter used to run the scheduler on a coarse cadence rather than on
     /// every PTY-byte tick.
     scheduler_tick: u64,
-    /// Animation frame for the orchestrator spinner. Advances every poll tick so
-    /// the "decomposing the task..." spinner feels alive while the planner runs.
+    /// Animation frame for the orchestrator spinner. Advances at most every 100ms.
     spinner_frame: usize,
+    last_spinner_advance: Instant,
     selected_agent: usize,
     /// Top line offset of the agents-pane list, persisted across frames so the pane
     /// scrolls to follow the selection when there are more rows than fit on screen.
@@ -899,6 +893,10 @@ struct AgentRun {
     /// text the RUDDER_PLAN_TASKS parser reads, and captures the session id for
     /// refine-via-resume. `None` for non-planner agents and until first ingest.
     plan_stream: Option<PlanStreamState>,
+    /// Parsed DAG/summary derived from the latest semantic planner-stream update.
+    /// `Some` with no tasks is a cached negative result, preventing the heartbeat and
+    /// render paths from reparsing identical incomplete output dozens of times a second.
+    plan_output_cache: Option<RudderPlanOutputCache>,
     /// When the user last sent input (a keystroke/prompt) to this agent's PTY. Used
     /// to decide whether post-completion output is a genuine NEW turn (user typed)
     /// vs incidental repaint (e.g. a resize when the pane is focused). Without this,
@@ -1250,6 +1248,7 @@ impl App {
             planner_question_round_done: false,
             scheduler_tick: 0,
             spinner_frame: 0,
+            last_spinner_advance: Instant::now(),
             selected_agent: 0,
             agents_scroll: 0,
             backend: selection.backend,
@@ -1447,7 +1446,19 @@ impl App {
 
     /// Current spinner glyph for the active animation frame.
     pub(crate) fn spinner_glyph(&self) -> &'static str {
-        SPINNER_FRAMES[(self.spinner_frame / SPINNER_TICKS_PER_FRAME) % SPINNER_FRAMES.len()]
+        SPINNER_FRAMES[self.spinner_frame % SPINNER_FRAMES.len()]
+    }
+
+    fn advance_spinner_if_due(&mut self, now: Instant) -> bool {
+        if !self.has_planning_orchestrator()
+            || now.duration_since(self.last_spinner_advance) < SPINNER_FRAME_INTERVAL
+        {
+            return false;
+        }
+        self.spinner_frame = self.spinner_frame.wrapping_add(1);
+        self.last_spinner_advance = now;
+        self.dirty = true;
+        true
     }
 
     /// True while an orchestrator (a RudderPlan agent) is actively decomposing:
@@ -4373,6 +4384,7 @@ impl App {
             // Discriminator: route completion to the APPEND path, not REPLACE.
             reconcile_planner: true,
             plan_stream: None,
+            plan_output_cache: None,
             last_worker_input_at: None,
             merge_resolver: false,
             merge_conflict: false,
@@ -4545,6 +4557,7 @@ impl App {
             node_id,
             reconcile_planner: false,
             plan_stream: None,
+            plan_output_cache: None,
             last_worker_input_at: None,
             merge_resolver: false,
             merge_conflict: false,
@@ -4698,6 +4711,7 @@ impl App {
             node_id: None,
             reconcile_planner: false,
             plan_stream: None,
+            plan_output_cache: None,
             last_worker_input_at: None,
             merge_resolver: false,
             merge_conflict: false,
@@ -4834,6 +4848,9 @@ impl App {
                 // Fresh re-plan (no session): start a clean transcript.
                 run.plan_stream = Some(PlanStreamState::new());
             }
+            // The prior turn's parsed DAG must not remain visible/detectable while the
+            // revised turn is still streaming. `Some(default)` is a cached negative.
+            run.plan_output_cache = Some(RudderPlanOutputCache::default());
         }
         if self.relaunch_orchestrator_with(index, command, feedback) {
             if answering_clarification {
@@ -4928,6 +4945,7 @@ impl App {
             } else {
                 run.plan_stream = Some(PlanStreamState::new());
             }
+            run.plan_output_cache = Some(RudderPlanOutputCache::default());
         }
         if self.relaunch_orchestrator_with(index, command, input) {
             self.push_activity(format!("rebasing the plan: {}", short_task(input)));
@@ -6551,6 +6569,7 @@ impl App {
             node_id: None,
             reconcile_planner: false,
             plan_stream: None,
+            plan_output_cache: None,
             last_worker_input_at: None,
             merge_resolver: false,
             merge_conflict: false,
@@ -6714,7 +6733,7 @@ impl App {
             run.mode == AgentMode::RudderPlan
                 && run.reconcile_planner
                 && run.autosteered
-                && extract_rudder_plan_tasks(&rudder_plan_output_for_run(run)).is_ok()
+                && rudder_plan_tasks_for_run(run).is_some()
         });
         if let Some(index) = reconcile_index {
             self.evaluate_completed_reconcile(index);
@@ -6730,7 +6749,7 @@ impl App {
                 run.mode == AgentMode::RudderPlan
                     && !run.reconcile_planner
                     && run.autosteered
-                    && extract_rudder_plan_tasks(&rudder_plan_output_for_run(run)).is_ok()
+                    && rudder_plan_tasks_for_run(run).is_some()
             });
             if let Some(index) = index {
                 self.evaluate_completed_rebase(index);
@@ -6759,7 +6778,7 @@ impl App {
             run.mode == AgentMode::RudderPlan
                 && !run.reconcile_planner
                 && run.autosteered
-                && extract_rudder_plan_tasks(&rudder_plan_output_for_run(run)).is_ok()
+                && rudder_plan_tasks_for_run(run).is_some()
         });
         if let Some(index) = index {
             self.evaluate_completed_plan(index);
@@ -7345,6 +7364,10 @@ impl App {
         // Clear the planner's autosteer flag so it is captured once, but KEEP the
         // run: it stays pinned at the top of the list as the orchestrator that owns
         // the plan. Its worker pane renders the DAG tree of the parsed tasks.
+        run.plan_output_cache = Some(RudderPlanOutputCache {
+            tasks: Some(tasks.clone()),
+            summary: summary.clone(),
+        });
         run.autosteered = false;
         let _ = save_native_run_record(&self.cwd, run);
         let _ = run;
@@ -7456,7 +7479,7 @@ impl App {
             let _ = save_native_run_record(&self.cwd, run);
             (
                 run.task.clone(),
-                rudder_plan_output_for_run(run),
+                recover_completed_codex_rudder_plan_output(run),
                 run.id.clone(),
             )
         };
@@ -7573,7 +7596,7 @@ impl App {
                 }
             }
         }
-        let output = rudder_plan_output_for_run(&self.agents[index]);
+        let output = recover_completed_codex_rudder_plan_output(&self.agents[index]);
 
         // Parse against the frontier so cross-block deps onto in-flight ids survive.
         let frontier: Vec<String> = self.plan_frontier().into_iter().map(|(id, _)| id).collect();
@@ -7602,6 +7625,12 @@ impl App {
             }
         };
         let summary = extract_rudder_plan_summary(&output);
+        if let Some(run) = self.agents.get_mut(index) {
+            run.plan_output_cache = Some(RudderPlanOutputCache {
+                tasks: Some(new_tasks.clone()),
+                summary: summary.clone(),
+            });
+        }
 
         // Snapshot the three zones from the live fleet.
         let merged_ids: Vec<String> = self
@@ -10380,6 +10409,7 @@ impl App {
             node_id: None,
             reconcile_planner: false,
             plan_stream: None,
+            plan_output_cache: None,
             last_worker_input_at: None,
             merge_resolver: false,
             merge_conflict: false,
@@ -11771,6 +11801,8 @@ What to do\n\
             let drained = terminal.drain_output();
             let drained_bytes = drained.len();
             let had_output = drained_bytes > 0;
+            let headless_planner = run.mode == AgentMode::RudderPlan
+                && (run.reconcile_planner || !run.interactive_orchestrator);
             let drain_duration = drain_started.elapsed();
             drain_perf.push((
                 drain_duration,
@@ -11782,7 +11814,11 @@ What to do\n\
                     "bytes": drained_bytes,
                 }),
             ));
-            if had_output {
+            // A headless planner's PTY contains JSON events plus rapidly repainting
+            // terminal chrome. The raw PTY is never rendered; only semantic changes in
+            // PlanStreamState affect the custom orchestrator pane. Do not turn every
+            // status-bar repaint into a full dashboard draw.
+            if had_output && !headless_planner {
                 any_dirty = true;
             }
             // Feed the orchestrator's JSON event stream into its live transcript +
@@ -11791,10 +11827,20 @@ What to do\n\
             if run.mode == AgentMode::RudderPlan {
                 let snapshot = terminal.output_log_snapshot().to_string();
                 let stream = run.plan_stream.get_or_insert_with(PlanStreamState::new);
-                if stream.ingest(&snapshot) {
+                let prior_plan_revision = stream.plan_revision();
+                let stream_changed = stream.ingest(&snapshot);
+                let plan_output_changed = stream.plan_revision() != prior_plan_revision;
+                let captured = stream.session_id().map(str::to_string);
+                if run.plan_output_cache.is_none() || plan_output_changed {
+                    let plan_text = stream
+                        .exit_plan()
+                        .or_else(|| stream.has_text().then(|| stream.parse_text()))
+                        .unwrap_or("");
+                    run.plan_output_cache = Some(parse_rudder_plan_output_cache(plan_text));
+                }
+                if stream_changed {
                     changed = true;
                 }
-                let captured = stream.session_id().map(str::to_string);
                 if run.session_id.is_none() {
                     if let Some(sid) = captured {
                         run.session_id = Some(sid);
@@ -12042,13 +12088,10 @@ What to do\n\
             self.maybe_handle_drift();
         }
 
-        // Advance the spinner each tick and force a redraw while an orchestrator is
-        // still planning, so "decomposing the task..." animates even when the
-        // planner is not emitting bytes this tick.
-        self.spinner_frame = self.spinner_frame.wrapping_add(1);
-        if self.has_planning_orchestrator() {
-            self.dirty = true;
-        }
+        // PTY output wakes/redraws immediately. When no output changes, animate at a
+        // calm 10fps rather than forcing a full terminal repaint on every planner
+        // heartbeat (which made Ghostty and WindowServer amplify Rudder's own CPU use).
+        self.advance_spinner_if_due(Instant::now());
 
         // MIRROR plan-launched agents' status transitions (running->review->merged
         // / failed) into graph.json so the board tracks them. Only when something
@@ -12578,18 +12621,12 @@ fn run(terminal: &mut Tui) -> Result<()> {
             );
         }
 
-        // While a planner is actively streaming, poll faster so its live transcript
-        // lands ~3x sooner (text appears in finer increments instead of 33ms bursts).
-        // Idle/normal use stays at the calmer 33ms tick to keep CPU low.
-        let poll_timeout = if app.has_planning_orchestrator() {
-            STREAM_TICK_RATE
-        } else {
-            TICK_RATE
-        };
-        let poll_timeout = app.scroll_draw_poll_timeout(poll_timeout);
+        // PTY readers wake this loop as soon as child output arrives, so the timeout is
+        // only a backstop for timer-driven state and does not need a planner fast path.
+        let poll_timeout = app.scroll_draw_poll_timeout(TICK_RATE);
         let active_us_before_block = frame_started.elapsed().as_micros() as u64;
         // Block until a terminal event, a PTY-output nudge, or the tick backstop.
-        // TICK_RATE/STREAM_TICK_RATE still bound worst-case latency for state that
+        // TICK_RATE still bounds worst-case latency for state that
         // does not signal (cloud polling, timers); PtyOutput just wakes us sooner.
         match signal_rx.recv_timeout(poll_timeout) {
             Ok(LoopSignal::Term(ev)) => {

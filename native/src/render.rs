@@ -1057,10 +1057,9 @@ pub(crate) enum OrchestratorPhase {
 /// RUDDER_PLAN_TASKS block means the plan is ready (even while the planner process
 /// is still winding down); otherwise it is still decomposing the task.
 pub(crate) fn orchestrator_phase(agent: &AgentRun) -> OrchestratorPhase {
-    match extract_rudder_plan_tasks(&rudder_plan_output_for_run(agent)) {
-        Ok(tasks) if !tasks.is_empty() => OrchestratorPhase::PlanReady(tasks),
-        _ => OrchestratorPhase::Planning,
-    }
+    rudder_plan_tasks_for_run(agent)
+        .map(OrchestratorPhase::PlanReady)
+        .unwrap_or(OrchestratorPhase::Planning)
 }
 
 fn orchestrator_phase_for_app(app: &App, agent: &AgentRun) -> OrchestratorPhase {
@@ -2257,12 +2256,11 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
             // summary.
             let mut prose: Vec<Line<'static>> = Vec::new();
             prose.push(Line::from(Span::styled("Plan", header_style(focused))));
-            // Re-extract the summary from the LIVE planner text every frame, not the
-            // frozen app.plan_summary captured at exit-detection: the planner's final
-            // bytes (the rest of the summary) often arrive a tick or two AFTER it is
-            // marked done, so a one-shot capture truncated it mid-sentence. Reading
-            // live lets the prose self-heal as the post-exit drain ingests the tail.
-            let summary = extract_rudder_plan_summary(&rudder_plan_output_for_run(agent))
+            // Read the cached LIVE summary rather than only the frozen app.plan_summary
+            // captured at exit-detection: final bytes can arrive a tick or two after the
+            // process is marked done. The cache refreshes on semantic stream changes, so
+            // the prose self-heals without reparsing the whole plan on every redraw.
+            let summary = rudder_plan_summary_for_run(agent)
                 .or_else(|| app.plan_summary.clone())
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty());

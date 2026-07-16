@@ -68,6 +68,14 @@ pub(crate) struct PlanStreamState {
     /// backstop, the `result` event's `permission_denials` (ExitPlanMode is auto-
     /// denied in headless `-p`). Cleared at the start of each turn.
     exit_plan: Option<String>,
+    /// Monotonic semantic revision. PTYs also emit carriage-return status chrome;
+    /// `ingest` compares this counter so those bytes do not masquerade as transcript
+    /// changes and trigger full-dashboard redraws.
+    revision: u64,
+    /// Subset revision for the text consumed by the DAG/summary parser. Reasoning,
+    /// tool, and session events change the rendered transcript but not plan text, so
+    /// they should not invalidate the parsed-plan cache.
+    plan_revision: u64,
 }
 
 const MAX_TRANSCRIPT: usize = 400;
@@ -90,6 +98,8 @@ impl PlanStreamState {
             consumed: 0,
             last_snapshot: String::new(),
             exit_plan: None,
+            revision: 0,
+            plan_revision: 0,
         }
     }
 
@@ -101,6 +111,10 @@ impl PlanStreamState {
 
     pub(crate) fn session_id(&self) -> Option<&str> {
         self.session_id.as_deref()
+    }
+
+    pub(crate) fn plan_revision(&self) -> u64 {
+        self.plan_revision
     }
 
     pub(crate) fn transcript(&self) -> &[PlanEntry] {
@@ -136,6 +150,7 @@ impl PlanStreamState {
         // A refine produces a NEW plan: drop the prior turn's ExitPlanMode capture so a
         // stale plan is never re-used before the revised one arrives.
         self.exit_plan = None;
+        self.mark_plan_changed();
     }
 
     /// Re-point ingest at a NEW underlying terminal (a refine relaunches a fresh PTY)
@@ -151,6 +166,7 @@ impl PlanStreamState {
     /// processed line are parsed. Returns true if anything changed. Resilient to the
     /// 200KB ring draining from the front (rebuilds from the current snapshot).
     pub(crate) fn ingest(&mut self, snapshot: &str) -> bool {
+        let starting_revision = self.revision;
         let appended_to_previous =
             self.last_snapshot.is_empty() || snapshot.starts_with(&self.last_snapshot);
         if !appended_to_previous
@@ -161,8 +177,15 @@ impl PlanStreamState {
             // `consumed` is a byte offset into the previous snapshot, not a durable
             // cursor. If the new snapshot is not an append of the previous one, the old
             // offset could skip fresh JSON or land inside a multi-byte UTF-8 scalar.
+            let cleared_plan_output = !self.assistant_text.is_empty();
+            let cleared_visible_state = cleared_plan_output || !self.transcript.is_empty();
             self.assistant_text.clear();
             self.transcript.clear();
+            if cleared_plan_output {
+                self.mark_plan_changed();
+            } else if cleared_visible_state {
+                self.mark_changed();
+            }
             self.saw_streaming_text = false;
             self.parse_baseline = 0;
             self.consumed = 0;
@@ -176,19 +199,17 @@ impl PlanStreamState {
         let tail = &snapshot[self.consumed..];
         if tail.is_empty() {
             self.remember_snapshot(snapshot);
-            return false;
+            return self.revision != starting_revision;
         }
         let mut offset = 0usize;
-        let mut changed = false;
         while let Some(nl) = tail[offset..].find('\n') {
             let line = &tail[offset..offset + nl];
             self.ingest_line(line);
             offset += nl + 1;
-            changed = true;
         }
         self.consumed += offset;
         self.remember_snapshot(snapshot);
-        changed
+        self.revision != starting_revision
     }
 
     fn remember_snapshot(&mut self, snapshot: &str) {
@@ -363,8 +384,9 @@ impl PlanStreamState {
                     .and_then(|input| input.get("plan"))
                     .and_then(Value::as_str)
                 {
-                    if !plan.trim().is_empty() {
+                    if !plan.trim().is_empty() && self.exit_plan.as_deref() != Some(plan) {
                         self.exit_plan = Some(plan.to_string());
+                        self.mark_plan_changed();
                     }
                 }
             }
@@ -389,6 +411,7 @@ impl PlanStreamState {
                 {
                     if !plan.trim().is_empty() {
                         self.exit_plan = Some(plan.to_string());
+                        self.mark_plan_changed();
                         return;
                     }
                 }
@@ -467,6 +490,7 @@ impl PlanStreamState {
     fn capture_session(&mut self, id: &str) {
         if self.session_id.is_none() && !id.trim().is_empty() {
             self.session_id = Some(id.to_string());
+            self.mark_changed();
         }
     }
 
@@ -479,10 +503,12 @@ impl PlanStreamState {
         if let Some(last) = self.transcript.last_mut() {
             if last.kind == PlanEntryKind::Text {
                 last.text.push_str(text);
+                self.mark_plan_changed();
                 return;
             }
         }
         self.push(PlanEntryKind::Text, text);
+        self.mark_plan_output_changed();
     }
 
     fn push_thinking(&mut self, text: &str) {
@@ -493,6 +519,7 @@ impl PlanStreamState {
             if last.kind == PlanEntryKind::Thinking {
                 if last.text.len() < MAX_THINKING_CHARS {
                     last.text.push_str(text);
+                    self.mark_changed();
                 }
                 return;
             }
@@ -528,6 +555,20 @@ impl PlanStreamState {
             let overflow = self.transcript.len() - MAX_TRANSCRIPT;
             self.transcript.drain(0..overflow);
         }
+        self.mark_changed();
+    }
+
+    fn mark_changed(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    fn mark_plan_output_changed(&mut self) {
+        self.plan_revision = self.plan_revision.wrapping_add(1);
+    }
+
+    fn mark_plan_changed(&mut self) {
+        self.mark_plan_output_changed();
+        self.mark_changed();
     }
 }
 

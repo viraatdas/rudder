@@ -689,6 +689,7 @@ pub(crate) fn review_all_run(
         node_id: None,
         reconcile_planner: false,
         plan_stream: None,
+        plan_output_cache: None,
         last_worker_input_at: None,
         merge_resolver: false,
         merge_conflict: false,

@@ -4992,6 +4992,7 @@ fn test_agent_run(id: &str, task: &str) -> AgentRun {
         node_id: None,
         reconcile_planner: false,
         plan_stream: None,
+        plan_output_cache: None,
         last_worker_input_at: None,
         merge_resolver: false,
         merge_conflict: false,
@@ -6306,6 +6307,7 @@ fn delete_agent_requires_second_d() {
         node_id: None,
         reconcile_planner: false,
         plan_stream: None,
+        plan_output_cache: None,
         last_worker_input_at: None,
         merge_resolver: false,
         merge_conflict: false,
@@ -10554,6 +10556,38 @@ fn plan_stream_skips_non_json_noise() {
 }
 
 #[test]
+fn plan_stream_terminal_chrome_does_not_report_a_semantic_change() {
+    let mut stream = PlanStreamState::new();
+    assert!(
+        !stream.ingest("\r12s · 432 tokens\r13s · 450 tokens\n"),
+        "terminal status repaint must not trigger a dashboard redraw"
+    );
+    assert!(
+        stream.ingest(
+            "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"real planner text\"}}\n"
+        ),
+        "a real planner event still redraws immediately"
+    );
+}
+
+#[test]
+fn plan_stream_reasoning_redraw_does_not_invalidate_parsed_plan_text() {
+    let mut stream = PlanStreamState::new();
+    stream.ingest(
+        "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"plan text\"}}\n",
+    );
+    let plan_revision = stream.plan_revision();
+    assert!(stream.ingest(
+        "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"plan text\"}}\n{\"type\":\"item.completed\",\"item\":{\"type\":\"reasoning\",\"text\":\"checking files\"}}\n",
+    ));
+    assert_eq!(
+        stream.plan_revision(),
+        plan_revision,
+        "reasoning redraws the transcript without reparsing unchanged DAG text"
+    );
+}
+
+#[test]
 fn plan_stream_drops_terminal_chrome_redraws() {
     // Codex/claude print a status bar that repaints in place with \r ("12s · 432
     // tokens · thinking..."), interleaved with JSON events on the same \n-chunk.
@@ -10588,23 +10622,32 @@ fn plan_stream_drops_terminal_chrome_redraws() {
 fn spinner_glyph_advances_with_frame() {
     let mut app = App::new();
     let first = app.spinner_glyph();
-    // The spinner is slowed: it holds each glyph for SPINNER_TICKS_PER_FRAME ticks, so
-    // a single tick must NOT change it, but a full frame's worth of ticks does.
     app.spinner_frame = app.spinner_frame.wrapping_add(1);
-    assert_eq!(
-        first,
-        app.spinner_glyph(),
-        "one tick holds the same glyph (slowed)"
-    );
-    app.spinner_frame = SPINNER_TICKS_PER_FRAME;
     assert_ne!(
         first,
         app.spinner_glyph(),
-        "a full frame of ticks advances the glyph"
+        "one scheduled animation frame advances the glyph"
     );
     // Wrapping back to frame 0 yields the first glyph.
-    app.spinner_frame = SPINNER_FRAMES.len() * SPINNER_TICKS_PER_FRAME;
+    app.spinner_frame = SPINNER_FRAMES.len();
     assert_eq!(app.spinner_glyph(), SPINNER_FRAMES[0]);
+}
+
+#[test]
+fn planner_spinner_only_marks_dirty_when_animation_frame_is_due() {
+    let mut app = App::new();
+    let mut planner = test_agent_run("planner", "plan it");
+    planner.mode = AgentMode::RudderPlan;
+    planner.status = AgentStatus::Running;
+    app.agents = vec![planner];
+    app.dirty = false;
+
+    let start = app.last_spinner_advance;
+    assert!(!app.advance_spinner_if_due(start + SPINNER_FRAME_INTERVAL / 2));
+    assert!(!app.dirty, "an unchanged spinner must not redraw the TUI");
+
+    assert!(app.advance_spinner_if_due(start + SPINNER_FRAME_INTERVAL));
+    assert!(app.dirty, "the next visible spinner frame triggers one redraw");
 }
 
 #[test]

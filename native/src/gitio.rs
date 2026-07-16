@@ -265,6 +265,7 @@ pub(crate) fn create_main_agent(
         node_id: None,
         reconcile_planner: false,
         plan_stream: None,
+        plan_output_cache: None,
         last_worker_input_at: None,
         merge_resolver: false,
         merge_conflict: false,
@@ -630,6 +631,7 @@ pub(crate) fn agent_from_run_record(
         // false, the real planner); load_persisted_agents filters true ones out.
         reconcile_planner,
         plan_stream: None,
+        plan_output_cache: None,
         last_worker_input_at: None,
         merge_resolver,
         merge_conflict,
