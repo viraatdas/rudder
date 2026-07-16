@@ -117,7 +117,10 @@ const SLOW_SCROLL_THRESHOLD: Duration = Duration::from_millis(5);
 const SLOW_LINE_RENDER_THRESHOLD: Duration = Duration::from_millis(5);
 // The Codex-side code-review profile (Claude plans review on Opus/Medium — see
 // `review_agent_profile`). Review runs the installed `thermonuclear` skill.
-const REVIEW_ALL_MODEL: &str = "gpt-5.6";
+// gpt-5.5 is Codex's current default/latest; an aspirational "gpt-5.6" is NOT a
+// real model — Codex rejects it ("not supported with a ChatGPT account"). Bump
+// this when a newer Codex model actually ships and appears in models.rs.
+const REVIEW_ALL_MODEL: &str = "gpt-5.5";
 const REVIEW_ALL_EFFORT: EffortLevel = EffortLevel::High;
 const TASK_SUMMARY_MODEL: &str = "claude-haiku-4-5-20251001";
 /// Default cap on how many plan-launched agents may run at once. Overridable via
