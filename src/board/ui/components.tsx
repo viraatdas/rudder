@@ -30,10 +30,27 @@ const COLUMNS: { key: Column; label: string }[] = [
   { key: "done", label: "Done" },
 ];
 
+function deliveryVerified(node: BoardNode): boolean {
+  const delivery = node.delivery;
+  return Boolean(
+    delivery?.required &&
+      (delivery.status === "deployed" || delivery.status === "verified") &&
+      delivery.kind?.trim() &&
+      delivery.target?.trim() &&
+      delivery.verifiedAt?.trim() &&
+      delivery.checks?.length,
+  );
+}
+
 // Map a node's raw status string to a CSS status token (drives spine color).
 function statusToken(node: BoardNode): string {
   if (node.merge && node.merge.status === "merge-conflict") return "conflict";
   if (node.blocked) return "blocked";
+  if (node.delivery?.required && node.status === "completed") {
+    if (node.delivery.status === "blocked" || node.delivery.status === "failed") return "failed";
+    if (deliveryVerified(node)) return "done";
+    return "review";
+  }
   switch (node.status) {
     case "running":
     case "steering":
@@ -48,6 +65,8 @@ function statusToken(node: BoardNode): string {
       return "failed";
     case "cancelled":
       return "failed";
+    case "paused":
+      return "done";
     case "merge-conflict":
       return "conflict";
     default:
@@ -58,6 +77,15 @@ function statusToken(node: BoardNode): string {
 function statusLabel(node: BoardNode): string {
   if (node.merge && node.merge.status === "merge-conflict") return "conflict";
   if (node.blocked) return "blocked";
+  if (node.delivery?.required && node.status === "completed") {
+    if (node.delivery.status === "blocked" || node.delivery.status === "failed") {
+      return "delivery blocked";
+    }
+    if (deliveryVerified(node)) {
+      return "deployed";
+    }
+    return "delivery proof needed";
+  }
   return node.status || node.column;
 }
 
@@ -637,6 +665,15 @@ function Card({
           {node.effort && <span class="card-effort">{node.effort}</span>}
         </div>
 
+        {node.delivery?.required && (
+          <div class="card-lastline mono">
+            <span class="lastline-text">
+              delivery {node.delivery.status} · {node.delivery.target ?? "target not recorded"}
+              {node.delivery.checks?.length ? ` · ${node.delivery.checks.length} check${node.delivery.checks.length === 1 ? "" : "s"}` : ""}
+            </span>
+          </div>
+        )}
+
         {node.lastLine && (
           <div class="card-lastline mono">
             {running && <span class="pulse-dot" aria-hidden="true" />}
@@ -1088,6 +1125,12 @@ function CardDetail({
           {node.worktree && (
             <div class="drawer-worktree mono" title={node.worktree.path}>
               {node.worktree.workspaceName ?? node.worktree.path}
+            </div>
+          )}
+          {node.delivery?.required && (
+            <div class="drawer-worktree mono" title={node.delivery.url ?? node.delivery.appPath ?? node.delivery.target}>
+              delivery {node.delivery.status} · {node.delivery.target ?? "target not recorded"}
+              {node.delivery.revision ? ` · ${node.delivery.revision}` : ""}
             </div>
           )}
         </header>

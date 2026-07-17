@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import type { BackendAdapter, BackendId, RunRequest, RudderEvent, AuthProfileStore, EffortLevel } from "./types.js";
-import { CODEX_RUDDER_CONFIG_ARGS, codexLaunchEnv, ensureRudderCodexBinary } from "./codex-binary.js";
+import { CODEX_RUDDER_WORKER_CONFIG_ARGS, codexLaunchEnv, ensureRudderCodexBinary } from "./codex-binary.js";
 import { loadAuthStore, loadConfig, saveRunRecord } from "./state.js";
 import { normalizeEffortForBackend } from "./effort.js";
 import {
@@ -184,7 +184,7 @@ function codexBackend(): BackendAdapter {
             "--dangerously-bypass-approvals-and-sandbox",
             "--enable",
             "goals",
-            ...CODEX_RUDDER_CONFIG_ARGS,
+            ...CODEX_RUDDER_WORKER_CONFIG_ARGS,
             effort ? "-c" : undefined,
             effort ? `model_reasoning_effort="${effort}"` : undefined,
             sessionId,
@@ -200,7 +200,7 @@ function codexBackend(): BackendAdapter {
             "--dangerously-bypass-approvals-and-sandbox",
             "--enable",
             "goals",
-            ...CODEX_RUDDER_CONFIG_ARGS,
+            ...CODEX_RUDDER_WORKER_CONFIG_ARGS,
             effort ? "-c" : undefined,
             effort ? `model_reasoning_effort="${effort}"` : undefined,
             `${request.contract}\n\n${prompt}`,

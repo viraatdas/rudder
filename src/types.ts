@@ -118,7 +118,13 @@ export type VcsMode = "git" | "jj";
 
 export type EffortLevel = "low" | "medium" | "high" | "xhigh" | "max";
 
-export type RunMode = "execute" | "plan";
+export type RunMode =
+  | "execute"
+  | "plan"
+  | "rudder-plan"
+  | "review-all"
+  | "main"
+  | "one-off";
 
 export type MergeStrategy = "merge" | "rebase";
 
@@ -137,10 +143,26 @@ export type RunStatus =
   | "completed"
   | "failed"
   | "cancelled"
+  | "paused"
   | "orphaned"
   | "migrated"
   | "merge-conflict"
   | "merged";
+
+export type DeliveryEvidence = {
+  required: boolean;
+  kind?: "web" | "macos-app" | "release" | "custom" | string;
+  status: "not-requested" | "pending" | "deployed" | "verified" | "blocked" | "failed";
+  target?: string;
+  url?: string;
+  appPath?: string;
+  provider?: string;
+  revision?: string;
+  deploymentId?: string;
+  version?: string;
+  verifiedAt?: string;
+  checks: string[];
+};
 
 export type UndoEntry = {
   opId: string;
@@ -338,6 +360,9 @@ export type RunRecord = {
     launchedAt: string;
   };
   verification?: VerificationResult;
+  /** Structured proof for an explicitly requested deploy/install/release. A
+   * completed process is not equivalent to a verified delivery. */
+  delivery?: DeliveryEvidence;
   merge?: MergeState;
   sync?: SyncState;
   /** Durable "an integration conflict happened at some point this run" marker.
@@ -528,6 +553,7 @@ export type BoardNode = {
   updatedAt: string;
   worktree: { path: string; workspaceName?: string } | null;
   merge: MergeState | null;
+  delivery?: DeliveryEvidence;
   /** User-authored follow-up turns, oldest first. The initial task is omitted. */
   updates: Array<{ instruction: string; ts: string; source?: string }>;
 };

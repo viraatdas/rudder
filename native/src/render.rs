@@ -314,6 +314,11 @@ pub(crate) fn push_agent_row_with_trailing<'a>(
         integration_line.extend([Span::raw("  "), Span::styled(detail, muted_style(focused))]);
         lines.push(ListItem::new(Line::from(integration_line)));
     }
+    if let Some(detail) = delivery_detail(agent) {
+        let mut delivery_line = cont_prefix.to_vec();
+        delivery_line.extend([Span::raw("  "), Span::styled(detail, muted_style(focused))]);
+        lines.push(ListItem::new(Line::from(delivery_line)));
+    }
     if let Some(summary) = diff {
         let mut diff_line = cont_prefix.to_vec();
         diff_line.extend([
@@ -427,6 +432,7 @@ pub(crate) fn status_bucket(agent: &AgentRun) -> Bucket {
         AgentStatus::Merged => Bucket::Done,
         AgentStatus::Failed
         | AgentStatus::Stopped
+        | AgentStatus::Paused
         | AgentStatus::Orphaned
         | AgentStatus::Migrated => Bucket::Closed,
     }
@@ -1150,18 +1156,25 @@ fn push_orchestrator_row<'a>(
         };
         ("plan mode", format!("{backend} · researching the plan"))
     } else if awaiting {
-        ("awaiting approval", "press Enter on this row to launch the plan".to_string())
+        (
+            "awaiting approval",
+            "press Enter on this row to launch the plan".to_string(),
+        )
     } else {
         ("orchestrator", orchestrator_phase_label(app, agent))
     };
     let row_accent = if awaiting { RUNNING_COLOR } else { ACCENT };
     let role_style = if awaiting {
-        Style::default().fg(RUNNING_COLOR).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(RUNNING_COLOR)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(ACCENT)
     };
     let phase_style = if awaiting {
-        Style::default().fg(RUNNING_COLOR).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(RUNNING_COLOR)
+            .add_modifier(Modifier::BOLD)
     } else {
         muted_style(focused)
     };
@@ -4355,6 +4368,35 @@ fn integration_detail(agent: &AgentRun) -> Option<String> {
     Some(format!("{bookmark} @ {revision} · {remote}"))
 }
 
+fn delivery_detail(agent: &AgentRun) -> Option<String> {
+    if !agent.delivery.required {
+        return None;
+    }
+    let target = agent
+        .delivery
+        .target
+        .as_deref()
+        .unwrap_or("target not recorded");
+    let revision = agent
+        .delivery
+        .revision
+        .as_deref()
+        .map(short_hash)
+        .unwrap_or_else(|| "revision not recorded".to_string());
+    Some(format!(
+        "delivery {} · {} · {} · {} check{}",
+        agent.delivery.status.as_str(),
+        target,
+        revision,
+        agent.delivery.checks.len(),
+        if agent.delivery.checks.len() == 1 {
+            ""
+        } else {
+            "s"
+        }
+    ))
+}
+
 /// A finished run that still has a workspace to integrate: it sits in the review
 /// bucket until merged (m / M for manual runs; automatic for DAG nodes), and hard-dependent nodes stay gated
 /// on it. Main, one-off, and planner runs never merge.
@@ -4371,6 +4413,19 @@ pub(crate) fn agent_status_style(agent: &AgentRun) -> Style {
         Style::default().fg(RUNNING_COLOR)
     } else if agent.has_merge_conflict() {
         Style::default().fg(FAILED_COLOR)
+    } else if agent.status == AgentStatus::Done
+        && agent.delivery.required
+        && matches!(
+            agent.delivery.status,
+            DeliveryStatus::Blocked | DeliveryStatus::Failed
+        )
+    {
+        Style::default().fg(FAILED_COLOR)
+    } else if agent.status == AgentStatus::Done
+        && agent.delivery.required
+        && !agent.delivery.is_verified()
+    {
+        Style::default().fg(RUNNING_COLOR)
     } else {
         status_style(agent.status)
     }

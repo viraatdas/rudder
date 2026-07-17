@@ -296,6 +296,22 @@ export type CompletionNote = {
   summary?: string;
   interfaces?: string;
   followups?: FollowupProposal[];
+  delivery?: DeliveryEvidence;
+};
+
+export type DeliveryEvidence = {
+  required?: boolean;
+  kind?: "web" | "macos-app" | "release" | "custom" | string;
+  status?: "pending" | "deployed" | "verified" | "blocked" | "failed";
+  target?: string;
+  url?: string;
+  appPath?: string;
+  provider?: string;
+  revision?: string;
+  deploymentId?: string;
+  version?: string;
+  verifiedAt?: string;
+  checks?: string[];
 };
 
 /** Parse a `rudder done` argument into a CompletionNote. Accepts a bare JSON object, a
@@ -359,6 +375,16 @@ export async function appendCompletionNote(
   const interfaces = (note.interfaces || "").replace(/\s+/g, " ").trim();
   if (interfaces) {
     body.push(`- **Interfaces:** ${interfaces}`);
+  }
+  if (note.delivery) {
+    const delivery = note.delivery;
+    const target = (delivery.target || delivery.url || delivery.appPath || "not recorded")
+      .replace(/\s+/g, " ")
+      .trim();
+    const checks = (delivery.checks || []).filter(Boolean);
+    body.push(
+      `- **Delivery:** ${delivery.status || "pending"}; ${delivery.kind || "custom"}; target=${target}; revision=${delivery.revision || "not recorded"}; verifiedAt=${delivery.verifiedAt || "not recorded"}; checks=${checks.length}`,
+    );
   }
   const followups = (note.followups || []).filter((f) => f && (f.title || f.prompt));
   if (followups.length) {

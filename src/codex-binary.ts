@@ -11,17 +11,31 @@ export const RUDDER_CODEX_RELEASE = "rudder-codex-v0.1.1-upstream-db9cb04";
 export const RUDDER_CODEX_ASSET_SHA256 = "ea08a91e85b35c0c4782a96535011dfcaeaff7259113e65ecf5260bc24368517";
 // Rudder workers run Codex as a child process, so do not inherit desktop-app
 // notification hooks that expect the official signed app launch chain.
-export const CODEX_RUDDER_CONFIG_ARGS = [
+const CODEX_RUDDER_COMMON_CONFIG_ARGS = [
   "-c",
   "notify=[]",
-  "-c",
-  "features.plugins=false",
-  "-c",
-  "features.computer_use=false",
   "-c",
   'model_reasoning_summary="detailed"',
   "-c",
   "model_supports_reasoning_summaries=true",
+];
+
+/** Full-capability profile for implementation, review, and shipping agents. */
+export const CODEX_RUDDER_WORKER_CONFIG_ARGS = [
+  ...CODEX_RUDDER_COMMON_CONFIG_ARGS,
+  "-c",
+  "features.plugins=true",
+  "-c",
+  "features.computer_use=true",
+];
+
+/** Restricted profile for read-only planners and the orchestration conductor. */
+export const CODEX_RUDDER_PLANNER_CONFIG_ARGS = [
+  ...CODEX_RUDDER_COMMON_CONFIG_ARGS,
+  "-c",
+  "features.plugins=false",
+  "-c",
+  "features.computer_use=false",
 ];
 
 export async function codexEnvVars(): Promise<Record<string, string>> {
@@ -29,7 +43,7 @@ export async function codexEnvVars(): Promise<Record<string, string>> {
     const codex = await ensureRudderCodexBinary();
     return {
       RUDDER_CODEX_BIN: codex,
-      RUDDER_CODEX_VERSION: RUDDER_CODEX_RELEASE,
+      RUDDER_CODEX_VERSION: codex === "codex" ? "system" : RUDDER_CODEX_RELEASE,
       CODEX_RUDDER_SCROLLBACK_SAFE: "1",
     };
   } catch {
@@ -57,6 +71,14 @@ export async function ensureRudderCodexBinary(): Promise<string> {
       return resolved;
     }
     throw new Error(`RUDDER_CODEX_BIN is set but is not executable: ${override}`);
+  }
+
+  // Match a direct Codex session by default. Rudder's managed fork is a
+  // compatibility fallback for machines without Codex on PATH, not a reason to
+  // pin every worker to an older opaque build. Explicit RUDDER_CODEX_BIN still
+  // wins above for tests and installations that require a custom binary.
+  if (await commandExists("codex")) {
+    return "codex";
   }
 
   const assets = platformAssetNames();

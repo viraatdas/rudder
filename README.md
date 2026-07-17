@@ -13,8 +13,10 @@
 
 Rudder runs coding agents the way they should be used: several at once,
 isolated, reviewable, and easy to merge. It opens a native three-pane dashboard,
-gives every task its own git worktree, and runs real Claude Code or Codex
-processes in the worker pane.
+gives isolated tasks their own jj workspace, and runs real Claude Code or Codex
+processes in the worker pane. Plain requests instead get one end-to-end owner in
+the main checkout, so implementation, release, and deployment do not fall between
+separate agents unless you explicitly ask for a DAG.
 
 > **AI agents and contributors:** this README is for using Rudder. If you are
 > an AI agent (or a human) working on the Rudder codebase itself, read
@@ -53,10 +55,11 @@ rudder
 ```
 
 With no arguments, `rudder` opens the dashboard. Type in the bottom input and
-press `Enter` to hand the request to the orchestrator. It can answer, inspect the
-repo, or plan a DAG and run isolated workers. Use `/run <task>` when you want
-exactly one isolated mergeable worker with no DAG. Use `/ask <text>` when you
-want a one-off agent in the main checkout with no merge step.
+press `Enter` to give the request to a single end-to-end main-checkout agent.
+That agent owns implementation, relevant tests, and any push/deploy/install work
+the request explicitly authorizes. Use `/plan <task>` when you want a reviewed
+multi-agent DAG, `/run <task>` for exactly one isolated mergeable worker with no
+DAG, or `/ask <text>` for a separate one-off main-checkout conversation.
 
 If a task needs shared local context like API tokens, private URLs, account ids,
 or environment values, save it with `/share <text>` in the task input. Rudder
@@ -96,7 +99,7 @@ to `~/.rudder/config.json`.
 │ task list     │ live Claude Code or Codex terminal           │
 │ status/model  │ DAG-over-orchestrator, scrollback, review    │
 ├───────────────┴────────────────────────────────────────────┤
-│ task input: orchestrator by default, /run single, /ask direct │
+│ task input: main owner by default, /plan DAG, /run isolated   │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -120,7 +123,8 @@ your browser. The board is a second control surface, not just a monitor: open a
 task to send an update while it runs, or request changes from Review to resume
 the same agent in the same workspace. The task's update thread records your
 directions alongside the latest worker activity. `+ Task` follows the same
-orchestrator path as typing in the dashboard task pane.
+end-to-end main-owner path as typing in the dashboard task pane; use `/plan` in
+the native dashboard for an explicit DAG.
 
 The board also works on its own with `rudder board`: in that mode updates
 redirect or resume the detached worker directly and move revised work back
@@ -212,18 +216,23 @@ reused next time. Rudder refreshes model metadata from
 `https://models.dev/api.json` and falls back to local caches when offline.
 The native Codex picker also reads `~/.codex/models_cache.json`, so account-specific
 models such as the GPT-5.6 Sol/Terra/Luna family appear as soon as Codex exposes them.
+Implementation, review, resume, and shipping Codex sessions keep Codex plugins and
+Computer Use enabled, matching a direct Codex session. Read-only planner sessions
+disable both capabilities so planning cannot cause external side effects.
 
 ## One-Off and Planning
 
 Type a fresh request in the bottom task input. When no plan is active, Rudder
-starts the orchestrator, which can inspect the repo, plan the work, and spawn
-isolated workers when needed.
+starts or continues one main-checkout agent as the end-to-end owner. It can inspect,
+edit, test, commit, release, and deploy according to the request and the repository's
+instructions. Rudder does not silently split a plain request across a planner and
+workers, which keeps final delivery ownership unambiguous.
 
 Use `/ask <text>` for a one-off conversational agent in the main checkout, with
 no DAG and no merge step. Use `/run <task>` for exactly one isolated worker that
 lands in Review and merges back with `m` or `/merge-all`. Use `/plan <text>` when
-you want to be explicit about the orchestrator / DAG path; it is the same route
-as plain input.
+you want the orchestrator / DAG path: the read-only planner decomposes the task,
+then separate isolated workers implement its nodes.
 
 For planned work, Rudder runs a dedicated Claude Code orchestrator PTY with a DAG
 pane above it. The flow stays inside Rudder: the orchestrator researches
@@ -254,8 +263,9 @@ After launch, typing a new task folds it into the running DAG as a new node. Whe
 finishes, Rudder reads back what it did and what work it found remaining (reconstructing it
 from the diff if the agent did not say), so the plan keeps growing on its own. Type a
 sweeping change ("rewrite this in Rust instead") and the plan re-plans around the work
-already done. The queued plan survives a restart, so quitting mid-plan resumes where you
-left off.
+already done. The queued plan and workspaces survive a restart. Closing the dashboard
+marks owned live PTYs `paused` and removes their dead process ids; select a paused row
+and press `Enter` to resume it (reusing its backend session when available).
 
 The orchestrator also handles worker operations in natural language. For example, tell it
 "pause the current tasks and resume them on Codex gpt-5.6 at max effort." It resolves the
@@ -266,12 +276,11 @@ with a handoff to inspect and continue the existing diff.
 
 ## Worktrees and merging
 
-Planned worker tasks run in their own git worktrees under `.rudder-worktrees/`
-inside your project (gitignored), so parallel DAG agents never edit the same
-checkout and every Rudder path stays within the project boundary. One-off agents
-are the exception: they intentionally run in the main checkout. Run records live
-under `.rudder/runs/`. If you quit Rudder, live workers stop but the agents stay
-listed the next time you open Rudder in that repo.
+Planned and `/run` worker tasks run in their own jj workspaces under a sibling
+`.rudder-worktrees` area, so parallel agents never edit the same checkout. Plain
+main-owner and `/ask` agents intentionally run in the main checkout. Run records
+live under `.rudder/runs/`. If you quit Rudder, live workers become `paused`, keep
+their workspace/session metadata, and stay listed when you reopen the repo.
 
 - Press `m` to merge the selected completed agent back into its branch.
 - Press `M` to merge all completed agents. Rudder confirms first.
@@ -299,6 +308,21 @@ rudder cleanup
 
 `rudder stop` records a durable cancellation request and terminates the native PTY process
 group. Cancellation is terminal: a resulting signal exit cannot be relabeled as a failure.
+
+## Shipping and delivery evidence
+
+Rudder treats these as different facts: an agent finished, changes merged locally,
+a revision was pushed, and a product was deployed. A task that explicitly asks to
+deploy, publish, release, install, or launch remains `delivery proof needed` until
+its completion report records the target, delivery kind, verification time, and at
+least one real smoke check. Verified web URLs, installed macOS app paths, provider
+deployment ids, revisions, and versions are persisted in `.rudder/runs/<id>/run.json`
+and shown in the native dashboard, web board, and generated `RUDDER.md`.
+
+Pushing a commit is never presented as proof that a host deployed it. Likewise,
+building a macOS app is not the same as replacing and launching the installed app.
+If delivery fails or needs credentials/user input, the row says `delivery blocked`
+instead of incorrectly moving to deployed.
 
 ## Review
 
@@ -376,6 +400,9 @@ rudder cleanup
 - Stale behavior after an upgrade: restart any already-running Rudder dashboards
   so no old `rudder-native` process lingers. New `rudder` launches auto-update
   unless `RUDDER_DISABLE_AUTO_UPDATE=1` is set.
+- Sustained CPU/redraw load: version 2.12.9 and newer cache Codex plan-output scans,
+  avoid reparsing unchanged planner JSON, throttle background PTY drains, and redraw
+  only dirty frames. Upgrade and restart any dashboard launched by 2.12.8 or older.
 - Trackpad scrolling: confirm your terminal sends scroll events with
   `rudder mouse-test parsed`. Set `RUDDER_WHEEL_SCROLL_ROWS=<n>` to change the
   scroll step, or `RUDDER_MOUSE_DEBUG=1` to inspect routing.

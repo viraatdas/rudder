@@ -396,6 +396,7 @@ enum AgentStatus {
     Merged,
     Failed,
     Stopped,
+    Paused,
     Orphaned,
     Migrated,
 }
@@ -408,6 +409,7 @@ impl AgentStatus {
             Self::Merged => "merged",
             Self::Failed => "failed",
             Self::Stopped => "stopped",
+            Self::Paused => "paused",
             Self::Orphaned => "orphaned",
             Self::Migrated => "migrated",
         }
@@ -852,6 +854,9 @@ struct AgentRun {
     /// merge/sync through jj for new (vcs:jj) runs.
     jj_change_id: Option<String>,
     integration: IntegrationEvidence,
+    /// First-class outcome evidence for an explicitly requested push/deploy,
+    /// orthogonal to process status and local jj integration.
+    delivery: DeliveryEvidence,
     session_id: Option<String>,
     terminal: Option<TerminalPane>,
     terminal_size: Option<TerminalSize>,
@@ -1694,7 +1699,7 @@ impl App {
         }
         self.quit_confirm_pending = true;
         self.notice = Some(format!(
-            "{running} agent{} still running. press q / Ctrl+C again to quit; any other key cancels. Claude agents auto-resume on next rudder.",
+            "{running} agent{} still running. press q / Ctrl+C again to quit and pause them; any other key cancels.",
             if running == 1 { "" } else { "s" }
         ));
         false
@@ -1927,6 +1932,20 @@ impl App {
                     self.delete_pending = None;
                     if self.selected_is_main() {
                         self.focus_or_spawn_main();
+                    } else if self.agents[self.selected_agent].status == AgentStatus::Paused {
+                        let index = self.selected_agent;
+                        if self.agents[index].is_orchestrator() {
+                            self.restart_selected_agent();
+                        } else {
+                            let continuation =
+                                if self.agents[index].current_prompt.trim().is_empty() {
+                                    self.agents[index].task.clone()
+                                } else {
+                                    self.agents[index].current_prompt.clone()
+                                };
+                            self.regoal_agent_at(index, &continuation);
+                        }
+                        self.focus = FocusPane::Worker;
                     } else {
                         self.focus = FocusPane::Worker;
                     }
@@ -4017,11 +4036,11 @@ impl App {
             return;
         }
 
-        // Default first task (no active plan): hand it to the orchestrator, which
-        // plans and implements it (spawning + merging workers as needed). No local
-        // classifier decides one-off vs DAG — the orchestrator is the default, and
-        // the one-off conversational agent is the explicit escape hatch via `/ask`.
-        self.start_rudder_plan_task(input);
+        // Default first task (no active plan): one end-to-end owner in the real
+        // checkout. This matches a direct Codex/Claude session: implementation,
+        // verification, and an explicitly requested deployment stay in one
+        // conversation. `/plan` remains the explicit multi-workspace DAG route.
+        self.start_or_continue_default_main(input);
     }
 
     /// Queue a deferred Enter for `run_id`, flushed by `flush_pending_enters`
@@ -4260,7 +4279,7 @@ impl App {
                 args.push("--ask-for-approval".to_string());
                 args.push("never".to_string());
                 args.push("--search".to_string());
-                push_codex_rudder_config_overrides(&mut args, effort);
+                push_codex_planner_config_overrides(&mut args, effort);
                 if !model.trim().is_empty() {
                     args.push("-m".to_string());
                     args.push(model.to_string());
@@ -4360,6 +4379,7 @@ impl App {
             workspace_name: None,
             jj_change_id: None,
             integration: IntegrationEvidence::default(),
+            delivery: DeliveryEvidence::default(),
             session_id,
             terminal: None,
             terminal_size: None,
@@ -4534,6 +4554,7 @@ impl App {
             workspace_name: worktree.workspace_name.clone(),
             jj_change_id: worktree.jj_change_id.clone(),
             integration: IntegrationEvidence::default(),
+            delivery: DeliveryEvidence::for_task(&goal_prompt),
             session_id,
             terminal: None,
             terminal_size: None,
@@ -4688,6 +4709,7 @@ impl App {
             workspace_name: None,
             jj_change_id: None,
             integration: IntegrationEvidence::default(),
+            delivery: DeliveryEvidence::default(),
             session_id,
             terminal: None,
             terminal_size: None,
@@ -5421,6 +5443,15 @@ impl App {
         self.focus_or_spawn_main_with_prompt("");
     }
 
+    fn start_or_continue_default_main(&mut self, input: &str) {
+        if let Some(index) = self.agents.iter().position(AgentRun::is_main) {
+            self.selected_agent = index;
+            self.focus_or_spawn_main_with_prompt(input);
+        } else {
+            self.handle_main_command(input);
+        }
+    }
+
     fn focus_or_spawn_main_with_prompt(&mut self, override_prompt: &str) {
         let main_index = match self.selected_main_index() {
             Some(idx) => idx,
@@ -5443,8 +5474,19 @@ impl App {
             // type it themselves.
             if !override_prompt.is_empty() {
                 let mut queued_run_id: Option<String> = None;
+                let done_path = self
+                    .agents
+                    .get(main_index)
+                    .map(|run| worker_done_file(&run.cwd, &run.id));
+                if let Some(path) = done_path {
+                    // A sidecar describes exactly one turn. Remove the previous
+                    // report before submitting another prompt so old delivery
+                    // proof cannot be mistaken for the new request's outcome.
+                    let _ = std::fs::remove_file(path);
+                }
                 if let Some(run) = self.agents.get_mut(main_index) {
                     if let Some(terminal) = run.terminal.as_mut() {
+                        let starting_new_turn = run.status == AgentStatus::Done;
                         // Text only; the submitting CR is deferred (see queue_enter_for).
                         let _ = terminal.write_input(&bracketed_paste_bytes(override_prompt));
                         let now = now_stamp();
@@ -5454,6 +5496,20 @@ impl App {
                             source: "user".to_string(),
                         });
                         run.last_user_input_at = now;
+                        run.last_worker_input_at = Some(Instant::now());
+                        run.current_prompt = override_prompt.to_string();
+                        run.done_summary = None;
+                        let requested_delivery = DeliveryEvidence::for_task(override_prompt);
+                        if requested_delivery.required
+                            || !run.delivery.required
+                            || starting_new_turn
+                        {
+                            run.delivery = requested_delivery;
+                        }
+                        run.status = AgentStatus::Running;
+                        run.completed_at = None;
+                        run.needs_permission = false;
+                        run.needs_user_input = false;
                         queued_run_id = Some(run.id.clone());
                     }
                 }
@@ -5466,7 +5522,7 @@ impl App {
             return;
         }
 
-        let (backend, model, effort, terminal_size, bootstrap, session_id) = {
+        let (backend, model, effort, terminal_size, bootstrap, session_id, resume_existing) = {
             let run = &self.agents[main_index];
             let bootstrap = if !override_prompt.is_empty() {
                 override_prompt.to_string()
@@ -5475,33 +5531,55 @@ impl App {
             } else {
                 String::new()
             };
+            let resume_existing = override_prompt.is_empty()
+                && run.status == AgentStatus::Paused
+                && run
+                    .session_id
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty());
             (
                 run.backend,
                 run.model.clone(),
                 run.effort,
                 run.terminal_size.unwrap_or_default(),
                 bootstrap,
-                // Re-spawning a stopped main starts a FRESH session: the old session id
-                // was already consumed, and `claude --session-id` is a NEW-session flag
-                // (not --resume), so reusing it fails to launch. Always mint a new id,
-                // matching restart_selected_agent.
-                mint_session_id_for(run.backend),
+                if resume_existing {
+                    run.session_id.clone()
+                } else {
+                    // A stopped/completed main starts a fresh session. A Paused main
+                    // is the one exception: it resumes the session captured at shutdown.
+                    mint_session_id_for(run.backend)
+                },
+                resume_existing,
             )
         };
-        let mut command = agent_command(
-            backend,
-            &model,
-            effort,
-            &bootstrap,
-            AgentMode::Main,
-            session_id.as_deref(),
-        );
+        let mut command = if resume_existing {
+            let run = &self.agents[main_index];
+            match backend {
+                Backend::Claude => claude_resume_command(run, session_id.as_deref().unwrap()),
+                Backend::Codex => codex_resume_command(run, session_id.as_deref().unwrap()),
+            }
+        } else {
+            agent_command(
+                backend,
+                &model,
+                effort,
+                &bootstrap,
+                AgentMode::Main,
+                session_id.as_deref(),
+            )
+        };
         signals::augment_worker_command(
             &mut command,
             backend,
             AgentMode::Main,
             &self.agents[main_index].id.clone(),
         );
+        let done_file = worker_done_file(&self.cwd, &self.agents[main_index].id);
+        if !bootstrap.is_empty() {
+            let _ = std::fs::remove_file(&done_file);
+        }
+        command = command.with_env("RUDDER_DONE_FILE", done_file.to_string_lossy().to_string());
         let cwd = self.cwd.clone();
         let options = TerminalPaneOptions {
             size: terminal_size,
@@ -5523,6 +5601,7 @@ impl App {
                 run.needs_permission = false;
                 run.last_error = None;
                 if !bootstrap.is_empty() {
+                    let starting_new_turn = run.status == AgentStatus::Done;
                     let now = now_stamp();
                     run.current_prompt = bootstrap.clone();
                     run.turns.push(AgentTurn {
@@ -5531,9 +5610,17 @@ impl App {
                         source: "bootstrap".to_string(),
                     });
                     run.last_user_input_at = now;
+                    run.done_summary = None;
+                    let requested_delivery = DeliveryEvidence::for_task(&bootstrap);
+                    if requested_delivery.required || !run.delivery.required || starting_new_turn {
+                        run.delivery = requested_delivery;
+                    }
                 }
                 self.focus = FocusPane::Worker;
                 self.worker_view = WorkerView::Terminal;
+                if resume_existing {
+                    self.notice = Some("resumed paused main session".to_string());
+                }
                 let _ = save_native_run_record(&self.cwd, run);
             }
             Err(error) => {
@@ -5570,6 +5657,9 @@ impl App {
             session_id.as_deref(),
         );
         signals::augment_worker_command(&mut command, backend, AgentMode::OneOff, &run_id);
+        let done_file = worker_done_file(&self.cwd, &run_id);
+        let _ = std::fs::remove_file(&done_file);
+        command = command.with_env("RUDDER_DONE_FILE", done_file.to_string_lossy().to_string());
         let options = TerminalPaneOptions {
             size: run.terminal_size.unwrap_or_default(),
             cwd: Some(self.cwd.clone()),
@@ -5809,12 +5899,11 @@ impl App {
                 true
             }
             Some("/plan") => {
-                // Explicit alias for the default: hand the task to the orchestrator.
-                // Plain task input does the same thing now.
+                // Explicit multi-agent route: hand the task to the DAG orchestrator.
                 let rest = command_rest(input, "/plan").trim();
                 if rest.is_empty() {
                     self.notice = Some(
-                        "usage: /plan <task> — same as plain input: the orchestrator plans + implements it (use /run for one isolated worker, /ask for direct one-off)"
+                        "usage: /plan <task>: plan and run an isolated multi-agent DAG (plain input uses one end-to-end main agent)"
                             .to_string(),
                     );
                 } else {
@@ -5841,14 +5930,16 @@ impl App {
                 // pane, continuing the SAME session with all permissions bypassed.
                 let args = parts.collect::<Vec<_>>();
                 match args.as_slice() {
-                    [provider, session_id] => match Backend::parse(&provider.to_ascii_lowercase()) {
-                        Some(backend) => self.start_restore_task(backend, session_id),
-                        None => {
-                            self.notice = Some(format!(
+                    [provider, session_id] => {
+                        match Backend::parse(&provider.to_ascii_lowercase()) {
+                            Some(backend) => self.start_restore_task(backend, session_id),
+                            None => {
+                                self.notice = Some(format!(
                                 "unknown provider {provider}; usage: /restore claude|codex <session-id>"
                             ));
+                            }
                         }
-                    },
+                    }
                     _ => {
                         self.notice = Some(
                             "usage: /restore claude|codex <session-id> — reopen that conversation in a new pane with permissions bypassed"
@@ -5864,7 +5955,7 @@ impl App {
                 let rest = command_rest(input, "/ask").trim();
                 if rest.is_empty() {
                     self.notice = Some(
-                        "usage: /ask <question or small change> — one-off agent in the main checkout, no DAG (plain input goes to the orchestrator)"
+                        "usage: /ask <question or small change>: one-off agent in the main checkout, no DAG"
                             .to_string(),
                     );
                 } else {
@@ -5900,7 +5991,7 @@ impl App {
             }
             Some("/help") => {
                 self.notice = Some(
-                    "plain input -> orchestrator/DAG · /run <task> -> one isolated mergeable worker · /ask <text> -> direct main-checkout one-off · /plan <text> -> force orchestrator/DAG · panes: Option-1/2/3 or ^W · keys: j/k select · Enter focus · v diff · m merge · M merge all · R review all · g nest · o web ui · x stop · b branch chat · dd delete · cc clear merged · P model — commands: /model /fast /sound /color /main /run /ask /plan /restore /share /usage /goal /cloud /web"
+                    "plain input -> one end-to-end main agent · /plan <task> -> isolated multi-agent DAG · /run <task> -> one isolated mergeable worker · /ask <text> -> direct one-off · panes: Option-1/2/3 or ^W · keys: j/k select · Enter focus · v diff · m merge · M merge all · R review all · g nest · o web ui · x stop · b branch chat · dd delete · cc clear merged · P model; commands: /model /fast /sound /color /main /run /ask /plan /restore /share /usage /goal /cloud /web"
                         .to_string(),
                 );
                 true
@@ -6546,6 +6637,7 @@ impl App {
             workspace_name: None,
             jj_change_id: None,
             integration: IntegrationEvidence::default(),
+            delivery: DeliveryEvidence::default(),
             session_id: None,
             terminal: None,
             terminal_size: None,
@@ -6947,9 +7039,10 @@ impl App {
         if self.refining || self.rebasing {
             return;
         }
-        if !self.has_running_interactive_orchestrator() {
-            return;
-        }
+        // RUDDER.md is the durable control channel. A marker written immediately
+        // before the orchestrator's turn-complete signal must still execute after
+        // that PTY becomes Done; gating on a live orchestrator stranded auto-ship
+        // and other final actions at exactly that boundary.
         let path = orchestrator_plan_path(&self.cwd);
         let Ok(text) = std::fs::read_to_string(&path) else {
             return;
@@ -8215,6 +8308,30 @@ impl App {
         }
     }
 
+    /// Main/one-off agents do not participate in the DAG follow-up ledger, but
+    /// their `rudder done` report is still authoritative session and delivery
+    /// evidence. Read it directly so a finished end-to-end owner has a durable
+    /// outcome instead of an empty generic "review" row.
+    fn ingest_direct_completion_notes(&mut self) {
+        let notes = self
+            .agents
+            .iter()
+            .enumerate()
+            .filter(|(_, run)| {
+                run.status == AgentStatus::Done && (run.is_main() || run.is_oneoff())
+            })
+            .filter_map(|(index, run)| {
+                std::fs::read_to_string(worker_done_file(&run.cwd, &run.id))
+                    .ok()
+                    .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                    .map(|note| (index, note))
+            })
+            .collect::<Vec<_>>();
+        for (index, note) in notes {
+            self.set_run_done_summary(index, &note);
+        }
+    }
+
     /// Recover the finishing worker's completion note from its sidecar and append its
     /// in-scope follow-ups (deduped, depth- and cap-guarded). If no note was filed, spawn a
     /// one-shot summarizer over the worker's diff so a silent agent still advances the plan
@@ -8327,8 +8444,9 @@ impl App {
         false
     }
 
-    /// Store the completion note's `summary` on the run (persisted as `doneSummary`)
-    /// so the finished-worker card shows what the agent actually did.
+    /// Store the completion note's human summary and structured delivery proof.
+    /// Delivery stays proof-gated: a requested ship cannot be cleared by filing
+    /// `required:false`, and incomplete evidence remains visibly pending.
     fn set_run_done_summary(&mut self, index: usize, note: &serde_json::Value) {
         let summary = note
             .get("summary")
@@ -8336,13 +8454,31 @@ impl App {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned);
-        let Some(summary) = summary else {
-            return;
-        };
+        let delivery = note
+            .get("delivery")
+            .and_then(|value| DeliveryEvidence::from_json(value, true));
         let cwd = self.cwd.clone();
         if let Some(run) = self.agents.get_mut(index) {
-            run.done_summary = Some(summary);
-            let _ = save_native_run_record(&cwd, run);
+            let mut changed = false;
+            if let Some(summary) = summary {
+                if run.done_summary.as_deref() != Some(summary.as_str()) {
+                    run.done_summary = Some(summary);
+                    changed = true;
+                }
+            }
+            if let Some(mut delivery) = delivery {
+                delivery.required |= run.delivery.required;
+                if delivery.required && delivery.status == DeliveryStatus::NotRequested {
+                    delivery.status = DeliveryStatus::Pending;
+                }
+                if run.delivery != delivery {
+                    run.delivery = delivery;
+                    changed = true;
+                }
+            }
+            if changed {
+                let _ = save_native_run_record(&cwd, run);
+            }
         }
     }
 
@@ -9293,6 +9429,7 @@ impl App {
                 AgentStatus::Done => "review",
                 AgentStatus::Merged => "merged",
                 AgentStatus::Failed | AgentStatus::Stopped => "failed",
+                AgentStatus::Paused => "paused",
                 AgentStatus::Orphaned => "orphaned",
                 AgentStatus::Migrated => "cloud-owned",
             };
@@ -9511,8 +9648,11 @@ impl App {
             .iter()
             .map(|run| run.worktree_path.clone().unwrap_or_else(|| run.cwd.clone()))
             .collect();
-        let live_names: HashSet<String> =
-            self.agents.iter().filter_map(|run| run.workspace_name.clone()).collect();
+        let live_names: HashSet<String> = self
+            .agents
+            .iter()
+            .filter_map(|run| run.workspace_name.clone())
+            .collect();
 
         // 1) Forget registry entries jj still lists that no live row owns.
         if let Ok(output) = Command::new("jj")
@@ -9654,14 +9794,17 @@ impl App {
                 run.last_output_at = Instant::now();
                 self.node_reviewers.insert(reviewer_id, node_id);
                 self.agents.push(run);
-                self.notice = Some(format!("reviewing {node_label} (thermonuclear) before merge"));
+                self.notice = Some(format!(
+                    "reviewing {node_label} (thermonuclear) before merge"
+                ));
                 self.dirty = true;
             }
             Err(error) => {
                 // Fail open: never block the DAG on a reviewer that won't start.
                 self.reviewed_nodes.insert(node_id);
-                self.notice =
-                    Some(format!("review could not start ({error}); merging {node_label} unreviewed"));
+                self.notice = Some(format!(
+                    "review could not start ({error}); merging {node_label} unreviewed"
+                ));
             }
         }
     }
@@ -10384,6 +10527,7 @@ impl App {
             workspace_name: worktree.workspace_name.clone(),
             jj_change_id: worktree.jj_change_id.clone(),
             integration: IntegrationEvidence::default(),
+            delivery: DeliveryEvidence::default(),
             // The fork mints its own fresh session id (Claude --fork-session prints
             // it; Codex records it under the fork's cwd, discovered at completion).
             session_id: None,
@@ -10976,9 +11120,8 @@ impl App {
             }
             // Delete the STALE completion sidecar so the re-goaled run cannot re-ingest its
             // previous turn's note before it has written a new one.
-            if let Some(node_id) = node_id.as_deref() {
-                let _ = std::fs::remove_file(worker_done_file(&run_cwd, node_id));
-            }
+            let report_id = node_id.as_deref().unwrap_or(&id);
+            let _ = std::fs::remove_file(worker_done_file(&run_cwd, report_id));
         }
         let (command, deliver_after, new_session, size, cwd, node_label) = {
             let Some(run) = self.agents.get(index) else {
@@ -11023,6 +11166,13 @@ impl App {
             // already exists, so the poll loop waits for the official signal — a
             // relaunch without the hooks wired would never flip back to review.
             signals::augment_worker_command(&mut command, backend, run_mode, &run_id);
+            let report_id = run.node_id.as_deref().unwrap_or(&run.id);
+            command = command.with_env(
+                "RUDDER_DONE_FILE",
+                worker_done_file(&run.cwd, report_id)
+                    .to_string_lossy()
+                    .to_string(),
+            );
             (command, deliver_after, new_session, size, cwd, label)
         };
 
@@ -11044,6 +11194,7 @@ impl App {
                 }
                 let now = now_stamp();
                 if let Some(run) = self.agents.get_mut(index) {
+                    let starting_new_turn = run.status == AgentStatus::Done;
                     run.terminal = Some(terminal);
                     run.status = AgentStatus::Running;
                     run.session_id = new_session;
@@ -11055,6 +11206,11 @@ impl App {
                     run.merge_resolver = false;
                     run.merge_conflict = false;
                     run.merge_conflict_files.clear();
+                    run.done_summary = None;
+                    let requested_delivery = DeliveryEvidence::for_task(new_goal);
+                    if requested_delivery.required || !run.delivery.required || starting_new_turn {
+                        run.delivery = requested_delivery;
+                    }
                     run.current_prompt = new_goal.to_string();
                     run.turns.push(AgentTurn {
                         ts: now.clone(),
@@ -12043,6 +12199,7 @@ What to do\n\
         self.maybe_recapture_orchestrator_plan();
         self.scan_orchestrator_markers();
         self.scan_orchestrator_skill_markers();
+        self.ingest_direct_completion_notes();
 
         // Drain the planned-node queue on a coarse cadence: as plan-launched
         // agents reach Merged their node ids satisfy dependents' hard deps, so a
@@ -12180,15 +12337,22 @@ What to do\n\
 
     fn shutdown(&mut self) {
         for run in &mut self.agents {
-            if run.terminal.is_some() && run.status == AgentStatus::Running {
+            if run.terminal.is_some() {
                 if run.backend == Backend::Codex && run.session_id.is_none() {
                     run.session_id = latest_codex_session_id_for_cwd(&run.cwd);
                 }
                 run.terminal = None;
-                run.status = AgentStatus::Running;
-                run.needs_permission = false;
-                run.needs_user_input = false;
-                run.completed_at = None;
+                if run.status == AgentStatus::Running {
+                    run.status = AgentStatus::Paused;
+                    run.needs_permission = false;
+                    run.needs_user_input = false;
+                    run.completed_at = None;
+                    run.last_error = Some(
+                        "paused because the Rudder dashboard closed; resume explicitly".to_string(),
+                    );
+                }
+                // Save every detached terminal, including a Done process whose
+                // interactive CLI had not exited yet, so `process` is removed.
                 let _ = save_native_run_record(&self.cwd, run);
             }
         }

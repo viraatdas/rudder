@@ -11,6 +11,7 @@ export type RunStatus =
   | "completed"
   | "failed"
   | "cancelled"
+  | "paused"
   | "orphaned"
   | "migrated"
   | "merge-conflict"
@@ -21,6 +22,21 @@ export type MergeState = {
   conflictedFiles?: string[];
   operationId?: string;
   mergeChangeId?: string;
+};
+
+export type DeliveryEvidence = {
+  required: boolean;
+  kind?: string;
+  status: "not-requested" | "pending" | "deployed" | "verified" | "blocked" | "failed";
+  target?: string;
+  url?: string;
+  appPath?: string;
+  provider?: string;
+  revision?: string;
+  deploymentId?: string;
+  version?: string;
+  verifiedAt?: string;
+  checks: string[];
 };
 
 export type Tokens = { input: number; output: number };
@@ -49,6 +65,7 @@ export type BoardNode = {
   updatedAt: string;
   worktree: { path: string; workspaceName?: string } | null;
   merge: MergeState | null;
+  delivery?: DeliveryEvidence;
   updates: TaskUpdate[];
 };
 

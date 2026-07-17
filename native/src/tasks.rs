@@ -17,6 +17,15 @@ pub(crate) fn execution_prompt(task: &str) -> String {
     format!("{CONTEXT}\n\n{task}")
 }
 
+/// Prompt for the default end-to-end owner. Unlike an isolated Execute worker,
+/// Main runs in the user's real checkout and is allowed to finish repository and
+/// delivery operations when the request explicitly includes them.
+pub(crate) fn main_task_prompt(task: &str) -> String {
+    let task = strip_rudder_prompt_wrappers(task);
+    const CONTEXT: &str = "Rudder-specific context injected by Rudder:\n- You are the single end-to-end owner for this request and run directly in the user's main checkout, NOT an isolated worker. Read AGENTS.md, CLAUDE.md, RUDDER.md, DECISIONS.md, and RUDDER_SHARED.md when present. Preserve unrelated user changes and coordinate with any live work named in RUDDER.md.\n- Drive the requested outcome through implementation, relevant tests/builds, and real verification. Use available skills, plugins, subagents, browser tools, and Computer Use when they materially improve correctness. Do not stop after diagnosis or a local build while a safe in-scope completion step remains.\n- Version control and delivery: ordinary code requests do not authorize an unrelated push or deployment. When the user explicitly asks to push, ship, release, publish, deploy, install, launch, or make the product live, you ARE authorized to perform the repository's documented commit/version/push/deploy workflow. Never force-push or overwrite unrelated work.\n- Delivery targets are distinct. For a web app, verify the canonical production URL and report provider, deployed revision/id, URL, verification time, and smoke checks. For a local macOS app, build and replace/install the expected .app, launch it, then report app path, bundle id/version, source revision, running/smoke proof, and verification time. For a public macOS release, additionally sign/notarize/staple/package/publish only when requested or required by repo rules, and report the release artifact. Pushing alone is not deployment. If the intended target is materially ambiguous, ask before choosing one.\n- Before finishing, run `rudder done` with a JSON report. Include `summary`, `interfaces`, `followups`, and, for any shipping request, a `delivery` object with `kind` (`web`, `macos-app`, `release`, or `custom`), `status` (`deployed`, `verified`, `blocked`, or `failed`), `target`, and available `url`, `appPath`, `provider`, `revision`, `deploymentId`, `version`, `verifiedAt`, and `checks`. Rudder will not label a requested delivery as deployed without this proof.";
+    format!("{CONTEXT}\n\n{task}")
+}
+
 /// Split a goal-formatted prompt into its leading objective + `Done when: ...` block
 /// and the remaining body. Legacy inputs may lead with `/goal` or `Goal:`; normalize
 /// them to `Objective:` so process-launch prompts are never parsed as backend goals.
@@ -96,12 +105,13 @@ pub(crate) fn plan_prompt(task: &str) -> String {
 
 /// Prompt for a ONE-OFF agent: a single conversational agent the user talks to in the
 /// MAIN checkout for a question or a small self-contained change — NOT a multi-step DAG.
-/// No /goal, no `rudder done`, no isolated-workspace framing: edits land in the working
-/// tree directly and the agent should escalate to the planner if the work turns out big.
+/// No /goal or isolated-workspace framing: edits land in the working tree directly and
+/// the agent should escalate to the planner if the work turns out big. It still files a
+/// completion note through the run-id sidecar so direct work has durable evidence.
 pub(crate) fn oneoff_prompt(task: &str) -> String {
     let task = strip_rudder_prompt_wrappers(task);
     format!(
-        "You are a Rudder one-off agent. The user wants to ASK A QUESTION or make a SMALL, self-contained change — not a multi-step project. You are running directly in the user's working checkout (NOT an isolated workspace), so any edits you make land in their working tree. Follow the repo's own rules: read CLAUDE.md and AGENTS.md if they exist and honor them for any change you make. Read RUDDER.md if it exists, and read RUDDER_SHARED.md if it exists; RUDDER_SHARED.md is gitignored local context the user shared for agents, often API tokens, credentials, private URLs, or env details. Be conversational and focused: answer the question, or make the change directly and explain what you did. Do NOT run git/jj commit, branch, or merge commands — just edit files; the user manages version control. If the request is about improving agent behavior, project instructions, or context quality, run `rudder context audit --json` first and use its findings as evidence. If the request turns out to be large or genuinely multi-part, say so and suggest the user let Rudder plan it as a multi-agent task instead of doing it all here.\n\n{task}"
+        "You are a Rudder one-off agent. The user wants to ASK A QUESTION or make a SMALL, self-contained change — not a multi-step project. You are running directly in the user's working checkout (NOT an isolated workspace), so any edits you make land in their working tree. Follow the repo's own rules: read CLAUDE.md and AGENTS.md if they exist and honor them for any change you make. Read RUDDER.md if it exists, and read RUDDER_SHARED.md if it exists; RUDDER_SHARED.md is gitignored local context the user shared for agents, often API tokens, credentials, private URLs, or env details. Be conversational and focused: answer the question, or make the change directly and explain what you did. Do NOT run git/jj commit, branch, or merge commands — just edit files; the user manages version control. If the request is about improving agent behavior, project instructions, or context quality, run `rudder context audit --json` first and use its findings as evidence. If the request turns out to be large or genuinely multi-part, say so and suggest the user let Rudder plan it as a multi-agent task instead of doing it all here. Before finishing, run `rudder done` with a JSON object containing a concise `summary`, any important `interfaces`, and `followups` (use an empty array when there are none). If this one-off explicitly performs a deploy/install/release, also include the same structured `delivery` proof requested by RUDDER.md.\n\n{task}"
     )
 }
 

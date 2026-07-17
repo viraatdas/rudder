@@ -416,6 +416,7 @@ function nodeStatusFromRunStatus(runStatus: RunStatus, fallback: NodeStatus): No
       return "review";
     case "failed":
     case "cancelled":
+    case "paused":
     case "orphaned":
       return "failed";
     case "merged":

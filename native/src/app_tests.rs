@@ -617,7 +617,7 @@ fn web_conductor_steer_uses_task_input_path_without_a_live_conductor() {
     assert!(
         app.notice
             .as_deref()
-            .is_some_and(|notice| notice.contains("plain input -> orchestrator/DAG")),
+            .is_some_and(|notice| notice.contains("plain input -> one end-to-end main agent")),
         "task-input command result remains visible: {:?}",
         app.notice
     );
@@ -2477,11 +2477,11 @@ fn plan_commands_use_read_only_backend_profiles() {
     assert!(execute_codex
         .args
         .windows(2)
-        .any(|window| window[0] == "-c" && window[1] == "features.plugins=false"));
+        .any(|window| window[0] == "-c" && window[1] == "features.plugins=true"));
     assert!(execute_codex
         .args
         .windows(2)
-        .any(|window| window[0] == "-c" && window[1] == "features.computer_use=false"));
+        .any(|window| window[0] == "-c" && window[1] == "features.computer_use=true"));
     assert!(execute_codex
         .env
         .iter()
@@ -4969,6 +4969,7 @@ fn test_agent_run(id: &str, task: &str) -> AgentRun {
         workspace_name: None,
         jj_change_id: None,
         integration: IntegrationEvidence::default(),
+        delivery: DeliveryEvidence::default(),
         session_id: None,
         terminal: None,
         terminal_size: None,
@@ -5319,6 +5320,195 @@ fn merged_status_is_distinct_and_labeled() {
 }
 
 #[test]
+fn delivery_evidence_requires_real_target_time_and_smoke_checks() {
+    assert!(task_requests_delivery(
+        "push, deploy, and make a new version"
+    ));
+    assert!(!task_requests_delivery(
+        "fix the rendering bug and add tests"
+    ));
+
+    let incomplete = DeliveryEvidence::from_json(
+        &serde_json::json!({
+            "kind": "web",
+            "status": "deployed",
+            "url": "https://example.test"
+        }),
+        true,
+    )
+    .expect("parse delivery");
+    assert_eq!(incomplete.target.as_deref(), Some("https://example.test"));
+    assert!(
+        !incomplete.is_verified(),
+        "a URL alone is not deployment proof"
+    );
+
+    let complete = DeliveryEvidence::from_json(
+        &serde_json::json!({
+            "kind": "web",
+            "status": "verified",
+            "target": "production",
+            "url": "https://example.test",
+            "provider": "vercel",
+            "revision": "abc123",
+            "deploymentId": "dpl_123",
+            "verifiedAt": "2026-07-17T12:00:00Z",
+            "checks": ["GET / returned 200", "health endpoint passed"]
+        }),
+        true,
+    )
+    .expect("parse delivery");
+    assert!(complete.is_verified());
+
+    let mut run = test_agent_run("ship-1", "deploy the site");
+    run.mode = AgentMode::Main;
+    run.status = AgentStatus::Done;
+    run.delivery = DeliveryEvidence::for_task(&run.task);
+    assert_eq!(run.lifecycle_label(), "delivery proof needed");
+    run.delivery = complete;
+    assert_eq!(run.lifecycle_label(), "deployed");
+}
+
+#[test]
+fn completion_note_persists_delivery_without_waiving_requested_proof() {
+    let repo = unique_test_repo("delivery-note");
+    let mut app = App::new();
+    app.cwd = repo.clone();
+    let mut run = test_agent_run("ship-note", "deploy the site");
+    run.mode = AgentMode::Main;
+    run.status = AgentStatus::Done;
+    run.cwd = repo.clone();
+    run.delivery = DeliveryEvidence::for_task(&run.task);
+    app.agents.push(run);
+
+    app.set_run_done_summary(
+        0,
+        &serde_json::json!({
+            "summary": "deployed and smoke-tested production",
+            "delivery": {
+                "required": false,
+                "kind": "web",
+                "status": "verified",
+                "target": "https://example.test",
+                "revision": "abc123",
+                "verifiedAt": "2026-07-17T12:00:00Z",
+                "checks": ["homepage returned 200"]
+            }
+        }),
+    );
+
+    assert_eq!(
+        app.agents[0].done_summary.as_deref(),
+        Some("deployed and smoke-tested production")
+    );
+    assert!(
+        app.agents[0].delivery.required,
+        "the agent cannot waive delivery"
+    );
+    assert!(app.agents[0].delivery.is_verified());
+
+    let loaded = load_persisted_agents(&repo)
+        .into_iter()
+        .find(|run| run.id == "ship-note")
+        .expect("delivery run reloads");
+    assert!(loaded.delivery.is_verified());
+    assert_eq!(loaded.delivery.revision.as_deref(), Some("abc123"));
+    let _ = fs::remove_dir_all(&repo);
+}
+
+#[cfg(not(windows))]
+#[test]
+fn graceful_shutdown_persists_paused_and_removes_process_owner() {
+    let repo = unique_test_repo("shutdown-paused");
+    let mut app = App::new();
+    app.cwd = repo.clone();
+    let pane = TerminalPane::spawn_shell_or_command(
+        Some(TerminalCommand::with_args("/bin/sh", ["-lc", "sleep 30"])),
+        TerminalPaneOptions::default(),
+    )
+    .expect("spawn live PTY");
+    let mut run = test_agent_run("pause-1", "keep working");
+    run.cwd = repo.clone();
+    run.terminal = Some(pane);
+    save_native_run_record(&repo, &run).expect("save live run");
+    app.agents.push(run);
+
+    app.shutdown();
+
+    assert_eq!(app.agents[0].status, AgentStatus::Paused);
+    assert!(app.agents[0].terminal.is_none());
+    let raw = fs::read_to_string(native_run_dir(&repo, "pause-1").join("run.json"))
+        .expect("read paused record");
+    let record: serde_json::Value = serde_json::from_str(&raw).expect("parse paused record");
+    assert_eq!(record["status"], "paused");
+    assert!(
+        record.get("process").is_none(),
+        "dead PTY ownership is removed"
+    );
+    let _ = fs::remove_dir_all(&repo);
+}
+
+#[cfg(not(windows))]
+#[test]
+fn enter_on_paused_rows_resumes_worker_and_main_sessions() {
+    let _env = env_guard();
+    let repo = unique_test_repo("resume-paused");
+    let fake = repo.join("fake-claude.sh");
+    write_fake_bin(&fake, "#!/bin/sh\nsleep 30\n");
+    std::env::set_var("RUDDER_CLAUDE_BIN", &fake);
+
+    let mut app = App::new();
+    app.cwd = repo.clone();
+    let mut worker = test_agent_run("paused-worker", "continue the worker");
+    worker.cwd = repo.clone();
+    worker.status = AgentStatus::Paused;
+    worker.session_id = Some("11111111-1111-4111-8111-111111111111".to_string());
+    app.agents.push(worker);
+    app.handle_agents_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(app.agents[0].status, AgentStatus::Running);
+    assert!(app.agents[0].terminal.is_some());
+    assert_eq!(
+        app.agents[0].session_id.as_deref(),
+        Some("11111111-1111-4111-8111-111111111111")
+    );
+    app.agents[0].terminal = None;
+
+    let mut main = create_main_agent(
+        &repo,
+        Backend::Claude,
+        "sonnet",
+        None,
+        "continue the main task",
+    );
+    main.status = AgentStatus::Paused;
+    main.session_id = Some("22222222-2222-4222-8222-222222222222".to_string());
+    app.agents = vec![main];
+    app.selected_agent = 0;
+    app.handle_agents_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(app.agents[0].status, AgentStatus::Running);
+    assert!(app.agents[0].terminal.is_some());
+    assert_eq!(
+        app.agents[0].session_id.as_deref(),
+        Some("22222222-2222-4222-8222-222222222222")
+    );
+    assert_eq!(app.notice.as_deref(), Some("resumed paused main session"));
+    app.agents[0].terminal = None;
+
+    std::env::remove_var("RUDDER_CLAUDE_BIN");
+    let _ = fs::remove_dir_all(&repo);
+}
+
+#[test]
+fn main_prompt_is_an_end_to_end_delivery_contract() {
+    let prompt = main_task_prompt("deploy the app");
+    assert!(prompt.contains("single end-to-end owner"));
+    assert!(prompt.contains("Pushing alone is not deployment"));
+    assert!(prompt.contains("Computer Use"));
+    assert!(prompt.contains("verifiedAt"));
+    assert!(prompt.ends_with("deploy the app"));
+}
+
+#[test]
 fn resume_commands_reuse_saved_session_ids() {
     // Builds commands via claude_program()/codex_program() (which read RUDDER_*_BIN), so
     // serialize against the bin-injecting orchestrator/harness tests.
@@ -5351,11 +5541,11 @@ fn resume_commands_reuse_saved_session_ids() {
     assert!(codex_command
         .args
         .windows(2)
-        .any(|window| window[0] == "-c" && window[1] == "features.plugins=false"));
+        .any(|window| window[0] == "-c" && window[1] == "features.plugins=true"));
     assert!(codex_command
         .args
         .windows(2)
-        .any(|window| window[0] == "-c" && window[1] == "features.computer_use=false"));
+        .any(|window| window[0] == "-c" && window[1] == "features.computer_use=true"));
     assert!(codex_command
         .args
         .iter()
@@ -6284,6 +6474,7 @@ fn delete_agent_requires_second_d() {
         workspace_name: None,
         jj_change_id: None,
         integration: IntegrationEvidence::default(),
+        delivery: DeliveryEvidence::default(),
         session_id: None,
         terminal: None,
         terminal_size: None,
@@ -8418,9 +8609,7 @@ fn write_rudder_context_includes_global_job_snapshot() {
         .split("## Completed local Rudder agents")
         .next()
         .unwrap();
-    assert!(
-        ready_section.contains("run-claude node=n3 mode=execute status=review backend=claude")
-    );
+    assert!(ready_section.contains("run-claude node=n3 mode=execute status=review backend=claude"));
     assert!(ready_section.contains("integration=ready"));
     assert!(!ready_section.contains("run-merged"));
     let completed_section = text
@@ -9282,7 +9471,7 @@ fn task_input_sends_enter_key_to_live_orchestrator() {
 
 #[cfg(not(windows))]
 #[test]
-fn completed_plan_launch_followup_starts_fresh_dag_not_old_conductor() {
+fn completed_plan_launch_followup_starts_main_owner_not_old_conductor() {
     let _env = env_guard();
     let repo = unique_test_repo("completed-plan-fresh-dag");
     let old_capture = repo.join("old-orchestrator-input.txt");
@@ -9331,22 +9520,20 @@ fn completed_plan_launch_followup_starts_fresh_dag_not_old_conductor() {
         !old_capture.exists(),
         "work-launching follow-up was not typed into the completed plan's conductor"
     );
-    let planners: Vec<&AgentRun> = app
-        .agents
-        .iter()
-        .filter(|run| run.is_orchestrator())
-        .collect();
-    assert_eq!(planners.len(), 1, "stale orchestrator retired");
-    let planner = planners[0];
-    assert_eq!(planner.id, app.agents[app.selected_agent].id);
-    assert_eq!(planner.mode, AgentMode::RudderPlan);
-    assert_eq!(
-        planner.task, "launch separate agents to fix this then merge them all",
-        "a fresh DAG planner owns the follow-up request"
-    );
+    let selected = &app.agents[app.selected_agent];
     assert!(
-        !planner.reconcile_planner,
-        "completed-plan implementation follow-up starts an initial planner"
+        selected.is_main(),
+        "plain follow-up gets one end-to-end owner"
+    );
+    assert_eq!(selected.mode, AgentMode::Main);
+    assert_eq!(
+        selected.current_prompt, "launch separate agents to fix this then merge them all",
+        "the main owner receives the full follow-up request"
+    );
+    assert_eq!(
+        app.agents.iter().filter(|run| run.is_main()).count(),
+        1,
+        "plain routing creates only one main owner"
     );
 
     for run in &mut app.agents {
@@ -9781,10 +9968,9 @@ fn completed_plan_does_not_hijack_a_new_task_into_refine() {
 
 #[cfg(not(windows))]
 #[test]
-fn default_task_input_goes_to_orchestrator() {
-    // Plain task input (no /ask) is handed to the orchestrator, which plans and
-    // implements it. There is no local one-off-vs-DAG classifier: the orchestrator
-    // is the default and /ask is the explicit one-off escape hatch.
+fn default_task_input_goes_to_one_end_to_end_main_owner() {
+    // Plain task input is owned end-to-end in the main checkout. /plan is the
+    // explicit isolated DAG path and /ask remains the explicit one-off path.
     let _env = env_guard();
     let repo = unique_test_repo("default-orch");
     let worker = repo.join("fake-worker.sh");
@@ -9798,17 +9984,15 @@ fn default_task_input_goes_to_orchestrator() {
 
     app.start_task_from_input("build the first feature for the app");
 
-    let spawned = app.agents.last().expect("an orchestrator spawned");
+    let spawned = app.agents.last().expect("a main owner spawned");
     assert_eq!(
         spawned.mode,
-        AgentMode::RudderPlan,
-        "plain input starts the orchestrator, not a one-off"
+        AgentMode::Main,
+        "plain input starts a main owner, not a planner"
     );
-    assert!(!spawned.is_oneoff(), "the default is no longer a one-off");
-    assert!(
-        !spawned.reconcile_planner,
-        "a fresh task starts the initial orchestrator planner"
-    );
+    assert!(spawned.is_main());
+    assert!(!spawned.is_oneoff());
+    assert!(!spawned.is_orchestrator());
 
     std::env::remove_var("RUDDER_CODEX_BIN");
     let _ = fs::remove_dir_all(&repo);
@@ -10647,7 +10831,10 @@ fn planner_spinner_only_marks_dirty_when_animation_frame_is_due() {
     assert!(!app.dirty, "an unchanged spinner must not redraw the TUI");
 
     assert!(app.advance_spinner_if_due(start + SPINNER_FRAME_INTERVAL));
-    assert!(app.dirty, "the next visible spinner frame triggers one redraw");
+    assert!(
+        app.dirty,
+        "the next visible spinner frame triggers one redraw"
+    );
 }
 
 #[test]
@@ -13090,9 +13277,17 @@ fn final_gate_treats_clean_jj_resolve_list_as_passing() {
     assert!(verification_passed(true, false, ""));
     assert!(verification_passed(true, false, "\n  \n"));
     // Real conflicts: jj lists them on stdout -> must fail.
-    assert!(!verification_passed(true, true, "src/a.rs    2-sided conflict\n"));
+    assert!(!verification_passed(
+        true,
+        true,
+        "src/a.rs    2-sided conflict\n"
+    ));
     // Exit-code commands (git diff --check, npm test) judge on exit status only.
-    assert!(verification_passed(false, true, "anything on stdout is fine"));
+    assert!(verification_passed(
+        false,
+        true,
+        "anything on stdout is fine"
+    ));
     assert!(!verification_passed(false, false, ""));
 }
 
@@ -13107,13 +13302,19 @@ fn forget_jj_workspace_refuses_paths_outside_rudder_worktrees() {
     std::fs::create_dir_all(&danger).unwrap();
     let err = forget_jj_workspace(&repo, "rudder-x", &danger);
     assert!(err.is_err(), "must refuse a path outside .rudder-worktrees");
-    assert!(danger.exists(), "the refused directory must be left untouched");
+    assert!(
+        danger.exists(),
+        "the refused directory must be left untouched"
+    );
     // A path under .rudder-worktrees is allowed (jj forget is best-effort; the
     // dir removal is what we assert).
     let ok_path = repo.join(".rudder-worktrees").join("proj").join("node-abc");
     std::fs::create_dir_all(&ok_path).unwrap();
     let _ = forget_jj_workspace(&repo, "rudder-y", &ok_path);
-    assert!(!ok_path.exists(), "an in-tree workspace directory is removed");
+    assert!(
+        !ok_path.exists(),
+        "an in-tree workspace directory is removed"
+    );
     let _ = std::fs::remove_dir_all(&repo);
 }
 
@@ -13125,11 +13326,18 @@ fn finalize_node_reviews_marks_reviewed_and_fails_open() {
     reviewer.mode = AgentMode::ReviewAll;
     reviewer.status = AgentStatus::Done;
     app.agents.push(reviewer);
-    app.node_reviewers.insert("rev-1".to_string(), "n0".to_string());
+    app.node_reviewers
+        .insert("rev-1".to_string(), "n0".to_string());
 
     app.finalize_node_reviews();
-    assert!(app.reviewed_nodes.contains("n0"), "node marked reviewed -> eligible to merge");
-    assert!(!app.agents.iter().any(|r| r.id == "rev-1"), "transient reviewer row removed");
+    assert!(
+        app.reviewed_nodes.contains("n0"),
+        "node marked reviewed -> eligible to merge"
+    );
+    assert!(
+        !app.agents.iter().any(|r| r.id == "rev-1"),
+        "transient reviewer row removed"
+    );
     assert!(app.node_reviewers.is_empty());
 
     // Fail open: a Failed reviewer must still mark the node reviewed so a broken
@@ -13138,9 +13346,13 @@ fn finalize_node_reviews_marks_reviewed_and_fails_open() {
     reviewer2.mode = AgentMode::ReviewAll;
     reviewer2.status = AgentStatus::Failed;
     app.agents.push(reviewer2);
-    app.node_reviewers.insert("rev-2".to_string(), "n1".to_string());
+    app.node_reviewers
+        .insert("rev-2".to_string(), "n1".to_string());
     app.finalize_node_reviews();
-    assert!(app.reviewed_nodes.contains("n1"), "failed review fails open");
+    assert!(
+        app.reviewed_nodes.contains("n1"),
+        "failed review fails open"
+    );
 }
 
 #[test]
@@ -13153,11 +13365,15 @@ fn maybe_start_node_review_respects_disable_and_serializes() {
     node.workspace_name = Some("rudder-n0".to_string());
     app.agents.push(node);
     app.maybe_start_node_review();
-    assert!(app.node_reviewers.is_empty(), "disabled: no reviewer spawned");
+    assert!(
+        app.node_reviewers.is_empty(),
+        "disabled: no reviewer spawned"
+    );
 
     // Enabled but a reviewer already tracked -> serialize (no second spawn).
     app.node_review_enabled = true;
-    app.node_reviewers.insert("rev-x".to_string(), "n9".to_string());
+    app.node_reviewers
+        .insert("rev-x".to_string(), "n9".to_string());
     let before = app.agents.len();
     app.maybe_start_node_review();
     assert_eq!(app.agents.len(), before, "one reviewer at a time");
@@ -13184,7 +13400,10 @@ fn gc_orphan_workspaces_protects_live_and_reaps_orphans() {
 
     app.gc_orphan_workspaces();
 
-    assert!(live_dir.exists(), "a live agent's workspace must never be reaped");
+    assert!(
+        live_dir.exists(),
+        "a live agent's workspace must never be reaped"
+    );
     assert!(!orphan_dir.exists(), "an orphan workspace dir is removed");
 
     std::env::remove_var("RUDDER_WORKTREE_GC_GRACE_SECS");

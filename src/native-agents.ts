@@ -1,5 +1,5 @@
 import type { RunRecord } from "./types.js";
-import { CODEX_RUDDER_CONFIG_ARGS } from "./codex-binary.js";
+import { CODEX_RUDDER_PLANNER_CONFIG_ARGS, CODEX_RUDDER_WORKER_CONFIG_ARGS } from "./codex-binary.js";
 import { normalizeEffortForBackend } from "./effort.js";
 import { PLAN_MODE_CONTRACT } from "./plan-mode.js";
 import { taskDisplayLabel } from "./task-summary.js";
@@ -60,7 +60,7 @@ function codexArgs(run: RunRecord, prompt: string, contract: string, codexComman
     "--dangerously-bypass-approvals-and-sandbox",
     "--enable",
     "goals",
-    ...CODEX_RUDDER_CONFIG_ARGS,
+    ...CODEX_RUDDER_WORKER_CONFIG_ARGS,
     effort ? "-c" : undefined,
     effort ? `model_reasoning_effort="${effort}"` : undefined,
     "--cd",
@@ -119,7 +119,7 @@ function codexPlanArgs(run: RunRecord, prompt: string, codexCommand = "codex"): 
     "--enable",
     "goals",
     "--search",
-    ...CODEX_RUDDER_CONFIG_ARGS,
+    ...CODEX_RUDDER_PLANNER_CONFIG_ARGS,
     effort ? "-c" : undefined,
     effort ? `model_reasoning_effort="${effort}"` : undefined,
     "--cd",

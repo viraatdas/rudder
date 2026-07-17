@@ -1146,10 +1146,32 @@ export function columnForStatus(status: RunStatus): BoardNode["column"] {
     case "merged":
     case "failed":
     case "cancelled":
+    case "paused":
       return "done";
     default:
       return "todo";
   }
+}
+
+export function hasVerifiedDelivery(run: RunRecord): boolean {
+  const delivery = run.delivery;
+  return Boolean(
+    delivery?.required &&
+      (delivery.status === "deployed" || delivery.status === "verified") &&
+      delivery.kind?.trim() &&
+      delivery.target?.trim() &&
+      delivery.verifiedAt?.trim() &&
+      delivery.checks?.length,
+  );
+}
+
+/** Process completion is terminal for direct/main-checkout work, but a requested
+ * delivery remains in review until its structured target + smoke proof exists. */
+export function columnForRun(run: RunRecord): BoardNode["column"] {
+  if (run.status === "completed" && !run.worktree.enabled) {
+    return run.delivery?.required && !hasVerifiedDelivery(run) ? "review" : "done";
+  }
+  return columnForStatus(run.status);
 }
 
 function userUpdates(run: RunRecord): BoardNode["updates"] {
@@ -1169,7 +1191,7 @@ function projectRunToNode(run: RunRecord, lastLine: string | null, graphNode?: T
     runId: run.id,
     title: graphNode?.title || run.taskSummary || run.task,
     status: graphNode?.status ?? run.status,
-    column: graphNode ? columnForNodeStatus(graphNode.status) : columnForStatus(run.status),
+    column: graphNode ? columnForNodeStatus(graphNode.status) : columnForRun(run),
     blocked: graphNode?.status === "blocked",
     backend: run.backend,
     model: run.model,
@@ -1183,6 +1205,7 @@ function projectRunToNode(run: RunRecord, lastLine: string | null, graphNode?: T
       ? { path: run.worktree.path, workspaceName: run.worktree.workspaceName }
       : null,
     merge: run.merge ?? null,
+    delivery: run.delivery,
     updates: userUpdates(run),
   };
 }
@@ -1309,7 +1332,7 @@ async function buildProjectSummary(project: ProjectEntry): Promise<ProjectSummar
     if (run.status === "failed" || run.status === "cancelled") {
       counts.failed += 1;
     } else {
-      counts[columnForStatus(run.status)] += 1;
+      counts[columnForRun(run)] += 1;
     }
     const stamp = run.updatedAt || run.createdAt;
     if (stamp && stamp > lastActivityAt) {

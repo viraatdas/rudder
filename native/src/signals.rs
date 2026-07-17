@@ -262,7 +262,7 @@ fn set_executable(_path: &Path) {}
 /// Append the official-signal launch flags to an already-built worker command.
 /// Claude gets `--settings <file>` (Stop + idle Notification hooks); Codex gets a
 /// trailing `-c notify=["<script>"]` that OVERRIDES the earlier `notify=[]` baked
-/// by `push_codex_rudder_config_overrides` (last `-c` wins). No-op for non-worker
+/// by the Codex capability profile (last `-c` wins). No-op for non-worker
 /// modes. Config-generation failure is surfaced by the poll loop.
 pub(crate) fn augment_worker_command(
     command: &mut TerminalCommand,
@@ -283,7 +283,7 @@ pub(crate) fn augment_worker_command(
         }
         Backend::Codex => {
             if let Some(path) = signals.codex_notify {
-                // Replace the `notify=[]` that push_codex_rudder_config_overrides baked
+                // Replace the `notify=[]` that the Codex worker profile baked
                 // in (its preceding `-c` stays), so this works regardless of how Codex
                 // resolves duplicate `-c` keys.
                 let replacement = format!("notify=[\"{}\"]", path.display());

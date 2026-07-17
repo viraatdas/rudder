@@ -185,7 +185,7 @@ pub(crate) fn codex_fork_command(
         "goals".to_string(),
         "--dangerously-bypass-approvals-and-sandbox".to_string(),
     ];
-    push_codex_rudder_config_overrides(&mut args, effort);
+    push_codex_worker_config_overrides(&mut args, effort);
     if !model.trim().is_empty() {
         args.push("-m".to_string());
         args.push(model.to_string());
@@ -203,7 +203,7 @@ pub(crate) fn codex_resume_command(run: &AgentRun, session_id: &str) -> Terminal
             args.push("--enable".to_string());
             args.push("goals".to_string());
             args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
-            push_codex_rudder_config_overrides(&mut args, run.effort);
+            push_codex_worker_config_overrides(&mut args, run.effort);
         }
         AgentMode::RudderPlan if run.interactive_orchestrator => {
             // A live conductor must be able to update RUDDER.md/RUDDER_SHARED.md.
@@ -219,7 +219,7 @@ pub(crate) fn codex_resume_command(run: &AgentRun, session_id: &str) -> Terminal
             args.push("--ask-for-approval".to_string());
             args.push("never".to_string());
             args.push("--search".to_string());
-            push_codex_rudder_config_overrides(&mut args, run.effort);
+            push_codex_planner_config_overrides(&mut args, run.effort);
         }
     }
     if !run.model.trim().is_empty() {
@@ -286,7 +286,7 @@ pub(crate) fn rudder_plan_refine_command(
                 "resume".to_string(),
                 "--json".to_string(),
             ];
-            push_codex_rudder_config_overrides(&mut args, effort);
+            push_codex_planner_config_overrides(&mut args, effort);
             if !model.trim().is_empty() {
                 args.push("-m".to_string());
                 args.push(model.to_string());
@@ -342,7 +342,7 @@ pub(crate) fn agent_command_with_orchestrator_mode(
             if task.trim().is_empty() {
                 None
             } else {
-                Some(execution_prompt(task))
+                Some(main_task_prompt(task))
             }
         }
         AgentMode::OneOff => Some(oneoff_prompt(task)),
@@ -459,7 +459,7 @@ pub(crate) fn agent_command_with_orchestrator_mode(
                     "--sandbox".to_string(),
                     "read-only".to_string(),
                 ];
-                push_codex_rudder_config_overrides(&mut args, effort);
+                push_codex_planner_config_overrides(&mut args, effort);
                 if !model.trim().is_empty() {
                     args.push("-m".to_string());
                     args.push(model.to_string());
@@ -485,7 +485,14 @@ pub(crate) fn agent_command_with_orchestrator_mode(
                     args.push("--search".to_string());
                 }
             }
-            push_codex_rudder_config_overrides(&mut args, effort);
+            match mode {
+                AgentMode::Execute | AgentMode::ReviewAll | AgentMode::Main | AgentMode::OneOff => {
+                    push_codex_worker_config_overrides(&mut args, effort);
+                }
+                AgentMode::Plan | AgentMode::RudderPlan => {
+                    push_codex_planner_config_overrides(&mut args, effort);
+                }
+            }
             if !model.trim().is_empty() {
                 args.push("-m".to_string());
                 args.push(model.to_string());
@@ -577,21 +584,14 @@ pub(crate) fn push_codex_interactive_orchestrator_args(
     args.push("--ask-for-approval".to_string());
     args.push("never".to_string());
     args.push("--search".to_string());
-    push_codex_rudder_config_overrides(args, effort);
+    push_codex_planner_config_overrides(args, effort);
 }
 
-pub(crate) fn push_codex_rudder_config_overrides(
-    args: &mut Vec<String>,
-    effort: Option<EffortLevel>,
-) {
+fn push_codex_common_config_overrides(args: &mut Vec<String>, effort: Option<EffortLevel>) {
     // Rudder workers run Codex as a child process, so do not inherit desktop-app
     // notification hooks that expect the official signed app launch chain.
     args.push("-c".to_string());
     args.push("notify=[]".to_string());
-    args.push("-c".to_string());
-    args.push("features.plugins=false".to_string());
-    args.push("-c".to_string());
-    args.push("features.computer_use=false".to_string());
     args.push("-c".to_string());
     args.push("model_reasoning_summary=\"detailed\"".to_string());
     args.push("-c".to_string());
@@ -600,6 +600,34 @@ pub(crate) fn push_codex_rudder_config_overrides(
         args.push("-c".to_string());
         args.push(format!("model_reasoning_effort=\"{}\"", effort.as_str()));
     }
+}
+
+/// Implementation, review, and shipping agents match a direct Codex session:
+/// user-installed plugins and Computer Use are available inside the already
+/// unrestricted worker. Explicit true values prevent a stale global setting from
+/// silently removing capabilities Rudder promises to workers.
+pub(crate) fn push_codex_worker_config_overrides(
+    args: &mut Vec<String>,
+    effort: Option<EffortLevel>,
+) {
+    push_codex_common_config_overrides(args, effort);
+    args.push("-c".to_string());
+    args.push("features.plugins=true".to_string());
+    args.push("-c".to_string());
+    args.push("features.computer_use=true".to_string());
+}
+
+/// Planners and conductors remain externally side-effect-free. Filesystem
+/// sandboxing alone cannot constrain a plugin or Computer Use action.
+pub(crate) fn push_codex_planner_config_overrides(
+    args: &mut Vec<String>,
+    effort: Option<EffortLevel>,
+) {
+    push_codex_common_config_overrides(args, effort);
+    args.push("-c".to_string());
+    args.push("features.plugins=false".to_string());
+    args.push("-c".to_string());
+    args.push("features.computer_use=false".to_string());
 }
 
 pub(crate) fn codex_program() -> String {
@@ -666,6 +694,7 @@ pub(crate) fn review_all_run(
         workspace_name: worktree.workspace_name.clone(),
         jj_change_id: worktree.jj_change_id.clone(),
         integration: IntegrationEvidence::default(),
+        delivery: DeliveryEvidence::default(),
         session_id,
         terminal: None,
         terminal_size: None,

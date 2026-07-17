@@ -31,6 +31,190 @@ pub(crate) struct IntegrationEvidence {
     pub(crate) pushed: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum DeliveryStatus {
+    #[default]
+    NotRequested,
+    Pending,
+    Deployed,
+    Verified,
+    Blocked,
+    Failed,
+}
+
+impl DeliveryStatus {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::NotRequested => "not-requested",
+            Self::Pending => "pending",
+            Self::Deployed => "deployed",
+            Self::Verified => "verified",
+            Self::Blocked => "blocked",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Self {
+        match value {
+            "pending" | "running" | "pushed" => Self::Pending,
+            "deployed" => Self::Deployed,
+            "verified" => Self::Verified,
+            "blocked" => Self::Blocked,
+            "failed" => Self::Failed,
+            _ => Self::NotRequested,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct DeliveryEvidence {
+    pub(crate) required: bool,
+    pub(crate) kind: Option<String>,
+    pub(crate) status: DeliveryStatus,
+    pub(crate) target: Option<String>,
+    pub(crate) url: Option<String>,
+    pub(crate) app_path: Option<String>,
+    pub(crate) provider: Option<String>,
+    pub(crate) revision: Option<String>,
+    pub(crate) deployment_id: Option<String>,
+    pub(crate) version: Option<String>,
+    pub(crate) verified_at: Option<String>,
+    pub(crate) checks: Vec<String>,
+}
+
+impl DeliveryEvidence {
+    pub(crate) fn for_task(task: &str) -> Self {
+        if task_requests_delivery(task) {
+            Self {
+                required: true,
+                status: DeliveryStatus::Pending,
+                ..Self::default()
+            }
+        } else {
+            Self::default()
+        }
+    }
+
+    pub(crate) fn is_verified(&self) -> bool {
+        self.required
+            && matches!(
+                self.status,
+                DeliveryStatus::Deployed | DeliveryStatus::Verified
+            )
+            && self
+                .kind
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            && self
+                .target
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            && self
+                .verified_at
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            && !self.checks.is_empty()
+    }
+
+    /// Parse the structured `delivery` object written by `rudder done` or stored
+    /// in run.json. A URL/app path also serves as the human-visible target so an
+    /// agent cannot accidentally provide evidence that the dashboard then hides.
+    pub(crate) fn from_json(value: &serde_json::Value, default_required: bool) -> Option<Self> {
+        let object = value.as_object()?;
+        let text = |key: &str| {
+            object
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+        };
+        let url = text("url");
+        let app_path = text("appPath").or_else(|| text("app_path"));
+        let target = text("target")
+            .or_else(|| url.clone())
+            .or_else(|| app_path.clone());
+        let checks = object
+            .get("checks")
+            .and_then(serde_json::Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let required = object
+            .get("required")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(default_required);
+        let status = object
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .map(DeliveryStatus::parse)
+            .unwrap_or(if required {
+                DeliveryStatus::Pending
+            } else {
+                DeliveryStatus::NotRequested
+            });
+        Some(Self {
+            required,
+            kind: text("kind"),
+            status,
+            target,
+            url,
+            app_path,
+            provider: text("provider"),
+            revision: text("revision"),
+            deployment_id: text("deploymentId").or_else(|| text("deployment_id")),
+            version: text("version"),
+            verified_at: text("verifiedAt").or_else(|| text("verified_at")),
+            checks,
+        })
+    }
+
+    pub(crate) fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "required": self.required,
+            "kind": self.kind,
+            "status": self.status.as_str(),
+            "target": self.target,
+            "url": self.url,
+            "appPath": self.app_path,
+            "provider": self.provider,
+            "revision": self.revision,
+            "deploymentId": self.deployment_id,
+            "version": self.version,
+            "verifiedAt": self.verified_at,
+            "checks": self.checks,
+        })
+    }
+}
+
+/// Conservative explicit-intent detector. Delivery is never inferred from an
+/// ordinary implementation request, but common direct requests such as “deploy
+/// it”, “ship a release”, and “install/launch the app” become proof-gated.
+pub(crate) fn task_requests_delivery(task: &str) -> bool {
+    let text = task.to_ascii_lowercase();
+    [
+        "deploy",
+        "make it live",
+        "ship it",
+        "ship this",
+        "publish",
+        "release",
+        "install the app",
+        "install it",
+        "launch the app",
+        "push and deploy",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum FinalGateStatus {
@@ -62,7 +246,11 @@ pub(crate) struct VerificationCommand {
 /// Judging that command on its exit status made the final gate report
 /// "jj conflicts failed: No conflicts found at this revision" exactly when the
 /// tree was conflict-free, so the gate could never go green.
-pub(crate) fn verification_passed(require_empty_stdout: bool, exit_success: bool, stdout: &str) -> bool {
+pub(crate) fn verification_passed(
+    require_empty_stdout: bool,
+    exit_success: bool,
+    stdout: &str,
+) -> bool {
     if require_empty_stdout {
         stdout.trim().is_empty()
     } else {
@@ -119,7 +307,19 @@ pub(crate) fn verification_commands(cwd: &Path) -> Vec<VerificationCommand> {
 
 impl AgentRun {
     pub(crate) fn lifecycle_label(&self) -> &'static str {
-        if self.merge_resolver && self.status == AgentStatus::Running {
+        if self.status == AgentStatus::Done && self.delivery.is_verified() {
+            "deployed"
+        } else if self.status == AgentStatus::Done
+            && self.delivery.required
+            && matches!(
+                self.delivery.status,
+                DeliveryStatus::Blocked | DeliveryStatus::Failed
+            )
+        {
+            "delivery blocked"
+        } else if self.delivery.required && self.status == AgentStatus::Done {
+            "delivery proof needed"
+        } else if self.merge_resolver && self.status == AgentStatus::Running {
             "resolving"
         } else if self.merge_conflict {
             "integration-blocked"
@@ -136,9 +336,11 @@ impl AgentRun {
                 // completion path calls it "a task entering review"). The old
                 // "verifying" label read as active work when the agent had in
                 // fact finished and was awaiting review/merge.
+                AgentStatus::Done if self.is_main() || self.is_oneoff() => "completed",
                 AgentStatus::Done => "review",
                 AgentStatus::Failed => "failed",
                 AgentStatus::Stopped => "cancelled",
+                AgentStatus::Paused => "paused",
                 AgentStatus::Orphaned => "orphaned",
                 AgentStatus::Migrated => "cloud-owned",
                 AgentStatus::Merged => unreachable!(),

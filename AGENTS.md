@@ -258,14 +258,18 @@ Implemented in `src/run-manager.ts`.
 The important shapes:
 - `RunRecord`: the full per-run document. Status union is
   `created | running | steering | verifying | completed | failed | cancelled |
-  orphaned | migrated | merge-conflict | merged`. Native also persists a
+  paused | orphaned | migrated | merge-conflict | merged`. Native also persists a
   `lifecyclePhase` (`working`, `verifying`, `integrating`, `resolving`,
-  `merged-locally`, `pushed`, `orphaned`, or `cloud-owned`). Holds
+  `merged-locally`, `pushed`, `deployed`, `delivery proof needed`, `orphaned`, or
+  `cloud-owned`). Holds
   `worktree{enabled,path,branch?,workspaceName?,jjChangeId?}`,
   `vcs:"jj"|"git"`, `process{pid,...}`, `turns[]`, `autoSteer`,
   `session{nativeSessionId,...}`, `terminal{kind:"tmux",...}`, `verification`,
   `merge` (with `operationId`/`mergeChangeId`), `sync`,
-  `resolverFor?`/`resolverRunId?`, `taskSummary`/`taskSummaryLlm`.
+  `resolverFor?`/`resolverRunId?`, `taskSummary`/`taskSummaryLlm`, and optional
+  `delivery` evidence (`kind`, status, target/url/appPath, provider, revision,
+  deployment id/version, verification time, and smoke checks). Process completion,
+  local integration, push, and verified delivery are deliberately separate facts.
 - `RudderConfig`: `defaultBackend`, `lastUsedBackend`, `mergeStrategy`,
   `runPolicy`, `backends{claude,codex,acpx}` (each `BackendConfig` with
   `model`/`effort`/`reasoningEffort`/`profileId`).
@@ -372,13 +376,12 @@ planner every tick. Completion of an interactive agent is declared once it has l
 idle for `READY_GRACE` = 3200 ms (or on clean process exit), which is robust against a
 TUI that repaints while idle.
 
-**Temporary perf diagnostics.** During the worker/review scroll-latency pass, the native
-TUI writes default-on NDJSON timing logs to `~/.rudder/native-perf.ndjson` unless
-`RUDDER_NATIVE_PERF=0`. This logs scroll routing, queued event drain counts, `poll_agents`,
+**Perf diagnostics.** The native TUI writes NDJSON timing logs only when
+`RUDDER_NATIVE_PERF=1`; normal runs do no perf-log I/O. This logs scroll routing,
+queued event drain counts, `poll_agents`,
 PTY drain/parse, worker/review line rendering, `terminal.draw`, and frame totals. Logs
 rotate at 10MB, keep three rotated files, and startup deletes perf logs older than three
-days. Treat this as temporary instrumentation to remove or make opt-in after the scroll
-performance pass.
+days.
 
 ### Panes and focus
 `FocusPane = Agents | Worker | Task`.
@@ -393,7 +396,16 @@ performance pass.
   screen apps are handled in `pty_terminal.rs`.
 - **Task**: an input line that starts the next agent. Supports history (`Up`/
   `Down`), readline-style editing (Ctrl+A/E/U/K/W/D/H, Alt/Ctrl+Backspace word
-  delete, Alt+Left/Right word nav), and slash-command completion.
+  delete, Alt+Left/Right word nav), and slash-command completion. Fresh plain input
+  starts or continues exactly one `AgentMode::Main` end-to-end owner in the real
+  checkout. `/plan` explicitly opts into the isolated DAG; `/run` starts one isolated
+  worker; `/ask` starts a separate direct one-off.
+
+**Graceful shutdown truth.** A dashboard-owned live PTY becomes `Paused` before it is
+dropped, and native persistence removes the `process` object whenever no PTY is owned.
+Never persist `Running` after intentionally killing the terminal. `Enter` on a paused
+row resumes it, using the saved backend session when available; an uncontrolled record
+that merely claims `Running` after a crash is reconciled as orphaned instead.
 
 **Cross-referencing the panes (v2.4.0).** Plan node ids (`n0`, `n1`, …) are the
 join key everywhere: the orchestrator DAG row shows `n2 <title>`, the matching
@@ -731,9 +743,13 @@ is a separate piece of work.
 - **The native dashboard reads `run.json` directly** and skips the TS load path,
   so it does not see the TS-side background summarizer's in-memory state. Persist
   through `saveRunRecord` and let the native side re-read.
-- **`rudder-codex` wrapper.** Codex always runs through the wrapped binary
-  (`src/codex-binary.ts`) so Rudder controls config/auth without mutating the
-  user's global Codex install.
+- **Codex binary and capability profiles.** `src/codex-binary.ts` prefers the user's
+  current `codex` on PATH (matching a direct session), with the checksum-pinned managed
+  `rudder-codex` binary only as a compatibility fallback; `RUDDER_CODEX_BIN` remains the
+  explicit override. Implementation/review/resume/shipping commands set
+  `features.plugins=true` and `features.computer_use=true`. Read-only planner/conductor
+  commands set both false. Keep the TS and Rust command builders in parity and retain
+  `notify=[]` before `signals::augment_worker_command` installs the per-run notifier.
 - **Style.** No em dashes in copy or UI strings. Avoid "massively parallel"
   framing in marketing copy.
 - **`dist/` is build output, not committed** (removed from git in PR #15).
@@ -928,7 +944,10 @@ The planner UX went through several iterations; these are the settled decisions 
   ABOVE the live PTY; keys forward to the PTY (converse). Unlike the retired PlanFront, the
   CC writes a DAG file so the DAG actually builds + renders. **SELF-LAUNCH (hardened, 1.21.0):**
   after the user approves in chat, the orchestrator signals approval and Rudder launches.
-  `App::scan_orchestrator_markers` (poll_agents) checks, in order: (1) PRIMARY — the orchestrator
+  `App::scan_orchestrator_markers` (poll_agents) checks even after the conductor's turn
+  has completed, because `RUDDER.md` is the durable control channel; a marker must not
+  strand merely because the PTY became Done before the next heartbeat. It checks, in
+  order: (1) PRIMARY — the orchestrator
   WROTE a `RUDDER_APPROVE_PLAN` line INTO its plan file (a structured Write, exact content, no
   TUI-rendering fragility); (2) FALLBACK — the marker printed in the orchestrator PTY
   (`output_has_approve_marker`, exact full-line match after ANSI + markdown strip). Either calls
@@ -996,16 +1015,16 @@ Signal hygiene: hook writes are ATOMIC (`printf > tmp && mv`, v2.6.x) so the pol
 never reads a torn JSON, and `cleanup_run_signals` removes a run's three signal files on
 agent delete.
 
-### 14.4c Default task input: orchestrator by default, `/run` for one worker, `/ask` for direct one-off
-Automatic local routing misclassified too many ordinary requests. A FRESH task
-(no active plan) now has a deterministic contract:
+### 14.4c Default task input: one end-to-end main owner; `/plan` is explicit
+A FRESH task (no active plan) has a deterministic ownership contract:
 
-- **Plain task input** goes to `start_rudder_plan_task`. It starts the interactive
-  orchestrator planner (`AgentMode::RudderPlan`) and lets that model decide whether
-  to answer, inspect, plan, spawn workers, merge, or ask follow-up questions through
-  Rudder's normal control markers. There is no local one-off-vs-DAG router.
-- **`/plan <text>`** is an explicit alias for the same orchestrator / DAG path.
-  Use it when you want the command line to state the intent clearly.
+- **Plain task input** goes to `start_or_continue_default_main`. It reuses the first
+  `AgentMode::Main` row or creates one when absent, running in the real checkout with
+  `main_task_prompt`. That prompt makes one agent responsible for implementation,
+  tests, and any explicitly requested commit/version/push/deploy/install workflow.
+  This prevents a planner/worker split from losing final delivery ownership.
+- **`/plan <text>`** explicitly starts `start_rudder_plan_task` and the orchestrator /
+  isolated DAG path. Planners remain read-only; workers implement in jj workspaces.
 - **`/run <task>`** is the explicit escape hatch for exactly one isolated worker
   with no DAG. It calls `start_execute_task_node(..., None)` and creates a normal
   **`AgentMode::Execute`** run. In a git repo, this uses the jj workspace launch
@@ -1015,13 +1034,19 @@ Automatic local routing misclassified too many ordinary requests. A FRESH task
 - **`/ask <text>`** is the explicit escape hatch for one-off work. It calls
   `start_oneoff_task`, spawning a single conversational **`AgentMode::OneOff`**
   agent in the MAIN checkout (`create_oneoff_agent`, cwd = repo root, NO jj
-  worktree, NO `node_id`), with `oneoff_prompt` (no `/goal`, no `rudder done`,
-  "edit directly; escalate to the planner if it's big") + bypassPermissions tools.
+  worktree, NO `node_id`) with bypassPermissions tools and a `RUDDER_DONE_FILE`
+  sidecar keyed by run id.
   Keys forward to its PTY. It is explicitly excluded from selected merge /
   merge-all / review-all, and implicitly excluded from plan integration / graph-mirror /
   scheduler by `node_id`/Execute gates; `mark_run_done` just marks it Done (no
   merge). It lives in its own **`Bucket::OneOff`** list section (`status_bucket`
   returns `OneOff` for it; leads `Bucket::ORDER`).
+
+Main and one-off `Done` rows mean direct work completed; they are not mislabeled as
+workspace review. If the task explicitly requested shipping, `DeliveryEvidence::for_task`
+proof-gates the row as `delivery proof needed` until `rudder done` records kind, target,
+verification time, and one or more checks. Only complete evidence may render `deployed`.
+
 ### 14.5 Conductor capabilities (BUILT vs PLANNED)
 - **Auto-expand from completion** (BUILT). A finished worker reports via **`rudder
   done`** report, and `maybe_ingest_worker_followups` → `ingest_worker_followups` →
@@ -1033,6 +1058,9 @@ Automatic local routing misclassified too many ordinary requests. A FRESH task
      reads it straight off disk — it never passes through the agent's TUI, so it
      survives any boxing/truncation/wrapping. Keyed by node id; under the gitignored
      `.rudder/` so jj never merges it.
+     Main and one-off runs use the same channel keyed by run id. Their reports are
+     ingested by `ingest_direct_completion_notes`, including structured `delivery`
+     evidence; they do not participate in DAG follow-up expansion.
   2. **Haiku backstop.** If no sidecar yielded structured follow-ups —
      including a FREEFORM prose report (`{summary: raw}` with no `followups` field) —
      `spawn_completion_backstop` runs a one-shot haiku summarizer over the worker's
@@ -1225,10 +1253,15 @@ Recorded so future contributors do not relitigate them:
   drift-fix, plan-rebase, merges). The bargain is VISIBLE (every action lands in
   `activity_log`) and UNDOABLE (jj op-log via `rudder undo`), not gated. The only
   explicit-intent action is reverting already-MERGED work (build-forward).
-- **Worktree isolation.** Every run gets its own jj workspace, never nested in the repo,
-  so concurrent agents never collide live; the only real cross-agent risks are a future
-  merge conflict (jj records it, the AI resolver fixes it) or interface drift (the hard
-  edge is the guard).
+- **Explicit isolation.** `/plan` DAG workers and `/run` workers get their own jj
+  workspace, never nested in the repo. Plain main-owner and `/ask` runs intentionally
+  use the real checkout so one agent can finish repository/release/deployment steps.
+  The only real cross-agent risks for isolated work are a future merge conflict (jj
+  records it, the AI resolver fixes it) or interface drift (the hard edge is the guard).
+- **Delivery is evidence, not inference.** `Done`, local merge, push, and deployment are
+  orthogonal. A shipping request stays actionable until the completion sidecar provides
+  a concrete kind/target, verification timestamp, and smoke checks. Never infer deployed
+  from `git push`, a clean process exit, or a build artifact alone.
 - **TUI-primary scheduler, daemon projector.** The Rust TUI is the sole worker scheduler
   in interactive use and hosts the PTYs in-process; the daemon runs projector-only
   (`scheduler:false`) while the TUI is live, so there is never a double-launch. One
@@ -1353,3 +1386,24 @@ adjusting the static weights in `rank.ts::TRACTABILITY`.
   made local keystroke echo take over a second.
 - Fly volumes are billed while unattached. Workspace deletion/GC must retain enough
   state to retry a failed volume deletion and must not lose orphan volume ids.
+
+---
+
+## Execute: Discoveries
+
+### 2026-07-17: direct-task ownership and truthful delivery
+
+- The installed system Codex already supports plugins, Computer Use, goals, and the
+  required notifier. Capability loss inside Rudder was self-inflicted by explicit
+  `features.*=false` overrides, not a Codex limitation. Keep worker and planner
+  profiles separate, and prefer the current system binary over the old managed fork.
+- A native `process` record is an ownership claim: it is valid only while the same
+  dashboard owns a live `TerminalPane`. Dropping a PTY while persisting `Running`
+  produces phantom work. Graceful exit must persist `Paused` and delete `process`.
+- Plain tasks need a single owner that can cross the implementation-to-delivery seam.
+  DAG planning remains valuable but must be explicit (`/plan`), because a read-only
+  planner plus isolated implementation workers has no inherent owner for versioning,
+  pushing, installing, or production verification.
+- Deployment cannot be inferred from process completion, a local merge, or a push.
+  Persist structured evidence and require a target, verification timestamp, and smoke
+  checks before any native/web/context surface says `deployed`.
