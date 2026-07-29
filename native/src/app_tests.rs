@@ -1314,6 +1314,31 @@ fn option_brackets_step_agents_without_leaving_the_worker_pane() {
 }
 
 #[test]
+fn stepping_agents_works_while_the_agents_own_composer_has_text() {
+    // The point of the chord: it is claimed by the dashboard BEFORE the worker
+    // pane forwards anything to the agent's PTY, so a half-typed message to the
+    // agent neither swallows the shortcut nor gets disturbed by it.
+    let mut app = App::new();
+    for index in 0..2 {
+        let mut run = test_agent_run(&format!("run-{index}"), "work");
+        run.status = AgentStatus::Running;
+        app.agents.push(run);
+    }
+    app.focus = FocusPane::Worker;
+    app.selected_agent = 0;
+    app.agents[0].worker_input_draft = "half a message to the agent".to_string();
+    app.agents[0].worker_input_cursor = app.agents[0].worker_input_draft.chars().count();
+
+    app.handle_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::ALT));
+
+    assert_eq!(app.selected_agent, 1, "stepped while the composer had text");
+    assert_eq!(
+        app.agents[0].worker_input_draft, "half a message to the agent",
+        "the draft it was typing is untouched"
+    );
+}
+
+#[test]
 fn a_curly_quote_is_text_in_the_task_pane_and_a_shortcut_everywhere_else() {
     // Terminals that swallow the Option modifier send what Option+[ TYPES. That
     // fallback must not hijack a quote the user is writing into a prompt.
