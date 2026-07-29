@@ -1883,6 +1883,37 @@ impl App {
             _ => {}
         }
 
+        // Option/Cmd + [ and ] step through agents WITHOUT leaving the pane you are
+        // in. The worker pane forwards every keystroke to the agent's own TUI, so
+        // moving between agents from there needs a chord the dashboard claims first;
+        // j/k only work in the agents list. Cmd is accepted for the terminals that
+        // report SUPER (the kitty protocol Rudder enables), Option for the rest.
+        let stepper_like = key
+            .modifiers
+            .intersects(KeyModifiers::ALT | KeyModifiers::META | KeyModifiers::SUPER);
+        match key.code {
+            KeyCode::Char('[') if stepper_like => {
+                self.select_previous_agent();
+                return false;
+            }
+            KeyCode::Char(']') if stepper_like => {
+                self.select_next_agent();
+                return false;
+            }
+            // Terminals that swallow the modifier send what Option+[ / Option+]
+            // TYPE on a US layout instead. Not honored while composing a task,
+            // where a curly quote is far more likely to be text than a shortcut.
+            KeyCode::Char('\u{201c}') if self.focus != FocusPane::Task => {
+                self.select_previous_agent();
+                return false;
+            }
+            KeyCode::Char('\u{2018}') if self.focus != FocusPane::Task => {
+                self.select_next_agent();
+                return false;
+            }
+            _ => {}
+        }
+
         match self.focus {
             FocusPane::Agents => self.handle_agents_key(key),
             FocusPane::Worker => self.handle_worker_key(key),
@@ -6474,7 +6505,7 @@ impl App {
             }
             Some("/help") => {
                 self.notice = Some(
-                    "plain input -> one end-to-end main agent · /plan <task> -> isolated multi-agent DAG · /run <task> -> one isolated mergeable worker · /ask <text> -> direct one-off · panes: Option-1/2/3 or ^W · keys: j/k select · Enter focus · v diff · m merge · M merge all · R review all · g nest · o web ui · x stop · b branch chat · dd delete · cc clear merged · P model; commands: /model /fast /sound /color /main /run /ask /plan /resume /restore /share /usage /goal /cloud /web"
+                    "plain input -> one end-to-end main agent · /plan <task> -> isolated multi-agent DAG · /run <task> -> one isolated mergeable worker · /ask <text> -> direct one-off · panes: Option-1/2/3 or ^W · keys: j/k select · Option-[ / Option-] step agents from any pane · Enter focus · v diff · m merge · M merge all · R review all · g nest · o web ui · x stop · b branch chat · dd delete · cc clear merged · P model; commands: /model /fast /sound /color /main /run /ask /plan /resume /restore /share /usage /goal /cloud /web"
                         .to_string(),
                 );
                 true

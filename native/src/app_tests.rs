@@ -1289,6 +1289,55 @@ fn opencode_model_list_keeps_provider_qualified_ids() {
 }
 
 #[test]
+fn option_brackets_step_agents_without_leaving_the_worker_pane() {
+    // The worker pane forwards every keystroke to the agent's own TUI, so j/k
+    // cannot select there. This chord is claimed by the dashboard first.
+    let mut app = App::new();
+    for index in 0..3 {
+        let mut run = test_agent_run(&format!("run-{index}"), "work");
+        run.status = AgentStatus::Running;
+        app.agents.push(run);
+    }
+    app.focus = FocusPane::Worker;
+    app.selected_agent = 0;
+
+    app.handle_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::ALT));
+    assert_eq!(app.selected_agent, 1, "next agent");
+    assert_eq!(app.focus, FocusPane::Worker, "focus stays where it was");
+
+    // Cmd, for the terminals that report SUPER through the kitty protocol.
+    app.handle_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::SUPER));
+    assert_eq!(app.selected_agent, 2);
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::ALT));
+    assert_eq!(app.selected_agent, 1, "previous agent");
+}
+
+#[test]
+fn a_curly_quote_is_text_in_the_task_pane_and_a_shortcut_everywhere_else() {
+    // Terminals that swallow the Option modifier send what Option+[ TYPES. That
+    // fallback must not hijack a quote the user is writing into a prompt.
+    let mut app = App::new();
+    for index in 0..2 {
+        let mut run = test_agent_run(&format!("run-{index}"), "work");
+        run.status = AgentStatus::Running;
+        app.agents.push(run);
+    }
+    app.selected_agent = 0;
+
+    app.focus = FocusPane::Worker;
+    app.handle_key(KeyEvent::new(KeyCode::Char('\u{2018}'), KeyModifiers::NONE));
+    assert_eq!(app.selected_agent, 1, "bare fallback steps agents");
+
+    app.focus = FocusPane::Task;
+    app.task_input.clear();
+    app.task_cursor = 0;
+    app.handle_key(KeyEvent::new(KeyCode::Char('\u{2018}'), KeyModifiers::NONE));
+    assert_eq!(app.task_input, "\u{2018}", "typed into the draft, not swallowed");
+    assert_eq!(app.selected_agent, 1, "selection untouched while composing");
+}
+
+#[test]
 fn conversation_model_labels_keep_the_version_and_drop_the_release_stamp() {
     // "opus-4" (what the cost table shows) is not enough to choose between two
     // chats; the picker keeps the minor version and loses only the date.

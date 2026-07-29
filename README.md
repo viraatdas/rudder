@@ -137,12 +137,20 @@ through Review before it can merge.
 | Key | Action |
 | --- | --- |
 | `Option-1` / `Option-2` / `Option-3` | Focus the agents, worker, or task pane |
+| `Option-[` / `Option-]` | Step to the previous / next agent, staying in the pane you are in |
 | `Option-v` | Toggle the selected agent's review view |
 | `Cmd-C` | Copy the active Rudder selection |
 | `Ctrl-C` | Quit (asks to confirm if agents are still running) |
 
-`Option-1/2/3` work out of the box on macOS terminals, whether or not "Use Option
-as Meta" is enabled.
+`Option-1/2/3` and `Option-[`/`Option-]` work out of the box on macOS terminals,
+whether or not "Use Option as Meta" is enabled. `Cmd-[` / `Cmd-]` also step agents
+in terminals that forward Cmd to the app (Ghostty and other terminals that speak
+the kitty keyboard protocol, and only if the terminal has not bound those keys
+itself). `Option-[`/`Option-]` are the ones that always work.
+
+Stepping agents is the shortcut worth learning: the worker pane hands every
+keystroke to the agent's own TUI, so `j`/`k` only select from the agents list —
+these move between agents without leaving the conversation you are reading.
 
 **Leader: press `Ctrl-W`, then one key.** A reliable way to run a dashboard
 command, even while typing inside the worker pane:
