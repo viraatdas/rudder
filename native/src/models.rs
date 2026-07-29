@@ -553,6 +553,17 @@ pub(crate) fn command_suggestions() -> Vec<Suggestion> {
             action: SuggestionAction::RunCommand("/cloud byoc".to_string()),
         },
         Suggestion {
+            label: "/feedback <what broke>".to_string(),
+            detail: "send a report with version, model and recent notices — never your prompts or code"
+                .to_string(),
+            action: SuggestionAction::Insert("/feedback ".to_string()),
+        },
+        Suggestion {
+            label: "/telemetry".to_string(),
+            detail: "show or change anonymous usage events (status|on|off)".to_string(),
+            action: SuggestionAction::Insert("/telemetry ".to_string()),
+        },
+        Suggestion {
             label: "/help".to_string(),
             detail: "show shortcuts".to_string(),
             action: SuggestionAction::ShowHelp,

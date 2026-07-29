@@ -1314,6 +1314,75 @@ fn option_brackets_step_agents_without_leaving_the_worker_pane() {
 }
 
 #[test]
+fn feedback_carries_what_was_on_screen_and_nothing_else() {
+    // A one-line report is only actionable with context, but the context must be
+    // STRUCTURE (backend, counts, notices) — never a prompt, a diff, or a file.
+    let mut app = App::new();
+    app.backend = Backend::Codex;
+    app.model = "gpt-5.6-sol".to_string();
+    app.effort = Some(EffortLevel::High);
+    app.focus = FocusPane::Worker;
+    app.worker_view = WorkerView::Diff;
+    let mut running = test_agent_run("run-1", "implement the cache");
+    running.status = AgentStatus::Running;
+    let mut failed = test_agent_run("run-2", "port the parser");
+    failed.status = AgentStatus::Failed;
+    failed.last_error = Some("jj workspace failed: no such change".to_string());
+    app.agents.push(running);
+    app.agents.push(failed);
+    app.record_activity("merge conflict in the parser".to_string());
+
+    let context = app.feedback_context("merge asked twice and did nothing");
+
+    assert_eq!(context["text"], "merge asked twice and did nothing");
+    assert_eq!(context["backend"], "codex");
+    assert_eq!(context["model"], "gpt-5.6-sol");
+    assert_eq!(context["effort"], "high");
+    assert_eq!(context["agents"], 2);
+    assert_eq!(context["agentsRunning"], 1);
+    assert_eq!(context["focus"], "worker");
+    assert_eq!(context["view"], "diff");
+    assert_eq!(context["lastError"], "jj workspace failed: no such change");
+    assert!(context["notices"]
+        .as_array()
+        .is_some_and(|notices| !notices.is_empty()));
+    // The agents' TASK TEXT is the user's own prompt: it must not be in here.
+    let serialized = context.to_string();
+    assert!(
+        !serialized.contains("implement the cache") && !serialized.contains("port the parser"),
+        "prompts must never ride along in a feedback report: {serialized}"
+    );
+}
+
+#[test]
+fn feedback_without_a_message_explains_itself() {
+    let mut app = App::new();
+
+    app.start_task_from_input("/feedback");
+
+    assert!(app.agents.is_empty(), "no agent is spawned by /feedback");
+    let notice = app.notice.as_deref().unwrap_or_default();
+    assert!(
+        notice.contains("usage: /feedback") && notice.contains("never your prompts"),
+        "the notice must state the privacy contract up front: {notice}"
+    );
+}
+
+#[test]
+fn feedback_is_written_locally_before_anything_is_sent() {
+    // The local file is the durable copy: a report must survive a missing `gh`,
+    // telemetry being off, and no network at all.
+    let app = App::new();
+    let path = telemetry::submit_feedback(&app.cwd, app.feedback_context("the diff pane lies"))
+        .expect("wrote the report");
+
+    let raw = std::fs::read_to_string(&path).expect("report on disk");
+    let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid json");
+    assert_eq!(parsed["text"], "the diff pane lies");
+    assert!(path.starts_with(app.cwd.join(".rudder").join("feedback")));
+}
+
+#[test]
 fn the_task_pane_title_says_what_a_new_agent_will_run_on() {
     // The hint line already carried the model, but every notice replaces the hint —
     // so the answer to "what will this run on?" vanished exactly when the user was

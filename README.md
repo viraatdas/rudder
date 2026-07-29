@@ -505,6 +505,33 @@ disables it. The full harness spec is in
 [`docs/continual-improvement.md`](./docs/continual-improvement.md);
 implementation details live in [`AGENTS.md`](./AGENTS.md) section 15.
 
+## Telemetry and feedback
+
+Rudder sends a small set of **anonymous usage events** so the parts people get
+stuck on are visible: how many installs ever start an agent, how many ever merge,
+which backend and model get picked, which errors fire most. It is on by default,
+disclosed the first time you run anything, and off in one command:
+
+```bash
+rudder telemetry status
+rudder telemetry off          # or RUDDER_TELEMETRY=0 in your shell
+```
+
+What is sent: the event name, rudder version, platform, backend/model, agent and
+merge counts, slash-command *names*, and a hashed project id (a digest of the
+repo path — it counts projects without naming them). What is never sent: your
+prompts, code, diffs, file contents, paths, repo names, branch names, or session
+ids. Events are anonymous (no person profile), keyed to a random id minted per
+install. Implementation and the rules it enforces: `src/analytics.ts`.
+
+**`/feedback <what broke>`** in the task pane (or `rudder feedback "..."`) sends a
+report with the message plus what was on screen in structure: version, platform,
+backend/model, how many agents were running, the last few notices and the last
+error — with paths stripped. It lands in three places, in order of durability: a
+local JSON copy under `.rudder/feedback/` (always, so nothing is lost offline), a
+usage event, and a GitHub issue when `gh` is installed and authenticated. Add
+`--no-issue` to keep it out of the public tracker.
+
 ## Building from source
 
 ```bash

@@ -822,6 +822,35 @@ Invariants worth keeping:
 
 ---
 
+## 12.6 Telemetry and feedback (`src/analytics.ts`, `src/feedback.ts`, `native/src/telemetry.rs`)
+
+Anonymous product events, on by default, disclosed on first run
+(`pendingTelemetryNotice`, printed by `main()` before the dashboard takes the
+screen), off via `rudder telemetry off` or `RUDDER_TELEMETRY=0`.
+
+- **Transport** is PostHog's public capture endpoint — one POST with the PROJECT
+  token (write-only, safe to ship) and `$process_person_profile: false`, which
+  keeps events anonymous and ~4x cheaper. Verified against the live project.
+- **The dashboard has no HTTP client and must not grow one.** Rust shells out
+  detached to `rudder __event <name> --props '<json>'` (`native/src/telemetry.rs`),
+  so one implementation owns transport, redaction, and the off switch. A stalled
+  POST inside the render loop would be a worse bug than a missing metric.
+- **`projectHash` lives in ONE place** (`src/analytics.ts`). The Rust side sends no
+  project id; the detached CLI child inherits the dashboard's cwd and stamps it.
+- **What may be sent** is whitelisted per call site and filtered again by
+  `sanitizeProperties`: any string that looks like a path or a token is DROPPED,
+  not shipped. `redactText` (feedback) collapses home-relative and absolute paths
+  and token-shaped strings before anything leaves the machine — a GitHub issue is
+  public, so redaction runs for that destination too.
+- **Events today**: `dashboard_opened`, `agent_started`, `merge_finished`
+  (ok/conflict/planned — the "done but never merged" failure mode is the point),
+  `command_used` (name only, never the argument), `feedback`.
+- **`/feedback`** writes the local JSON copy FIRST (`.rudder/feedback/`), then the
+  usage event, then a `gh` issue if available, and reports honestly which
+  destinations were skipped and why.
+
+---
+
 ## 13. Where to start for common changes
 
 - New CLI command: add a `case` in `src/main.ts` and the implementation in the

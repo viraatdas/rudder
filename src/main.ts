@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import fsp from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { authStoreExists, runDoctor, runOnboard } from "./auth.js";
@@ -8,7 +9,10 @@ import { runCloudCommand } from "./cloud.js";
 import { printContextAudit } from "./context-audit.js";
 import { currentBranch, findRepoRoot } from "./git.js";
 import { runGc } from "./gc.js";
-import { runHandoff } from "./handoff.js";
+import { capture, pendingTelemetryNotice, projectHash, setTelemetryEnabled, telemetryEnabled, TELEMETRY_NOTICE } from "./analytics.js";
+import { submitFeedback } from "./feedback.js";
+import type { FeedbackContext } from "./feedback.js";
+import { dashboardRoot, runHandoff } from "./handoff.js";
 import { ensureBoardRunning } from "./daemon.js";
 import {
   createNodeWorkspace,
@@ -75,6 +79,12 @@ type Parsed = {
     port?: number;
     open?: boolean;
     n?: number;
+    /** `rudder feedback --context <file>`: the dashboard's on-screen context. */
+    contextFile?: string;
+    /** `--no-issue` opts out of filing a GitHub issue for a feedback report. */
+    issue?: boolean;
+    /** `rudder __event <name> --props '{json}'` (hidden telemetry emitter). */
+    props?: string;
   };
 };
 
@@ -82,6 +92,15 @@ export async function main(): Promise<void> {
   const parsed = parseArgs(process.argv.slice(2));
   if (shouldAutoUpdateForCommand(parsed.command) && await autoUpdateAndRerunIfNeeded(process.argv.slice(2))) {
     return;
+  }
+  // One-time disclosure, before the dashboard takes over the screen. Printing it
+  // here (rather than burying it in docs) is the deal: telemetry is on, and the
+  // user is told what it is and how to stop it the first time they run anything.
+  if (!parsed.command?.startsWith("__")) {
+    const notice = await pendingTelemetryNotice();
+    if (notice) {
+      console.log(notice);
+    }
   }
   if (parsed.flags.version || parsed.command === "version") {
     const current = await packageVersion();
@@ -355,6 +374,21 @@ export async function main(): Promise<void> {
       await runContextCommand(parsed);
       return;
     }
+    case "telemetry": {
+      await runTelemetryCommand(parsed.args[0]);
+      return;
+    }
+    case "feedback": {
+      await runFeedbackCommand(parsed);
+      return;
+    }
+    case "__event": {
+      // Hidden: the native dashboard shells out to this so one telemetry
+      // implementation serves both halves of Rudder. Fire-and-forget by design —
+      // it must never fail loudly or delay the caller.
+      await runEventCommand(parsed);
+      return;
+    }
     case "handoff": {
       // Run from inside a live claude/codex chat: queues THIS conversation for
       // the dashboard, which forks it into an agent pane with all of its context.
@@ -456,6 +490,26 @@ function parseArgs(argv: string[]): Parsed {
     }
     if (arg === "--no-open") {
       parsed.flags.open = false;
+      continue;
+    }
+    if (arg === "--no-issue") {
+      parsed.flags.issue = false;
+      continue;
+    }
+    if (takesValue(arg, "--context")) {
+      parsed.flags.contextFile = readValue(argv, ++i, arg);
+      continue;
+    }
+    if (arg.startsWith("--context=")) {
+      parsed.flags.contextFile = arg.slice("--context=".length);
+      continue;
+    }
+    if (takesValue(arg, "--props")) {
+      parsed.flags.props = readValue(argv, ++i, arg);
+      continue;
+    }
+    if (arg.startsWith("--props=")) {
+      parsed.flags.props = arg.slice("--props=".length);
       continue;
     }
     if (takesValue(arg, "--port", "-p")) {
@@ -868,6 +922,79 @@ async function runRemember(insight: string): Promise<void> {
   console.log("Remembered. Appended to DECISIONS.md (shared, jj-tracked).");
 }
 
+async function runTelemetryCommand(action: string | undefined): Promise<void> {
+  const verb = (action ?? "status").trim().toLowerCase();
+  if (verb === "on" || verb === "enable") {
+    await setTelemetryEnabled(true);
+    console.log(`Telemetry ON. ${TELEMETRY_NOTICE}`);
+    return;
+  }
+  if (verb === "off" || verb === "disable") {
+    await setTelemetryEnabled(false);
+    console.log("Telemetry OFF. Nothing is sent; `rudder feedback` still works and stays local.");
+    return;
+  }
+  if (verb === "status") {
+    const enabled = await telemetryEnabled();
+    console.log(enabled ? `Telemetry ON. ${TELEMETRY_NOTICE}` : "Telemetry OFF.");
+    return;
+  }
+  throw new Error("Usage: rudder telemetry [status|on|off]");
+}
+
+async function runFeedbackCommand(parsed: Parsed): Promise<void> {
+  // `--context <file>` is how the dashboard hands over what was on screen; a
+  // plain CLI report just carries the message.
+  const contextFile = parsed.flags.contextFile;
+  let context: FeedbackContext | undefined;
+  if (contextFile) {
+    const raw = await fsp.readFile(contextFile, "utf8").catch(() => "");
+    try {
+      context = JSON.parse(raw) as FeedbackContext;
+    } catch {
+      context = undefined;
+    }
+  }
+  const text = parsed.args.join(" ").trim();
+  const report = await submitFeedback({
+    text: text || (context as { text?: string } | undefined)?.text || "",
+    context,
+    issue: parsed.flags.issue,
+  });
+  console.log(`Thanks. Saved locally to ${report.localPath.replace(os.homedir(), "~")}.`);
+  if (report.issueUrl) {
+    console.log(`Filed ${report.issueUrl}`);
+  }
+  for (const reason of report.skipped) {
+    console.log(`  note: ${reason}`);
+  }
+}
+
+async function runEventCommand(parsed: Parsed): Promise<void> {
+  const event = parsed.args[0]?.trim();
+  if (!event) {
+    return;
+  }
+  let properties: Record<string, string | number | boolean> = {};
+  const raw = parsed.flags.props;
+  if (raw) {
+    try {
+      const parsedProps = JSON.parse(raw) as Record<string, unknown>;
+      for (const [key, value] of Object.entries(parsedProps)) {
+        if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+          properties[key] = value;
+        }
+      }
+    } catch {
+      properties = {};
+    }
+  }
+  // Stamp the project id here so ONE implementation owns it: the dashboard
+  // shells out with its repo as cwd, and CLI invocations resolve the same root.
+  properties.project ??= projectHash(dashboardRoot());
+  await capture(event, properties);
+}
+
 async function runShare(text: string): Promise<void> {
   const repoRoot = findRepoRoot();
   await appendSharedContext(repoRoot, text, "cli share");
@@ -1049,6 +1176,10 @@ Conversation handoff:
   rudder handoff --here "..."     Continue it in the main checkout instead of an isolated workspace
   rudder handoff --opencode "..." Hand off an opencode chat (default is the claude one; --codex for codex)
   rudder handoff --list           List recent conversations in this repo with their session ids
+
+Telemetry and feedback:
+  rudder feedback "<what broke>"  Send a report: message + version/model/recent notices (never prompts or code)
+  rudder telemetry [status|on|off] Anonymous usage events; on by default, off in one command
 
 Memory:
   rudder remember "<insight>"    Append a durable cross-cutting decision to DECISIONS.md (shared, jj-tracked)

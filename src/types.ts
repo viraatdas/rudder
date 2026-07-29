@@ -71,6 +71,12 @@ export type RudderConfig = {
   lastUsedBackend?: BackendId;
   mergeStrategy: MergeStrategy;
   colorMode?: "terminal" | "paper";
+  /** Anonymous usage events. Undefined means on; see src/analytics.ts. */
+  telemetry?: boolean;
+  /** Stable anonymous id for this INSTALL (not a person). Minted on first use. */
+  installId?: string;
+  /** When the one-time telemetry disclosure was printed. */
+  telemetryNoticeShownAt?: string;
   // NOTE: no merge-gate knob lives here. "mergeMode" was written-but-never-read
   // for several releases and looked exactly like the automerge setting users
   // hunt for; planned DAG nodes always auto-integrate (see AGENTS.md §14.7)

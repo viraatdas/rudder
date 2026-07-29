@@ -76,6 +76,7 @@ mod lifecycle;
 use crate::lifecycle::*;
 mod handoff;
 use crate::handoff::*;
+mod telemetry;
 mod plan_stream;
 
 mod signals;
@@ -647,6 +648,8 @@ struct App {
     /// a keystroke. Kept separately so a plain refresh does not drop them.
     handoff_extra_candidates: Vec<ConversationCandidate>,
     handoff_extra_rx: Option<mpsc::Receiver<Vec<ConversationCandidate>>>,
+    /// One `dashboard_opened` event per session, not per App (tests build many).
+    dashboard_open_emitted: bool,
     worker_selection: Option<WorkerSelection>,
     task_selection: Option<WorkerSelection>,
     /// Mouse text selection over the orchestrator pane. That pane composes Lines
@@ -1320,6 +1323,7 @@ impl App {
             handoff_candidates_at: None,
             handoff_extra_candidates: Vec::new(),
             handoff_extra_rx: None,
+            dashboard_open_emitted: false,
             worker_selection: None,
             task_selection: None,
             orch_selection: None,
@@ -5865,6 +5869,15 @@ impl App {
             }
         }
         let spawned = run.terminal.is_some();
+        telemetry::emit_event(
+            "agent_started",
+            serde_json::json!({
+                "mode": "ask",
+                "backend": run.backend.as_str(),
+                "model": run.model,
+                "spawned": spawned,
+            }),
+        );
         let _ = save_native_run_record(&self.cwd, &run);
         self.agents.push(run);
         self.selected_agent = self.agents.len().saturating_sub(1);
@@ -6126,6 +6139,52 @@ impl App {
         self.dirty = true;
     }
 
+    /// What was on screen when the user complained: enough to act on a one-line
+    /// report, and nothing that could carry their code. Recent activity lines are
+    /// included because they usually ARE the error text; the CLI redacts paths out
+    /// of them before anything leaves the machine.
+    fn feedback_context(&self, text: &str) -> serde_json::Value {
+        let running = self
+            .agents
+            .iter()
+            .filter(|run| run.status == AgentStatus::Running)
+            .count();
+        let mut notices: Vec<String> = self
+            .activity_log
+            .iter()
+            .rev()
+            .take(3)
+            .cloned()
+            .collect();
+        notices.reverse();
+        let last_error = self
+            .agents
+            .iter()
+            .rev()
+            .find_map(|run| run.last_error.clone());
+        serde_json::json!({
+            "text": text,
+            "backend": self.backend.as_str(),
+            "model": self.model,
+            "effort": effort_label(self.effort),
+            "agents": self.agents.len(),
+            "agentsRunning": running,
+            "notices": notices,
+            "lastError": last_error,
+            "focus": match self.focus {
+                FocusPane::Agents => "agents",
+                FocusPane::Worker => "worker",
+                FocusPane::Task => "task",
+            },
+            "view": match self.worker_view {
+                WorkerView::Terminal => "terminal",
+                WorkerView::Diff => "diff",
+                WorkerView::PlanReview => "plan-review",
+            },
+            "planActive": self.plan_is_active(),
+        })
+    }
+
     /// Keep the `/handoff` palette's conversation list fresh WITHOUT hitting the
     /// filesystem on the render path: refresh while the user is typing `/handoff`,
     /// at most once every few seconds.
@@ -6299,7 +6358,22 @@ impl App {
         }
     }
 
+    /// Which slash commands people actually use (the NAME only — never the
+    /// argument, which is the user's task text).
+    fn emit_command_used(&mut self, input: &str) {
+        let name = input
+            .trim_start()
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        if name.starts_with('/') && name.len() > 1 {
+            telemetry::emit_event("command_used", serde_json::json!({ "name": name }));
+        }
+    }
+
     fn handle_command(&mut self, input: &str) -> bool {
+        self.emit_command_used(input);
         let mut parts = input.split_whitespace();
         match parts.next() {
             Some("/model") => {
@@ -6508,9 +6582,51 @@ impl App {
                 }
                 true
             }
+            Some("/feedback") => {
+                // A one-line gripe plus what was on screen. The context is
+                // structured (backend, model, agent counts, recent notices, last
+                // error) so a report is actionable without shipping any prompt,
+                // diff, or file content — see src/feedback.ts for the redaction.
+                let rest = command_rest(input, "/feedback").trim().to_string();
+                if rest.is_empty() {
+                    self.notice = Some(
+                        "usage: /feedback <what went wrong or what you wanted> — sends the message plus version, model and recent notices; never your prompts or code"
+                            .to_string(),
+                    );
+                } else {
+                    match telemetry::submit_feedback(&self.cwd, self.feedback_context(&rest)) {
+                        Ok(path) => {
+                            self.record_activity(format!("feedback: {rest}"));
+                            self.notice = Some(format!(
+                                "thanks — feedback saved to {} and sent (paths redacted)",
+                                path.file_name()
+                                    .map(|name| name.to_string_lossy().to_string())
+                                    .unwrap_or_default()
+                            ));
+                        }
+                        Err(error) => {
+                            self.notice = Some(format!("feedback failed to save: {error}"));
+                        }
+                    }
+                }
+                true
+            }
+            Some("/telemetry") => {
+                let rest = command_rest(input, "/telemetry").trim().to_string();
+                let action = if rest.is_empty() {
+                    "status".to_string()
+                } else {
+                    rest
+                };
+                self.start_rudder_cli_command(
+                    &format!("telemetry {action}"),
+                    vec!["telemetry".to_string(), action],
+                );
+                true
+            }
             Some("/help") => {
                 self.notice = Some(
-                    "plain input -> one end-to-end main agent · /plan <task> -> isolated multi-agent DAG · /run <task> -> one isolated mergeable worker · /ask <text> -> direct one-off · panes: Option-1/2/3 or ^W · keys: j/k select · Option-[ / Option-] step agents from any pane · Enter focus · v diff · m merge · M merge all · R review all · g nest · o web ui · x stop · b branch chat · dd delete · cc clear merged · P model; commands: /model /fast /sound /color /main /run /ask /plan /resume /restore /share /usage /goal /cloud /web"
+                    "plain input -> one end-to-end main agent · /plan <task> -> isolated multi-agent DAG · /run <task> -> one isolated mergeable worker · /ask <text> -> direct one-off · panes: Option-1/2/3 or ^W · keys: j/k select · Option-[ / Option-] step agents from any pane · Enter focus · v diff · m merge · M merge all · R review all · g nest · o web ui · x stop · b branch chat · dd delete · cc clear merged · P model; commands: /model /fast /sound /color /main /run /ask /plan /resume /restore /share /usage /goal /cloud /web /feedback"
                         .to_string(),
                 );
                 true
@@ -11655,6 +11771,20 @@ impl App {
         self.run_scheduler();
     }
 
+    /// Merge outcomes are the sharpest product signal Rudder has: work that
+    /// reaches "done" and never merges is the failure mode users complain about.
+    fn emit_merge_finished(&mut self, ok: bool, conflict: bool, planned: bool) {
+        telemetry::emit_event(
+            "merge_finished",
+            serde_json::json!({
+                "ok": ok,
+                "conflict": conflict,
+                "planned": planned,
+                "backend": self.backend.as_str(),
+            }),
+        );
+    }
+
     fn handle_merge_error(
         &mut self,
         task: String,
@@ -11671,6 +11801,7 @@ impl App {
         // those; the git query remains only for rebase conflict reporting.
         let jj_conflicts = self.pending_jj_conflict.take();
         let mut conflicts = jj_conflicts.unwrap_or_else(|| conflicted_files(&self.cwd));
+        self.emit_merge_finished(false, !conflicts.is_empty(), agent_id.is_none());
         if conflicts.is_empty() {
             if let Some(path) = worktree_path.as_ref() {
                 let worktree_conflicts = conflicted_files(path);
@@ -12538,6 +12669,10 @@ What to do\n\
         }
 
         let mut merged_node_ids = Vec::new();
+        let planned_merge = merge_indices
+            .iter()
+            .any(|index| self.agents.get(*index).is_some_and(|run| run.node_id.is_some()));
+        self.emit_merge_finished(true, false, planned_merge);
         for merge_index in merge_indices {
             if let Some(run) = self.agents.get_mut(merge_index) {
                 run.terminal = None;
@@ -12572,8 +12707,28 @@ What to do\n\
         self.mirror_graph();
     }
 
+    /// One `dashboard_opened` per session, on the first poll rather than in
+    /// `App::new` (which tests construct thousands of times).
+    fn emit_dashboard_opened_once(&mut self) {
+        if self.dashboard_open_emitted {
+            return;
+        }
+        self.dashboard_open_emitted = true;
+        telemetry::emit_event(
+            "dashboard_opened",
+            serde_json::json!({
+                "backend": self.backend.as_str(),
+                "model": self.model,
+                "agents_restored": self.agents.len(),
+                // `project` is added by the CLI (one hash implementation, in
+                // src/analytics.ts); the detached child inherits this cwd.
+            }),
+        );
+    }
+
     fn poll_agents(&mut self) {
         let poll_started = Instant::now();
+        self.emit_dashboard_opened_once();
         self.flush_pending_enters();
         self.maybe_start_queued_reconcile();
         self.poll_task_summary_workers();
