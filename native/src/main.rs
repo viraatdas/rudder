@@ -74,6 +74,8 @@ mod perf;
 use crate::perf::*;
 mod lifecycle;
 use crate::lifecycle::*;
+mod handoff;
+use crate::handoff::*;
 mod plan_stream;
 
 mod signals;
@@ -105,6 +107,9 @@ const READY_EVAL_LULL: Duration = Duration::from_millis(900);
 // re-exported above so call sites are unchanged.
 const DEFAULT_WHEEL_SCROLL_ROWS: u16 = 3;
 const TASK_HISTORY_LIMIT: usize = 100;
+/// How many recent conversations the `/handoff` palette offers. Each one costs a
+/// transcript head read, and a list longer than the popup is not a list.
+const HANDOFF_PICKER_LIMIT: usize = 8;
 const MOUSE_DEBUG_ENV: &str = "RUDDER_MOUSE_DEBUG";
 const RUDDER_MOUSE_ENABLE_SEQUENCES: &[u8] = b"\x1b[?1003l\x1b[?1000h\x1b[?1002h\x1b[?1006h";
 const RUDDER_MOUSE_DISABLE_SEQUENCES: &[u8] = b"\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
@@ -338,6 +343,12 @@ fn optional_nonempty(value: &str) -> Option<String> {
 enum Backend {
     Claude,
     Codex,
+    /// opencode (https://opencode.ai) — a third CLI agent Rudder can drive. It
+    /// speaks the same shapes Rudder needs: an interactive TUI, `--session <id>`
+    /// resume, `--fork`, and `--prompt` for the first turn. What it does NOT have
+    /// is a turn-end hook (see signals.rs) or a reasoning-effort flag, so those
+    /// surfaces degrade rather than pretend.
+    Opencode,
 }
 
 impl Backend {
@@ -345,6 +356,7 @@ impl Backend {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::Opencode => "opencode",
         }
     }
 
@@ -352,6 +364,7 @@ impl Backend {
         match value {
             "claude" | "anthropic" => Some(Self::Claude),
             "codex" | "openai" => Some(Self::Codex),
+            "opencode" | "oc" => Some(Self::Opencode),
             _ => None,
         }
     }
@@ -593,12 +606,6 @@ struct App {
     /// is paused for input, rendered as a clean numbered prompt in the orchestrator pane.
     /// Set when the planner pauses; cleared on DAG-capture / approval / fresh plan.
     pending_questions: Vec<String>,
-    /// Code-level mandatory first question gate. A fresh initial planner may not
-    /// capture a `RUDDER_PLAN_TASKS` block until the user has answered one question
-    /// round. This makes "asks first" deterministic instead of relying only on the
-    /// model prompt. Refine/rebase/reconcile paths are already later turns and do
-    /// not use this gate.
-    planner_question_round_done: bool,
     /// Tick counter used to run the scheduler on a coarse cadence rather than on
     /// every PTY-byte tick.
     scheduler_tick: u64,
@@ -623,6 +630,23 @@ struct App {
     /// so handle_merge_error reads them from here instead of `git diff -U`.
     pending_jj_conflict: Option<Vec<String>>,
     picker_index: usize,
+    /// When Esc dismisses the command palette, remember the exact input it was
+    /// dismissed for: while `task_input` still equals this, `suggestions_for`
+    /// stays empty. Any edit changes the input and re-enables the palette. This
+    /// lets Esc close the popup WITHOUT destroying a typed draft.
+    picker_dismissed_input: Option<String>,
+    /// Recent CLI conversations offered by the `/handoff` picker. Populated from
+    /// disk while the user types `/handoff` (never on the render path — the picker
+    /// is consulted every frame, and a readdir + transcript read per frame is
+    /// exactly the kind of work that made the dashboard burn CPU before).
+    handoff_candidates: Vec<ConversationCandidate>,
+    handoff_candidates_at: Option<Instant>,
+    /// Codex and opencode conversations, fetched OFF-THREAD: Codex means walking
+    /// `~/.codex/sessions` and opencode means a ~0.5s `opencode session list`
+    /// subprocess. Doing either on the input thread would stall the dashboard for
+    /// a keystroke. Kept separately so a plain refresh does not drop them.
+    handoff_extra_candidates: Vec<ConversationCandidate>,
+    handoff_extra_rx: Option<mpsc::Receiver<Vec<ConversationCandidate>>>,
     worker_selection: Option<WorkerSelection>,
     task_selection: Option<WorkerSelection>,
     /// Mouse text selection over the orchestrator pane. That pane composes Lines
@@ -1092,6 +1116,32 @@ struct InitialSelection {
     effort: Option<EffortLevel>,
 }
 
+/// One request to fork an existing CLI conversation into a fresh worker row.
+struct ForkedConversation {
+    backend: Backend,
+    model: String,
+    effort: Option<EffortLevel>,
+    session_id: String,
+    /// Directory the SOURCE conversation ran in. Claude resolves `--resume` against
+    /// the current directory's transcript folder, so the fork needs to know where
+    /// the transcript came from in order to stage it.
+    source_cwd: PathBuf,
+    /// jj change the new workspace starts from; None starts from the dashboard's.
+    base_change: Option<String>,
+    /// Workspace label, also the row title.
+    label: String,
+    /// The `task` text recorded on the row.
+    task: String,
+    /// First turn handed to the fork. None opens it waiting for the user to type.
+    seed: Option<String>,
+}
+
+enum ForkOutcome {
+    Started,
+    /// The row exists (marked Failed) but the backend process never started.
+    SpawnFailed(String),
+}
+
 #[derive(Default)]
 struct CliSelection {
     backend: Option<Backend>,
@@ -1250,7 +1300,6 @@ impl App {
             interactive_orchestrator: interactive_orchestrator(),
             planner_paused_for_input: false,
             pending_questions: Vec::new(),
-            planner_question_round_done: false,
             scheduler_tick: 0,
             spinner_frame: 0,
             last_spinner_advance: Instant::now(),
@@ -1266,6 +1315,11 @@ impl App {
             conflict_prompt: None,
             pending_jj_conflict: None,
             picker_index: 0,
+            picker_dismissed_input: None,
+            handoff_candidates: Vec::new(),
+            handoff_candidates_at: None,
+            handoff_extra_candidates: Vec::new(),
+            handoff_extra_rx: None,
             worker_selection: None,
             task_selection: None,
             orch_selection: None,
@@ -1611,7 +1665,14 @@ impl App {
         // model. Update all main rows here (the one chokepoint every path calls).
         let model_now = self.model.clone();
         let cwd_now = self.cwd.clone();
-        for run in self.agents.iter_mut().filter(|run| run.is_main()) {
+        // Only relabel main rows with NO live PTY: a running process keeps its
+        // launch-time model, and rewriting its row advertised a model the
+        // process was not using. The next (re)spawn picks up the new default.
+        for run in self
+            .agents
+            .iter_mut()
+            .filter(|run| run.is_main() && run.terminal.is_none())
+        {
             run.backend = backend;
             run.model = model_now.clone();
             run.effort = effort;
@@ -2596,6 +2657,13 @@ impl App {
                     .unwrap_or_else(|| REVIEW_ALL_MODEL.to_string()),
                 REVIEW_ALL_EFFORT,
             ),
+            // Reviews run on whatever model opencode is configured with; there is no
+            // Rudder-curated review profile to pin (and no effort dial to set).
+            Backend::Opencode => (
+                Backend::Opencode,
+                env_override("RUDDER_REVIEW_MODEL_OPENCODE").unwrap_or_default(),
+                EffortLevel::Medium,
+            ),
         }
     }
 
@@ -2695,16 +2763,27 @@ impl App {
         }
 
         if self.handle_picker_key(key) {
+            self.maybe_refresh_handoff_candidates();
             return false;
         }
 
         match key.code {
             KeyCode::Esc => {
-                self.reset_task_history_navigation();
-                self.task_input.clear();
-                self.task_cursor = 0;
-                self.pasted_chunks.clear();
-                self.picker_index = 0;
+                // First Esc with the palette open just dismisses the palette;
+                // clearing the whole draft here lost long typed tasks whose
+                // author only wanted the popup gone. A second Esc (or Esc with
+                // no palette) clears the draft as before.
+                if !suggestions_for(self).is_empty() {
+                    self.picker_dismissed_input = Some(self.task_input.clone());
+                    self.picker_index = 0;
+                } else {
+                    self.reset_task_history_navigation();
+                    self.task_input.clear();
+                    self.task_cursor = 0;
+                    self.pasted_chunks.clear();
+                    self.picker_index = 0;
+                    self.picker_dismissed_input = None;
+                }
             }
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 // Shift+Enter inserts a literal newline in the task draft.
@@ -2814,7 +2893,7 @@ impl App {
                 self.task_cursor = 1;
                 self.picker_index = 0;
                 self.notice = Some(
-                    "type /run for one mergeable worker, /ask for direct one-off, /plan for DAG, /model, /main|/m, /usage, or /cloud"
+                    "type /run for one mergeable worker, /ask for direct one-off, /plan for DAG, /resume to continue a chat you already started, /model, /main|/m, /usage, or /cloud"
                         .to_string(),
                 );
             }
@@ -2825,6 +2904,10 @@ impl App {
             }
             _ => {}
         }
+        // The /handoff palette lists conversations read off disk. Refresh it here,
+        // on the (user-paced) keystroke, never in `suggestions_for` — that runs on
+        // every frame.
+        self.maybe_refresh_handoff_candidates();
         false
     }
 
@@ -2852,9 +2935,14 @@ impl App {
     fn replace_task_input(&mut self, value: String) {
         self.task_input = value;
         self.task_cursor = self.task_input.chars().count();
-        // The draft is being replaced wholesale (history nav, command prefill); any
-        // paste chips it referenced are gone, so drop their remembered text.
-        self.pasted_chunks.clear();
+        // Keep the remembered text for any paste chip the replacement still
+        // shows: history nav restores drafts WITH their chips, and dropping the
+        // chunks here sent the literal "[Pasted #1 +60 lines]" placeholder to
+        // the agent instead of the pasted content. Chips absent from the new
+        // text are genuinely gone.
+        let input = &self.task_input;
+        self.pasted_chunks
+            .retain(|chunk| input.contains(&chunk.placeholder));
         self.task_selection = None;
         self.picker_index = 0;
         self.clamp_picker_index();
@@ -2894,6 +2982,24 @@ impl App {
                 true
             }
             KeyCode::Enter => {
+                // Capture Enter only while the user is still TYPING a command
+                // name (no argument text yet) or inside the /model drill-down.
+                // "/plan x" fuzzy-matched the "/plan" suggestion, and accepting
+                // it REPLACED the input — silently deleting the argument and
+                // requiring a second Enter. Once real arguments exist, Enter
+                // submits the command.
+                let trimmed = self.task_input.trim();
+                let typing_command_name = !trimmed.contains(char::is_whitespace);
+                // /model and /resume are drill-down pickers: their argument is
+                // chosen from the list, not typed, so Enter keeps selecting. Both
+                // hide the palette once a concrete argument is present, which is
+                // what lets a second Enter submit.
+                if !(typing_command_name
+                    || trimmed.starts_with("/model")
+                    || resume_command_rest(trimmed).is_some())
+                {
+                    return false;
+                }
                 let selected = suggestions
                     .get(self.picker_index.min(suggestions.len().saturating_sub(1)))
                     .cloned();
@@ -3984,6 +4090,25 @@ impl App {
         if self.handle_command(&input) {
             return;
         }
+        // A slash-command-shaped token that no command matched is almost always
+        // a typo (/plna, /deploy). Falling through spawned a REAL agent whose
+        // prompt was the literal "/plna fix the bug" — an expensive way to
+        // learn about a typo. Paths ("/tmp/x") contain another slash and still
+        // pass through as plain text.
+        let trimmed = input.trim_start();
+        if let Some(token) = trimmed.strip_prefix('/').and_then(|rest| rest.split_whitespace().next()) {
+            if !token.is_empty()
+                && token
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            {
+                self.notice = Some(format!(
+                    "unknown command /{token} — /help lists commands · remove the leading / to send this as a task"
+                ));
+                self.dirty = true;
+                return;
+            }
+        }
         self.notice = None;
 
         // REFINE / CONVERSE: while a plan is parsed but not yet approved, a typed
@@ -4288,6 +4413,10 @@ impl App {
                 TerminalCommand::with_args(codex_program(), args)
                     .with_env("CODEX_RUDDER_SCROLLBACK_SAFE", "1")
             }
+            // opencode has no read-only headless mode; the reconcile planner runs in
+            // its TUI (no --auto, so an unexpected edit stops for approval) and its
+            // plan block is read out of the pane like every other opencode planner.
+            Backend::Opencode => opencode_command(model, Some(prompt), AgentMode::RudderPlan),
         }
     }
 
@@ -4604,10 +4733,17 @@ impl App {
         }
 
         let run_id = run.id.clone();
+        let spawned = run.terminal.is_some();
         self.agents.push(run);
         self.selected_agent = self.agents.len().saturating_sub(1);
         self.delete_pending = None;
-        self.focus = FocusPane::Worker;
+        // A dead pane swallows every key except q; focusing it after a failed
+        // spawn trapped the user. Stay in the task bar so they can retry.
+        self.focus = if spawned {
+            FocusPane::Worker
+        } else {
+            FocusPane::Task
+        };
         if let Some(run) = self.agents.get(self.selected_agent) {
             let _ = save_native_run_record(&self.cwd, run);
         }
@@ -4621,7 +4757,6 @@ impl App {
         // A fresh plan supersedes any paused planner.
         self.planner_paused_for_input = false;
         self.pending_questions.clear();
-        self.planner_question_round_done = false;
         // AT-MOST-ONE ORCHESTRATOR: a brand-new plan supersedes any prior pinned
         // planner. Retire stale orchestrator rows (and their on-disk records) before
         // pushing the new one so completed plans never stack as phantom orchestrators
@@ -4780,10 +4915,15 @@ impl App {
             }
         }
 
+        let spawned = run.terminal.is_some();
         self.agents.push(run);
         self.selected_agent = self.agents.len().saturating_sub(1);
         self.delete_pending = None;
-        self.focus = FocusPane::Worker;
+        self.focus = if spawned {
+            FocusPane::Worker
+        } else {
+            FocusPane::Task
+        };
         if let Some(run) = self.agents.get(self.selected_agent) {
             let _ = save_native_run_record(&self.cwd, run);
         }
@@ -4875,9 +5015,6 @@ impl App {
             run.plan_output_cache = Some(RudderPlanOutputCache::default());
         }
         if self.relaunch_orchestrator_with(index, command, feedback) {
-            if answering_clarification {
-                self.planner_question_round_done = true;
-            }
             self.notice = Some("refining the plan with your feedback…".to_string());
         } else {
             // The planner could not be relaunched: drop back to the existing plan so
@@ -5558,6 +5695,9 @@ impl App {
             match backend {
                 Backend::Claude => claude_resume_command(run, session_id.as_deref().unwrap()),
                 Backend::Codex => codex_resume_command(run, session_id.as_deref().unwrap()),
+                Backend::Opencode => {
+                    opencode_resume_command(run, session_id.as_deref().unwrap())
+                }
             }
         } else {
             agent_command(
@@ -5587,6 +5727,11 @@ impl App {
             ..TerminalPaneOptions::default()
         };
 
+        // Read the PRE-spawn status: the Ok arm flips it to Running before the
+        // delivery guard below, and comparing the already-overwritten value
+        // against Done was always false — stale delivery evidence survived a
+        // fresh non-delivery turn. (The sibling sites read status first.)
+        let was_done_before_spawn = self.agents[main_index].status == AgentStatus::Done;
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
             Ok(mut terminal) => {
                 let _ = terminal.drain_output();
@@ -5601,7 +5746,7 @@ impl App {
                 run.needs_permission = false;
                 run.last_error = None;
                 if !bootstrap.is_empty() {
-                    let starting_new_turn = run.status == AgentStatus::Done;
+                    let starting_new_turn = was_done_before_spawn;
                     let now = now_stamp();
                     run.current_prompt = bootstrap.clone();
                     run.turns.push(AgentTurn {
@@ -5683,10 +5828,15 @@ impl App {
                 self.notice = Some(format!("one-off launch failed: {error}"));
             }
         }
+        let spawned = run.terminal.is_some();
         let _ = save_native_run_record(&self.cwd, &run);
         self.agents.push(run);
         self.selected_agent = self.agents.len().saturating_sub(1);
-        self.focus = FocusPane::Worker;
+        self.focus = if spawned {
+            FocusPane::Worker
+        } else {
+            FocusPane::Task
+        };
         self.worker_view = WorkerView::Terminal;
         self.dirty = true;
     }
@@ -5732,6 +5882,7 @@ impl App {
         let mut command = match backend {
             Backend::Claude => claude_resume_command(&run, &session_id),
             Backend::Codex => codex_resume_command(&run, &session_id),
+            Backend::Opencode => opencode_resume_command(&run, &session_id),
         };
         // Re-wire completion hooks like every other (re)spawn path; without this
         // the run would sit "running" forever waiting for a signal the resumed
@@ -5760,12 +5911,290 @@ impl App {
                 self.notice = Some(format!("restore failed to start: {error}"));
             }
         }
+        let spawned = run.terminal.is_some();
         let _ = save_native_run_record(&self.cwd, &run);
         self.agents.push(run);
         self.selected_agent = self.agents.len().saturating_sub(1);
-        self.focus = FocusPane::Worker;
+        self.focus = if spawned {
+            FocusPane::Worker
+        } else {
+            FocusPane::Task
+        };
         self.worker_view = WorkerView::Terminal;
         self.dirty = true;
+    }
+
+    /// Which CLI recorded this conversation. Claude transcripts are per-directory
+    /// files under `~/.claude/projects`; Codex keeps one global rollout tree. None
+    /// means the id matches nothing on this machine.
+    fn detect_handoff_backend(&self, session_id: &str) -> Option<Backend> {
+        if claude_transcript_path(&self.cwd, session_id).is_some() {
+            return Some(Backend::Claude);
+        }
+        if codex_session_exists(session_id) {
+            return Some(Backend::Codex);
+        }
+        opencode_session_exists(session_id).then_some(Backend::Opencode)
+    }
+
+    /// `/handoff <session-id> [next step]`, and every request queued by
+    /// `rudder handoff`: ADOPT a conversation that was happening outside the
+    /// dashboard (a plain `claude`/`codex` chat in another terminal) and continue it
+    /// as a Rudder agent that already knows everything that was discussed.
+    ///
+    /// The conversation is FORKED, never resumed in place: the source chat is
+    /// usually still open in the user's terminal, and two processes appending to one
+    /// transcript corrupt it. The original is left exactly where it was.
+    fn start_handoff_task(&mut self, request: HandoffRequest) {
+        let session_id = request.session_id.trim().to_string();
+        if !valid_session_id(&session_id) {
+            self.notice = Some(
+                "usage: /resume <session-id> [next step] — continue an existing claude/codex/opencode chat as a worker"
+                    .to_string(),
+            );
+            return;
+        }
+        let short_id: String = session_id.chars().take(8).collect();
+        // A conversation that does not exist must never create a workspace: check
+        // BOTH backends here, because queued requests name their own backend.
+        let exists = match request.backend {
+            Backend::Claude => claude_transcript_path(&self.cwd, &session_id).is_some(),
+            Backend::Codex => codex_session_exists(&session_id),
+            Backend::Opencode => opencode_session_exists(&session_id),
+        };
+        if !exists {
+            self.notice = Some(format!(
+                "no {} conversation found for {short_id}… — /handoff lists the recent ones",
+                request.backend.as_str()
+            ));
+            return;
+        }
+        let title = request
+            .title
+            .clone()
+            .filter(|text| !text.trim().is_empty())
+            .or_else(|| conversation_title(&self.cwd, &session_id))
+            .unwrap_or_else(|| format!("session {short_id}…"));
+        let title = truncate_chars(title.trim(), 60);
+        let instruction = request
+            .instruction
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(ToString::to_string);
+        let task = match instruction.as_deref() {
+            Some(next) => format!("Handed-off conversation ({title}). Next: {next}"),
+            None => format!("Handed-off conversation ({title})"),
+        };
+        let backend = request.backend;
+        let model = self.model.clone();
+        let effort = self.effort;
+
+        match request.target {
+            HandoffTarget::Worker => {
+                match self.spawn_forked_conversation(ForkedConversation {
+                    backend,
+                    model,
+                    effort,
+                    session_id,
+                    source_cwd: self.cwd.clone(),
+                    // No base change: the fork starts from the dashboard checkout's
+                    // current jj change, which is the tree the conversation was about.
+                    base_change: None,
+                    label: format!("handoff: {title}"),
+                    task,
+                    seed: instruction,
+                }) {
+                    Ok(ForkOutcome::Started) => {
+                        self.record_activity(format!("handed off conversation: {title}"));
+                        self.notice = Some(format!(
+                            "picked up “{title}” in an isolated worker; merge with m when it is done"
+                        ));
+                    }
+                    Ok(ForkOutcome::SpawnFailed(error)) => {
+                        self.notice = Some(format!("handoff failed to start: {error}"));
+                    }
+                    Err(error) => {
+                        self.notice = Some(format!("handoff failed: {error}"));
+                    }
+                }
+            }
+            HandoffTarget::Here => self.start_handoff_in_main_checkout(
+                backend,
+                &session_id,
+                &title,
+                &task,
+                instruction.as_deref(),
+            ),
+        }
+    }
+
+    /// `rudder handoff --here`: continue the conversation in the MAIN checkout, like
+    /// `/ask`. No workspace, no merge step — the fork edits the user's tree directly,
+    /// which is what they want when the chat was already about these exact files.
+    fn start_handoff_in_main_checkout(
+        &mut self,
+        backend: Backend,
+        session_id: &str,
+        title: &str,
+        task: &str,
+        instruction: Option<&str>,
+    ) {
+        // Claude scopes `--resume` lookup to the current directory's project folder;
+        // a chat started in a subdirectory of this repo lives in a different one.
+        if backend == Backend::Claude {
+            if let Err(error) = stage_claude_session_for_cwd(&self.cwd, session_id, &self.cwd) {
+                self.notice = Some(format!("handoff failed: {error}"));
+                return;
+            }
+        }
+        let model = self.model.clone();
+        let effort = self.effort;
+        let mut run = create_oneoff_agent(&self.cwd, backend, &model, effort, task);
+        run.task_summary = truncate_chars(&format!("handoff: {title}"), 56);
+        let mut command = match backend {
+            Backend::Claude => claude_fork_command(&model, effort, session_id, instruction),
+            Backend::Codex => codex_fork_command(&model, effort, session_id, instruction),
+            Backend::Opencode => opencode_fork_command(&model, session_id, instruction),
+        };
+        signals::augment_worker_command(&mut command, backend, run.mode, &run.id);
+        let options = TerminalPaneOptions {
+            size: run.terminal_size.unwrap_or_default(),
+            cwd: Some(self.cwd.clone()),
+            ..TerminalPaneOptions::default()
+        };
+        match TerminalPane::spawn_shell_or_command(Some(command), options) {
+            Ok(mut terminal) => {
+                let _ = terminal.drain_output();
+                Self::attach_output_waker(&self.pty_output_waker, &terminal);
+                run.terminal = Some(terminal);
+                run.status = AgentStatus::Running;
+                run.last_output_at = Instant::now();
+                self.record_activity(format!("handed off conversation: {title}"));
+                self.notice = Some(format!(
+                    "picked up “{title}” in the main checkout — it edits this tree directly"
+                ));
+            }
+            Err(error) => {
+                run.status = AgentStatus::Failed;
+                run.last_error = Some(error.to_string());
+                self.notice = Some(format!("handoff failed to start: {error}"));
+            }
+        }
+        let spawned = run.terminal.is_some();
+        let _ = save_native_run_record(&self.cwd, &run);
+        self.agents.push(run);
+        self.selected_agent = self.agents.len().saturating_sub(1);
+        self.focus = if spawned {
+            FocusPane::Worker
+        } else {
+            FocusPane::Task
+        };
+        self.worker_view = WorkerView::Terminal;
+        self.dirty = true;
+    }
+
+    /// Keep the `/handoff` palette's conversation list fresh WITHOUT hitting the
+    /// filesystem on the render path: refresh while the user is typing `/handoff`,
+    /// at most once every few seconds.
+    fn maybe_refresh_handoff_candidates(&mut self) {
+        // Always cheap: pick up a background list that landed since the last key.
+        self.drain_handoff_extra();
+        if resume_command_rest(&self.task_input).is_none() {
+            return;
+        }
+        if self
+            .handoff_candidates_at
+            .is_some_and(|at| at.elapsed() < Duration::from_secs(3))
+        {
+            return;
+        }
+        self.handoff_candidates_at = Some(Instant::now());
+        self.rebuild_handoff_candidates();
+        // Codex's session tree and opencode's `session list` subprocess are both too
+        // slow for the input thread; fetch them together and merge when they land.
+        if self.handoff_extra_rx.is_none() {
+            let (tx, rx) = mpsc::channel();
+            let cwd = self.cwd.clone();
+            self.handoff_extra_rx = Some(rx);
+            thread::spawn(move || {
+                let mut found = recent_codex_conversations(&cwd, HANDOFF_PICKER_LIMIT);
+                found.extend(recent_opencode_conversations(&cwd, HANDOFF_PICKER_LIMIT));
+                let _ = tx.send(found);
+            });
+        }
+    }
+
+    fn drain_handoff_extra(&mut self) {
+        let Some(rx) = self.handoff_extra_rx.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(found) => {
+                self.handoff_extra_rx = None;
+                self.handoff_extra_candidates = found;
+                self.rebuild_handoff_candidates();
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => self.handoff_extra_rx = None,
+        }
+    }
+
+    /// Merge every backend's conversations into ONE list, newest first: the user is
+    /// looking for "the chat I was just having", not for which CLI hosted it.
+    fn rebuild_handoff_candidates(&mut self) {
+        // An agent's own session is not a handoff candidate — it is already a pane,
+        // and `b` branches it in place.
+        let mine: HashSet<String> = self
+            .agents
+            .iter()
+            .filter_map(|run| run.session_id.clone())
+            .collect();
+        let mut candidates = recent_claude_conversations(&self.cwd, HANDOFF_PICKER_LIMIT, &mine);
+        candidates.extend(
+            self.handoff_extra_candidates
+                .iter()
+                .filter(|candidate| !mine.contains(&candidate.session_id))
+                .cloned(),
+        );
+        candidates.sort_by(|left, right| right.modified.cmp(&left.modified));
+        candidates.dedup_by(|left, right| left.session_id == right.session_id);
+        candidates.truncate(HANDOFF_PICKER_LIMIT);
+        self.handoff_candidates = candidates;
+        self.dirty = true;
+    }
+
+    /// Drain `.rudder/handoffs/`: requests dropped by `rudder handoff` running inside
+    /// a live chat elsewhere. Consumed at most once — the file is removed before the
+    /// agent is launched, so a crash mid-launch cannot spawn the same fork twice.
+    fn poll_handoff_inbox(&mut self) {
+        let dir = self.cwd.join(".rudder").join("handoffs");
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return;
+        };
+        let mut files: Vec<PathBuf> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+            .collect();
+        // Filename order is queue order (the CLI stamps them with the epoch millis).
+        files.sort();
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|since| since.as_millis() as u64)
+            .unwrap_or_default();
+        for path in files {
+            let parsed = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                .and_then(|value| parse_handoff_request(&value, now_ms));
+            // Malformed, stale, or unreadable: drop it rather than retrying forever.
+            let _ = std::fs::remove_file(&path);
+            let Some(request) = parsed else {
+                continue;
+            };
+            self.start_handoff_task(request);
+        }
     }
 
     fn open_main_model_switcher(&mut self) {
@@ -5949,6 +6378,40 @@ impl App {
                 }
                 true
             }
+            Some("/resume") | Some("/handoff") => {
+                // Adopt a chat that was happening OUTSIDE the dashboard. With no
+                // session id the palette (which lists this repo's recent
+                // conversations) is the interface; reaching here means the user
+                // dismissed it, so say what the command wants.
+                let rest = resume_command_rest(input).unwrap_or_default().trim().to_string();
+                let mut tokens = rest.splitn(2, char::is_whitespace);
+                let session_id = tokens.next().unwrap_or_default().trim().to_string();
+                let instruction = tokens.next().map(str::trim).unwrap_or_default().to_string();
+                if session_id.is_empty() {
+                    self.maybe_refresh_handoff_candidates();
+                    let found = self.handoff_candidates.len();
+                    self.notice = Some(format!(
+                        "/resume <session-id> [next step] — continue an existing claude/codex/opencode chat as a worker ({found} in the palette) · from inside that chat: rudder handoff \"<next step>\""
+                    ));
+                } else {
+                    let Some(backend) = self.detect_handoff_backend(&session_id) else {
+                        self.notice = Some(format!(
+                            "no claude, codex, or opencode conversation found for {} — /handoff lists this repo's recent chats",
+                            truncate_chars(&session_id, 8)
+                        ));
+                        return true;
+                    };
+                    self.start_handoff_task(HandoffRequest {
+                        session_id,
+                        backend,
+                        target: HandoffTarget::Worker,
+                        instruction: (!instruction.is_empty()).then_some(instruction),
+                        title: None,
+                        created_at_ms: None,
+                    });
+                }
+                true
+            }
             Some("/ask") => {
                 // The escape hatch from the orchestrator default: a one-off
                 // conversational agent in the main checkout, no DAG.
@@ -5991,7 +6454,7 @@ impl App {
             }
             Some("/help") => {
                 self.notice = Some(
-                    "plain input -> one end-to-end main agent · /plan <task> -> isolated multi-agent DAG · /run <task> -> one isolated mergeable worker · /ask <text> -> direct one-off · panes: Option-1/2/3 or ^W · keys: j/k select · Enter focus · v diff · m merge · M merge all · R review all · g nest · o web ui · x stop · b branch chat · dd delete · cc clear merged · P model; commands: /model /fast /sound /color /main /run /ask /plan /restore /share /usage /goal /cloud /web"
+                    "plain input -> one end-to-end main agent · /plan <task> -> isolated multi-agent DAG · /run <task> -> one isolated mergeable worker · /ask <text> -> direct one-off · panes: Option-1/2/3 or ^W · keys: j/k select · Enter focus · v diff · m merge · M merge all · R review all · g nest · o web ui · x stop · b branch chat · dd delete · cc clear merged · P model; commands: /model /fast /sound /color /main /run /ask /plan /resume /restore /share /usage /goal /cloud /web"
                         .to_string(),
                 );
                 true
@@ -6122,6 +6585,14 @@ impl App {
                             ))
                         });
                     }
+                    Backend::Opencode => {
+                        // No fast tier and no effort dial: say so instead of silently
+                        // doing nothing (or pretending a flag was applied).
+                        self.notice = Some(
+                            "opencode has no fast mode or effort dial — pick a faster model with /model opencode <provider/model>"
+                                .to_string(),
+                        );
+                    }
                 }
                 true
             }
@@ -6204,6 +6675,19 @@ impl App {
     fn handle_main_command(&mut self, prompt: &str) {
         let cwd = self.cwd.clone();
         let trimmed_prompt = prompt.trim();
+        // /main deliberately creates ANOTHER main agent (plain input reuses the
+        // existing one) — but two live agents editing the same checkout
+        // concurrently is a foot-gun worth naming when it happens.
+        let live_main_exists = self
+            .agents
+            .iter()
+            .any(|run| run.is_main() && run.status == AgentStatus::Running);
+        if live_main_exists {
+            self.push_activity(
+                "note: another main agent is live in this same checkout — they can overwrite each other's edits"
+                    .to_string(),
+            );
+        }
         let run = create_main_agent(&cwd, self.backend, &self.model, self.effort, trimmed_prompt);
         let run_id = run.id.clone();
         self.agents.insert(0, run);
@@ -6858,14 +7342,6 @@ impl App {
         if !self.refining && (self.awaiting_approval || !self.planned_nodes.is_empty()) {
             return;
         }
-        // Mandatory first question gate: do not capture a first-turn DAG from
-        // streaming output. Let the planner process finish, then
-        // `evaluate_completed_plan` pauses for the required user answer. This
-        // prevents a model that ignored the prompt from slipping a plan through
-        // the early-capture path.
-        if !self.refining && !self.planner_question_round_done {
-            return;
-        }
         let index = self.agents.iter().position(|run| {
             run.mode == AgentMode::RudderPlan
                 && !run.reconcile_planner
@@ -7396,6 +7872,9 @@ impl App {
                     .as_deref()
                     .and_then(|sid| claude_transcript_final_text(&self.cwd, sid)),
                 Backend::Codex => latest_codex_rudder_plan_output(run),
+                // opencode keeps its transcript in a database Rudder does not read;
+                // the pane text IS the plan source for this backend.
+                Backend::Opencode => None,
             };
             if let Some(text) = fallback_text {
                 if extract_rudder_plan_tasks(&text)
@@ -7425,18 +7904,11 @@ impl App {
                 return;
             }
         };
-        if !self.refining && !self.planner_question_round_done {
-            run.autosteered = false;
-            let _ = save_native_run_record(&self.cwd, run);
-            self.planner_paused_for_input = true;
-            self.pending_questions = planner_questions_or_forced(&output);
-            self.notice = Some(
-                "planner needs one question round before the DAG — type your answer to continue planning"
-                    .to_string(),
-            );
-            self.dirty = true;
-            return;
-        }
+        // A parsed first-turn DAG is a RESULT, not a violation: the planner asks
+        // clarifying questions only when something material is missing (prompt),
+        // and the approval gate below is the human checkpoint either way. The
+        // old mandatory question round discarded this DAG and forced a second
+        // full planner round-trip for every request, even trivial ones.
         // Capture the planner's prose after the block (assumptions / open questions)
         // so the orchestrator pane can show what it assumed and invite refinement.
         let summary = extract_rudder_plan_summary(&output);
@@ -8206,6 +8678,10 @@ impl App {
         if self.agent_index_for_token(task_id).is_none() {
             return SteerDelivery::Failed(format!("target not found: {task_id}"));
         }
+        // The failure branch below reports self.notice as the reason; a notice
+        // left over from an unrelated action would masquerade as this merge's
+        // error on the board.
+        self.notice = None;
         self.merge_agent_for_marker(task_id);
         match self.agent_index_for_token(task_id) {
             Some(index) if self.agents[index].status == AgentStatus::Merged => {
@@ -8675,7 +9151,11 @@ impl App {
                     deps.push(PlanEdge {
                         on: dep.clone(),
                         edge: EdgeType::Hard,
-                        why: None,
+                        // The parser demotes hard edges with no justification to
+                        // soft (an LLM habit-check). These edges are USER-typed:
+                        // a round-trip through the RUDDER.md block must not
+                        // silently discard the user's explicit ordering.
+                        why: Some("user-specified ordering".to_string()),
                     });
                 }
             }
@@ -9896,12 +10376,24 @@ impl App {
             match self.merge_agent_at(index) {
                 Ok(()) => merged_labels.push(short_task(&label)),
                 Err(error) => {
+                    // Only a REAL conflict (jj reported conflicted files) gets the AI
+                    // resolver. Every other failure — rudder CLI missing, 120s timeout,
+                    // dirty integration target — used to be dressed up as a conflict
+                    // with zero files, which spawned a resolver with nothing to resolve
+                    // and stamped merge_conflict, excluding the node from this loop
+                    // forever. Route those through the same terminal handling as a
+                    // manual merge failure instead.
+                    let files = self.pending_jj_conflict.clone().unwrap_or_default();
+                    if files.is_empty() {
+                        self.handle_merge_error(task, error, None, None, None, Some(id.clone()));
+                        conflicted = true;
+                        break; // stop integrating this tick; the notice explains why
+                    }
                     // Conflict: auto-spawn the AI resolver to integrate both sides in
                     // the integration workspace. finalize_merge_resolvers flips the
                     // node to Merged (unblocking children) once it finishes clean.
                     // Clone (don't consume) the recorded conflict so it survives a
                     // resolver spawn failure for any later manual recovery.
-                    let files = self.pending_jj_conflict.clone().unwrap_or_default();
                     self.conflict_prompt = Some(MergeConflictPrompt {
                         operation: ConflictOperation::Merge,
                         task,
@@ -10273,9 +10765,17 @@ impl App {
         let Some(run) = self.agents.get_mut(self.selected_agent) else {
             return;
         };
-        if run.review_terminal.is_some() {
-            return;
+        if let Some(review) = run.review_terminal.as_mut() {
+            if review.is_alive() {
+                return;
+            }
+            // The watch loop died (workspace deleted, jj crash): keep the last
+            // frame and a frozen pane was all the user got. Respawn instead.
+            review.terminate_and_wait();
+            run.review_terminal = None;
         }
+        // A once-failed pane must not pin its error forever; each open retries.
+        run.review_error = None;
 
         #[cfg(test)]
         {
@@ -10286,11 +10786,39 @@ impl App {
 
         #[cfg(not(test))]
         {
+            // A cloud agent's cwd is the LOCAL repo root — its real workspace
+            // lives on the remote worker and there is no diff fetch-back yet.
+            // Watching the local checkout here would confidently show the
+            // user's own edits as the worker's. Be honest instead.
+            if render::is_cloud_agent(run) {
+                run.review_error = Some(
+                    "cloud worker: its diff lives on the remote workspace (local diff view \
+                     would show YOUR checkout) · use `rudder cloud logs <id>` or merge-back"
+                        .to_string(),
+                );
+                return;
+            }
+            // The workspace can be gone (merged + GC'd): spawning sh in a deleted
+            // cwd yields a bare ENOENT that reads like a Rudder bug. Say what
+            // actually happened instead.
+            if !run.cwd.exists() {
+                run.review_error = Some(
+                    "workspace was reclaimed (merged work is cleaned up); nothing left to diff"
+                        .to_string(),
+                );
+                return;
+            }
             // The review pane is jj's own diff, watched live: `jj status` (the
-            // working-copy summary) + `jj diff` (jj's default diff program), redrawn
-            // every 2s so edits the agent makes show up. The agent works in a jj
-            // workspace, so this is the faithful view of its changes. Falls back to
-            // `git diff` only if jj is somehow unavailable.
+            // working-copy summary) + `jj diff` (jj's default diff program). The
+            // agent works in a jj workspace, so this is the faithful view of its
+            // changes. Falls back to `git diff` only if jj is somehow unavailable.
+            //
+            // The loop only repaints when the capture CHANGED: an unconditional
+            // clear+reprint every 2s shifted the scroll position by a whole diff
+            // length per tick (scrollback is measured from the bottom), making any
+            // >1-screen diff unreadable while an idle pane still churned CPU.
+            // A stale working copy (siblings snapshotting concurrently) recovers
+            // via `jj workspace update-stale` instead of erroring forever.
             //
             // CRITICAL: pipe jj through `cat` (and use git `--no-pager`). The pane is
             // a real PTY, so jj/git see a tty on stdout and would launch a PAGER on a
@@ -10300,7 +10828,7 @@ impl App {
                 "sh",
                 [
                     "-lc",
-                    "if command -v jj >/dev/null 2>&1; then while :; do printf '\\033[2J\\033[H'; jj --color=always status 2>&1 | cat; printf '\\n'; jj --color=always diff 2>&1 | cat; sleep 2; done; else while :; do printf '\\033[2J\\033[H'; git --no-pager status --short 2>&1; printf '\\n'; git --no-pager diff --color=always HEAD 2>&1; sleep 2; done; fi",
+                    "if command -v jj >/dev/null 2>&1 && jj root >/dev/null 2>&1; then snap() { jj --color=always status 2>&1 | cat; printf '\\n'; jj --color=always diff 2>&1 | cat; }; else snap() { git --no-pager status --short 2>&1; printf '\\n'; git --no-pager diff --color=always HEAD 2>&1; }; fi; prev='__rudder_unrendered__'; while :; do cur=$(snap); case \"$cur\" in *'working copy is stale'*) jj workspace update-stale >/dev/null 2>&1; cur=$(snap);; esac; if [ \"$cur\" != \"$prev\" ]; then printf '\\033[2J\\033[H'; printf '%s\\n' \"$cur\"; prev=$cur; fi; sleep 2; done",
                 ],
             );
             let options = TerminalPaneOptions {
@@ -10359,6 +10887,19 @@ impl App {
         // click resolves to nothing instead of a neighbor (next render rebuilds it).
         self.agent_row_map.clear();
         let _ = remove_native_run_record(&self.cwd, &run.id);
+        // A deleted launched node must leave the plan's id set: its id can never
+        // reach Merged, so keeping it in plan_launched_node_ids made every hard
+        // dependent permanently un-ready (known_plan_node_ids still contained
+        // the id) with no notice. Dropping it turns the dep into a dangling id,
+        // which is_ready treats as satisfied — the user removed the node, so
+        // its dependents proceed.
+        if let Some(node_id) = run.node_id.as_deref() {
+            if !self.plan_merged_node_ids.contains(node_id)
+                && self.plan_launched_node_ids.remove(node_id)
+            {
+                self.persist_plan_queue();
+            }
+        }
         // Drop the run's hook/signal files too, or ~/.rudder/signals grows forever.
         signals::cleanup_run_signals(&run.id);
         // Prune the run from the ingest ledger so it does not accumulate dead ids (and so
@@ -10473,32 +11014,81 @@ impl App {
         }
 
         let label = format!("branch: {source_summary}");
-        // Seed the fork's workspace from the source's CURRENT jj change (jj snapshots
-        // the source working copy in the process), so files match the forked memory.
-        let worktree = match prepare_jj_workspace_at(&self.cwd, &label, base_change.as_deref()) {
-            Ok(worktree) => worktree,
+        match self.spawn_forked_conversation(ForkedConversation {
+            backend,
+            model,
+            effort,
+            session_id,
+            source_cwd,
+            // Seed the fork's workspace from the source's CURRENT jj change (jj snapshots
+            // the source working copy in the process), so files match the forked memory.
+            base_change,
+            label,
+            task: format!("Branch of: {source_task}"),
+            seed: None,
+        }) {
+            Ok(ForkOutcome::Started) => {
+                self.notice = Some(format!(
+                    "branched {source_summary}; type the new direction in the forked pane"
+                ));
+            }
+            Ok(ForkOutcome::SpawnFailed(error)) => {
+                self.notice = Some(format!("branch failed to start: {error}"));
+            }
             Err(error) => {
                 self.notice = Some(format!("branch failed: {error}"));
-                return;
             }
-        };
+        }
+        self.delete_pending = None;
+    }
+
+    /// Fork a CLI conversation into a NEW jj workspace and open it as a worker row.
+    /// Shared by `b` (branch a live agent's chat) and `/handoff` (adopt a chat that
+    /// was happening OUTSIDE the dashboard). Always a fork, never a plain resume:
+    /// the source conversation may still be open in another process, and two
+    /// writers on one transcript corrupt it.
+    fn spawn_forked_conversation(
+        &mut self,
+        request: ForkedConversation,
+    ) -> std::result::Result<ForkOutcome, String> {
+        let ForkedConversation {
+            backend,
+            model,
+            effort,
+            session_id,
+            source_cwd,
+            base_change,
+            label,
+            task,
+            seed,
+        } = request;
+        // Claude resolves --resume against the CURRENT directory's transcripts; make
+        // sure the source session's transcript actually exists before creating a
+        // workspace we'd abandon on failure. (Codex sessions are global.)
+        if backend == Backend::Claude && claude_transcript_path(&source_cwd, &session_id).is_none()
+        {
+            return Err("no session transcript found to fork".to_string());
+        }
+        let worktree = prepare_jj_workspace_at(&self.cwd, &label, base_change.as_deref())
+            .map_err(|error| error.to_string())?;
         if let Err(error) = self.write_rudder_context_timed(Some(&worktree)) {
             self.notice = Some(format!("context warning: {error}"));
         }
         // Stage the source transcript into the fork workspace's project folder so
         // `--resume <sid> --fork-session` can find the conversation from its new cwd.
         if backend == Backend::Claude {
-            if let Err(error) =
-                stage_claude_session_for_cwd(&source_cwd, &session_id, &worktree.path)
-            {
-                self.notice = Some(format!("branch failed: {error}"));
-                return;
-            }
+            stage_claude_session_for_cwd(&source_cwd, &session_id, &worktree.path)?;
         }
-
+        // A seeded fork wakes up in a DIFFERENT directory than the conversation it
+        // remembers; say so before the instruction so it re-reads instead of trusting
+        // its memory of the other checkout.
+        let seed = seed
+            .map(|text| worker_orientation(&worktree.path, &text))
+            .filter(|text| !text.trim().is_empty());
         let mut command = match backend {
-            Backend::Claude => claude_fork_command(&model, effort, &session_id),
-            Backend::Codex => codex_fork_command(&model, effort, &session_id),
+            Backend::Claude => claude_fork_command(&model, effort, &session_id, seed.as_deref()),
+            Backend::Codex => codex_fork_command(&model, effort, &session_id, seed.as_deref()),
+            Backend::Opencode => opencode_fork_command(&model, &session_id, seed.as_deref()),
         };
         signals::augment_worker_command(&mut command, backend, AgentMode::Execute, &worktree.id);
         let options = TerminalPaneOptions {
@@ -10512,10 +11102,19 @@ impl App {
             id: worktree.id.clone(),
             created_at: created_at.clone(),
             mode: AgentMode::Execute,
-            task: format!("Branch of: {source_task}"),
+            task,
             task_summary: truncate_chars(&label, 56),
-            current_prompt: String::new(),
-            turns: Vec::new(),
+            current_prompt: seed.clone().unwrap_or_default(),
+            turns: seed
+                .clone()
+                .map(|prompt| {
+                    vec![AgentTurn {
+                        ts: created_at.clone(),
+                        prompt,
+                        source: "user".to_string(),
+                    }]
+                })
+                .unwrap_or_default(),
             last_user_input_at: created_at,
             backend,
             model,
@@ -10565,31 +11164,35 @@ impl App {
             tokens_out: 0,
         };
 
+        let mut outcome = ForkOutcome::Started;
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
             Ok(mut terminal) => {
                 let _ = terminal.drain_output();
                 Self::attach_output_waker(&self.pty_output_waker, &terminal);
                 run.terminal = Some(terminal);
-                self.notice = Some(format!(
-                    "branched {source_summary}; type the new direction in the forked pane"
-                ));
             }
             Err(error) => {
                 run.status = AgentStatus::Failed;
                 run.last_error = Some(error.to_string());
-                self.notice = Some(format!("branch failed to start: {error}"));
+                outcome = ForkOutcome::SpawnFailed(error.to_string());
             }
         }
 
+        let spawned = run.terminal.is_some();
         self.agents.push(run);
         self.selected_agent = self.agents.len().saturating_sub(1);
-        self.delete_pending = None;
-        self.focus = FocusPane::Worker;
+        self.focus = if spawned {
+            FocusPane::Worker
+        } else {
+            FocusPane::Task
+        };
         self.worker_view = WorkerView::Terminal;
         if let Some(run) = self.agents.get(self.selected_agent) {
             let _ = save_native_run_record(&self.cwd, run);
         }
         let _ = self.write_rudder_context_timed(None);
+        self.dirty = true;
+        Ok(outcome)
     }
 
     /// `c` in the agents pane: clear every MERGED agent from the list in one
@@ -10732,6 +11335,11 @@ impl App {
             self.notice = Some("one-off agent: merge disabled".to_string());
             return;
         }
+        if run.status == AgentStatus::Running {
+            self.notice =
+                Some("agent is still running; stop it with x or wait before merging".to_string());
+            return;
+        }
         if run.has_merge_conflict() {
             self.start_stored_merge_conflict_resolution(self.selected_agent);
             return;
@@ -10741,12 +11349,17 @@ impl App {
             return;
         }
         self.delete_pending = None;
+        // Merges run with --allow-dirty: uncommitted edits in the main checkout
+        // become part of the merge parent. Surprising enough to warn about in
+        // the modal instead of discovering it in the merge commit.
+        let dirty_warning = diff_short_summary_at(&self.cwd)
+            .map(|stat| format!("your uncommitted local changes merge too ({stat})"));
         self.merge_confirm = Some(MergeConfirmation {
             intent: MergeIntent::Selected {
                 id: run.id.clone(),
                 task: run.task.clone(),
             },
-            detail: None,
+            detail: dirty_warning,
         });
         self.conflict_prompt = None;
         // The modal carries the question and the keys; a parallel notice would
@@ -10824,7 +11437,13 @@ impl App {
                     self.merge_confirm = None;
                     self.notice = Some("merge cancelled".to_string());
                 }
-                _ => {}
+                _ => {
+                    // The modal captures EVERY key; a silently-eaten keystroke
+                    // reads as a frozen dashboard. Say why nothing happened.
+                    self.notice =
+                        Some("merge prompt open — y merges · n or Esc cancels".to_string());
+                    self.dirty = true;
+                }
             }
             return true;
         }
@@ -10845,7 +11464,12 @@ impl App {
                         "resolve the jj conflicts manually, then press m to finalize".to_string()
                     });
                 }
-                _ => {}
+                _ => {
+                    self.notice = Some(
+                        "conflict prompt open — y starts the AI resolver · n dismisses".to_string(),
+                    );
+                    self.dirty = true;
+                }
             }
             return true;
         }
@@ -10905,6 +11529,12 @@ impl App {
                     let Some(index) = self.agents.iter().position(|run| run.id == *id) else {
                         continue;
                     };
+                    // The ids were snapshotted at request time; auto-integration
+                    // may have landed some meanwhile. Counting those as "merged
+                    // by merge-all" over-reported the batch.
+                    if self.agents[index].status == AgentStatus::Merged {
+                        continue;
+                    }
                     let task = self.agents[index].task.clone();
                     let source_branch = self.agents[index].worktree_branch.clone();
                     let worktree_path = self.agents[index].worktree_path.clone();
@@ -10988,7 +11618,11 @@ impl App {
                 .and_then(|id| self.agents.iter().position(|run| run.id == id))
             {
                 if let Some(run) = self.agents.get_mut(index) {
-                    run.status = AgentStatus::Failed;
+                    // A failed MERGE must not kill a live agent: the work is
+                    // still in progress, only the (refused) integration failed.
+                    if run.status != AgentStatus::Running {
+                        run.status = AgentStatus::Failed;
+                    }
                     run.last_error = Some(error.to_string());
                     let _ = save_native_run_record(&self.cwd, run);
                 }
@@ -11142,6 +11776,7 @@ impl App {
                 let command = match backend {
                     Backend::Claude => claude_resume_command(run, sid),
                     Backend::Codex => codex_resume_command(run, sid),
+                    Backend::Opencode => opencode_resume_command(run, sid),
                 };
                 (command, Some(new_goal.to_string()), session.clone())
             } else {
@@ -11717,6 +12352,12 @@ What to do\n\
         if run.status == AgentStatus::Merged {
             return Ok(());
         }
+        // A live agent's workspace is mid-edit; merging it would land a
+        // half-finished diff. Every entry point (modal, markers, board steer)
+        // funnels through here, so guard once at the seam.
+        if run.status == AgentStatus::Running {
+            anyhow::bail!("agent is still running; stop it or wait before merging");
+        }
         let is_jj = Self::run_is_jj(run);
         let review_source_ids = run.review_source_ids.clone();
         let run_id = run.id.clone();
@@ -11898,6 +12539,7 @@ What to do\n\
         if self.last_steer_poll.elapsed() >= Duration::from_secs(1) {
             self.last_steer_poll = Instant::now();
             self.poll_steer_inbox();
+            self.poll_handoff_inbox();
             self.maybe_emit_heartbeat();
         }
 
@@ -12271,15 +12913,21 @@ What to do\n\
         // its review_terminal, so the `jj diff` watch loop's every-2s output never
         // reached the grid and `v` looked frozen. Drain the selected agent's review
         // pane here whenever the Diff view is open so it refreshes as the agent edits.
-        if self.worker_view == WorkerView::Diff {
-            if let Some(review) = self
-                .agents
-                .get_mut(self.selected_agent)
-                .and_then(|run| run.review_terminal.as_mut())
-            {
+        // Every OTHER review terminal is torn down: nothing drains it (its PTY
+        // buffer would grow without bound) and its sh+jj watch loop would keep
+        // spinning for the run's lifetime. `v` respawns one instantly on re-open.
+        let viewed_review = (self.worker_view == WorkerView::Diff).then_some(self.selected_agent);
+        for (index, run) in self.agents.iter_mut().enumerate() {
+            let Some(review) = run.review_terminal.as_mut() else {
+                continue;
+            };
+            if Some(index) == viewed_review {
                 if !review.drain_output().is_empty() {
                     any_dirty = true;
                 }
+            } else {
+                review.terminate_and_wait();
+                run.review_terminal = None;
             }
         }
 

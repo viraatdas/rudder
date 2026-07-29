@@ -18,7 +18,9 @@ const ORCHESTRATOR_SKILLS_DIR: &str = ".claude/skills";
 pub(crate) fn mint_session_id_for(backend: Backend) -> Option<String> {
     match backend {
         Backend::Claude => Some(uuid::Uuid::new_v4().to_string()),
-        Backend::Codex => None,
+        // Codex and opencode mint their own session ids and offer no way to
+        // pre-declare one; Rudder discovers theirs after the fact.
+        Backend::Codex | Backend::Opencode => None,
     }
 }
 
@@ -121,7 +123,7 @@ const ORCHESTRATOR_SKILLS: &[OrchestratorSkill] = &[
 
 pub(crate) fn can_resume_agent(run: &AgentRun) -> bool {
     match run.backend {
-        Backend::Claude | Backend::Codex => run.session_id.is_some(),
+        Backend::Claude | Backend::Codex | Backend::Opencode => run.session_id.is_some(),
     }
 }
 
@@ -146,11 +148,13 @@ pub(crate) fn claude_resume_command(run: &AgentRun, session_id: &str) -> Termina
 /// BRANCH a Claude chat: resume the source session but `--fork-session` so the
 /// continuation gets a NEW session id and the original conversation is left
 /// exactly where it was. The forked pane opens interactive with the full prior
-/// context; the user types the new direction as its next turn.
+/// context; the user types the new direction as its next turn — or `prompt`
+/// supplies it (a handoff carries the next step with it).
 pub(crate) fn claude_fork_command(
     model: &str,
     effort: Option<EffortLevel>,
     session_id: &str,
+    prompt: Option<&str>,
 ) -> TerminalCommand {
     let mut args: Vec<String> = vec![
         "--permission-mode".to_string(),
@@ -167,6 +171,10 @@ pub(crate) fn claude_fork_command(
     args.push("--resume".to_string());
     args.push(session_id.to_string());
     args.push("--fork-session".to_string());
+    // Claude takes the first turn as a positional prompt and still opens interactive.
+    if let Some(prompt) = prompt.map(str::trim).filter(|value| !value.is_empty()) {
+        args.push(prompt.to_string());
+    }
     TerminalCommand::with_args(claude_program(), args).with_env("CLAUDE_CODE_NO_FLICKER", "0")
 }
 
@@ -178,6 +186,7 @@ pub(crate) fn codex_fork_command(
     model: &str,
     effort: Option<EffortLevel>,
     session_id: &str,
+    prompt: Option<&str>,
 ) -> TerminalCommand {
     let mut args = vec![
         "--no-alt-screen".to_string(),
@@ -192,6 +201,10 @@ pub(crate) fn codex_fork_command(
     }
     args.push("fork".to_string());
     args.push(session_id.to_string());
+    // `codex fork [SESSION_ID] [PROMPT]` — the optional prompt starts the session.
+    if let Some(prompt) = prompt.map(str::trim).filter(|value| !value.is_empty()) {
+        args.push(prompt.to_string());
+    }
     TerminalCommand::with_args(codex_program(), args).with_env("CODEX_RUDDER_SCROLLBACK_SAFE", "1")
 }
 
@@ -295,6 +308,21 @@ pub(crate) fn rudder_plan_refine_command(
             args.push(feedback_prompt.to_string());
             TerminalCommand::with_args(codex_program(), args)
                 .with_env("CODEX_RUDDER_SCROLLBACK_SAFE", "1")
+        }
+        // opencode resumes the planner session in its TUI and takes the feedback as
+        // the next turn; there is no headless streaming mode to parse, so the
+        // revised plan block is read out of the pane exactly like the first turn.
+        Backend::Opencode => {
+            let mut args = vec![
+                "--session".to_string(),
+                session_id.to_string(),
+            ];
+            push_opencode_model(&mut args, model);
+            if !feedback_prompt.trim().is_empty() {
+                args.push("--prompt".to_string());
+                args.push(feedback_prompt.to_string());
+            }
+            TerminalCommand::with_args(opencode_program(), args)
         }
     }
 }
@@ -506,7 +534,78 @@ pub(crate) fn agent_command_with_orchestrator_mode(
             TerminalCommand::with_args(codex_program(), args)
                 .with_env("CODEX_RUDDER_SCROLLBACK_SAFE", "1")
         }
+        Backend::Opencode => opencode_command(model, prompt.as_deref(), mode),
     }
+}
+
+/// Every opencode launch has the same shape: the interactive TUI, optionally
+/// auto-approving, with the first turn passed as `--prompt`.
+///
+/// opencode has no headless streaming mode Rudder can parse (no `claude -p
+/// --output-format stream-json`, no `codex exec --json`), so planner modes run the
+/// same TUI and Rudder reads their RUDDER_PLAN_TASKS block out of the pane text —
+/// the same path the interactive orchestrator already uses. Planners are launched
+/// WITHOUT `--auto` so an unexpected edit stops for approval rather than landing.
+pub(crate) fn opencode_command(
+    model: &str,
+    prompt: Option<&str>,
+    mode: AgentMode,
+) -> TerminalCommand {
+    let mut args: Vec<String> = Vec::new();
+    if matches!(
+        mode,
+        AgentMode::Execute | AgentMode::ReviewAll | AgentMode::Main | AgentMode::OneOff
+    ) {
+        args.push("--auto".to_string());
+    }
+    push_opencode_model(&mut args, model);
+    if let Some(prompt) = prompt.map(str::trim).filter(|value| !value.is_empty()) {
+        args.push("--prompt".to_string());
+        args.push(prompt.to_string());
+    }
+    TerminalCommand::with_args(opencode_program(), args)
+}
+
+/// opencode names models `provider/model`. An empty model means "whatever opencode
+/// is configured to use", which is a legitimate choice, so it is simply omitted.
+fn push_opencode_model(args: &mut Vec<String>, model: &str) {
+    let model = model.trim();
+    if !model.is_empty() {
+        args.push("-m".to_string());
+        args.push(model.to_string());
+    }
+}
+
+/// Continue an opencode conversation in place (same session, no fork).
+pub(crate) fn opencode_resume_command(run: &AgentRun, session_id: &str) -> TerminalCommand {
+    let mut args = vec![
+        "--auto".to_string(),
+        "--session".to_string(),
+        session_id.to_string(),
+    ];
+    push_opencode_model(&mut args, &run.model);
+    TerminalCommand::with_args(opencode_program(), args)
+}
+
+/// BRANCH an opencode chat: `--session <id> --fork` copies the conversation into a
+/// new session and leaves the original untouched, like the other two backends.
+pub(crate) fn opencode_fork_command(
+    model: &str,
+    session_id: &str,
+    prompt: Option<&str>,
+) -> TerminalCommand {
+    let mut args = vec![
+        "--auto".to_string(),
+        "--session".to_string(),
+        session_id.to_string(),
+        "--fork".to_string(),
+    ];
+    push_opencode_model(&mut args, model);
+    if let Some(prompt) = prompt.map(str::trim).filter(|value| !value.is_empty()) {
+        args.push("--prompt".to_string());
+        args.push(prompt.to_string());
+    }
+    TerminalCommand::with_args(opencode_program(), args)
 }
 
 /// Resume an INTERACTIVE orchestrator session as the LIVE CONDUCTOR.
@@ -569,6 +668,18 @@ pub(crate) fn rudder_orchestrator_resume_command(
             TerminalCommand::with_args(codex_program(), args)
                 .with_env("CODEX_RUDDER_SCROLLBACK_SAFE", "1")
         }
+        Backend::Opencode => {
+            let mut args = vec![
+                "--session".to_string(),
+                session_id.to_string(),
+            ];
+            push_opencode_model(&mut args, model);
+            if !continuation.trim().is_empty() {
+                args.push("--prompt".to_string());
+                args.push(continuation.to_string());
+            }
+            TerminalCommand::with_args(opencode_program(), args)
+        }
     }
 }
 
@@ -597,6 +708,14 @@ fn push_codex_common_config_overrides(args: &mut Vec<String>, effort: Option<Eff
     args.push("-c".to_string());
     args.push("model_supports_reasoning_summaries=true".to_string());
     if let Some(effort) = effort {
+        // Codex has no "max" tier; TS normalizes max→xhigh (normalizeEffortForBackend)
+        // but this Rust path used to emit the raw value, which Codex rejects —
+        // `/model codex gpt-5.5 max` launched a worker that died on startup.
+        let effort = if effort == EffortLevel::Max {
+            EffortLevel::XHigh
+        } else {
+            effort
+        };
         args.push("-c".to_string());
         args.push(format!("model_reasoning_effort=\"{}\"", effort.as_str()));
     }
@@ -628,6 +747,14 @@ pub(crate) fn push_codex_planner_config_overrides(
     args.push("features.plugins=false".to_string());
     args.push("-c".to_string());
     args.push("features.computer_use=false".to_string());
+}
+
+pub(crate) fn opencode_program() -> String {
+    env::var("RUDDER_OPENCODE_BIN")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "opencode".to_string())
 }
 
 pub(crate) fn codex_program() -> String {

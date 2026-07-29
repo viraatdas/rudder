@@ -10,7 +10,7 @@ import type {
   ReconcileResult,
 } from "./types.js";
 import { callTextModel } from "./task-summary.js";
-import { loadInstructionFiles } from "./brain.js";
+import { loadInstructionFiles, suggestTests } from "./brain.js";
 import { createEmptyChange, currentJjChangeId } from "./jj.js";
 import { newEdgeId, newNodeId, updateGraph } from "./graph.js";
 import { nowIso } from "./util.js";
@@ -234,7 +234,7 @@ function parseFileScope(value: unknown): string[] | undefined {
 }
 
 function isBackend(value: unknown): value is BackendId {
-  return value === "claude" || value === "codex" || value === "acpx";
+  return value === "claude" || value === "codex" || value === "acpx" || value === "opencode";
 }
 
 function isEffort(value: unknown): value is EffortLevel {
@@ -341,9 +341,16 @@ export async function planTask(task: string, ctx: PlanContext): Promise<PlanDag>
   const instructionText = instructions.length
     ? `\n\nRepository instructions:\n${instructions.map((file) => `### ${file.path}\n${file.content}`).join("\n\n")}`
     : "";
+  // Ground `success` in this repo's REAL check commands; without them the model
+  // invents unverifiable prose bars ("its own verification passes").
+  const checks = await suggestTests(ctx.root).catch(() => [] as string[]);
+  const checksText = checks.length
+    ? `\nVerification commands available in this repository (base each task's \`success\` on the relevant ones): ${checks.join(", ")}`
+    : "";
   const user = [
     `Repository root (for your read-only inspection ONLY — do NOT put this path in any task prompt; workers run elsewhere): ${ctx.root}`,
     `Branch: ${ctx.branch}`,
+    checksText,
     "",
     `User request:\n${task}`,
     instructionText,

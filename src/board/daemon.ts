@@ -1147,6 +1147,11 @@ export function columnForStatus(status: RunStatus): BoardNode["column"] {
     case "failed":
     case "cancelled":
     case "paused":
+    // Orphaned (dashboard closed under a live row) and migrated (handed to a
+    // cloud worker) are terminal-here states; the default "todo" made them
+    // look like un-started work.
+    case "orphaned":
+    case "migrated":
       return "done";
     default:
       return "todo";

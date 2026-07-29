@@ -153,7 +153,7 @@ export function mirrorNodeStatus(status: string | undefined): NodeStatus {
 }
 
 function mirrorBackend(backend: string | undefined): BackendId {
-  return backend === "codex" || backend === "acpx" ? backend : "claude";
+  return backend === "codex" || backend === "acpx" || backend === "opencode" ? backend : "claude";
 }
 
 function mirrorEffort(effort: string | undefined): EffortLevel | undefined {
@@ -416,9 +416,13 @@ function nodeStatusFromRunStatus(runStatus: RunStatus, fallback: NodeStatus): No
       return "review";
     case "failed":
     case "cancelled":
-    case "paused":
     case "orphaned":
       return "failed";
+    // Paused is RESUMABLE (quitting the dashboard pauses live workers);
+    // projecting it as "failed" turned every node red on quit as if the fleet
+    // had crashed. "blocked" reads as not-progressing without claiming death.
+    case "paused":
+      return "blocked";
     case "merged":
       return "merged";
     case "merge-conflict":

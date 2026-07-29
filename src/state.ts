@@ -183,7 +183,6 @@ export function defaultConfig(): RudderConfig {
     runPolicy: {
       sameCheckout: "single-active",
       concurrentPromptMode: "worktree",
-      mergeMode: "manual-on-conflict",
     },
     acpx: { install: "latest" },
     backends: {

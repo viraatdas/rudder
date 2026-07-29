@@ -33,6 +33,9 @@ export function getBackend(id: BackendId): BackendAdapter {
   if (id === "codex") {
     return codexBackend();
   }
+  if (id === "opencode") {
+    return opencodeBackend();
+  }
   return acpxBackend();
 }
 
@@ -210,6 +213,48 @@ function codexBackend(): BackendAdapter {
         args,
         cwd: request.run.worktree.path,
         env,
+        request,
+        emit,
+      });
+    },
+  };
+}
+
+/**
+ * opencode (https://opencode.ai). `opencode run --format json` streams JSONL parts
+ * and reports the session id on every one, so a follow-up turn resumes the same
+ * conversation with `--session`. Models are named `provider/model`; an empty model
+ * means "whatever opencode is configured with", which is a legitimate choice here.
+ *
+ * No effort flag exists, so `run.effort` is deliberately not translated.
+ */
+function opencodeBackend(): BackendAdapter {
+  return {
+    id: "opencode",
+    async verify() {
+      return commandExists("opencode")
+        ? { ok: true, message: "opencode found" }
+        : { ok: false, message: formatMissingToolMessage("opencode") };
+    },
+    async run(request, emit) {
+      const prompt = stripRudderPromptWrappers(request.prompt);
+      const sessionId = request.run.session?.nativeSessionId;
+      const isFollowUp = (request.run.turns?.length ?? 0) > 1 && Boolean(sessionId);
+      const args = compact([
+        "run",
+        "--format",
+        "json",
+        request.run.model ? "-m" : undefined,
+        request.run.model || undefined,
+        isFollowUp ? "--session" : undefined,
+        isFollowUp ? sessionId : undefined,
+        `${request.contract}\n\n${prompt}`,
+      ]);
+      return await spawnAndStream({
+        command: "opencode",
+        args,
+        cwd: request.run.worktree.path,
+        env: process.env,
         request,
         emit,
       });
@@ -486,9 +531,11 @@ function sessionIdFromBackendData(data: unknown): string | undefined {
   // `codex exec --json` announces the resumable conversation with a
   // thread.started event. Persist it so a web steer resumes model context rather
   // than merely re-running in the same workspace.
-  return data.type === "thread.started" && typeof data.thread_id === "string"
-    ? data.thread_id
-    : undefined;
+  if (data.type === "thread.started" && typeof data.thread_id === "string") {
+    return data.thread_id;
+  }
+  // `opencode run --format json` stamps every part with its session id.
+  return typeof data.sessionID === "string" ? data.sessionID : undefined;
 }
 
 function saveBackendRun(run: RunRequest["run"]): Promise<boolean> {
@@ -602,6 +649,10 @@ function textFromBackendData(data: unknown, sawStreamingText: boolean): string {
   }
   if (isRecord(record.error) && typeof record.error.message === "string") {
     return record.error.message;
+  }
+  // opencode: text parts carry the assistant prose; step_start/step_finish do not.
+  if (record.type === "text" && isRecord(record.part) && typeof record.part.text === "string") {
+    return record.part.text;
   }
   if (record.type === "assistant") {
     if (sawStreamingText) {

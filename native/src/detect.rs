@@ -111,6 +111,13 @@ pub(crate) fn looks_like_idle_chrome(backend: Backend, line: &str) -> bool {
     }
     match backend {
         Backend::Claude => lower.contains("(shift+tab"),
+        // opencode's idle footer: the status/help hints it draws under the composer.
+        Backend::Opencode => {
+            lower.contains("/help")
+                || lower.contains("ctrl+")
+                || lower.contains("tab ")
+                || lower.contains("· opencode")
+        }
         Backend::Codex => {
             // Codex idle markers seen in the wild:
             //   "Worked for 4m 46s"        - turn-end summary line
@@ -409,6 +416,12 @@ pub(crate) fn looks_like_agent_prompt(backend: Backend, line: &str) -> bool {
             line == "›"
                 || line.starts_with("› ")
                 || line.starts_with("> ")
+                || line.contains("Type a message")
+        }
+        Backend::Opencode => {
+            line == ">"
+                || line.starts_with("> ")
+                || line.starts_with("❯ ")
                 || line.contains("Type a message")
         }
     }

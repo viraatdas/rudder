@@ -138,17 +138,46 @@ export async function verifyRun(run: RunRecord): Promise<VerificationResult> {
   } else {
     satisfied.push(diff.trim() ? "The run produced a git diff." : "The run produced git status changes.");
   }
-  if (/test|spec|check|lint|typecheck|verify/i.test(transcript)) {
-    satisfied.push("The transcript mentions verification or tests.");
-  } else if ((changed || expectsCodeChanges(run.task)) && spec?.suggestedTests.length) {
-    missing.push("No explicit verification/test run was detected in the transcript.");
+  // Verify against the node's own contract, not a keyword scan: the old
+  // /test|spec|check/ mention-regex passed a transcript that literally said
+  // "I did not run the tests". Look for evidence a concrete expected command
+  // ran (the spec's success line and suggested tests name them), or real
+  // test-runner output, and treat an explicit "couldn't run" as a gap.
+  const expectedCommands = [
+    ...extractCommands(spec?.success ?? ""),
+    ...(spec?.suggestedTests ?? []),
+  ].filter((cmd, index, all) => cmd && all.indexOf(cmd) === index);
+  const ranCommand = expectedCommands.find((cmd) => transcript.includes(cmd));
+  const testOutputEvidence =
+    /\b(\d+\s+(?:passed|passing)|tests?\s+pass(?:ed)?|test result: ok|all checks passed|0 failures|exit code 0)\b/i.test(
+      transcript,
+    );
+  const refusedVerification =
+    /\b(did not run|didn'?t run|could not run|couldn'?t run|unable to run|skipp(?:ed|ing) (?:the )?(?:tests?|checks?|verification))\b/i.test(
+      transcript,
+    );
+  if (changed || expectsCodeChanges(run.task)) {
+    if (refusedVerification) {
+      missing.push("The transcript says verification was skipped or could not run.");
+    } else if (ranCommand) {
+      satisfied.push(`The transcript shows an expected check ran (${ranCommand}).`);
+    } else if (testOutputEvidence) {
+      satisfied.push("The transcript contains test/check output evidence.");
+    } else if (expectedCommands.length > 0) {
+      missing.push(
+        `No evidence the expected checks ran (looked for: ${expectedCommands.slice(0, 4).join(", ")}).`,
+      );
+    }
   }
 
+  const successLine = spec?.success?.trim();
   const result: VerificationResult = {
     satisfied,
     missing,
     notes: changed
-      ? "Local verifier checked for produced changes and evidence of verification."
+      ? successLine
+        ? `Local verifier checked produced changes and execution evidence against the task's own bar: ${successLine}`
+        : "Local verifier checked for produced changes and evidence of verification."
       : expectsCodeChanges(run.task)
         ? "Local verifier found no changes. The worker may have only analyzed the task."
         : "Local verifier accepted a no-change response for a non-edit prompt.",
@@ -156,6 +185,28 @@ export async function verifyRun(run: RunRecord): Promise<VerificationResult> {
   };
   await writeJson(verifierPath(run.repoRoot, run.id), result);
   return result;
+}
+
+/**
+ * Concrete runnable commands named by a success/done-when line: backtick-quoted
+ * spans plus a bare common-runner invocation ("npm run check", "cargo test",
+ * "pytest"). Used to check the transcript for execution evidence.
+ */
+function extractCommands(text: string): string[] {
+  const out: string[] = [];
+  for (const match of text.matchAll(/`([^`]+)`/g)) {
+    const cmd = match[1].trim();
+    if (cmd) {
+      out.push(cmd);
+    }
+  }
+  const runner = text.match(
+    /\b((?:npm|npx|pnpm|yarn|cargo|pytest|go|make|node)\s+(?:run\s+)?[a-zA-Z0-9_.:-]+)/,
+  );
+  if (runner) {
+    out.push(runner[1].trim());
+  }
+  return out;
 }
 
 function expectsCodeChanges(task: string): boolean {
@@ -178,7 +229,7 @@ function buildAcceptanceCriteria(task: string): string[] {
   return criteria;
 }
 
-async function suggestTests(workspace: string): Promise<string[]> {
+export async function suggestTests(workspace: string): Promise<string[]> {
   const suggestions: string[] = [];
   const packageJson = await readJson<{ scripts?: Record<string, string> }>(
     path.join(workspace, "package.json"),

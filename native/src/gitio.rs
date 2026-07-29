@@ -1451,18 +1451,11 @@ pub(crate) fn conflicted_files(cwd: &Path) -> Vec<String> {
 /// to predict cross-agent collisions before they reach a merge. Empty on any error
 /// or non-jj cwd.
 pub(crate) fn jj_touched_files(cwd: &Path) -> Vec<String> {
-    let Ok(output) = Command::new("jj")
-        .args(["diff", "--name-only", "--no-pager"])
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .output()
+    let Some(stdout) = run_jj_with_stale_recovery(cwd, &["diff", "--name-only", "--no-pager"])
     else {
         return Vec::new();
     };
-    if !output.status.success() {
-        return Vec::new();
-    }
-    String::from_utf8_lossy(&output.stdout)
+    stdout
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
@@ -1479,24 +1472,48 @@ pub(crate) fn jj_touched_files(cwd: &Path) -> Vec<String> {
 /// bounds the summarizer prompt). Used by the completion-note backstop to reconstruct a
 /// report for an agent that finished without filing one. Empty on any failure.
 pub(crate) fn jj_diff_text(cwd: &Path, max_chars: usize) -> String {
-    let Ok(output) = Command::new("jj")
-        .args(["diff", "--no-pager", "--git"])
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .output()
-    else {
+    let Some(text) = run_jj_with_stale_recovery(cwd, &["diff", "--no-pager", "--git"]) else {
         return String::new();
     };
-    if !output.status.success() {
-        return String::new();
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
     if text.chars().count() > max_chars {
         let head: String = text.chars().take(max_chars).collect();
         format!("{head}\n...(diff truncated)...")
     } else {
-        text.into_owned()
+        text
     }
+}
+
+/// Run a read-only jj command in `cwd`, recovering ONCE from a stale working
+/// copy. Sibling workspaces snapshotting concurrently routinely leave a worker
+/// workspace stale; without recovery every jj read here returns empty and the
+/// UI silently shows "no changes" for a workspace full of edits. Mirrors the
+/// TS-side recoverStaleWorkspace (src/jj.ts). None on any other failure.
+fn run_jj_with_stale_recovery(cwd: &Path, args: &[&str]) -> Option<String> {
+    let run = || {
+        Command::new("jj")
+            .args(args)
+            .current_dir(cwd)
+            .stdin(Stdio::null())
+            .output()
+    };
+    let output = run().ok()?;
+    if output.status.success() {
+        return Some(String::from_utf8_lossy(&output.stdout).into_owned());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !stderr.contains("stale") {
+        return None;
+    }
+    let _ = Command::new("jj")
+        .args(["workspace", "update-stale"])
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .output();
+    let retry = run().ok()?;
+    if !retry.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&retry.stdout).into_owned())
 }
 
 /// Best-effort: set a jj workspace's working-copy change description to reflect
@@ -1864,6 +1881,12 @@ fn deep_merge_json(left: &serde_json::Value, right: &serde_json::Value) -> serde
 }
 
 pub(crate) fn diff_short_summary_at(cwd: &Path) -> Option<String> {
+    // Worker cwds are jj workspaces under .rudder-worktrees with no .git of
+    // their own; git silently walks UP to the enclosing repo and reports the
+    // MAIN checkout's diff on every worker row. Ask jj about jj workspaces.
+    if cwd.join(".jj").is_dir() && !cwd.join(".git").exists() {
+        return jj_diff_short_summary(cwd);
+    }
     let status = git_output(cwd, ["status", "--short"]).ok()?;
     if status.trim().is_empty() {
         return None;
@@ -1880,6 +1903,23 @@ pub(crate) fn diff_short_summary_at(cwd: &Path) -> Option<String> {
         "{files} file{} changed",
         if files == 1 { "" } else { "s" }
     ))
+}
+
+/// The roll-up line of `jj diff --stat` for the workspace's working-copy
+/// change ("3 files changed, 10 insertions(+), 2 deletions(-)"). None when the
+/// change is empty or jj fails.
+fn jj_diff_short_summary(cwd: &Path) -> Option<String> {
+    let stdout = run_jj_with_stale_recovery(cwd, &["diff", "--stat", "--no-pager"])?;
+    let summary = stdout
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?
+        .to_string();
+    if summary.starts_with("0 files changed") {
+        return None;
+    }
+    Some(summary)
 }
 
 pub(crate) fn play_completion_sound() {

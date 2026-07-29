@@ -762,7 +762,16 @@ async function scheduleTickCore(repoRoot: string, bus: RudderBus): Promise<void>
   // variants end in review, superseded by the judge's choice.
   const fresh = await readGraph(repoRoot);
   for (const node of Object.values(fresh.nodes)) {
-    if (node.status === "review" && !node.supersededBy && !isJudgedVariant(fresh, node.id)) {
+    // reviewState is the board's lever: "changes-requested" holds the node out
+    // of auto-integration until the revised work lands back in review. Without
+    // this check the flag was write-only and the board's review controls were
+    // cosmetic — the tick merged every review node regardless.
+    if (
+      node.status === "review" &&
+      !node.supersededBy &&
+      node.reviewState !== "changes-requested" &&
+      !isJudgedVariant(fresh, node.id)
+    ) {
       await mergeNodeIntoIntegration(repoRoot, node, bus);
     }
   }
@@ -867,7 +876,8 @@ async function onRunTransitionCore(repoRoot: string, runId: string, bus: RudderB
     if (!isJudgedVariant(graph, node.id)) {
       const fresh = await readGraph(repoRoot);
       const refreshed = fresh.nodes[node.id];
-      if (refreshed) {
+      // Same changes-requested hold as the tick-path integrator.
+      if (refreshed && refreshed.reviewState !== "changes-requested") {
         await mergeNodeIntoIntegration(repoRoot, refreshed, bus);
       }
     }

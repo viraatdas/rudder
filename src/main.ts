@@ -8,6 +8,7 @@ import { runCloudCommand } from "./cloud.js";
 import { printContextAudit } from "./context-audit.js";
 import { currentBranch, findRepoRoot } from "./git.js";
 import { runGc } from "./gc.js";
+import { runHandoff } from "./handoff.js";
 import { ensureBoardRunning } from "./daemon.js";
 import {
   createNodeWorkspace,
@@ -354,6 +355,12 @@ export async function main(): Promise<void> {
       await runContextCommand(parsed);
       return;
     }
+    case "handoff": {
+      // Run from inside a live claude/codex chat: queues THIS conversation for
+      // the dashboard, which forks it into an agent pane with all of its context.
+      await runHandoff(parsed.args, parsed.flags.backend);
+      return;
+    }
     default: {
       await maybeOnboard();
       await startRun({
@@ -581,7 +588,7 @@ function readValue(argv: string[], index: number, flag: string): string {
 }
 
 function normalizeBackend(value: string): BackendId {
-  if (value === "claude" || value === "codex" || value === "acpx") {
+  if (value === "claude" || value === "codex" || value === "acpx" || value === "opencode") {
     return value;
   }
   throw new Error(`Unknown backend: ${value}`);
@@ -1037,6 +1044,12 @@ Planner:
   rudder fanout "task" [--n N]   Fan out N variant agents on one task, then a judge picks/merges the best (default N=3)
   rudder context audit           Audit agent context files for size, duplication, secrets, and injection text
 
+Conversation handoff:
+  rudder handoff "<next step>"    Hand THIS chat to Rudder: it forks the conversation into a worker that already knows everything
+  rudder handoff --here "..."     Continue it in the main checkout instead of an isolated workspace
+  rudder handoff --opencode "..." Hand off an opencode chat (default is the claude one; --codex for codex)
+  rudder handoff --list           List recent conversations in this repo with their session ids
+
 Memory:
   rudder remember "<insight>"    Append a durable cross-cutting decision to DECISIONS.md (shared, jj-tracked)
   rudder share "<token/context>"  Append gitignored shared context to RUDDER_SHARED.md for all agents
@@ -1071,7 +1084,7 @@ Options:
       --worktree                  Always isolate in a worktree/workspace
       --queue                     Queue mode (reserved)
   -m, --model <model>             Backend model
-  -b, --backend <backend>         claude or codex
+  -b, --backend <backend>         claude, codex, or opencode
   -C, --cwd <dir>                 Run from another directory
   -p, --port <port>               Board server port (default 4774)
       --n <count>                 Number of fan-out variants for rudder fanout (default 3)

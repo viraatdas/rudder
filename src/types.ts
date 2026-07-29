@@ -71,10 +71,13 @@ export type RudderConfig = {
   lastUsedBackend?: BackendId;
   mergeStrategy: MergeStrategy;
   colorMode?: "terminal" | "paper";
+  // NOTE: no merge-gate knob lives here. "mergeMode" was written-but-never-read
+  // for several releases and looked exactly like the automerge setting users
+  // hunt for; planned DAG nodes always auto-integrate (see AGENTS.md §14.7)
+  // and manual runs merge via m/M.
   runPolicy: {
     sameCheckout: "single-active";
     concurrentPromptMode: "worktree" | "queue";
-    mergeMode: "manual-on-conflict";
   };
   acpx: {
     install: "latest";
@@ -83,6 +86,7 @@ export type RudderConfig = {
     claude?: BackendConfig;
     codex?: BackendConfig;
     acpx?: BackendConfig;
+    opencode?: BackendConfig;
   };
   board?: {
     port?: number;
@@ -112,7 +116,7 @@ export type RudderConfig = {
 
 export const DEFAULT_BOARD_PORT = 4774;
 
-export type BackendId = "claude" | "codex" | "acpx";
+export type BackendId = "claude" | "codex" | "acpx" | "opencode";
 
 export type VcsMode = "git" | "jj";
 

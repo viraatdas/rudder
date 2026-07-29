@@ -395,6 +395,31 @@ fn bare_string_dep_becomes_a_soft_edge() {
 }
 
 #[test]
+fn planned_node_hard_deps_survive_a_rudder_md_round_trip() {
+    // PlannedNode.deps only holds ACCEPTED hard edges (LLM-justified or
+    // user-typed in plan review). to_task used to re-serialize them with no
+    // `why`, so the parser's "unjustified hard → soft" demotion erased the
+    // ordering on every RUDDER.md round-trip and the tasks ran in parallel.
+    let block = "RUDDER_PLAN_TASKS_START\n{\"tasks\":[{\"id\":\"n0\",\"title\":\"a\",\"prompt\":\"p\"},{\"id\":\"n1\",\"title\":\"b\",\"prompt\":\"q\",\"deps\":[{\"on\":\"n0\",\"type\":\"hard\",\"why\":\"n1 builds on n0's API\"}]}]}\nRUDDER_PLAN_TASKS_END";
+    let tasks = extract_rudder_plan_tasks(block).expect("parses");
+    let nodes: Vec<PlannedNode> = tasks.iter().map(PlannedNode::from_task).collect();
+    assert_eq!(nodes[1].deps, vec!["n0".to_string()], "hard dep recorded");
+
+    let rendered: Vec<RudderPlanTask> = nodes.iter().map(PlannedNode::to_task).collect();
+    let reblock = format!(
+        "RUDDER_PLAN_TASKS_START\n{}\nRUDDER_PLAN_TASKS_END",
+        rudder_plan_tasks_block(&rendered)
+    );
+    let reparsed = extract_rudder_plan_tasks(&reblock).expect("round-trip parses");
+    let n1 = reparsed.iter().find(|t| t.id == "n1").expect("n1");
+    assert_eq!(
+        n1.hard_deps().collect::<Vec<_>>(),
+        vec!["n0"],
+        "hard dep must stay hard after re-render + re-parse"
+    );
+}
+
+#[test]
 fn structural_markers_match_whole_words_not_substrings() {
     // A marker inside a longer word must NOT force a rebase.
     assert!(!is_structural_direction(
@@ -1091,6 +1116,355 @@ fn auto_steer_prompt_is_plain_task_text() {
     assert!(!prompt.contains("USER TASK"));
     assert!(!prompt.contains("[RUDDER PROMPT INJECTION]"));
     assert!(execution_prompt(&prompt).contains(task));
+}
+
+#[test]
+fn picker_enter_submits_command_with_arguments_instead_of_completing() {
+    // "/plan x" fuzzy-matched the "/plan" suggestion, and Enter used to ACCEPT
+    // the suggestion — replacing the input and silently deleting the argument.
+    let mut app = App::new();
+    app.focus = FocusPane::Task;
+    app.task_input = "/plan x".to_string();
+    app.task_cursor = app.task_input.chars().count();
+
+    let consumed = app.handle_picker_key(KeyEvent::from(KeyCode::Enter));
+
+    assert!(!consumed, "Enter must fall through to submit the command");
+    assert_eq!(app.task_input, "/plan x", "the argument text survives");
+}
+
+#[test]
+fn esc_dismisses_the_palette_before_clearing_the_draft() {
+    let mut app = App::new();
+    app.focus = FocusPane::Task;
+    app.task_input = "/pl".to_string();
+    app.task_cursor = 3;
+    assert!(!suggestions_for(&app).is_empty(), "palette open for /pl");
+
+    // First Esc: palette closes, draft survives.
+    app.handle_task_key(KeyEvent::from(KeyCode::Esc));
+    assert_eq!(app.task_input, "/pl", "draft kept");
+    assert!(suggestions_for(&app).is_empty(), "palette dismissed");
+
+    // Editing re-enables the palette.
+    app.handle_task_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+    assert!(!suggestions_for(&app).is_empty(), "palette back after edit");
+
+    // Esc with no palette clears the draft (original behavior).
+    app.task_input = "plain draft".to_string();
+    app.handle_task_key(KeyEvent::from(KeyCode::Esc));
+    assert!(app.task_input.is_empty(), "second-form Esc clears");
+}
+
+#[test]
+fn unknown_slash_command_reports_instead_of_spawning_an_agent() {
+    let mut app = App::new();
+    app.cwd = std::env::temp_dir();
+
+    app.start_task_from_input("/plna fix the bug");
+
+    assert!(app.agents.is_empty(), "no agent for a typo'd command");
+    assert!(app
+        .notice
+        .as_deref()
+        .is_some_and(|notice| notice.contains("unknown command /plna")));
+
+    // A path-shaped token is NOT a command; it must fall through as plain text
+    // (which will try to spawn — enough here that no unknown-command notice fires).
+    app.notice = None;
+    app.start_task_from_input("/tmp/repro.sh explain this script");
+    assert!(
+        !app.notice.as_deref().unwrap_or("").contains("unknown command"),
+        "paths pass through"
+    );
+}
+
+#[test]
+fn opencode_workers_auto_approve_but_opencode_planners_do_not() {
+    // A worker is already isolated in its own workspace, so it runs unattended;
+    // a planner must not silently edit the tree it is only supposed to read.
+    let worker = opencode_command("anthropic/claude-sonnet-4-5", Some("do the thing"), AgentMode::Execute);
+    assert_eq!(worker.program, "opencode");
+    assert!(worker.args.iter().any(|arg| arg == "--auto"));
+    assert!(worker
+        .args
+        .windows(2)
+        .any(|w| w[0] == "-m" && w[1] == "anthropic/claude-sonnet-4-5"));
+    assert!(worker
+        .args
+        .windows(2)
+        .any(|w| w[0] == "--prompt" && w[1] == "do the thing"));
+
+    let planner = opencode_command("", Some("decompose this"), AgentMode::RudderPlan);
+    assert!(
+        !planner.args.iter().any(|arg| arg == "--auto"),
+        "planners stop for approval instead of editing: {:?}",
+        planner.args
+    );
+    assert!(
+        !planner.args.iter().any(|arg| arg == "-m"),
+        "an empty model means opencode's own default, not an empty flag"
+    );
+}
+
+#[test]
+fn opencode_forks_the_conversation_and_leaves_the_original_alone() {
+    let fork = opencode_fork_command("", "ses_05585081affeaTLQtSQn6hdypX", Some("keep going"));
+    assert_eq!(fork.program, "opencode");
+    assert!(fork
+        .args
+        .windows(2)
+        .any(|w| w[0] == "--session" && w[1] == "ses_05585081affeaTLQtSQn6hdypX"));
+    assert!(
+        fork.args.iter().any(|arg| arg == "--fork"),
+        "--fork is what keeps the ORIGINAL session untouched"
+    );
+    assert!(fork
+        .args
+        .windows(2)
+        .any(|w| w[0] == "--prompt" && w[1] == "keep going"));
+}
+
+#[test]
+fn opencode_workers_get_a_real_completion_signal_not_a_guess() {
+    // Rudder kills interactive workers whose lifecycle hooks were never installed
+    // rather than guessing completion from terminal chrome. opencode has no hook
+    // flag, so Rudder generates a plugin that reports session.idle.
+    let signal = std::path::Path::new("/tmp/rudder-signals/run-1.json");
+    let plugin = signals::opencode_plugin_js(signal);
+    assert!(plugin.contains("session.idle"), "{plugin}");
+    assert!(plugin.contains("\"done\""), "idle maps to done: {plugin}");
+    assert!(
+        plugin.contains("permission.updated"),
+        "a waiting-for-approval turn is the input state: {plugin}"
+    );
+    assert!(
+        plugin.contains("renameSync"),
+        "the signal is written atomically so the poll loop never reads a torn file"
+    );
+
+    let config = signals::opencode_config_json(std::path::Path::new("/tmp/rudder-signals/run-1.js"));
+    let parsed: serde_json::Value = serde_json::from_str(&config).expect("valid config json");
+    assert_eq!(
+        parsed["plugin"][0].as_str(),
+        Some("/tmp/rudder-signals/run-1.js"),
+        "the config loads the generated plugin by absolute path"
+    );
+}
+
+#[test]
+fn opencode_offers_no_effort_dial_because_it_has_no_flag_for_one() {
+    assert_eq!(
+        effort_options_for(Backend::Opencode, "anthropic/claude-sonnet-4-5"),
+        vec![None],
+        "offering an effort Rudder cannot pass would be a dead control"
+    );
+    assert_eq!(provider_backend("opencode"), Some(Backend::Opencode));
+    assert_eq!(Backend::parse("opencode"), Some(Backend::Opencode));
+}
+
+#[test]
+fn a_provider_qualified_model_selects_opencode() {
+    // `/model anthropic/claude-sonnet-4-5` with no provider word in front is an
+    // opencode id: routing it to Claude would launch a model claude cannot name.
+    assert_eq!(
+        backend_for_model("anthropic/claude-sonnet-4-5"),
+        Backend::Opencode
+    );
+    assert_eq!(backend_for_model("opencode/big-pickle"), Backend::Opencode);
+    assert_eq!(backend_for_model("gpt-5.5"), Backend::Codex);
+    assert_eq!(backend_for_model("opus"), Backend::Claude);
+}
+
+#[test]
+fn opencode_model_list_keeps_provider_qualified_ids() {
+    let raw = "opencode/big-pickle\nanthropic/claude-sonnet-4-5\n\nSome header line\n";
+    let rows = parse_opencode_model_list(raw);
+    assert_eq!(
+        rows.iter().map(|(_, id, _)| id.as_str()).collect::<Vec<_>>(),
+        vec!["opencode/big-pickle", "anthropic/claude-sonnet-4-5"],
+        "prose lines are not models"
+    );
+    assert_eq!(rows[0].2, "opencode", "the provider is the detail line");
+}
+
+#[test]
+fn conversation_model_labels_keep_the_version_and_drop_the_release_stamp() {
+    // "opus-4" (what the cost table shows) is not enough to choose between two
+    // chats; the picker keeps the minor version and loses only the date.
+    assert_eq!(conversation_model_label("claude-opus-4-5-20251101"), "opus-4-5");
+    assert_eq!(conversation_model_label("claude-fable-5"), "fable-5");
+    assert_eq!(conversation_model_label("gpt-5.6-sol"), "gpt-5.6-sol");
+    assert_eq!(conversation_model_label(""), "");
+}
+
+#[test]
+fn resume_without_a_session_id_explains_itself_instead_of_spawning() {
+    let mut app = App::new();
+
+    app.start_task_from_input("/resume");
+
+    assert!(app.agents.is_empty(), "a bare /resume starts nothing");
+    let notice = app.notice.as_deref().unwrap_or_default();
+    assert!(
+        notice.contains("/resume <session-id>") && notice.contains("rudder handoff"),
+        "the notice teaches BOTH directions (pull from the palette, push from the chat): {notice}"
+    );
+
+    // `/handoff` stays a working alias: it is what the CLI half is called and what
+    // early users typed. Same command, same notice.
+    app.notice = None;
+    app.start_task_from_input("/handoff");
+    assert!(app.agents.is_empty());
+    assert!(app
+        .notice
+        .as_deref()
+        .is_some_and(|notice| notice.contains("/resume <session-id>")));
+}
+
+#[test]
+fn handoff_refuses_a_session_that_exists_nowhere() {
+    // A mistyped id must not create a jj workspace for a conversation that cannot
+    // be forked; the id is checked against both backends' on-disk records first.
+    let mut app = App::new();
+
+    app.start_task_from_input("/resume 00000000-dead-beef-0000-000000000000 keep going");
+
+    assert!(app.agents.is_empty(), "no workspace for an unknown session");
+    assert!(
+        app.notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("no claude, codex, or opencode conversation found")),
+        "notice was {:?}",
+        app.notice
+    );
+}
+
+#[test]
+fn handoff_palette_lists_conversations_then_gets_out_of_the_way() {
+    let mut app = App::new();
+    app.handoff_candidates = vec![
+        ConversationCandidate {
+            session_id: "11111111-1111-1111-1111-111111111111".to_string(),
+            backend: Backend::Claude,
+            title: "rewrite the auth middleware".to_string(),
+            model: Some("claude-opus-4-5-20251101".to_string()),
+            modified: SystemTime::now(),
+        },
+        ConversationCandidate {
+            session_id: "22222222-2222-2222-2222-222222222222".to_string(),
+            backend: Backend::Claude,
+            title: "diff pane shows the wrong repo".to_string(),
+            model: None,
+            modified: SystemTime::now(),
+        },
+    ];
+
+    // Typing filters by what the conversation was ABOUT — nobody remembers uuids.
+    app.task_input = "/resume auth".to_string();
+    let filtered = suggestions_for(&app);
+    assert_eq!(filtered.len(), 1, "filtered to the matching chat");
+    assert!(filtered[0].label.contains("auth"));
+    // The row says which backend, WHICH MODEL, how long ago, and which session —
+    // enough to tell two similar conversations apart before committing to one.
+    let detail = filtered[0].detail.as_str();
+    assert!(detail.contains("claude"), "{detail}");
+    assert!(detail.contains("opus-4-5"), "the model, undated: {detail}");
+    assert!(detail.contains("11111111"), "the session id: {detail}");
+
+    // Once a session id is in the input the choice is made: the palette must
+    // disappear so Enter submits the command (with any instruction typed after it)
+    // instead of replacing it with a suggestion.
+    app.task_input = "/resume 11111111-1111-1111-1111-111111111111 now write the tests".to_string();
+    assert!(
+        suggestions_for(&app).is_empty(),
+        "palette steps aside once a session id is present"
+    );
+}
+
+#[test]
+fn handoff_palette_enter_selects_a_conversation_before_submitting() {
+    let mut app = App::new();
+    app.focus = FocusPane::Task;
+    app.handoff_candidates = vec![ConversationCandidate {
+        session_id: "11111111-1111-1111-1111-111111111111".to_string(),
+        backend: Backend::Claude,
+        title: "rewrite the auth middleware".to_string(),
+        model: Some("claude-opus-4-5-20251101".to_string()),
+        modified: SystemTime::now(),
+    }];
+    app.task_input = "/resume auth".to_string();
+    app.task_cursor = app.task_input.chars().count();
+    // Pretend the list was just refreshed, so the keystroke's throttled refresh
+    // leaves the injected candidates alone and the assertions test the picker.
+    app.handoff_candidates_at = Some(Instant::now());
+
+    // "/handoff auth" contains whitespace, which normally means "arguments exist,
+    // submit it". For a drill-down picker that would run a command whose argument
+    // is a search word, not a session — Enter must pick instead.
+    app.handle_task_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert_eq!(
+        app.task_input,
+        "/resume 11111111-1111-1111-1111-111111111111 ",
+        "Enter filled in the chosen conversation and left room for an instruction"
+    );
+    assert!(app.agents.is_empty(), "nothing started yet");
+    assert!(
+        suggestions_for(&app).is_empty(),
+        "the next Enter submits rather than re-picking"
+    );
+}
+
+#[test]
+fn queued_handoff_requests_are_consumed_exactly_once() {
+    let mut app = App::new();
+    let dir = app.cwd.join(".rudder").join("handoffs");
+    std::fs::create_dir_all(&dir).expect("create queue dir");
+    let malformed = dir.join("1-malformed.json");
+    let unknown = dir.join("2-unknown.json");
+    std::fs::write(&malformed, "{not json").expect("write");
+    std::fs::write(
+        &unknown,
+        serde_json::json!({
+            "sessionId": "00000000-dead-beef-0000-000000000000",
+            "backend": "claude",
+        })
+        .to_string(),
+    )
+    .expect("write");
+
+    app.poll_handoff_inbox();
+
+    assert!(app.agents.is_empty(), "an unknown session starts nothing");
+    assert!(
+        !malformed.exists() && !unknown.exists(),
+        "every request is consumed — a file that cannot launch must not be retried forever"
+    );
+    // A second drain has nothing to do (and must not resurrect anything).
+    app.notice = None;
+    app.poll_handoff_inbox();
+    assert!(app.notice.is_none(), "empty queue is silent");
+}
+
+#[test]
+fn replace_task_input_keeps_paste_chunks_still_referenced() {
+    let mut app = App::new();
+    let chunk_text = "line1\n".repeat(40);
+    let mut cursor = 0;
+    let mut input = String::new();
+    apply_task_paste(&mut input, &mut cursor, &mut app.pasted_chunks, &chunk_text);
+    let with_chip = input.clone();
+    assert!(with_chip.contains("[Pasted #"), "chip placeholder present");
+
+    // History nav restores a draft that still shows the chip: the chunk's real
+    // text must survive, or the agent receives the literal placeholder.
+    app.replace_task_input(with_chip.clone());
+    assert_eq!(app.pasted_chunks.len(), 1, "referenced chunk kept");
+
+    // A replacement without the chip really does drop it.
+    app.replace_task_input("fresh draft".to_string());
+    assert!(app.pasted_chunks.is_empty(), "unreferenced chunk dropped");
 }
 
 #[test]
@@ -5559,7 +5933,7 @@ fn fork_commands_branch_the_session_without_touching_the_original() {
     let _env = env_guard();
 
     // Claude branches by resuming WITH --fork-session (new session id minted).
-    let claude = claude_fork_command("opus", Some(EffortLevel::High), "sid-claude");
+    let claude = claude_fork_command("opus", Some(EffortLevel::High), "sid-claude", None);
     assert_eq!(claude.program, "claude");
     assert!(claude
         .args
@@ -5575,7 +5949,7 @@ fn fork_commands_branch_the_session_without_touching_the_original() {
         .any(|w| w[0] == "--model" && w[1] == "opus"));
 
     // Codex has a first-class fork subcommand.
-    let codex = codex_fork_command("gpt-test", None, "sid-codex");
+    let codex = codex_fork_command("gpt-test", None, "sid-codex", None);
     assert_eq!(codex.program, "codex");
     assert!(codex
         .args
@@ -5861,6 +6235,84 @@ fn merge_request_clears_pending_delete() {
 
     assert!(app.delete_pending.is_none());
     assert!(app.merge_confirm.is_some());
+}
+
+#[test]
+fn merge_request_refuses_running_agent() {
+    let mut app = App::new();
+    let mut run = test_agent_run("run-1", "test task");
+    run.status = AgentStatus::Running;
+    run.worktree_branch = Some("rudder/test".to_string());
+    run.worktree_path = Some(app.cwd.join("worktree"));
+    app.agents.push(run);
+
+    app.request_merge_selected_agent();
+
+    assert!(app.merge_confirm.is_none());
+    assert!(app
+        .notice
+        .as_deref()
+        .is_some_and(|notice| notice.contains("still running")));
+}
+
+#[test]
+fn merge_agent_at_refuses_running_agent() {
+    let mut app = App::new();
+    let mut run = test_agent_run("run-1", "test task");
+    run.status = AgentStatus::Running;
+    run.worktree_branch = Some("rudder/test".to_string());
+    run.worktree_path = Some(app.cwd.join("worktree"));
+    app.agents.push(run);
+
+    let result = app.merge_agent_at(0);
+
+    assert!(result.is_err());
+    assert_eq!(app.agents[0].status, AgentStatus::Running);
+}
+
+#[test]
+fn merge_error_does_not_fail_running_agent() {
+    let mut app = App::new();
+    let mut run = test_agent_run("run-1", "test task");
+    run.status = AgentStatus::Running;
+    app.agents.push(run);
+
+    app.handle_merge_error(
+        "test task".to_string(),
+        anyhow::anyhow!("agent is still running; stop it or wait before merging"),
+        None,
+        None,
+        None,
+        Some("run-1".to_string()),
+    );
+
+    assert_eq!(app.agents[0].status, AgentStatus::Running);
+    assert!(app.agents[0].last_error.is_some());
+}
+
+#[test]
+fn auto_integration_non_conflict_error_does_not_spawn_resolver() {
+    let mut app = App::new();
+    let mut run = test_agent_run("run-1", "planned node task");
+    run.status = AgentStatus::Done;
+    run.node_id = Some("n1".to_string());
+    // No workspace_name / jj_change_id: merge_agent_at fails with a plain
+    // (non-conflict) error before any shell-out.
+    app.agents.push(run);
+
+    app.integrate_ready_plan_nodes();
+
+    // A zero-file "conflict" used to spawn a resolver and stamp merge_conflict,
+    // wedging the node out of the integrator forever. Now it must take the
+    // terminal failure path instead.
+    assert!(app.conflict_prompt.is_none());
+    assert_eq!(app.agents.len(), 1, "no resolver agent may be spawned");
+    assert_eq!(app.agents[0].status, AgentStatus::Failed);
+    assert!(!app.agents[0].has_merge_conflict());
+    assert!(app
+        .notice
+        .as_deref()
+        .is_some_and(|notice| notice.contains("merge stopped")));
 }
 
 #[test]
@@ -7039,6 +7491,37 @@ fn scheduler_launches_ready_root_but_holds_blocked_dependent() {
 }
 
 #[test]
+fn deleting_a_launched_nodes_agent_unblocks_its_hard_dependents() {
+    let mut app = App::new();
+    app.cwd = std::env::temp_dir();
+    // n0 launched (agent exists), n1 queued hard-dep'ing on n0.
+    app.planned_nodes = vec![test_planned_node("n1", &["n0"])];
+    app.plan_launched_node_ids.insert("n0".to_string());
+    app.agents.push(node_agent("n0", AgentStatus::Failed));
+    app.selected_agent = 0;
+
+    assert!(
+        app.next_node_to_launch(4).is_none(),
+        "n1 blocked while n0 is launched-but-unmerged"
+    );
+
+    // Delete n0's agent (d twice: first arms the confirm, second deletes). Its
+    // id must leave plan_launched_node_ids, or n1 would wait on a node that can
+    // never merge — a permanent, unexplained stall.
+    app.delete_selected_agent();
+    app.delete_selected_agent();
+    assert!(app.agents.is_empty(), "agent deleted");
+    assert!(
+        !app.plan_launched_node_ids.contains("n0"),
+        "deleted node id no longer counts as part of the plan"
+    );
+    let position = app
+        .next_node_to_launch(4)
+        .expect("dependent unblocked by the deletion");
+    assert_eq!(app.planned_nodes[position].id, "n1");
+}
+
+#[test]
 fn scheduler_respects_parallelism_cap() {
     let mut app = App::new();
     app.cwd = std::env::temp_dir();
@@ -7401,7 +7884,6 @@ fn completed_plan_queues_planned_nodes_and_pins_orchestrator() {
     let planner = planner_with_block(&app, block);
     app.agents.push(planner);
     app.selected_agent = 0;
-    app.planner_question_round_done = true;
 
     app.evaluate_completed_plan(0);
 
@@ -7459,7 +7941,6 @@ fn trivial_plan_gates_for_approval_then_launches_on_enter() {
     let planner = planner_with_block(&app, block);
     app.agents.push(planner);
     app.selected_agent = 0;
-    app.planner_question_round_done = true;
 
     app.evaluate_completed_plan(0);
 
@@ -7493,7 +7974,11 @@ fn trivial_plan_gates_for_approval_then_launches_on_enter() {
 
 #[cfg(not(windows))]
 #[test]
-fn first_turn_dag_is_forced_to_pause_for_question_round() {
+fn first_turn_dag_is_captured_into_the_approval_gate() {
+    // A parsed first-turn DAG is a RESULT: the old mandatory question round
+    // discarded it and forced a second full planner round-trip for every
+    // request. The approval gate (user reviews, refines, or approves) is the
+    // human checkpoint — nothing launches without consent either way.
     let mut app = App::new();
     app.cwd = std::env::temp_dir();
     let block = "RUDDER_PLAN_TASKS_START\n{\"tasks\":[{\"title\":\"only\",\"prompt\":\"do the thing\",\"goal\":\"thing\",\"success\":\"done\"}]}\nRUDDER_PLAN_TASKS_END\n";
@@ -7504,22 +7989,18 @@ fn first_turn_dag_is_forced_to_pause_for_question_round() {
     app.evaluate_completed_plan(0);
 
     assert!(
-        app.planner_paused_for_input,
-        "the first turn must ask before DAG capture"
+        !app.planner_paused_for_input,
+        "a captured DAG means the planner is not waiting on an answer"
+    );
+    assert!(app.awaiting_approval, "the DAG gates for user approval");
+    assert_eq!(app.planned_nodes.len(), 1, "the first-turn DAG is queued");
+    assert!(
+        app.pending_questions.is_empty(),
+        "no synthetic question is injected when a DAG was produced"
     );
     assert!(
-        !app.awaiting_approval,
-        "no approval gate until the answer turn emits a DAG"
-    );
-    assert!(app.planned_nodes.is_empty(), "premature DAG is not queued");
-    assert_eq!(
-        app.pending_questions,
-        forced_planner_questions(),
-        "Rudder supplies a deterministic question if the model skipped its own"
-    );
-    assert!(
-        !app.agents[0].autosteered,
-        "the refused first turn is captured once and waits for a resumed answer"
+        !app.agents.iter().any(|run| run.node_id.is_some()),
+        "nothing launches before approval"
     );
 }
 
@@ -8265,9 +8746,6 @@ fn tui_harness_drives_planner_to_dag_and_renders_it() {
     app.cwd = repo.clone();
     app.backend = Backend::Claude;
     app.start_rudder_plan_task("build mathutils.add and a test");
-    // The first-question gate is unit-tested on its own; here we drive the DAG-capture
-    // path, so mark the question round satisfied.
-    app.planner_question_round_done = true;
 
     let mut captured = false;
     for _ in 0..300 {
@@ -9825,7 +10303,6 @@ fn evaluate_populates_planned_nodes_without_launching() {
     let planner = planner_with_block(&app, block);
     app.agents.push(planner);
     app.selected_agent = 0;
-    app.planner_question_round_done = true;
 
     app.evaluate_completed_plan(0);
 
@@ -9892,17 +10369,18 @@ fn extract_rudder_questions_parses_a_numbered_block() {
 
 #[test]
 fn planner_prompt_asks_and_pauses_when_materially_ambiguous() {
-    // The planner must be told to ASK + STOP on the first turn, not decide that a
-    // request is clear enough to skip questions. And the clarification-answer framing
-    // must be distinct from the refine framing.
+    // The planner asks + stops when something MATERIAL is missing, and emits the
+    // DAG straight away when the request is clear (the mandatory first-turn
+    // question round cost every request a full extra planner round-trip). The
+    // clarification-answer framing must stay distinct from the refine framing.
     let prompt = rudder_plan_prompt("make me something");
     assert!(
-        prompt.contains("ALWAYS ASK") && prompt.contains("STOP"),
-        "instructs ask-then-pause"
+        prompt.contains("MATERIAL") && prompt.contains("STOP"),
+        "instructs ask-then-pause on material ambiguity"
     );
     assert!(
-        !prompt.contains("unless it is already completely specified"),
-        "the first-turn question round is no longer optional"
+        prompt.contains("emit the COMPLETE task DAG on this very turn"),
+        "a clear request plans on the first turn"
     );
     let answer = build_clarification_answer_followup("medium_term, top 5 tracks");
     assert!(
@@ -10436,7 +10914,6 @@ fn reconcile_planner_is_discriminated_from_initial_planner() {
     // The discriminator is what the poll loop branches on: capture the initial
     // plan (replace) and verify the queue holds exactly its node.
     app.agents.push(initial);
-    app.planner_question_round_done = true;
     app.evaluate_completed_plan(0);
     assert_eq!(app.planned_nodes.len(), 1);
     assert_eq!(

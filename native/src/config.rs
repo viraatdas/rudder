@@ -64,6 +64,9 @@ pub(crate) fn config_effort(config: &serde_json::Value, backend: Backend) -> Opt
     let keys: &[&str] = match backend {
         Backend::Claude => &["effort", "reasoningEffort"],
         Backend::Codex => &["reasoningEffort", "effort"],
+        // opencode has no effort flag; read the keys anyway so a config written by
+        // hand is not silently ignored if opencode ever gains one.
+        Backend::Opencode => &["effort", "reasoningEffort"],
     };
     keys.iter().find_map(|key| {
         backend_config
@@ -284,6 +287,10 @@ pub(crate) fn save_model_defaults(
                 backend_config.remove("reasoningEffort");
             }
         }
+        Backend::Opencode => {
+            backend_config.remove("effort");
+            backend_config.remove("reasoningEffort");
+        }
     }
 
     write_config_atomically(&path, &config)
@@ -305,8 +312,7 @@ pub(crate) fn ensure_config_defaults(config: &mut serde_json::Value) {
     root.entry("runPolicy".to_string()).or_insert_with(|| {
         serde_json::json!({
             "sameCheckout": "single-active",
-            "concurrentPromptMode": "worktree",
-            "mergeMode": "manual-on-conflict"
+            "concurrentPromptMode": "worktree"
         })
     });
     root.entry("acpx".to_string())
@@ -323,8 +329,7 @@ pub(crate) fn default_config_value() -> serde_json::Value {
         "colorMode": "terminal",
         "runPolicy": {
             "sameCheckout": "single-active",
-            "concurrentPromptMode": "worktree",
-            "mergeMode": "manual-on-conflict"
+            "concurrentPromptMode": "worktree"
         },
         "acpx": { "install": "latest" },
         "backends": {

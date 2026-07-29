@@ -211,6 +211,16 @@ the picker labels context windows such as Opus's 1M context without inventing a
 different model name. Codex offers `gpt-5.5`, `gpt-5.4-codex`, and other
 discovered models. `auto` effort means Rudder passes no override.
 
+`opencode` is available as a third backend: `/model opencode <provider/model>`
+(its ids are provider-qualified, e.g. `anthropic/claude-sonnet-4-5`), and the
+picker lists whatever `opencode models` reports for your authenticated providers.
+opencode has no reasoning-effort flag, so Rudder offers no effort choice for it
+rather than a dead control, and `/fast` says so instead of pretending. Turn-end is
+reported by a small plugin Rudder generates per run (loaded through
+`OPENCODE_CONFIG`, never written into your workspace), so opencode rows reach
+Review deterministically like the other two. Token/cost accounting for opencode
+rows is not wired up yet and reports zero.
+
 Your last provider, model, and effort are saved in `~/.rudder/config.json` and
 reused next time. Rudder refreshes model metadata from
 `https://models.dev/api.json` and falls back to local caches when offline.
@@ -239,8 +249,10 @@ pane above it. The flow stays inside Rudder: the orchestrator researches
 read-only, writes the DAG to `RUDDER.md`, and separate workers do the
 implementation.
 
-1. **It asks first.** The planner inspects the repo and then asks at least one
-   clarifying or confirmation question before the first DAG, shown as a numbered prompt:
+1. **It asks when it needs to.** The planner inspects the repo first. If something
+   material is missing (scope, approach, a key decision), it asks before the first
+   DAG, shown as a numbered prompt; a clear request goes straight to a DAG with the
+   planner's assumptions listed under it:
 
    ```
    ❓ The planner needs your input
@@ -274,7 +286,46 @@ workspace, and resumes it on the requested provider/model. A same-provider switc
 the agent conversation; a provider switch keeps the workspace and starts a fresh session
 with a handoff to inspect and continue the existing diff.
 
+## Continuing a conversation you already started
+
+The chat you are already having in a terminal — a plain `claude`, `codex`, or
+`opencode` session — holds the context you would otherwise retype: the files you
+looked at, the decisions you made, the plan you agreed on. Rudder can pick that
+conversation up and keep it going as an agent.
+
+Two directions, same result:
+
+- **From the dashboard:** type `/resume`. The palette lists this repository's
+  recent conversations — Claude, Codex, and opencode in one list, newest first —
+  showing what each was about, which model it was running, how long ago, and its
+  session id. Pick one, optionally type the next step after it, and press Enter. It
+  opens as an isolated worker that merges with `m` like any other.
+- **From inside the chat:** run `rudder handoff "<next step>"`. That queues the
+  conversation you are in; the dashboard picks it up within a second (start it with
+  `rudder` if it is not open). `--here` continues in the main checkout instead of an
+  isolated workspace, `--list` shows the conversations Rudder can see, and
+  `--codex` / `--opencode` pick a different source CLI.
+
+Handoffs always FORK the conversation. The chat in your terminal is untouched and
+keeps working; the Rudder agent continues from a copy. The fork is told it is now
+running in a different workspace, so it re-reads files instead of trusting its
+memory of the checkout it came from.
+
+`/handoff` still works as an alias for `/resume` (it is what the CLI half is
+called). `b` on a worker row does the same thing for a conversation already inside
+Rudder, and `/restore <claude|codex> <id>` continues a session IN PLACE (same
+session, main checkout) instead of forking it into a worker.
+
 ## Worktrees and merging
+
+**Who merges what:** planned `/plan` DAG nodes integrate into your checkout
+**automatically** as soon as they finish — no per-node confirmation — so
+dependent nodes unblock and the chain keeps flowing (their row shows
+`done · auto-merging`, then `merged locally`; the final gate runs the repo's
+checks after the last node lands). Manually started `/run` workers never
+auto-merge: they wait in Review (`done · press m to merge`) until you merge
+them yourself. There is no `/automerge` command or config flag — this split is
+the behavior.
 
 Planned and `/run` worker tasks run in their own jj workspaces under a sibling
 `.rudder-worktrees` area, so parallel agents never edit the same checkout. Plain
@@ -283,7 +334,9 @@ live under `.rudder/runs/`. If you quit Rudder, live workers become `paused`, ke
 their workspace/session metadata, and stay listed when you reopen the repo.
 
 - Press `m` to merge the selected completed agent back into its branch.
-- Press `M` to merge all completed agents. Rudder confirms first.
+- Press `M` (or `/merge-all`) to merge all completed agents.
+- Both ask for a `y`/`n` confirmation first, and the prompt warns when your own
+  uncommitted changes in the main checkout would ride along in the merge.
 
 Clean merges become merge commits. If git reports conflicts, Rudder leaves the
 conflicted state in place and can open an agent in the main checkout to help

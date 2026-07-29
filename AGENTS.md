@@ -54,7 +54,8 @@ plus a worker image, used only when a task is handed off to the cloud.
 │   ├── src/render.rs      ratatui rendering: panes, prompts, layout, styles
 │   ├── src/selection.rs   mouse->coordinate mapping, selection, clipboard, cells
 │   ├── src/detect.rs      worker-output heuristics for permission/prompt UX (not completion)
-│   ├── src/signals.rs     official completion signals (Claude Stop hook / Codex notify) — PRIMARY
+│   ├── src/signals.rs     official completion signals (Claude Stop hook / Codex notify / opencode plugin) — PRIMARY
+│   ├── src/handoff.rs     conversation handoff: discovery, transcript titles, queued requests
 │   ├── src/models.rs      model/effort tables, model picker, suggestion ranking
 │   ├── src/launch.rs      agent launch/resume command building, review-all runs
 │   ├── src/tasks.rs       prompt construction, task summaries, rudder-plan parsing
@@ -620,6 +621,19 @@ functional but less battle-tested than the local dashboard; treat it as beta.
   families (for example GPT-5.6 Sol/Terra/Luna) appear immediately in Codex's own order.
 - `src/effort.ts`: `EffortLevel = low | medium | high | xhigh | max` and the
   per-backend mapping (Claude uses `effort`, Codex uses `reasoningEffort`).
+  opencode gets `undefined`: it has no effort flag, and passing one it would
+  reject is worse than offering no dial.
+- **opencode (third backend, added with `/handoff`).** `Backend::Opencode` /
+  `BackendId "opencode"`. Model ids are provider-qualified (`anthropic/claude-…`);
+  an EMPTY model is legal and means "opencode's own default", so `-m` is omitted
+  rather than passed empty. The picker reads a cached `opencode models` list
+  (`<rudder home>/opencode-models.txt`, refreshed detached once a day) because
+  only opencode knows which providers the user authenticated. Every launch is the
+  interactive TUI (`--auto` for workers, omitted for planners so an unexpected
+  edit stops for approval, `--prompt` for the first turn); there is no headless
+  streaming mode to parse, so planner output is read from the pane like the
+  interactive orchestrator. Known gaps, deliberate: no token/cost accounting
+  (`usage.rs` reports zero), no cloud-worker support, no `/fast` preset.
 - **`/fast` (v2.5.0, decided):** the fast preset is the FLAGSHIP model at LOW
   effort — claude `opus(low)`, codex `gpt-5.5(low)` (`fast_model_for`,
   `native/src/models.rs`) — never a downgrade to haiku/spark. This mirrors
@@ -758,6 +772,56 @@ is a separate piece of work.
 
 ---
 
+## 12.5 Conversation handoff (`native/src/handoff.rs`, `src/handoff.ts`)
+
+Continuing an EXISTING CLI conversation as a Rudder agent. Two entry points, one
+launcher (`App::start_handoff_task`):
+
+- **Pull:** `/resume` in the task bar (`/handoff` is a working alias — see
+  `RESUME_COMMANDS` / `resume_command_rest`, which every call site goes through).
+  `suggestions_for` routes it to `handoff_suggestions`, which reads
+  `App::handoff_candidates` — a cache refilled on KEYSTROKES
+  (`maybe_refresh_handoff_candidates`, 3s throttle), never on the render path,
+  because the palette is consulted every frame. Rows show backend · model · age ·
+  short session id; the model comes from the transcript itself (Claude's
+  `message.model`, Codex's `turn_context.model`; opencode records none, so it is
+  omitted rather than invented).
+- **Push:** `rudder handoff "<next step>"` writes a JSON request into
+  `.rudder/handoffs/`; `poll_handoff_inbox` drains it inside the existing 1s
+  throttled block next to `poll_steer_inbox`. Requests are consumed exactly once
+  (the file is removed before the launch) and dropped after 6h.
+
+Invariants worth keeping:
+- **Always FORK, never resume in place.** The source chat is usually still open in
+  the user's terminal; two processes appending to one transcript corrupt it.
+  `spawn_forked_conversation` is shared with `b` (branch a live agent's chat).
+- **A conversation that does not exist must never create a workspace.** Both entry
+  points verify the session against the backend's own records first
+  (`claude_transcript_path` / `codex_session_exists` / `opencode_session_exists`).
+- **Session ids are spliced onto a command line**, so `valid_session_id` gates
+  every path, including requests read off disk.
+- **Discovery excludes Rudder's own machinery**: `.rudder-worktrees` project dirs,
+  live agent rows' session ids, and non-interactive transcripts (Rudder's one-shot
+  `claude -p` calls for titles and completion notes record no session-mode marker).
+  If that filter ever empties the list, the unfiltered list is shown instead — a
+  noisy picker beats an empty one.
+- **Filter before truncating for GLOBAL session stores.** Claude's transcripts are
+  already per-directory, so "newest N files" is safe there. Codex keeps one global
+  tree (~1200 rollouts here, 52 for this repo, none in the newest 32), so taking
+  the newest N first showed the repo nothing. `recent_codex_conversations_in`
+  instead walks newest-first and stops at `limit` MATCHES or `CODEX_SCAN_LIMIT`
+  files, with a 4KB `"cwd":"…"` prefix reject before the full parse (~90ms over
+  1200 rollouts). Path matching tries both the raw and canonicalized cwd — the
+  rollout records whatever the shell was in, and a substring test cannot resolve
+  `/tmp` -> `/private/tmp`.
+- **Claude is scanned on the input thread; Codex and opencode are not.** The Codex
+  tree walk and `opencode session list` (~600ms) run on a background thread
+  (`handoff_extra_rx`) and merge when they land.
+- A seeded fork is told it is now in a different workspace (`worker_orientation`)
+  so it re-reads files rather than trusting its memory of the other checkout.
+
+---
+
 ## 13. Where to start for common changes
 
 - New CLI command: add a `case` in `src/main.ts` and the implementation in the
@@ -863,24 +927,22 @@ user only ever talks to Rudder; the planner can never go off and implement on it
    + `render_orchestrator`. It researches read-only and CANNOT implement (inspection-only
    tools). The pinned row is LABELED as the model's **plan mode** ("plan mode · Claude Code
    · researching the plan").
-2. **Ask (hard gate on the first turn).** The planner prompt (`rudder_plan_prompt`) tells it
-   to ALWAYS ask 1–4 clarifying/confirmation questions in a
-   `RUDDER_QUESTIONS_START..END` block and STOP without a DAG on the first turn. Rudder also
-   enforces this in code: `planner_question_round_done` starts false for a fresh plan,
-   `maybe_detect_plan_ready` refuses streaming DAG capture before it is true, and
-   `evaluate_completed_plan` pauses instead of queuing a first-turn DAG if the model skipped
-   the question. If the model did not emit a question block, Rudder supplies a deterministic
-   fallback question via `planner_questions_or_forced`. The pane renders the planner's
-   inspection transcript first, then a bold "❓ The planner needs your input" header + the
-   questions as a NUMBERED list anchored at the BOTTOM of the body (the body sticks to the
-   bottom, so the questions stay in view above a long transcript instead of scrolling off).
-   The raw `RUDDER_QUESTIONS_START..END` block is stripped from that transcript
-   (`push_transcript_lines(strip_questions)`) so the questions are not shown twice. The user's
-   free-text answer routes through
-   `planner_awaiting_input()` → `refine_plan`, which RESUMES the same session with the
-   clarification-answer framing (`build_clarification_answer_followup`, distinct from the
-   refine framing) and sets `planner_question_round_done = true`. The planner then emits the
-   DAG (or asks once more).
+2. **Ask (conditional).** The planner prompt (`rudder_plan_prompt`) tells it to ask 1–4
+   clarifying questions in a `RUDDER_QUESTIONS_START..END` block and STOP without a DAG
+   ONLY when something material is missing (scope, approach, key decision, constraint);
+   a clear or trivial request emits the COMPLETE DAG on the first turn with assumptions
+   stated in the post-block summary. When the planner produces NO DAG (it asked, or needs
+   detail), `evaluate_completed_plan` pauses for input and — if the model asked nothing —
+   supplies a deterministic fallback question via `planner_questions_or_forced`. The pane
+   renders the planner's inspection transcript first, then a bold "❓ The planner needs
+   your input" header + the questions as a NUMBERED list anchored at the BOTTOM of the body
+   (the body sticks to the bottom, so the questions stay in view above a long transcript
+   instead of scrolling off). The raw `RUDDER_QUESTIONS_START..END` block is stripped from
+   that transcript (`push_transcript_lines(strip_questions)`) so the questions are not
+   shown twice. The user's free-text answer routes through `planner_awaiting_input()` →
+   `refine_plan`, which RESUMES the same session with the clarification-answer framing
+   (`build_clarification_answer_followup`, distinct from the refine framing). The planner
+   then emits the DAG (or asks once more).
 3. **DAG ready.** The instant a `RUDDER_PLAN_TASKS` block parses, the pane flips to the
    **pinned DAG** (`orchestrator_phase` Planning → PlanReady) and `awaiting_approval` holds.
    CAPTURE ROBUSTNESS: if the live PTY stream truncated a large block, `evaluate_completed_plan`
@@ -917,11 +979,14 @@ The planner UX went through several iterations; these are the settled decisions 
 - **Labeled "plan mode".** The headless decomposer is presented as the model's plan mode
   (the pinned row + header show "plan mode · Claude Code/Codex · …") because that is what it
   is to the user: the model planning read-only. This is a deliberate product framing.
-- **Hard first question gate.** The planner asks first (step 2) rather than silently
-  assuming, including for trivial or fully specified requests. This is no longer only
-  prompt-driven: Rudder refuses to capture the first DAG until the user has answered one
-  question round. The tradeoff is intentional: every fresh plan pauses once, but the "does it
-  ask?" behavior is deterministic.
+- **Conditional question round (2.12.x, REVERSING the earlier hard gate).** The planner
+  asks only when something material is missing; a clear request plans on the first turn
+  with stated assumptions. The earlier "hard first question gate" (mandatory round even
+  for trivial requests, enforced by `planner_question_round_done`) was retired because it
+  DISCARDED an already-parsed first-turn DAG and cost every fresh plan a second full
+  planner round-trip — the top user complaint about getting things done. The approval
+  gate (empty-Enter) remains the deterministic human checkpoint before anything launches;
+  a first-turn DAG is captured straight into it, never thrown away.
 - **Free-text answers, not a selectable widget.** Questions render as a numbered list and
   the user answers in the task box with free text (e.g. "1: 6 months, 2: reuse"). Chosen over
   forcing the headless model to invent multiple-choice options, because free text is more

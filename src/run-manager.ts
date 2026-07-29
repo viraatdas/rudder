@@ -104,7 +104,9 @@ export async function startRun(params: {
       ? config.backends.claude?.model
       : backend === "codex"
         ? config.backends.codex?.model
-        : config.backends.acpx?.model);
+        : backend === "opencode"
+          ? config.backends.opencode?.model
+          : config.backends.acpx?.model);
   const effort = params.effort ?? effortForBackend(backend, config);
 
   ensureJj();
@@ -886,6 +888,10 @@ function effortForBackend(backend: BackendId, config: Awaited<ReturnType<typeof 
   if (backend === "codex") {
     return config.backends.codex?.reasoningEffort ?? config.backends.codex?.effort;
   }
+  // opencode has no effort flag; normalizeEffortForBackend drops it anyway.
+  if (backend === "opencode") {
+    return undefined;
+  }
   return config.backends.acpx?.reasoningEffort ?? config.backends.acpx?.effort;
 }
 
@@ -1039,6 +1045,12 @@ export async function mergeRun(runId: string, allowDirty = false, options?: { si
   const run = await loadRunRecord(repoRoot, runId);
   if (!run) {
     throw new Error(`Run not found: ${runId}`);
+  }
+  if (run.status === "merged") {
+    throw new Error(`Run ${runId} is already merged; re-running the merge would create a spurious second merge.`);
+  }
+  if (isActiveStatus(run.status)) {
+    throw new Error(`Run ${runId} is still active; stop it or wait for it to finish before merging.`);
   }
   const config = await loadConfig();
   const merged = await mergeRunIntoCurrentBranch(run, allowDirty, config.mergeStrategy);

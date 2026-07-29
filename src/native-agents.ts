@@ -18,7 +18,9 @@ export function nativeAgentCommand(params: {
     ? planArgs(params.run, prompt, params.codexCommand)
     : params.run.backend === "codex"
       ? codexArgs(params.run, prompt, params.contract, params.codexCommand)
-      : claudeArgs(params.run, prompt, params.contract);
+      : params.run.backend === "opencode"
+        ? opencodeArgs(params.run, prompt, params.contract)
+        : claudeArgs(params.run, prompt, params.contract);
   return args.map(shellQuote).join(" ");
 }
 
@@ -44,6 +46,22 @@ function claudeArgs(run: RunRecord, prompt: string, contract: string): string[] 
     sessionId ? "--session-id" : undefined,
     sessionId,
     prompt,
+  ]);
+}
+
+/**
+ * opencode's interactive TUI: `--auto` approves what is not explicitly denied (the
+ * worker is already isolated in its own workspace), `--prompt` carries the first
+ * turn. Models are `provider/model`; an empty model uses opencode's own default.
+ */
+function opencodeArgs(run: RunRecord, prompt: string, contract: string): string[] {
+  return compact([
+    "opencode",
+    "--auto",
+    run.model ? "-m" : undefined,
+    run.model || undefined,
+    "--prompt",
+    [contract, "", prompt].join("\n"),
   ]);
 }
 

@@ -6,6 +6,10 @@ pub(crate) fn default_model_for(backend: Backend) -> &'static str {
     match backend {
         Backend::Claude => "sonnet",
         Backend::Codex => "gpt-5.5",
+        // opencode is a front-end for many providers and already has a configured
+        // default; an empty model means "use it" rather than Rudder guessing a
+        // provider the user may not even be authenticated for.
+        Backend::Opencode => "",
     }
 }
 
@@ -22,6 +26,8 @@ pub(crate) fn fast_model_for(backend: Backend) -> &'static str {
     match backend {
         Backend::Claude => "opus",
         Backend::Codex => "gpt-5.5",
+        // No fast tier to select: opencode's speed is whatever model is configured.
+        Backend::Opencode => "",
     }
 }
 
@@ -50,6 +56,7 @@ pub(crate) fn provider_backend(provider: &str) -> Option<Backend> {
     match provider.to_ascii_lowercase().as_str() {
         "claude" | "anthropic" => Some(Backend::Claude),
         "codex" | "openai" => Some(Backend::Codex),
+        "opencode" | "oc" => Some(Backend::Opencode),
         _ => None,
     }
 }
@@ -81,6 +88,7 @@ pub(crate) fn effort_detail(backend: Backend, effort: Option<EffortLevel>) -> &'
         (_, Some(EffortLevel::XHigh)) => "extended reasoning",
         (Backend::Claude, Some(EffortLevel::Max)) => "maximum reasoning",
         (Backend::Codex, Some(EffortLevel::Max)) => "not used",
+        (Backend::Opencode, Some(EffortLevel::Max)) => "not used",
     }
 }
 
@@ -100,6 +108,9 @@ pub(crate) fn model_supports_reasoning(backend: Backend, model: &str) -> bool {
         Backend::Codex => {
             is_gpt_text_model(model) || model.contains("codex") || is_o_series_model(model)
         }
+        // opencode exposes no reasoning-effort flag, whatever the underlying model
+        // supports, so Rudder offers no effort choice rather than a dead one.
+        Backend::Opencode => false,
     };
     // OR the heuristic with the cache rather than letting the cache override it: a
     // stale or wrong models.dev entry (`reasoning: false`) must never REMOVE the
@@ -117,6 +128,7 @@ pub(crate) fn is_reasoning_alias(backend: Backend, model: &str) -> bool {
         Backend::Codex => {
             is_gpt_text_model(model) || model.contains("codex") || is_o_series_model(model)
         }
+        Backend::Opencode => false,
     }
 }
 
@@ -127,6 +139,9 @@ pub(crate) fn cached_model_reasoning(backend: Backend, model_id: &str) -> Option
     let provider = match backend {
         Backend::Claude => "anthropic",
         Backend::Codex => "openai",
+        // opencode ids already carry their provider ("anthropic/claude-sonnet-4-5");
+        // there is no single models.dev provider to look them up under.
+        Backend::Opencode => return None,
     };
     data.get(provider)?
         .get("models")?
@@ -136,9 +151,18 @@ pub(crate) fn cached_model_reasoning(backend: Backend, model_id: &str) -> Option
 }
 
 pub(crate) fn suggestions_for(app: &App) -> Vec<Suggestion> {
+    // Esc dismissed the palette for exactly this input; stay hidden until the
+    // user edits the draft (which makes it a different string again).
+    if app.picker_dismissed_input.as_deref() == Some(app.task_input.as_str()) {
+        return Vec::new();
+    }
     let input = app.task_input.trim_start();
     if !input.starts_with('/') {
         return Vec::new();
+    }
+
+    if let Some(rest) = resume_command_rest(input) {
+        return handoff_suggestions(app, rest);
     }
 
     if input.starts_with("/model") {
@@ -149,6 +173,107 @@ pub(crate) fn suggestions_for(app: &App) -> Vec<Suggestion> {
     }
 
     rank_suggestions(command_suggestions(), input.trim_start_matches('/'))
+}
+
+/// `/resume` (and its `/handoff` alias) with whatever follows it, or None when this
+/// input is some other command.
+pub(crate) fn resume_command_rest(input: &str) -> Option<&str> {
+    let input = input.trim_start();
+    for command in RESUME_COMMANDS {
+        if let Some(rest) = input.strip_prefix(command) {
+            return Some(rest);
+        }
+    }
+    None
+}
+
+/// `/resume` is the name; `/handoff` stays a working alias because it is what the
+/// CLI half is called (`rudder handoff`) and what early users typed.
+pub(crate) const RESUME_COMMANDS: [&str; 2] = ["/resume", "/handoff"];
+
+/// The `/resume` drill-down: this repo's recent CLI conversations, newest first,
+/// filtered by whatever the user typed after the command.
+///
+/// Reads only the cached list (`App::handoff_candidates`); the cache itself is
+/// refilled on keystrokes, never here — this runs on every frame.
+pub(crate) fn handoff_suggestions(app: &App, rest: &str) -> Vec<Suggestion> {
+    let query = rest.trim();
+    // Once a concrete session id is present the choice is made: hide the palette so
+    // Enter submits the command (and any instruction typed after the id) as written.
+    if crate::handoff::valid_session_id(query.split_whitespace().next().unwrap_or_default()) {
+        return Vec::new();
+    }
+    if app.handoff_candidates.is_empty() {
+        return vec![Suggestion {
+            label: "/resume <session-id>".to_string(),
+            detail: "no recent claude, codex, or opencode conversations for this repo".to_string(),
+            action: SuggestionAction::Insert("/resume ".to_string()),
+        }];
+    }
+    let now = std::time::SystemTime::now();
+    let normalized = normalize_search_text(query);
+    let mut ranked: Vec<(i32, Suggestion)> = Vec::new();
+    for candidate in &app.handoff_candidates {
+        // Score the TITLE only. Every row's detail shares the same handful of words
+        // ("claude", "continue this chat"…), and the fuzzy matcher happily finds a
+        // subsequence of any short query in them — scoring details would make every
+        // conversation match every filter.
+        let score = if normalized.is_empty() {
+            0
+        } else {
+            match text_match_score(&normalize_search_text(&candidate.title), &normalized, 10_000) {
+                Some(score) => score,
+                None => continue,
+            }
+        };
+        ranked.push((
+            score,
+            Suggestion {
+                label: truncate_chars(&candidate.title, 64),
+                // Backend + MODEL + age + the id itself: enough to tell two similar
+                // conversations apart, and to see what the fork will run on.
+                detail: format!(
+                    "{} · {}{} · {}",
+                    candidate.backend.as_str(),
+                    candidate
+                        .model
+                        .as_deref()
+                        .map(|model| format!("{} · ", conversation_model_label(model)))
+                        .unwrap_or_default(),
+                    crate::handoff::relative_age(candidate.modified, now),
+                    short_session_label(&candidate.session_id),
+                ),
+                // Insert rather than run: it leaves room to type the next step after
+                // the id (`/resume <id> now write the tests`) before Enter.
+                action: SuggestionAction::Insert(format!("/resume {} ", candidate.session_id)),
+            },
+        ));
+    }
+    // Ties keep the incoming order, which is newest-conversation-first.
+    ranked.sort_by(|left, right| right.0.cmp(&left.0));
+    ranked
+        .into_iter()
+        .map(|(_, suggestion)| suggestion)
+        .collect()
+}
+
+/// The model a conversation ran on, shortened for a picker row: drop the vendor
+/// prefix and the release stamp, keep the version ("claude-opus-4-5-20251101" ->
+/// "opus-4-5"). Deliberately NOT `usage::short_model_label`, which truncates to the
+/// major version ("opus-4") — fine for a cost table, lossy for choosing a chat.
+pub(crate) fn conversation_model_label(model: &str) -> String {
+    let model = model.trim();
+    let trimmed = model.strip_prefix("claude-").unwrap_or(model);
+    let undated = match trimmed.rsplit_once('-') {
+        Some((head, tail)) if tail.len() == 8 && tail.chars().all(|ch| ch.is_ascii_digit()) => head,
+        _ => trimmed,
+    };
+    truncate_chars(undated, 22)
+}
+
+/// Session ids are unreadable in full; show the leading chunk that identifies one.
+pub(crate) fn short_session_label(session_id: &str) -> String {
+    session_id.chars().take(8).collect()
 }
 
 pub(crate) fn mark_current_model_suggestions(
@@ -341,8 +466,15 @@ pub(crate) fn command_suggestions() -> Vec<Suggestion> {
         },
         Suggestion {
             label: "/plan <text>".to_string(),
-            detail: "orchestrator planner for DAG work (same route as plain input)".to_string(),
+            detail: "orchestrator planner for DAG work (plain input runs one main agent instead)".to_string(),
             action: SuggestionAction::Insert("/plan ".to_string()),
+        },
+        Suggestion {
+            label: "/resume".to_string(),
+            detail:
+                "pick a recent claude/codex/opencode chat and continue it as a worker, context intact"
+                    .to_string(),
+            action: SuggestionAction::Insert("/resume ".to_string()),
         },
         Suggestion {
             label: "/restore <claude|codex> <session-id>".to_string(),
@@ -501,6 +633,7 @@ pub(crate) fn provider_suggestions(query: &str) -> Vec<Suggestion> {
     let suggestions = [
         (Backend::Claude, "Claude Code models"),
         (Backend::Codex, "Codex models"),
+        (Backend::Opencode, "opencode models (provider/model)"),
     ]
     .into_iter()
     .map(|(backend, detail)| Suggestion {
@@ -532,6 +665,12 @@ pub(crate) fn model_suggestions_for(backend_filter: Backend, query: &str) -> Vec
     // receives new model families before models.dev. Keep its native ordering.
     if backend_filter == Backend::Codex {
         for (backend, model, detail) in cached_codex_local_rows() {
+            push_model_suggestion(&mut suggestions, &mut seen, backend, &model, &detail);
+        }
+    }
+    if backend_filter == Backend::Opencode {
+        maybe_refresh_opencode_models_cache();
+        for (backend, model, detail) in cached_opencode_rows() {
             push_model_suggestion(&mut suggestions, &mut seen, backend, &model, &detail);
         }
     }
@@ -693,6 +832,9 @@ pub(crate) fn collect_provider_models(
         .filter(|(id, model)| match backend {
             Backend::Claude => is_claude_picker_model(id, model),
             Backend::Codex => is_codex_picker_model(id, model),
+            // opencode's own `opencode models` output is the authoritative list for
+            // that backend (it knows which providers are authenticated).
+            Backend::Opencode => false,
         })
         // A dated snapshot ("claude-opus-4-5-20251101") duplicates its un-dated
         // (latest) twin in the picker; list the twin only.
@@ -841,7 +983,95 @@ pub(crate) fn score_model(backend: Backend, id: &str) -> i32 {
             }
             score
         }
+        // opencode's own list is already ordered the way opencode presents it;
+        // Rudder does not second-guess a catalog that spans every provider.
+        Backend::Opencode => 0,
     }
+}
+
+/// Where `opencode models` output is cached for the picker. Running the binary on
+/// the render path is not an option, so the list is refreshed in the background.
+pub(crate) fn opencode_models_cache_path() -> Option<PathBuf> {
+    std::env::var_os("RUDDER_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".rudder")))
+        .map(|home| home.join("opencode-models.txt"))
+}
+
+/// One detached `opencode models` refresh per session when the cache is missing or
+/// a day old. Mirrors `maybe_refresh_models_dev_cache`: the picker re-reads the
+/// file every render, so the list fills in live once the refresh lands.
+fn maybe_refresh_opencode_models_cache() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static REFRESH_STARTED: AtomicBool = AtomicBool::new(false);
+    if cfg!(test) {
+        return;
+    }
+    let Some(path) = opencode_models_cache_path() else {
+        return;
+    };
+    let stale = fs::metadata(&path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .map(|age| age > Duration::from_secs(24 * 60 * 60))
+        .unwrap_or(true);
+    if !stale || REFRESH_STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    // Write to a temp and rename so a half-written list is never read.
+    let script = format!(
+        "{program} models > '{path}'.tmp 2>/dev/null && mv -f '{path}'.tmp '{path}'",
+        program = opencode_program(),
+        path = path.display()
+    );
+    if let Ok(mut child) = Command::new("sh")
+        .arg("-c")
+        .arg(script)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
+}
+
+/// The models `opencode models` reported: `provider/model` per line. That command
+/// knows which providers the user is actually authenticated for, which no static
+/// table could.
+pub(crate) fn cached_opencode_rows() -> Vec<(Backend, String, String)> {
+    let Some(path) = opencode_models_cache_path() else {
+        return Vec::new();
+    };
+    let Ok(raw) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    parse_opencode_model_list(&raw)
+}
+
+pub(crate) fn parse_opencode_model_list(raw: &str) -> Vec<(Backend, String, String)> {
+    raw.lines()
+        .map(str::trim)
+        .filter(|line| {
+            !line.is_empty()
+                && line.contains('/')
+                && !line.contains(char::is_whitespace)
+                && line
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || "/-_.:[]".contains(ch))
+        })
+        .map(|line| {
+            let provider = line.split('/').next().unwrap_or_default().to_string();
+            (Backend::Opencode, line.to_string(), provider)
+        })
+        .collect()
 }
 
 pub(crate) fn is_excluded_openai_text_model(id: &str) -> bool {
@@ -921,6 +1151,11 @@ pub(crate) fn models_dev_cache_path() -> Option<PathBuf> {
 }
 
 pub(crate) fn backend_for_model(model: &str) -> Backend {
+    // A provider-qualified id ("anthropic/claude-sonnet-4-5") is opencode's shape;
+    // neither claude nor codex names a model with a slash.
+    if model.contains('/') {
+        return Backend::Opencode;
+    }
     if model.starts_with("gpt-") || model.contains("codex") || is_o_series_model(model) {
         Backend::Codex
     } else {

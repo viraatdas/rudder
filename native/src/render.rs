@@ -776,6 +776,7 @@ fn push_planned_row<'a>(
     task_width: usize,
     prefix: &[Span<'a>],
     _cont_prefix: &[Span<'a>],
+    blocked_reason: Option<&str>,
 ) {
     let label = if node.title.trim().is_empty() {
         summarize_task(&node.prompt)
@@ -792,6 +793,12 @@ fn push_planned_row<'a>(
             pane_text_style(focused),
         ),
     ]);
+    if let Some(dep) = blocked_reason {
+        line.push(Span::styled(
+            format!("  blocked: {dep} failed"),
+            Style::default().fg(ST_FAILED),
+        ));
+    }
     lines.push(ListItem::new(Line::from(line)));
 }
 
@@ -810,6 +817,7 @@ fn planned_walk<'a>(
     task_width: usize,
     lanes: &mut Vec<bool>,
     visited: &mut Vec<bool>,
+    blocked_reasons: &std::collections::HashMap<String, String>,
 ) {
     if visited[index] {
         return;
@@ -829,6 +837,7 @@ fn planned_walk<'a>(
         task_width,
         &prefix,
         &cont_prefix,
+        blocked_reasons.get(&nodes[index].id).map(String::as_str),
     );
 
     let pending: Vec<(usize, EdgeType)> = own_children
@@ -850,6 +859,7 @@ fn planned_walk<'a>(
             task_width,
             lanes,
             visited,
+            blocked_reasons,
         );
         lanes.pop();
     }
@@ -866,6 +876,7 @@ fn render_planned_section<'a>(
     task_width: usize,
     leading_blank: bool,
     awaiting_approval: bool,
+    blocked_reasons: &std::collections::HashMap<String, String>,
 ) -> bool {
     use std::collections::HashMap;
     if nodes.is_empty() {
@@ -943,6 +954,7 @@ fn render_planned_section<'a>(
                 task_width,
                 &mut lanes,
                 &mut visited,
+                blocked_reasons,
             );
         }
     }
@@ -960,6 +972,7 @@ fn render_planned_section<'a>(
                 task_width,
                 &mut lanes,
                 &mut visited,
+                blocked_reasons,
             );
         }
     }
@@ -1153,6 +1166,7 @@ fn push_orchestrator_row<'a>(
         let backend = match agent.backend {
             Backend::Claude => "Claude Code",
             Backend::Codex => "Codex",
+            Backend::Opencode => "opencode",
         };
         ("plan mode", format!("{backend} · researching the plan"))
     } else if awaiting {
@@ -1368,6 +1382,26 @@ pub(crate) fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             // The Todo section is the planned-node queue (no agent ever buckets
             // there); every other section renders agents by status.
             let emitted = if bucket == Bucket::Todo {
+                // A queued node whose HARD dep FAILED can never launch until the
+                // user retries/deletes the failed node; say so ON the row (the
+                // one-shot notice was easy to miss and the node then sat in todo
+                // with no explanation forever).
+                let failed_ids: std::collections::HashSet<&str> = app
+                    .agents
+                    .iter()
+                    .filter(|run| run.status == AgentStatus::Failed)
+                    .filter_map(|run| run.node_id.as_deref())
+                    .collect();
+                let blocked_reasons: std::collections::HashMap<String, String> = app
+                    .planned_nodes
+                    .iter()
+                    .filter_map(|node| {
+                        node.deps
+                            .iter()
+                            .find(|dep| failed_ids.contains(dep.as_str()))
+                            .map(|dep| (node.id.clone(), dep.clone()))
+                    })
+                    .collect();
                 render_planned_section(
                     &mut lines,
                     &app.planned_nodes,
@@ -1375,6 +1409,7 @@ pub(crate) fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                     task_width,
                     leading_blank,
                     app.awaiting_approval,
+                    &blocked_reasons,
                 )
             } else {
                 render_status_section(
@@ -2062,6 +2097,7 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
     let backend_label = match agent.backend {
         Backend::Claude => "Claude Code",
         Backend::Codex => "Codex",
+        Backend::Opencode => "opencode",
     };
     let model_label = if agent.model.trim().is_empty() {
         backend_label.to_string()
@@ -3594,7 +3630,7 @@ pub(crate) fn task_default_hint(app: &App) -> &'static str {
     {
         "type to talk to the live orchestrator for status, retro, or follow-up control  ·  ^W pane"
     } else {
-        "type for orchestrator; /run for one mergeable worker; /ask for direct one-off  ·  Option-1/2/3 or ^W pane"
+        "type for one end-to-end main agent; /plan for a DAG; /run for one mergeable worker; /ask for one-off  ·  Option-1/2/3 or ^W pane"
     }
 }
 
@@ -4328,6 +4364,13 @@ pub(crate) fn agent_status_label(agent: &AgentRun) -> &'static str {
         && agent.status == AgentStatus::Running
     {
         "plan mode"
+    } else if agent.status == AgentStatus::Merged
+        && agent.delivery.required
+        && !agent.delivery.is_verified()
+    {
+        // A "deploy/publish" node auto-merges within a tick, and the plain
+        // "merged locally" label silently swallowed its unmet delivery proof.
+        "merged · delivery proof needed"
     } else if agent.status == AgentStatus::Merged && agent.integration.pushed {
         "pushed"
     } else if agent.status == AgentStatus::Merged {
@@ -4338,8 +4381,22 @@ pub(crate) fn agent_status_label(agent: &AgentRun) -> &'static str {
         "resolving conflict"
     } else if agent.has_merge_conflict() && agent.status == AgentStatus::Done {
         "merge conflict · press m"
+    } else if agent.status == AgentStatus::Done && agent.delivery.required {
+        // A deploy/publish task's delivery state (deployed / delivery blocked /
+        // delivery proof needed) outranks the generic merge hint — these labels
+        // were unreachable for worktree runs because the awaits-merge branch
+        // below always won.
+        agent.lifecycle_label()
     } else if agent.status == AgentStatus::Done && agent_awaits_merge(agent) {
-        "verifying · ready to integrate"
+        // Two different futures, one bucket: planned DAG nodes integrate on
+        // their own; everything else waits for the user. The old label
+        // ("verifying · ready to integrate") claimed active work that wasn't
+        // happening and never said WHO merges next.
+        if agent.node_id.is_some() {
+            "done · auto-merging"
+        } else {
+            "done · press m to merge"
+        }
     } else {
         agent.lifecycle_label()
     }
