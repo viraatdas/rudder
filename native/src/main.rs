@@ -5973,6 +5973,15 @@ impl App {
             .title
             .clone()
             .filter(|text| !text.trim().is_empty())
+            // The palette already read every backend's title; reuse it so a Codex or
+            // opencode row is named after the conversation instead of "session
+            // 019f6cc3…". `conversation_title` only knows Claude transcripts.
+            .or_else(|| {
+                self.handoff_candidates
+                    .iter()
+                    .find(|candidate| candidate.session_id == session_id)
+                    .map(|candidate| candidate.title.clone())
+            })
             .or_else(|| conversation_title(&self.cwd, &session_id))
             .unwrap_or_else(|| format!("session {short_id}…"));
         let title = truncate_chars(title.trim(), 60);

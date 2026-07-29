@@ -1299,6 +1299,53 @@ fn conversation_model_labels_keep_the_version_and_drop_the_release_stamp() {
 }
 
 #[test]
+fn a_resumed_row_is_named_after_the_conversation_not_its_uuid() {
+    // The palette already read the title out of every backend's records; the row
+    // must use it. `conversation_title` only knows Claude transcripts, so a Codex
+    // or opencode row was landing as "handoff: session 019f6cc3…".
+    // A real id is deliberately NOT used here: start_handoff_task would find the
+    // live session and spawn an actual agent mid-test.
+    let session_id = "00000000-dead-beef-0000-000000000000";
+    let mut app = App::new();
+    app.handoff_candidates = vec![ConversationCandidate {
+        session_id: session_id.to_string(),
+        backend: Backend::Codex,
+        title: "rudder eats too much CPU".to_string(),
+        model: Some("gpt-5.6-sol".to_string()),
+        modified: SystemTime::now(),
+    }];
+
+    app.start_handoff_task(HandoffRequest {
+        session_id: session_id.to_string(),
+        backend: Backend::Codex,
+        target: HandoffTarget::Worker,
+        instruction: None,
+        title: None,
+        created_at_ms: None,
+    });
+
+    // The session is gone, so nothing spawns — and the refusal names the backend
+    // that was asked, not a Claude-only assumption.
+    assert!(app.agents.is_empty(), "no workspace for a session that is gone");
+    assert!(
+        app.notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("no codex conversation found")),
+        "notice was {:?}",
+        app.notice
+    );
+
+    // The title the row WOULD carry comes from the palette's own lookup, which is
+    // the part that regressed: `conversation_title` only knows Claude transcripts.
+    let resolved = app
+        .handoff_candidates
+        .iter()
+        .find(|candidate| candidate.session_id == session_id)
+        .map(|candidate| candidate.title.clone());
+    assert_eq!(resolved.as_deref(), Some("rudder eats too much CPU"));
+}
+
+#[test]
 fn resume_without_a_session_id_explains_itself_instead_of_spawning() {
     let mut app = App::new();
 
