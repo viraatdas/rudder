@@ -468,6 +468,179 @@ pub(crate) fn parse_codex_session_head(raw: &str) -> Option<CodexSessionHead> {
     })
 }
 
+/// What a (possibly partial) session id resolved to.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SessionLookup {
+    Found {
+        backend: Backend,
+        session_id: String,
+    },
+    /// The prefix matches more than one session; the user must be more specific.
+    Ambiguous(Vec<String>),
+    Missing,
+}
+
+/// Resolve a session id that may have been TRUNCATED to the real one.
+///
+/// Every TUI that displays a session id cuts it to fit the pane, so what a user
+/// copies is routinely a prefix ("019f7cde-6d6f-7be0-8359-67e" — 27 of 36 chars).
+/// Accepting that and handing it to the backend fails at launch with "No saved
+/// session found with ID …", which reads like Rudder losing the conversation.
+/// Resolving the prefix here turns a dead end into the thing the user meant.
+pub(crate) fn resolve_session(cwd: &Path, partial: &str) -> SessionLookup {
+    let partial = partial.trim();
+    if !valid_session_id(partial) {
+        return SessionLookup::Missing;
+    }
+    // An exact hit wins outright: no scanning, no ambiguity.
+    if crate::claude_transcript_path(cwd, partial).is_some() {
+        return SessionLookup::Found {
+            backend: Backend::Claude,
+            session_id: partial.to_string(),
+        };
+    }
+    let mut matches: Vec<(Backend, String)> = Vec::new();
+    for (backend, id) in claude_session_ids_starting_with(cwd, partial)
+        .into_iter()
+        .map(|id| (Backend::Claude, id))
+        .chain(
+            codex_session_ids_starting_with(partial)
+                .into_iter()
+                .map(|id| (Backend::Codex, id)),
+        )
+        .chain(
+            opencode_session_ids_starting_with(partial)
+                .into_iter()
+                .map(|id| (Backend::Opencode, id)),
+        )
+    {
+        if id == partial {
+            return SessionLookup::Found {
+                backend,
+                session_id: id,
+            };
+        }
+        if !matches.iter().any(|(_, seen)| seen == &id) {
+            matches.push((backend, id));
+        }
+    }
+    match matches.len() {
+        0 => SessionLookup::Missing,
+        1 => {
+            let (backend, session_id) = matches.remove(0);
+            SessionLookup::Found {
+                backend,
+                session_id,
+            }
+        }
+        _ => SessionLookup::Ambiguous(matches.into_iter().map(|(_, id)| id).collect()),
+    }
+}
+
+fn claude_session_ids_starting_with(cwd: &Path, partial: &str) -> Vec<String> {
+    let Some(home) = crate::cloudio::user_home_dir() else {
+        return Vec::new();
+    };
+    claude_session_ids_starting_with_in(&home.join(".claude").join("projects"), cwd, partial)
+}
+
+pub(crate) fn claude_session_ids_starting_with_in(
+    projects: &Path,
+    cwd: &Path,
+    partial: &str,
+) -> Vec<String> {
+    let encoded = crate::encode_claude_project_dir(cwd);
+    let Ok(entries) = std::fs::read_dir(projects) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name != encoded && !name.starts_with(&format!("{encoded}-")) {
+            continue;
+        }
+        let Ok(sessions) = std::fs::read_dir(entry.path()) else {
+            continue;
+        };
+        for session in sessions.flatten() {
+            let path = session.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            if stem.starts_with(partial) && valid_session_id(stem) {
+                found.push(stem.to_string());
+            }
+        }
+    }
+    found
+}
+
+/// Codex names each rollout `rollout-<timestamp>-<session id>.jsonl`, so the id can
+/// be read off the filename without opening 1200 files.
+fn codex_session_ids_starting_with(partial: &str) -> Vec<String> {
+    let Some(home) = crate::cloudio::user_home_dir() else {
+        return Vec::new();
+    };
+    let mut files: Vec<(SystemTime, PathBuf)> = Vec::new();
+    collect_jsonl_files(&home.join(".codex").join("sessions"), &mut files, 0);
+    let mut found = Vec::new();
+    for (_, path) in files {
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        let Some(id) = codex_session_id_from_file_stem(stem) else {
+            continue;
+        };
+        if id.starts_with(partial) && !found.contains(&id) {
+            found.push(id);
+        }
+    }
+    found
+}
+
+/// The trailing UUID of `rollout-2026-07-19T17-12-59-019f7cde-…-67e68c2deec6`.
+pub(crate) fn codex_session_id_from_file_stem(stem: &str) -> Option<String> {
+    let parts: Vec<&str> = stem.rsplitn(6, '-').collect();
+    if parts.len() < 6 {
+        return None;
+    }
+    // rsplitn yields the tail first; the id is those five groups back in order.
+    let id = parts[..5]
+        .iter()
+        .rev()
+        .copied()
+        .collect::<Vec<_>>()
+        .join("-");
+    let groups: Vec<&str> = id.split('-').collect();
+    let shaped = groups.len() == 5
+        && [8, 4, 4, 4, 12]
+            .iter()
+            .zip(&groups)
+            .all(|(len, group)| group.len() == *len)
+        && groups
+            .iter()
+            .all(|group| group.chars().all(|ch| ch.is_ascii_hexdigit()));
+    shaped.then_some(id)
+}
+
+fn opencode_session_ids_starting_with(partial: &str) -> Vec<String> {
+    let Some(raw) = opencode_session_list_json(200) else {
+        return Vec::new();
+    };
+    serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|session| session.get("id").and_then(serde_json::Value::as_str))
+        .filter(|id| id.starts_with(partial))
+        .map(ToString::to_string)
+        .collect()
+}
+
 /// Does `~/.codex/sessions` hold a rollout for this id? Codex records the session id
 /// in the FILENAME, so a walk beats opening every transcript. Used to tell a real
 /// Codex session apart from a mistyped id, which would otherwise launch a workspace
@@ -1027,6 +1200,46 @@ mod tests {
         assert_eq!(head.session_id, "019cb763-9efd-7320-b337-64233ca29d6e");
         assert_eq!(head.cwd, "/repo");
         assert_eq!(head.title, "port the cache to the new store");
+    }
+
+    #[test]
+    fn codex_session_ids_are_read_off_the_rollout_filename() {
+        assert_eq!(
+            codex_session_id_from_file_stem(
+                "rollout-2026-07-19T17-12-59-019f7cde-6d6f-7be0-8359-67e68c2deec6"
+            )
+            .as_deref(),
+            Some("019f7cde-6d6f-7be0-8359-67e68c2deec6")
+        );
+        // A timestamp alone is not a session id.
+        assert_eq!(codex_session_id_from_file_stem("rollout-2026-07-19T17-12-59"), None);
+        assert_eq!(codex_session_id_from_file_stem("nonsense"), None);
+    }
+
+    #[test]
+    fn a_truncated_session_id_resolves_to_the_real_one() {
+        // Every TUI cuts the id to fit its pane, so users paste a PREFIX. Handing
+        // that prefix to the backend fails with "No saved session found with ID …",
+        // which reads like Rudder losing the conversation.
+        let root = std::env::temp_dir().join(format!(
+            "rudder-handoff-prefix-{}-{}",
+            std::process::id(),
+            now_millis()
+        ));
+        let cwd = root.join("repo");
+        let projects = root.join("projects");
+        let dir = projects.join(crate::encode_claude_project_dir(&cwd));
+        write_transcript(
+            &dir,
+            "3503304e-5818-45d5-8b5b-4ea15a857e09",
+            "the chat I want back",
+            true,
+        );
+
+        let ids = claude_session_ids_starting_with_in(&projects, &cwd, "3503304e-5818-45d5");
+
+        assert_eq!(ids, vec!["3503304e-5818-45d5-8b5b-4ea15a857e09".to_string()]);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

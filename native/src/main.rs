@@ -5924,19 +5924,6 @@ impl App {
         self.dirty = true;
     }
 
-    /// Which CLI recorded this conversation. Claude transcripts are per-directory
-    /// files under `~/.claude/projects`; Codex keeps one global rollout tree. None
-    /// means the id matches nothing on this machine.
-    fn detect_handoff_backend(&self, session_id: &str) -> Option<Backend> {
-        if claude_transcript_path(&self.cwd, session_id).is_some() {
-            return Some(Backend::Claude);
-        }
-        if codex_session_exists(session_id) {
-            return Some(Backend::Codex);
-        }
-        opencode_session_exists(session_id).then_some(Backend::Opencode)
-    }
-
     /// `/handoff <session-id> [next step]`, and every request queued by
     /// `rudder handoff`: ADOPT a conversation that was happening outside the
     /// dashboard (a plain `claude`/`codex` chat in another terminal) and continue it
@@ -6403,12 +6390,36 @@ impl App {
                         "/resume <session-id> [next step] — continue an existing claude/codex/opencode chat as a worker ({found} in the palette) · from inside that chat: rudder handoff \"<next step>\""
                     ));
                 } else {
-                    let Some(backend) = self.detect_handoff_backend(&session_id) else {
-                        self.notice = Some(format!(
-                            "no claude, codex, or opencode conversation found for {} — /handoff lists this repo's recent chats",
-                            truncate_chars(&session_id, 8)
-                        ));
-                        return true;
+                    // The id may be TRUNCATED: every TUI cuts it to fit its pane,
+                    // so what gets pasted here is often a prefix. Resolve it to the
+                    // real one rather than handing a prefix to the backend, which
+                    // fails at launch with "No saved session found with ID …".
+                    let (backend, session_id) = match resolve_session(&self.cwd, &session_id) {
+                        SessionLookup::Found {
+                            backend,
+                            session_id,
+                        } => (backend, session_id),
+                        SessionLookup::Ambiguous(ids) => {
+                            let shown = ids
+                                .iter()
+                                .take(3)
+                                .map(|id| truncate_chars(id, 14))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            self.notice = Some(format!(
+                                "{} conversations start with {} ({shown}…) — paste more of the id",
+                                ids.len(),
+                                truncate_chars(&session_id, 14)
+                            ));
+                            return true;
+                        }
+                        SessionLookup::Missing => {
+                            self.notice = Some(format!(
+                                "no claude, codex, or opencode conversation found for {} — /resume lists this repo's recent chats",
+                                truncate_chars(&session_id, 14)
+                            ));
+                            return true;
+                        }
                     };
                     self.start_handoff_task(HandoffRequest {
                         session_id,
