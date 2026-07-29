@@ -5997,6 +5997,18 @@ fn fork_commands_branch_the_session_without_touching_the_original() {
 
     // Codex has a first-class fork subcommand.
     let codex = codex_fork_command("gpt-test", None, "sid-codex", None);
+    // A forked Codex session remembers the checkout it ran in and STOPS to ask
+    // which directory to use. Rudder spawns it in the workspace it means, so it
+    // answers up front — otherwise the user picks, and picking "session" sends the
+    // agent's edits into the main checkout, outside the workspace Rudder merges.
+    assert!(
+        codex
+            .args
+            .windows(2)
+            .any(|w| w[0] == "-c" && w[1] == "tui.resume_cwd=\"current\""),
+        "fork answers the working-directory prompt: {:?}",
+        codex.args
+    );
     assert_eq!(codex.program, "codex");
     assert!(codex
         .args

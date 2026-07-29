@@ -194,6 +194,7 @@ pub(crate) fn codex_fork_command(
         "goals".to_string(),
         "--dangerously-bypass-approvals-and-sandbox".to_string(),
     ];
+    push_codex_resume_cwd_current(&mut args);
     push_codex_worker_config_overrides(&mut args, effort);
     if !model.trim().is_empty() {
         args.push("-m".to_string());
@@ -210,6 +211,7 @@ pub(crate) fn codex_fork_command(
 
 pub(crate) fn codex_resume_command(run: &AgentRun, session_id: &str) -> TerminalCommand {
     let mut args = Vec::new();
+    push_codex_resume_cwd_current(&mut args);
     match run.mode {
         AgentMode::Execute | AgentMode::ReviewAll | AgentMode::Main | AgentMode::OneOff => {
             args.push("--no-alt-screen".to_string());
@@ -681,6 +683,18 @@ pub(crate) fn rudder_orchestrator_resume_command(
             TerminalCommand::with_args(opencode_program(), args)
         }
     }
+}
+
+/// Answer Codex's "Choose working directory to fork this session" prompt up front.
+///
+/// A forked/resumed Codex session remembers the directory it ran in, which for a
+/// Rudder handoff is the MAIN checkout — while Rudder deliberately spawns it in a
+/// fresh jj workspace. Left unanswered, Codex stops and asks, and picking the
+/// session directory would send the agent's edits into the main checkout, outside
+/// the workspace Rudder merges. Rudder always sets the cwd it means, so: current.
+pub(crate) fn push_codex_resume_cwd_current(args: &mut Vec<String>) {
+    args.push("-c".to_string());
+    args.push("tui.resume_cwd=\"current\"".to_string());
 }
 
 pub(crate) fn push_codex_interactive_orchestrator_args(
