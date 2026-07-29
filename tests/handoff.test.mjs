@@ -8,6 +8,7 @@ import { normalizeEffortForBackend } from "../dist/effort.js";
 import {
   firstUserPrompt,
   isValidSessionId,
+  parseCodexSessionHead,
   parseHandoffArgs,
   parseOpencodeSessions,
   recentClaudeConversations,
@@ -132,6 +133,42 @@ test("resolveClaudeSessionId: prefers the session this command is running inside
     resolveClaudeSessionId(process.cwd(), { CLAUDE_CODE_SESSION_ID: sessionId }),
     sessionId,
   );
+});
+
+test("parseCodexSessionHead: the human's turn, not the harness's or Rudder's", () => {
+  const raw = [
+    JSON.stringify({ type: "session_meta", payload: { id: "019cb763-9efd-7320-b337-64233ca29d6e", cwd: "/repo" } }),
+    // Codex opens every session with the repo's instructions file as a USER turn.
+    JSON.stringify({
+      type: "response_item",
+      payload: { type: "message", role: "user", content: [{ type: "input_text", text: "# AGENTS.md instructions for /repo\n<INSTRUCTIONS>\nbe good\n</INSTRUCTIONS>" }] },
+    }),
+    // Rudder drives `codex exec` for task titles; that is not a conversation.
+    JSON.stringify({
+      type: "response_item",
+      payload: { type: "message", role: "user", content: [{ type: "input_text", text: "Summarize this coding agent task for a compact sidebar label." }] },
+    }),
+    JSON.stringify({
+      type: "response_item",
+      payload: { type: "message", role: "user", content: [{ type: "input_text", text: "rudder eats too much CPU" }] },
+    }),
+  ].join("\n");
+  assert.deepEqual(parseCodexSessionHead(raw), {
+    sessionId: "019cb763-9efd-7320-b337-64233ca29d6e",
+    cwd: "/repo",
+    title: "rudder eats too much CPU",
+  });
+});
+
+test("parseCodexSessionHead: subagent threads are not conversations", () => {
+  const raw = [
+    JSON.stringify({ type: "session_meta", payload: { id: "019cb763-9efd-7320-b337-64233ca29d6e", cwd: "/repo", thread_source: "subagent" } }),
+    JSON.stringify({
+      type: "response_item",
+      payload: { type: "message", role: "user", content: [{ type: "input_text", text: "audit the routing layer" }] },
+    }),
+  ].join("\n");
+  assert.equal(parseCodexSessionHead(raw), undefined);
 });
 
 test("parseOpencodeSessions: this repo's opencode chats, newest first", () => {

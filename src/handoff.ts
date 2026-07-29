@@ -169,7 +169,8 @@ function userPromptFromLine(line: string): string | undefined {
       .map((block) => block.text)
       .join(" ");
   }
-  return stripWrapperBlocks(text) || undefined;
+  const cleaned = stripWrapperBlocks(text);
+  return cleaned && !isRudderGeneratedPrompt(cleaned) ? cleaned : undefined;
 }
 
 /**
@@ -372,9 +373,27 @@ export function parseOpencodeSessions(raw: string, cwd: string, limit = 10): Con
 }
 
 /** Newest Codex session recorded for `cwd`. Codex sessions live in one global tree. */
-export function resolveCodexSessionId(cwd: string, root = path.join(os.homedir(), ".codex", "sessions")): string | undefined {
+export function resolveCodexSessionId(cwd: string, root = codexSessionsDir()): string | undefined {
+  return recentCodexConversations(cwd, 1, root)[0]?.sessionId;
+}
+
+export function codexSessionsDir(): string {
+  return path.join(os.homedir(), ".codex", "sessions");
+}
+
+/**
+ * Recent Codex conversations for `cwd`, newest first. Codex keeps ONE global
+ * rollout tree, so this filters by the recorded cwd BEFORE taking the newest few —
+ * the newest rollouts overall are usually other repositories'. Mirrors
+ * `recent_codex_conversations_in` in native/src/handoff.rs.
+ */
+export function recentCodexConversations(
+  cwd: string,
+  limit = 10,
+  root = codexSessionsDir(),
+): ConversationCandidate[] {
   const target = path.resolve(cwd);
-  let best: { id: string; modifiedMs: number } | undefined;
+  const files: { file: string; modifiedMs: number }[] = [];
   const walk = (dir: string, depth: number): void => {
     if (depth > 8) {
       return;
@@ -394,32 +413,114 @@ export function resolveCodexSessionId(cwd: string, root = path.join(os.homedir()
       if (!entry.name.endsWith(".jsonl")) {
         continue;
       }
-      const head = readHead(full, 64 * 1024);
-      if (!head.includes(`"cwd":"${target}"`) && !head.includes(`"cwd": "${target}"`)) {
-        continue;
-      }
-      const id = codexSessionIdFrom(head) ?? path.basename(entry.name, ".jsonl");
-      if (!isValidSessionId(id)) {
-        continue;
-      }
-      let modifiedMs = 0;
       try {
-        modifiedMs = fs.statSync(full).mtimeMs;
+        files.push({ file: full, modifiedMs: fs.statSync(full).mtimeMs });
       } catch {
-        continue;
-      }
-      if (!best || modifiedMs > best.modifiedMs) {
-        best = { id, modifiedMs };
+        // Raced with a delete; skip it.
       }
     }
   };
   walk(root, 0);
-  return best?.id;
+  files.sort((left, right) => right.modifiedMs - left.modifiedMs);
+
+  const found: ConversationCandidate[] = [];
+  // Resuming a session writes ANOTHER rollout under the same id; newest wins.
+  const seen = new Set<string>();
+  let examined = 0;
+  for (const { file, modifiedMs } of files) {
+    if (found.length >= limit || examined >= 600) {
+      break;
+    }
+    examined += 1;
+    // Cheap reject first: `session_meta` puts cwd in the first few hundred bytes,
+    // while the rest of that line is the entire Codex system prompt.
+    const prefix = readHead(file, 4096);
+    if (!prefix.includes(`"cwd":"${target}`) && !prefix.includes(`"cwd": "${target}`)) {
+      continue;
+    }
+    const head = parseCodexSessionHead(readHead(file, TITLE_SCAN_BYTES));
+    if (!head || !path.resolve(head.cwd).startsWith(target)) {
+      continue;
+    }
+    if (seen.has(head.sessionId)) {
+      continue;
+    }
+    seen.add(head.sessionId);
+    found.push({ sessionId: head.sessionId, title: head.title, modifiedMs, path: file });
+  }
+  return found;
 }
 
-function codexSessionIdFrom(head: string): string | undefined {
-  const match = /"id"\s*:\s*"([0-9a-fA-F-]{8,})"/.exec(head);
-  return match?.[1];
+/**
+ * A Codex rollout's identity: the `session_meta` line carries the id and cwd, and
+ * the title is the first turn whose role is `user` — `developer` turns are the
+ * harness's own context blocks.
+ */
+export function parseCodexSessionHead(
+  raw: string,
+): { sessionId: string; cwd: string; title: string } | undefined {
+  let sessionId = "";
+  let cwd = "";
+  for (const line of raw.split("\n")) {
+    let value: Record<string, unknown>;
+    try {
+      value = JSON.parse(line) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    const payload = (value.payload ?? {}) as Record<string, unknown>;
+    if (value.type === "session_meta") {
+      // A subagent thread is the model talking to itself: not a conversation.
+      if (payload.thread_source === "subagent") {
+        return undefined;
+      }
+      sessionId = typeof payload.id === "string" ? payload.id : "";
+      cwd = typeof payload.cwd === "string" ? payload.cwd : "";
+      continue;
+    }
+    if (!sessionId || payload.type !== "message" || payload.role !== "user") {
+      continue;
+    }
+    const content = Array.isArray(payload.content) ? payload.content : [];
+    const text = content
+      .map((block) => (isRecordLike(block) && typeof block.text === "string" ? block.text : ""))
+      .join(" ");
+    const title = stripWrapperBlocks(text);
+    // Codex opens every session by sending the repo's instructions file as a USER
+    // turn; the human's first turn is the one after it.
+    if (!title || isInjectedInstructions(title) || isRudderGeneratedPrompt(title)) {
+      continue;
+    }
+    if (!isValidSessionId(sessionId) || !cwd) {
+      return undefined;
+    }
+    return { sessionId, cwd, title };
+  }
+  return undefined;
+}
+
+/** `# AGENTS.md instructions for /path` — the harness talking, not a person. */
+export function isInjectedInstructions(text: string): boolean {
+  const head = text.trimStart();
+  return head.startsWith("#") && head.includes(" instructions for ");
+}
+
+/**
+ * Prompts RUDDER writes itself. A `codex exec` rollout looks exactly like a real
+ * chat in its metadata (`originator: codex-tui`, `source: cli`), so these are
+ * matched by their opening text — which Rudder controls. Mirrors
+ * `is_rudder_generated_prompt` in native/src/handoff.rs.
+ */
+export function isRudderGeneratedPrompt(text: string): boolean {
+  const head = text.trimStart();
+  return [
+    "Summarize this coding agent task for a compact sidebar label.",
+    "A coding agent finished the task below but did not file a structured report.",
+  ].some((prompt) => head.startsWith(prompt));
+}
+
+function isRecordLike(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object";
 }
 
 /** `.rudder/` lives at the dashboard root, never inside an agent's workspace. */
@@ -451,7 +552,11 @@ export async function runHandoff(args: string[], backendFlag?: string): Promise<
   const repoRoot = dashboardRoot(cwd);
 
   if (parsed.list) {
-    const candidates = [...recentClaudeConversations(repoRoot, 10), ...recentOpencodeConversations(repoRoot, 10)]
+    const candidates = [
+      ...recentClaudeConversations(repoRoot, 10),
+      ...recentCodexConversations(repoRoot, 10),
+      ...recentOpencodeConversations(repoRoot, 10),
+    ]
       .sort((left, right) => right.modifiedMs - left.modifiedMs)
       .slice(0, 10);
     if (candidates.length === 0) {

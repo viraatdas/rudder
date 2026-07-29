@@ -276,6 +276,7 @@ pub(crate) fn recent_codex_conversations_in(
         needles.push(format!("\"cwd\": \"{path}"));
     }
     let mut candidates: Vec<ConversationCandidate> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut examined = 0_usize;
     for (modified, path) in files {
         if candidates.len() >= limit || examined >= CODEX_SCAN_LIMIT {
@@ -300,6 +301,11 @@ pub(crate) fn recent_codex_conversations_in(
         // confirm on the parsed path.
         let session_cwd = std::fs::canonicalize(&head.cwd).unwrap_or(PathBuf::from(&head.cwd));
         if !session_cwd.starts_with(&target) && !Path::new(&head.cwd).starts_with(cwd) {
+            continue;
+        }
+        // Resuming a Codex session writes ANOTHER rollout file with the same id;
+        // the newest one wins (files are walked newest-first).
+        if !seen.insert(head.session_id.clone()) {
             continue;
         }
         candidates.push(ConversationCandidate {
@@ -337,6 +343,27 @@ fn collect_jsonl_files(dir: &Path, out: &mut Vec<(SystemTime, PathBuf)>, depth: 
     }
 }
 
+/// Is this user turn the harness injecting an instructions file rather than a
+/// person typing? Codex prefixes it with `# <FILE> instructions for <path>`.
+pub(crate) fn is_injected_instructions(text: &str) -> bool {
+    let head = text.trim_start();
+    head.starts_with('#') && head.split_once(" instructions for ").is_some()
+}
+
+/// Prompts RUDDER writes to a backend itself. Claude's one-shot calls are caught
+/// structurally (no session-mode marker), but a `codex exec` rollout is
+/// indistinguishable from a real chat by metadata — `originator: codex-tui`,
+/// `source: cli`, same as a person typing. So these are matched by their opening
+/// text, which Rudder controls. Keep in sync with `tasks.rs`.
+pub(crate) fn is_rudder_generated_prompt(text: &str) -> bool {
+    const RUDDER_PROMPTS: [&str; 2] = [
+        "Summarize this coding agent task for a compact sidebar label.",
+        "A coding agent finished the task below but did not file a structured report.",
+    ];
+    let head = text.trim_start();
+    RUDDER_PROMPTS.iter().any(|prompt| head.starts_with(prompt))
+}
+
 /// What the picker needs from a Codex rollout: which session, where it ran, and
 /// what the human opened it with.
 pub(crate) struct CodexSessionHead {
@@ -360,6 +387,13 @@ pub(crate) fn parse_codex_session_head(raw: &str) -> Option<CodexSessionHead> {
         let payload = value.get("payload");
         if kind == Some("session_meta") {
             if let Some(payload) = payload {
+                // A subagent thread is the model talking to itself, like Claude's
+                // sidechains: never a conversation to hand off.
+                if payload.get("thread_source").and_then(serde_json::Value::as_str)
+                    == Some("subagent")
+                {
+                    return None;
+                }
                 session_id = payload
                     .get("id")
                     .and_then(serde_json::Value::as_str)
@@ -405,7 +439,14 @@ pub(crate) fn parse_codex_session_head(raw: &str) -> Option<CodexSessionHead> {
             })
             .unwrap_or_default();
         let cleaned = strip_wrapper_blocks(&text);
-        if cleaned.is_empty() {
+        // Codex opens every session by sending the repo's instructions file as a
+        // USER turn ("# AGENTS.md instructions for /path" + an <INSTRUCTIONS>
+        // block). Titling the conversation with that gives every row in the picker
+        // the same useless name; the human's first turn is the one after it.
+        if cleaned.is_empty()
+            || is_injected_instructions(&cleaned)
+            || is_rudder_generated_prompt(&cleaned)
+        {
             continue;
         }
         if !valid_session_id(&session_id) || cwd.is_empty() {
@@ -624,7 +665,8 @@ pub(crate) fn scan_transcript_lines(
         if title.is_none() {
             // The mode markers are written before the first user turn, so by the
             // time a title exists the interactive question is already answered.
-            title = user_prompt_from_entry(&value);
+            title = user_prompt_from_entry(&value)
+                .filter(|prompt| !is_rudder_generated_prompt(prompt));
         }
         if model.is_none() {
             model = value
@@ -985,6 +1027,65 @@ mod tests {
         assert_eq!(head.session_id, "019cb763-9efd-7320-b337-64233ca29d6e");
         assert_eq!(head.cwd, "/repo");
         assert_eq!(head.title, "port the cache to the new store");
+    }
+
+    #[test]
+    fn codex_titles_skip_the_harness_and_rudders_own_prompts() {
+        // Codex opens every session with the repo's instructions file as a USER
+        // turn, and Rudder itself drives `codex exec` for task titles — neither is
+        // a conversation a human would recognize in a picker.
+        let raw = [
+            r#"{"type":"session_meta","payload":{"id":"019cb763-9efd-7320-b337-64233ca29d6e","cwd":"/repo"}}"#,
+            // r##"…"## because the JSON contains `"#` (from "# AGENTS.md"), which
+            // would close a plain r#"…"# raw string.
+            r##"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for /repo\n<INSTRUCTIONS>\nbe good\n</INSTRUCTIONS>"}]}}"##,
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Summarize this coding agent task for a compact sidebar label. Return exactly one JSON object"}]}}"#,
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"rudder eats too much CPU"}]}}"#,
+        ]
+        .join("\n");
+
+        let head = parse_codex_session_head(&raw).expect("parsed");
+
+        assert_eq!(head.title, "rudder eats too much CPU");
+    }
+
+    #[test]
+    fn codex_subagent_threads_are_not_conversations() {
+        // The model talking to itself, like Claude's sidechains.
+        let raw = [
+            r#"{"type":"session_meta","payload":{"id":"019cb763-9efd-7320-b337-64233ca29d6e","cwd":"/repo","thread_source":"subagent"}}"#,
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"audit the routing layer"}]}}"#,
+        ]
+        .join("\n");
+
+        assert!(parse_codex_session_head(&raw).is_none());
+    }
+
+    #[test]
+    fn one_resumed_codex_session_is_one_row() {
+        // Resuming writes a NEW rollout file under the SAME session id; the picker
+        // showed the same conversation four times before this.
+        let root = std::env::temp_dir().join(format!(
+            "rudder-handoff-codex-dupe-{}-{}",
+            std::process::id(),
+            now_millis()
+        ));
+        let day = root.join("2026").join("07").join("20");
+        std::fs::create_dir_all(&day).expect("create session dir");
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).expect("create repo dir");
+        let rollout = format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"019cb763-9efd-7320-b337-64233ca29d6e\",\"cwd\":\"{}\"}}}}\n{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"the long running chat\"}}]}}}}",
+            repo.to_string_lossy()
+        );
+        for part in 0..4 {
+            std::fs::write(day.join(format!("rollout-{part}.jsonl")), &rollout).expect("write");
+        }
+
+        let found = recent_codex_conversations_in(&root, &repo, 10);
+
+        assert_eq!(found.len(), 1, "one session, one row: {found:?}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
