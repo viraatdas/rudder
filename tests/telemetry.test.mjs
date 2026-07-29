@@ -6,6 +6,7 @@ import test from "node:test";
 
 import { projectHash, sanitizeProperties, TELEMETRY_NOTICE, telemetryEnabled } from "../dist/analytics.js";
 import { issueBody, issueTitle, parseGithubSlug, redactText, submitFeedback } from "../dist/feedback.js";
+import { isInternalCommand } from "../dist/main.js";
 
 // Nothing in this file may reach the network. `submitFeedback` is exercised with
 // telemetry off and issue filing disabled, so the assertions are about the local
@@ -125,6 +126,16 @@ test("issueTitle / issueBody: a scannable title and a context block with no code
   assert.match(body, /- model: gpt-5\.6-sol/);
   assert.match(body, /Recent notices:/);
   assert.match(body, /_Filed by `rudder feedback`\._/);
+});
+
+test("an unknown internal command is inert, not a task", () => {
+  // The dashboard shells out to `rudder __event`, resolving `rudder` from PATH —
+  // which can be an OLDER install than the binary calling it. Without this the
+  // fallback would spawn a real agent named "__event dashboard_opened …".
+  assert.equal(isInternalCommand("__event"), true);
+  assert.equal(isInternalCommand("__does_not_exist_yet"), true);
+  assert.equal(isInternalCommand("merge"), false);
+  assert.equal(isInternalCommand(undefined), false);
 });
 
 test("feedbackRepo: a fork files its own issues", () => {

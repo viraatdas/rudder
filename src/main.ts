@@ -396,6 +396,14 @@ export async function main(): Promise<void> {
       return;
     }
     default: {
+      // INTERNAL calls (`__event`, `__worker`, …) come from the native dashboard,
+      // which finds `rudder` on PATH — and that can be a DIFFERENT version than
+      // the binary calling it. Falling through here would treat the unknown
+      // internal command as a task and spawn a real agent named
+      // "__event dashboard_opened …". Version skew must be inert, not expensive.
+      if (isInternalCommand(parsed.command)) {
+        return;
+      }
       await maybeOnboard();
       await startRun({
         task: [parsed.command, ...parsed.args].join(" "),
@@ -409,6 +417,11 @@ export async function main(): Promise<void> {
       });
     }
   }
+}
+
+/** Hidden cross-process entry points; never user tasks. */
+export function isInternalCommand(command: string | undefined): boolean {
+  return Boolean(command?.startsWith("__"));
 }
 
 function shouldAutoUpdateForCommand(command: string | undefined): boolean {
