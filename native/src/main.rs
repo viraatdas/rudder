@@ -1814,7 +1814,7 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('g') {
             self.nav_mode = !self.nav_mode;
             self.notice = Some(if self.nav_mode {
-                "nav mode: 1 agents  2 worker  3 task  v review  R review-all  M merge-all  Esc exits"
+                "nav mode: 1 agents  2 worker  3 task  v review  b branch chat  R review-all  M merge-all  Esc exits"
                     .to_string()
             } else {
                 "worker input restored".to_string()
@@ -1829,7 +1829,7 @@ impl App {
             self.leader_pending = true;
             self.nav_mode = false;
             self.notice = Some(
-                "Ctrl+W: Tab cycle  1/2/3 panes  v review  m merge  R review-all  M merge-all  Esc cancels"
+                "Ctrl+W: Tab cycle  1/2/3 panes  v review  m merge  b branch chat  R review-all  M merge-all  Esc cancels"
                     .to_string(),
             );
             return false;
@@ -1942,6 +1942,10 @@ impl App {
             }
             KeyCode::Char('v') => self.toggle_worker_view(),
             KeyCode::Char('r') => self.start_rename_selected_agent(),
+            // Branching is only bound to a bare `b` in the agents list, which the
+            // worker pane cannot use — every keystroke there goes to the agent's own
+            // TUI, so `b` was simply typed into it. Reachable here and under ^W.
+            KeyCode::Char('b') => self.branch_selected_agent(),
             KeyCode::Up | KeyCode::Char('k') => self.select_previous_agent(),
             KeyCode::Down | KeyCode::Char('j') => self.select_next_agent(),
             KeyCode::Char('m') => self.request_merge_selected_agent(),
@@ -1990,6 +1994,7 @@ impl App {
             }
             KeyCode::Char('v') | KeyCode::Char('\u{221a}') => self.toggle_worker_view(),
             KeyCode::Char('r') => self.start_rename_selected_agent(),
+            KeyCode::Char('b') => self.branch_selected_agent(),
             KeyCode::Up | KeyCode::Char('k') => self.select_previous_agent(),
             KeyCode::Down | KeyCode::Char('j') => self.select_next_agent(),
             KeyCode::Char('m') => self.request_merge_selected_agent(),
@@ -11028,19 +11033,36 @@ impl App {
             self.notice = Some("branch works on worker agents, not main/orchestrator".to_string());
             return;
         }
-        // Codex runs only learn their session id at completion; for a live branch,
-        // fall back to the newest recorded Codex session for that workspace.
+        let backend_for_notice = run.backend;
+        // Codex and opencode runs only learn their session id later; for a live
+        // branch, fall back to the newest session recorded for that workspace.
         let session_id = run
             .session_id
             .clone()
             .filter(|s| !s.trim().is_empty())
-            .or_else(|| {
-                (run.backend == Backend::Codex)
-                    .then(|| latest_codex_session_id_for_cwd(&run.cwd))
-                    .flatten()
+            .or_else(|| match run.backend {
+                Backend::Codex => latest_codex_session_id_for_cwd(&run.cwd),
+                // opencode records its sessions in a database and ships the query.
+                Backend::Opencode => recent_opencode_conversations(&run.cwd, 1)
+                    .into_iter()
+                    .next()
+                    .map(|candidate| candidate.session_id),
+                Backend::Claude => None,
             });
         let Some(session_id) = session_id else {
-            self.notice = Some("no resumable session to branch yet".to_string());
+            // Say WHY. Claude gets a session id at launch (Rudder mints it), but
+            // Codex and opencode only record one once the conversation exists, and
+            // Rudder finds it by the directory the session ran in.
+            self.notice = Some(match backend_for_notice {
+                Backend::Claude => {
+                    "nothing to branch: this agent has no session yet".to_string()
+                }
+                other => format!(
+                    "no {} session recorded for this workspace yet — {} writes one once the conversation starts; branch after its first reply",
+                    other.as_str(),
+                    other.as_str()
+                ),
+            });
             return;
         };
 

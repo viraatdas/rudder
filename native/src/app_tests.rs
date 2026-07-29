@@ -1314,6 +1314,31 @@ fn option_brackets_step_agents_without_leaving_the_worker_pane() {
 }
 
 #[test]
+fn the_task_pane_title_says_what_a_new_agent_will_run_on() {
+    // The hint line already carried the model, but every notice replaces the hint —
+    // so the answer to "what will this run on?" vanished exactly when the user was
+    // acting. The title survives notices.
+    let mut app = App::new();
+    app.backend = Backend::Claude;
+    app.model = "opus".to_string();
+    app.effort = Some(EffortLevel::High);
+    assert_eq!(task_pane_title(&app), "task · claude opus(high)");
+
+    app.effort = None;
+    assert_eq!(task_pane_title(&app), "task · claude opus(auto)");
+
+    // /fast changes behaviour without changing the model, so it is called out.
+    app.fast_mode = true;
+    assert_eq!(task_pane_title(&app), "task · claude opus(auto) · fast");
+
+    // opencode's legitimate "whatever you have configured" — no empty parens.
+    app.fast_mode = false;
+    app.backend = Backend::Opencode;
+    app.model = String::new();
+    assert_eq!(task_pane_title(&app), "task · opencode");
+}
+
+#[test]
 fn stepping_agents_works_while_the_agents_own_composer_has_text() {
     // The point of the chord: it is claimed by the dashboard BEFORE the worker
     // pane forwards anything to the agent's PTY, so a half-typed message to the
@@ -6136,11 +6161,31 @@ fn branch_guards_main_orchestrator_and_sessionless_runs() {
     app.selected_agent = 2;
     app.branch_selected_agent();
     assert_eq!(app.agents.len(), 3, "no fork row without a session");
-    assert!(app
-        .notice
-        .as_deref()
-        .unwrap_or_default()
-        .contains("no resumable session"));
+    assert!(
+        app.notice
+            .as_deref()
+            .unwrap_or_default()
+            .contains("no session yet"),
+        "notice was {:?}",
+        app.notice
+    );
+
+    // A Codex worker with no recorded session says WHY, and what to do about it:
+    // Codex writes its session once the conversation starts, and Rudder finds it by
+    // the directory it ran in. "no resumable session" told the user nothing.
+    let mut codex_worker = test_agent_run("w-2", "some work");
+    codex_worker.backend = Backend::Codex;
+    codex_worker.cwd = app.cwd.join("does-not-exist");
+    app.agents.push(codex_worker);
+    app.selected_agent = 3;
+    app.branch_selected_agent();
+    assert_eq!(app.agents.len(), 4, "no fork row without a session");
+    let notice = app.notice.as_deref().unwrap_or_default();
+    assert!(
+        notice.contains("no codex session recorded for this workspace")
+            && notice.contains("first reply"),
+        "notice was {notice:?}"
+    );
 }
 
 #[test]

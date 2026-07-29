@@ -3662,6 +3662,22 @@ pub(crate) fn notice_style(text: &str, focused: bool) -> Style {
     }
 }
 
+/// `task · claude opus(high)` — the backend, model and effort a new agent gets.
+/// `/fast` is called out because it changes behaviour without changing the model.
+pub(crate) fn task_pane_title(app: &App) -> String {
+    let model = app.model.trim();
+    if model.is_empty() {
+        // opencode's legitimate "use your configured default".
+        return format!("task · {}", app.backend.as_str());
+    }
+    let fast = if app.fast_mode { " · fast" } else { "" };
+    format!(
+        "task · {} {model}({}){fast}",
+        app.backend.as_str(),
+        effort_label(app.effort)
+    )
+}
+
 pub(crate) fn render_task(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let focused = app.focus == FocusPane::Task;
     let default_hint = task_default_hint(app);
@@ -3734,24 +3750,22 @@ pub(crate) fn render_task(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 },
                 accent_style(focused),
             ),
-            Span::raw("  "),
-            Span::styled(app.backend.as_str(), accent_style(focused)),
-            Span::raw(" "),
-            Span::styled(app.model.as_str(), model_style(focused)),
-            Span::styled(
-                format!("({})", effort_label(app.effort)),
-                model_style(focused),
-            ),
+            // The model used to be repeated here; it lives in the pane title now,
+            // where a notice cannot hide it.
         ]));
         for line in wrapped_hint.into_iter().skip(1) {
             lines.push(Line::from(Span::styled(line, muted_style(focused))));
         }
     }
 
-    let paragraph =
-        Paragraph::new(lines)
-            .style(app_style())
-            .block(pane_block("task", focused, app.nav_mode));
+    // The model belongs in the TITLE, not only on the hint line: the hint is
+    // replaced by every notice, so the one place that answers "what will this run
+    // on?" kept disappearing exactly when the user was acting.
+    let paragraph = Paragraph::new(lines).style(app_style()).block(pane_block(
+        &task_pane_title(app),
+        focused,
+        app.nav_mode,
+    ));
 
     frame.render_widget(paragraph, area);
 

@@ -163,6 +163,7 @@ command, even while typing inside the worker pane:
 | `M` | Merge all completed worktrees |
 | `R` | Review all completed worktrees (Codex review-all agent) |
 | `r` | Rename the selected agent |
+| `b` | Branch the selected agent's chat into a new worker |
 | `d` | Delete the selected agent and its worktree |
 | `j` / `k` | Move the agent selection |
 | `q` | Quit |
