@@ -1350,18 +1350,23 @@ fn run_main_starts_another_agent_in_the_checkout() {
         "the notice says where it landed: {notice}"
     );
 
-    // A task that merely BEGINS with the word main is still an isolated worker.
-    app.notice = None;
-    let before = app.agents.len();
-    app.handle_command("/run mainframe migration");
-    assert!(
-        app.agents.len() > before,
-        "it started something"
-    );
-    assert!(
-        app.agents.last().is_some_and(|run| !run.is_main()),
-        "'mainframe' is a task, not the main keyword"
-    );
+    // `main` counts ONLY as its own word directly after /run. Anything that merely
+    // starts with those four letters is a task, and gets an isolated worker.
+    for task in [
+        "/run mainframe migration",
+        "/run main-thread deadlock",
+        "/run maintain the docs",
+        "/run Main menu is broken",
+    ] {
+        app.notice = None;
+        let before = app.agents.len();
+        app.handle_command(task);
+        assert!(app.agents.len() > before, "{task} started something");
+        assert!(
+            app.agents.last().is_some_and(|run| !run.is_main()),
+            "{task} is a task, not the main keyword"
+        );
+    }
 }
 
 #[test]
