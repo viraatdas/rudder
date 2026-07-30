@@ -249,7 +249,10 @@ workers, which keeps final delivery ownership unambiguous.
 
 Use `/ask <text>` for a one-off conversational agent in the main checkout, with
 no DAG and no merge step. Use `/run <task>` for exactly one isolated worker that
-lands in Review and merges back with `m` or `/merge-all`. Use `/plan <text>` when
+lands in Review and merges back with `m` or `/merge-all`. Use `/run main <task>`
+to add another agent in the main checkout itself — several may run there at once
+(they edit the same tree, so they can overwrite each other; rudder says so in the
+activity log rather than stopping you). Use `/plan <text>` when
 you want the orchestrator / DAG path: the read-only planner decomposes the task,
 then separate isolated workers implement its nodes.
 

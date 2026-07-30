@@ -6466,9 +6466,25 @@ impl App {
                 // Force one isolated implementation worker. This skips the
                 // planner/DAG, but unlike /ask it is mergeable through m/M.
                 let rest = command_rest(input, "/run").trim();
-                if rest.is_empty() {
+                // `/run main <prompt>` puts the agent in the MAIN checkout instead
+                // of an isolated workspace, and starts a NEW one each time —
+                // several agents on the main branch at once is a supported way to
+                // work, not a mistake.
+                let main_rest = rest
+                    .strip_prefix("main")
+                    .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+                    .map(str::trim);
+                if let Some(prompt) = main_rest {
+                    self.handle_main_command(prompt);
+                    self.notice = Some(if prompt.is_empty() {
+                        "main-checkout agent started — it edits this tree directly, nothing to merge"
+                            .to_string()
+                    } else {
+                        "started in the main checkout — it edits this tree directly · /run <task> for an isolated mergeable worker".to_string()
+                    });
+                } else if rest.is_empty() {
                     self.notice = Some(
-                        "usage: /run <task> — one isolated jj worker, no DAG; merge with m or /merge-all"
+                        "usage: /run <task> — one isolated jj worker, no DAG; merge with m or /merge-all · /run main <task> runs it in the main checkout instead"
                             .to_string(),
                     );
                 } else {
@@ -6642,7 +6658,7 @@ impl App {
             }
             Some("/help") => {
                 self.notice = Some(
-                    "plain input -> one end-to-end main agent · /plan <task> -> isolated multi-agent DAG · /run <task> -> one isolated mergeable worker · /ask <text> -> direct one-off · panes: Option-1/2/3 or ^W · keys: j/k select · Option-[ / Option-] step agents from any pane · Enter focus · v diff · m merge · M merge all · R review all · g nest · o web ui · x stop · b branch chat · dd delete · cc clear merged · P model; commands: /model /fast /sound /color /main /run /ask /plan /resume /restore /share /usage /goal /cloud /web /feedback"
+                    "plain input -> one end-to-end main agent · /plan <task> -> isolated multi-agent DAG · /run <task> -> one isolated mergeable worker · /run main <task> -> another agent in this checkout · /ask <text> -> direct one-off · panes: Option-1/2/3 or ^W · keys: j/k select · Option-[ / Option-] step agents from any pane · Enter focus · v diff · m merge · M merge all · R review all · g nest · o web ui · x stop · b branch chat · dd delete · cc clear merged · P model; commands: /model /fast /sound /color /main /run /ask /plan /resume /restore /share /usage /goal /cloud /web /feedback"
                         .to_string(),
                 );
                 true
@@ -6872,7 +6888,7 @@ impl App {
             .any(|run| run.is_main() && run.status == AgentStatus::Running);
         if live_main_exists {
             self.push_activity(
-                "note: another main agent is live in this same checkout — they can overwrite each other's edits"
+                "note: another main agent is live in this same checkout — supported, but they can overwrite each other's edits"
                     .to_string(),
             );
         }

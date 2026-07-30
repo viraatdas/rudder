@@ -1329,6 +1329,42 @@ fn write_codex_rollout(dir: &std::path::Path, id: &str, cwd: &str, started_iso: 
 }
 
 #[test]
+fn run_main_starts_another_agent_in_the_checkout() {
+    // Several agents on the main branch at once is a supported way to work, so
+    // `/run main <task>` adds one rather than reusing or replacing the existing.
+    let mut app = App::new();
+    app.handle_command("/run main fix the slack reply");
+    assert_eq!(app.agents.len(), 1);
+    app.handle_command("/run main check the PR sandbox");
+    assert_eq!(app.agents.len(), 2, "a second main-checkout agent, not a reuse");
+    for run in &app.agents {
+        assert!(run.is_main(), "both rows run in the checkout");
+        assert!(run.worktree_path.is_none(), "no workspace, nothing to merge");
+    }
+    // Distinct ids: their run records, hook configs and stop requests must not
+    // collide, which is what makes several of them safe to run at once.
+    assert_ne!(app.agents[0].id, app.agents[1].id);
+    let notice = app.notice.as_deref().unwrap_or_default();
+    assert!(
+        notice.contains("main checkout"),
+        "the notice says where it landed: {notice}"
+    );
+
+    // A task that merely BEGINS with the word main is still an isolated worker.
+    app.notice = None;
+    let before = app.agents.len();
+    app.handle_command("/run mainframe migration");
+    assert!(
+        app.agents.len() > before,
+        "it started something"
+    );
+    assert!(
+        app.agents.last().is_some_and(|run| !run.is_main()),
+        "'mainframe' is a task, not the main keyword"
+    );
+}
+
+#[test]
 fn switching_model_provider_cannot_kill_a_running_agent() {
     // The chain that took out live main agents: the /model picker rewrote the
     // selected row's BACKEND even while its process was running, and the poll loop

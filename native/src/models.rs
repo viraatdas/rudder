@@ -465,6 +465,12 @@ pub(crate) fn command_suggestions() -> Vec<Suggestion> {
             action: SuggestionAction::Insert("/run ".to_string()),
         },
         Suggestion {
+            label: "/run main <task>".to_string(),
+            detail: "another agent in the main checkout (several may run at once)"
+                .to_string(),
+            action: SuggestionAction::Insert("/run main ".to_string()),
+        },
+        Suggestion {
             label: "/plan <text>".to_string(),
             detail: "orchestrator planner for DAG work (plain input runs one main agent instead)".to_string(),
             action: SuggestionAction::Insert("/plan ".to_string()),
