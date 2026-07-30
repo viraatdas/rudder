@@ -5714,6 +5714,68 @@ fn conflict_hint_color_emphasizes_keys_not_weight() {
 }
 
 #[test]
+fn the_merge_dialogue_always_shows_which_key_confirms() {
+    // The modal was sized by Line COUNT while rendering with wrapping, so the long
+    // explanation and the dirty-checkout warning pushed the key hint off the
+    // bottom: it asked for confirmation without ever saying that `y` confirms.
+    let mut app = App::new();
+    app.merge_confirm = Some(MergeConfirmation {
+        intent: MergeIntent::Selected {
+            id: "run-1".to_string(),
+            task: "build the thread replay".to_string(),
+        },
+        detail: Some(
+            "your uncommitted local changes merge too (12 files changed, 400 insertions(+), 120 deletions(-))"
+                .to_string(),
+        ),
+    });
+
+    let area = Rect::new(0, 0, 80, 24);
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("test backend");
+    terminal
+        .draw(|frame| render_merge_prompt(frame, area, &app))
+        .expect("draw merge prompt");
+    let text: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+
+    assert!(text.contains("Confirm merge"), "modal is titled");
+    assert!(
+        text.contains("y merges") && text.contains("Esc cancels"),
+        "the keys are on the border, where a clipped body cannot hide them"
+    );
+    assert!(
+        text.contains("to merge") && text.contains("cancel"),
+        "and the hint line survives inside the body"
+    );
+    assert!(
+        text.contains("uncommitted local changes"),
+        "the warning that made the modal overflow is still shown"
+    );
+}
+
+#[test]
+fn a_modal_is_sized_by_wrapped_rows_not_line_structs() {
+    let lines = vec![
+        Line::from("short"),
+        Line::from(""),
+        Line::from(
+            "a sentence long enough that it certainly wraps across several rows when the modal is only forty columns wide inside its border",
+        ),
+    ];
+    assert_eq!(wrapped_line_count(&lines, 200), 3, "no wrapping needed");
+    assert!(
+        wrapped_line_count(&lines, 40) >= 5,
+        "the long line counts as the rows it actually occupies"
+    );
+}
+
+#[test]
 fn render_merge_conflict_modal_lists_files_and_hint() {
     let mut app = App::new();
     app.conflict_prompt = Some(MergeConflictPrompt {

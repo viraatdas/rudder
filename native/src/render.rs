@@ -3926,7 +3926,7 @@ pub(crate) fn render_merge_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) 
         lines.push(Line::from(""));
         lines.push(merge_confirm_hint_line());
         (
-            Span::styled(" Confirm merge ", Style::default().fg(ACCENT)),
+            Span::styled(" Confirm merge · y merges · Esc cancels ", Style::default().fg(ACCENT)),
             lines,
             ACCENT,
         )
@@ -3987,7 +3987,17 @@ pub(crate) fn render_merge_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) 
         return;
     };
 
-    let modal = centered_modal(area, 76, (lines.len() as u16).saturating_add(2));
+    // Height must count WRAPPED rows, not Line structs. The body holds a long
+    // explanatory sentence and, when the checkout is dirty, a warning — each one
+    // Line that renders as three or four. Sizing by `lines.len()` clipped the
+    // bottom of the modal, and the bottom is exactly where the key hint lives, so
+    // the dialogue asked for confirmation without ever saying which key confirms.
+    let modal_width = 76;
+    let inner_width = modal_width
+        .min(area.width.saturating_sub(4))
+        .max(24)
+        .saturating_sub(2);
+    let modal = centered_modal(area, modal_width, wrapped_line_count(&lines, inner_width).saturating_add(2));
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
@@ -4054,7 +4064,18 @@ pub(crate) fn render_cloud_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) 
             Span::styled(" cancel", muted_style(true)),
         ]),
     ];
-    let modal = centered_modal(area, 78, (lines.len() as u16).saturating_add(2));
+    // Same wrapping rule as the merge modal: size by rendered rows, or the last
+    // line (which carries the keys) falls off the bottom.
+    let modal_width = 78;
+    let inner_width = modal_width
+        .min(area.width.saturating_sub(4))
+        .max(24)
+        .saturating_sub(2);
+    let modal = centered_modal(
+        area,
+        modal_width,
+        wrapped_line_count(&lines, inner_width).saturating_add(2),
+    );
     let block = Block::default()
         .title(" cloud launch ")
         .borders(Borders::ALL)
@@ -4092,6 +4113,27 @@ pub(crate) fn conflict_resolve_hint_line() -> Line<'static> {
             muted_style(true),
         ),
     ])
+}
+
+/// How many terminal rows these lines occupy once wrapped to `width` — what a
+/// modal must be sized by, since `Paragraph::wrap` reflows every Line.
+pub(crate) fn wrapped_line_count(lines: &[Line<'_>], width: u16) -> u16 {
+    lines
+        .iter()
+        .map(|line| {
+            let text: String = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<Vec<_>>()
+                .join("");
+            if text.trim().is_empty() {
+                1
+            } else {
+                wrap_text(&text, width).len().max(1) as u16
+            }
+        })
+        .sum()
 }
 
 pub(crate) fn centered_modal(area: Rect, desired_width: u16, desired_height: u16) -> Rect {
