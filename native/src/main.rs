@@ -650,6 +650,8 @@ struct App {
     handoff_extra_rx: Option<mpsc::Receiver<Vec<ConversationCandidate>>>,
     /// One `dashboard_opened` event per session, not per App (tests build many).
     dashboard_open_emitted: bool,
+    /// Last heartbeat sentence written, so an unchanged one is not repeated.
+    last_heartbeat_summary: Option<String>,
     /// Backoff for `ensure_session_ids_recorded`: a row whose backend never wrote
     /// a session (it died at launch) must not make the dashboard rescan forever.
     session_id_attempts: HashMap<String, u32>,
@@ -1328,6 +1330,7 @@ impl App {
             handoff_extra_candidates: Vec::new(),
             handoff_extra_rx: None,
             dashboard_open_emitted: false,
+            last_heartbeat_summary: None,
             session_id_attempts: HashMap::new(),
             session_id_last_try: HashMap::new(),
             worker_selection: None,
@@ -8613,6 +8616,13 @@ impl App {
         } else {
             format!("{total} worker(s) idle, awaiting review or merge")
         };
+        // Only on CHANGE. An unconditional heartbeat every 45s buried every real
+        // event: one repo's log held 3,000 lines, all the same sentence, and no
+        // record of the merges and sweeps that actually happened.
+        if self.last_heartbeat_summary.as_deref() == Some(summary.as_str()) {
+            return;
+        }
+        self.last_heartbeat_summary = Some(summary.clone());
         self.append_activity_jsonl(&summary, "heartbeat");
     }
 
@@ -10239,6 +10249,7 @@ impl App {
         let now = std::time::SystemTime::now();
         let repo = self.cwd.clone();
         let mut cleaned = 0usize;
+        let mut swept: Vec<String> = Vec::new();
         for run in self.agents.iter_mut() {
             if cleaned >= MAX_PER_SWEEP {
                 break;
@@ -10254,9 +10265,21 @@ impl App {
                 run.worktree_path = None;
                 let _ = save_native_run_record(&repo, run);
                 cleaned += 1;
+                // Durable, not just a notice: "where did my workspace go?" has to
+                // be answerable after the fact.
+                swept.push(format!(
+                    "swept merged workspace {} ({})",
+                    path.file_name()
+                        .map(|name| name.to_string_lossy().to_string())
+                        .unwrap_or_default(),
+                    run.id
+                ));
             }
         }
         if cleaned > 0 {
+            for entry in swept {
+                self.push_activity(entry);
+            }
             self.notice = Some(format!(
                 "reclaimed {cleaned} merged workspace{} from disk",
                 if cleaned == 1 { "" } else { "s" }

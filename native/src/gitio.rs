@@ -824,17 +824,35 @@ pub(crate) fn save_native_run_record(repo_root: &Path, run: &AgentRun) -> Result
     // A run isolated in a jj workspace carries a workspace name. Those records
     // declare `vcs:"jj"` so the TS merge/sync path routes through jj. Old
     // git-worktree records retain `vcs:"git"` for readable history only.
-    let is_jj_run = run.workspace_name.is_some() || run.jj_change_id.is_some();
+    // A workspace's IDENTITY is written once and never unwritten. An in-memory row
+    // that has lost its name or change id (reloaded from a partial record, rebuilt
+    // by a path that does not carry them) must not erase what disk already knows:
+    // without those fields the row cannot be merged, and the orphan sweep stops
+    // recognising its directory as owned — which is how a finished-but-unmerged
+    // workspace disappeared from a live repo.
+    let recorded_workspace_name = existing_record
+        .get("worktree")
+        .and_then(|value| value.get("workspaceName"))
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned);
+    let recorded_change_id = existing_record
+        .get("worktree")
+        .and_then(|value| value.get("jjChangeId"))
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned);
+    let workspace_name = run.workspace_name.clone().or(recorded_workspace_name);
+    let jj_change_id = run.jj_change_id.clone().or(recorded_change_id);
+    let is_jj_run = workspace_name.is_some() || jj_change_id.is_some();
     let mut worktree = serde_json::json!({
         "enabled": run.worktree_path.is_some(),
         "path": run.cwd,
     });
     if let Some(map) = worktree.as_object_mut() {
         if is_jj_run {
-            if let Some(name) = run.workspace_name.as_ref() {
+            if let Some(name) = workspace_name.as_ref() {
                 map.insert("workspaceName".to_string(), serde_json::json!(name));
             }
-            if let Some(change_id) = run.jj_change_id.as_ref() {
+            if let Some(change_id) = jj_change_id.as_ref() {
                 map.insert("jjChangeId".to_string(), serde_json::json!(change_id));
             }
         } else if let Some(branch) = run.worktree_branch.as_ref() {

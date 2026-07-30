@@ -1329,6 +1329,41 @@ fn write_codex_rollout(dir: &std::path::Path, id: &str, cwd: &str, started_iso: 
 }
 
 #[test]
+fn a_save_never_erases_the_workspace_identity_already_on_disk() {
+    // Found in a live repo: a finished-but-unmerged row whose record had lost
+    // workspaceName and jjChangeId. Without them the row cannot be merged and the
+    // orphan sweep no longer recognises its directory as owned — so the work was
+    // stranded and the checkout was collected.
+    let repo = unique_test_repo("record-identity");
+    let mut run = test_agent_run("run-1", "some work");
+    run.cwd = repo.join("ws");
+    run.worktree_path = Some(run.cwd.clone());
+    run.workspace_name = Some("rudder-ws-1".to_string());
+    run.jj_change_id = Some("qyywqtlworvr".to_string());
+    save_native_run_record(&repo, &run).expect("first save");
+
+    // A later save from a row that no longer carries the identity (reloaded from a
+    // partial record, or rebuilt by a path that does not set it).
+    run.workspace_name = None;
+    run.jj_change_id = None;
+    save_native_run_record(&repo, &run).expect("second save");
+
+    let raw = fs::read_to_string(native_run_dir(&repo, "run-1").join("run.json")).expect("record");
+    let record: serde_json::Value = serde_json::from_str(&raw).expect("valid json");
+    assert_eq!(
+        record["worktree"]["workspaceName"].as_str(),
+        Some("rudder-ws-1"),
+        "identity survives a save that did not know it"
+    );
+    assert_eq!(
+        record["worktree"]["jjChangeId"].as_str(),
+        Some("qyywqtlworvr"),
+        "the change id is what makes the row mergeable later"
+    );
+    let _ = fs::remove_dir_all(&repo);
+}
+
+#[test]
 fn a_merged_workspace_with_a_live_agent_in_it_is_never_swept() {
     // "Merged" does not mean the agent exited: claude and codex stay resident
     // between turns. Deleting the directory under a live pane left a real worker
