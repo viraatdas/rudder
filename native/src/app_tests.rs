@@ -1313,6 +1313,83 @@ fn option_brackets_step_agents_without_leaving_the_worker_pane() {
     assert_eq!(app.selected_agent, 1, "previous agent");
 }
 
+/// Write a Codex rollout header the way Codex does: `session_meta` on line 1 with
+/// the id, cwd, and the UTC time the session began.
+fn write_codex_rollout(dir: &std::path::Path, id: &str, cwd: &str, started_iso: &str) {
+    std::fs::create_dir_all(dir).expect("create day dir");
+    let meta = serde_json::json!({
+        "type": "session_meta",
+        "payload": { "id": id, "cwd": cwd, "timestamp": started_iso },
+    });
+    std::fs::write(
+        dir.join(format!("rollout-{id}.jsonl")),
+        format!("{meta}\n"),
+    )
+    .expect("write rollout");
+}
+
+#[test]
+fn a_codex_session_is_matched_by_start_time_not_by_being_newest() {
+    // The bug this prevents: dozens of sessions share a main checkout (90 in two
+    // days on the machine that hit it), so "newest session for this cwd" pins
+    // somebody else's conversation — worse than finding none, because resuming it
+    // opens the wrong chat.
+    let root = std::env::temp_dir().join(format!(
+        "rudder-codex-map-{}-{}",
+        std::process::id(),
+        now_stamp()
+    ));
+    let day = root.join("2026").join("07").join("28");
+    let cwd = "/repo";
+    // Rudder spawned the run at 2026-07-28T23:45:48Z.
+    let started_at_ms = parse_iso8601_millis("2026-07-28T23:45:48.000Z").expect("parsed") as u64;
+    write_codex_rollout(&day, "019fabfa-0000-0000-0000-000000000001", cwd, "2026-07-28T23:45:49.186Z");
+    // A LATER session in the same directory: newest, and not ours.
+    write_codex_rollout(&day, "019fabfa-0000-0000-0000-000000000002", cwd, "2026-07-28T23:52:00.000Z");
+    // An earlier one, also not ours.
+    write_codex_rollout(&day, "019fabfa-0000-0000-0000-000000000003", cwd, "2026-07-28T22:00:00.000Z");
+    // Same instant, different repo.
+    write_codex_rollout(&day, "019fabfa-0000-0000-0000-000000000004", "/other", "2026-07-28T23:45:49.000Z");
+
+    let found = codex_session_id_for_run_in(&root, std::path::Path::new(cwd), started_at_ms);
+
+    assert_eq!(
+        found.as_deref(),
+        Some("019fabfa-0000-0000-0000-000000000001"),
+        "the session that started right after the spawn is the run's"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn no_codex_session_near_the_spawn_maps_to_nothing() {
+    // Better to report no mapping than to guess one: a wrong id resumes another
+    // conversation into this workspace.
+    let root = std::env::temp_dir().join(format!(
+        "rudder-codex-nomap-{}-{}",
+        std::process::id(),
+        now_stamp()
+    ));
+    let day = root.join("2026").join("07").join("28");
+    let started_at_ms = parse_iso8601_millis("2026-07-28T23:45:48.000Z").expect("parsed") as u64;
+    write_codex_rollout(&day, "019fabfa-0000-0000-0000-00000000000a", "/repo", "2026-07-28T21:00:00.000Z");
+
+    assert_eq!(
+        codex_session_id_for_run_in(&root, std::path::Path::new("/repo"), started_at_ms),
+        None
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn iso8601_timestamps_parse_without_a_timezone_database() {
+    assert_eq!(parse_iso8601_millis("1970-01-01T00:00:00.000Z"), Some(0));
+    assert_eq!(parse_iso8601_millis("2026-07-29T04:49:30.689Z"), Some(1785300570689));
+    // Seconds-only form (no fraction) is still valid ISO 8601.
+    assert_eq!(parse_iso8601_millis("2026-07-29T04:49:30Z"), Some(1785300570000));
+    assert_eq!(parse_iso8601_millis("nonsense"), None);
+}
+
 #[test]
 fn feedback_carries_what_was_on_screen_and_nothing_else() {
     // A one-line report is only actionable with context, but the context must be

@@ -650,6 +650,10 @@ struct App {
     handoff_extra_rx: Option<mpsc::Receiver<Vec<ConversationCandidate>>>,
     /// One `dashboard_opened` event per session, not per App (tests build many).
     dashboard_open_emitted: bool,
+    /// Backoff for `ensure_session_ids_recorded`: a row whose backend never wrote
+    /// a session (it died at launch) must not make the dashboard rescan forever.
+    session_id_attempts: HashMap<String, u32>,
+    session_id_last_try: HashMap<String, Instant>,
     worker_selection: Option<WorkerSelection>,
     task_selection: Option<WorkerSelection>,
     /// Mouse text selection over the orchestrator pane. That pane composes Lines
@@ -1324,6 +1328,8 @@ impl App {
             handoff_extra_candidates: Vec::new(),
             handoff_extra_rx: None,
             dashboard_open_emitted: false,
+            session_id_attempts: HashMap::new(),
+            session_id_last_try: HashMap::new(),
             worker_selection: None,
             task_selection: None,
             orch_selection: None,
@@ -12707,6 +12713,66 @@ What to do\n\
         self.mirror_graph();
     }
 
+    /// Pin the backend session id for every row that does not have one yet.
+    ///
+    /// Claude ids are minted by Rudder at launch, so they are durable from the
+    /// first instant. Codex and opencode mint their OWN, and Rudder used to learn
+    /// them only when a turn ended or the dashboard shut down cleanly — so a
+    /// machine that died mid-session lost the mapping permanently, and with it the
+    /// ability to resume or branch that conversation. (This is not hypothetical: a
+    /// kernel panic took one.)
+    ///
+    /// Recording it while the run is alive closes that window, and running the same
+    /// lookup for rows that RELOAD without an id rescues the ones already lost —
+    /// the rollout is still on disk, Rudder just never wrote down which one it was.
+    fn ensure_session_ids_recorded(&mut self) {
+        const RETRY_AFTER: Duration = Duration::from_secs(5);
+        const MAX_ATTEMPTS: u32 = 24;
+        let cwd = self.cwd.clone();
+        let mut found: Vec<(usize, String)> = Vec::new();
+        for (index, run) in self.agents.iter().enumerate() {
+            if run.session_id.is_some() || run.backend != Backend::Codex {
+                continue;
+            }
+            // A row that never started has nothing to map.
+            if matches!(run.status, AgentStatus::Failed | AgentStatus::Migrated) {
+                continue;
+            }
+            let attempts = self.session_id_attempts.get(&run.id).copied().unwrap_or(0);
+            if attempts >= MAX_ATTEMPTS {
+                continue;
+            }
+            if self
+                .session_id_last_try
+                .get(&run.id)
+                .is_some_and(|at| at.elapsed() < RETRY_AFTER)
+            {
+                continue;
+            }
+            let Ok(started_at_ms) = run.created_at.parse::<u64>() else {
+                continue;
+            };
+            self.session_id_attempts.insert(run.id.clone(), attempts + 1);
+            self.session_id_last_try.insert(run.id.clone(), Instant::now());
+            let search_cwd = if run.cwd.as_os_str().is_empty() {
+                cwd.clone()
+            } else {
+                run.cwd.clone()
+            };
+            if let Some(session_id) = codex_session_id_for_run(&search_cwd, started_at_ms) {
+                found.push((index, session_id));
+            }
+        }
+        for (index, session_id) in found {
+            let Some(run) = self.agents.get_mut(index) else {
+                continue;
+            };
+            run.session_id = Some(session_id);
+            let _ = save_native_run_record(&cwd, run);
+            self.dirty = true;
+        }
+    }
+
     /// One `dashboard_opened` per session, on the first poll rather than in
     /// `App::new` (which tests construct thousands of times).
     fn emit_dashboard_opened_once(&mut self) {
@@ -12768,6 +12834,7 @@ What to do\n\
             self.last_steer_poll = Instant::now();
             self.poll_steer_inbox();
             self.poll_handoff_inbox();
+            self.ensure_session_ids_recorded();
             self.maybe_emit_heartbeat();
         }
 

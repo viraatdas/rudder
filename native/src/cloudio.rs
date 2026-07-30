@@ -265,6 +265,175 @@ pub(crate) fn latest_codex_session_id_for_cwd(cwd: &Path) -> Option<String> {
     latest_codex_session_id_in_dir(&root, cwd)
 }
 
+/// The Codex session a SPECIFIC RUN started, matched by cwd AND start time.
+///
+/// Matching on cwd alone is wrong for anything running in the main checkout: a
+/// busy repo accumulates dozens of sessions in the same directory (90 in two days
+/// on the machine this was written for), so "the newest one" pins somebody else's
+/// conversation — worse than finding nothing, because resuming or branching it
+/// opens the wrong chat.
+///
+/// A rollout records when its session began, and exactly one session begins in the
+/// seconds after Rudder spawns the process. That makes the mapping unambiguous
+/// even when it has to be reconstructed later — which is what rescues a run whose
+/// id was never recorded because the machine died mid-session.
+pub(crate) fn codex_session_id_for_run(cwd: &Path, started_at_ms: u64) -> Option<String> {
+    let root = user_home_dir()?.join(".codex").join("sessions");
+    codex_session_id_for_run_in(&root, cwd, started_at_ms)
+}
+
+/// How long after the spawn a session may appear and still be considered this
+/// run's. Codex writes `session_meta` within a second; the slack absorbs a slow
+/// start, and the small negative bound absorbs clock jitter.
+const CODEX_SESSION_MATCH_BEFORE_MS: i64 = 30_000;
+const CODEX_SESSION_MATCH_AFTER_MS: i64 = 180_000;
+
+pub(crate) fn codex_session_id_for_run_in(
+    root: &Path,
+    cwd: &Path,
+    started_at_ms: u64,
+) -> Option<String> {
+    let target = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let needles = [
+        format!("\"cwd\":\"{}\"", target.display()),
+        format!("\"cwd\":\"{}\"", cwd.display()),
+    ];
+    let mut best: Option<(i64, String)> = None;
+    // Codex partitions rollouts by DAY, so only the day of the spawn and its
+    // neighbours can hold the match — the difference between reading ~100 files
+    // and every rollout the user has ever created.
+    for dir in codex_day_dirs(root, started_at_ms) {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Some(head) = read_file_head(&path, 8 * 1024) else {
+                continue;
+            };
+            // Cheap reject before parsing: `cwd` sits in the first few hundred
+            // bytes, while the rest of that line is the entire system prompt.
+            if !needles.iter().any(|needle| head.contains(needle.as_str())) {
+                continue;
+            }
+            let Some(line) = head.lines().next() else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            if value.get("type").and_then(serde_json::Value::as_str) != Some("session_meta") {
+                continue;
+            }
+            let Some(payload) = value.get("payload") else {
+                continue;
+            };
+            let Some(id) = payload.get("id").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let Some(started) = payload
+                .get("timestamp")
+                .and_then(serde_json::Value::as_str)
+                .and_then(parse_iso8601_millis)
+            else {
+                continue;
+            };
+            let delta = started - started_at_ms as i64;
+            if delta < -CODEX_SESSION_MATCH_BEFORE_MS || delta > CODEX_SESSION_MATCH_AFTER_MS {
+                continue;
+            }
+            if best
+                .as_ref()
+                .is_none_or(|(current, _)| delta.abs() < current.abs())
+            {
+                best = Some((delta, id.to_string()));
+            }
+        }
+    }
+    best.map(|(_, id)| id)
+}
+
+/// `<root>/YYYY/MM/DD` for the spawn day and its neighbours. Codex names the
+/// directory in LOCAL time while the record inside is UTC, so the neighbours cover
+/// the offset without needing a timezone database.
+fn codex_day_dirs(root: &Path, started_at_ms: u64) -> Vec<PathBuf> {
+    let day = (started_at_ms / 86_400_000) as i64;
+    (-1..=1)
+        .filter_map(|offset| {
+            let (year, month, date) = civil_from_days(day + offset);
+            let dir = root
+                .join(format!("{year:04}"))
+                .join(format!("{month:02}"))
+                .join(format!("{date:02}"));
+            dir.is_dir().then_some(dir)
+        })
+        .collect()
+}
+
+fn read_file_head(path: &Path, max_bytes: usize) -> Option<String> {
+    use std::io::Read;
+    let mut file = fs::File::open(path).ok()?;
+    let mut buffer = vec![0_u8; max_bytes];
+    let read = file.read(&mut buffer).ok()?;
+    buffer.truncate(read);
+    Some(String::from_utf8_lossy(&buffer).into_owned())
+}
+
+/// Epoch millis from `2026-07-29T04:49:30.689Z`. The timestamp is always UTC, so
+/// this needs no timezone data — only the civil-date arithmetic below.
+pub(crate) fn parse_iso8601_millis(value: &str) -> Option<i64> {
+    let value = value.trim();
+    let bytes = value.as_bytes();
+    if bytes.len() < 19 || bytes[4] != b'-' || bytes[7] != b'-' || bytes[10] != b'T' {
+        return None;
+    }
+    let number = |range: std::ops::Range<usize>| value.get(range)?.parse::<i64>().ok();
+    let year = number(0..4)?;
+    let month = number(5..7)?;
+    let day = number(8..10)?;
+    let hour = number(11..13)?;
+    let minute = number(14..16)?;
+    let second = number(17..19)?;
+    let millis = value
+        .get(20..23)
+        .filter(|_| bytes.get(19) == Some(&b'.'))
+        .and_then(|fraction| fraction.parse::<i64>().ok())
+        .unwrap_or(0);
+    let days = days_from_civil(year, month, day);
+    Some(((days * 86_400 + hour * 3_600 + minute * 60 + second) * 1_000) + millis)
+}
+
+/// Howard Hinnant's civil-date algorithms: days since 1970-01-01 and back.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let day_of_year = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let days = days + 719_468;
+    let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
+    let day_of_era = days - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = if month_prime < 10 {
+        month_prime + 3
+    } else {
+        month_prime - 9
+    };
+    (if month <= 2 { year + 1 } else { year }, month, day)
+}
+
 pub(crate) fn latest_codex_session_id_in_dir(root: &Path, cwd: &Path) -> Option<String> {
     let target = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
     let mut best: Option<(SystemTime, String)> = None;
@@ -475,12 +644,39 @@ pub(crate) fn visit_codex_session_dir(
     }
 }
 
+/// Cheap "could this rollout be ours?" test against a bounded head.
+///
+/// The caller hands us a CANONICAL path while the rollout recorded whatever the
+/// shell was in, so both spellings of macOS's symlinked roots are accepted
+/// (`/private/var/...` vs `/var/...`). A false positive only costs the JSON parse
+/// below, which then compares canonicalized paths properly; a false NEGATIVE would
+/// silently lose the session, so this errs wide.
+fn head_mentions_cwd(head: &str, target_cwd: &Path) -> bool {
+    let canonical = target_cwd.display().to_string();
+    let mut spellings = vec![canonical.clone()];
+    match canonical.strip_prefix("/private") {
+        Some(rest) if rest.starts_with('/') => spellings.push(rest.to_string()),
+        _ => spellings.push(format!("/private{canonical}")),
+    }
+    spellings.iter().any(|spelling| {
+        head.contains(&format!("\"cwd\":\"{spelling}\""))
+            || head.contains(&format!("\"cwd\": \"{spelling}\""))
+    })
+}
+
 pub(crate) fn codex_session_id_if_cwd_matches(path: &Path, target_cwd: &Path) -> Option<String> {
-    let file = fs::File::open(path).ok()?;
-    let mut reader = io::BufReader::new(file);
-    let mut line = String::new();
-    reader.read_line(&mut line).ok()?;
-    let value = serde_json::from_str::<serde_json::Value>(&line).ok()?;
+    // Read a bounded HEAD, not the first line: that line carries Codex's entire
+    // system prompt (~19KB here), and this runs once per rollout across a tree
+    // that grows into the thousands. `cwd` sits in its first few hundred bytes, so
+    // a short read plus a substring reject skips the JSON parse for almost every
+    // file — the difference between a scan that stalls the dashboard for seconds
+    // and one that does not.
+    let head = read_file_head(path, 8 * 1024)?;
+    if !head_mentions_cwd(&head, target_cwd) {
+        return None;
+    }
+    let line = head.lines().next()?;
+    let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
     if value.get("type").and_then(serde_json::Value::as_str) != Some("session_meta") {
         return None;
     }
