@@ -5676,41 +5676,25 @@ fn busy_spinner_reopens_a_falsely_completed_agent() {
 }
 
 #[test]
-fn merge_confirm_hint_highlights_merge_action() {
-    let line = merge_confirm_hint_line();
-    let text = line
+fn key_choices_read_as_buttons_not_prose() {
+    // A confirm dialogue's keys are the one thing that must be unmissable, so they
+    // render bracketed and in the accent colour, ahead of any explanation.
+    let line = key_choice_line(&[("y", "merge"), ("Esc", "cancel")]);
+    let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+    assert_eq!(text, "  [y] merge     [Esc] cancel");
+
+    let keys: Vec<&str> = line
         .spans
         .iter()
+        .filter(|span| span.style.fg == Some(ACCENT))
         .map(|span| span.content.as_ref())
-        .collect::<String>();
-
-    assert_eq!(text, "Press y to merge  ·  n or Esc to cancel");
-    assert_eq!(line.spans.len(), 3);
-    // The action key is color-emphasized in the focus accent (teal), not red.
-    assert_eq!(line.spans[1].content.as_ref(), "y");
-    assert_eq!(line.spans[1].style.fg, Some(ACCENT));
-    // Thin theme: emphasis is by color, not weight.
-    assert!(!line.spans[1].style.add_modifier.contains(Modifier::BOLD));
-}
-
-#[test]
-fn conflict_hint_color_emphasizes_keys_not_weight() {
-    let line = conflict_resolve_hint_line();
-    let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-    assert_eq!(
-        text,
-        "Press y for an AI resolver  ·  n to resolve it yourself  ·  Esc to cancel"
-    );
-    assert_eq!(line.spans[1].content.as_ref(), "y");
-    assert_eq!(line.spans[1].style.fg, Some(ACCENT));
-    assert_eq!(line.spans[3].content.as_ref(), "n");
-    assert_eq!(line.spans[3].style.fg, Some(ACCENT));
-    assert!(
-        line.spans
-            .iter()
-            .all(|s| !s.style.add_modifier.contains(Modifier::BOLD)),
-        "emphasis is by color, not weight"
-    );
+        .collect();
+    assert_eq!(keys, vec!["y", "Esc"], "every key is accent-coloured");
+    // Thin theme: emphasis is by colour, not weight.
+    assert!(line
+        .spans
+        .iter()
+        .all(|span| !span.style.add_modifier.contains(Modifier::BOLD)));
 }
 
 #[test]
@@ -5750,8 +5734,8 @@ fn the_merge_dialogue_always_shows_which_key_confirms() {
         "the keys are on the border, where a clipped body cannot hide them"
     );
     assert!(
-        text.contains("to merge") && text.contains("cancel"),
-        "and the hint line survives inside the body"
+        text.contains("[y] merge") && text.contains("[Esc] cancel"),
+        "and the choices render as buttons inside the body, above the explanation"
     );
     assert!(
         text.contains("uncommitted local changes"),

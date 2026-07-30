@@ -3908,8 +3908,14 @@ pub(crate) fn render_merge_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) 
                 if ids.len() == 1 { "" } else { "s" }
             ),
         };
+        // The ACTION comes first. This modal used to explain itself for three
+        // wrapped rows and mention the keys only on the last one, which is also the
+        // row that got clipped — so the question "which key confirms?" had no
+        // answer on screen.
         let mut lines = vec![
             Line::from(Span::styled(headline, app_style())),
+            Line::from(""),
+            key_choice_line(&[("y", "merge"), ("Esc", "cancel")]),
             Line::from(""),
             Line::from(Span::styled(
                 "Dependent nodes unblock once it lands. A clean merge is mechanical (no AI); on conflict you can launch an AI resolver or resolve it yourself.",
@@ -3923,8 +3929,7 @@ pub(crate) fn render_merge_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) 
                 Style::default().fg(RUNNING_COLOR),
             )));
         }
-        lines.push(Line::from(""));
-        lines.push(merge_confirm_hint_line());
+
         (
             Span::styled(" Confirm merge · y merges · Esc cancels ", Style::default().fg(ACCENT)),
             lines,
@@ -3947,6 +3952,12 @@ pub(crate) fn render_merge_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) 
             )),
             Line::from(""),
         ];
+        lines.push(key_choice_line(&[
+            ("y", "AI resolver"),
+            ("n", "resolve it yourself"),
+            ("Esc", "cancel"),
+        ]));
+        lines.push(Line::from(""));
         if prompt.conflicted_files.is_empty() {
             lines.push(Line::from(Span::styled(
                 "No specific files were reported.",
@@ -3969,8 +3980,7 @@ pub(crate) fn render_merge_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) 
                 )));
             }
         }
-        lines.push(Line::from(""));
-        lines.push(conflict_resolve_hint_line());
+
         (
             Span::styled(
                 if prompt.operation == ConflictOperation::Rebase {
@@ -4091,32 +4101,27 @@ pub(crate) fn render_cloud_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) 
     );
 }
 
-pub(crate) fn merge_confirm_hint_line() -> Line<'static> {
-    Line::from(vec![
-        Span::styled("Press ", muted_style(true)),
-        Span::styled("y", accent_style(true)),
-        Span::styled(" to merge  ·  n or Esc to cancel", muted_style(true)),
-    ])
-}
-
-/// Hint for the conflict modal: the keys are color-emphasized (teal), the rest muted,
-/// matching the thin theme (emphasis by color, not weight) and the "·"-separated style
-/// used in the orchestrator pane.
-pub(crate) fn conflict_resolve_hint_line() -> Line<'static> {
-    Line::from(vec![
-        Span::styled("Press ", muted_style(true)),
-        Span::styled("y", accent_style(true)),
-        Span::styled(" for an AI resolver  ·  ", muted_style(true)),
-        Span::styled("n", accent_style(true)),
-        Span::styled(
-            " to resolve it yourself  ·  Esc to cancel",
-            muted_style(true),
-        ),
-    ])
+/// The one row a confirm dialogue must never bury: `[y] merge   [Esc] cancel`,
+/// keys bracketed and in the accent colour so they read as buttons rather than
+/// prose. Rendered directly under the headline, before any explanation.
+pub(crate) fn key_choice_line(choices: &[(&str, &str)]) -> Line<'static> {
+    let mut spans = vec![Span::raw("  ")];
+    for (index, (key, label)) in choices.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::raw("     "));
+        }
+        spans.push(Span::styled("[", muted_style(true)));
+        spans.push(Span::styled((*key).to_string(), accent_style(true)));
+        spans.push(Span::styled("] ", muted_style(true)));
+        spans.push(Span::styled((*label).to_string(), app_style()));
+    }
+    Line::from(spans)
 }
 
 /// How many terminal rows these lines occupy once wrapped to `width` — what a
-/// modal must be sized by, since `Paragraph::wrap` reflows every Line.
+/// modal must be sized by, since `Paragraph::wrap` reflows every Line. Sizing by
+/// `lines.len()` clipped the bottom of the box, and the bottom is where a
+/// dialogue's keys used to live.
 pub(crate) fn wrapped_line_count(lines: &[Line<'_>], width: u16) -> u16 {
     lines
         .iter()
