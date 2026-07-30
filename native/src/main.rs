@@ -11177,8 +11177,12 @@ impl App {
             self.notice = Some("no agent selected".to_string());
             return;
         };
-        if run.is_main() || run.is_orchestrator() {
-            self.notice = Some("branch works on worker agents, not main/orchestrator".to_string());
+        // The orchestrator owns the plan and cannot be forked into a worker, but a
+        // MAIN or one-off row is just a conversation in the checkout — forking it
+        // into an isolated, mergeable worker is one of the more useful things you
+        // can do with it, and refusing was arbitrary.
+        if run.is_orchestrator() {
+            self.notice = Some("branch works on agents, not the orchestrator".to_string());
             return;
         }
         let backend_for_notice = run.backend;
@@ -11201,13 +11205,24 @@ impl App {
             // Say WHY. Claude gets a session id at launch (Rudder mints it), but
             // Codex and opencode only record one once the conversation exists, and
             // Rudder finds it by the directory the session ran in.
-            self.notice = Some(match backend_for_notice {
-                Backend::Claude => {
+            // Say which of the two states this is. "No session yet" almost always
+            // means the pane never got past its first prompt (a codex fork asking
+            // which directory to use, an auth prompt), and the row still reads as
+            // running — so point at the pane rather than at the backend.
+            let never_spoke = self
+                .agents
+                .get(self.selected_agent)
+                .is_some_and(|run| run.turns.is_empty() || run.last_output_at.elapsed() > Duration::from_secs(600));
+            self.notice = Some(match (backend_for_notice, never_spoke) {
+                (Backend::Claude, _) => {
                     "nothing to branch: this agent has no session yet".to_string()
                 }
-                other => format!(
-                    "no {} session recorded for this workspace yet — {} writes one once the conversation starts; branch after its first reply",
-                    other.as_str(),
+                (other, true) => format!(
+                    "nothing to branch: this {} pane never started a conversation — open it (Enter) and check whether it is waiting on a prompt",
+                    other.as_str()
+                ),
+                (other, false) => format!(
+                    "no {} session recorded for this workspace yet — it is written once the conversation starts; branch after its first reply",
                     other.as_str()
                 ),
             });

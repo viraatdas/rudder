@@ -6420,18 +6420,23 @@ fn fork_commands_branch_the_session_without_touching_the_original() {
 fn branch_guards_main_orchestrator_and_sessionless_runs() {
     let mut app = App::new();
 
-    // Main agent: refused.
+    // A MAIN row is branchable now: it is just a conversation in the checkout, and
+    // forking it into an isolated worker is the useful move. With no session id
+    // there is still nothing to fork, so it stops for that reason instead.
     let mut main = test_agent_run(MAIN_AGENT_ID, "main branch");
     main.mode = AgentMode::Main;
     app.agents.push(main);
     app.selected_agent = 0;
     app.branch_selected_agent();
-    assert_eq!(app.agents.len(), 1, "no fork row was created for main");
-    assert!(app
-        .notice
-        .as_deref()
-        .unwrap_or_default()
-        .contains("branch works on worker agents"));
+    assert_eq!(app.agents.len(), 1, "no fork row without a session");
+    assert!(
+        app.notice
+            .as_deref()
+            .unwrap_or_default()
+            .contains("nothing to branch"),
+        "notice was {:?}",
+        app.notice
+    );
 
     // Orchestrator: refused.
     app.agents.push(planner_run("orch-1", false));
