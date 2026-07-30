@@ -3101,12 +3101,19 @@ impl App {
                 if let Some(main_index) = self.selected_main_index() {
                     let cwd = self.cwd.clone();
                     let run = &mut self.agents[main_index];
-                    run.backend = backend;
-                    run.model = model;
-                    run.effort = effort;
-                    let _ = save_native_run_record(&cwd, run);
-                    if run.terminal.is_none() && self.selected_agent == main_index {
-                        should_spawn_main = true;
+                    // Only a row with no live process takes the new selection.
+                    // `set_model_defaults` already refuses to relabel a running
+                    // row; overriding that here advertised a model the process was
+                    // not using, and rewriting `backend` mid-flight made the poll
+                    // loop hunt for the wrong hook file and kill the agent.
+                    if run.terminal.is_none() {
+                        run.backend = backend;
+                        run.model = model;
+                        run.effort = effort;
+                        let _ = save_native_run_record(&cwd, run);
+                        if self.selected_agent == main_index {
+                            should_spawn_main = true;
+                        }
                     }
                 }
                 if should_spawn_main {

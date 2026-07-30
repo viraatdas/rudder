@@ -66,12 +66,20 @@ pub(crate) fn worker_has_config(run_id: &str, backend: Backend) -> bool {
     let Some(dir) = signals_dir() else {
         return false;
     };
-    let file = match backend {
-        Backend::Claude => dir.join(format!("{run_id}-claude.json")),
-        Backend::Codex => dir.join(format!("{run_id}-notify.sh")),
-        Backend::Opencode => dir.join(format!("{run_id}-opencode.json")),
-    };
-    file.exists()
+    // Ask "were hooks wired for this RUN", not "for this run under the backend it
+    // claims right now". A row's backend can change after launch (switching model
+    // provider rewrites it), and keying the check on the current value made the
+    // poll loop look for a file that was never going to exist — then KILL a
+    // perfectly healthy worker for "lifecycle hooks were not installed".
+    // The run id is unique, so any of the three configs proves the wiring ran.
+    let _ = backend;
+    [
+        dir.join(format!("{run_id}-claude.json")),
+        dir.join(format!("{run_id}-notify.sh")),
+        dir.join(format!("{run_id}-opencode.json")),
+    ]
+    .iter()
+    .any(|file| file.exists())
 }
 
 /// Read the latest signal a worker wrote, if any.

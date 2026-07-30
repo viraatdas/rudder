@@ -1329,6 +1329,77 @@ fn write_codex_rollout(dir: &std::path::Path, id: &str, cwd: &str, started_iso: 
 }
 
 #[test]
+fn switching_model_provider_cannot_kill_a_running_agent() {
+    // The chain that took out live main agents: the /model picker rewrote the
+    // selected row's BACKEND even while its process was running, and the poll loop
+    // then looked for that backend's hook file, found none, and killed the worker
+    // with "worker lifecycle hooks were not installed".
+    let _env = env_guard();
+    let run_id = "run-hooks-1";
+    // Hooks wired at launch, as a Claude worker.
+    let wired = signals::prepare_worker_signals(run_id, Backend::Claude);
+    assert!(wired.claude_settings.is_some(), "claude settings written");
+
+    // The row now claims a different backend. The wiring did not change.
+    assert!(
+        signals::worker_has_config(run_id, Backend::Codex),
+        "a run's hooks belong to the RUN, not to whatever backend the row claims now"
+    );
+    assert!(signals::worker_has_config(run_id, Backend::Claude));
+    signals::cleanup_run_signals(run_id);
+    assert!(
+        !signals::worker_has_config(run_id, Backend::Claude),
+        "and a run with no wiring at all is still reported honestly"
+    );
+}
+
+#[test]
+fn picking_a_model_leaves_a_running_main_row_alone() {
+    let mut app = App::new();
+    let mut main = test_agent_run(MAIN_AGENT_ID, "own the checkout");
+    main.mode = AgentMode::Main;
+    main.backend = Backend::Claude;
+    main.model = "opus".to_string();
+    main.status = AgentStatus::Running;
+    let fake = app.cwd.join("sleeper.sh");
+    write_fake_bin(&fake, "#!/bin/sh\nsleep 30\n");
+    main.terminal = Some(
+        TerminalPane::spawn_shell_or_command(
+            Some(TerminalCommand::with_args(
+                fake.to_string_lossy().to_string(),
+                Vec::<String>::new(),
+            )),
+            TerminalPaneOptions::default(),
+        )
+        .expect("spawn sleeper"),
+    );
+    app.agents.push(main);
+    app.selected_agent = 0;
+
+    app.apply_suggestion(Suggestion {
+        label: "gpt-5.5".to_string(),
+        detail: String::new(),
+        action: SuggestionAction::SetModel {
+            backend: Backend::Codex,
+            model: "gpt-5.5".to_string(),
+            effort: Some(EffortLevel::Low),
+        },
+    });
+
+    let row = app.agents.first().expect("row");
+    assert_eq!(row.backend, Backend::Claude, "the live row keeps its backend");
+    assert_eq!(row.model, "opus", "and the model it is actually running");
+    // The DEFAULT for new agents did change.
+    assert_eq!(app.backend, Backend::Codex);
+    assert_eq!(app.model, "gpt-5.5");
+    if let Some(run) = app.agents.first_mut() {
+        if let Some(terminal) = run.terminal.as_mut() {
+            terminal.terminate_and_wait();
+        }
+    }
+}
+
+#[test]
 fn a_dead_main_row_can_be_deleted_but_a_live_one_says_why_not() {
     // "main agent: delete disabled" explained nothing and applied always, so a main
     // row orphaned by a crash could never be cleared off the list.
