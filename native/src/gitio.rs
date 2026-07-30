@@ -739,6 +739,10 @@ pub(crate) fn integration_evidence_from_record(record: &serde_json::Value) -> In
             .map(ToOwned::to_owned)
     };
     IntegrationEvidence {
+        operation_id: text("operationId"),
+        // Derived, never loaded: whether the work is still in trunk is a question
+        // for jj on every tick, not a flag that can go stale on disk.
+        in_trunk: None,
         phase: match record
             .get("lifecyclePhase")
             .and_then(serde_json::Value::as_str)
@@ -1241,6 +1245,36 @@ pub(crate) fn prepare_jj_workspace(cwd: &Path, task: &str) -> Result<WorktreeInf
 /// working copy is parented on that jj change (via `__launch-node --base`), so the
 /// run starts from another run's current edits instead of the repo's default base.
 /// Used by branch/fork so the forked chat's file state matches its conversation.
+/// Is this change still an ancestor of trunk (or of the working copy)? The
+/// question "did this merge land, and is it STILL landed?" belongs to jj, which
+/// answers it exactly and cheaply. Rudder used to store the answer as a flag at
+/// merge time and never look again — so a row went on claiming "merged" after
+/// history was rewritten under it. None means jj could not be asked.
+pub(crate) fn jj_change_in_trunk(repo_root: &Path, change_id: &str) -> Option<bool> {
+    let change_id = change_id.trim();
+    if change_id.is_empty() || !is_git_repo(repo_root) {
+        return None;
+    }
+    let output = Command::new("jj")
+        .args([
+            "log",
+            "--no-graph",
+            "--ignore-working-copy",
+            "-r",
+            &format!("{change_id} & ::(trunk() | @)"),
+            "-T",
+            "change_id.short()",
+        ])
+        .current_dir(repo_root)
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(!String::from_utf8_lossy(&output.stdout).trim().is_empty())
+}
+
 pub(crate) fn prepare_jj_workspace_at(
     cwd: &Path,
     task: &str,

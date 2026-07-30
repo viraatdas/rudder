@@ -164,6 +164,7 @@ command, even while typing inside the worker pane:
 | `R` | Review all completed worktrees (Codex review-all agent) |
 | `r` | Rename the selected agent |
 | `b` | Branch the selected agent's chat into a new worker |
+| `u` | Undo the selected row's merge (restores the jj operation it ran as) |
 | `d` | Delete the selected agent and its worktree |
 | `j` / `k` | Move the agent selection |
 | `q` | Quit |
@@ -507,6 +508,18 @@ Everything stays on your machine, spend is hard-capped per cycle
 disables it. The full harness spec is in
 [`docs/continual-improvement.md`](./docs/continual-improvement.md);
 implementation details live in [`AGENTS.md`](./AGENTS.md) section 15.
+
+## What Rudder derives rather than remembers
+
+A status that can be checked is checked, on a slow tick, against whatever actually
+knows: jj for "is this work in main", the process handle for "is this agent
+alive", the filesystem for "does this workspace exist", each backend's own session
+store for "which conversation is this". Anything that changed is written to
+`.rudder/activity.jsonl` with the ids it touched — change id, bookmark, commit,
+jj operation — so it can be lined up against `jj op log` afterwards.
+
+This is why a merged row can say **`merged · NOT in main`**: the merge landed, and
+then something rewrote history under it. Rudder used to keep claiming success.
 
 ## Telemetry and feedback
 

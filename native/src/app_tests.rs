@@ -1329,6 +1329,65 @@ fn write_codex_rollout(dir: &std::path::Path, id: &str, cwd: &str, started_iso: 
 }
 
 #[test]
+fn a_merged_row_whose_work_left_trunk_stops_claiming_success() {
+    // The lie class this whole pass exists to kill: a row said "merged" forever,
+    // while jj knew the change was no longer in trunk (observed in a live repo —
+    // history was rewritten under a landed merge and the pane never noticed).
+    let mut run = test_agent_run("run-1", "build the thing");
+    run.status = AgentStatus::Merged;
+    run.integration.merge_change_id = Some("ztqrqkpqwzto".to_string());
+
+    run.integration.in_trunk = None;
+    let unchecked = agent_status_label(&run);
+    assert!(
+        unchecked.starts_with("merged"),
+        "unchecked still reads as merged: {unchecked}"
+    );
+
+    run.integration.in_trunk = Some(true);
+    assert_eq!(
+        agent_status_label(&run),
+        unchecked,
+        "a verified merge reads exactly as it did before"
+    );
+
+    run.integration.in_trunk = Some(false);
+    assert_eq!(
+        agent_status_label(&run),
+        "merged · NOT in main",
+        "the row states the evidence rather than the belief"
+    );
+}
+
+#[test]
+fn undo_needs_a_merged_row_and_a_recorded_operation() {
+    let mut app = App::new();
+    let mut run = test_agent_run("run-1", "build the thing");
+    run.status = AgentStatus::Done;
+    app.agents.push(run);
+    app.selected_agent = 0;
+
+    app.undo_selected_merge();
+    assert!(app
+        .notice
+        .as_deref()
+        .is_some_and(|notice| notice.contains("not merged")));
+
+    // Merged, but nothing recorded the operation: say how to do it by hand rather
+    // than pretending there is nothing to undo.
+    app.agents[0].status = AgentStatus::Merged;
+    app.notice = None;
+    app.undo_selected_merge();
+    assert!(
+        app.notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("jj op log")),
+        "notice was {:?}",
+        app.notice
+    );
+}
+
+#[test]
 fn run_main_starts_another_agent_in_the_checkout() {
     // Several agents on the main branch at once is a supported way to work, so
     // `/run main <task>` adds one rather than reusing or replacing the existing.
@@ -4065,6 +4124,8 @@ fn native_save_preserves_launch_and_clean_merge_metadata() {
         merge_change_id: Some("change-after".to_string()),
         git_commit: Some("abc123def456".to_string()),
         pushed: false,
+        operation_id: None,
+        in_trunk: None,
     };
 
     save_native_run_record(&repo, &run).expect("save merged native record");

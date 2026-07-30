@@ -4417,6 +4417,13 @@ pub(crate) fn status_style(status: AgentStatus) -> Style {
 }
 
 pub(crate) fn agent_status_label(agent: &AgentRun) -> &'static str {
+    // Evidence first. A row that claims "merged" while jj says the change is no
+    // longer in trunk is the most misleading thing the pane can show — the work
+    // looks landed and is not. Same for a row still pointing at a workspace that
+    // has been swept: every key you press against it will fail.
+    if agent.status == AgentStatus::Merged && agent.integration.in_trunk == Some(false) {
+        return "merged · NOT in main";
+    }
     if agent.needs_permission {
         "needs permission"
     } else if agent.needs_user_input {

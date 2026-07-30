@@ -652,6 +652,13 @@ struct App {
     dashboard_open_emitted: bool,
     /// Last heartbeat sentence written, so an unchanged one is not repeated.
     last_heartbeat_summary: Option<String>,
+    /// Rows whose workspace is gone from disk, refreshed by the reconcile pass.
+    /// A derived fact lives here rather than on the row: it is a question for the
+    /// filesystem, asked again every pass, never persisted.
+    rows_missing_workspace: HashSet<String>,
+    /// Last full reconcile against the authorities (jj, the filesystem, the
+    /// backends' session stores). Cheap, but not every-tick cheap.
+    last_reconcile: Option<Instant>,
     /// Backoff for `ensure_session_ids_recorded`: a row whose backend never wrote
     /// a session (it died at launch) must not make the dashboard rescan forever.
     session_id_attempts: HashMap<String, u32>,
@@ -1331,6 +1338,8 @@ impl App {
             handoff_extra_rx: None,
             dashboard_open_emitted: false,
             last_heartbeat_summary: None,
+            rows_missing_workspace: HashSet::new(),
+            last_reconcile: None,
             session_id_attempts: HashMap::new(),
             session_id_last_try: HashMap::new(),
             worker_selection: None,
@@ -1959,6 +1968,7 @@ impl App {
             // worker pane cannot use — every keystroke there goes to the agent's own
             // TUI, so `b` was simply typed into it. Reachable here and under ^W.
             KeyCode::Char('b') => self.branch_selected_agent(),
+            KeyCode::Char('u') => self.undo_selected_merge(),
             KeyCode::Up | KeyCode::Char('k') => self.select_previous_agent(),
             KeyCode::Down | KeyCode::Char('j') => self.select_next_agent(),
             KeyCode::Char('m') => self.request_merge_selected_agent(),
@@ -2008,6 +2018,7 @@ impl App {
             KeyCode::Char('v') | KeyCode::Char('\u{221a}') => self.toggle_worker_view(),
             KeyCode::Char('r') => self.start_rename_selected_agent(),
             KeyCode::Char('b') => self.branch_selected_agent(),
+            KeyCode::Char('u') => self.undo_selected_merge(),
             KeyCode::Up | KeyCode::Char('k') => self.select_previous_agent(),
             KeyCode::Down | KeyCode::Char('j') => self.select_next_agent(),
             KeyCode::Char('m') => self.request_merge_selected_agent(),
@@ -2086,6 +2097,7 @@ impl App {
             }
             KeyCode::Char('c') => self.clear_merged_agents(),
             KeyCode::Char('b') => self.branch_selected_agent(),
+            KeyCode::Char('u') => self.undo_selected_merge(),
             KeyCode::Char('P') => self.open_main_model_switcher(),
             KeyCode::Char('o') => self.open_web_ui(),
             _ => {}
@@ -6658,7 +6670,7 @@ impl App {
             }
             Some("/help") => {
                 self.notice = Some(
-                    "plain input -> one end-to-end main agent · /plan <task> -> isolated multi-agent DAG · /run <task> -> one isolated mergeable worker · /run main <task> -> another agent in this checkout · /ask <text> -> direct one-off · panes: Option-1/2/3 or ^W · keys: j/k select · Option-[ / Option-] step agents from any pane · Enter focus · v diff · m merge · M merge all · R review all · g nest · o web ui · x stop · b branch chat · dd delete · cc clear merged · P model; commands: /model /fast /sound /color /main /run /ask /plan /resume /restore /share /usage /goal /cloud /web /feedback"
+                    "plain input -> one end-to-end main agent · /plan <task> -> isolated multi-agent DAG · /run <task> -> one isolated mergeable worker · /run main <task> -> another agent in this checkout · /ask <text> -> direct one-off · panes: Option-1/2/3 or ^W · keys: j/k select · Option-[ / Option-] step agents from any pane · Enter focus · v diff · m merge · u undo a merge · M merge all · R review all · g nest · o web ui · x stop · b branch chat · dd delete · cc clear merged · P model; commands: /model /fast /sound /color /main /run /ask /plan /resume /restore /share /usage /goal /cloud /web /feedback"
                         .to_string(),
                 );
                 true
@@ -8602,6 +8614,31 @@ impl App {
             }
         }
         let line = serde_json::json!({ "ts": now_stamp(), "text": text, "kind": kind });
+        self.write_activity_line(&path, line);
+    }
+
+    /// Record an operation WITH the ids it touched. A line of prose cannot answer
+    /// "what happened to this merge?" three hours later; a change id, a bookmark
+    /// and an op id can — and they join to `jj op log`, which is the only other
+    /// record of the same events.
+    fn record_event(&self, kind: &str, text: &str, fields: serde_json::Value) {
+        let dir = self.cwd.join(".rudder");
+        if std::fs::create_dir_all(&dir).is_err() {
+            return;
+        }
+        let path = dir.join("activity.jsonl");
+        let mut line = serde_json::json!({ "ts": now_stamp(), "text": text, "kind": kind });
+        if let (Some(target), Some(extra)) = (line.as_object_mut(), fields.as_object()) {
+            for (key, value) in extra {
+                if !value.is_null() {
+                    target.insert(key.clone(), value.clone());
+                }
+            }
+        }
+        self.write_activity_line(&path, line);
+    }
+
+    fn write_activity_line(&self, path: &Path, line: serde_json::Value) {
         if let Ok(mut file) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -12743,6 +12780,23 @@ What to do\n\
             .iter()
             .any(|index| self.agents.get(*index).is_some_and(|run| run.node_id.is_some()));
         self.emit_merge_finished(true, false, planned_merge);
+        for index in &merge_indices {
+            let Some(run) = self.agents.get(*index) else {
+                continue;
+            };
+            self.record_event(
+                "merge",
+                &format!("merged {}", run.task_summary),
+                serde_json::json!({
+                    "run": run.id,
+                    "change": run.integration.merge_change_id,
+                    "bookmark": run.integration.bookmark,
+                    "commit": run.integration.git_commit,
+                    "op": run.integration.operation_id,
+                    "pushed": run.integration.pushed,
+                }),
+            );
+        }
         for merge_index in merge_indices {
             if let Some(run) = self.agents.get_mut(merge_index) {
                 run.terminal = None;
@@ -12775,6 +12829,136 @@ What to do\n\
         // A merge is a meaningful node transition (-> merged); mirror it so the
         // board reflects it without waiting for the next poll pass. Coalesced.
         self.mirror_graph();
+    }
+
+    /// `u` on a merged row: undo exactly that merge.
+    ///
+    /// jj records every operation, and Rudder already captured the id its merge
+    /// ran as — it just never offered it. Undoing a merge was therefore a manual
+    /// `jj op log` expedition, which is a lot to ask of someone who merged the
+    /// wrong row with one keystroke.
+    fn undo_selected_merge(&mut self) {
+        let Some(run) = self.agents.get(self.selected_agent) else {
+            self.notice = Some("no agent selected".to_string());
+            return;
+        };
+        if run.status != AgentStatus::Merged {
+            self.notice = Some("u undoes a merge — this row is not merged".to_string());
+            return;
+        }
+        let Some(operation) = run.integration.operation_id.clone() else {
+            self.notice = Some(
+                "no recorded jj operation for this merge — undo it with `jj op log` and `jj op restore`"
+                    .to_string(),
+            );
+            return;
+        };
+        let summary = run.task_summary.clone();
+        let run_id = run.id.clone();
+        self.record_event(
+            "merge-undo",
+            &format!("undoing the merge of {summary}"),
+            serde_json::json!({ "run": run_id, "op": operation }),
+        );
+        self.start_rudder_cli_command(
+            &format!("undo merge of {summary}"),
+            vec!["undo".to_string(), operation],
+        );
+    }
+
+    /// Replace BELIEFS with what the authorities say.
+    ///
+    /// Every wrong thing Rudder has shown came from a stored answer drifting from
+    /// something that already knew better: a row "running" with no process, a row
+    /// "merged" whose change is not in trunk, a row owning a workspace that is
+    /// gone, a session id Rudder never wrote down while the backend had it on
+    /// disk. Statuses that can be derived are derived here, on a slow tick, and
+    /// anything that changed is recorded with its ids so the change is explicable
+    /// afterwards.
+    fn reconcile_rows(&mut self) {
+        const EVERY: Duration = Duration::from_secs(60);
+        if self
+            .last_reconcile
+            .is_some_and(|at| at.elapsed() < EVERY)
+        {
+            return;
+        }
+        self.last_reconcile = Some(Instant::now());
+        self.ensure_session_ids_recorded();
+        self.verify_merged_rows();
+        self.flag_missing_workspaces();
+    }
+
+    /// Ask jj whether each merged row's work is STILL in trunk. A merge that was
+    /// undone, abandoned, or rebased away leaves the row claiming success forever
+    /// otherwise — which is exactly what happened in a live repo tonight.
+    fn verify_merged_rows(&mut self) {
+        let cwd = self.cwd.clone();
+        let mut drifted: Vec<(String, String)> = Vec::new();
+        for run in self.agents.iter_mut() {
+            if run.status != AgentStatus::Merged {
+                continue;
+            }
+            let Some(change) = run
+                .integration
+                .merge_change_id
+                .clone()
+                .or_else(|| run.jj_change_id.clone())
+            else {
+                continue;
+            };
+            let Some(in_trunk) = jj_change_in_trunk(&cwd, &change) else {
+                continue;
+            };
+            let was = run.integration.in_trunk;
+            run.integration.in_trunk = Some(in_trunk);
+            if !in_trunk && was != Some(false) {
+                drifted.push((run.id.clone(), change));
+            }
+        }
+        for (run_id, change) in drifted {
+            self.record_event(
+                "merge-drift",
+                "merged work is no longer in trunk — history was rewritten under it",
+                serde_json::json!({ "run": run_id, "change": change }),
+            );
+            self.dirty = true;
+        }
+    }
+
+    /// A row that still points at a workspace which is gone cannot be diffed,
+    /// merged, or branched. Say so on the row instead of failing at the keystroke.
+    fn flag_missing_workspaces(&mut self) {
+        let mut vanished: Vec<(String, String)> = Vec::new();
+        let mut missing_now: HashSet<String> = HashSet::new();
+        for run in self.agents.iter() {
+            let missing = run
+                .worktree_path
+                .as_ref()
+                .is_some_and(|path| !path.is_dir());
+            if !missing {
+                continue;
+            }
+            missing_now.insert(run.id.clone());
+            if !self.rows_missing_workspace.contains(&run.id) {
+                vanished.push((
+                    run.id.clone(),
+                    run.worktree_path
+                        .as_ref()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_default(),
+                ));
+            }
+        }
+        self.rows_missing_workspace = missing_now;
+        for (run_id, path) in vanished {
+            self.record_event(
+                "workspace-missing",
+                "a row's workspace is gone from disk",
+                serde_json::json!({ "run": run_id, "workspace": path }),
+            );
+            self.dirty = true;
+        }
     }
 
     /// Pin the backend session id for every row that does not have one yet.
@@ -12831,8 +13015,15 @@ What to do\n\
             let Some(run) = self.agents.get_mut(index) else {
                 continue;
             };
-            run.session_id = Some(session_id);
+            run.session_id = Some(session_id.clone());
+            let id = run.id.clone();
+            let backend = run.backend.as_str();
             let _ = save_native_run_record(&cwd, run);
+            self.record_event(
+                "session-pinned",
+                "recorded the backend session for a run",
+                serde_json::json!({ "run": id, "backend": backend, "session": session_id }),
+            );
             self.dirty = true;
         }
     }
@@ -12898,7 +13089,7 @@ What to do\n\
             self.last_steer_poll = Instant::now();
             self.poll_steer_inbox();
             self.poll_handoff_inbox();
-            self.ensure_session_ids_recorded();
+            self.reconcile_rows();
             self.maybe_emit_heartbeat();
         }
 

@@ -851,6 +851,34 @@ screen), off via `rudder telemetry off` or `RUDDER_TELEMETRY=0`.
 
 ---
 
+## 12.7 Derived state: the reconcile pass (`App::reconcile_rows`)
+
+Every wrong thing the pane has shown came from a STORED answer drifting from
+something that already knew better — a row "running" with no process, "merged"
+whose change is not in trunk, owning a workspace that is gone, or missing a
+session id the backend had on disk the whole time. The rule:
+
+**If an authority can answer it, ask the authority. Do not cache the answer.**
+
+`reconcile_rows` runs on a 60s tick (and on the first poll after launch):
+- `ensure_session_ids_recorded` — Codex/opencode ids matched by cwd AND start time
+  (see §12.5), pinned while the run is alive so a crash cannot lose the mapping.
+- `verify_merged_rows` — `jj_change_in_trunk` asks jj whether each merged row's
+  change is still an ancestor of `trunk() | @`. `IntegrationEvidence::in_trunk` is
+  DERIVED, never loaded from the record. A row whose work left trunk renders as
+  `merged · NOT in main` instead of claiming success forever.
+- `flag_missing_workspaces` — the filesystem decides; the result lives in
+  `App::rows_missing_workspace`, not on the row, because it is a question and not
+  a fact about the run.
+
+Anything that changes is written through `App::record_event`, which is
+`append_activity_jsonl` plus the IDS INVOLVED (run, change, bookmark, commit, jj
+op). Prose alone could not answer "what happened to this merge?" three hours
+later; these lines join to `jj op log`, which is the only other record of the same
+events. `u` on a merged row undoes exactly that operation via `rudder undo <op>`.
+
+---
+
 ## 13. Where to start for common changes
 
 - New CLI command: add a `case` in `src/main.ts` and the implementation in the

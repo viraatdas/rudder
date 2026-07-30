@@ -29,6 +29,12 @@ pub(crate) struct IntegrationEvidence {
     pub(crate) merge_change_id: Option<String>,
     pub(crate) git_commit: Option<String>,
     pub(crate) pushed: bool,
+    /// The jj operation the merge ran as, so it can be undone exactly.
+    pub(crate) operation_id: Option<String>,
+    /// Whether the merge change is still an ancestor of trunk. None = not checked
+    /// yet. `Some(false)` means the row SAYS merged but the work is no longer in
+    /// main — history was rewritten under it, which used to be invisible.
+    pub(crate) in_trunk: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
