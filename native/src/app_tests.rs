@@ -1329,6 +1329,66 @@ fn write_codex_rollout(dir: &std::path::Path, id: &str, cwd: &str, started_iso: 
 }
 
 #[test]
+fn a_dead_main_row_can_be_deleted_but_a_live_one_says_why_not() {
+    // "main agent: delete disabled" explained nothing and applied always, so a main
+    // row orphaned by a crash could never be cleared off the list.
+    let mut app = App::new();
+    let mut main = test_agent_run(MAIN_AGENT_ID, "own the checkout");
+    main.mode = AgentMode::Main;
+    main.status = AgentStatus::Orphaned;
+    // A main row works in the checkout itself: deleting it must never remove a
+    // worktree, and there is none to remove.
+    assert!(main.worktree_path.is_none());
+    app.agents.push(main);
+    app.selected_agent = 0;
+
+    app.delete_selected_agent();
+    assert_eq!(app.agents.len(), 1, "first press asks");
+    assert!(app
+        .notice
+        .as_deref()
+        .is_some_and(|notice| notice.contains("press d again")));
+    app.delete_selected_agent();
+    assert!(app.agents.is_empty(), "a dead main row is deletable");
+
+    // A LIVE one is refused, with the action that unblocks it.
+    let mut live = test_agent_run(MAIN_AGENT_ID, "own the checkout");
+    live.mode = AgentMode::Main;
+    live.status = AgentStatus::Running;
+    let fake = app.cwd.join("sleeper.sh");
+    write_fake_bin(&fake, "#!/bin/sh\nsleep 30\n");
+    live.terminal = Some(
+        TerminalPane::spawn_shell_or_command(
+            Some(TerminalCommand::with_args(
+                fake.to_string_lossy().to_string(),
+                Vec::<String>::new(),
+            )),
+            TerminalPaneOptions::default(),
+        )
+        .expect("spawn sleeper"),
+    );
+    app.agents.push(live);
+    app.selected_agent = 0;
+    app.delete_pending = None;
+
+    app.delete_selected_agent();
+
+    assert_eq!(app.agents.len(), 1, "a running main row is kept");
+    assert!(
+        app.notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("stop it with x")),
+        "the refusal names the way out: {:?}",
+        app.notice
+    );
+    if let Some(run) = app.agents.first_mut() {
+        if let Some(terminal) = run.terminal.as_mut() {
+            terminal.terminate_and_wait();
+        }
+    }
+}
+
+#[test]
 fn a_save_never_erases_the_workspace_identity_already_on_disk() {
     // Found in a live repo: a finished-but-unmerged row whose record had lost
     // workspaceName and jjChangeId. Without them the row cannot be merged and the
@@ -7442,7 +7502,7 @@ fn task_summary_worker_updates_main_agent_label() {
 }
 
 #[test]
-fn main_agent_blocks_delete_merge_and_rename() {
+fn main_agent_blocks_merge_and_rename() {
     let mut app = App::new();
     let mut main = test_agent_run(MAIN_AGENT_ID, "main branch");
     main.mode = AgentMode::Main;
@@ -7451,14 +7511,10 @@ fn main_agent_blocks_delete_merge_and_rename() {
     app.agents.push(main);
     app.selected_agent = 0;
 
-    app.delete_selected_agent();
-    assert_eq!(app.agents.len(), 1);
-    assert!(app
-        .notice
-        .as_deref()
-        .unwrap_or_default()
-        .contains("main agent"));
-
+    // Delete is NOT blocked outright any more — see
+    // `a_dead_main_row_can_be_deleted_but_a_live_one_says_why_not`. Merge and
+    // rename still are: a main row owns the checkout, so there is nothing to merge
+    // and nothing to rename.
     app.notice = None;
     app.request_merge_selected_agent();
     assert!(app.merge_confirm.is_none());

@@ -11048,9 +11048,22 @@ impl App {
         if self.agents.is_empty() {
             return;
         }
+        // A main row used to be undeletable, full stop, with a notice that
+        // explained nothing. Nothing requires one to exist (typing a task recreates
+        // it), and crashes leave dead main rows — one orphaned since a kernel panic
+        // could never be cleared. Refuse only while it is LIVE, and say what to do.
         if self.selected_is_main() {
-            self.notice = Some("main agent: delete disabled".to_string());
-            return;
+            let live = self
+                .agents
+                .get(self.selected_agent)
+                .is_some_and(|run| run.terminal.is_some() && run.status == AgentStatus::Running);
+            if live {
+                self.notice = Some(
+                    "main agent is still running — stop it with x, then d twice to delete the row"
+                        .to_string(),
+                );
+                return;
+            }
         }
         let Some(selected) = self.agents.get(self.selected_agent) else {
             return;
