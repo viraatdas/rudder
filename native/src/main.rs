@@ -10228,6 +10228,7 @@ impl App {
     /// dashboard with its workspace path nulled. Capped per sweep so a large
     /// backlog (e.g. the piles already on disk) drains without a UI stall.
     fn gc_merged_workspaces(&mut self) {
+        // See `merged_workspace_is_sweepable` for why a live pane is untouchable.
         const MAX_PER_SWEEP: usize = 3;
         let grace = Duration::from_secs(
             std::env::var("RUDDER_WORKTREE_GC_GRACE_SECS")
@@ -10242,22 +10243,11 @@ impl App {
             if cleaned >= MAX_PER_SWEEP {
                 break;
             }
-            if run.status != AgentStatus::Merged || run.is_main() {
-                continue;
-            }
             let (Some(name), Some(path)) = (run.workspace_name.clone(), run.worktree_path.clone())
             else {
                 continue;
             };
-            // Grace: only sweep once the checkout has been idle past the window.
-            // The dir mtime survives restarts, unlike an in-memory timestamp.
-            let idle_long_enough = std::fs::metadata(&path)
-                .and_then(|meta| meta.modified())
-                .ok()
-                .and_then(|mtime| now.duration_since(mtime).ok())
-                .map(|age| age >= grace)
-                .unwrap_or(false);
-            if !idle_long_enough {
+            if !merged_workspace_is_sweepable(run, now, grace) {
                 continue;
             }
             if forget_jj_workspace(&repo, &name, &path).is_ok() {
@@ -13855,6 +13845,39 @@ fn load_followup_gen(cwd: &Path) -> HashMap<String, u8> {
         .ok()
         .and_then(|raw| serde_json::from_str::<HashMap<String, u8>>(&raw).ok())
         .unwrap_or_default()
+}
+
+/// Whether a merged row's workspace may be deleted.
+///
+/// "Merged" does NOT mean the agent is gone: claude and codex stay RESIDENT between
+/// turns, so a row can be merged while its pane is still live and rooted in that
+/// directory. Deleting it then leaves the agent running in a phantom cwd — observed
+/// in the wild as a codex worker whose working directory had become the user's HOME,
+/// with approvals bypassed, so anything it wrote landed outside the repo and nothing
+/// it did could ever merge. A live pane keeps its workspace; clearing the row (`cc`,
+/// `dd`) drops the terminal and the next sweep collects it.
+fn merged_workspace_is_sweepable(
+    run: &AgentRun,
+    now: std::time::SystemTime,
+    grace: Duration,
+) -> bool {
+    if run.status != AgentStatus::Merged || run.is_main() {
+        return false;
+    }
+    if run.terminal.is_some() {
+        return false;
+    }
+    let Some(path) = run.worktree_path.as_ref() else {
+        return false;
+    };
+    // Grace: only sweep once the checkout has been idle past the window. The dir
+    // mtime survives restarts, unlike an in-memory timestamp.
+    std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|mtime| now.duration_since(mtime).ok())
+        .map(|age| age >= grace)
+        .unwrap_or(false)
 }
 
 /// Encode a working directory the way Claude Code names its session-transcript folder

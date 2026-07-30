@@ -1329,6 +1329,53 @@ fn write_codex_rollout(dir: &std::path::Path, id: &str, cwd: &str, started_iso: 
 }
 
 #[test]
+fn a_merged_workspace_with_a_live_agent_in_it_is_never_swept() {
+    // "Merged" does not mean the agent exited: claude and codex stay resident
+    // between turns. Deleting the directory under a live pane left a real worker
+    // rooted in the user's HOME with approvals bypassed — writing outside the repo,
+    // with nothing that could ever merge.
+    let app = App::new();
+    let workspace = app.cwd.join("ws");
+    std::fs::create_dir_all(&workspace).expect("create workspace");
+    // Backdate it well past any grace window.
+    let long_ago = std::time::SystemTime::now() - Duration::from_secs(30 * 24 * 3600);
+    let grace = Duration::from_secs(3600);
+
+    let mut run = test_agent_run("run-1", "some work");
+    run.status = AgentStatus::Merged;
+    run.workspace_name = Some("rudder-ws".to_string());
+    run.worktree_path = Some(workspace.clone());
+
+    // With no pane, an idle merged workspace is collectable.
+    assert!(
+        merged_workspace_is_sweepable(&run, long_ago + Duration::from_secs(60 * 24 * 3600), grace),
+        "an abandoned merged workspace is exactly what the sweep is for"
+    );
+
+    // A live pane makes it untouchable, however old the directory looks.
+    let fake = app.cwd.join("sleeper.sh");
+    write_fake_bin(&fake, "#!/bin/sh\nsleep 30\n");
+    let terminal = TerminalPane::spawn_shell_or_command(
+        Some(TerminalCommand::with_args(
+            fake.to_string_lossy().to_string(),
+            Vec::<String>::new(),
+        )),
+        TerminalPaneOptions::default(),
+    )
+    .expect("spawn sleeper");
+    run.terminal = Some(terminal);
+    assert!(
+        !merged_workspace_is_sweepable(&run, long_ago + Duration::from_secs(60 * 24 * 3600), grace),
+        "a resident agent keeps its workspace until the row is cleared"
+    );
+
+    if let Some(terminal) = run.terminal.as_mut() {
+        terminal.terminate_and_wait();
+    }
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[test]
 fn a_codex_session_is_matched_by_start_time_not_by_being_newest() {
     // The bug this prevents: dozens of sessions share a main checkout (90 in two
     // days on the machine that hit it), so "newest session for this cwd" pins
