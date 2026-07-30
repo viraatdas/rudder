@@ -30,7 +30,7 @@ use ratatui::{
     Frame, Terminal,
 };
 use rudder_native::pty_terminal::{
-    PtyOutputWaker, StyledTerminalCell, TerminalCommand, TerminalCursor, TerminalPane,
+    CellContents, PtyOutputWaker, StyledTerminalCell, TerminalCommand, TerminalCursor, TerminalPane,
     TerminalPaneOptions, TerminalSize,
 };
 
@@ -132,6 +132,22 @@ const TASK_SUMMARY_MODEL: &str = "claude-haiku-4-5-20251001";
 /// `orchestrator.maxParallel` in ~/.rudder/config.json. This is what makes nodes
 /// visibly wait in Todo and move to In Progress as slots free.
 const DEFAULT_MAX_PARALLEL: usize = 1000;
+/// Polls that shell out to another process start at their base interval and, when
+/// they keep returning the same answer, double up to the cap. Anything that could
+/// plausibly change the answer resets them to base, so responsiveness is preserved
+/// where it matters and an idle dashboard stops spawning processes for nothing.
+const REMOTE_STATE_BASE_INTERVAL: Duration = Duration::from_secs(5);
+const REMOTE_STATE_MAX_INTERVAL: Duration = Duration::from_secs(300);
+const WORKSPACE_CHECK_BASE_INTERVAL: Duration = Duration::from_secs(30);
+/// Held lower than the remote-state cap: a cloud workspace can start or stop
+/// without any local signal to key off, so this one has to keep looking.
+const WORKSPACE_CHECK_MAX_INTERVAL: Duration = Duration::from_secs(120);
+
+/// Doubles a poll interval, capped. Used by the process-spawning background polls.
+fn backed_off_interval(current: Duration, cap: Duration) -> Duration {
+    current.saturating_mul(2).clamp(Duration::from_secs(1), cap)
+}
+
 /// Run the scheduler every N poll ticks (a coarse cadence; the tick rate is 33ms).
 const SCHEDULER_TICK_INTERVAL: u64 = 8;
 /// Max plan nodes to launch per scheduler pass. Each launch synchronously sets up
@@ -712,6 +728,16 @@ struct App {
     /// Refreshes whether each locally integrated Git commit is contained by its
     /// origin tracking branch. This is local-only and never performs a fetch.
     last_remote_state_check: Instant,
+    /// Current gap between those refreshes. Each pass spawns one `git merge-base`
+    /// per merged-but-unpushed agent, and `origin/<bookmark>` can only move on a
+    /// fetch or push - so a fixed 5s cadence spawned thousands of processes a day
+    /// to re-learn an unchanged answer. The interval backs off while the answer
+    /// holds still and snaps back the moment it changes.
+    remote_state_interval: Duration,
+    /// How many merged-but-unpushed agents the last refresh watched. A newly
+    /// merged agent has to be noticed promptly, so a rise here resets the backoff
+    /// rather than leaving the new row's push badge stale for minutes.
+    remote_state_watched: usize,
     /// Cadence gate for the merged-workspace GC sweep (gc_merged_workspaces).
     last_worktree_gc: Instant,
     /// Throttle for the web-board steer inbox poll (.rudder/steer/*.json): checked
@@ -722,6 +748,10 @@ struct App {
     last_heartbeat_emit: Instant,
     cloud_workspace: Option<CloudWorkspaceStatus>,
     last_workspace_check: Option<Instant>,
+    /// Current gap between cloud workspace polls. Each poll spawns the Node CLI
+    /// (`rudder cloud workspace status`), which costs far more than the answer is
+    /// usually worth, so this backs off while the status is unchanged.
+    workspace_check_interval: Duration,
     workspace_status_rx: Option<mpsc::Receiver<Option<CloudWorkspaceStatus>>>,
     workspace_idle_notified: bool,
     task_summary_tx: mpsc::Sender<TaskSummaryResult>,
@@ -1362,11 +1392,14 @@ impl App {
             cloud_runtime: cloud.runtime,
             last_cloud_check: Instant::now(),
             last_remote_state_check: Instant::now(),
+            remote_state_interval: REMOTE_STATE_BASE_INTERVAL,
+            remote_state_watched: 0,
             last_worktree_gc: Instant::now(),
             last_steer_poll: Instant::now(),
             last_heartbeat_emit: Instant::now(),
             cloud_workspace: None,
             last_workspace_check: None,
+            workspace_check_interval: WORKSPACE_CHECK_BASE_INTERVAL,
             workspace_status_rx: None,
             workspace_idle_notified: false,
             task_summary_tx,
@@ -7435,11 +7468,25 @@ impl App {
         if !self.cloud_connected {
             self.cloud_workspace = None;
             self.workspace_status_rx = None;
+            // Re-arm so reconnecting polls at once instead of inheriting the
+            // backed-off cadence from the last connected session.
+            self.workspace_check_interval = WORKSPACE_CHECK_BASE_INTERVAL;
+            self.last_workspace_check = None;
             return;
         }
         if let Some(rx) = self.workspace_status_rx.take() {
             match rx.try_recv() {
                 Ok(snapshot) => {
+                    // Each poll costs a Node CLI spawn, so only keep paying that
+                    // often while the answer is actually moving.
+                    self.workspace_check_interval = if self.cloud_workspace == snapshot {
+                        backed_off_interval(
+                            self.workspace_check_interval,
+                            WORKSPACE_CHECK_MAX_INTERVAL,
+                        )
+                    } else {
+                        WORKSPACE_CHECK_BASE_INTERVAL
+                    };
                     if self.cloud_workspace != snapshot {
                         self.cloud_workspace = snapshot;
                         self.dirty = true;
@@ -7458,7 +7505,7 @@ impl App {
         }
         let due = match self.last_workspace_check {
             None => true,
-            Some(at) => at.elapsed() >= Duration::from_secs(30),
+            Some(at) => at.elapsed() >= self.workspace_check_interval,
         };
         if !due {
             return;
@@ -13059,7 +13106,7 @@ What to do\n\
         // before try_wait can observe the resulting signal as a failed process.
         self.consume_stop_requests();
 
-        if self.last_remote_state_check.elapsed() >= Duration::from_secs(5) {
+        if self.last_remote_state_check.elapsed() >= self.remote_state_interval {
             self.refresh_remote_integration_state();
             self.last_remote_state_check = Instant::now();
         }

@@ -879,6 +879,61 @@ events. `u` on a merged row undoes exactly that operation via `rudder undo <op>`
 
 ---
 
+## 12.8 Performance: what the dashboard costs, and the two rules that keep it cheap
+
+Measured on a live session (macOS, `sample` + `footprint`, one agent running):
+27 MB resident / 34 MB peak for the TUI, and ~93% of samples blocked on the event
+loop's semaphore. The loop is genuinely event-driven — PTY output wakes it — so
+idle cost comes from the two things below, not from spinning.
+
+**Rule 1 — the styled grid is rebuilt every frame, so cells must not allocate.**
+`invalidate_render_cache` fires on every PTY drain, and the next frame
+re-materializes the whole screen through `compute_styled_lines_snapshot`. That is
+~9,300 cells for a full-screen pane. When `StyledTerminalCell.contents` was a
+`String` this meant ~9,300 mallocs per frame and profiling attributed ~41% of
+render time to it. It is now `CellContents`: 22 bytes inline plus a length,
+matching `vt100`'s own fixed cell (`CONTENT_BYTES = 22`, and it refuses to append
+past 18, so 21 bytes is the widest cluster the parser can emit — inline storage is
+lossless, not a truncation trade). The whole cell is `Copy` at 36 bytes, locked in
+by a `const` size assertion. Cost went 295µs → 87µs per frame.
+
+Two things follow, and both are easy to undo by accident:
+- **Never put a pointer in `StyledTerminalCell`** — a `String`, `Vec`, or `Box`
+  field restores the per-cell allocation and the size assertion will fail. Fix the
+  design, not the assertion.
+- **Build spans with `CellContents::span_text()`**, which hands out a
+  `Cow::Borrowed` from a static ASCII table for single-byte cells. Calling
+  `.to_string()` instead re-adds one allocation per cell in the render path.
+
+`native/tests/cell_render_bench.rs` measures this; it is `#[ignore]`d because it
+is a timing test:
+```
+cargo test --manifest-path native/Cargo.toml --release \
+  --test cell_render_bench -- --ignored --nocapture
+```
+
+**Rule 2 — a poll that spawns a process backs off.** Two background polls shell
+out, and both used to run at a fixed cadence forever:
+- `refresh_remote_integration_state` spawns `git merge-base` per merged-but-unpushed
+  agent. `origin/<bookmark>` only moves on a fetch or push, so a 5s cadence spawned
+  thousands of processes a day to re-learn an unchanged answer.
+- `refresh_cloud_workspace_status` spawns the **Node CLI** (`rudder cloud workspace
+  status`), which costs a full Node startup (~150ms CPU) per poll.
+
+Both now double their interval while the answer holds still and snap back to base
+the moment it changes — or, for the git one, when a newly merged agent appears
+(`remote_state_watched`). The caps differ on purpose: 300s for the push check,
+120s for cloud status, because nothing local signals a cloud workspace starting so
+that one has to keep looking. If you add a background poll that spawns anything,
+give it the same treatment via `backed_off_interval`.
+
+**Known, not yet addressed:** the Node supervisor that launches the TUI peaks near
+950 MB at startup and settles at 46–78 MB while using ~2s of CPU over hours. It
+stays resident to host the board daemon in-process (`ensureBoardRunning`), which
+starts on every launch whether or not anyone opens the board.
+
+---
+
 ## 13. Where to start for common changes
 
 - New CLI command: add a `case` in `src/main.ts` and the implementation in the

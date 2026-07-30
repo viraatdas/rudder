@@ -358,11 +358,13 @@ impl AgentRun {
 impl App {
     pub(crate) fn refresh_remote_integration_state(&mut self) {
         let mut changed = false;
+        let mut watched = 0usize;
         for run in self
             .agents
             .iter_mut()
             .filter(|run| run.status == AgentStatus::Merged && !run.integration.pushed)
         {
+            watched += 1;
             let (Some(bookmark), Some(commit)) = (
                 run.integration.bookmark.as_deref(),
                 run.integration.git_commit.as_deref(),
@@ -388,6 +390,16 @@ impl App {
                 changed = true;
             }
         }
+        // Re-arm the cadence. A flipped flag or a newly merged agent means the
+        // answer is moving, so go back to checking often; otherwise widen the gap
+        // so an idle dashboard is not spawning `git merge-base` around the clock.
+        self.remote_state_interval = if changed || watched > self.remote_state_watched {
+            REMOTE_STATE_BASE_INTERVAL
+        } else {
+            backed_off_interval(self.remote_state_interval, REMOTE_STATE_MAX_INTERVAL)
+        };
+        self.remote_state_watched = watched;
+
         if changed {
             self.dirty = true;
             let _ = self.write_rudder_context_timed(None);

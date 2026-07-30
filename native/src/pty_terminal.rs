@@ -6,6 +6,8 @@
 //! is small enough that the buffer backend can be replaced with
 //! `alacritty_terminal` later without forcing app layout code to change.
 
+use std::borrow::Cow;
+use std::fmt;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
@@ -152,9 +154,140 @@ enum AnsiTrackState {
     Csi(Vec<u8>),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The number of bytes a single cell's grapheme cluster can occupy.
+///
+/// This mirrors `vt100`'s own fixed-size cell storage (`CONTENT_BYTES = 22`).
+/// Because the parser physically cannot hand us more than that, inline storage
+/// of the same width is lossless: there is no heap-fallback case to get wrong.
+const CELL_CONTENT_BYTES: usize = 22;
+
+/// One cell's text, stored inline instead of in a `String`.
+///
+/// The grid is re-materialized from the parser on every frame that follows new
+/// output, so a `String` here meant one heap allocation per cell — roughly 9,300
+/// mallocs per frame for a full-screen pane, which profiling showed dominating
+/// render time. Inline storage makes the whole cell `Copy`, so rebuilding a row
+/// and cloning the visible window are both plain memory copies.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct CellContents {
+    bytes: [u8; CELL_CONTENT_BYTES],
+    len: u8,
+}
+
+impl CellContents {
+    pub const SPACE: Self = Self::from_ascii(b' ');
+
+    const fn from_ascii(byte: u8) -> Self {
+        let mut bytes = [0u8; CELL_CONTENT_BYTES];
+        bytes[0] = byte;
+        Self { bytes, len: 1 }
+    }
+
+    /// Copies `text` inline. Anything that would not fit is truncated on a char
+    /// boundary rather than panicking or corrupting UTF-8; vt100 cannot produce
+    /// such a value, so this only guards future callers.
+    pub fn new(text: &str) -> Self {
+        let mut end = text.len().min(CELL_CONTENT_BYTES);
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let mut bytes = [0u8; CELL_CONTENT_BYTES];
+        bytes[..end].copy_from_slice(&text.as_bytes()[..end]);
+        Self {
+            bytes,
+            len: end as u8,
+        }
+    }
+
+    pub fn from_char(value: char) -> Self {
+        let mut buffer = [0u8; 4];
+        Self::new(value.encode_utf8(&mut buffer))
+    }
+
+    pub fn as_str(&self) -> &str {
+        // Always valid: every constructor copies from an existing `&str` and
+        // only ever cuts on a char boundary.
+        str::from_utf8(&self.bytes[..self.len as usize]).unwrap_or_default()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Text for a ratatui `Span`, which wants `Cow<'static, str>`.
+    ///
+    /// The overwhelmingly common cell is a single ASCII byte, and those are
+    /// served from a static table — so the render path allocates nothing at all
+    /// for ordinary text, and only pays for wide characters and emoji.
+    pub fn span_text(&self) -> Cow<'static, str> {
+        if self.len == 1 {
+            if let Some(text) = ascii_str(self.bytes[0]) {
+                return Cow::Borrowed(text);
+            }
+        }
+        Cow::Owned(self.as_str().to_string())
+    }
+}
+
+/// `[0, 1, 2, ..., 127]`, so any single ASCII byte can be handed out as a
+/// `&'static str` slice of length one without allocating.
+static ASCII_BYTES: [u8; 128] = {
+    let mut table = [0u8; 128];
+    let mut index = 0;
+    while index < 128 {
+        table[index] = index as u8;
+        index += 1;
+    }
+    table
+};
+
+fn ascii_str(byte: u8) -> Option<&'static str> {
+    let index = byte as usize;
+    let slice = ASCII_BYTES.get(index..index.checked_add(1)?)?;
+    str::from_utf8(slice).ok()
+}
+
+impl std::ops::Deref for CellContents {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl fmt::Debug for CellContents {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(self.as_str(), formatter)
+    }
+}
+
+impl PartialEq<str> for CellContents {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl PartialEq<&str> for CellContents {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+impl From<&str> for CellContents {
+    fn from(value: &str) -> Self {
+        Self::new(value)
+    }
+}
+
+/// A `Copy` cell with no heap tail: rebuilding a row and cloning the visible
+/// window are both memory copies, and a scrollback row costs exactly its cells.
+/// The assertion is here so a future field cannot quietly reintroduce a pointer
+/// (and with it, a per-cell allocation) without someone noticing.
+const _: () = assert!(std::mem::size_of::<StyledTerminalCell>() == 36);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StyledTerminalCell {
-    pub contents: String,
+    pub contents: CellContents,
     pub fg: vt100::Color,
     pub bg: vt100::Color,
     pub bold: bool,
@@ -431,7 +564,7 @@ impl TerminalPane {
                 .iter()
                 .map(|line| {
                     line.chars()
-                        .map(|ch| StyledTerminalCell::plain(ch.to_string()))
+                        .map(|ch| StyledTerminalCell::plain(CellContents::from_char(ch)))
                         .collect()
                 })
                 .collect();
@@ -466,9 +599,9 @@ impl TerminalPane {
                 continue;
             }
             let contents = if cell.has_contents() {
-                cell.contents().to_string()
+                CellContents::new(cell.contents())
             } else {
-                " ".to_string()
+                CellContents::SPACE
             };
             cells.push(StyledTerminalCell {
                 contents,
@@ -632,7 +765,7 @@ impl TerminalPane {
 }
 
 impl StyledTerminalCell {
-    fn plain(contents: String) -> Self {
+    fn plain(contents: CellContents) -> Self {
         Self {
             contents,
             fg: vt100::Color::Default,
@@ -658,7 +791,7 @@ fn trim_styled_cells(cells: &mut Vec<StyledTerminalCell>) {
 fn styled_cells_to_plain(cells: &[StyledTerminalCell]) -> String {
     let mut text = String::new();
     for cell in cells {
-        text.push_str(&cell.contents);
+        text.push_str(cell.contents.as_str());
     }
     text
 }
@@ -805,7 +938,10 @@ impl TerminalPane {
         self.alternate_history.get(index)
     }
 
-    fn invalidate_render_cache(&mut self) {
+    /// Drop the materialized styled-cell grid so the next snapshot rebuilds it.
+    /// Called on every path that changes what the screen shows; also public so
+    /// benchmarks can measure a cold rebuild without faking terminal output.
+    pub fn invalidate_render_cache(&mut self) {
         self.styled_lines_cache = None;
     }
 

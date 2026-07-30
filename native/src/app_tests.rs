@@ -2186,12 +2186,130 @@ fn rudder_mouse_capture_disables_sgr_wheel_modes_without_any_event_tracking() {
 
 #[test]
 fn styled_terminal_line_draws_visible_cursor_cell() {
-    let line = styled_terminal_line(vec![plain_terminal_cell("a".to_string())], None, Some(3));
+    let line = styled_terminal_line(vec![plain_terminal_cell("a")], None, Some(3));
 
     assert_eq!(line.spans.len(), 4);
     assert_eq!(line.spans[0].content.as_ref(), "a");
     assert_eq!(line.spans[3].content.as_ref(), " ");
     assert_eq!(line.spans[3].style, cursor_cell_style());
+}
+
+// ---------------------------------------------------------------------------
+// Inline cell storage. The grid is rebuilt from the parser on every frame that
+// follows new output, so these cells must hold their text without allocating -
+// but not at the cost of mangling anything wider than ASCII.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cell_contents_round_trips_everything_the_parser_can_emit() {
+    // `vt100::Cell` stores 22 bytes and refuses to append past 18, so the widest
+    // cluster it can hand us is 21 bytes. Matching that capacity exactly is what
+    // makes inline storage lossless: there is no case where the String version
+    // would have kept text that this drops.
+    let widest = "\u{1f469}\u{200d}\u{1f469}\u{200d}\u{1f467}"; // 18 bytes
+    for text in ["a", " ", "", "é", "→", "😀", "a\u{0301}", widest] {
+        assert!(text.len() <= 21, "fixture outgrew the parser's own cap");
+        assert_eq!(CellContents::new(text).as_str(), text, "round trip {text:?}");
+    }
+    assert_eq!(CellContents::SPACE.as_str(), " ");
+    assert_eq!(CellContents::from_char('あ').as_str(), "あ");
+    assert!(CellContents::new("").is_empty());
+    assert!(!CellContents::SPACE.is_empty());
+
+    // Equality is derived over the whole fixed buffer, so every constructor has
+    // to leave the unused tail zeroed. If one of them ever skipped that, cells
+    // holding identical text would compare unequal and the trailing-blank trim
+    // (and every render cache comparison) would silently stop working.
+    assert_eq!(CellContents::new(" "), CellContents::SPACE);
+    assert_eq!(CellContents::new("a"), CellContents::from_char('a'));
+    assert_eq!(CellContents::new("😀"), CellContents::from_char('😀'));
+    assert_ne!(CellContents::new("a"), CellContents::new("ab"));
+}
+
+#[test]
+fn cell_contents_truncates_on_a_char_boundary_instead_of_corrupting_utf8() {
+    // vt100 caps a cell at 22 bytes so this cannot arise from the parser, but if
+    // some future caller oversteps, the result must still be valid UTF-8 rather
+    // than a panic or a torn code point.
+    let oversized = "😀".repeat(16); // 64 bytes of 4-byte chars
+    let cell = CellContents::new(&oversized);
+    assert!(oversized.starts_with(cell.as_str()));
+    assert_eq!(cell.as_str().chars().count(), 5); // 20 of 22 bytes, whole chars only
+}
+
+#[test]
+fn cell_contents_serves_ascii_spans_without_allocating() {
+    // The render path builds one span per cell; borrowing the static table for
+    // ordinary text is what keeps that path allocation-free.
+    assert!(matches!(
+        CellContents::new("x").span_text(),
+        std::borrow::Cow::Borrowed("x")
+    ));
+    assert!(matches!(
+        CellContents::SPACE.span_text(),
+        std::borrow::Cow::Borrowed(" ")
+    ));
+    // Wide characters still work, they just pay for an allocation.
+    assert!(matches!(
+        CellContents::new("😀").span_text(),
+        std::borrow::Cow::Owned(_)
+    ));
+    assert_eq!(CellContents::new("😀").span_text().as_ref(), "😀");
+}
+
+// ---------------------------------------------------------------------------
+// Background poll backoff. Both of these polls spawn a child process, so the
+// cadence is a real cost, not a detail.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn background_polls_back_off_to_their_own_caps() {
+    let mut interval = REMOTE_STATE_BASE_INTERVAL;
+    for _ in 0..20 {
+        interval = backed_off_interval(interval, REMOTE_STATE_MAX_INTERVAL);
+    }
+    assert_eq!(interval, REMOTE_STATE_MAX_INTERVAL);
+
+    // Cloud status is capped lower: nothing local signals a workspace starting,
+    // so that poll has to keep looking more often than the push check does.
+    let mut interval = WORKSPACE_CHECK_BASE_INTERVAL;
+    for _ in 0..20 {
+        interval = backed_off_interval(interval, WORKSPACE_CHECK_MAX_INTERVAL);
+    }
+    assert_eq!(interval, WORKSPACE_CHECK_MAX_INTERVAL);
+    assert!(WORKSPACE_CHECK_MAX_INTERVAL < REMOTE_STATE_MAX_INTERVAL);
+
+    // Doubling, not jumping straight to the cap.
+    assert_eq!(
+        backed_off_interval(REMOTE_STATE_BASE_INTERVAL, REMOTE_STATE_MAX_INTERVAL),
+        REMOTE_STATE_BASE_INTERVAL * 2
+    );
+}
+
+#[test]
+fn remote_state_refresh_rearms_when_a_new_agent_is_merged() {
+    let mut app = App::new();
+    app.remote_state_interval = REMOTE_STATE_MAX_INTERVAL;
+    app.remote_state_watched = 0;
+
+    // No merged-unpushed agents: nothing to watch, so it stays backed off and
+    // spawns nothing.
+    app.refresh_remote_integration_state();
+    assert_eq!(app.remote_state_interval, REMOTE_STATE_MAX_INTERVAL);
+    assert_eq!(app.remote_state_watched, 0);
+
+    // A newly merged agent must be picked up promptly rather than waiting out
+    // the backoff, or its push badge would sit stale for minutes.
+    let mut run = test_agent_run("merged-agent", "ship the thing");
+    run.status = AgentStatus::Merged;
+    run.integration.pushed = false;
+    run.integration.bookmark = Some("feature".to_string());
+    run.integration.git_commit = Some("deadbeef".to_string());
+    app.agents.push(run);
+
+    app.refresh_remote_integration_state();
+    assert_eq!(app.remote_state_watched, 1);
+    assert_eq!(app.remote_state_interval, REMOTE_STATE_BASE_INTERVAL);
 }
 
 #[cfg(not(windows))]

@@ -324,8 +324,8 @@ pub(crate) fn styled_terminal_line(
         .map(|col| {
             let cell = cells
                 .get(col)
-                .cloned()
-                .unwrap_or_else(|| plain_terminal_cell(" ".to_string()));
+                .copied()
+                .unwrap_or_else(|| plain_terminal_cell(" "));
             let mut style = terminal_cell_style(&cell);
             if selection.is_some_and(|(start, end)| col >= start && col <= end) {
                 // A pale teal selection highlight stays readable in both terminal
@@ -335,7 +335,7 @@ pub(crate) fn styled_terminal_line(
             if cursor_col == Some(col) {
                 style = cursor_cell_style();
             }
-            Span::styled(cell.contents, style)
+            Span::styled(cell.contents.span_text(), style)
         })
         .collect::<Vec<_>>();
     Line::from(spans)
@@ -347,9 +347,9 @@ pub(crate) fn cursor_cell_style() -> Style {
     Style::default().fg(PAPER).bg(ACCENT)
 }
 
-pub(crate) fn plain_terminal_cell(contents: String) -> StyledTerminalCell {
+pub(crate) fn plain_terminal_cell(contents: &str) -> StyledTerminalCell {
     StyledTerminalCell {
-        contents,
+        contents: CellContents::new(contents),
         fg: vt100::Color::Default,
         bg: vt100::Color::Default,
         bold: false,
