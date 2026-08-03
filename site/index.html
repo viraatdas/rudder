@@ -190,6 +190,15 @@
                 one task truly depends on another.
               </p>
             </article>
+            <article class="principle">
+              <h3>Fast because it gets out of the way.</h3>
+              <p>
+                The dashboard is a native Rust TUI: 27 MB resident and asleep until
+                an agent writes. It renders a full pane without allocating per
+                terminal cell, and background checks back off instead of spawning
+                processes at you around the clock.
+              </p>
+            </article>
           </div>
         </section>
 
