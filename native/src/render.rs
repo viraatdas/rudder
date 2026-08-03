@@ -3630,7 +3630,7 @@ pub(crate) fn task_default_hint(app: &App) -> &'static str {
     {
         "type to talk to the live orchestrator for status, retro, or follow-up control  ·  ^W pane"
     } else {
-        "type for one end-to-end main agent; /plan for a DAG; /run for one mergeable worker; /ask for one-off  ·  Option-1/2/3 or ^W pane"
+        "type for one isolated mergeable worker; /plan for a DAG; /main for this checkout  ·  Option-1/2/3 or ^W pane"
     }
 }
 

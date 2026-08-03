@@ -453,9 +453,10 @@ enum AgentMode {
     RudderPlan,
     ReviewAll,
     Main,
-    /// A single conversational agent the user talks to in the MAIN checkout for a
-    /// question or a small self-contained change — NOT a DAG node. Spawned by
-    /// `/ask`. Structurally like Main (main checkout, no jj
+    /// A single conversational agent the user talks to in the MAIN checkout — NOT a
+    /// DAG node. `/ask` used to spawn these; it is gone, and the survivors are
+    /// `/restore` and `/resume --here`, which adopt an existing chat that was already
+    /// about the user's real files. Structurally like Main (main checkout, no jj
     /// worktree, bypass-permissions tools), distinct in intent + its own list section.
     OneOff,
 }
@@ -2311,7 +2312,21 @@ impl App {
                         run.worker_input_cursor = 0;
                     }
                     self.remember_task_history(&draft);
-                    self.refine_plan(&draft);
+                    // Talking to an orchestrator pane edits THAT orchestrator's plan,
+                    // and is now the only way to do it: the task pane always starts a
+                    // standalone worker instead. Before approval the message refines
+                    // the draft plan; once it is running the message conducts, so a
+                    // structural pivot rebases the DAG and anything else is injected
+                    // as work on top of it.
+                    if self.plan_is_active() {
+                        if self.classify_new_direction(&draft) {
+                            self.start_plan_rebase(&draft);
+                        } else {
+                            self.reconcile_injection(&draft);
+                        }
+                    } else {
+                        self.refine_plan(&draft);
+                    }
                 }
             }
             // Editing in the chat draft, at full parity with the task pane so a
@@ -2987,7 +3002,7 @@ impl App {
                 self.task_cursor = 1;
                 self.picker_index = 0;
                 self.notice = Some(
-                    "type /run for one mergeable worker, /ask for direct one-off, /plan for DAG, /resume to continue a chat you already started, /model, /main|/m, /usage, or /cloud"
+                    "just type for one isolated mergeable worker, /plan for a DAG, /main|/m for this checkout, /resume to continue a chat you already started, /model, /usage, or /cloud"
                         .to_string(),
                 );
             }
@@ -4224,35 +4239,6 @@ impl App {
             return;
         }
 
-        // CONDUCTING: a plan is already active and approved. Prefer the live
-        // high-level orchestrator when it exists so the user can talk to the
-        // conductor and let it decide whether to inspect, explain, add work, re-plan,
-        // merge, stop, or re-goal workers through RUDDER_* markers. Headless plans
-        // fall back to the local classifier.
-        if self.plan_is_active() {
-            if self.send_to_interactive_orchestrator(input) {
-                return;
-            }
-            if self.classify_new_direction(&input) {
-                self.start_plan_rebase(&input);
-            } else {
-                self.reconcile_injection(&input);
-            }
-            return;
-        }
-
-        // Completed DAG: keep the old live conductor only for status/retro/question
-        // style turns. Implementation-y follow-ups such as "launch separate agents
-        // to fix this" must start a fresh DAG directly; otherwise the request is just
-        // typed into the old orchestrator and depends on the model remembering to
-        // write a RUDDER_* marker.
-        if self.agents.iter().any(|run| run.node_id.is_some())
-            && completed_plan_input_is_conversation(input)
-            && self.send_to_interactive_orchestrator(input)
-        {
-            return;
-        }
-
         // The planner ran but produced NO DAG (it asked a clarifying question, or needs
         // more detail). It is left resumable; RESUME the same session with this message so
         // the planning conversation continues, instead of starting a fresh planner that
@@ -4262,11 +4248,18 @@ impl App {
             return;
         }
 
-        // Default first task (no active plan): one end-to-end owner in the real
-        // checkout. This matches a direct Codex/Claude session: implementation,
-        // verification, and an explicitly requested deployment stay in one
-        // conversation. `/plan` remains the explicit multi-workspace DAG route.
-        self.start_or_continue_default_main(input);
+        // DEFAULT: one isolated worker in its own jj workspace, always.
+        //
+        // Plain input used to mean "one end-to-end agent in the real checkout", and
+        // while a plan was running it was instead routed into the orchestrator as
+        // conducting. Both are gone. A typed task now means the same thing no matter
+        // what else is on screen: a standalone mergeable worker that touches nothing
+        // but its own workspace. Editing a plan is done by talking to that
+        // orchestrator's own pane, which is unambiguous once several plans can run at
+        // once — a single global input could not say WHICH plan it meant.
+        // `/plan` is the only route to an orchestrator; `/main` is the only route
+        // into the shared checkout.
+        self.start_single_run_task(input);
     }
 
     /// Queue a deferred Enter for `run_id`, flushed by `flush_pending_enters`
@@ -5681,15 +5674,6 @@ impl App {
         self.focus_or_spawn_main_with_prompt("");
     }
 
-    fn start_or_continue_default_main(&mut self, input: &str) {
-        if let Some(index) = self.agents.iter().position(AgentRun::is_main) {
-            self.selected_agent = index;
-            self.focus_or_spawn_main_with_prompt(input);
-        } else {
-            self.handle_main_command(input);
-        }
-    }
-
     fn focus_or_spawn_main_with_prompt(&mut self, override_prompt: &str) {
         let main_index = match self.selected_main_index() {
             Some(idx) => idx,
@@ -5883,74 +5867,6 @@ impl App {
     /// worktree, no DAG node) that the user talks to for a question or a small change. It
     /// can edit the working tree directly. Selected + focused so the user can converse
     /// immediately (keys forward to its PTY via the normal worker path).
-    fn start_oneoff_task(&mut self, input: &str) {
-        let input = input.trim();
-        if input.is_empty() {
-            return;
-        }
-        let backend = self.backend;
-        let model = self.model.clone();
-        let effort = self.effort;
-        let session_id = mint_session_id_for(backend);
-        let mut run = create_oneoff_agent(&self.cwd, backend, &model, effort, input);
-        let run_id = run.id.clone();
-        let mut command = agent_command(
-            backend,
-            &model,
-            effort,
-            input,
-            AgentMode::OneOff,
-            session_id.as_deref(),
-        );
-        signals::augment_worker_command(&mut command, backend, AgentMode::OneOff, &run_id);
-        let done_file = worker_done_file(&self.cwd, &run_id);
-        let _ = std::fs::remove_file(&done_file);
-        command = command.with_env("RUDDER_DONE_FILE", done_file.to_string_lossy().to_string());
-        let options = TerminalPaneOptions {
-            size: run.terminal_size.unwrap_or_default(),
-            cwd: Some(self.cwd.clone()),
-            ..TerminalPaneOptions::default()
-        };
-        match TerminalPane::spawn_shell_or_command(Some(command), options) {
-            Ok(mut terminal) => {
-                let _ = terminal.drain_output();
-                Self::attach_output_waker(&self.pty_output_waker, &terminal);
-                run.terminal = Some(terminal);
-                run.status = AgentStatus::Running;
-                run.session_id = session_id;
-                run.last_output_at = Instant::now();
-                self.notice = Some(
-                    "one-off agent — talk to it; it edits the main checkout directly".to_string(),
-                );
-            }
-            Err(error) => {
-                run.status = AgentStatus::Failed;
-                run.last_error = Some(error.to_string());
-                self.notice = Some(format!("one-off launch failed: {error}"));
-            }
-        }
-        let spawned = run.terminal.is_some();
-        telemetry::emit_event(
-            "agent_started",
-            serde_json::json!({
-                "mode": "ask",
-                "backend": run.backend.as_str(),
-                "model": run.model,
-                "spawned": spawned,
-            }),
-        );
-        let _ = save_native_run_record(&self.cwd, &run);
-        self.agents.push(run);
-        self.selected_agent = self.agents.len().saturating_sub(1);
-        self.focus = if spawned {
-            FocusPane::Worker
-        } else {
-            FocusPane::Task
-        };
-        self.worker_view = WorkerView::Terminal;
-        self.dirty = true;
-    }
-
     /// `/restore claude|codex <session-id>`: reopen an existing CLI conversation
     /// in a new agent pane with all permissions bypassed (claude:
     /// `--permission-mode bypassPermissions`, codex:
@@ -6135,8 +6051,8 @@ impl App {
         }
     }
 
-    /// `rudder handoff --here`: continue the conversation in the MAIN checkout, like
-    /// `/ask`. No workspace, no merge step — the fork edits the user's tree directly,
+    /// `rudder handoff --here`: continue the conversation in the MAIN checkout.
+    /// No workspace, no merge step — the fork edits the user's tree directly,
     /// which is what they want when the chat was already about these exact files.
     fn start_handoff_in_main_checkout(
         &mut self,
@@ -6507,36 +6423,6 @@ impl App {
                 }
                 true
             }
-            Some("/run") => {
-                // Force one isolated implementation worker. This skips the
-                // planner/DAG, but unlike /ask it is mergeable through m/M.
-                let rest = command_rest(input, "/run").trim();
-                // `/run main <prompt>` puts the agent in the MAIN checkout instead
-                // of an isolated workspace, and starts a NEW one each time —
-                // several agents on the main branch at once is a supported way to
-                // work, not a mistake.
-                let main_rest = rest
-                    .strip_prefix("main")
-                    .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
-                    .map(str::trim);
-                if let Some(prompt) = main_rest {
-                    self.handle_main_command(prompt);
-                    self.notice = Some(if prompt.is_empty() {
-                        "main-checkout agent started — it edits this tree directly, nothing to merge"
-                            .to_string()
-                    } else {
-                        "started in the main checkout — it edits this tree directly · /run <task> for an isolated mergeable worker".to_string()
-                    });
-                } else if rest.is_empty() {
-                    self.notice = Some(
-                        "usage: /run <task> — one isolated jj worker, no DAG; merge with m or /merge-all · /run main <task> runs it in the main checkout instead"
-                            .to_string(),
-                    );
-                } else {
-                    self.start_single_run_task(rest);
-                }
-                true
-            }
             Some("/restore") => {
                 // Reopen an existing claude/codex CLI conversation in a new agent
                 // pane, continuing the SAME session with all permissions bypassed.
@@ -6619,20 +6505,6 @@ impl App {
                 }
                 true
             }
-            Some("/ask") => {
-                // The escape hatch from the orchestrator default: a one-off
-                // conversational agent in the main checkout, no DAG.
-                let rest = command_rest(input, "/ask").trim();
-                if rest.is_empty() {
-                    self.notice = Some(
-                        "usage: /ask <question or small change>: one-off agent in the main checkout, no DAG"
-                            .to_string(),
-                    );
-                } else {
-                    self.start_oneoff_task(rest);
-                }
-                true
-            }
             Some("/share") => {
                 // Durable, gitignored local context for all Rudder agents. Use this for
                 // API tokens, private URLs, account ids, env details, and anything else
@@ -6703,7 +6575,7 @@ impl App {
             }
             Some("/help") => {
                 self.notice = Some(
-                    "plain input -> one end-to-end main agent · /plan <task> -> isolated multi-agent DAG · /run <task> -> one isolated mergeable worker · /run main <task> -> another agent in this checkout · /ask <text> -> direct one-off · panes: Option-1/2/3 or ^W · keys: j/k select · Option-[ / Option-] step agents from any pane · Enter focus · v diff · m merge · u undo a merge · M merge all · R review all · g nest · o web ui · x stop · b branch chat · dd delete · cc clear merged · P model; commands: /model /fast /sound /color /main /run /ask /plan /resume /restore /share /usage /goal /cloud /web /feedback"
+                    "plain input -> one isolated mergeable worker in its own jj workspace · /plan <task> -> an orchestrator that plans and runs a DAG · /main|/m <task> -> another agent in this shared checkout · panes: Option-1/2/3 or ^W · keys: j/k select · Option-[ / Option-] step agents from any pane · Enter focus · v diff · m merge · u undo a merge · M merge all · R review all · g nest · o web ui · x stop · b branch chat · dd delete · cc clear merged · P model; commands: /model /fast /sound /color /main /plan /resume /restore /share /usage /goal /cloud /web /feedback"
                         .to_string(),
                 );
                 true
@@ -7860,7 +7732,8 @@ impl App {
             if rest.is_empty() {
                 self.notice = Some("RUDDER_RUN requires a task".to_string());
             } else {
-                self.handle_command(&format!("/run {rest}"));
+                // `/run` is gone; one isolated worker is what plain input means now.
+                self.start_single_run_task(rest);
             }
             return;
         }
@@ -7886,12 +7759,15 @@ impl App {
             }
             return;
         }
+        // RUDDER_ASK is retired along with `/ask`. Older orchestrator sessions (and
+        // any model working from a stale prompt) can still emit it, so route it to
+        // the main checkout rather than dropping the request on the floor.
         if let Some(rest) = marker.strip_prefix("RUDDER_ASK") {
             let rest = rest.trim();
             if rest.is_empty() {
-                self.notice = Some("RUDDER_ASK requires a question or small change".to_string());
+                self.notice = Some("RUDDER_ASK is retired; use RUDDER_MAIN <prompt>".to_string());
             } else {
-                self.handle_command(&format!("/ask {rest}"));
+                self.handle_command(&format!("/main {rest}"));
             }
             return;
         }
@@ -14428,49 +14304,6 @@ fn is_orchestrator_skill_marker(line: &str) -> bool {
     ]
     .iter()
     .any(|marker| line == *marker || line.starts_with(&format!("{marker} ")))
-}
-
-fn completed_plan_input_is_conversation(input: &str) -> bool {
-    let text = input.trim().to_ascii_lowercase();
-    if text.is_empty() {
-        return false;
-    }
-
-    // Work-launching language after a completed DAG should create a fresh task set
-    // directly, not rely on a long-lived conductor to remember the RUDDER_* marker API.
-    const WORK_VERBS: &[&str] = &[
-        "add ",
-        "build ",
-        "create ",
-        "deploy ",
-        "do more",
-        "fix ",
-        "implement ",
-        "launch ",
-        "merge ",
-        "new task",
-        "new tasks",
-        "run ",
-        "separate agent",
-        "ship ",
-        "spawn ",
-        "start ",
-        "wire ",
-    ];
-    if WORK_VERBS.iter().any(|needle| text.contains(needle)) {
-        return false;
-    }
-
-    const QUESTION_PREFIXES: &[&str] = &[
-        "are ", "can ", "could ", "did ", "do ", "does ", "how ", "is ", "should ", "status",
-        "what ", "what's", "whats ", "when ", "where ", "who ", "why ",
-    ];
-    text.ends_with('?')
-        || text.contains("what's the deal")
-        || text.contains("whats the deal")
-        || QUESTION_PREFIXES
-            .iter()
-            .any(|prefix| text.starts_with(prefix))
 }
 
 fn handle_event(app: &mut App, event: Event) -> bool {

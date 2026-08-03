@@ -642,7 +642,7 @@ fn web_conductor_steer_uses_task_input_path_without_a_live_conductor() {
     assert!(
         app.notice
             .as_deref()
-            .is_some_and(|notice| notice.contains("plain input -> one end-to-end main agent")),
+            .is_some_and(|notice| notice.contains("plain input -> one isolated mergeable worker")),
         "task-input command result remains visible: {:?}",
         app.notice
     );
@@ -1388,14 +1388,19 @@ fn undo_needs_a_merged_row_and_a_recorded_operation() {
 }
 
 #[test]
-fn run_main_starts_another_agent_in_the_checkout() {
+fn main_command_starts_another_agent_in_the_checkout() {
     // Several agents on the main branch at once is a supported way to work, so
-    // `/run main <task>` adds one rather than reusing or replacing the existing.
+    // `/main <task>` adds one rather than reusing or replacing the existing. It is
+    // up to the user to manage what they are doing to each other.
     let mut app = App::new();
-    app.handle_command("/run main fix the slack reply");
+    app.handle_command("/main fix the slack reply");
     assert_eq!(app.agents.len(), 1);
-    app.handle_command("/run main check the PR sandbox");
-    assert_eq!(app.agents.len(), 2, "a second main-checkout agent, not a reuse");
+    app.handle_command("/m check the PR sandbox");
+    assert_eq!(
+        app.agents.len(),
+        2,
+        "a second main-checkout agent, not a reuse"
+    );
     for run in &app.agents {
         assert!(run.is_main(), "both rows run in the checkout");
         assert!(run.worktree_path.is_none(), "no workspace, nothing to merge");
@@ -1403,29 +1408,6 @@ fn run_main_starts_another_agent_in_the_checkout() {
     // Distinct ids: their run records, hook configs and stop requests must not
     // collide, which is what makes several of them safe to run at once.
     assert_ne!(app.agents[0].id, app.agents[1].id);
-    let notice = app.notice.as_deref().unwrap_or_default();
-    assert!(
-        notice.contains("main checkout"),
-        "the notice says where it landed: {notice}"
-    );
-
-    // `main` counts ONLY as its own word directly after /run. Anything that merely
-    // starts with those four letters is a task, and gets an isolated worker.
-    for task in [
-        "/run mainframe migration",
-        "/run main-thread deadlock",
-        "/run maintain the docs",
-        "/run Main menu is broken",
-    ] {
-        app.notice = None;
-        let before = app.agents.len();
-        app.handle_command(task);
-        assert!(app.agents.len() > before, "{task} started something");
-        assert!(
-            app.agents.last().is_some_and(|run| !run.is_main()),
-            "{task} is a task, not the main keyword"
-        );
-    }
 }
 
 #[test]
@@ -10616,7 +10598,7 @@ fn approval_keeps_the_orchestrator_live_and_mirrors_graph() {
 
 #[cfg(not(windows))]
 #[test]
-fn task_input_routes_to_live_orchestrator_after_launch() {
+fn task_input_reaches_the_orchestrator_while_a_plan_awaits_approval() {
     let _env = env_guard();
     let repo = unique_test_repo("orch-task-forward");
     let capture = repo.join("orchestrator-input.txt");
@@ -10654,6 +10636,11 @@ fn task_input_routes_to_live_orchestrator_after_launch() {
     worker.status = AgentStatus::Running;
     app.agents.push(worker);
 
+    // The ONLY surviving route from the task pane into an orchestrator: a plan is
+    // parsed and waiting for approval, so a typed message is feedback on that draft.
+    // Once a plan is running, the task pane starts its own worker instead and the
+    // orchestrator is edited by talking to its own pane.
+    app.awaiting_approval = true;
     app.start_task_from_input("what is happening?");
     // The submitting CR is deferred (paste-detection guard); force it due and flush.
     for pending in &mut app.pending_enters {
@@ -10728,6 +10715,7 @@ fn task_input_sends_enter_key_to_live_orchestrator() {
     worker.status = AgentStatus::Running;
     app.agents.push(worker);
 
+    app.awaiting_approval = true;
     app.start_task_from_input("go!");
     // The submitting CR is deferred (paste-detection guard); force it due and flush.
     for pending in &mut app.pending_enters {
@@ -10753,7 +10741,7 @@ fn task_input_sends_enter_key_to_live_orchestrator() {
 
 #[cfg(not(windows))]
 #[test]
-fn completed_plan_launch_followup_starts_main_owner_not_old_conductor() {
+fn completed_plan_followup_starts_its_own_worker_not_the_old_conductor() {
     let _env = env_guard();
     let repo = unique_test_repo("completed-plan-fresh-dag");
     let old_capture = repo.join("old-orchestrator-input.txt");
@@ -10803,99 +10791,28 @@ fn completed_plan_launch_followup_starts_main_owner_not_old_conductor() {
         "work-launching follow-up was not typed into the completed plan's conductor"
     );
     let selected = &app.agents[app.selected_agent];
+    assert_eq!(
+        selected.mode,
+        AgentMode::Execute,
+        "a follow-up after a completed plan gets its own isolated worker, not the old conductor"
+    );
+    assert!(!selected.is_main(), "it does not touch the user's checkout");
     assert!(
-        selected.is_main(),
-        "plain follow-up gets one end-to-end owner"
+        selected
+            .current_prompt
+            .contains("launch separate agents to fix this then merge them all"),
+        "the worker receives the full follow-up request inside its objective scaffold: {:?}",
+        selected.current_prompt
     );
-    assert_eq!(selected.mode, AgentMode::Main);
-    assert_eq!(
-        selected.current_prompt, "launch separate agents to fix this then merge them all",
-        "the main owner receives the full follow-up request"
-    );
-    assert_eq!(
-        app.agents.iter().filter(|run| run.is_main()).count(),
-        1,
-        "plain routing creates only one main owner"
+    assert!(
+        !app.agents.iter().any(|run| run.is_main()),
+        "plain routing never creates a main-checkout agent"
     );
 
     for run in &mut app.agents {
         run.terminal = None;
     }
     std::env::remove_var("RUDDER_CODEX_BIN");
-    let _ = fs::remove_dir_all(&repo);
-}
-
-#[cfg(not(windows))]
-#[test]
-fn completed_plan_status_question_still_goes_to_old_conductor() {
-    let _env = env_guard();
-    let repo = unique_test_repo("completed-plan-status-conductor");
-    let capture = repo.join("orchestrator-input.bin");
-    let ready = repo.join("orchestrator-ready");
-    let script = format!(
-        "stty raw -echo; : > {}; dd bs=1 count=32 of={} 2>/dev/null; sleep 1",
-        shell_single_quote(&ready.to_string_lossy()),
-        shell_single_quote(&capture.to_string_lossy())
-    );
-    let command = TerminalCommand::with_args("/bin/sh", vec!["-lc".to_string(), script]);
-    let pane = TerminalPane::spawn_shell_or_command(
-        Some(command),
-        TerminalPaneOptions {
-            size: TerminalSize { rows: 10, cols: 80 },
-            scrollback_lines: 100,
-            ..Default::default()
-        },
-    )
-    .expect("spawn orchestrator pty");
-
-    for _ in 0..40 {
-        if ready.exists() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
-    assert!(ready.exists(), "orchestrator pty is ready for input");
-
-    let mut app = App::new();
-    app.cwd = repo.clone();
-    app.interactive_orchestrator = true;
-    let mut orch = test_agent_run("orch-1", "old plan");
-    orch.cwd = repo.clone();
-    orch.mode = AgentMode::RudderPlan;
-    orch.backend = Backend::Claude;
-    orch.autosteered = false;
-    orch.interactive_orchestrator = true;
-    orch.status = AgentStatus::Running;
-    orch.terminal = Some(pane);
-    app.agents.push(orch);
-
-    let mut completed = test_agent_run("run-1", "old node");
-    completed.cwd = repo.clone();
-    completed.node_id = Some("n0".to_string());
-    completed.status = AgentStatus::Merged;
-    app.agents.push(completed);
-
-    app.start_task_from_input("what is the status?");
-    // The submitting CR is deferred (paste-detection guard); force it due and flush.
-    for pending in &mut app.pending_enters {
-        pending.due = Instant::now() - Duration::from_millis(1);
-    }
-    app.flush_pending_enters();
-
-    let mut captured = Vec::new();
-    for _ in 0..40 {
-        if let Ok(bytes) = fs::read(&capture) {
-            captured = bytes;
-            if captured.len() >= 32 {
-                break;
-            }
-        }
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
-    assert_eq!(captured, b"\x1b[200~what is the status?\x1b[201~\r");
-    assert_eq!(app.selected_agent, 0, "the old conductor stays selected");
-    assert_eq!(app.notice.as_deref(), Some("sent to orchestrator"));
-
     let _ = fs::remove_dir_all(&repo);
 }
 
@@ -11132,11 +11049,14 @@ fn reconcile_planner_with_block(app: &App, block: &str) -> AgentRun {
 }
 
 #[test]
-fn second_task_routes_to_reconcile_when_plan_active() {
+fn a_typed_task_never_touches_a_running_plan() {
     let mut app = App::new();
     app.cwd = std::env::temp_dir();
-    // A plan is active: a node is queued. A newly typed task must reconcile into
-    // the existing plan, not spawn a fresh planner that would replace it.
+    // A plan is active: a node is queued. A newly typed task used to be reconciled
+    // INTO that plan. It no longer is - the task pane always starts its own
+    // standalone worker, and editing a plan is done by talking to that
+    // orchestrator's pane. With several plans able to run at once, a single global
+    // input could not say which plan it meant.
     app.planned_nodes = vec![test_planned_node("n0", &[])];
     assert!(app.plan_is_active(), "queued nodes mean a plan is active");
 
@@ -11144,19 +11064,19 @@ fn second_task_routes_to_reconcile_when_plan_active() {
     let before_nodes = app.planned_nodes.len();
     app.start_task_from_input("add a second feature");
 
-    // Exactly one new agent appeared and it is a reconcile planner (not a fresh
-    // initial planner). The existing queued node is untouched (not replaced).
-    assert_eq!(app.agents.len(), before_agents + 1, "one planner spawned");
-    let spawned = app.agents.last().expect("a spawned planner");
-    assert_eq!(spawned.mode, AgentMode::RudderPlan);
-    assert!(
-        spawned.reconcile_planner,
-        "an active plan routes the second task to a RECONCILE planner"
+    assert_eq!(app.agents.len(), before_agents + 1, "one worker spawned");
+    let spawned = app.agents.last().expect("a spawned worker");
+    assert_eq!(
+        spawned.mode,
+        AgentMode::Execute,
+        "a standalone worker, not a reconcile planner"
     );
+    assert!(!spawned.reconcile_planner);
+    assert!(spawned.node_id.is_none(), "it joins no DAG");
     assert_eq!(
         app.planned_nodes.len(),
         before_nodes,
-        "the existing queued node is preserved, not wiped by a fresh plan"
+        "the running plan is left exactly as it was"
     );
 }
 
@@ -11250,11 +11170,13 @@ fn completed_plan_does_not_hijack_a_new_task_into_refine() {
 
 #[cfg(not(windows))]
 #[test]
-fn default_task_input_goes_to_one_end_to_end_main_owner() {
-    // Plain task input is owned end-to-end in the main checkout. /plan is the
-    // explicit isolated DAG path and /ask remains the explicit one-off path.
+fn default_task_input_starts_one_isolated_mergeable_worker() {
+    // Plain task input means ONE isolated worker in its own jj workspace. It used
+    // to mean an end-to-end agent in the real checkout; that is now `/main`, and
+    // `/plan` is the only route to an orchestrator. The safe thing is the default:
+    // typing a task cannot touch the user's tree.
     let _env = env_guard();
-    let repo = unique_test_repo("default-orch");
+    let repo = unique_test_repo("default-worker");
     let worker = repo.join("fake-worker.sh");
     write_fake_bin(&worker, FAKE_CONDUCTOR_WORKER);
     std::env::set_var("RUDDER_CODEX_BIN", &worker);
@@ -11266,15 +11188,19 @@ fn default_task_input_goes_to_one_end_to_end_main_owner() {
 
     app.start_task_from_input("build the first feature for the app");
 
-    let spawned = app.agents.last().expect("a main owner spawned");
+    let spawned = app.agents.last().expect("a worker spawned");
     assert_eq!(
         spawned.mode,
-        AgentMode::Main,
-        "plain input starts a main owner, not a planner"
+        AgentMode::Execute,
+        "plain input starts an isolated worker, not a main owner or a planner"
     );
-    assert!(spawned.is_main());
+    assert!(!spawned.is_main(), "it does not run in the user's checkout");
     assert!(!spawned.is_oneoff());
     assert!(!spawned.is_orchestrator());
+    assert!(
+        spawned.node_id.is_none(),
+        "one manual worker, not a DAG node"
+    );
 
     std::env::remove_var("RUDDER_CODEX_BIN");
     let _ = fs::remove_dir_all(&repo);
@@ -11308,64 +11234,29 @@ fn plan_command_starts_orchestrator_for_dag_work() {
 
 #[cfg(not(windows))]
 #[test]
-fn run_command_starts_single_execute_worker() {
-    let _env = env_guard();
-    let repo = unique_test_repo("run-cmd");
-    let worker = repo.join("fake-worker.sh");
-    write_fake_bin(&worker, FAKE_CONDUCTOR_WORKER);
-    std::env::set_var("RUDDER_CODEX_BIN", &worker);
-
+fn retired_slash_commands_are_not_silently_reinterpreted() {
+    // `/run` and `/ask` are gone: `/run`'s behavior is what plain input does now,
+    // and `/ask` is gone entirely. Neither may fall through and spawn an agent
+    // whose prompt is the literal "/run build the settings panel" - the unknown
+    // command guard has to catch them and say so.
     let mut app = App::new();
-    app.cwd = repo.clone();
-    app.backend = Backend::Codex;
+    app.cwd = std::env::temp_dir();
 
-    let handled = app.handle_command("/run build the settings panel");
-    assert!(handled, "/run is a recognized command");
-    let spawned = app
-        .agents
-        .last()
-        .expect("an execute worker spawned by /run");
-    assert_eq!(spawned.mode, AgentMode::Execute);
-    assert!(
-        !spawned.is_oneoff(),
-        "/run is not the direct main-checkout one-off path"
-    );
-    assert!(
-        !spawned.is_orchestrator(),
-        "/run skips the planner/orchestrator path"
-    );
-    assert!(
-        spawned.node_id.is_none(),
-        "/run creates one manual worker, not a DAG node"
-    );
-
-    if let Some(run) = app.agents.last_mut() {
-        run.terminal = None;
+    for retired in ["/run build the settings panel", "/ask explain the build"] {
+        app.notice = None;
+        let before = app.agents.len();
+        app.start_task_from_input(retired);
+        assert_eq!(
+            app.agents.len(),
+            before,
+            "{retired} must not spawn anything"
+        );
+        let notice = app.notice.as_deref().unwrap_or_default();
+        assert!(
+            notice.contains("unknown command"),
+            "{retired} is reported as unknown: {notice}"
+        );
     }
-    std::env::remove_var("RUDDER_CODEX_BIN");
-    let _ = fs::remove_dir_all(&repo);
-}
-
-#[cfg(not(windows))]
-#[test]
-fn ask_command_starts_oneoff_alias() {
-    let _env = env_guard();
-    let repo = unique_test_repo("ask-cmd");
-    let worker = repo.join("fake-worker.sh");
-    write_fake_bin(&worker, FAKE_CONDUCTOR_WORKER);
-    std::env::set_var("RUDDER_CODEX_BIN", &worker);
-
-    let mut app = App::new();
-    app.cwd = repo.clone();
-    app.backend = Backend::Codex;
-
-    let handled = app.handle_command("/ask explain the build script");
-    assert!(handled, "/ask is a recognized command");
-    let spawned = app.agents.last().expect("a one-off agent spawned by /ask");
-    assert_eq!(spawned.mode, AgentMode::OneOff);
-
-    std::env::remove_var("RUDDER_CODEX_BIN");
-    let _ = fs::remove_dir_all(&repo);
 }
 
 #[cfg(not(windows))]
