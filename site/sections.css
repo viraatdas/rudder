@@ -216,11 +216,23 @@
   border-top: 2px solid var(--rule-strong);
 }
 
+/* Drawn, not a Unicode arrow standing in for an icon: stroked at the same 1px
+ * the rules are, so the mark belongs to the form rather than to the font. */
 .bus-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5em;
   font-family: var(--font-mono);
   font-size: 0.78rem;
   font-weight: 500;
   color: var(--ink);
+}
+
+.bus-arrow {
+  width: 8px;
+  height: 12px;
+  flex: none;
+  overflow: visible;
 }
 
 .bus-note {
