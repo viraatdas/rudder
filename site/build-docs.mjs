@@ -46,7 +46,7 @@ const ORDER = NAV.flatMap((section) => section.items.map(([slug]) => slug));
 const PAGES = {
   "": {
     title: "Overview",
-    lede: "Rudder runs coding agents in parallel on one repository. Every agent works in its own jj workspace, so several changes in flight cannot collide, and you review and merge them from one dashboard.",
+    lede: "Run coding agents in parallel on one repo. Each works in its own copy, so they cannot collide.",
     toc: [
       ["start", "Start in 60 seconds"],
       ["the-loop", "The whole loop"],
@@ -68,7 +68,7 @@ task and a second one starts beside it, unable to see or overwrite the first.</p
 
 <h2 id="the-loop">The whole loop</h2>
 <table class="docs-table">
-  <thead><tr><th>key</th><th>what happens</th></tr></thead>
+  <thead><tr><th>you do</th><th>what happens</th></tr></thead>
   <tbody>
     <tr><td>type a task</td><td>One isolated agent starts in its own workspace.</td></tr>
     <tr><td>Option-1 / 2 / 3</td><td>Agents list · the agent's terminal · the task box.</td></tr>
