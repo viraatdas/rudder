@@ -2060,6 +2060,12 @@ pub(crate) fn write_rudder_context_with_history(
                 .unwrap_or_default()
         ));
     }
+    // Legend for the `where=` token on every roster row below. Without it a worker
+    // reads sibling rows and assumes one shared tree — then looks for a sibling's
+    // edits that are not in its workspace, or tries to hand work over by writing a
+    // file into a directory nothing else can see. Stated once here rather than per
+    // row: RUDDER.md is re-read every turn, so the rows stay one line each.
+    body.push_str("\n## Where each agent works\n\nEvery row below carries `where=`. `where=workspace` means that agent has its OWN jj workspace — a private copy of the repo at `.rudder-worktrees/<name>` (its `cwd=`), isolated from the user's checkout and from every other agent; its work reaches the user only when Rudder integrates it. `where=main-checkout` means that agent edits the user's REAL files in place: several agents can share that tree, and they have nothing to merge.\n\nSo: a sibling's uncommitted edits are NOT in your tree and you cannot read them, waiting on a file a sibling is \"about to write\" will hang forever, and writing into another agent's workspace to hand work over does not work. Coordinate through this file, not the filesystem.\n");
     body.push_str("\n## Active local Rudder agents\n");
     let live_agents = agents
         .iter()
@@ -2073,8 +2079,13 @@ pub(crate) fn write_rudder_context_with_history(
     }
     if let Some(worktree) = pending {
         body.push_str(&format!(
-            "- starting node=- mode=execute status=starting backend=pending model=pending cwd={} branch={}\n",
+            "- starting node=- mode=execute status=starting backend=pending model=pending cwd={} where={} branch={}\n",
             worktree.path.display(),
+            if worktree.path_is_worktree {
+                "workspace"
+            } else {
+                "main-checkout"
+            },
             worktree.branch.as_deref().unwrap_or("current")
         ));
     }
@@ -2117,7 +2128,7 @@ pub(crate) fn write_rudder_context_with_history(
         "\nRead this file before making changes so you know what other Rudder agents are doing. If RUDDER_SHARED.md exists beside it, read that too; it is Rudder's gitignored file for user-shared credentials, API tokens, private URLs, and other local context that must survive model compaction.\n",
     );
     body.push_str(
-        "\n## Version control\n\nThis repo uses jj (Jujutsu), colocated with git. Each agent works in its own jj workspace; jj is authoritative. Inspect changes with `jj status` / `jj diff`. Run `jj log` to see every agent's workspace and its description — Rudder sets each workspace's change description to what that agent is doing and its status (e.g. `rudder[n3]: fix memory leak [done]`), so read them to see where sibling work is and avoid stepping on the same files.\n\nIMPLEMENTATION nodes: do NOT run commit/branch/merge yourself — Rudder snapshots and integrates your working copy, and pushing partial node work is wrong.\n\nSHIPPING (push / publish / deploy) is NOT automatic and is a separate step: Rudder integrates work into LOCAL git only — it NEVER pushes to a remote or deploys. If your task is to push, publish, or deploy, that IS your job: push the integrated result with `jj git push` (or `git push`), then run the project's deploy command (or rely on the host auto-deploying from the pushed remote, e.g. Netlify/Vercel). `merged` means local git only — nothing is on the remote or live until you push and deploy, so verify the actual remote/host before reporting something as deployed.\n",
+        "\n## Version control\n\nThis repo uses jj (Jujutsu), colocated with git. Workspace agents each have their own jj workspace, main-checkout agents share the user's; jj is authoritative. Inspect changes with `jj status` / `jj diff`. Run `jj log` to see every agent's workspace and its description — Rudder sets each workspace's change description to what that agent is doing and its status (e.g. `rudder[n3]: fix memory leak [done]`), so read them to see where sibling work is and avoid stepping on the same files.\n\nIMPLEMENTATION nodes: do NOT run commit/branch/merge yourself — Rudder snapshots and integrates your working copy, and pushing partial node work is wrong.\n\nSHIPPING (push / publish / deploy) is NOT automatic and is a separate step: Rudder integrates work into LOCAL git only — it NEVER pushes to a remote or deploys. If your task is to push, publish, or deploy, that IS your job: push the integrated result with `jj git push` (or `git push`), then run the project's deploy command (or rely on the host auto-deploying from the pushed remote, e.g. Netlify/Vercel). `merged` means local git only — nothing is on the remote or live until you push and deploy, so verify the actual remote/host before reporting something as deployed.\n",
     );
     {
         // One lock per write batch at the repo root (the TS side locks the same
@@ -2188,7 +2199,7 @@ fn append_agent_context_line(body: &mut String, agent: &AgentRun) {
         String::new()
     };
     body.push_str(&format!(
-        "- {} node={} mode={} status={}{} backend={} model={} cwd={}{}{}{} task=\"{}\"{}{}\n",
+        "- {} node={} mode={} status={}{} backend={} model={} cwd={} where={}{}{}{} task=\"{}\"{}{}\n",
         agent.id,
         node,
         agent.mode.as_str(),
@@ -2197,6 +2208,7 @@ fn append_agent_context_line(body: &mut String, agent: &AgentRun) {
         agent.backend.as_str(),
         agent.model,
         agent.cwd.display(),
+        agent_location_label(agent),
         deps,
         merge_state,
         delivery_state,
@@ -2204,6 +2216,22 @@ fn append_agent_context_line(body: &mut String, agent: &AgentRun) {
         current_prompt,
         did
     ));
+}
+
+/// Which tree a row's files actually live in. Derived from the cwd rather than
+/// from mode/workspace_name because the path is ground truth: workspaces are
+/// always created under `<repo>/.rudder-worktrees`, so this cannot drift out of
+/// sync with the spawn bookkeeping the way a mode lookup table would.
+fn agent_location_label(agent: &AgentRun) -> &'static str {
+    let under_rudder = agent
+        .cwd
+        .components()
+        .any(|component| component.as_os_str() == ".rudder-worktrees");
+    if under_rudder {
+        "workspace"
+    } else {
+        "main-checkout"
+    }
 }
 
 fn agent_is_live_for_context(agent: &AgentRun) -> bool {

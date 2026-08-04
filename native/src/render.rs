@@ -1317,7 +1317,16 @@ pub(crate) fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 
     let task_width = area.width.saturating_sub(4).max(12) as usize;
 
-    let main_count = app.agents.iter().filter(|a| a.is_main()).count();
+    // Mirrors `sectioned_agent_order`: a pinned planner draws in the orchestrator
+    // block above, so it must not also count as (or render in) the main section.
+    let main_indices: Vec<usize> = app
+        .agents
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| a.is_main() && !a.is_pinned_planner())
+        .map(|(index, _)| index)
+        .collect();
+    let main_count = main_indices.len();
     let run_total = app.agents.iter().filter(|a| !a.is_main()).count();
     let orchestrator_count = app.agents.iter().filter(|a| a.is_pinned_planner()).count();
 
@@ -1352,19 +1361,23 @@ pub(crate) fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         // / review / done / closed), each header carrying a count and omitted when
         // empty. Dependents nest under their parents within a section.
         if main_count > 0 {
-            lines.push(ListItem::new(Line::from(Span::styled(
-                "main",
-                header_style(focused),
-            ))));
-            for (index, agent) in app.agents.iter().enumerate() {
-                if !agent.is_main() {
-                    continue;
-                }
+            // Running several `/main` agents at once is supported, but they all edit
+            // the SAME working copy, so the header states it: with only the per-row
+            // "main" tag the shared-checkout risk had to be inferred by counting rows.
+            let noun = if main_count == 1 { "agent" } else { "agents" };
+            lines.push(ListItem::new(Line::from(vec![
+                Span::styled("main", header_style(focused)),
+                Span::styled(
+                    format!(" {main_count} {noun} · shared checkout"),
+                    muted_style(focused),
+                ),
+            ])));
+            for &index in &main_indices {
                 push_agent_row(
                     &mut lines,
                     app,
                     index,
-                    agent,
+                    &app.agents[index],
                     None,
                     focused,
                     task_width,

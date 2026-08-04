@@ -12916,6 +12916,61 @@ fn sectioned_render_emits_status_headers_with_counts() {
 }
 
 #[test]
+fn main_agents_group_into_one_shared_checkout_section() {
+    let mut app = App::new();
+    app.focus = FocusPane::Agents;
+    let mut push = test_agent_run("m1", "push the release");
+    push.mode = AgentMode::Main;
+    let mut deploy = test_agent_run("m2", "check the deploy");
+    deploy.mode = AgentMode::Main;
+    // A finished main agent still belongs to the main section, not to "review".
+    deploy.status = AgentStatus::Done;
+    let worker = test_agent_run("w", "fix login redirect"); // isolated: in progress
+    app.agents = vec![push, deploy, worker];
+
+    let area = Rect::new(0, 0, 34, 40);
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(34, 40)).expect("test backend");
+    terminal
+        .draw(|frame| render_agents(frame, area, &mut app))
+        .expect("draw agents pane");
+    let text: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+
+    let header = text
+        .find("main 2 agents · shared checkout")
+        .expect("main header names the count and the shared checkout");
+    let push_at = text.find("push the release").expect("first main row");
+    let deploy_at = text.find("check the deploy").expect("second main row");
+    let in_progress = text
+        .find("in progress")
+        .expect("worker section still renders");
+    let worker_at = text
+        .find("fix login redirect")
+        .expect("isolated worker row");
+    // Both main rows sit under the one header, above every status section; the
+    // isolated worker keeps its status bucket.
+    assert!(
+        header < push_at && push_at < deploy_at && deploy_at < in_progress,
+        "main rows group under the main header, above the status sections:\n{text}"
+    );
+    assert!(
+        in_progress < worker_at,
+        "isolated worker renders inside its status section:\n{text}"
+    );
+    assert_eq!(
+        text.matches("push the release").count(),
+        1,
+        "a main row renders once, not also in a status bucket:\n{text}"
+    );
+}
+
+#[test]
 fn cross_section_dependent_renders_dep_hint() {
     let mut app = App::new();
     app.focus = FocusPane::Agents;
