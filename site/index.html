@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Rudder — several changes to one repo, at once, that never touch</title>
+    <title>Rudder: several changes to one repo, at once, that never touch</title>
     <meta
       name="description"
       content="Rudder runs coding agents in parallel on one repository. Every agent works in its own jj workspace, so changes in flight cannot collide, and you review and merge them from one dashboard."
@@ -67,7 +67,7 @@
             <p class="lede">
               Run Claude Code, Codex and opencode in parallel on one repo. Each
               gets <strong>its own workspace</strong>, so they cannot touch each
-              other's work — or yours.
+              other's work, or yours.
             </p>
             <div class="install">
               <code id="install-command"
@@ -135,7 +135,7 @@
 
 <span class="ok">●</span> Read src/server/middleware.ts
 <span class="ok">●</span> Edit src/server/rate-limit.ts <span class="add">+64</span>
-<span class="ok">●</span> Bash npm test <span class="dim">— 41 passed</span>
+<span class="ok">●</span> Bash npm test <span class="dim">· 41 passed</span>
 
 <span class="run">▌</span> writing the burst-window test…</pre>
                 </div>
@@ -174,7 +174,7 @@
                 </div>
                 <div class="pane pane-main">
                   <div class="pane-label">nothing here is yours yet</div>
-                  <pre class="tty"><span class="dim">jj diff — .rudder-worktrees/settings-form</span>
+                  <pre class="tty"><span class="dim">jj diff · .rudder-worktrees/settings-form</span>
 
 <span class="dim">src/settings/Form.tsx</span>
 <span class="del">- const [state, setState] = useState(initial)</span>
@@ -335,7 +335,7 @@
       </main>
 
       <footer class="site-foot">
-        <span>Rudder — a terminal orchestrator for coding agents.</span>
+        <span>Rudder, a terminal orchestrator for coding agents.</span>
         <nav aria-label="Footer">
           <a href="/docs">Docs</a>
           <a href="https://github.com/viraatdas/rudder">GitHub</a>

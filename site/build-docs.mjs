@@ -231,7 +231,7 @@ whatever order they finish.</p>
 working-copy commit. Edits in one are invisible to the others until they are merged.
 Rudder gives every agent one.</p>
 <p>This is the reason several agents can work on the same files at the same time. They
-are not coordinating, taking turns, or locking anything. They simply cannot reach
+are not coordinating, taking turns, or locking anything. They cannot reach
 each other.</p>
 
 <h2 id="where">Where they live</h2>
@@ -494,7 +494,7 @@ function render(slug, page) {
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>${page.title} — Rudder docs</title>
+    <title>${page.title} · Rudder docs</title>
     <meta name="description" content="${page.lede.replace(/"/g, "&quot;")}" />
     <link rel="canonical" href="https://rudder.viraat.dev${canonical}" />
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
