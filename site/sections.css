@@ -247,30 +247,40 @@
 
 /* ---------- movements ---------- */
 
+/* Ruled rows, not an n-up grid.
+ *
+ * This was four columns side by side, which is the icon-heading-text feature
+ * grid PRODUCT.md lists as an anti-reference, wearing hairlines instead of card
+ * borders. The sheet above it is a two-column ruled form, so these read as more
+ * rows of the same form: label column, content column, one rule between each. */
 .movements {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(196px, 1fr));
   border-top: var(--hair) solid var(--rule-strong);
 }
 
 .movement {
-  padding: 20px 22px 24px 0;
+  display: grid;
+  grid-template-columns: minmax(0, 14rem) minmax(0, 1fr);
+  gap: 8px clamp(20px, 4vw, 56px);
+  align-items: baseline;
+  padding: 16px 0;
   border-bottom: var(--hair) solid var(--rule);
 }
 
 .movement h3 {
-  margin-bottom: 7px;
+  margin: 0;
 }
 
 .movement p {
   color: var(--ink-2);
-  font-size: 0.9rem;
-  max-width: 34ch;
+  font-size: 0.94rem;
+  max-width: 60ch;
 }
 
-.movement .field-label {
-  display: block;
-  margin-bottom: 11px;
+@media (max-width: 620px) {
+  .movement {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 5px;
+  }
 }
 
 /* ---------- what you type ---------- */
@@ -334,37 +344,47 @@
 
 /* ---------- the desk ---------- */
 
+/* The pane key IS the content here, so it sets in the key column rather than
+ * floating above the heading as a label. Was a fully boxed 3-up: the only boxed
+ * element on a page whose thesis is rules and not boxes, and the third n-up grid
+ * in a row. Now it is the same ruled two-column form as everything else, with
+ * the keys aligned down their own column so they read as a keyboard map. */
 .desk {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
-  border: var(--hair) solid var(--rule-strong);
+  border-top: var(--hair) solid var(--rule-strong);
 }
 
 .strip {
-  padding: 18px;
-  border-right: var(--hair) solid var(--rule);
+  display: grid;
+  grid-template-columns: minmax(0, 7rem) minmax(0, 1fr);
+  gap: 6px clamp(20px, 4vw, 56px);
+  align-items: baseline;
+  padding: 16px 0;
+  border-bottom: var(--hair) solid var(--rule);
 }
 
-.strip:last-child {
-  border-right: 0;
+.strip .field-label {
+  font-size: 0.78rem;
+  color: var(--ink);
 }
 
 .strip h3 {
-  margin: 10px 0 6px;
+  margin: 0;
 }
 
 .strip p {
-  font-size: 0.88rem;
+  grid-column: 2;
+  font-size: 0.94rem;
   color: var(--ink-2);
+  max-width: 60ch;
 }
 
-@media (max-width: 700px) {
+@media (max-width: 620px) {
   .strip {
-    border-right: 0;
-    border-bottom: var(--hair) solid var(--rule);
+    grid-template-columns: minmax(0, 1fr);
+    gap: 4px;
   }
-  .strip:last-child {
-    border-bottom: 0;
+  .strip p {
+    grid-column: 1;
   }
 }
 
