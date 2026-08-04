@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Install — Rudder docs</title>
+    <meta name="description" content="One global npm install. Rudder checks for jj on the way in and installs it if you do not have it." />
+    <link rel="canonical" href="https://rudder.viraat.dev/docs/install" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <meta name="theme-color" content="#ffffff" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/docs.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <div class="page">
+      <header class="site-head">
+        <a class="brand" href="/">
+          <img src="/favicon.svg" alt="" />
+          <span>Rudder</span>
+        </a>
+        <nav class="site-nav" aria-label="Primary">
+          <a href="/docs" aria-current="page">Docs</a>
+          <a href="https://github.com/viraatdas/rudder">GitHub</a>
+          <a href="https://www.npmjs.com/package/@viraatdas/rudder">npm</a>
+          <a href="/login">Sign in</a>
+        </nav>
+      </header>
+    </div>
+
+    <div class="docs">
+      <nav class="docs-nav" aria-label="Documentation">
+        <h2>get started</h2>
+        <ul>
+          <li><a href="/docs">Overview</a></li>
+          <li><a href="/docs/install" aria-current="page">Install</a></li>
+          <li><a href="/docs/first-agent">Your first agent</a></li>
+        </ul>
+        <h2>core</h2>
+        <ul>
+          <li><a href="/docs/workspaces">Workspaces</a></li>
+          <li><a href="/docs/plans">Plans and the DAG</a></li>
+        </ul>
+        <h2>reference</h2>
+        <ul>
+          <li><a href="/docs/commands">Commands and keys</a></li>
+          <li><a href="/docs/faq">FAQ</a></li>
+        </ul>
+      </nav>
+
+      <main class="docs-main" id="main">
+        <h1>Install</h1>
+        <p class="docs-lede">One global npm install. Rudder checks for jj on the way in and installs it if you do not have it.</p>
+<h2 id="install-it">Install it</h2>
+<pre><code><span class="prompt">$ </span>npm install -g @viraatdas/rudder@latest</code></pre>
+<p>Then, from inside any git repository:</p>
+<pre><code><span class="prompt">$ </span>cd ~/code/your-project
+<span class="prompt">$ </span>rudder</code></pre>
+<p>That opens the dashboard. On a repository Rudder has not seen before, it sets up
+the jj colocation it needs and leaves your git history alone.</p>
+
+<h2 id="jj">About jj</h2>
+<p>Rudder uses <a href="https://jj-vcs.github.io/jj/latest/">jj (Jujutsu)</a> as its
+isolation mechanism. jj sits <strong>alongside</strong> git in the same repository,
+so your git remotes, branches and history keep working exactly as before, and your
+teammates never need to know it is there.</p>
+<p>The install script checks for jj and installs it if it is missing. It never fails
+the install: if it cannot, it prints how to install jj yourself and exits cleanly.</p>
+
+<h2 id="agents">Agent CLIs</h2>
+<p>Rudder drives agent CLIs you have already installed and signed into. Install
+whichever you want to use:</p>
+<table class="docs-table">
+  <thead><tr><th>backend</th><th>what to install</th></tr></thead>
+  <tbody>
+    <tr><td>claude</td><td>Claude Code</td></tr>
+    <tr><td>codex</td><td>OpenAI Codex CLI</td></tr>
+    <tr><td>opencode</td><td>opencode</td></tr>
+  </tbody>
+</table>
+<p>You do not need all three. Rudder detects what is present and offers only those.</p>
+
+<h2 id="update">Updating</h2>
+<pre><code><span class="prompt">$ </span>npm install -g @viraatdas/rudder@latest</code></pre>
+<p>Rudder tells you in the dashboard when a newer version is published.</p>
+      <nav class="docs-pager" aria-label="Pagination">
+        <a class="prev" href="/docs"><span class="field-label">previous</span>Overview</a>
+        <a class="next" href="/docs/first-agent"><span class="field-label">next</span>Your first agent</a>
+      </nav>
+      </main>
+
+      <aside class="docs-toc">
+        <h2>on this page</h2>
+        <ul>
+            <li><a href="#install-it">Install it</a></li>
+            <li><a href="#jj">About jj</a></li>
+            <li><a href="#agents">Agent CLIs</a></li>
+            <li><a href="#update">Updating</a></li>
+        </ul>
+      </aside>
+    </div>
+  </body>
+</html>

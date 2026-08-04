@@ -1,410 +1,543 @@
-/* ---------- sections ---------- */
+/* Sections of the track sheet.
+ *
+ * Composition rule for this world: the page is one continuous ruled form. Blocks
+ * are separated by rules and space, never by cards with shadows. Where something
+ * is tabular in life (tracks, commands, options) it is set as a real ruled table.
+ */
+
+/* ---------- title block + the sheet ---------- */
+
+/* One column. An earlier two-column version parked the stamp bottom-right and
+ * left a large dead void above it; the stamp now belongs to the sheet, which is
+ * what it actually describes. */
+.titleblock {
+  padding: clamp(46px, 7vw, 86px) 0 clamp(30px, 4vw, 48px);
+}
+
+.titleblock h1 {
+  max-width: 16ch;
+}
+
+.titleblock .lede {
+  font-size: clamp(1rem, 1.35vw, 1.12rem);
+  color: var(--ink-2);
+  max-width: 48ch;
+  margin-top: 18px;
+}
+
+.titleblock .lede strong {
+  color: var(--ink);
+  font-weight: 500;
+}
+
+/* The sheet's own header: its title on the left, the run's stamped facts on the
+ * right, sitting on the rule that opens the table. */
+.sheet-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 12px 32px;
+  margin-bottom: 12px;
+}
+
+.sheet-head h2 {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  font-weight: 400;
+  letter-spacing: 0.05em;
+  color: var(--ink-3);
+}
+
+.stamp {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 26px;
+  margin: 0;
+}
+
+.stamp-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.stamp-row dt {
+  margin: 0;
+}
+
+.stamp-row dd {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 0.74rem;
+  color: var(--ink);
+}
+
+/* Install line: the one primary action, set as a machine command. */
+.install {
+  display: flex;
+  align-items: stretch;
+  margin-top: 26px;
+  border: var(--hair) solid var(--rule-strong);
+  max-width: 34rem;
+  background: var(--stock);
+}
+
+.install code {
+  font-family: var(--font-mono);
+  font-size: 0.83rem;
+  padding: 11px 13px;
+  flex: 1;
+  min-width: 0;
+  overflow-x: auto;
+  white-space: nowrap;
+  color: var(--ink);
+}
+
+.install .prompt {
+  color: var(--ink-3);
+  user-select: none;
+}
+
+.copy {
+  font-family: var(--font-mono);
+  font-size: 0.73rem;
+  padding: 0 15px;
+  border: 0;
+  border-left: var(--hair) solid var(--rule-strong);
+  background: var(--ink);
+  color: var(--stock);
+  cursor: pointer;
+  transition: background 140ms var(--ease-quint);
+}
+
+.copy:hover {
+  background: var(--work-deep);
+}
+
+.copy[data-copied="true"] {
+  background: var(--st-merged);
+}
+
+.actions-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 18px;
+  margin-top: 14px;
+  font-size: 0.85rem;
+}
+
+.actions-row a {
+  color: var(--ink-2);
+}
+
+/* ---------- the track sheet ---------- */
+
+.sheet-wrap {
+  overflow-x: auto;
+  padding-bottom: 2px;
+}
+
+.tracks {
+  width: 100%;
+  min-width: 640px;
+  border-collapse: collapse;
+  font-size: 0.875rem;
+  table-layout: fixed;
+}
+
+.tracks caption {
+  text-align: left;
+  padding-bottom: 9px;
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  color: var(--ink-3);
+  letter-spacing: 0.03em;
+}
+
+.tracks th {
+  text-align: left;
+  font-family: var(--font-mono);
+  font-size: 0.67rem;
+  font-weight: 400;
+  letter-spacing: 0.05em;
+  color: var(--ink-3);
+  padding: 0 12px 7px 0;
+  border-bottom: var(--hair) solid var(--rule-strong);
+  white-space: nowrap;
+}
+
+.tracks td {
+  padding: 13px 12px 13px 0;
+  border-bottom: var(--hair) solid var(--rule);
+  vertical-align: baseline;
+}
+
+.tracks tbody tr {
+  transition: background 120ms var(--ease-quint);
+}
+
+.tracks tbody tr:hover {
+  background: var(--stock-band);
+}
+
+.tracks .t-no {
+  width: 3.1rem;
+  font-family: var(--font-mono);
+  font-size: 0.76rem;
+  color: var(--ink-3);
+}
+
+.tracks .t-task {
+  color: var(--ink);
+  font-weight: 500;
+}
+
+.tracks .t-ws {
+  width: 30%;
+  font-family: var(--font-mono);
+  font-size: 0.76rem;
+  color: var(--ink-2);
+  overflow-wrap: anywhere;
+}
+
+.tracks .t-state {
+  width: 8.5rem;
+}
+
+/* The sum bus: every track lands here, and only when you say so. */
+.bus {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 10px 16px;
+  padding: 14px 0 0;
+  border-top: 2px solid var(--rule-strong);
+}
+
+.bus-label {
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  font-weight: 500;
+  color: var(--ink);
+}
+
+.bus-note {
+  font-size: 0.85rem;
+  color: var(--ink-3);
+}
+
+/* ---------- section rhythm ---------- */
+
 .section {
-  margin-top: clamp(84px, 11vw, 152px);
+  padding: clamp(54px, 7.5vw, 96px) 0 0;
 }
 
 .section-head {
-  max-width: 720px;
-}
-
-h2 {
-  margin: 0;
-  font-family: var(--font-display);
-  font-size: clamp(30px, 4.4vw, 50px);
-  line-height: 1.02;
-  font-weight: 600;
-  letter-spacing: -0.03em;
-  text-wrap: balance;
+  max-width: var(--measure);
+  margin-bottom: clamp(24px, 3.4vw, 38px);
 }
 
 .section-head p {
-  margin: 18px 0 0;
-  max-width: 60ch;
-  color: var(--muted);
-  font-size: clamp(16px, 1.5vw, 18px);
-  line-height: 1.6;
-  text-wrap: pretty;
+  margin-top: 13px;
+  color: var(--ink-2);
+  font-size: 1.02rem;
 }
 
-/* hero: dashboard screenshot */
-.shot {
-  margin: 0;
-  border: 1px solid var(--line);
-  border-radius: var(--radius-lg);
-  overflow: hidden;
-  background: var(--panel);
-  box-shadow: var(--shadow-md);
+/* ---------- movements ---------- */
+
+.movements {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(196px, 1fr));
+  border-top: var(--hair) solid var(--rule-strong);
 }
-.shot img {
+
+.movement {
+  padding: 20px 22px 24px 0;
+  border-bottom: var(--hair) solid var(--rule);
+}
+
+.movement h3 {
+  margin-bottom: 7px;
+}
+
+.movement p {
+  color: var(--ink-2);
+  font-size: 0.9rem;
+  max-width: 34ch;
+}
+
+.movement .field-label {
   display: block;
+  margin-bottom: 11px;
+}
+
+/* ---------- what you type ---------- */
+
+.table-wrap {
+  overflow-x: auto;
+}
+
+.commands {
   width: 100%;
-  height: auto;
+  min-width: 620px;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+  table-layout: fixed;
 }
 
-/* flow: describe -> plan -> run -> review -> merge */
-.flow {
-  display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
-  margin-top: 48px;
-  border-top: 1px solid var(--ink);
-}
-.flow-step {
-  padding: 24px 22px 0 22px;
-  min-height: 156px;
-  border-right: 1px solid var(--soft-line);
-}
-.flow-step:first-child {
-  padding-left: 0;
-}
-.flow-step:last-child {
-  border-right: 0;
-  padding-right: 0;
-}
-.flow-step .marker {
-  display: block;
-  margin-bottom: 16px;
+.commands th {
+  text-align: left;
   font-family: var(--font-mono);
-  font-size: 11.5px;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-  color: var(--faint);
-}
-.flow-step h3 {
-  margin: 0 0 8px;
-  font-family: var(--font-display);
-  font-size: 19px;
-  font-weight: 600;
-  letter-spacing: -0.01em;
-}
-.flow-step p {
-  margin: 0;
-  color: var(--muted);
-  font-size: 14.5px;
-  line-height: 1.5;
+  font-size: 0.67rem;
+  font-weight: 400;
+  letter-spacing: 0.05em;
+  color: var(--ink-3);
+  padding: 0 16px 7px 0;
+  border-bottom: var(--hair) solid var(--rule-strong);
 }
 
-/* feature trio: hairline columns, no boxes, no color noise */
-.features {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  margin-top: 48px;
-  border: 1px solid var(--line);
-}
-.feature {
-  padding: 30px 28px 34px;
-  border-right: 1px solid var(--line);
-}
-.feature:last-child {
-  border-right: 0;
-}
-.feature .tag {
-  display: block;
-  margin-bottom: 18px;
-  font-family: var(--font-mono);
-  font-size: 11.5px;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--accent);
-}
-.feature h3 {
-  margin: 0 0 12px;
-  font-family: var(--font-display);
-  font-size: 21px;
-  font-weight: 600;
-  letter-spacing: -0.02em;
-}
-.feature p {
-  margin: 0;
-  color: var(--muted);
-  font-size: 15px;
-  line-height: 1.6;
+.commands td {
+  padding: 15px 16px 15px 0;
+  border-bottom: var(--hair) solid var(--rule);
+  vertical-align: top;
 }
 
-/* principles: editorial two-column list, no numbers */
-.principles {
-  margin-top: 48px;
-  border-top: 1px solid var(--ink);
-}
-.principle {
-  display: grid;
-  grid-template-columns: minmax(0, 24ch) minmax(0, 1fr);
-  gap: clamp(20px, 5vw, 64px);
-  padding: 30px 0;
-  border-bottom: 1px solid var(--soft-line);
-  align-items: baseline;
-}
-.principle h3 {
-  margin: 0;
-  font-family: var(--font-display);
-  font-size: clamp(20px, 2.4vw, 27px);
-  font-weight: 600;
-  letter-spacing: -0.02em;
-  line-height: 1.1;
-}
-.principle p {
-  margin: 0;
-  max-width: 62ch;
-  color: var(--muted);
-  font-size: 16px;
-  line-height: 1.62;
+.commands .c-in {
+  width: 16rem;
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+  color: var(--work-deep);
+  font-weight: 500;
 }
 
-/* edit-the-plan: node editor + keys */
-.edit-stage {
-  display: grid;
-  grid-template-columns: minmax(0, 1.1fr) minmax(260px, 0.9fr);
-  gap: 16px;
-  margin-top: 48px;
-}
-.node-card {
-  border-radius: var(--radius-lg);
-  background: var(--screen-bg);
-  border: 1px solid var(--screen-line);
-  padding: 22px clamp(16px, 3vw, 28px) 24px;
-}
-.node-card .nc-head {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  margin-bottom: 18px;
-  font-family: var(--font-mono);
-  font-size: 12px;
-  color: var(--screen-muted);
-}
-.node-card .nc-chip {
-  padding: 3px 8px;
-  border-radius: var(--radius);
-  border: 1px solid var(--screen-line);
-  color: var(--screen-accent);
-  font-weight: 600;
-}
-.nc-field {
-  display: grid;
-  grid-template-columns: 92px minmax(0, 1fr);
-  gap: 14px;
-  align-items: baseline;
-  padding: 11px 0;
-  border-top: 1px solid var(--screen-line);
-}
-.nc-field:first-of-type {
-  border-top: 0;
-}
-.nc-field .k {
-  font-family: var(--font-mono);
-  font-size: 12px;
-  color: var(--screen-muted);
-}
-.nc-field .v {
-  font-size: 14.5px;
-  color: var(--screen-ink);
-  line-height: 1.4;
-}
-.nc-field .v.muted {
-  color: var(--screen-muted);
-}
-.nc-field.active .v {
-  color: #fff;
-}
-.nc-field.active .editcaret {
-  display: inline-block;
-  width: 2px;
-  height: 1.05em;
-  margin-left: 1px;
-  vertical-align: text-bottom;
-  background: var(--screen-accent);
-  animation: blink 1.05s steps(2, start) infinite;
-}
-.nc-field .editcaret {
-  display: none;
-}
-
-/* keys panel */
-.keys-card {
-  align-self: start;
-  border: 1px solid var(--line);
-  border-radius: var(--radius-lg);
-  background: var(--panel);
-  padding: 20px 22px;
-}
-.keys-card .keys-title {
-  display: block;
-  margin-bottom: 14px;
-  font-family: var(--font-mono);
-  font-size: 11.5px;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--faint);
-}
-.keys-row {
-  display: grid;
-  grid-template-columns: minmax(96px, max-content) minmax(0, 1fr);
-  gap: 14px;
-  align-items: center;
-  padding: 11px 0;
-  border-top: 1px solid var(--soft-line);
-}
-.keys-row:first-of-type {
-  border-top: 0;
-}
-kbd {
-  display: inline-flex;
-  align-items: center;
-  padding: 3px 7px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  background: var(--paper-2);
-  font-family: var(--font-mono);
-  font-size: 12px;
-  font-weight: 600;
+.commands .c-what {
   color: var(--ink);
-  white-space: nowrap;
-}
-.keys-row span {
-  color: var(--muted);
-  font-size: 14px;
-  line-height: 1.35;
+  font-weight: 500;
 }
 
-/* controls: three panes */
-.panes {
+.commands .c-what span {
+  display: block;
+  font-weight: 400;
+  color: var(--ink-2);
+  margin-top: 4px;
+  font-size: 0.87rem;
+}
+
+.commands .c-where {
+  width: 11rem;
+  font-family: var(--font-mono);
+  font-size: 0.76rem;
+  color: var(--ink-2);
+}
+
+/* ---------- the desk ---------- */
+
+.desk {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  margin-top: 48px;
-  border: 1px solid var(--line);
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  border: var(--hair) solid var(--rule-strong);
 }
-.pane {
-  padding: 28px 26px 30px;
-  border-right: 1px solid var(--line);
-  transition: background 160ms ease;
+
+.strip {
+  padding: 18px;
+  border-right: var(--hair) solid var(--rule);
 }
-.pane:last-child {
+
+.strip:last-child {
   border-right: 0;
 }
-.pane:hover {
-  background: var(--paper-2);
-}
-.pane .key {
-  display: inline-flex;
-  padding: 4px 8px;
-  margin-bottom: 18px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  color: var(--accent);
-  font-family: var(--font-mono);
-  font-size: 12.5px;
-  font-weight: 600;
-}
-.pane h3 {
-  margin: 0 0 12px;
-  font-family: var(--font-display);
-  font-size: clamp(22px, 2.6vw, 30px);
-  font-weight: 600;
-  letter-spacing: -0.02em;
-  line-height: 1;
-}
-.pane p {
-  margin: 0;
-  color: var(--muted);
-  font-size: 14.5px;
-  line-height: 1.5;
+
+.strip h3 {
+  margin: 10px 0 6px;
 }
 
-.control-extra {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(260px, 0.8fr);
-  gap: 16px;
-  margin-top: 16px;
+.strip p {
+  font-size: 0.88rem;
+  color: var(--ink-2);
 }
-.type-card {
-  border: 1px solid var(--line);
-  border-radius: var(--radius-lg);
-  background: var(--panel);
-  padding: 22px;
-  font-family: var(--font-mono);
-}
-.type-label {
-  display: block;
-  margin-bottom: 16px;
-  color: var(--faint);
-  font-size: 11.5px;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-}
-.typed-line {
-  color: var(--ink);
-  font-size: clamp(16px, 2.2vw, 22px);
-  line-height: 1.25;
-  overflow-wrap: anywhere;
-}
-.typed-line .gt {
-  color: var(--accent);
-}
-.cursor {
-  display: inline-block;
-  width: 0.55em;
-  color: var(--accent);
-  animation: blink 1s steps(2, start) infinite;
-}
-@keyframes blink {
-  50% {
-    opacity: 0;
+
+@media (max-width: 700px) {
+  .strip {
+    border-right: 0;
+    border-bottom: var(--hair) solid var(--rule);
+  }
+  .strip:last-child {
+    border-bottom: 0;
   }
 }
 
-/* closing cta: flat dark band */
-.cta {
-  margin-top: clamp(96px, 12vw, 168px);
-  padding: clamp(48px, 6vw, 84px) clamp(28px, 5vw, 64px);
-  border-radius: var(--radius-lg);
-  background: var(--screen-bg);
-  border: 1px solid var(--screen-line);
-}
-.cta h2 {
-  color: var(--screen-ink);
-  font-size: clamp(32px, 4.6vw, 54px);
-}
-.cta p {
-  margin: 16px 0 0;
-  max-width: 52ch;
-  color: var(--screen-muted);
-  font-size: clamp(16px, 1.6vw, 18px);
-  line-height: 1.55;
-}
-.cta .install {
-  border-color: var(--screen-line);
-  background: rgba(255, 255, 255, 0.03);
-}
-.cta .install code {
-  color: var(--screen-ink);
-}
-.cta .install code .prompt {
-  color: var(--screen-accent);
-}
-.cta .copy {
-  background: var(--screen-ink);
-  color: var(--screen-bg);
-  border-left-color: var(--screen-line);
-}
-.cta .button-link {
-  border-color: var(--screen-line);
-  color: var(--screen-ink);
-}
-.cta .button-link:hover {
-  background: rgba(255, 255, 255, 0.05);
+/* ---------- options ---------- */
+
+.options {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(238px, 1fr));
+  border-top: var(--hair) solid var(--rule-strong);
+  gap: 0 clamp(20px, 3vw, 44px);
 }
 
-footer {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 14px 28px;
-  align-items: center;
-  justify-content: space-between;
-  margin-top: 56px;
-  padding: 30px 0 56px;
-  border-top: 1px solid var(--line);
-  color: var(--muted);
-  font-size: 13.5px;
+.option-group {
+  padding: 20px 0 8px;
 }
-footer nav {
-  gap: 8px 20px;
+
+.option-group h3 {
+  margin-bottom: 4px;
+}
+
+.option-group > p {
+  font-size: 0.86rem;
+  color: var(--ink-3);
+  margin-bottom: 14px;
+}
+
+.option-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 0;
+}
+
+.option-list li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: baseline;
+  font-family: var(--font-mono);
+  font-size: 0.79rem;
+  color: var(--ink);
+  border-bottom: var(--hair) solid var(--rule);
+  padding: 7px 0;
+}
+
+.option-list li:last-child {
+  border-bottom: 0;
+}
+
+.option-list li em {
+  font-style: normal;
+  font-family: var(--font-form);
+  font-size: 0.79rem;
+  color: var(--ink-3);
+  text-align: right;
+}
+
+/* ---------- close ---------- */
+
+/* One gap, not two: this used to carry both a margin and a padding above the
+ * rule, which read as a hole in the page rather than a section break. */
+.close {
+  padding: clamp(48px, 6vw, 76px) 0 0;
+  border-top: var(--hair) solid var(--rule-strong);
+  margin-top: clamp(48px, 6vw, 76px);
+}
+
+.close h2 {
+  max-width: 18ch;
+}
+
+.close p {
+  margin-top: 14px;
+  color: var(--ink-2);
+  max-width: 52ch;
+}
+
+/* ---------------------------------------------------------------------------
+ * Narrow screens: the tables STACK instead of scrolling sideways.
+ *
+ * Horizontal scroll hid the state column entirely on a phone, which is the one
+ * column the sheet exists to show. Each row becomes its own labelled block, so
+ * nothing needs to be discovered by dragging.
+ * ------------------------------------------------------------------------- */
+
+@media (max-width: 720px) {
+  .tracks,
+  .commands {
+    min-width: 0;
+    display: block;
+  }
+
+  .tracks thead,
+  .commands thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+
+  .tracks tbody,
+  .commands tbody,
+  .tracks tr,
+  .commands tr {
+    display: block;
+    width: 100%;
+  }
+
+  .tracks tr,
+  .commands tr {
+    border-bottom: var(--hair) solid var(--rule-strong);
+    padding: 14px 0;
+  }
+
+  .tracks tr:last-child,
+  .commands tr:last-child {
+    border-bottom: 0;
+  }
+
+  /* These need the same specificity as the desktop column widths they undo,
+   * or the fixed widths survive and a path breaks one character per line. */
+  .tracks td,
+  .commands td,
+  .tracks .t-no,
+  .tracks .t-task,
+  .tracks .t-ws,
+  .tracks .t-state,
+  .commands .c-in,
+  .commands .c-what,
+  .commands .c-where {
+    display: grid;
+    grid-template-columns: 6.5rem minmax(0, 1fr);
+    gap: 12px;
+    width: auto;
+    padding: 3px 0;
+    border-bottom: 0;
+  }
+
+  .tracks .t-ws {
+    overflow-wrap: normal;
+  }
+
+  .tracks td::before,
+  .commands td::before {
+    content: attr(data-label);
+    font-family: var(--font-mono);
+    font-size: 0.66rem;
+    letter-spacing: 0.04em;
+    color: var(--ink-3);
+  }
+
+  .tracks .t-task,
+  .commands .c-what {
+    font-weight: 500;
+  }
+
+  /* A caption on a display:block table loses its full width and collapses into
+   * a narrow column, so it gets its width back explicitly. */
+  .tracks caption {
+    display: block;
+    width: 100%;
+    padding-bottom: 12px;
+  }
+}
+
+@media (max-width: 560px) {
+  .titleblock {
+    padding-top: 36px;
+  }
+  .sheet-head {
+    align-items: flex-start;
+  }
 }

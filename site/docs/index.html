@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Overview — Rudder docs</title>
+    <meta name="description" content="Rudder runs coding agents in parallel on one repository. Every agent works in its own jj workspace, so several changes in flight cannot collide, and you review and merge them from one dashboard." />
+    <link rel="canonical" href="https://rudder.viraat.dev/docs" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <meta name="theme-color" content="#ffffff" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/docs.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <div class="page">
+      <header class="site-head">
+        <a class="brand" href="/">
+          <img src="/favicon.svg" alt="" />
+          <span>Rudder</span>
+        </a>
+        <nav class="site-nav" aria-label="Primary">
+          <a href="/docs" aria-current="page">Docs</a>
+          <a href="https://github.com/viraatdas/rudder">GitHub</a>
+          <a href="https://www.npmjs.com/package/@viraatdas/rudder">npm</a>
+          <a href="/login">Sign in</a>
+        </nav>
+      </header>
+    </div>
+
+    <div class="docs">
+      <nav class="docs-nav" aria-label="Documentation">
+        <h2>get started</h2>
+        <ul>
+          <li><a href="/docs" aria-current="page">Overview</a></li>
+          <li><a href="/docs/install">Install</a></li>
+          <li><a href="/docs/first-agent">Your first agent</a></li>
+        </ul>
+        <h2>core</h2>
+        <ul>
+          <li><a href="/docs/workspaces">Workspaces</a></li>
+          <li><a href="/docs/plans">Plans and the DAG</a></li>
+        </ul>
+        <h2>reference</h2>
+        <ul>
+          <li><a href="/docs/commands">Commands and keys</a></li>
+          <li><a href="/docs/faq">FAQ</a></li>
+        </ul>
+      </nav>
+
+      <main class="docs-main" id="main">
+        <h1>Overview</h1>
+        <p class="docs-lede">Rudder runs coding agents in parallel on one repository. Every agent works in its own jj workspace, so several changes in flight cannot collide, and you review and merge them from one dashboard.</p>
+<h2 id="what-it-is">What it is</h2>
+<p>Rudder is a terminal dashboard that starts, watches, reviews and merges coding
+agents. It drives <strong>Claude Code</strong>, <strong>Codex</strong> and
+<strong>opencode</strong>: it does not replace them. Each agent runs in its own real
+terminal, with its own native prompts, inside a pane you can talk to.</p>
+<p>What Rudder adds is everything around the agent: where it works, what it can
+touch, how you see what it did, and how that reaches your main branch.</p>
+
+<h2 id="the-problem">The problem it solves</h2>
+<p>Running one agent is easy. Running four on the same repository is where it falls
+apart: they stash over each other, leave half-finished edits in your working tree,
+and you lose track of which branch holds what.</p>
+<p>Rudder's answer is isolation. Every agent gets a <strong>jj workspace</strong> of
+its own, outside your checkout. Four agents editing the same file are four separate
+trees. Nothing merges until you say so, and your own checkout stays exactly where
+you left it the whole time.</p>
+
+<h2 id="how-it-works">How it works</h2>
+<ol>
+  <li><strong>You type a task.</strong> Plain text starts one isolated agent.</li>
+  <li><strong>It gets a workspace.</strong> Created under
+  <code>.rudder-worktrees/</code>, never nested in your checkout.</li>
+  <li><strong>You watch it.</strong> The worker pane is the agent's own terminal.</li>
+  <li><strong>You review it.</strong> <code>v</code> shows the live
+  <code>jj diff</code> of that workspace.</li>
+  <li><strong>You merge it.</strong> <code>m</code> merges one row into your
+  branch, <code>u</code> undoes it.</li>
+</ol>
+
+<div class="note">
+  <span class="field-label">worth knowing early</span>
+  <p><strong>Merged means local.</strong> Rudder integrates into your local git and
+  never pushes or deploys on its own. Nothing is on a remote until you push it.</p>
+</div>
+
+<h2 id="requirements">Requirements</h2>
+<ul>
+  <li>macOS or Linux</li>
+  <li>Node 18 or newer</li>
+  <li>A git repository</li>
+  <li><a href="https://jj-vcs.github.io/jj/latest/">jj</a>, installed for you on
+  first install if it is missing</li>
+  <li>At least one of the Claude Code, Codex or opencode CLIs, signed in</li>
+</ul>
+      <nav class="docs-pager" aria-label="Pagination">
+        <a class="next" href="/docs/install"><span class="field-label">next</span>Install</a>
+      </nav>
+      </main>
+
+      <aside class="docs-toc">
+        <h2>on this page</h2>
+        <ul>
+            <li><a href="#what-it-is">What it is</a></li>
+            <li><a href="#the-problem">The problem it solves</a></li>
+            <li><a href="#how-it-works">How it works</a></li>
+            <li><a href="#requirements">Requirements</a></li>
+        </ul>
+      </aside>
+    </div>
+  </body>
+</html>

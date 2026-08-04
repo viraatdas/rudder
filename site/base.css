@@ -1,49 +1,69 @@
+/* Rudder — the track sheet.
+ *
+ * The world is a studio track sheet: a ruled paper form where each track is
+ * logged on its own row, captured in isolation, and nothing is summed until the
+ * mixdown. Every token here serves that: real stock, real ink, hairline rules,
+ * no card shadows standing in for hierarchy.
+ *
+ * The ground is TRUE white (chroma 0), not cream. Cream plus a serif is the
+ * house style of every generated page in this category; a working form printed
+ * on stock is not warm, it is plain.
+ */
+
 :root {
-  --paper: #ffffff;
-  --paper-2: #f5f6f7;
-  --ink: #111317;
-  --muted: #555c66;
-  --faint: #79808b;
-  --line: #e5e7eb;
-  --soft-line: #eef0f2;
-  --panel: #ffffff;
+  /* Stock. Cool-leaning greys only; never warmed toward paper/parchment. */
+  --stock: oklch(99.2% 0 0);
+  --stock-band: oklch(97.2% 0.003 235);
+  --stock-sink: oklch(94.8% 0.004 235);
+  --stock-fill: oklch(92.4% 0.005 235);
 
-  /* one accent, used sparingly */
-  --accent: #0c6a72;
-  --accent-strong: #084a50;
+  /* Ink. --ink-3 is held at 52% so secondary copy still clears 4.5:1 on stock. */
+  --ink: oklch(19% 0.014 250);
+  --ink-2: oklch(41% 0.012 250);
+  --ink-3: oklch(52% 0.011 250);
 
-  /* product status colors live only inside the dashboard screenshot */
-  --cyan: #0b747c;
-  --green: #15803d;
-  --amber: #b45309;
-  --magenta: #a21caf;
+  /* Rules. The form is drawn with these, not with borders on boxes. */
+  --rule: oklch(88% 0.005 240);
+  --rule-mid: oklch(80% 0.007 240);
+  --rule-strong: oklch(30% 0.010 245);
 
-  /* dark instrument surfaces (edit card, closing cta) */
-  --screen-bg: #0f1216;
-  --screen-line: rgba(255, 255, 255, 0.09);
-  --screen-muted: #9aa1ad;
-  --screen-ink: #ecedf0;
-  --screen-accent: #5ec8d0;
+  /* The working ink: the teal this brand already committed to (#0c6a72). */
+  --work: oklch(47.5% 0.078 202);
+  --work-deep: oklch(36% 0.068 202);
+  --work-wash: oklch(96% 0.020 202);
 
-  --shadow-sm: 0 1px 2px rgba(17, 19, 23, 0.05);
-  --shadow-md: 0 8px 24px rgba(17, 19, 23, 0.07);
+  /* State. Semantics only: these never appear as decoration.
+   * Each is paired with a text label in the markup, never color alone. */
+  --st-running: oklch(47% 0.085 210);
+  --st-review: oklch(52% 0.125 70);
+  --st-merged: oklch(48% 0.105 150);
+  --st-conflict: oklch(50% 0.150 15);
+  --st-idle: oklch(62% 0.008 240);
 
-  --radius: 4px;
-  --radius-lg: 6px;
+  --measure: 68ch;
+
+  /* The form is printed, not extruded: one hairline, no radius, no shadow. */
+  --hair: 1px;
+  --radius: 2px;
 
   --ease-quint: cubic-bezier(0.22, 1, 0.36, 1);
   --ease-expo: cubic-bezier(0.16, 1, 0.3, 1);
 
-  --font-display: "Bricolage Grotesque", ui-sans-serif, system-ui,
-    -apple-system, sans-serif;
-  --font-sans: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
-    "Segoe UI", sans-serif;
-  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  /* Archivo is a grotesque drawn for forms and high-performance printing, which
+   * is the track sheet's own lettering. JetBrains Mono carries anything the
+   * machine says, because that is literally what it renders in. */
+  --font-form: "Archivo", ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  --z-sticky: 100;
+  --z-nav: 200;
+  --z-dialog: 300;
 
   color: var(--ink);
-  background: var(--paper);
-  font-family: var(--font-sans);
+  background: var(--stock);
+  font-family: var(--font-form);
   font-weight: 400;
+  font-synthesis-weight: none;
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
 }
@@ -54,194 +74,287 @@
 
 html {
   scroll-behavior: smooth;
+  background: var(--stock);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
 }
 
 body {
   margin: 0;
-  background: var(--paper);
+  background: var(--stock);
   color: var(--ink);
   overflow-x: hidden;
+  font-size: 16px;
+  line-height: 1.55;
+}
+
+h1,
+h2,
+h3,
+h4 {
+  font-family: var(--font-form);
+  font-weight: 600;
+  letter-spacing: -0.022em;
+  text-wrap: balance;
+  margin: 0;
+}
+
+h1 {
+  /* Display ceiling held well under 6rem; the sheet is a document, not a poster. */
+  font-size: clamp(2.4rem, 5.4vw, 4.15rem);
+  line-height: 1.03;
+  letter-spacing: -0.032em;
+}
+
+h2 {
+  font-size: clamp(1.6rem, 2.9vw, 2.3rem);
+  line-height: 1.1;
+}
+
+h3 {
+  font-size: 1.06rem;
+  letter-spacing: -0.012em;
+}
+
+p {
+  margin: 0;
+  text-wrap: pretty;
 }
 
 a {
   color: inherit;
-  text-decoration-color: rgba(17, 19, 23, 0.25);
+  text-decoration-color: color-mix(in oklch, var(--ink) 30%, transparent);
   text-decoration-thickness: 1px;
-  text-underline-offset: 4px;
-  transition: color 140ms ease, text-decoration-color 140ms ease;
+  text-underline-offset: 3px;
+  transition: color 140ms var(--ease-quint),
+    text-decoration-color 140ms var(--ease-quint);
 }
 
 a:hover {
-  color: var(--accent);
+  color: var(--work);
   text-decoration-color: currentColor;
 }
 
 :focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 3px;
-  border-radius: 2px;
+  outline: 2px solid var(--work);
+  outline-offset: 2px;
+  border-radius: var(--radius);
 }
+
+img,
+svg {
+  max-width: 100%;
+  display: block;
+}
+
+/* ---------------------------------------------------------------------------
+ * Form primitives. The sheet's own vocabulary, reused by the landing page and
+ * the docs so the two read as one printed system.
+ * ------------------------------------------------------------------------- */
+
+/* A field label as printed on a form: small, in the machine face, and ALWAYS
+ * attached to a value. Never used as a section eyebrow. */
+.field-label {
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  letter-spacing: 0.04em;
+  color: var(--ink-3);
+}
+
+.mono {
+  font-family: var(--font-mono);
+  font-size: 0.855em;
+  letter-spacing: -0.01em;
+}
+
+.sheet {
+  border-top: var(--hair) solid var(--rule-strong);
+  border-bottom: var(--hair) solid var(--rule-strong);
+  background: var(--stock);
+}
+
+.sheet-row {
+  border-bottom: var(--hair) solid var(--rule);
+}
+
+.sheet-row:last-child {
+  border-bottom: 0;
+}
+
+/* State stamp: color plus an always-present word, never color alone. */
+.state {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.42em;
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  letter-spacing: 0.01em;
+  color: var(--state-ink, var(--ink-2));
+  white-space: nowrap;
+}
+
+.state::before {
+  content: "";
+  width: 0.5em;
+  height: 0.5em;
+  flex: none;
+  background: currentColor;
+}
+
+.state--running {
+  --state-ink: var(--st-running);
+}
+.state--review {
+  --state-ink: var(--st-review);
+}
+.state--merged {
+  --state-ink: var(--st-merged);
+}
+.state--conflict {
+  --state-ink: var(--st-conflict);
+}
+.state--idle {
+  --state-ink: var(--st-idle);
+}
+
+/* Merged is the resolved state, so its mark reads as a completed cross. */
+.state--merged::before {
+  clip-path: polygon(
+    0 40%,
+    40% 40%,
+    40% 0,
+    60% 0,
+    60% 40%,
+    100% 40%,
+    100% 60%,
+    60% 60%,
+    60% 100%,
+    40% 100%,
+    40% 60%,
+    0 60%
+  );
+}
+
+kbd {
+  font-family: var(--font-mono);
+  font-size: 0.74rem;
+  padding: 0.16em 0.42em;
+  border: var(--hair) solid var(--rule-mid);
+  border-radius: var(--radius);
+  background: var(--stock-band);
+  color: var(--ink);
+  white-space: nowrap;
+}
+
+.skip-link {
+  position: absolute;
+  left: -9999px;
+  top: 0;
+  z-index: var(--z-nav);
+  background: var(--ink);
+  color: var(--stock);
+  padding: 0.6rem 1rem;
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+}
+
+.skip-link:focus {
+  left: 0;
+}
+
+/* ---------- shell ---------- */
 
 .page {
   position: relative;
-  max-width: 1180px;
+  max-width: 1240px;
   margin: 0 auto;
-  padding: 24px clamp(20px, 5vw, 56px) 0;
+  padding: 0 clamp(18px, 4.5vw, 52px);
 }
 
-/* ---------- header ---------- */
-header {
+.site-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 24px;
-  padding: 2px 0 clamp(60px, 9vw, 108px);
+  gap: 18px;
+  height: 62px;
+  border-bottom: var(--hair) solid var(--rule);
 }
 
 .brand {
   display: inline-flex;
   align-items: center;
-  gap: 10px;
-  font-family: var(--font-display);
-  font-size: 17px;
+  gap: 9px;
   font-weight: 600;
-  letter-spacing: -0.01em;
+  font-size: 0.95rem;
+  letter-spacing: -0.015em;
   text-decoration: none;
 }
 
 .brand img {
-  width: 24px;
-  height: 24px;
+  width: 17px;
+  height: 17px;
 }
 
-nav {
+.site-nav {
+  display: flex;
+  align-items: center;
+  gap: clamp(14px, 2.4vw, 26px);
+  font-size: 0.85rem;
+}
+
+.site-nav a {
+  text-decoration: none;
+  color: var(--ink-2);
+}
+
+.site-nav a:hover {
+  color: var(--work);
+}
+
+.site-nav a[aria-current="page"] {
+  color: var(--ink);
+  font-weight: 500;
+}
+
+.site-foot {
   display: flex;
   flex-wrap: wrap;
-  justify-content: flex-end;
   align-items: center;
-  gap: 8px 26px;
-  color: var(--muted);
-  font-size: 14px;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 30px 0 44px;
+  margin-top: 68px;
+  border-top: var(--hair) solid var(--rule);
+  font-size: 0.82rem;
+  color: var(--ink-3);
 }
 
-.nav-cta {
-  padding: 7px 15px;
-  border: 1px solid var(--ink);
-  border-radius: var(--radius);
-  color: var(--ink);
-  text-decoration: none;
-  font-weight: 500;
-  transition: background 140ms ease, color 140ms ease;
-}
-
-.nav-cta:hover {
-  background: var(--ink);
-  color: var(--paper);
-}
-
-/* ---------- hero ---------- */
-.hero {
-  display: grid;
-  gap: clamp(40px, 5vw, 60px);
-}
-
-.eyebrow {
-  margin: 0 0 22px;
-  color: var(--faint);
-  font-family: var(--font-mono);
-  font-size: 12.5px;
-  letter-spacing: 0.04em;
-}
-
-h1 {
-  margin: 0;
-  font-family: var(--font-display);
-  font-size: clamp(44px, 7.4vw, 82px);
-  line-height: 0.96;
-  font-weight: 600;
-  letter-spacing: -0.035em;
-  max-width: 15ch;
-  text-wrap: balance;
-}
-
-.lede {
-  margin: 28px 0 0;
-  max-width: 56ch;
-  font-size: clamp(17px, 1.7vw, 20px);
-  line-height: 1.55;
-  color: var(--muted);
-  text-wrap: pretty;
-}
-
-.actions {
+.site-foot nav {
   display: flex;
-  flex-wrap: wrap;
-  gap: 10px;
-  margin-top: 32px;
+  gap: 20px;
 }
 
-.install {
-  display: inline-flex;
-  align-items: stretch;
-  width: min(100%, 440px);
-  min-width: 0;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  background: var(--panel);
-  overflow: hidden;
-}
-
-.install code {
-  min-width: 0;
-  flex: 1;
-  padding: 12px 14px;
-  overflow-x: auto;
-  font-family: var(--font-mono);
-  font-size: 13px;
-  line-height: 1.5;
-  white-space: pre;
-}
-
-.install code .prompt {
-  color: var(--accent);
-  user-select: none;
-}
-
-.copy,
-.button-link {
-  appearance: none;
-  border: 0;
-  cursor: pointer;
-  font: inherit;
-  font-size: 13px;
-  font-weight: 500;
+.site-foot a {
   text-decoration: none;
-  transition: background 140ms ease, color 140ms ease;
+  color: var(--ink-2);
 }
 
-.copy {
-  flex: 0 0 auto;
-  padding: 0 16px;
-  border-left: 1px solid var(--line);
-  background: var(--ink);
-  color: #fff;
+.site-foot a:hover {
+  color: var(--work);
 }
 
-.copy:hover {
-  background: #000;
-}
-
-.button-link {
-  display: inline-flex;
-  align-items: center;
-  padding: 0 18px;
-  min-height: 44px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  background: transparent;
-  color: var(--ink);
-}
-
-.button-link:hover {
-  background: var(--paper-2);
+@media (max-width: 560px) {
+  .site-head {
+    height: auto;
+    padding: 14px 0;
+    flex-wrap: wrap;
+  }
+  .site-nav {
+    width: 100%;
+    justify-content: flex-start;
+  }
 }

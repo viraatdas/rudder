@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Workspaces — Rudder docs</title>
+    <meta name="description" content="The isolation mechanism. Every agent works in its own jj workspace, so parallel work on one repository genuinely cannot collide." />
+    <link rel="canonical" href="https://rudder.viraat.dev/docs/workspaces" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <meta name="theme-color" content="#ffffff" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/docs.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <div class="page">
+      <header class="site-head">
+        <a class="brand" href="/">
+          <img src="/favicon.svg" alt="" />
+          <span>Rudder</span>
+        </a>
+        <nav class="site-nav" aria-label="Primary">
+          <a href="/docs" aria-current="page">Docs</a>
+          <a href="https://github.com/viraatdas/rudder">GitHub</a>
+          <a href="https://www.npmjs.com/package/@viraatdas/rudder">npm</a>
+          <a href="/login">Sign in</a>
+        </nav>
+      </header>
+    </div>
+
+    <div class="docs">
+      <nav class="docs-nav" aria-label="Documentation">
+        <h2>get started</h2>
+        <ul>
+          <li><a href="/docs">Overview</a></li>
+          <li><a href="/docs/install">Install</a></li>
+          <li><a href="/docs/first-agent">Your first agent</a></li>
+        </ul>
+        <h2>core</h2>
+        <ul>
+          <li><a href="/docs/workspaces" aria-current="page">Workspaces</a></li>
+          <li><a href="/docs/plans">Plans and the DAG</a></li>
+        </ul>
+        <h2>reference</h2>
+        <ul>
+          <li><a href="/docs/commands">Commands and keys</a></li>
+          <li><a href="/docs/faq">FAQ</a></li>
+        </ul>
+      </nav>
+
+      <main class="docs-main" id="main">
+        <h1>Workspaces</h1>
+        <p class="docs-lede">The isolation mechanism. Every agent works in its own jj workspace, so parallel work on one repository genuinely cannot collide.</p>
+<h2 id="what">What a workspace is</h2>
+<p>A jj workspace is a second working copy of the same repository, with its own
+working-copy commit. Edits in one are invisible to the others until they are merged.
+Rudder gives every agent one.</p>
+<p>This is the reason several agents can work on the same files at the same time. They
+are not coordinating, taking turns, or locking anything. They simply cannot reach
+each other.</p>
+
+<h2 id="where">Where they live</h2>
+<pre><code>your-repo/
+  .rudder-worktrees/
+    fix-login-redirect/
+    port-settings-form/
+    drop-sessions-table/</code></pre>
+<p>They sit beside your checkout, never nested inside it, so your editor, your build
+and your git status are unaffected by what the agents are doing.</p>
+
+<h2 id="merging">How merging works</h2>
+<p>Merging a row runs <code>jj new</code> against your branch and that agent's change.
+It is a real merge commit, not a squash of the working copy, so the agent's history
+stays intact and the merge is a normal thing to inspect or undo.</p>
+<p><kbd>m</kbd> merges the selected row. <kbd>M</kbd> merges everything that is ready.
+<kbd>u</kbd> undoes a merge through jj's operation log.</p>
+
+<div class="note">
+  <span class="field-label">merged is local</span>
+  <p>Merging integrates into your <strong>local</strong> git only. Rudder never
+  pushes to a remote and never deploys. Nothing is live until you push.</p>
+</div>
+
+<h2 id="conflicts">Conflicts</h2>
+<p>jj records conflicts <em>in the change</em> rather than refusing the merge. A
+conflicted merge still completes; the conflict is then a thing you can see, resolve,
+or undo, instead of a wall you hit mid-operation.</p>
+<p>This is what lets Rudder integrate several overlapping agents without stopping the
+whole session on the first collision.</p>
+
+<h2 id="main">The main checkout</h2>
+<p>Some jobs are genuinely about your working tree: tagging a release, running a
+deploy, poking at something by hand. Those are <code>/main</code>, and they run in
+your real checkout with nothing to merge.</p>
+<p>Several <code>/main</code> agents can run at once. Rudder allows it because it is
+sometimes what you want; managing what they do to each other is yours.</p>
+      <nav class="docs-pager" aria-label="Pagination">
+        <a class="prev" href="/docs/first-agent"><span class="field-label">previous</span>Your first agent</a>
+        <a class="next" href="/docs/plans"><span class="field-label">next</span>Plans and the DAG</a>
+      </nav>
+      </main>
+
+      <aside class="docs-toc">
+        <h2>on this page</h2>
+        <ul>
+            <li><a href="#what">What a workspace is</a></li>
+            <li><a href="#where">Where they live</a></li>
+            <li><a href="#merging">How merging works</a></li>
+            <li><a href="#conflicts">Conflicts</a></li>
+            <li><a href="#main">The main checkout</a></li>
+        </ul>
+      </aside>
+    </div>
+  </body>
+</html>

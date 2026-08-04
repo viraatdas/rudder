@@ -1,0 +1,308 @@
+@import url("/base.css");
+
+/* Docs share the landing page's world: same stock, same ink, same rules. The
+ * difference is mode, not identity. This surface exists to be READ, so it drops
+ * the sheet's staging and gives the reader a fixed frame, a measure, and a map. */
+
+.docs {
+  max-width: 1240px;
+  margin: 0 auto;
+  padding: 0 clamp(18px, 4.5vw, 52px);
+  display: grid;
+  grid-template-columns: 15rem minmax(0, 1fr) 12.5rem;
+  gap: clamp(24px, 3.6vw, 56px);
+  align-items: start;
+}
+
+/* ---------- left: the map ---------- */
+
+/* The rule runs the full height of the viewport rather than stopping under the
+ * last link, where it read as a hanging stub. */
+.docs-nav {
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  overflow-y: auto;
+  padding: 30px 18px 40px 0;
+  border-right: var(--hair) solid var(--rule);
+}
+
+.docs-nav h2 {
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  font-weight: 400;
+  letter-spacing: 0.05em;
+  color: var(--ink-3);
+  margin: 22px 0 8px;
+}
+
+.docs-nav h2:first-of-type {
+  margin-top: 0;
+}
+
+.docs-nav ul {
+  list-style: none;
+  margin: 0 0 4px;
+  padding: 0;
+  display: grid;
+}
+
+.docs-nav a {
+  display: block;
+  padding: 5px 0 5px 10px;
+  font-size: 0.87rem;
+  color: var(--ink-2);
+  text-decoration: none;
+  border-left: var(--hair) solid var(--rule);
+}
+
+.docs-nav a:hover {
+  color: var(--work);
+  border-left-color: var(--rule-mid);
+}
+
+.docs-nav a[aria-current="page"] {
+  color: var(--ink);
+  font-weight: 500;
+  border-left-color: var(--work);
+}
+
+/* ---------- centre: the reading column ---------- */
+
+.docs-main {
+  padding: 30px 0 20px;
+  min-width: 0;
+}
+
+.docs-main h1 {
+  font-size: clamp(1.9rem, 3.3vw, 2.6rem);
+  letter-spacing: -0.028em;
+  margin-bottom: 12px;
+}
+
+.docs-lede {
+  font-size: 1.06rem;
+  color: var(--ink-2);
+  max-width: 62ch;
+  margin-bottom: 30px;
+  padding-bottom: 24px;
+  border-bottom: var(--hair) solid var(--rule);
+}
+
+.docs-main h2 {
+  font-size: 1.32rem;
+  margin: 40px 0 12px;
+  scroll-margin-top: 20px;
+}
+
+.docs-main h3 {
+  font-size: 1rem;
+  margin: 26px 0 8px;
+  scroll-margin-top: 20px;
+}
+
+.docs-main p,
+.docs-main li {
+  max-width: 68ch;
+  color: var(--ink-2);
+}
+
+.docs-main p {
+  margin: 0 0 14px;
+}
+
+.docs-main strong {
+  color: var(--ink);
+  font-weight: 500;
+}
+
+.docs-main ul,
+.docs-main ol {
+  margin: 0 0 16px;
+  padding-left: 20px;
+}
+
+.docs-main li {
+  margin-bottom: 7px;
+}
+
+.docs-main code {
+  font-family: var(--font-mono);
+  font-size: 0.85em;
+  background: var(--stock-band);
+  border: var(--hair) solid var(--rule);
+  border-radius: var(--radius);
+  padding: 0.08em 0.34em;
+  color: var(--ink);
+}
+
+.docs-main pre {
+  margin: 0 0 18px;
+  padding: 14px 16px;
+  background: var(--stock-band);
+  border: var(--hair) solid var(--rule-strong);
+  overflow-x: auto;
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+  line-height: 1.6;
+  color: var(--ink);
+}
+
+.docs-main pre code {
+  background: none;
+  border: 0;
+  padding: 0;
+  font-size: inherit;
+}
+
+.docs-main pre .prompt {
+  color: var(--ink-3);
+  user-select: none;
+}
+
+/* A note is a ruled aside, not a tinted card with a coloured left border. */
+.note {
+  margin: 0 0 20px;
+  padding: 14px 0 14px 16px;
+  border-top: var(--hair) solid var(--rule-strong);
+  border-bottom: var(--hair) solid var(--rule);
+  max-width: 68ch;
+}
+
+.note p {
+  margin: 0;
+  font-size: 0.92rem;
+}
+
+.note .field-label {
+  display: block;
+  margin-bottom: 6px;
+}
+
+.docs-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.88rem;
+  margin: 0 0 20px;
+}
+
+.docs-table th {
+  text-align: left;
+  font-family: var(--font-mono);
+  font-size: 0.66rem;
+  font-weight: 400;
+  letter-spacing: 0.05em;
+  color: var(--ink-3);
+  padding: 0 14px 7px 0;
+  border-bottom: var(--hair) solid var(--rule-strong);
+}
+
+.docs-table td {
+  padding: 11px 14px 11px 0;
+  border-bottom: var(--hair) solid var(--rule);
+  vertical-align: top;
+  color: var(--ink-2);
+}
+
+.docs-table td:first-child {
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  color: var(--ink);
+  white-space: nowrap;
+}
+
+.table-wrap {
+  overflow-x: auto;
+}
+
+/* ---------- right: on this page ---------- */
+
+.docs-toc {
+  position: sticky;
+  top: 0;
+  padding: 34px 0 40px;
+  font-size: 0.82rem;
+}
+
+.docs-toc h2 {
+  font-family: var(--font-mono);
+  font-size: 0.66rem;
+  font-weight: 400;
+  letter-spacing: 0.05em;
+  color: var(--ink-3);
+  margin: 0 0 9px;
+}
+
+.docs-toc ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.docs-toc a {
+  color: var(--ink-3);
+  text-decoration: none;
+}
+
+.docs-toc a:hover {
+  color: var(--work);
+}
+
+/* ---------- prev / next ---------- */
+
+.docs-pager {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  margin-top: 52px;
+  padding-top: 20px;
+  border-top: var(--hair) solid var(--rule-strong);
+}
+
+.docs-pager a {
+  text-decoration: none;
+  font-size: 0.9rem;
+  color: var(--ink-2);
+  max-width: 46%;
+}
+
+.docs-pager a:hover {
+  color: var(--work);
+}
+
+.docs-pager .field-label {
+  display: block;
+  margin-bottom: 3px;
+}
+
+.docs-pager .next {
+  text-align: right;
+  margin-left: auto;
+}
+
+@media (max-width: 1080px) {
+  .docs {
+    grid-template-columns: 13rem minmax(0, 1fr);
+  }
+  .docs-toc {
+    display: none;
+  }
+}
+
+@media (max-width: 760px) {
+  .docs {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .docs-nav {
+    position: static;
+    max-height: none;
+    border-right: 0;
+    border-bottom: var(--hair) solid var(--rule);
+    padding: 18px 0;
+  }
+  .docs-nav ul {
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  }
+}

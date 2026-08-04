@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>FAQ — Rudder docs</title>
+    <meta name="description" content="The questions that come up in the first hour." />
+    <link rel="canonical" href="https://rudder.viraat.dev/docs/faq" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <meta name="theme-color" content="#ffffff" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/docs.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <div class="page">
+      <header class="site-head">
+        <a class="brand" href="/">
+          <img src="/favicon.svg" alt="" />
+          <span>Rudder</span>
+        </a>
+        <nav class="site-nav" aria-label="Primary">
+          <a href="/docs" aria-current="page">Docs</a>
+          <a href="https://github.com/viraatdas/rudder">GitHub</a>
+          <a href="https://www.npmjs.com/package/@viraatdas/rudder">npm</a>
+          <a href="/login">Sign in</a>
+        </nav>
+      </header>
+    </div>
+
+    <div class="docs">
+      <nav class="docs-nav" aria-label="Documentation">
+        <h2>get started</h2>
+        <ul>
+          <li><a href="/docs">Overview</a></li>
+          <li><a href="/docs/install">Install</a></li>
+          <li><a href="/docs/first-agent">Your first agent</a></li>
+        </ul>
+        <h2>core</h2>
+        <ul>
+          <li><a href="/docs/workspaces">Workspaces</a></li>
+          <li><a href="/docs/plans">Plans and the DAG</a></li>
+        </ul>
+        <h2>reference</h2>
+        <ul>
+          <li><a href="/docs/commands">Commands and keys</a></li>
+          <li><a href="/docs/faq" aria-current="page">FAQ</a></li>
+        </ul>
+      </nav>
+
+      <main class="docs-main" id="main">
+        <h1>FAQ</h1>
+        <p class="docs-lede">The questions that come up in the first hour.</p>
+<h2 id="git">Does this change my git repository?</h2>
+<p>jj is colocated with git in the same repository. Your git history, branches and
+remotes keep working exactly as they did. Rudder adds workspaces under
+<code>.rudder-worktrees/</code> and merges into your local branch; it does not rewrite
+your history behind you.</p>
+
+<h2 id="push">Does it push or deploy anything?</h2>
+<p>No. <strong>Merged means merged into local git.</strong> Rudder never pushes to a
+remote and never runs a deploy on its own. If you want the result shipped, that is an
+explicit step you ask for.</p>
+
+<h2 id="teammates">Do my teammates need jj?</h2>
+<p>No. What they see is ordinary git commits on ordinary branches. jj is a local tool
+for how <em>you</em> work; nothing about it reaches the remote.</p>
+
+<h2 id="cost">What does it cost to run?</h2>
+<p>Rudder itself is free and open source. You pay for whatever the agent CLIs cost
+you, exactly as you would running them by hand. <code>/usage</code> shows tokens and
+cost for the session.</p>
+<p>The dashboard is a native Rust TUI: about 27 MB resident, and asleep until an agent
+writes.</p>
+
+<h2 id="crash">What happens if it crashes?</h2>
+<p>Agent sessions belong to the backend CLIs, not to Rudder, so they survive. Rudder
+records each row's session id as soon as it exists and derives state on restart from
+jj, the filesystem and the running processes rather than from anything it remembered.
+Reopen it and use <code>/resume</code> for anything that lost its pane.</p>
+      <nav class="docs-pager" aria-label="Pagination">
+        <a class="prev" href="/docs/commands"><span class="field-label">previous</span>Commands and keys</a>
+      </nav>
+      </main>
+
+      <aside class="docs-toc">
+        <h2>on this page</h2>
+        <ul>
+            <li><a href="#git">Does this change my git repo?</a></li>
+            <li><a href="#push">Does it push or deploy?</a></li>
+            <li><a href="#teammates">Do my teammates need jj?</a></li>
+            <li><a href="#cost">What does it cost to run?</a></li>
+            <li><a href="#crash">What if it crashes?</a></li>
+        </ul>
+      </aside>
+    </div>
+  </body>
+</html>

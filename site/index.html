@@ -3,325 +3,382 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Rudder</title>
+    <title>Rudder — several changes to one repo, at once, that never touch</title>
     <meta
       name="description"
-      content="Rudder is a terminal orchestrator for coding agents. Describe a goal; it plans a task DAG you can edit before it runs, runs Claude Code and Codex agents in parallel across isolated jj workspaces, then helps you review and merge."
+      content="Rudder runs coding agents in parallel on one repository. Every agent works in its own jj workspace, so changes in flight cannot collide, and you review and merge them from one dashboard."
     />
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <meta property="og:title" content="Rudder" />
     <meta
       property="og:description"
-      content="A terminal orchestrator for coding agents: plan a task DAG, edit it before it runs, run Claude Code and Codex in parallel across isolated jj workspaces, review, and merge."
+      content="Several changes to one repo, at the same time, that never touch each other until you merge them."
     />
     <meta property="og:image" content="/screenshot.svg" />
     <meta name="theme-color" content="#ffffff" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
-      href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,500;12..96,600;12..96,700&display=swap"
+      href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap"
       rel="stylesheet"
     />
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
+    <!--
+      THESIS: Rudder's page is a studio track sheet. One ruled row per agent,
+      each captured in isolation, nothing summed until the mixdown. It refuses
+      the two arrangements this category always ships: the dark terminal hero
+      with a typing animation, and the white SaaS page of icon-heading-text cards.
+      OWN-WORLD: True white stock at chroma 0 (never cream), cool near-black ink,
+      hairline rules doing the work borders would. Archivo for the form's printed
+      lettering, JetBrains Mono for anything the machine says. Teal #0c6a72 is the
+      working ink; other color is state only, always paired with a word.
+      STORY: A developer with three changes in flight sees them logged side by
+      side on one sheet, understands each is isolated, and installs.
+      FIRST VIEWPORT: Title block left, revision stamp right, install beneath;
+      then the ruled track sheet, four tracks in flight, closed by the sum bus
+      labelled main.
+      FORM: studio track sheet; candidate 4 of the ordered list; seed 9b5209e6.
+      FINISH: unreviewed and undocumented is unfinished; this build ends with the finish review, the verdict, and DESIGN.md
+    -->
+    <a class="skip-link" href="#main">Skip to content</a>
     <div class="page">
-      <header data-reveal>
+      <header class="site-head">
         <a class="brand" href="/">
           <img src="/favicon.svg" alt="" />
           <span>Rudder</span>
         </a>
-        <nav aria-label="Primary navigation">
-          <a href="https://www.npmjs.com/package/@viraatdas/rudder">npm</a>
+        <nav class="site-nav" aria-label="Primary">
+          <a href="/docs">Docs</a>
           <a href="https://github.com/viraatdas/rudder">GitHub</a>
-          <a class="nav-cta" href="/login">Sign in</a>
+          <a href="https://www.npmjs.com/package/@viraatdas/rudder">npm</a>
+          <a href="/login">Sign in</a>
         </nav>
       </header>
 
-      <main>
-        <section class="hero" aria-labelledby="hero-title">
-          <div>
-            <p class="eyebrow" data-reveal>plan, run in parallel, review, merge</p>
-            <h1 id="hero-title" data-reveal>Steer your coding agents.</h1>
-            <p class="lede" data-reveal>
-              Rudder is the terminal orchestrator. Describe a goal; it plans the
-              work into a task DAG you can edit before it runs, executes Claude
-              Code and Codex in parallel across isolated jj workspaces, then keeps
-              review and merge in one dashboard.
+      <main id="main">
+        <section class="titleblock" aria-labelledby="title">
+          <div class="titleblock-main">
+            <h1 id="title">Three changes to one repo. None of them touching.</h1>
+            <p class="lede">
+              Rudder runs Claude Code, Codex and opencode in parallel on the same
+              repository. Every agent works in
+              <strong>its own jj workspace</strong>, so work in flight cannot
+              collide, cannot half-land in your checkout, and reaches main only
+              when you merge it.
             </p>
-            <div class="actions" data-reveal>
-              <div class="install">
-                <code id="install-command"><span class="prompt">$ </span>npm install -g @viraatdas/rudder@latest</code>
-                <button class="copy" type="button" data-copy="install-command" data-copy-value="npm install -g @viraatdas/rudder@latest">
-                  Copy
-                </button>
-              </div>
-              <a class="button-link" href="https://github.com/viraatdas/rudder">View source</a>
-            </div>
-          </div>
-
-          <figure class="shot" data-reveal>
-            <img
-              src="/screenshot.svg"
-              alt="Rudder's dashboard: an agents list on the left, the worker pane showing the orchestrator's live task DAG and plan on the right, and a task box along the bottom."
-            />
-          </figure>
-        </section>
-
-        <section class="section" aria-labelledby="flow-title">
-          <div class="section-head" data-reveal>
-            <h2 id="flow-title">One goal in. A steered plan out.</h2>
-            <p>
-              You describe the outcome. Rudder turns it into a graph of tasks and
-              drives each one from planned to merged, in parallel, while you watch.
-            </p>
-          </div>
-
-          <div class="flow" data-reveal-group>
-            <div class="flow-step">
-              <span class="marker">Describe</span>
-              <h3>The goal</h3>
-              <p>Type what you want built into the task box, in plain language.</p>
-            </div>
-            <div class="flow-step">
-              <span class="marker">Plan</span>
-              <h3>A task DAG</h3>
-              <p>A read-only planner inspects the repo and proposes typed dependencies.</p>
-            </div>
-            <div class="flow-step">
-              <span class="marker">Run</span>
-              <h3>In parallel</h3>
-              <p>Claude Code and Codex build ready nodes in isolated jj workspaces.</p>
-            </div>
-            <div class="flow-step">
-              <span class="marker">Review</span>
-              <h3>A live diff</h3>
-              <p>Press v for the jj diff of any node, right inside the pane.</p>
-            </div>
-            <div class="flow-step">
-              <span class="marker">Merge</span>
-              <h3>And unblock</h3>
-              <p>Clean work merges mechanically and unblocks its children.</p>
-            </div>
-          </div>
-        </section>
-
-        <section class="section" aria-labelledby="why-title">
-          <div class="section-head" data-reveal>
-            <h2 id="why-title">A plan you can watch and steer.</h2>
-            <p>
-              Rudder is not a transcript UI. You give it a goal, it decomposes the
-              work, and shows every node's status live. Refine the plan by chat,
-              add tasks while it runs, then review and merge.
-            </p>
-          </div>
-
-          <div class="features" data-reveal-group>
-            <article class="feature">
-              <span class="tag">Orchestrate</span>
-              <h3>Plan into a DAG</h3>
-              <p>
-                Describe a goal once. A read-only planner inspects the repo and
-                emits a task DAG with typed hard and soft dependencies. Edit any
-                node inline, or refine the whole plan by chat, before it launches.
-              </p>
-            </article>
-            <article class="feature">
-              <span class="tag">Parallel</span>
-              <h3>Agents in jj workspaces</h3>
-              <p>
-                Ready nodes run Claude Code and Codex in parallel, each in its own
-                isolated jj workspace, so they build concurrently without trampling
-                the main checkout.
-              </p>
-            </article>
-            <article class="feature">
-              <span class="tag">Review</span>
-              <h3>Review and merge</h3>
-              <p>
-                Watch a live jj diff of any node, merge clean work mechanically,
-                and let an AI resolver integrate conflicts. Merging a parent
-                unblocks its children automatically.
-              </p>
-            </article>
-          </div>
-        </section>
-
-        <section class="section" aria-labelledby="idea-title">
-          <div class="section-head" data-reveal>
-            <h2 id="idea-title">A few opinions, made into a tool.</h2>
-            <p>
-              Rudder is not trying to be a faster chat window. It takes a stance on
-              how agents should work: plan first, isolate the work, and keep you
-              steering with full visibility and undo.
-            </p>
-          </div>
-
-          <div class="principles" data-reveal-group>
-            <article class="principle">
-              <h3>Plan before you build.</h3>
-              <p>
-                The planner is read-only. It inspects the repo, asks a round of
-                questions before it assumes anything, and proposes a DAG. Nothing
-                is written to your code until you approve it.
-              </p>
-            </article>
-            <article class="principle">
-              <h3>Isolate the work, don't coordinate it.</h3>
-              <p>
-                Every node runs in its own jj workspace, never nested in your repo,
-                so parallel agents never collide live. The only thing left to
-                reconcile is a merge, and Rudder handles that.
-              </p>
-            </article>
-            <article class="principle">
-              <h3>Steer, don't babysit.</h3>
-              <p>
-                The orchestrator acts on its own: it expands the plan, fixes drift,
-                and merges clean work. Every action is logged and every action is
-                undoable, so you stay in control without watching each step.
-              </p>
-            </article>
-            <article class="principle">
-              <h3>Block only on real gates.</h3>
-              <p>
-                Hard edges wait for a parent to merge; soft edges are context only.
-                Work that can run in parallel does, and the plan blocks just where
-                one task truly depends on another.
-              </p>
-            </article>
-            <article class="principle">
-              <h3>Fast because it gets out of the way.</h3>
-              <p>
-                The dashboard is a native Rust TUI: 27 MB resident and asleep until
-                an agent writes. It renders a full pane without allocating per
-                terminal cell, and background checks back off instead of spawning
-                processes at you around the clock.
-              </p>
-            </article>
-          </div>
-        </section>
-
-        <section class="section" aria-labelledby="edit-title">
-          <div class="section-head" data-reveal>
-            <h2 id="edit-title">Edit the plan before it runs.</h2>
-            <p>
-              The DAG is a draft, not a verdict. Press v on the orchestrator to
-              open plan review, then edit any node inline: its title, goal, success
-              criteria, dependencies, and the prompt the agent will run. Approve
-              once and Rudder launches the plan you actually want.
-            </p>
-          </div>
-
-          <div class="edit-stage">
-            <div class="node-card" data-reveal aria-label="Editing a node in plan review.">
-              <div class="nc-head">
-                <span class="nc-chip">plan review</span>
-                <span>node 04 &middot; dashboard</span>
-              </div>
-              <div class="nc-field">
-                <span class="k">title</span><span class="v">dashboard</span>
-              </div>
-              <div class="nc-field active">
-                <span class="k">goal</span><span class="v">render the top-tracks view from the api client<span class="editcaret"></span></span>
-              </div>
-              <div class="nc-field">
-                <span class="k">done</span><span class="v muted">tracks list renders with cover art and play counts</span>
-              </div>
-              <div class="nc-field">
-                <span class="k">hard deps</span><span class="v">02 &nbsp; 03</span>
-              </div>
-              <div class="nc-field">
-                <span class="k">soft deps</span><span class="v muted">none</span>
-              </div>
-              <div class="nc-field">
-                <span class="k">prompt</span><span class="v muted">build the dashboard route, fetch via the api client, gate on auth&hellip;</span>
-              </div>
-            </div>
-
-            <div class="keys-card" data-reveal>
-              <span class="keys-title">plan review keys</span>
-              <div class="keys-row"><kbd>v</kbd><span>open plan review on the orchestrator</span></div>
-              <div class="keys-row"><kbd>Tab</kbd><span>move between fields on a node</span></div>
-              <div class="keys-row"><kbd>Ctrl-S</kbd><span>save your edits to the DAG</span></div>
-              <div class="keys-row"><kbd>Ctrl-Enter</kbd><span>approve and launch the plan</span></div>
-              <div class="keys-row"><kbd>Esc</kbd><span>hide review, back to the orchestrator</span></div>
-            </div>
-          </div>
-        </section>
-
-        <section class="section" aria-labelledby="controls-title">
-          <div class="section-head" data-reveal>
-            <h2 id="controls-title">Three panes, three jumps.</h2>
-            <p>
-              Option-1, Option-2, and Option-3 always mean Agents, Worker, and
-              Task. The Worker pane belongs to Claude or Codex, so dashboard
-              commands from there start with the Ctrl-W leader.
-            </p>
-          </div>
-
-          <div class="panes" data-reveal-group>
-            <div class="pane">
-              <span class="key">Option-1</span>
-              <h3>Agents</h3>
-              <p>Pick a run, move with j/k, then review, merge, rename, or delete.</p>
-            </div>
-            <div class="pane">
-              <span class="key">Option-2</span>
-              <h3>Worker</h3>
-              <p>Talk directly to Claude Code or Codex. Tab and prompts stay native.</p>
-            </div>
-            <div class="pane">
-              <span class="key">Option-3</span>
-              <h3>Task</h3>
-              <p>Start a plan, answer planner questions, or add work to a running DAG.</p>
-            </div>
-          </div>
-
-          <div class="control-extra">
-            <div class="type-card" data-type-card>
-              <span class="type-label">task pane</span>
-              <div class="typed-line">
-                <span class="gt">&rsaquo; </span><span data-type-text>build a spotify top-tracks dashboard</span><span class="cursor">_</span>
-              </div>
-            </div>
-
-            <div class="keys-card">
-              <span class="keys-title">from inside worker</span>
-              <div class="keys-row"><kbd>Ctrl-W 1/2/3</kbd><span>use the same pane jumps</span></div>
-              <div class="keys-row"><kbd>Ctrl-W v</kbd><span>open review for the selected agent</span></div>
-              <div class="keys-row"><kbd>Ctrl-W m</kbd><span>merge the selected agent</span></div>
-              <div class="keys-row"><kbd>/model</kbd><span>switch Claude, Codex, model, effort</span></div>
-            </div>
-          </div>
-        </section>
-
-        <section class="cta" aria-labelledby="cta-title">
-          <h2 id="cta-title" data-reveal>Start steering.</h2>
-          <p data-reveal>
-            Install Rudder, describe a goal, and watch the plan run. Free and open
-            source.
-          </p>
-          <div class="actions" data-reveal>
             <div class="install">
-              <code id="install-command-2"><span class="prompt">$ </span>npm install -g @viraatdas/rudder@latest</code>
-              <button class="copy" type="button" data-copy="install-command-2" data-copy-value="npm install -g @viraatdas/rudder@latest">
+              <code id="install-command"
+                ><span class="prompt">$ </span
+                >npm install -g @viraatdas/rudder@latest</code
+              >
+              <button
+                class="copy"
+                type="button"
+                data-copy="install-command"
+                data-copy-value="npm install -g @viraatdas/rudder@latest"
+              >
                 Copy
               </button>
             </div>
-            <a class="button-link" href="https://github.com/viraatdas/rudder">View source</a>
+            <p class="actions-row">
+              <a href="/docs">Read the docs</a>
+              <a href="https://github.com/viraatdas/rudder">View source</a>
+            </p>
           </div>
+
+        </section>
+
+        <section aria-labelledby="sheet-title">
+          <div class="sheet-head">
+            <h2 id="sheet-title">session sheet</h2>
+            <dl class="stamp">
+              <div class="stamp-row">
+                <dt class="field-label">runs on</dt>
+                <dd>macOS · Linux</dd>
+              </div>
+              <div class="stamp-row">
+                <dt class="field-label">agents</dt>
+                <dd>claude · codex · opencode</dd>
+              </div>
+              <div class="stamp-row">
+                <dt class="field-label">isolation</dt>
+                <dd>jj workspaces</dd>
+              </div>
+            </dl>
+          </div>
+          <div class="sheet-wrap">
+            <table class="tracks">
+              <caption>
+                One row per agent. Read the column, not the rows: nothing here
+                shares a working tree.
+              </caption>
+              <thead>
+                <tr>
+                  <th scope="col">no.</th>
+                  <th scope="col">task</th>
+                  <th scope="col">workspace</th>
+                  <th scope="col">state</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td class="t-no" data-label="no.">01</td>
+                  <td class="t-task" data-label="task">rate-limit the public API</td>
+                  <td class="t-ws" data-label="workspace">.rudder-worktrees/rate-limit</td>
+                  <td class="t-state" data-label="state">
+                    <span class="state state--running">running</span>
+                  </td>
+                </tr>
+                <tr>
+                  <td class="t-no" data-label="no.">02</td>
+                  <td class="t-task" data-label="task">port the settings screen to the new form</td>
+                  <td class="t-ws" data-label="workspace">.rudder-worktrees/settings-form</td>
+                  <td class="t-state" data-label="state">
+                    <span class="state state--review">needs review</span>
+                  </td>
+                </tr>
+                <tr>
+                  <td class="t-no" data-label="no.">03</td>
+                  <td class="t-task" data-label="task">drop the legacy session table</td>
+                  <td class="t-ws" data-label="workspace">.rudder-worktrees/drop-sessions</td>
+                  <td class="t-state" data-label="state">
+                    <span class="state state--merged">merged</span>
+                  </td>
+                </tr>
+                <tr>
+                  <td class="t-no" data-label="no.">04</td>
+                  <td class="t-task" data-label="task">write the migration guide</td>
+                  <td class="t-ws" data-label="workspace">.rudder-worktrees/migration-doc</td>
+                  <td class="t-state" data-label="state">
+                    <span class="state state--running">running</span>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="bus">
+            <span class="bus-label">&#8595; main</span>
+            <span class="bus-note">
+              Track 03 landed. The other three are still in their own trees and
+              have changed nothing you can see.
+            </span>
+          </p>
+        </section>
+
+        <section class="section" aria-labelledby="how-title">
+          <div class="section-head">
+            <h2 id="how-title">Isolation is the whole trick.</h2>
+            <p>
+              Parallel agents are easy. Parallel agents that do not corrupt each
+              other's work is the part that needs a mechanism, and jj workspaces
+              are it.
+            </p>
+          </div>
+          <div class="movements">
+            <div class="movement">
+              <span class="field-label">isolate</span>
+              <h3>A workspace per agent</h3>
+              <p>
+                Each agent gets its own jj workspace outside your checkout. It
+                cannot see, stash, or overwrite anyone else's edits.
+              </p>
+            </div>
+            <div class="movement">
+              <span class="field-label">run</span>
+              <h3>All of them at once</h3>
+              <p>
+                Claude Code, Codex and opencode run side by side, on the same
+                repository, without a single branch checkout between them.
+              </p>
+            </div>
+            <div class="movement">
+              <span class="field-label">review</span>
+              <h3>A real diff, per row</h3>
+              <p>
+                Press <kbd>v</kbd> on any agent for the live <code class="mono">jj diff</code>
+                of its workspace, before any of it is yours.
+              </p>
+            </div>
+            <div class="movement">
+              <span class="field-label">merge</span>
+              <h3>Only when you say</h3>
+              <p>
+                <kbd>m</kbd> merges one, <kbd>M</kbd> merges everything ready.
+                Conflicts are recorded in the change rather than blocking it, and
+                <kbd>u</kbd> undoes the merge.
+              </p>
+            </div>
+          </div>
+        </section>
+
+        <section class="section" aria-labelledby="type-title">
+          <div class="section-head">
+            <h2 id="type-title">Three things you can type.</h2>
+            <p>
+              The task box takes plain language. What you type decides where the
+              work lands, and that is the only decision you have to make.
+            </p>
+          </div>
+          <div class="table-wrap">
+            <table class="commands">
+              <thead>
+                <tr>
+                  <th scope="col">you type</th>
+                  <th scope="col">what happens</th>
+                  <th scope="col">where it works</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td class="c-in" data-label="you type">fix the login redirect</td>
+                  <td class="c-what" data-label="what happens">
+                    One isolated agent
+                    <span
+                      >Plain text is the default. It never touches your checkout
+                      and merges with <kbd>m</kbd>.</span
+                    >
+                  </td>
+                  <td class="c-where" data-label="where it works">its own workspace</td>
+                </tr>
+                <tr>
+                  <td class="c-in" data-label="you type">/plan ship billing v2</td>
+                  <td class="c-what" data-label="what happens">
+                    An orchestrator
+                    <span
+                      >Breaks the goal into a task graph you can edit, then runs
+                      and merges the nodes as their dependencies land.</span
+                    >
+                  </td>
+                  <td class="c-where" data-label="where it works">one workspace per node</td>
+                </tr>
+                <tr>
+                  <td class="c-in" data-label="you type">/main tag the release</td>
+                  <td class="c-what" data-label="what happens">
+                    An agent in your checkout
+                    <span
+                      >For the jobs that are actually about your working tree.
+                      Nothing to merge, because it is already here.</span
+                    >
+                  </td>
+                  <td class="c-where" data-label="where it works">your real checkout</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="section" aria-labelledby="desk-title">
+          <div class="section-head">
+            <h2 id="desk-title">Three panes, three jumps.</h2>
+            <p>
+              <kbd>Option-1</kbd>, <kbd>Option-2</kbd> and <kbd>Option-3</kbd>
+              always mean the same three places. The worker pane belongs to the
+              agent, so dashboard keys from inside it take the
+              <kbd>Ctrl-W</kbd> leader.
+            </p>
+          </div>
+          <div class="desk">
+            <div class="strip">
+              <span class="field-label">option-1</span>
+              <h3>Agents</h3>
+              <p>
+                Every run on one sheet. Move with <kbd>j</kbd>/<kbd>k</kbd>, then
+                review, merge, rename or delete.
+              </p>
+            </div>
+            <div class="strip">
+              <span class="field-label">option-2</span>
+              <h3>Worker</h3>
+              <p>
+                The agent's own terminal, unmodified. Talk to Claude or Codex
+                directly; their prompts stay native.
+              </p>
+            </div>
+            <div class="strip">
+              <span class="field-label">option-3</span>
+              <h3>Task</h3>
+              <p>
+                Where work starts. Type a task, or steer a plan that is already
+                running.
+              </p>
+            </div>
+          </div>
+        </section>
+
+        <section class="section" aria-labelledby="options-title">
+          <div class="section-head">
+            <h2 id="options-title">Set per agent, changed mid-session.</h2>
+            <p>
+              Backend, model and reasoning effort are per row, not global. Switch
+              with <code class="mono">/model</code> and the next agent picks it
+              up.
+            </p>
+          </div>
+          <div class="options">
+            <div class="option-group">
+              <h3>Backend</h3>
+              <p>Which CLI actually runs.</p>
+              <ul class="option-list">
+                <li><span>claude</span><em>Claude Code</em></li>
+                <li><span>codex</span><em>OpenAI Codex</em></li>
+                <li><span>opencode</span><em>opencode</em></li>
+              </ul>
+            </div>
+            <div class="option-group">
+              <h3>Effort</h3>
+              <p>How long it thinks before it writes.</p>
+              <ul class="option-list">
+                <li><span>low</span><em>mechanical edits</em></li>
+                <li><span>medium</span><em>the default</em></li>
+                <li><span>high</span><em>design and debugging</em></li>
+              </ul>
+            </div>
+            <div class="option-group">
+              <h3>Where it runs</h3>
+              <p>Your machine, or not.</p>
+              <ul class="option-list">
+                <li><span>local</span><em>your hardware</em></li>
+                <li><span>cloud</span><em>Rudder Cloud</em></li>
+              </ul>
+            </div>
+          </div>
+        </section>
+
+        <section class="close" aria-labelledby="close-title">
+          <h2 id="close-title">Put four things in flight.</h2>
+          <p>
+            Install it, type four tasks, and watch four workspaces fill up while
+            your checkout stays exactly where you left it.
+          </p>
+          <div class="install">
+            <code id="install-command-2"
+              ><span class="prompt">$ </span
+              >npm install -g @viraatdas/rudder@latest</code
+            >
+            <button
+              class="copy"
+              type="button"
+              data-copy="install-command-2"
+              data-copy-value="npm install -g @viraatdas/rudder@latest"
+            >
+              Copy
+            </button>
+          </div>
+          <p class="actions-row">
+            <a href="/docs">Read the docs</a>
+            <a href="https://github.com/viraatdas/rudder">View source</a>
+          </p>
         </section>
       </main>
 
-      <footer>
-        <a class="brand" href="/">
-          <img src="/favicon.svg" alt="" />
-          <span>Rudder</span>
-        </a>
-        <nav aria-label="Footer navigation">
-          <a href="https://www.npmjs.com/package/@viraatdas/rudder">npm</a>
+      <footer class="site-foot">
+        <span>Rudder — a terminal orchestrator for coding agents.</span>
+        <nav aria-label="Footer">
+          <a href="/docs">Docs</a>
           <a href="https://github.com/viraatdas/rudder">GitHub</a>
+          <a href="https://www.npmjs.com/package/@viraatdas/rudder">npm</a>
           <a href="/login">Sign in</a>
         </nav>
       </footer>

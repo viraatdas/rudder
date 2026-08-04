@@ -1,84 +1,84 @@
-/* ---------- responsive ---------- */
-@media (max-width: 920px) {
-  .flow {
-    grid-template-columns: 1fr 1fr;
-  }
-  .flow-step {
-    border-bottom: 1px solid var(--soft-line);
-    padding-left: 22px;
-    padding-right: 20px;
-  }
-  .flow-step:nth-child(odd) {
-    padding-left: 0;
-  }
-  .flow-step:nth-child(2n) {
-    border-right: 0;
-  }
+/* One authored moment, not scattered effects.
+ *
+ * The sheet's native motion is being filled in: a form is written a row at a
+ * time, and the ink lands. On load the track rows ink in with a short stagger
+ * and the sum-bus rule draws left to right, once. Nothing else on the page
+ * animates on scroll.
+ *
+ * Content is visible by default. The animation runs FROM the final state, so a
+ * headless render, a background tab, or a failed script still ships a complete
+ * page rather than a blank one.
+ */
 
-  .features,
-  .panes {
-    grid-template-columns: 1fr;
+@keyframes ink-in {
+  from {
+    opacity: 0;
+    transform: translateY(3px);
   }
-  .feature,
-  .pane {
-    border-right: 0;
-    border-bottom: 1px solid var(--line);
-  }
-  .feature:last-child,
-  .pane:last-child {
-    border-bottom: 0;
-  }
-
-  .edit-stage,
-  .control-extra {
-    grid-template-columns: 1fr;
+  to {
+    opacity: 1;
+    transform: none;
   }
 }
 
-@media (max-width: 600px) {
-  header {
-    flex-direction: column;
-    align-items: flex-start;
-    gap: 16px;
+@keyframes rule-draw {
+  from {
+    transform: scaleX(0);
   }
-  nav {
-    justify-content: flex-start;
-  }
-  .flow {
-    grid-template-columns: 1fr;
-  }
-  .flow-step {
-    border-right: 0;
-    padding-left: 0;
-    padding-right: 0;
-  }
-  .principle {
-    grid-template-columns: 1fr;
-    gap: 8px;
-    padding: 24px 0;
-  }
-  .nc-field {
-    grid-template-columns: 1fr;
-    gap: 3px;
-  }
-  .keys-row {
-    grid-template-columns: 1fr;
-    gap: 4px;
-  }
-  .install {
-    width: 100%;
+  to {
+    transform: scaleX(1);
   }
 }
 
-@media (prefers-reduced-motion: reduce) {
-  html {
-    scroll-behavior: auto;
+@media (prefers-reduced-motion: no-preference) {
+  .tracks tbody tr {
+    animation: ink-in 520ms var(--ease-expo) both;
   }
-  *,
-  *::before,
-  *::after {
-    animation-duration: 0.01ms !important;
-    animation-iteration-count: 1 !important;
-    transition-duration: 0.01ms !important;
+
+  .tracks tbody tr:nth-child(1) {
+    animation-delay: 60ms;
+  }
+  .tracks tbody tr:nth-child(2) {
+    animation-delay: 140ms;
+  }
+  .tracks tbody tr:nth-child(3) {
+    animation-delay: 220ms;
+  }
+  .tracks tbody tr:nth-child(4) {
+    animation-delay: 300ms;
+  }
+
+  .bus {
+    position: relative;
+  }
+
+  /* The bus rule draws itself once, after the last row has landed. */
+  .bus::before {
+    content: "";
+    position: absolute;
+    inset-inline: 0;
+    top: -2px;
+    height: 2px;
+    background: var(--rule-strong);
+    transform-origin: left center;
+    animation: rule-draw 620ms var(--ease-expo) 340ms both;
+  }
+}
+
+/* The state stamp for a running track breathes, because that row is live.
+ * This is the only looping motion on the page and it stops at reduced motion. */
+@media (prefers-reduced-motion: no-preference) {
+  @keyframes pulse-mark {
+    0%,
+    100% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.35;
+    }
+  }
+
+  .state--running::before {
+    animation: pulse-mark 2.1s var(--ease-quint) infinite;
   }
 }

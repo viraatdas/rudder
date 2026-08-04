@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Plans and the DAG — Rudder docs</title>
+    <meta name="description" content="When a goal needs several steps in a particular order, /plan gives you an orchestrator: it proposes a task graph, you edit it, then it runs and merges the nodes as their dependencies land." />
+    <link rel="canonical" href="https://rudder.viraat.dev/docs/plans" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <meta name="theme-color" content="#ffffff" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/docs.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <div class="page">
+      <header class="site-head">
+        <a class="brand" href="/">
+          <img src="/favicon.svg" alt="" />
+          <span>Rudder</span>
+        </a>
+        <nav class="site-nav" aria-label="Primary">
+          <a href="/docs" aria-current="page">Docs</a>
+          <a href="https://github.com/viraatdas/rudder">GitHub</a>
+          <a href="https://www.npmjs.com/package/@viraatdas/rudder">npm</a>
+          <a href="/login">Sign in</a>
+        </nav>
+      </header>
+    </div>
+
+    <div class="docs">
+      <nav class="docs-nav" aria-label="Documentation">
+        <h2>get started</h2>
+        <ul>
+          <li><a href="/docs">Overview</a></li>
+          <li><a href="/docs/install">Install</a></li>
+          <li><a href="/docs/first-agent">Your first agent</a></li>
+        </ul>
+        <h2>core</h2>
+        <ul>
+          <li><a href="/docs/workspaces">Workspaces</a></li>
+          <li><a href="/docs/plans" aria-current="page">Plans and the DAG</a></li>
+        </ul>
+        <h2>reference</h2>
+        <ul>
+          <li><a href="/docs/commands">Commands and keys</a></li>
+          <li><a href="/docs/faq">FAQ</a></li>
+        </ul>
+      </nav>
+
+      <main class="docs-main" id="main">
+        <h1>Plans and the DAG</h1>
+        <p class="docs-lede">When a goal needs several steps in a particular order, /plan gives you an orchestrator: it proposes a task graph, you edit it, then it runs and merges the nodes as their dependencies land.</p>
+<h2 id="start">Starting a plan</h2>
+<pre><code>/plan add billing with Stripe, including the webhook handler</code></pre>
+<p>A read-only planner inspects the repository, asks a round of questions if the goal
+is ambiguous, and proposes a graph of tasks. <strong>Nothing is written to your code
+until you approve it.</strong></p>
+
+<h2 id="edit">Editing before it runs</h2>
+<p>The plan is a draft, not a verdict. Press <kbd>v</kbd> on the orchestrator to open
+plan review and edit any node in place: its title, goal, success criteria,
+dependencies, and the exact prompt the agent will run.</p>
+<table class="docs-table">
+  <thead><tr><th>key</th><th>in plan review</th></tr></thead>
+  <tbody>
+    <tr><td>v</td><td>open plan review on the orchestrator</td></tr>
+    <tr><td>Tab</td><td>move between fields on a node</td></tr>
+    <tr><td>Ctrl-S</td><td>save your edits to the graph</td></tr>
+    <tr><td>Ctrl-Enter</td><td>approve and launch</td></tr>
+    <tr><td>Esc</td><td>back to the orchestrator</td></tr>
+  </tbody>
+</table>
+
+<h2 id="deps">Hard and soft edges</h2>
+<p>A <strong>hard</strong> edge means a node waits for its parent to merge. A
+<strong>soft</strong> edge is context only and never gates a launch. Work that can run
+in parallel does, and the plan blocks only where one task truly depends on another.</p>
+<p>As each node merges, its children unblock and launch on their own.</p>
+
+<h2 id="steer">Steering a running plan</h2>
+<p>Talk to the orchestrator's own pane. Select the orchestrator row, type into it, and
+it will add tasks, re-plan structurally, stop or re-goal specific workers, or explain
+what is happening.</p>
+
+<div class="note">
+  <span class="field-label">the task box is not the orchestrator</span>
+  <p>Typing into the task box always starts a new standalone agent, even while a plan
+  is running. To change a plan, talk to that plan's pane.</p>
+</div>
+      <nav class="docs-pager" aria-label="Pagination">
+        <a class="prev" href="/docs/workspaces"><span class="field-label">previous</span>Workspaces</a>
+        <a class="next" href="/docs/commands"><span class="field-label">next</span>Commands and keys</a>
+      </nav>
+      </main>
+
+      <aside class="docs-toc">
+        <h2>on this page</h2>
+        <ul>
+            <li><a href="#start">Starting a plan</a></li>
+            <li><a href="#edit">Editing before it runs</a></li>
+            <li><a href="#deps">Hard and soft edges</a></li>
+            <li><a href="#steer">Steering a running plan</a></li>
+        </ul>
+      </aside>
+    </div>
+  </body>
+</html>

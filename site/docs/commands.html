@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Commands and keys — Rudder docs</title>
+    <meta name="description" content="Everything you can type into the task box, and every key the dashboard listens for." />
+    <link rel="canonical" href="https://rudder.viraat.dev/docs/commands" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <meta name="theme-color" content="#ffffff" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/docs.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <div class="page">
+      <header class="site-head">
+        <a class="brand" href="/">
+          <img src="/favicon.svg" alt="" />
+          <span>Rudder</span>
+        </a>
+        <nav class="site-nav" aria-label="Primary">
+          <a href="/docs" aria-current="page">Docs</a>
+          <a href="https://github.com/viraatdas/rudder">GitHub</a>
+          <a href="https://www.npmjs.com/package/@viraatdas/rudder">npm</a>
+          <a href="/login">Sign in</a>
+        </nav>
+      </header>
+    </div>
+
+    <div class="docs">
+      <nav class="docs-nav" aria-label="Documentation">
+        <h2>get started</h2>
+        <ul>
+          <li><a href="/docs">Overview</a></li>
+          <li><a href="/docs/install">Install</a></li>
+          <li><a href="/docs/first-agent">Your first agent</a></li>
+        </ul>
+        <h2>core</h2>
+        <ul>
+          <li><a href="/docs/workspaces">Workspaces</a></li>
+          <li><a href="/docs/plans">Plans and the DAG</a></li>
+        </ul>
+        <h2>reference</h2>
+        <ul>
+          <li><a href="/docs/commands" aria-current="page">Commands and keys</a></li>
+          <li><a href="/docs/faq">FAQ</a></li>
+        </ul>
+      </nav>
+
+      <main class="docs-main" id="main">
+        <h1>Commands and keys</h1>
+        <p class="docs-lede">Everything you can type into the task box, and every key the dashboard listens for.</p>
+<h2 id="typing">What you type</h2>
+<table class="docs-table">
+  <thead><tr><th>input</th><th>result</th></tr></thead>
+  <tbody>
+    <tr><td>plain text</td><td>One isolated agent in its own workspace. The default, and the only thing that cannot touch your checkout.</td></tr>
+    <tr><td>/plan &lt;goal&gt;</td><td>An orchestrator that plans a task graph, then runs and merges it.</td></tr>
+    <tr><td>/main &lt;task&gt;</td><td>An agent in your real checkout. Nothing to merge. <code>/m</code> is the same thing.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="commands">Commands</h2>
+<table class="docs-table">
+  <thead><tr><th>command</th><th>what it does</th></tr></thead>
+  <tbody>
+    <tr><td>/model</td><td>Switch backend, model and reasoning effort for the next agent.</td></tr>
+    <tr><td>/fast</td><td>Toggle faster output on supported models.</td></tr>
+    <tr><td>/resume</td><td>Continue an existing Claude, Codex or opencode chat as an agent.</td></tr>
+    <tr><td>/restore</td><td>Reopen a specific session id in a new pane.</td></tr>
+    <tr><td>/share</td><td>Durable local context every agent reads. For tokens, URLs, env details.</td></tr>
+    <tr><td>/goal</td><td>Set or change the session's overall goal.</td></tr>
+    <tr><td>/usage</td><td>Token and cost usage for this session.</td></tr>
+    <tr><td>/cloud</td><td>Move the fleet onto Rudder Cloud.</td></tr>
+    <tr><td>/web</td><td>Open the web board for this project.</td></tr>
+    <tr><td>/feedback</td><td>Send a report, with the local copy written first.</td></tr>
+    <tr><td>/sound, /color</td><td>Notification sound and colour preferences.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="keys">Keys</h2>
+<table class="docs-table">
+  <thead><tr><th>key</th><th>action</th></tr></thead>
+  <tbody>
+    <tr><td>j / k</td><td>Move down and up the agents list.</td></tr>
+    <tr><td>Enter</td><td>Focus the selected agent's pane.</td></tr>
+    <tr><td>Option-[ / Option-]</td><td>Step to the previous or next agent from any pane.</td></tr>
+    <tr><td>v</td><td>Live jj diff of the selected agent.</td></tr>
+    <tr><td>m</td><td>Merge the selected agent.</td></tr>
+    <tr><td>M</td><td>Merge everything ready.</td></tr>
+    <tr><td>u</td><td>Undo a merge.</td></tr>
+    <tr><td>R</td><td>Review all.</td></tr>
+    <tr><td>x</td><td>Stop the selected agent.</td></tr>
+    <tr><td>b</td><td>Branch a new chat from this agent's session.</td></tr>
+    <tr><td>g</td><td>Nest work under the selected node.</td></tr>
+    <tr><td>o</td><td>Open the web board.</td></tr>
+    <tr><td>P</td><td>Model picker for the selected row.</td></tr>
+    <tr><td>dd</td><td>Delete the selected agent.</td></tr>
+    <tr><td>cc</td><td>Clear merged rows.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="panes">Panes</h2>
+<p><kbd>Option-1</kbd>, <kbd>Option-2</kbd> and <kbd>Option-3</kbd> always mean Agents,
+Worker and Task.</p>
+<p>The worker pane belongs to the agent, so its keystrokes go to Claude or Codex, not
+to Rudder. To send a dashboard key from inside it, use the <kbd>Ctrl-W</kbd> leader:
+<kbd>Ctrl-W v</kbd> reviews, <kbd>Ctrl-W m</kbd> merges, <kbd>Ctrl-W 1/2/3</kbd>
+switches panes.</p>
+      <nav class="docs-pager" aria-label="Pagination">
+        <a class="prev" href="/docs/plans"><span class="field-label">previous</span>Plans and the DAG</a>
+        <a class="next" href="/docs/faq"><span class="field-label">next</span>FAQ</a>
+      </nav>
+      </main>
+
+      <aside class="docs-toc">
+        <h2>on this page</h2>
+        <ul>
+            <li><a href="#typing">What you type</a></li>
+            <li><a href="#commands">Commands</a></li>
+            <li><a href="#keys">Keys</a></li>
+            <li><a href="#panes">Panes</a></li>
+        </ul>
+      </aside>
+    </div>
+  </body>
+</html>
