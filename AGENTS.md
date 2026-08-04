@@ -469,7 +469,7 @@ agent whose task is a `/review` over the combined diff. Native no longer creates
 integrates Git worktree branches.
 
 ### Tests
-`native/src/app_tests.rs` holds the dashboard tests (320, plus one `#[ignore]`d live
+`native/src/app_tests.rs` holds the dashboard tests (502, plus one `#[ignore]`d live
 conductor harness; declared `#[cfg(test)] mod app_tests;` in `main.rs`). Includes the
 leader/Option-key coverage: `ctrl_w_leader_then_digit_focuses_pane`,
 `ctrl_w_leader_is_one_shot`, `ctrl_w_leader_escape_cancels_without_action`,
@@ -954,8 +954,34 @@ starts on every launch whether or not anyone opens the board.
 
 ## 14. Orchestrator: the DAG, the schedulers, and the conductor (v3)
 
-Beyond single runs (sections 5–7), Rudder decomposes ONE goal into a DAG of tasks
+Beyond single runs (sections 5–7), Rudder decomposes a goal into a DAG of tasks
 and runs them as a fleet. This section is the map of that orchestrator.
+
+**Several plans at once (v2.x).** `/plan` used to be AT-MOST-ONE: a second `/plan`
+retired the running orchestrator row and wiped the plan state. It no longer does.
+Each `/plan` owns a `PlanState` (`native/src/main.rs`) in `App::plans` — its own
+queue, launch/merge ledgers, approval gate, refine/rebase turn, plan review draft
+and final gate. `App::plan()` / `plan_mut()` resolve the plan the UI is acting on,
+DERIVED from the selection (the selected orchestrator's `plan_id`, or the plan
+owning the selected worker's node), falling back to the most recently started plan;
+nothing caches "the active plan". `AgentRun.plan_id` and `PlannedNode.plan_id` link a
+row or node back to its plan, and `adopt_plan_nodes` renames a node id that another
+plan already uses (deps rewritten with it) so `node_id` stays a unique join key —
+a lone plan keeps the planner's `n0`, `n1`, … verbatim. A run with NO `plan_id`
+(persisted before plan ids existed) is attributed to the single plan when there is
+only one, which is why one-plan sessions behave exactly as before. A fresh `/plan`
+RECYCLES a spent plan slot (no queue, no gate, no live workers) rather than stacking,
+so repeated single-plan use still shows exactly one orchestrator row.
+
+Deliberately still global: the `activity_log`, the parallelism cap (`max_parallel()`
+is a machine limit, not a per-plan one), `node_review_enabled`, and the `RUDDER.md`
+control channel — there is one per repo, so the INTERACTIVE orchestrator's file
+channel (`maybe_capture_orchestrator_plan`, `maybe_recapture_orchestrator_plan`,
+`scan_orchestrator_markers`) resolves to the live interactive conductor's plan and
+handles one at a time. Headless orchestrators stream their DAG through their own PTY
+and are fully plan-scoped, so any number run side by side. Plans share no state:
+each node gets its own jj workspace and merges independently, and there is no
+cross-plan coordination by design.
 
 ### 14.1 The model
 - A goal → a DAG of task nodes in `.rudder/graph.json`. Edges are typed: **hard**
@@ -970,11 +996,13 @@ and runs them as a fleet. This section is the map of that orchestrator.
   is MERGED, so it builds on the real, landed interface.
 
 ### 14.2 Two schedulers, one brain (deliberate; deduped)
-- **TUI brain** (`native/src/main.rs`): owns the plan in memory (`planned_nodes` +
+- **TUI brain** (`native/src/main.rs`): owns the plans in memory (`App::plans` +
   `agents`), spawns each worker's PTY **in-process** (that is what renders the live
-  panes), and is the **sole worker scheduler** in interactive use (`run_scheduler` →
-  `next_node_to_launch` → `start_execute_task_node`). It MIRRORS its plan into
-  `graph.json` one-way via `rudder __graph-mirror` (`mirror_graph`/`build_mirror_payload`).
+  panes), and is the **sole worker scheduler** in interactive use (`run_scheduler`
+  fans out over every plan → `run_scheduler_for` → `next_node_to_launch_in` →
+  `start_execute_task_node`). It MIRRORS every plan into
+  `graph.json` one-way via `rudder __graph-mirror` (`mirror_graph`/`build_mirror_payload`);
+  the mirror is one flat node list because node ids are unique across plans.
 - **Daemon** (`src/scheduler.ts`): dispatches **only headless** (`rudder board`/`serve`,
   `scheduler:true`), reading `graph.json` as source of truth and spawning detached
   `rudder __worker` subprocesses. When the TUI is up it starts the daemon
@@ -993,9 +1021,9 @@ and runs them as a fleet. This section is the map of that orchestrator.
   reads it back for scheduling. They are mutually-exclusive schedulers, not duplicates —
   one runtime for live panes (Rust), one for headless/web (TS).
 
-**The scheduler: queue, ledger, gates, cadence.** `planned_nodes` is the pending queue
-(the Todo section), while `plan_launched_node_ids` and `plan_merged_node_ids` are the
-durable at-most-once facts for the active plan. A launch records the node id and persists
+**The scheduler: queue, ledger, gates, cadence.** Each plan's `planned_nodes` is its
+pending queue (the Todo section renders every plan's), while `plan_launched_node_ids`
+and `plan_merged_node_ids` are that plan's durable at-most-once facts. A launch records the node id and persists
 the shrunken queue in one snapshot *before* spawning the worker. Startup reconciles any
 older queue snapshot against persisted `AgentRun.node_id` records, so the crash window
 between run creation and queue persistence cannot relaunch a node. Presentation cleanup
@@ -1066,7 +1094,9 @@ user only ever talks to Rudder; the planner can never go off and implement on it
    updates in place (no wipe).
 5. **Approve → launch.** Empty-Enter → `approve_planned_queue` → `run_scheduler` dispatches
    ready nodes (todo → running), each in its own jj workspace. The queued plan + gate state
-   plus launched/merged node ledgers persist to `.rudder/plan-queue.json`, so a mid-plan
+   plus launched/merged node ledgers persist to `.rudder/plan-queue.json` (a `plans: []`
+   array — one entry per live plan; a file written in the older single-plan shape is still
+   read and becomes one plan), so a mid-plan
    restart resumes without losing or duplicating work. Interactive plan-file capture is
    explicitly armed only by a fresh planning turn; an empty queue/all-merged fleet never
    causes an old `RUDDER_PLAN_TASKS` block to be interpreted as a new request.
@@ -1430,6 +1460,11 @@ Recorded so future contributors do not relitigate them:
   drift-fix, plan-rebase, merges). The bargain is VISIBLE (every action lands in
   `activity_log`) and UNDOABLE (jj op-log via `rudder undo`), not gated. The only
   explicit-intent action is reverting already-MERGED work (build-forward).
+- **Several plans, no shared state.** `/plan` is no longer at-most-one: each plan owns
+  its own `PlanState`, workspaces and merges, and talking to an orchestrator's pane edits
+  THAT plan. There is deliberately no cross-plan coordination — two plans that touch the
+  same files rejoin at the same place every isolated worker does, the merge. The task pane
+  still routes into NO plan: plain input always starts a standalone worker.
 - **Explicit isolation.** `/plan` DAG workers and `/run` workers get their own jj
   workspace, never nested in the repo. Plain main-owner and `/ask` runs intentionally
   use the real checkout so one agent can finish repository/release/deployment steps.

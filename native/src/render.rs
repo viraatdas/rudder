@@ -808,7 +808,7 @@ fn push_planned_row<'a>(
 #[allow(clippy::too_many_arguments)]
 fn planned_walk<'a>(
     lines: &mut Vec<ListItem<'a>>,
-    nodes: &[PlannedNode],
+    nodes: &[&PlannedNode],
     children: &std::collections::HashMap<usize, Vec<(usize, EdgeType)>>,
     index: usize,
     edge: Option<EdgeType>,
@@ -832,7 +832,7 @@ fn planned_walk<'a>(
 
     push_planned_row(
         lines,
-        &nodes[index],
+        nodes[index],
         focused,
         task_width,
         &prefix,
@@ -871,7 +871,7 @@ fn planned_walk<'a>(
 /// true when anything was emitted.
 fn render_planned_section<'a>(
     lines: &mut Vec<ListItem<'a>>,
-    nodes: &[PlannedNode],
+    nodes: &[&PlannedNode],
     focused: bool,
     task_width: usize,
     leading_blank: bool,
@@ -1082,7 +1082,7 @@ pub(crate) fn orchestrator_phase(agent: &AgentRun) -> OrchestratorPhase {
 }
 
 fn orchestrator_phase_for_app(app: &App, agent: &AgentRun) -> OrchestratorPhase {
-    if agent.is_orchestrator() && app.planner_paused_for_input {
+    if agent.is_orchestrator() && app.plan().planner_paused_for_input {
         OrchestratorPhase::Planning
     } else {
         orchestrator_phase(agent)
@@ -1160,7 +1160,7 @@ fn push_orchestrator_row<'a>(
     // The plan is decomposed and waiting for the user to approve it before any
     // node launches. Surface that on the left panel in the attention color so
     // "it's asking for approval" is obvious without opening the plan.
-    let awaiting = app.awaiting_approval && agent.is_orchestrator() && !planning;
+    let awaiting = app.plan().awaiting_approval && agent.is_orchestrator() && !planning;
     let badge = if planning { app.spinner_glyph() } else { BADGE };
     let (role, phase) = if planning {
         let backend = match agent.backend {
@@ -1406,6 +1406,7 @@ pub(crate) fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                     .filter_map(|run| run.node_id.as_deref())
                     .collect();
                 let blocked_reasons: std::collections::HashMap<String, String> = app
+                    .plan()
                     .planned_nodes
                     .iter()
                     .filter_map(|node| {
@@ -1415,13 +1416,26 @@ pub(crate) fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                             .map(|dep| (node.id.clone(), dep.clone()))
                     })
                     .collect();
+                // EVERY plan's queue, not just the selected one's: the agents pane is
+                // the whole fleet, so work waiting in another plan must not vanish from
+                // it just because a different orchestrator is focused. Node ids are kept
+                // unique across plans, so the flat list stays unambiguous.
+                let queued: Vec<&PlannedNode> = app
+                    .plans
+                    .iter()
+                    .flat_map(|plan| plan.planned_nodes.iter())
+                    .collect();
+                let awaiting = app
+                    .plans
+                    .iter()
+                    .any(|plan| plan.awaiting_approval && !plan.planned_nodes.is_empty());
                 render_planned_section(
                     &mut lines,
-                    &app.planned_nodes,
+                    &queued,
                     focused,
                     task_width,
                     leading_blank,
-                    app.awaiting_approval,
+                    awaiting,
                     &blocked_reasons,
                 )
             } else {
@@ -1440,7 +1454,10 @@ pub(crate) fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             }
         }
 
-        if main_count == 0 && run_total == 0 && app.planned_nodes.is_empty() {
+        if main_count == 0
+            && run_total == 0
+            && app.plans.iter().all(|plan| plan.planned_nodes.is_empty())
+        {
             lines.push(ListItem::new(Line::from(Span::styled(
                 "no agents yet  ·  type a task or /main",
                 muted_style(focused),
@@ -2096,7 +2113,7 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
     };
 
     let phase = orchestrator_phase_for_app(app, agent);
-    let phase_label = match app.final_gate_status {
+    let phase_label = match app.plan().final_gate_status {
         FinalGateStatus::Running => "all integrated · verifying".to_string(),
         FinalGateStatus::Passed => "all integrated · checks passed".to_string(),
         FinalGateStatus::Failed => "all integrated · checks failed".to_string(),
@@ -2189,9 +2206,9 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
             // working forever. A typed message resumes the session (planner_awaiting_input).
             let paused = agent.status != AgentStatus::Running;
             if !paused {
-                let spinner_label = if app.rebasing {
+                let spinner_label = if app.plan().rebasing {
                     "rebasing the plan…"
-                } else if app.refining {
+                } else if app.plan().refining {
                     "refining the plan…"
                 } else {
                     "decomposing the task…"
@@ -2222,7 +2239,7 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
                 // Only strip the questions block when we actually re-render it as a
                 // separate prompt below; otherwise (no parsed questions) leave it in the
                 // transcript so the "its question is above" pointer is truthful.
-                let strip_questions = paused && !app.pending_questions.is_empty();
+                let strip_questions = paused && !app.plan().pending_questions.is_empty();
                 push_transcript_lines(&mut body, transcript, focused, strip_questions);
             }
             if paused {
@@ -2232,7 +2249,7 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
                 // the bottom) instead of scrolling off above a long transcript. The answer is
                 // `worker_input_draft`; Enter submits it (refine), Esc clears it.
                 body.push(Line::default());
-                if app.pending_questions.is_empty() {
+                if app.plan().pending_questions.is_empty() {
                     body.push(Line::from(Span::styled(
                         "❓ The planner needs your input",
                         Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
@@ -2244,7 +2261,7 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
                 } else {
                     push_question_card(
                         &mut body,
-                        &app.pending_questions,
+                        &app.plan().pending_questions,
                         &agent.worker_input_draft,
                         agent.worker_input_cursor,
                         inner.width as usize,
@@ -2274,7 +2291,7 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
             // so without this they are invisible in the orchestrator DAG. The initial
             // nodes share ids with `tasks`, so only post-launch additions get appended
             // here, and the user sees a typed task show up in the DAG.
-            for node in &app.planned_nodes {
+            for node in &app.plan().planned_nodes {
                 if !tasks.iter().any(|task| task.id == node.id) {
                     tasks.push(node.to_task());
                 }
@@ -2305,7 +2322,7 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
                 format!("running {running} · review {review} · done {done} · todo {todo}{failed_suffix}"),
                 muted_style(focused),
             )));
-            if app.awaiting_approval {
+            if app.plan().awaiting_approval {
                 dag.push(Line::from(Span::styled(
                     "type below to refine  ·  Enter to approve & launch",
                     Style::default().fg(ACCENT),
@@ -2318,12 +2335,12 @@ pub(crate) fn render_orchestrator(frame: &mut Frame<'_>, area: Rect, app: &mut A
             // summary.
             let mut prose: Vec<Line<'static>> = Vec::new();
             prose.push(Line::from(Span::styled("Plan", header_style(focused))));
-            // Read the cached LIVE summary rather than only the frozen app.plan_summary
+            // Read the cached LIVE summary rather than only the frozen app.plan().plan_summary
             // captured at exit-detection: final bytes can arrive a tick or two after the
             // process is marked done. The cache refreshes on semantic stream changes, so
             // the prose self-heals without reparsing the whole plan on every redraw.
             let summary = rudder_plan_summary_for_run(agent)
-                .or_else(|| app.plan_summary.clone())
+                .or_else(|| app.plan().plan_summary.clone())
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty());
             if let Some(summary) = summary {
@@ -2818,7 +2835,7 @@ pub(crate) fn render_interactive_orchestrator(frame: &mut Frame<'_>, area: Rect,
         )));
     } else {
         dag_lines = orchestrator_dag_tree_lines(app, &tasks);
-        if app.awaiting_approval {
+        if app.plan().awaiting_approval {
             dag_lines.push(Line::from(Span::styled(
                 "awaiting approval — press empty Enter in the task pane to launch",
                 Style::default().fg(ACCENT),
@@ -3142,7 +3159,7 @@ pub(crate) fn render_worker(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         },
         WorkerView::PlanReview => format!(
             "plan review · {} · Ctrl+S save · Ctrl+Enter approve · Esc hide",
-            app.plan_review.field.label()
+            app.plan().plan_review.field.label()
         ),
     };
     let paragraph = Paragraph::new(lines)
@@ -3183,12 +3200,12 @@ fn oneoff_display_index(app: &App, run_id: &str) -> Option<usize> {
 }
 
 pub(crate) fn plan_review_lines(app: &mut App, height: usize, width: usize) -> Vec<Line<'static>> {
-    app.plan_review.cursor_row = None;
-    app.plan_review.cursor_col = 0;
+    app.plan_mut().plan_review.cursor_row = None;
+    app.plan_mut().plan_review.cursor_col = 0;
     let focused = app.focus == FocusPane::Worker;
     let mut lines: Vec<Line<'static>> = Vec::new();
     let content_width = width.max(1);
-    if app.plan_review.nodes.is_empty() {
+    if app.plan().plan_review.nodes.is_empty() {
         return vec![Line::from(Span::styled(
             "No approval-gated plan is available.",
             muted_style(focused),
@@ -3213,8 +3230,8 @@ pub(crate) fn plan_review_lines(app: &mut App, height: usize, width: usize) -> V
     ]));
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled("Tasks", muted_style(focused))));
-    for (index, node) in app.plan_review.nodes.iter().enumerate() {
-        let selected = index == app.plan_review.selected;
+    for (index, node) in app.plan().plan_review.nodes.iter().enumerate() {
+        let selected = index == app.plan().plan_review.selected;
         let marker = if selected { "▶ " } else { "  " };
         let style = if selected {
             Style::default().fg(PAPER).bg(FOCUS_COLOR)
@@ -3240,12 +3257,12 @@ pub(crate) fn plan_review_lines(app: &mut App, height: usize, width: usize) -> V
     }
     lines.push(Line::from(""));
 
-    let selected = app.plan_review.selected;
-    if let Some(node) = app.plan_review.nodes.get(selected).cloned() {
+    let selected = app.plan().plan_review.selected;
+    if let Some(node) = app.plan().plan_review.nodes.get(selected).cloned() {
         lines.push(Line::from(vec![
             Span::styled(format!("Editing {} ", node.id), accent_style(focused)),
             Span::styled(
-                format!("({}/{})", selected + 1, app.plan_review.nodes.len()),
+                format!("({}/{})", selected + 1, app.plan().plan_review.nodes.len()),
                 muted_style(focused),
             ),
         ]));
@@ -3305,23 +3322,23 @@ pub(crate) fn plan_review_lines(app: &mut App, height: usize, width: usize) -> V
         );
     }
 
-    if !app.plan_review.errors.is_empty() {
+    if !app.plan().plan_review.errors.is_empty() {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled("Errors", error_style())));
-        for error in &app.plan_review.errors {
+        for error in &app.plan().plan_review.errors {
             lines.push(Line::from(Span::styled(
                 format!("  {error}"),
                 error_style(),
             )));
         }
     }
-    if !app.plan_review.warnings.is_empty() {
+    if !app.plan().plan_review.warnings.is_empty() {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "Warnings",
             Style::default().fg(ACCENT_2),
         )));
-        for warning in &app.plan_review.warnings {
+        for warning in &app.plan().plan_review.warnings {
             lines.push(Line::from(Span::styled(
                 format!("  {warning}"),
                 Style::default().fg(ACCENT_2),
@@ -3330,10 +3347,10 @@ pub(crate) fn plan_review_lines(app: &mut App, height: usize, width: usize) -> V
     }
 
     let max_scroll = lines.len().saturating_sub(height.max(1));
-    app.plan_review.scroll = app.plan_review.scroll.min(max_scroll);
+    app.plan_mut().plan_review.scroll = app.plan().plan_review.scroll.min(max_scroll);
     lines
         .into_iter()
-        .skip(app.plan_review.scroll)
+        .skip(app.plan().plan_review.scroll)
         .take(height.max(1))
         .collect()
 }
@@ -3352,16 +3369,16 @@ fn push_plan_review_field(
     width: usize,
     focused: bool,
 ) {
-    let active = app.plan_review.field == field;
+    let active = app.plan().plan_review.field == field;
     let label_text = format!("  {label}: ");
     let label_width = label_text.chars().count();
     let value_width = width.saturating_sub(label_width).max(1) as u16;
     let wrapped = wrap_input_text(value, value_width);
     if active {
         let (cursor_line, cursor_col) =
-            task_cursor_position(value, app.plan_review.cursor, value_width);
-        app.plan_review.cursor_row = Some(lines.len() + cursor_line);
-        app.plan_review.cursor_col = label_width + cursor_col;
+            task_cursor_position(value, app.plan().plan_review.cursor, value_width);
+        app.plan_mut().plan_review.cursor_row = Some(lines.len() + cursor_line);
+        app.plan_mut().plan_review.cursor_col = label_width + cursor_col;
     }
     let label_style = if active {
         accent_style(focused)
@@ -3387,17 +3404,18 @@ fn push_plan_review_field(
 }
 
 pub(crate) fn set_plan_review_cursor(frame: &mut Frame<'_>, inner: Rect, app: &App) {
-    let Some(row) = app.plan_review.cursor_row else {
+    let Some(row) = app.plan().plan_review.cursor_row else {
         return;
     };
-    if row < app.plan_review.scroll {
+    if row < app.plan().plan_review.scroll {
         return;
     }
-    let visible_row = row - app.plan_review.scroll;
+    let visible_row = row - app.plan().plan_review.scroll;
     if visible_row >= inner.height as usize {
         return;
     }
     let col = app
+        .plan()
         .plan_review
         .cursor_col
         .min(inner.width.saturating_sub(1) as usize);
@@ -3632,9 +3650,9 @@ pub(crate) fn review_lines(app: &mut App, height: usize) -> Vec<Line<'static>> {
 /// the SAME string: if these drift, the pane height and mouse selection bounds
 /// disagree and clicks on valid input rows get rejected.
 pub(crate) fn task_default_hint(app: &App) -> &'static str {
-    if app.planner_paused_for_input {
+    if app.plan().planner_paused_for_input {
         "↳ the planner asked a question — answer here or in the orchestrator pane"
-    } else if app.awaiting_approval {
+    } else if app.plan().awaiting_approval {
         "type to talk to the orchestrator, or press Enter to approve  ·  Option-1/2/3 or ^W pane"
     } else if app.plan_is_active() {
         "type to talk to the live orchestrator; it can add, re-plan, merge, stop, or re-goal workers  ·  ^W pane"
@@ -3723,7 +3741,7 @@ pub(crate) fn render_task(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .enumerate()
         .map(|(offset, line)| {
             let display = if app.task_input.is_empty() {
-                if app.awaiting_approval {
+                if app.plan().awaiting_approval {
                     "Type to refine the plan, or press Enter to approve"
                 } else {
                     "Type a task to plan and run"
@@ -3756,7 +3774,7 @@ pub(crate) fn render_task(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Span::styled(first_hint, muted_style(focused)),
             Span::raw("  "),
             Span::styled(
-                if app.awaiting_approval {
+                if app.plan().awaiting_approval {
                     "refine"
                 } else {
                     "run"
@@ -3944,7 +3962,10 @@ pub(crate) fn render_merge_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) 
         }
 
         (
-            Span::styled(" Confirm merge · y merges · Esc cancels ", Style::default().fg(ACCENT)),
+            Span::styled(
+                " Confirm merge · y merges · Esc cancels ",
+                Style::default().fg(ACCENT),
+            ),
             lines,
             ACCENT,
         )
@@ -4020,7 +4041,11 @@ pub(crate) fn render_merge_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) 
         .min(area.width.saturating_sub(4))
         .max(24)
         .saturating_sub(2);
-    let modal = centered_modal(area, modal_width, wrapped_line_count(&lines, inner_width).saturating_add(2));
+    let modal = centered_modal(
+        area,
+        modal_width,
+        wrapped_line_count(&lines, inner_width).saturating_add(2),
+    );
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)

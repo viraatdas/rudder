@@ -233,6 +233,9 @@ pub(crate) enum FinalGateStatus {
 
 #[derive(Debug)]
 pub(crate) struct FinalGateResult {
+    /// The plan whose gate produced this verdict. Gates from several plans share one
+    /// channel, so the result has to say which plan it belongs to.
+    pub(crate) plan_id: String,
     pub(crate) passed: bool,
     pub(crate) summary: String,
 }
@@ -408,23 +411,29 @@ impl App {
     }
 
     pub(crate) fn maybe_start_final_gate(&mut self) {
-        if self.final_gate_status != FinalGateStatus::Idle
-            || self.awaiting_approval
-            || !self.planned_nodes.is_empty()
-            || self.plan_launched_node_ids.is_empty()
-            || !self
-                .plan_launched_node_ids
-                .is_subset(&self.plan_merged_node_ids)
-        {
+        // Each plan verifies itself: a plan whose own launched nodes have all merged is
+        // finished regardless of what any other plan is still doing.
+        let Some(plan_index) = (0..self.plans.len()).find(|&index| {
+            let plan = &self.plans[index];
+            plan.final_gate_status == FinalGateStatus::Idle
+                && !plan.awaiting_approval
+                && plan.planned_nodes.is_empty()
+                && !plan.plan_launched_node_ids.is_empty()
+                && plan
+                    .plan_launched_node_ids
+                    .is_subset(&plan.plan_merged_node_ids)
+        }) else {
             return;
-        }
+        };
         let commands = verification_commands(&self.cwd);
         let cwd = self.cwd.clone();
         let tx = self.final_gate_tx.clone();
-        self.final_gate_status = FinalGateStatus::Running;
-        self.final_gate_summary = Some(format!("running {} repository checks", commands.len()));
+        let plan_id = self.plans[plan_index].id.clone();
+        self.plans[plan_index].final_gate_status = FinalGateStatus::Running;
+        self.plans[plan_index].final_gate_summary =
+            Some(format!("running {} repository checks", commands.len()));
         self.persist_plan_queue();
-        self.notice = self.final_gate_summary.clone();
+        self.notice = self.plans[plan_index].final_gate_summary.clone();
         self.dirty = true;
         thread::spawn(move || {
             let mut passed = Vec::new();
@@ -457,6 +466,7 @@ impl App {
                             };
                             let detail = truncate_chars(&detail_owned, 1200);
                             let _ = tx.send(FinalGateResult {
+                                plan_id: plan_id.clone(),
                                 passed: false,
                                 summary: format!("{} failed: {detail}", command.label),
                             });
@@ -465,6 +475,7 @@ impl App {
                     }
                     Err(error) => {
                         let _ = tx.send(FinalGateResult {
+                            plan_id: plan_id.clone(),
                             passed: false,
                             summary: format!("{} could not start: {error}", command.label),
                         });
@@ -473,6 +484,7 @@ impl App {
                 }
             }
             let _ = tx.send(FinalGateResult {
+                plan_id,
                 passed: true,
                 // Be explicit about scope: these are LOCAL checks only. "passed"
                 // must not read as "shipped" — the plan can be fully merged and
@@ -489,22 +501,29 @@ impl App {
         let Ok(result) = self.final_gate_rx.try_recv() else {
             return;
         };
-        if !self.planned_nodes.is_empty()
-            || !self
+        // Route the verdict back to the plan that ran it. An unlabelled result (only a
+        // test constructs one) falls back to the plan the UI is acting on.
+        let plan_index = self
+            .plans
+            .iter()
+            .position(|plan| plan.id == result.plan_id)
+            .unwrap_or_else(|| self.active_plan_index());
+        if !self.plans[plan_index].planned_nodes.is_empty()
+            || !self.plans[plan_index]
                 .plan_launched_node_ids
-                .is_subset(&self.plan_merged_node_ids)
+                .is_subset(&self.plans[plan_index].plan_merged_node_ids)
         {
-            self.final_gate_status = FinalGateStatus::Idle;
-            self.final_gate_summary = None;
+            self.plans[plan_index].final_gate_status = FinalGateStatus::Idle;
+            self.plans[plan_index].final_gate_summary = None;
             self.persist_plan_queue();
             return;
         }
-        self.final_gate_status = if result.passed {
+        self.plans[plan_index].final_gate_status = if result.passed {
             FinalGateStatus::Passed
         } else {
             FinalGateStatus::Failed
         };
-        self.final_gate_summary = Some(result.summary.clone());
+        self.plans[plan_index].final_gate_summary = Some(result.summary.clone());
         self.notice = Some(result.summary);
         self.persist_plan_queue();
         let _ = self.write_rudder_context_timed(None);

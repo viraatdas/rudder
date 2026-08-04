@@ -30,8 +30,8 @@ use ratatui::{
     Frame, Terminal,
 };
 use rudder_native::pty_terminal::{
-    CellContents, PtyOutputWaker, StyledTerminalCell, TerminalCommand, TerminalCursor, TerminalPane,
-    TerminalPaneOptions, TerminalSize,
+    CellContents, PtyOutputWaker, StyledTerminalCell, TerminalCommand, TerminalCursor,
+    TerminalPane, TerminalPaneOptions, TerminalSize,
 };
 
 /// A single message the main event loop selects on. Either a terminal input
@@ -76,8 +76,8 @@ mod lifecycle;
 use crate::lifecycle::*;
 mod handoff;
 use crate::handoff::*;
-mod telemetry;
 mod plan_stream;
+mod telemetry;
 
 mod signals;
 use crate::plan_stream::*;
@@ -494,6 +494,93 @@ impl AgentMode {
     }
 }
 
+/// Everything ONE `/plan` owns. Several orchestrators run at once, each driving its
+/// own DAG, so none of this may be global: two plans reuse the same node ids (`n0`,
+/// `n1`, …) and each has its own approval gate, refine/rebase turn, and final gate.
+/// Anything a second plan could clobber lives here; genuinely dashboard-wide state
+/// (the selected backend, `node_review_enabled`, the activity log) stays on `App`.
+#[derive(Default)]
+struct PlanState {
+    /// Stable identity of this plan, minted when its `/plan` starts. `AgentRun.plan_id`
+    /// and `PlannedNode.plan_id` point back at it, which is what lets a node resolve to
+    /// its own plan when node ids collide across plans. The orchestrator ROW is found by
+    /// `plan_id`, not stored here, so a relaunched orchestrator (refine, rebase) does not
+    /// strand the plan.
+    id: String,
+    /// Queue of planned (not-yet-launched) DAG nodes. The scheduler drains these
+    /// into live agents as their hard deps merge and parallelism slots free.
+    /// Rendered in the Todo section. A new completed plan replaces the queue.
+    planned_nodes: Vec<PlannedNode>,
+    /// Durable facts for this plan. Queue membership is not sufficient: a
+    /// crash can happen after a worker run is persisted but before the shrunken
+    /// queue is saved, and presentation cleanup may delete merged run rows.
+    plan_launched_node_ids: HashSet<String>,
+    plan_merged_node_ids: HashSet<String>,
+    /// Node ids that passed the optional per-node review gate (eligible to merge);
+    /// `node_reviewers` maps a live reviewer run id -> the node id it reviews.
+    reviewed_nodes: HashSet<String>,
+    node_reviewers: HashMap<String, String>,
+    /// A plan file is accepted only after an explicit new planning turn arms
+    /// capture. An empty queue/all-merged fleet is never evidence of a new plan.
+    plan_capture_armed: bool,
+    /// Editable projection of `planned_nodes` while an approval-gated plan is being
+    /// reviewed in the worker pane. Draft edits are committed back to
+    /// `planned_nodes` only after validation, so an invalid dependency edit cannot
+    /// launch or persist accidentally.
+    plan_review: PlanReviewState,
+    /// The original user request that produced `planned_nodes`, used to build each
+    /// worker launch prompt so the worker sees the coordinating request.
+    planned_origin: String,
+    /// The canonical first request the user typed for this plan, preserved verbatim
+    /// across refine rounds so each refinement re-plans against the ORIGINAL ask
+    /// (plus the running DAG + feedback) rather than the previous composite prompt.
+    plan_request: String,
+    /// The orchestrator's human-readable summary/assumptions/open-questions prose
+    /// printed AFTER the RUDDER_PLAN_TASKS block. Shown under the DAG so the user
+    /// knows what the planner assumed and what to discuss/refine.
+    plan_summary: Option<String>,
+    final_gate_status: FinalGateStatus,
+    final_gate_summary: Option<String>,
+    /// True while this plan's orchestrator is RE-PLANNING in response to refinement
+    /// feedback (between relaunch and the revised DAG being captured). It lets plan
+    /// detection run even though `awaiting_approval` is still true (so the refined plan
+    /// is captured), blocks premature approval of the stale plan, and is cleared the
+    /// moment the revised plan lands (or the re-plan fails).
+    refining: bool,
+    /// Set while a STRUCTURAL plan-rebase is in flight: the orchestrator session has
+    /// been resumed with a `build_rebase_request` (a mid-flight pivot), and we are
+    /// waiting for its revised DAG. Like `refining` it lets plan detection run even
+    /// though a plan is already active (post-approval, nodes launched), but it routes
+    /// capture to `evaluate_completed_rebase` (build-forward diff/apply) instead of
+    /// `evaluate_completed_plan`. Suppresses integration while set so the zones
+    /// stay stable until the diff is applied. Cleared the moment the rebase lands or fails.
+    rebasing: bool,
+    /// Set alongside `rebasing` when the rebase was triggered on the LIVE INTERACTIVE
+    /// conductor (the backend PTY the user is conversing with), e.g. via the
+    /// conductor's own `RUDDER_REPLAN` marker. The rebase relaunches that row as a
+    /// headless re-decompose, which tears down the interactive PTY; this flag tells the
+    /// rebase evaluator to re-spawn the interactive conductor (resuming the same session)
+    /// once the diff lands or fails, so the user never loses the conversation.
+    rebase_restore_interactive: bool,
+    /// While true, a plan has been parsed into `planned_nodes` but is awaiting the
+    /// user's APPROVAL gate: nothing launches. Enter approves (clears this and runs
+    /// the scheduler); d removes the selected node, or discards the whole plan when
+    /// the orchestrator is selected. Set on streaming plan detection; cleared once
+    /// the user approves (or discards the plan).
+    awaiting_approval: bool,
+    /// True ONLY while a headless planner has finished a turn WITHOUT emitting a DAG (it
+    /// asked a clarifying question / needs more detail) and is waiting for the user's
+    /// reply. Distinguishes a paused planner from a COMPLETED-and-shipped plan's leftover
+    /// Done orchestrator, so a brand-new task typed after a plan finished is NOT mistakenly
+    /// routed into refining the old session. Set in evaluate_completed_plan's no-DAG
+    /// branches; cleared when a DAG is captured, on approval, and on a fresh plan.
+    planner_paused_for_input: bool,
+    /// The planner's clarifying questions (parsed from its RUDDER_QUESTIONS block) while it
+    /// is paused for input, rendered as a clean numbered prompt in the orchestrator pane.
+    /// Set when the planner pauses; cleared on DAG-capture / approval / fresh plan.
+    pending_questions: Vec<String>,
+}
+
 struct App {
     focus: FocusPane,
     nav_mode: bool,
@@ -530,68 +617,19 @@ struct App {
     task_history_index: Option<usize>,
     task_history_draft: String,
     agents: Vec<AgentRun>,
-    /// Queue of planned (not-yet-launched) DAG nodes. The scheduler drains these
-    /// into live agents as their hard deps merge and parallelism slots free.
-    /// Rendered in the Todo section. A new completed plan replaces the queue.
-    planned_nodes: Vec<PlannedNode>,
-    /// Durable facts for the active plan. Queue membership is not sufficient: a
-    /// crash can happen after a worker run is persisted but before the shrunken
-    /// queue is saved, and presentation cleanup may delete merged run rows.
-    plan_launched_node_ids: HashSet<String>,
-    plan_merged_node_ids: HashSet<String>,
+    /// Every live plan, in the order its `/plan` was started. Several orchestrators
+    /// may run at once and each owns exactly one entry, so plan state is per-plan
+    /// rather than global. NEVER empty: `App::new` seeds one plan (holding whatever
+    /// `plan-queue.json` restored) so the accessors below can always resolve one.
+    plans: Vec<PlanState>,
     /// Per-node auto-review gate. When enabled, a finished plan node is reviewed
     /// (thermonuclear skill, auto-fix in its own workspace) before it auto-merges.
     /// OFF by default — this automatic review is deliberately disabled pending a
-    /// better design; opt in with `RUDDER_NODE_REVIEW=1`. `reviewed_nodes` are
-    /// node ids that passed review (eligible to merge); `node_reviewers` maps a
-    /// live reviewer run id -> the node id it reviews.
+    /// better design; opt in with `RUDDER_NODE_REVIEW=1`. It is a dashboard-wide
+    /// setting, not a per-plan one, so it stays on `App`.
     node_review_enabled: bool,
-    reviewed_nodes: HashSet<String>,
-    node_reviewers: HashMap<String, String>,
-    /// A plan file is accepted only after an explicit new planning turn arms
-    /// capture. An empty queue/all-merged fleet is never evidence of a new plan.
-    plan_capture_armed: bool,
-    /// Editable projection of `planned_nodes` while an approval-gated plan is being
-    /// reviewed in the worker pane. Draft edits are committed back to
-    /// `planned_nodes` only after validation, so an invalid dependency edit cannot
-    /// launch or persist accidentally.
-    plan_review: PlanReviewState,
-    /// The original user request that produced `planned_nodes`, used to build each
-    /// worker launch prompt so the worker sees the coordinating request.
-    planned_origin: String,
-    /// The canonical first request the user typed for this plan, preserved verbatim
-    /// across refine rounds so each refinement re-plans against the ORIGINAL ask
-    /// (plus the running DAG + feedback) rather than the previous composite prompt.
-    plan_request: String,
-    /// The orchestrator's human-readable summary/assumptions/open-questions prose
-    /// printed AFTER the RUDDER_PLAN_TASKS block. Shown under the DAG so the user
-    /// knows what the planner assumed and what to discuss/refine.
-    plan_summary: Option<String>,
-    final_gate_status: FinalGateStatus,
-    final_gate_summary: Option<String>,
     final_gate_tx: mpsc::Sender<FinalGateResult>,
     final_gate_rx: mpsc::Receiver<FinalGateResult>,
-    /// True while the orchestrator is RE-PLANNING in response to refinement feedback
-    /// (between relaunch and the revised DAG being captured). It lets plan detection
-    /// run even though `awaiting_approval` is still true (so the refined plan is
-    /// captured), blocks premature approval of the stale plan, and is cleared the
-    /// moment the revised plan lands (or the re-plan fails).
-    refining: bool,
-    /// Set while a STRUCTURAL plan-rebase is in flight: the orchestrator session has
-    /// been resumed with a `build_rebase_request` (a mid-flight pivot), and we are
-    /// waiting for its revised DAG. Like `refining` it lets plan detection run even
-    /// though a plan is already active (post-approval, nodes launched), but it routes
-    /// capture to `evaluate_completed_rebase` (build-forward diff/apply) instead of
-    /// `evaluate_completed_plan`. Suppresses integration while set so the zones
-    /// stay stable until the diff is applied. Cleared the moment the rebase lands or fails.
-    rebasing: bool,
-    /// Set alongside `rebasing` when the rebase was triggered on the LIVE INTERACTIVE
-    /// conductor (the backend PTY the user is conversing with), e.g. via the
-    /// conductor's own `RUDDER_REPLAN` marker. The rebase relaunches that row as a
-    /// headless re-decompose, which tears down the interactive PTY; this flag tells the
-    /// rebase evaluator to re-spawn the interactive conductor (resuming the same session)
-    /// once the diff lands or fails, so the user never loses the conversation.
-    rebase_restore_interactive: bool,
     /// Whether Claude Code's native fast mode is on for NEW agents (toggled by `/fast`).
     /// Display/UX mirror of the persisted `fastMode` config flag; the authoritative
     /// value injected into a worker's `--settings` is read from config at launch.
@@ -602,28 +640,11 @@ struct App {
     /// None when launched without a board. Surfaced in the agents pane + opened by
     /// `/web` and the `o` key so users can live-monitor and steer from the browser.
     board_url: Option<String>,
-    /// While true, a plan has been parsed into `planned_nodes` but is awaiting the
-    /// user's APPROVAL gate: nothing launches. Enter approves (clears this and runs
-    /// the scheduler); d removes the selected node, or discards the whole plan when
-    /// the orchestrator is selected. Set on streaming plan detection; cleared once
-    /// the user approves (or discards the plan).
-    awaiting_approval: bool,
     /// Whether the orchestrator runs as an INTERACTIVE backend PTY (the default; see
     /// `interactive_orchestrator()`) vs the headless decomposer. Snapshotted from the env
     /// ONCE at construction so render/poll/key paths read a per-App field instead of the
     /// process-global env (which races across parallel tests). Tests set it directly.
     interactive_orchestrator: bool,
-    /// True ONLY while a headless planner has finished a turn WITHOUT emitting a DAG (it
-    /// asked a clarifying question / needs more detail) and is waiting for the user's
-    /// reply. Distinguishes a paused planner from a COMPLETED-and-shipped plan's leftover
-    /// Done orchestrator, so a brand-new task typed after a plan finished is NOT mistakenly
-    /// routed into refining the old session. Set in evaluate_completed_plan's no-DAG
-    /// branches; cleared when a DAG is captured, on approval, and on a fresh plan.
-    planner_paused_for_input: bool,
-    /// The planner's clarifying questions (parsed from its RUDDER_QUESTIONS block) while it
-    /// is paused for input, rendered as a clean numbered prompt in the orchestrator pane.
-    /// Set when the planner pauses; cleared on DAG-capture / approval / fresh plan.
-    pending_questions: Vec<String>,
     /// Tick counter used to run the scheduler on a coarse cadence rather than on
     /// every PTY-byte tick.
     scheduler_tick: u64,
@@ -958,6 +979,11 @@ struct AgentRun {
     /// scheduler. `None` for manually started agents and planner runs. When the
     /// run reaches Merged, this id enters the merged set and unblocks dependents.
     node_id: Option<String>,
+    /// The plan this run belongs to (`PlanState::id`): set on the orchestrator row that
+    /// drives the plan AND on every worker the plan launches. Node ids (`n0`, `n1`, …)
+    /// repeat across concurrent plans, so `node_id` alone cannot identify a node — the
+    /// pair does. `None` for manually started agents that belong to no plan.
+    plan_id: Option<String>,
     /// True when this is a RECONCILE planner: a RudderPlan agent spawned to fold
     /// one ADDED task into an already-active plan. The poll loop routes its
     /// completion to the APPEND path (`evaluate_completed_reconcile`) instead of
@@ -1207,6 +1233,252 @@ fn test_default_cwd() -> PathBuf {
 }
 
 impl App {
+    /// Index of the plan the UI is currently acting on. DERIVED from the selection
+    /// (12.7: ask the authority, do not cache): the plan owned by the selected row —
+    /// its orchestrator, or the worker whose node belongs to it — falling back to the
+    /// most recently started plan. That fallback is what keeps a single-plan session
+    /// behaving exactly as before, when there was only one global plan.
+    fn active_plan_index(&self) -> usize {
+        if let Some(id) = self
+            .agents
+            .get(self.selected_agent)
+            .and_then(|run| run.plan_id.as_deref())
+        {
+            if let Some(index) = self.plans.iter().position(|plan| plan.id == id) {
+                return index;
+            }
+        }
+        self.plans.len().saturating_sub(1)
+    }
+
+    /// The plan the UI is currently acting on. `plans` is never empty (see the field),
+    /// so this cannot panic.
+    fn plan(&self) -> &PlanState {
+        &self.plans[self.active_plan_index()]
+    }
+
+    fn plan_mut(&mut self) -> &mut PlanState {
+        let index = self.active_plan_index();
+        &mut self.plans[index]
+    }
+
+    /// Which plan owns `node_id`. Node ids repeat across concurrent plans, so this asks
+    /// the two authorities that actually know — the launched run's `plan_id`, then the
+    /// queue a node with that id still sits in — before falling back to the active plan
+    /// (the single-plan answer, and the only one when the node is brand new).
+    fn plan_id_for_node(&self, node_id: &str) -> String {
+        if let Some(id) = self
+            .agents
+            .iter()
+            .find(|run| run.node_id.as_deref() == Some(node_id))
+            .and_then(|run| run.plan_id.clone())
+        {
+            return id;
+        }
+        if let Some(plan) = self
+            .plans
+            .iter()
+            .find(|plan| plan.planned_nodes.iter().any(|node| node.id == node_id))
+        {
+            return plan.id.clone();
+        }
+        self.plan().id.clone()
+    }
+
+    /// The orchestrator row driving `plan_id`. Several orchestrators are live at once,
+    /// so every path that used to grab "the" orchestrator must name the plan it means.
+    /// A row restored from disk (or one that predates plan ids) carries no `plan_id`;
+    /// it is adopted only when there is a single plan, where it cannot be ambiguous.
+    fn orchestrator_index_for_plan(&self, plan_id: &str) -> Option<usize> {
+        if let Some(index) = self
+            .agents
+            .iter()
+            .position(|run| run.is_orchestrator() && run.plan_id.as_deref() == Some(plan_id))
+        {
+            return Some(index);
+        }
+        (self.plans.len() == 1)
+            .then(|| {
+                self.agents
+                    .iter()
+                    .position(|run| run.is_orchestrator() && run.plan_id.is_none())
+            })
+            .flatten()
+    }
+
+    /// The orchestrator of the plan the UI is acting on.
+    fn active_orchestrator_index(&self) -> Option<usize> {
+        let plan_id = self.plan().id.clone();
+        self.orchestrator_index_for_plan(&plan_id)
+    }
+
+    /// A plan with nothing left to lose: no queue, nothing at the approval gate, no
+    /// planner turn in flight, and no worker of its own still short of merged. A fresh
+    /// `/plan` reuses such a slot instead of stacking a new one, which is what keeps
+    /// repeated single-plan use looking exactly as it did before plans could coexist.
+    fn spent_plan_index(&self) -> Option<usize> {
+        (0..self.plans.len()).find(|&index| {
+            let plan = &self.plans[index];
+            if !plan.planned_nodes.is_empty()
+                || plan.awaiting_approval
+                || plan.refining
+                || plan.rebasing
+                || plan.planner_paused_for_input
+            {
+                return false;
+            }
+            if self
+                .orchestrator_index_for_plan(&plan.id)
+                .is_some_and(|i| self.agents[i].status == AgentStatus::Running)
+            {
+                return false;
+            }
+            !self
+                .plan_agents(index)
+                .any(|run| run.node_id.is_some() && run.status != AgentStatus::Merged)
+        })
+    }
+
+    /// Adopt freshly parsed nodes into `plan_index`: stamp each with its owning plan and
+    /// RENAME any id another live plan already uses, rewriting this plan's own deps to
+    /// match. `AgentRun.node_id` is the join key everywhere (the agents pane, the merge
+    /// ledgers, graph.json), so two plans both calling a node `n0` would silently cross
+    /// their wires. Renaming only fires on an actual collision, so a lone plan keeps the
+    /// planner's `n0`, `n1`, … verbatim and reads exactly as it always has.
+    fn adopt_plan_nodes(&mut self, plan_index: usize, mut nodes: Vec<PlannedNode>) {
+        let plan_id = self.plans[plan_index].id.clone();
+        let taken: HashSet<String> = self
+            .plans
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != plan_index)
+            .flat_map(|(_, plan)| {
+                plan.planned_nodes
+                    .iter()
+                    .map(|node| node.id.clone())
+                    .chain(plan.plan_launched_node_ids.iter().cloned())
+            })
+            .chain(
+                self.agents
+                    .iter()
+                    .filter(|run| run.plan_id.as_deref() != Some(plan_id.as_str()))
+                    .filter_map(|run| run.node_id.clone()),
+            )
+            .collect();
+        let mut renames: HashMap<String, String> = HashMap::new();
+        let mut used: HashSet<String> = nodes.iter().map(|node| node.id.clone()).collect();
+        for node in &mut nodes {
+            if !taken.contains(&node.id) {
+                continue;
+            }
+            let mut suffix = 2usize;
+            let fresh = loop {
+                let candidate = format!("{}-{suffix}", node.id);
+                if !taken.contains(&candidate) && !used.contains(&candidate) {
+                    break candidate;
+                }
+                suffix += 1;
+            };
+            used.insert(fresh.clone());
+            renames.insert(node.id.clone(), fresh.clone());
+            node.id = fresh;
+        }
+        for node in &mut nodes {
+            node.plan_id = plan_id.clone();
+            for dep in node.deps.iter_mut().chain(node.soft_deps.iter_mut()) {
+                if let Some(fresh) = renames.get(dep) {
+                    *dep = fresh.clone();
+                }
+            }
+        }
+        self.plans[plan_index].planned_nodes = nodes;
+    }
+
+    /// Append one node to `plan_index` under the same adoption rules.
+    fn push_plan_node(&mut self, plan_index: usize, node: PlannedNode) {
+        let mut nodes = std::mem::take(&mut self.plans[plan_index].planned_nodes);
+        nodes.push(node);
+        self.adopt_plan_nodes(plan_index, nodes);
+    }
+
+    /// Plan that owns the `RUDDER.md` control channel. Prefers a RUNNING interactive
+    /// orchestrator, then the most recent interactive orchestrator row whatever its
+    /// state (a marker must not strand merely because the PTY finished first), and
+    /// finally the plan the UI is acting on.
+    fn marker_channel_plan_index(&self) -> usize {
+        if let Some((_, plan_index)) = self.running_interactive_orchestrator_plan() {
+            return plan_index;
+        }
+        if let Some(run_index) = self
+            .agents
+            .iter()
+            .rposition(|run| self.is_interactive_orchestrator_run(run))
+        {
+            return self.plan_index_for_run(run_index);
+        }
+        self.active_plan_index()
+    }
+
+    /// Does `run` belong to the plan at `plan_index`? A run stamped with a plan id
+    /// answers for itself. A run with NO plan id predates concurrent plans (restored
+    /// from disk, or started before any `/plan`); with a single plan there is only one
+    /// possible owner, so it is attributed there — which is what keeps a one-plan
+    /// session behaving exactly as it did before plans could coexist. With several
+    /// plans live an unstamped run is claimed by none of them.
+    fn run_belongs_to_plan(&self, run: &AgentRun, plan_index: usize) -> bool {
+        match run.plan_id.as_deref() {
+            Some(id) => id == self.plans[plan_index].id,
+            None => self.plans.len() == 1,
+        }
+    }
+
+    /// The workers belonging to `plan_index`. Node ids are per-plan, so any question
+    /// about "this plan's workers" has to filter by owner or it answers for the fleet.
+    fn plan_agents(&self, plan_index: usize) -> impl Iterator<Item = &AgentRun> {
+        self.agents
+            .iter()
+            .filter(move |run| self.run_belongs_to_plan(run, plan_index))
+    }
+
+    /// The workers belonging to the plan the UI is acting on.
+    fn active_plan_agents(&self) -> impl Iterator<Item = &AgentRun> {
+        self.plan_agents(self.active_plan_index())
+    }
+
+    /// The running interactive orchestrator and the plan it drives, as `(run, plan)`
+    /// indices. `RUDDER.md` is a single per-repo file, so the interactive orchestrator's
+    /// FILE channel (DAG capture, `RUDDER_*` markers) belongs to whichever interactive
+    /// conductor is live rather than to the selected pane. Headless orchestrators stream
+    /// their DAG through their own PTY and are plan-scoped without this restriction, so
+    /// any number of them run side by side.
+    fn running_interactive_orchestrator_plan(&self) -> Option<(usize, usize)> {
+        let run_index = self.agents.iter().position(|run| {
+            self.is_interactive_orchestrator_run(run) && run.status == AgentStatus::Running
+        })?;
+        Some((run_index, self.plan_index_for_run(run_index)))
+    }
+
+    /// The plan the agent row at `run_index` belongs to. Plan capture, approval and
+    /// rebase are driven by a specific orchestrator ROW, so they resolve their plan from
+    /// that row rather than from what the user happens to have selected.
+    fn plan_index_for_run(&self, run_index: usize) -> usize {
+        self.agents
+            .get(run_index)
+            .and_then(|run| run.plan_id.as_deref())
+            .and_then(|id| self.plans.iter().position(|plan| plan.id == id))
+            .unwrap_or_else(|| self.active_plan_index())
+    }
+
+    /// Index of the plan owning `node_id`, for the paths that must write to that plan's
+    /// ledgers (launch/merge facts, queue drain) rather than the selected one.
+    fn plan_index_for_node(&self, node_id: &str) -> usize {
+        let id = self.plan_id_for_node(node_id);
+        self.plans
+            .iter()
+            .position(|plan| plan.id == id)
+            .unwrap_or_else(|| self.active_plan_index())
+    }
+
     fn new() -> Self {
         // In tests, default to a UNIQUE temp dir, never the real repo: App methods write
         // real files (DECISIONS.md, .rudder/, RUDDER.md, graph.json) keyed on cwd, so a test
@@ -1248,20 +1520,48 @@ impl App {
         // resumes the plan instead of silently losing it. awaiting_approval is restored
         // TOGETHER with the queue, so the scheduler never launches an un-approved plan.
         let mut restored_queue = if cfg!(test) {
-            PlanQueueSnapshot::default()
+            PlanQueueFile::default()
         } else {
             load_plan_queue(&cwd).unwrap_or_default()
         };
-        reconcile_plan_queue_with_agents(&mut restored_queue, &agents);
-        if restored_queue.final_gate_status == FinalGateStatus::Running {
-            restored_queue.final_gate_status = FinalGateStatus::Idle;
-            restored_queue.final_gate_summary = None;
+        let sole_plan = restored_queue.plans.len() <= 1;
+        for snapshot in &mut restored_queue.plans {
+            reconcile_plan_queue_with_agents(snapshot, &agents, sole_plan);
+            if snapshot.final_gate_status == FinalGateStatus::Running {
+                snapshot.final_gate_status = FinalGateStatus::Idle;
+                snapshot.final_gate_summary = None;
+            }
         }
-        let restored_plan_review = if restored_queue.awaiting_approval {
-            PlanReviewState::from_planned_nodes(&restored_queue.planned_nodes)
-        } else {
-            PlanReviewState::default()
-        };
+        let restored_plans = restored_queue.into_plans();
+        // Runs persisted before plans had ids carry no `plan_id`. With one restored plan
+        // there is exactly one answer, so adopt them into it — otherwise the restored
+        // fleet would look ownerless and the plan would read as spent.
+        let mut agents = agents;
+        if restored_plans.len() == 1 {
+            let plan_id = restored_plans[0].id.clone();
+            for run in &mut agents {
+                if run.plan_id.is_none() && (run.node_id.is_some() || run.is_orchestrator()) {
+                    run.plan_id = Some(plan_id.clone());
+                }
+            }
+        }
+        // Drop orchestrator rows whose plan did not come back. `load_persisted_agents`
+        // now keeps the newest planner PER PLAN, which is what stops concurrent plans
+        // collapsing into one across a restart — but every plan that ever ran left a
+        // planner row on disk, so without this the pane fills with orchestrators for
+        // plans that no longer exist and cannot be steered. This is the only place that
+        // knows which plans were actually restored. Rows with no plan id predate
+        // concurrent plans and are left alone; the loader already collapsed those.
+        if !restored_plans.is_empty() {
+            let live: HashSet<&str> = restored_plans.iter().map(|plan| plan.id.as_str()).collect();
+            agents.retain(|run| {
+                !run.is_orchestrator()
+                    || run
+                        .plan_id
+                        .as_deref()
+                        .is_none_or(|plan_id| live.contains(plan_id))
+            });
+        }
         // Main is no longer auto-pinned. If the user wants one, they type
         // /main from the task pane. Main records render in their own section
         // instead of being mixed into ordinary worktree agents.
@@ -1298,9 +1598,7 @@ impl App {
             task_history_index: None,
             task_history_draft: String::new(),
             agents,
-            planned_nodes: restored_queue.planned_nodes,
-            plan_launched_node_ids: restored_queue.launched_node_ids,
-            plan_merged_node_ids: restored_queue.merged_node_ids,
+            plans: restored_plans,
             // OFF by default: the automatic per-node review is disabled pending a
             // better design. Opt in explicitly with RUDDER_NODE_REVIEW=1.
             node_review_enabled: std::env::var("RUDDER_NODE_REVIEW")
@@ -1309,20 +1607,8 @@ impl App {
                     value == "1" || value.eq_ignore_ascii_case("true")
                 })
                 .unwrap_or(false),
-            reviewed_nodes: HashSet::new(),
-            node_reviewers: HashMap::new(),
-            plan_capture_armed: restored_queue.capture_armed,
-            plan_review: restored_plan_review,
-            planned_origin: restored_queue.planned_origin,
-            plan_request: restored_queue.plan_request,
-            plan_summary: restored_queue.plan_summary,
-            final_gate_status: restored_queue.final_gate_status,
-            final_gate_summary: restored_queue.final_gate_summary,
             final_gate_tx,
             final_gate_rx,
-            refining: false,
-            rebasing: false,
-            rebase_restore_interactive: false,
             fast_mode: if cfg!(test) {
                 false
             } else {
@@ -1343,10 +1629,7 @@ impl App {
                         .unwrap_or_else(|| "http://127.0.0.1:4774".to_string()),
                 )
             },
-            awaiting_approval: restored_queue.awaiting_approval,
             interactive_orchestrator: interactive_orchestrator(),
-            planner_paused_for_input: false,
-            pending_questions: Vec::new(),
             scheduler_tick: 0,
             spinner_frame: 0,
             last_spinner_advance: Instant::now(),
@@ -1535,14 +1818,19 @@ impl App {
 
     fn write_rudder_context_timed(&mut self, pending: Option<&WorktreeInfo>) -> Result<()> {
         let started = Instant::now();
-        let final_gate = (self.final_gate_status != FinalGateStatus::Idle)
-            .then_some((self.final_gate_status, self.final_gate_summary.as_deref()));
+        // Every plan reports its own verdict: each verifies only the nodes it launched.
+        let final_gates: Vec<(FinalGateStatus, Option<&str>)> = self
+            .plans
+            .iter()
+            .filter(|plan| plan.final_gate_status != FinalGateStatus::Idle)
+            .map(|plan| (plan.final_gate_status, plan.final_gate_summary.as_deref()))
+            .collect();
         let result = write_rudder_context_with_history(
             &self.cwd,
             &self.agents,
             pending,
             &self.task_history,
-            final_gate,
+            &final_gates,
         );
         let duration = started.elapsed();
         self.record_perf_duration("write_rudder_context", duration);
@@ -1589,16 +1877,16 @@ impl App {
     /// the spinner froze, only advancing a frame per input event. Running-or-refining
     /// can never diverge that way.
     pub(crate) fn has_planning_orchestrator(&self) -> bool {
-        let plan_lifecycle_started = self.awaiting_approval
-            || !self.planned_nodes.is_empty()
-            || self.agents.iter().any(|run| run.node_id.is_some());
-        self.refining
-            || self.rebasing
-            || self.agents.iter().any(|run| {
+        let plan_lifecycle_started = self.plan().awaiting_approval
+            || !self.plan().planned_nodes.is_empty()
+            || self.active_plan_agents().any(|run| run.node_id.is_some());
+        self.plan().refining
+            || self.plan().rebasing
+            || self.active_plan_agents().any(|run| {
                 run.mode == AgentMode::RudderPlan
                     && run.status == AgentStatus::Running
                     && (!self.is_interactive_orchestrator_run(run)
-                        || self.awaiting_approval
+                        || self.plan().awaiting_approval
                         || !plan_lifecycle_started)
             })
     }
@@ -1681,7 +1969,7 @@ impl App {
         if !self.selected_headless_orchestrator_rendered_view_active() {
             return false;
         }
-        if self.planner_paused_for_input {
+        if self.plan().planner_paused_for_input {
             return false;
         }
         self.agents.get(self.selected_agent).is_some_and(|run| {
@@ -1758,42 +2046,42 @@ impl App {
     /// something, else `None`.
     fn retire_planner_for_model_switch(&mut self) -> Option<String> {
         // Executing plan = any plan-launched worker not yet merged. Do not disturb it;
-        // retiring the conductor mid-flight would strand the running workers.
-        let executing = self
-            .agents
-            .iter()
-            .any(|run| run.node_id.is_some() && run.status != AgentStatus::Merged);
-        if executing {
+        // retiring the conductor mid-flight would strand the running workers. Asked per
+        // plan, so a second plan that is already executing does not veto clearing a
+        // first plan that is still only a proposal.
+        let mut retired = 0usize;
+        for index in 0..self.plans.len() {
+            let plan_id = self.plans[index].id.clone();
+            let executing = self
+                .plan_agents(index)
+                .any(|run| run.node_id.is_some() && run.status != AgentStatus::Merged);
+            if executing {
+                continue;
+            }
+            let planner = self
+                .orchestrator_index_for_plan(&plan_id)
+                .map(|i| self.agents[i].id.clone());
+            if planner.is_none()
+                && self.plans[index].planned_nodes.is_empty()
+                && !self.plans[index].awaiting_approval
+            {
+                continue;
+            }
+            if let Some(id) = planner {
+                self.retire_planner_row(&id);
+            }
+            // Drop the pending (unapproved) plan so the next typed task starts a FRESH
+            // planner (plan_is_active() is now false) instead of refining the old model's
+            // proposal. Persist so a restart does not reload the discarded plan.
+            self.plans[index] = PlanState {
+                id: plan_id,
+                ..PlanState::default()
+            };
+            retired += 1;
+        }
+        if retired == 0 {
             return None;
         }
-        let planners: Vec<String> = self
-            .agents
-            .iter()
-            .filter(|run| run.is_orchestrator())
-            .map(|run| run.id.clone())
-            .collect();
-        if planners.is_empty() && self.planned_nodes.is_empty() && !self.awaiting_approval {
-            return None;
-        }
-        for id in &planners {
-            self.retire_planner_row(id);
-        }
-        // Drop the pending (unapproved) plan so the next typed task starts a FRESH
-        // planner (plan_is_active() is now false) instead of refining the old model's
-        // proposal. Persist so a restart does not reload the discarded plan.
-        self.planned_nodes.clear();
-        self.plan_launched_node_ids.clear();
-        self.plan_merged_node_ids.clear();
-        // Node ids (n0, n1, …) are reused across plans, so review state must not
-        // carry over — a new plan's n0 must not inherit an old n0's reviewed flag.
-        self.reviewed_nodes.clear();
-        self.node_reviewers.clear();
-        self.final_gate_status = FinalGateStatus::Idle;
-        self.final_gate_summary = None;
-        self.plan_capture_armed = false;
-        self.plan_review = PlanReviewState::default();
-        self.awaiting_approval = false;
-        self.plan_summary = None;
         self.persist_plan_queue();
         Some(format!(
             "model → {} {}: cleared the planner; next task plans on the new model",
@@ -2080,7 +2368,7 @@ impl App {
                 // APPROVAL GATE: while a plan awaits approval and the pinned
                 // orchestrator is selected, Enter approves the plan and launches the
                 // ready nodes rather than focusing the worker pane.
-                if self.awaiting_approval && self.selected_is_orchestrator() {
+                if self.plan().awaiting_approval && self.selected_is_orchestrator() {
                     self.delete_pending = None;
                     self.approve_planned_queue();
                 } else if !self.agents.is_empty() {
@@ -2290,15 +2578,15 @@ impl App {
                     .map(|run| run.worker_input_draft.trim().to_string())
                     .unwrap_or_default();
                 if draft.is_empty() {
-                    if self.rebasing {
+                    if self.plan().rebasing {
                         self.notice = Some(
                             "still rebasing — applying the new direction to the live plan"
                                 .to_string(),
                         );
-                    } else if self.refining {
+                    } else if self.plan().refining {
                         self.notice =
                             Some("still refining — the updated plan is on its way".to_string());
-                    } else if self.awaiting_approval {
+                    } else if self.plan().awaiting_approval {
                         self.approve_planned_queue();
                     } else {
                         self.notice = Some(
@@ -2626,7 +2914,7 @@ impl App {
 
     fn toggle_worker_view(&mut self) {
         self.worker_selection = None;
-        if self.awaiting_approval && self.selected_is_orchestrator() {
+        if self.plan().awaiting_approval && self.selected_is_orchestrator() {
             self.worker_view = match self.worker_view {
                 WorkerView::PlanReview => WorkerView::Terminal,
                 _ => {
@@ -3766,16 +4054,18 @@ impl App {
 
     fn scroll_plan_review(&mut self, mouse: MouseEvent, area: Rect) -> bool {
         let rows = mouse_scrollback_delta(mouse, area.height);
-        let before = self.plan_review.scroll;
+        let before = self.plan().plan_review.scroll;
         if rows > 0 {
-            self.plan_review.scroll = self.plan_review.scroll.saturating_sub(rows as usize);
+            self.plan_mut().plan_review.scroll =
+                self.plan().plan_review.scroll.saturating_sub(rows as usize);
         } else if rows < 0 {
-            self.plan_review.scroll = self
+            self.plan_mut().plan_review.scroll = self
+                .plan()
                 .plan_review
                 .scroll
                 .saturating_add(rows.unsigned_abs() as usize);
         }
-        self.plan_review.scroll != before
+        self.plan().plan_review.scroll != before
     }
 
     fn set_mouse_debug(&mut self, message: String) {
@@ -4188,7 +4478,7 @@ impl App {
         if input.is_empty() {
             // Empty Enter while a plan awaits approval = approve & launch. This makes
             // the task pane the single plan-mode surface: type to refine, Enter to go.
-            if self.awaiting_approval {
+            if self.plan().awaiting_approval {
                 self.approve_planned_queue();
             }
             return;
@@ -4212,7 +4502,10 @@ impl App {
         // learn about a typo. Paths ("/tmp/x") contain another slash and still
         // pass through as plain text.
         let trimmed = input.trim_start();
-        if let Some(token) = trimmed.strip_prefix('/').and_then(|rest| rest.split_whitespace().next()) {
+        if let Some(token) = trimmed
+            .strip_prefix('/')
+            .and_then(|rest| rest.split_whitespace().next())
+        {
             if !token.is_empty()
                 && token
                     .chars()
@@ -4231,7 +4524,7 @@ impl App {
         // message is feedback to the orchestrator, not a new node. Interactive
         // orchestrators are live Claude sessions, so send the text into that PTY and
         // let it update RUDDER.md; headless planners still use the old refine path.
-        if self.awaiting_approval {
+        if self.plan().awaiting_approval {
             if self.send_to_interactive_orchestrator(input) {
                 return;
             }
@@ -4355,13 +4648,13 @@ impl App {
         // without a DAG (asked a question), and cleared on DAG-capture / approval / fresh
         // plan. Without it, a COMPLETED plan's leftover Done orchestrator (empty queue, no
         // gate, all workers merged) would also look "paused" and hijack a new task.
-        if !self.planner_paused_for_input {
+        if !self.plan().planner_paused_for_input {
             return false;
         }
-        if self.awaiting_approval
-            || self.refining
-            || self.rebasing
-            || !self.planned_nodes.is_empty()
+        if self.plan().awaiting_approval
+            || self.plan().refining
+            || self.plan().rebasing
+            || !self.plan().planned_nodes.is_empty()
         {
             return false;
         }
@@ -4386,11 +4679,10 @@ impl App {
     /// carrying a `node_id`) has not yet merged. While this holds, a newly typed
     /// task is RECONCILED into the existing plan instead of starting a fresh one.
     pub(crate) fn plan_is_active(&self) -> bool {
-        if !self.planned_nodes.is_empty() || self.has_planning_orchestrator() {
+        if !self.plan().planned_nodes.is_empty() || self.has_planning_orchestrator() {
             return true;
         }
-        self.agents
-            .iter()
+        self.active_plan_agents()
             .any(|run| run.node_id.is_some() && run.status != AgentStatus::Merged)
     }
 
@@ -4398,11 +4690,12 @@ impl App {
     /// plan agents. Feeds the structural-vs-additive classifier's title-overlap heuristic.
     fn plan_node_titles(&self) -> Vec<String> {
         let mut titles: Vec<String> = self
+            .plan()
             .planned_nodes
             .iter()
             .map(|node| node.title.clone())
             .collect();
-        for run in &self.agents {
+        for run in self.active_plan_agents() {
             if run.node_id.is_some() && run.status != AgentStatus::Merged {
                 titles.push(run.task_summary.clone());
             }
@@ -4423,11 +4716,12 @@ impl App {
     /// plan-launched agent (carrying a `node_id`) that has not yet merged.
     fn plan_frontier(&self) -> Vec<(String, String)> {
         let mut frontier: Vec<(String, String)> = self
+            .plan()
             .planned_nodes
             .iter()
             .map(|node| (node.id.clone(), node.title.clone()))
             .collect();
-        for run in &self.agents {
+        for run in self.active_plan_agents() {
             // Skip Merged (already a satisfied/dangling ref) AND Failed/Stopped: a dead
             // node id must never be advertised as a hard-dep target, or a reconcile/rebase
             // node hard-linked to it would deadlock on arrival (is_ready never satisfies a
@@ -4558,6 +4852,8 @@ impl App {
             return;
         }
         let frontier = self.plan_frontier();
+        // The injected node joins the plan whose pane the message was typed into.
+        let plan_id = self.plan().id.clone();
         let model = self.model.clone();
         let backend = self.backend;
         // Reconciling one task against a known frontier does not need max reasoning;
@@ -4583,6 +4879,7 @@ impl App {
             id: new_run_id(input),
             created_at: created_at.clone(),
             mode: AgentMode::RudderPlan,
+            plan_id: Some(plan_id),
             task: input.to_string(),
             task_summary: format!("add {}", summarize_task(input)),
             current_prompt: input.to_string(),
@@ -4717,6 +5014,12 @@ impl App {
             .and_then(EffortLevel::parse)
             .or(self.effort);
         let node_id = node.as_ref().map(|n| n.id.clone());
+        // A node carries its owning plan, so the worker row records which plan it
+        // belongs to. Without it a merge could credit the wrong plan's ledger.
+        let plan_id = node
+            .as_ref()
+            .map(|n| n.plan_id.clone())
+            .filter(|id| !id.is_empty());
         let node_deps = node.as_ref().map(|n| n.deps.clone()).unwrap_or_default();
         let session_id = mint_session_id_for(backend);
         // Lead the launch prompt with the canonical Objective + Done-when block so
@@ -4799,6 +5102,7 @@ impl App {
             deps: node_deps,
             soft_deps: Vec::new(),
             node_id,
+            plan_id,
             reconcile_planner: false,
             plan_stream: None,
             plan_output_cache: None,
@@ -4848,42 +5152,45 @@ impl App {
     }
 
     fn start_rudder_plan_task(&mut self, input: &str) {
-        // A fresh plan supersedes any paused planner.
-        self.planner_paused_for_input = false;
-        self.pending_questions.clear();
-        // AT-MOST-ONE ORCHESTRATOR: a brand-new plan supersedes any prior pinned
-        // planner. Retire stale orchestrator rows (and their on-disk records) before
-        // pushing the new one so completed plans never stack as phantom orchestrators
-        // in the agent pane (`is_orchestrator()` is true for any RudderPlan row).
-        // refine/rebase reuse the existing orchestrator in place and never reach here;
-        // this path only runs for a genuinely fresh plan (`!plan_is_active()`).
-        let stale_orchestrators: Vec<String> = self
-            .agents
-            .iter()
-            .filter(|run| run.is_orchestrator())
-            .map(|run| run.id.clone())
-            .collect();
-        for id in stale_orchestrators {
-            self.retire_planner_row(&id);
+        // SEVERAL ORCHESTRATORS: a fresh `/plan` opens its OWN plan next to any plan
+        // already running, so two goals can be decomposed and conducted side by side.
+        // (This replaced an at-most-one rule that retired every existing orchestrator
+        // row and wiped the plan state; that made a second `/plan` silently destroy the
+        // first one's DAG.) A plan is only ever RECYCLED when it is spent — no queue, no
+        // live workers, nothing at the gate — so a user who runs one `/plan` after
+        // another still sees exactly one orchestrator row rather than a growing museum
+        // of finished ones. refine/rebase reuse their own orchestrator in place and
+        // never reach here.
+        let plan_index = match self.spent_plan_index() {
+            Some(index) => {
+                self.plans[index] = PlanState {
+                    id: self.plans[index].id.clone(),
+                    ..PlanState::default()
+                };
+                index
+            }
+            None => {
+                self.plans.push(PlanState {
+                    id: new_plan_id(),
+                    ..PlanState::default()
+                });
+                self.plans.len() - 1
+            }
+        };
+        let plan_id = self.plans[plan_index].id.clone();
+        // Retire only THIS plan's own leftover orchestrator row (a recycled slot can
+        // still be showing the finished planner); other plans keep theirs.
+        if let Some(stale) = self.orchestrator_index_for_plan(&plan_id) {
+            let stale_id = self.agents[stale].id.clone();
+            self.retire_planner_row(&stale_id);
         }
+        let plan = &mut self.plans[plan_index];
         // Remember the original request so the refine loop can re-plan against it
         // (each refinement layers the user's feedback on top of this, not on top of
         // the previous composite prompt).
-        self.plan_request = input.to_string();
-        self.planned_origin = input.to_string();
-        self.plan_summary = None;
-        self.planned_nodes.clear();
-        self.plan_launched_node_ids.clear();
-        self.plan_merged_node_ids.clear();
-        // Node ids (n0, n1, …) are reused across plans, so review state must not
-        // carry over — a new plan's n0 must not inherit an old n0's reviewed flag.
-        self.reviewed_nodes.clear();
-        self.node_reviewers.clear();
-        self.final_gate_status = FinalGateStatus::Idle;
-        self.final_gate_summary = None;
-        self.plan_capture_armed = true;
-        self.awaiting_approval = false;
-        self.plan_review = PlanReviewState::default();
+        plan.plan_request = input.to_string();
+        plan.planned_origin = input.to_string();
+        plan.plan_capture_armed = true;
         self.persist_plan_queue();
         let backend = self.backend;
         let interactive_planner = self.interactive_orchestrator;
@@ -4919,6 +5226,9 @@ impl App {
             id: new_run_id(input),
             created_at: created_at.clone(),
             mode: AgentMode::RudderPlan,
+            // This row DRIVES the plan opened above; that link is what lets each
+            // orchestrator's pane keep talking to its own plan.
+            plan_id: Some(plan_id),
             task: input.to_string(),
             task_summary: format!("plan {}", summarize_task(input)),
             current_prompt: input.to_string(),
@@ -5031,11 +5341,13 @@ impl App {
         // A refine/rebase is already in flight: the revised plan is on its way. Relaunching
         // the orchestrator now would kill the in-flight planner and race its capture, so
         // hold (mirrors the empty-Enter and approve_planned_queue guards).
-        if self.refining || self.rebasing {
+        if self.plan().refining || self.plan().rebasing {
             self.notice = Some("still refining — the updated plan is on its way".to_string());
             return;
         }
-        let Some(index) = self.agents.iter().position(|run| run.is_orchestrator()) else {
+        // Refine the plan the user is looking at, via ITS own orchestrator: another
+        // plan's planner must not be resumed with this plan's feedback.
+        let Some(index) = self.active_orchestrator_index() else {
             // No orchestrator to refine (shouldn't happen while awaiting approval):
             // fall back to a fresh plan from the feedback.
             self.start_rudder_plan_task(feedback);
@@ -5059,7 +5371,7 @@ impl App {
         // message is an ANSWER (continue planning), not feedback on a shown plan. Using the
         // refine framing here ("the plan you produced") would confuse the model since no
         // plan exists yet, and its "do not ask questions" would block further clarification.
-        let answering_clarification = self.planner_paused_for_input;
+        let answering_clarification = self.plan().planner_paused_for_input;
         let followup = if answering_clarification {
             build_clarification_answer_followup(feedback)
         } else {
@@ -5068,10 +5380,10 @@ impl App {
         let command = match &session {
             Some(sid) => rudder_plan_refine_command(backend, &model, effort, &followup, sid),
             None => {
-                let original = if self.plan_request.trim().is_empty() {
-                    self.planned_origin.clone()
+                let original = if self.plan().plan_request.trim().is_empty() {
+                    self.plan().planned_origin.clone()
                 } else {
-                    self.plan_request.clone()
+                    self.plan().plan_request.clone()
                 };
                 let outline = self.current_plan_outline();
                 let composite = build_refine_request(&original, &outline, feedback);
@@ -5090,7 +5402,7 @@ impl App {
         // never launches the stale plan and Enter cannot approve it mid-refine) while
         // maybe_detect_plan_ready still captures the revised DAG. evaluate_completed_plan
         // clears `refining` once the new plan lands.
-        self.refining = true;
+        self.plan_mut().refining = true;
         if let Some(run) = self.agents.get_mut(index) {
             if resume {
                 // Keep the conversation transcript; append "you: <feedback>" and move
@@ -5113,7 +5425,7 @@ impl App {
         } else {
             // The planner could not be relaunched: drop back to the existing plan so
             // the user is not stuck (they can still approve it or try again).
-            self.refining = false;
+            self.plan_mut().refining = false;
             self.notice =
                 Some("could not relaunch the planner; the current plan still stands".to_string());
         }
@@ -5129,11 +5441,11 @@ impl App {
     fn start_plan_rebase(&mut self, input: &str) {
         // A refine/rebase is already in flight: relaunching the orchestrator now would kill
         // the in-flight planner and race its capture (same guard refine_plan has).
-        if self.refining || self.rebasing {
+        if self.plan().refining || self.plan().rebasing {
             self.notice = Some("still refining — the updated plan is on its way".to_string());
             return;
         }
-        let Some(index) = self.agents.iter().position(|run| run.is_orchestrator()) else {
+        let Some(index) = self.active_orchestrator_index() else {
             // No orchestrator session to resume (e.g. a daemon-launched plan): a
             // structural change with no planner to re-decompose against falls back to
             // a fresh plan from the new direction.
@@ -5163,7 +5475,7 @@ impl App {
         // headless re-decompose. If this WAS the interactive conductor (e.g. it emitted
         // RUDDER_REPLAN itself), remember to re-spawn it once the rebase resolves so the
         // user keeps the conversation.
-        self.rebase_restore_interactive = was_interactive;
+        self.plan_mut().rebase_restore_interactive = was_interactive;
         let request = build_rebase_request(
             &self.rebase_zone_merged(),
             &self.rebase_zone_running(),
@@ -5188,7 +5500,7 @@ impl App {
         };
         // Mark the rebase in flight BEFORE relaunch so the poll loop routes the revised
         // block to evaluate_completed_rebase and holds plan integration steady.
-        self.rebasing = true;
+        self.plan_mut().rebasing = true;
         if let Some(run) = self.agents.get_mut(index) {
             if resume {
                 if let Some(stream) = run.plan_stream.as_mut() {
@@ -5206,8 +5518,8 @@ impl App {
             // Could not relaunch: drop back to the current plan so the fleet keeps
             // running. Nothing was changed; the rebase is simply abandoned (the old
             // interactive session was never replaced), so there is nothing to restore.
-            self.rebasing = false;
-            self.rebase_restore_interactive = false;
+            self.plan_mut().rebasing = false;
+            self.plan_mut().rebase_restore_interactive = false;
             self.notice = Some(
                 "could not relaunch the planner to rebase; the current plan still stands"
                     .to_string(),
@@ -5263,7 +5575,7 @@ impl App {
     /// the orchestrator so it can revise rather than start from scratch.
     fn current_plan_outline(&self) -> String {
         let mut lines: Vec<String> = Vec::new();
-        for node in &self.planned_nodes {
+        for node in &self.plan().planned_nodes {
             let mut deps: Vec<String> = node.deps.iter().map(|d| format!("{d}:hard")).collect();
             deps.extend(node.soft_deps.iter().map(|d| format!("{d}:soft")));
             let deps_str = if deps.is_empty() {
@@ -5780,9 +6092,7 @@ impl App {
             match backend {
                 Backend::Claude => claude_resume_command(run, session_id.as_deref().unwrap()),
                 Backend::Codex => codex_resume_command(run, session_id.as_deref().unwrap()),
-                Backend::Opencode => {
-                    opencode_resume_command(run, session_id.as_deref().unwrap())
-                }
+                Backend::Opencode => opencode_resume_command(run, session_id.as_deref().unwrap()),
             }
         } else {
             agent_command(
@@ -6126,13 +6436,7 @@ impl App {
             .iter()
             .filter(|run| run.status == AgentStatus::Running)
             .count();
-        let mut notices: Vec<String> = self
-            .activity_log
-            .iter()
-            .rev()
-            .take(3)
-            .cloned()
-            .collect();
+        let mut notices: Vec<String> = self.activity_log.iter().rev().take(3).cloned().collect();
         notices.reverse();
         let last_error = self
             .agents
@@ -6452,7 +6756,10 @@ impl App {
                 // session id the palette (which lists this repo's recent
                 // conversations) is the interface; reaching here means the user
                 // dismissed it, so say what the command wants.
-                let rest = resume_command_rest(input).unwrap_or_default().trim().to_string();
+                let rest = resume_command_rest(input)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
                 let mut tokens = rest.splitn(2, char::is_whitespace);
                 let session_id = tokens.next().unwrap_or_default().trim().to_string();
                 let instruction = tokens.next().map(str::trim).unwrap_or_default().to_string();
@@ -6633,10 +6940,10 @@ impl App {
                 true
             }
             Some("/verify") => {
-                self.final_gate_status = FinalGateStatus::Idle;
-                self.final_gate_summary = None;
+                self.plan_mut().final_gate_status = FinalGateStatus::Idle;
+                self.plan_mut().final_gate_summary = None;
                 self.maybe_start_final_gate();
-                if self.final_gate_status == FinalGateStatus::Idle {
+                if self.plan().final_gate_status == FinalGateStatus::Idle {
                     self.notice = Some(
                         "verification waits until every planned node is integrated".to_string(),
                     );
@@ -7264,6 +7571,7 @@ impl App {
             deps: Vec::new(),
             soft_deps: Vec::new(),
             node_id: None,
+            plan_id: None,
             reconcile_planner: false,
             plan_stream: None,
             plan_output_cache: None,
@@ -7451,40 +7759,43 @@ impl App {
             return;
         }
 
-        // REBASE: a structural pivot resumed the orchestrator WHILE a plan is active
-        // (post-approval, nodes launched), so its revised block must be captured from
-        // streaming output regardless of the initial-plan guard below (which would bail
-        // on the non-empty queue). Detected before that guard, like reconcile.
-        if self.rebasing {
-            let index = self.agents.iter().position(|run| {
+        // Each remaining orchestrator is judged against ITS OWN plan: one plan already
+        // sitting at the approval gate must not suppress capture for another that is
+        // still decomposing. At most one is handled per tick (as before), so a capture
+        // that reshuffles rows cannot invalidate the indices behind it.
+        let candidates: Vec<usize> = self
+            .agents
+            .iter()
+            .enumerate()
+            .filter(|(_, run)| {
                 run.mode == AgentMode::RudderPlan
                     && !run.reconcile_planner
                     && run.autosteered
                     && rudder_plan_tasks_for_run(run).is_some()
-            });
-            if let Some(index) = index {
+            })
+            .map(|(index, _)| index)
+            .collect();
+        for index in candidates {
+            let plan = &self.plans[self.plan_index_for_run(index)];
+            // REBASE: a structural pivot resumed the orchestrator WHILE a plan is active
+            // (post-approval, nodes launched), so its revised block must be captured from
+            // streaming output regardless of the initial-plan guard below (which would
+            // bail on the non-empty queue). Checked first, like reconcile.
+            if plan.rebasing {
                 self.evaluate_completed_rebase(index);
+                return;
             }
-            return;
-        }
-
-        // INITIAL plan: a fresh plan is already captured (awaiting approval, or
-        // some nodes queued): do not re-capture from a still-streaming orchestrator.
-        // EXCEPTION: while `refining`, the orchestrator has been relaunched to revise
-        // the plan, so we MUST capture its new block even though a (stale) plan is
-        // still pending; evaluate_completed_plan replaces the queue and clears the
-        // flag.
-        if !self.refining && (self.awaiting_approval || !self.planned_nodes.is_empty()) {
-            return;
-        }
-        let index = self.agents.iter().position(|run| {
-            run.mode == AgentMode::RudderPlan
-                && !run.reconcile_planner
-                && run.autosteered
-                && rudder_plan_tasks_for_run(run).is_some()
-        });
-        if let Some(index) = index {
+            // INITIAL plan: a fresh plan is already captured (awaiting approval, or
+            // some nodes queued): do not re-capture from a still-streaming orchestrator.
+            // EXCEPTION: while `refining`, the orchestrator has been relaunched to revise
+            // the plan, so we MUST capture its new block even though a (stale) plan is
+            // still pending; evaluate_completed_plan replaces the queue and clears the
+            // flag.
+            if !plan.refining && (plan.awaiting_approval || !plan.planned_nodes.is_empty()) {
+                continue;
+            }
             self.evaluate_completed_plan(index);
+            return;
         }
     }
 
@@ -7501,17 +7812,28 @@ impl App {
     /// `interactive_orchestrator` flag is authoritative for persisted rows; the App
     /// env setting only chooses the mode for fresh launches.
     fn maybe_capture_orchestrator_plan(&mut self) {
-        if !self.plan_capture_armed || self.refining || self.rebasing || self.awaiting_approval {
+        // RUDDER.md is the interactive orchestrator's control channel and there is one
+        // per repo, so plan-file capture is resolved from the interactive orchestrator
+        // that is actually running and applied to ITS plan.
+        let Some((_, plan_index)) = self.running_interactive_orchestrator_plan() else {
+            return;
+        };
+        if !self.plans[plan_index].plan_capture_armed
+            || self.plans[plan_index].refining
+            || self.plans[plan_index].rebasing
+            || self.plans[plan_index].awaiting_approval
+        {
             return;
         }
         // Only capture a FRESH plan: nothing pending and no live/unmerged workers.
         // Historical merged nodes may still be in the agents list; they must not
         // block a brand-new orchestrator plan after the previous DAG completed.
-        if !self.planned_nodes.is_empty()
-            || self
-                .agents
-                .iter()
-                .any(|run| run.node_id.is_some() && run.status != AgentStatus::Merged)
+        if !self.plans[plan_index].planned_nodes.is_empty()
+            || self.agents.iter().any(|run| {
+                run.node_id.is_some()
+                    && self.run_belongs_to_plan(run, plan_index)
+                    && run.status != AgentStatus::Merged
+            })
         {
             return;
         }
@@ -7527,25 +7849,25 @@ impl App {
         };
         let nodes = self.planned_nodes_from_fresh_tasks(&tasks);
         let count = nodes.len();
-        self.planned_nodes = nodes;
-        self.plan_launched_node_ids.clear();
-        self.plan_merged_node_ids.clear();
+        self.adopt_plan_nodes(plan_index, nodes);
+        self.plans[plan_index].plan_launched_node_ids.clear();
+        self.plans[plan_index].plan_merged_node_ids.clear();
         // Node ids (n0, n1, …) are reused across plans, so review state must not
         // carry over — a new plan's n0 must not inherit an old n0's reviewed flag.
-        self.reviewed_nodes.clear();
-        self.node_reviewers.clear();
-        self.final_gate_status = FinalGateStatus::Idle;
-        self.final_gate_summary = None;
-        self.plan_capture_armed = false;
+        self.plans[plan_index].reviewed_nodes.clear();
+        self.plans[plan_index].node_reviewers.clear();
+        self.plans[plan_index].final_gate_status = FinalGateStatus::Idle;
+        self.plans[plan_index].final_gate_summary = None;
+        self.plans[plan_index].plan_capture_armed = false;
         if let Some(origin) = self.running_interactive_orchestrator_task() {
-            self.plan_request = origin.clone();
-            self.planned_origin = origin;
-        } else if !self.plan_request.trim().is_empty() {
-            self.planned_origin = self.plan_request.clone();
+            self.plans[plan_index].plan_request = origin.clone();
+            self.plans[plan_index].planned_origin = origin;
+        } else if !self.plans[plan_index].plan_request.trim().is_empty() {
+            self.plans[plan_index].planned_origin = self.plans[plan_index].plan_request.clone();
         }
-        self.plan_summary = extract_rudder_plan_summary(&text);
-        self.planner_paused_for_input = false;
-        self.awaiting_approval = true;
+        self.plans[plan_index].plan_summary = extract_rudder_plan_summary(&text);
+        self.plans[plan_index].planner_paused_for_input = false;
+        self.plans[plan_index].awaiting_approval = true;
         self.persist_plan_queue();
         self.open_plan_review();
         self.notice = Some(format!(
@@ -7564,14 +7886,23 @@ impl App {
     /// no-ops once any worker has launched (post-approval DAG changes go through conductor
     /// control markers like RUDDER_ADD_TASK and RUDDER_REPLAN).
     fn maybe_recapture_orchestrator_plan(&mut self) {
-        if !self.awaiting_approval || self.refining || self.rebasing {
+        // RUDDER.md is the interactive orchestrator's control channel and there is one
+        // per repo, so plan-file capture is resolved from the interactive orchestrator
+        // that is actually running and applied to ITS plan.
+        let Some((_, plan_index)) = self.running_interactive_orchestrator_plan() else {
+            return;
+        };
+        if !self.plans[plan_index].awaiting_approval
+            || self.plans[plan_index].refining
+            || self.plans[plan_index].rebasing
+        {
             return;
         }
-        if self
-            .agents
-            .iter()
-            .any(|run| run.node_id.is_some() && run.status != AgentStatus::Merged)
-        {
+        if self.agents.iter().any(|run| {
+            run.node_id.is_some()
+                && self.run_belongs_to_plan(run, plan_index)
+                && run.status != AgentStatus::Merged
+        }) {
             return;
         }
         if !self.has_running_interactive_orchestrator() {
@@ -7590,16 +7921,27 @@ impl App {
             _ => return,
         };
         let nodes = self.planned_nodes_from_fresh_tasks(&tasks);
-        if nodes == self.planned_nodes {
+        // Compare the DAG, not the bookkeeping: live nodes carry their owning plan's
+        // stamp while freshly parsed ones do not, and that difference is not an edit.
+        let unchanged = nodes.len() == self.plans[plan_index].planned_nodes.len()
+            && nodes
+                .iter()
+                .zip(self.plans[plan_index].planned_nodes.iter())
+                .all(|(parsed, live)| {
+                    let mut parsed = parsed.clone();
+                    parsed.plan_id = live.plan_id.clone();
+                    parsed == *live
+                });
+        if unchanged {
             return; // unchanged since the last capture — nothing to refresh
         }
         let count = nodes.len();
-        self.planned_nodes = nodes;
+        self.adopt_plan_nodes(plan_index, nodes);
         if let Some(origin) = self.running_interactive_orchestrator_task() {
-            self.plan_request = origin.clone();
-            self.planned_origin = origin;
+            self.plans[plan_index].plan_request = origin.clone();
+            self.plans[plan_index].planned_origin = origin;
         }
-        self.plan_summary = extract_rudder_plan_summary(&text);
+        self.plans[plan_index].plan_summary = extract_rudder_plan_summary(&text);
         self.persist_plan_queue();
         self.open_plan_review();
         self.notice = Some(format!(
@@ -7619,7 +7961,14 @@ impl App {
     /// (early-returns when !awaiting_approval and flips it false on success), so the signal
     /// re-seen on every poll approves EXACTLY once. Gated by the per-run interactive flag.
     fn scan_orchestrator_markers(&mut self) {
-        if !self.awaiting_approval || self.refining || self.rebasing {
+        // Resolve which plan the marker approves WITHOUT requiring a live PTY: RUDDER.md
+        // is the durable control channel, so a marker written just before the
+        // orchestrator's turn ended must still land (it used to strand forever).
+        let plan_index = self.marker_channel_plan_index();
+        if !self.plans[plan_index].awaiting_approval
+            || self.plans[plan_index].refining
+            || self.plans[plan_index].rebasing
+        {
             return;
         }
         // PRIMARY (hardened file channel): the plan is already persisted, so a
@@ -7642,12 +7991,12 @@ impl App {
                 .filter_map(|run| run.terminal.as_ref())
                 .any(|terminal| output_has_approve_marker(terminal.output_log_snapshot()));
         if file_approved || pty_approved {
-            self.approve_planned_queue();
+            self.approve_planned_queue_for(plan_index);
         }
     }
 
     fn scan_orchestrator_skill_markers(&mut self) {
-        if self.refining || self.rebasing {
+        if self.plan().refining || self.plan().rebasing {
             return;
         }
         // RUDDER.md is the durable control channel. A marker written immediately
@@ -7958,10 +8307,13 @@ impl App {
     }
 
     fn evaluate_completed_plan(&mut self, index: usize) {
+        // Capture belongs to the plan THIS orchestrator drives, not to whichever
+        // plan the user is currently looking at.
+        let plan_index = self.plan_index_for_run(index);
         // A REBASE in flight must NEVER reach the initial-plan REPLACE path (it would wipe
         // the running plan's todo queue and re-gate the fleet); evaluate_completed_rebase
         // owns that case. Defensive guard in case a caller routes a rebase planner here.
-        if self.rebasing {
+        if self.plans[plan_index].rebasing {
             return;
         }
         let Some(run) = self.agents.get_mut(index) else {
@@ -8030,13 +8382,13 @@ impl App {
             Err(error) => {
                 run.autosteered = false;
                 let _ = save_native_run_record(&self.cwd, run);
-                self.refining = false;
+                self.plans[plan_index].refining = false;
                 // No DAG yet: the planner likely asked a clarifying question or needs more
                 // detail. Mark it PAUSED-for-input so the next typed message RESUMES this
                 // planning conversation (NOT a leftover Done orchestrator from a shipped
                 // plan, which must start fresh), and capture its questions for the prompt.
-                self.planner_paused_for_input = true;
-                self.pending_questions = planner_questions_or_forced(&output);
+                self.plans[plan_index].planner_paused_for_input = true;
+                self.plans[plan_index].pending_questions = planner_questions_or_forced(&output);
                 self.notice = Some(format!(
                     "planner is waiting ({error}) — type your answer or more detail to continue planning"
                 ));
@@ -8054,9 +8406,9 @@ impl App {
         if tasks.is_empty() {
             run.autosteered = false;
             let _ = save_native_run_record(&self.cwd, run);
-            self.refining = false;
-            self.planner_paused_for_input = true;
-            self.pending_questions = planner_questions_or_forced(&output);
+            self.plans[plan_index].refining = false;
+            self.plans[plan_index].planner_paused_for_input = true;
+            self.plans[plan_index].pending_questions = planner_questions_or_forced(&output);
             // Same as the Err branch: keep the planner resumable so a typed answer
             // continues this conversation rather than starting a fresh planner.
             self.notice = Some(
@@ -8076,38 +8428,39 @@ impl App {
         let _ = save_native_run_record(&self.cwd, run);
         let _ = run;
         // A DAG WAS captured: this planner is no longer paused for input.
-        self.planner_paused_for_input = false;
-        self.pending_questions.clear();
+        self.plans[plan_index].planner_paused_for_input = false;
+        self.plans[plan_index].pending_questions.clear();
 
         // Queue every task as a PLANNED node. A new plan replaces any pending queue
         // (the planner is the single source of truth for the active plan).
         let nodes = self.planned_nodes_from_fresh_tasks(&tasks);
         let count = nodes.len();
-        self.planned_nodes = nodes;
-        self.plan_launched_node_ids.clear();
-        self.plan_merged_node_ids.clear();
+        self.adopt_plan_nodes(plan_index, nodes);
+        self.plans[plan_index].plan_launched_node_ids.clear();
+        self.plans[plan_index].plan_merged_node_ids.clear();
         // Node ids (n0, n1, …) are reused across plans, so review state must not
         // carry over — a new plan's n0 must not inherit an old n0's reviewed flag.
-        self.reviewed_nodes.clear();
-        self.node_reviewers.clear();
-        self.final_gate_status = FinalGateStatus::Idle;
-        self.final_gate_summary = None;
-        self.plan_capture_armed = false;
+        self.plans[plan_index].reviewed_nodes.clear();
+        self.plans[plan_index].node_reviewers.clear();
+        self.plans[plan_index].final_gate_status = FinalGateStatus::Idle;
+        self.plans[plan_index].final_gate_summary = None;
+        self.plans[plan_index].plan_capture_armed = false;
         // Keep planned_origin anchored to the ORIGINAL request so refine rounds (whose
         // run.task is a composite "revise this" prompt) do not overwrite it; worker
         // launch prompts and further refinements stay tied to what the user asked for.
-        self.planned_origin = if self.plan_request.trim().is_empty() {
-            planner_task
-        } else {
-            self.plan_request.clone()
-        };
-        self.plan_summary = summary;
+        self.plans[plan_index].planned_origin =
+            if self.plans[plan_index].plan_request.trim().is_empty() {
+                planner_task
+            } else {
+                self.plans[plan_index].plan_request.clone()
+            };
+        self.plans[plan_index].plan_summary = summary;
         // The revised plan has landed: the refine round is complete.
-        self.refining = false;
+        self.plans[plan_index].refining = false;
 
         // APPROVAL GATE: do NOT launch. Hold the plan until the user approves so
         // they can review, discuss/refine (type in the task pane), or approve it.
-        self.awaiting_approval = true;
+        self.plans[plan_index].awaiting_approval = true;
         // Persist the captured queue + gate so a restart resumes at this gate.
         self.persist_plan_queue();
         self.open_plan_review();
@@ -8167,6 +8520,9 @@ impl App {
     /// deps are met; if the initial plan is still awaiting approval, the node is
     /// left queued so it becomes part of the plan the user approves.
     fn evaluate_completed_reconcile(&mut self, index: usize) {
+        // Capture belongs to the plan THIS orchestrator drives, not to whichever
+        // plan the user is currently looking at.
+        let plan_index = self.plan_index_for_run(index);
         // Read + validate the planner run inside a scoped mutable borrow, then drop
         // it before touching other `self` state (frontier, uniquify, append). On a
         // parse failure the captured-once flag is cleared and we bail.
@@ -8227,16 +8583,16 @@ impl App {
                 node.soft_deps = frontier.clone();
             }
 
-            self.planned_nodes.push(node);
-            self.final_gate_status = FinalGateStatus::Idle;
-            self.final_gate_summary = None;
+            self.push_plan_node(plan_index, node);
+            self.plans[plan_index].final_gate_status = FinalGateStatus::Idle;
+            self.plans[plan_index].final_gate_summary = None;
             appended += 1;
         }
 
         // Keep the planned-origin populated so worker prompts have an origin even
         // when reconcile happens before any initial plan was captured.
-        if self.planned_origin.trim().is_empty() {
-            self.planned_origin = planner_task;
+        if self.plans[plan_index].planned_origin.trim().is_empty() {
+            self.plans[plan_index].planned_origin = planner_task;
         }
 
         // The reconcile planner has done its job; retire it (drop from self.agents AND
@@ -8248,7 +8604,7 @@ impl App {
         // launches as soon as its deps are met. If the initial plan is still
         // awaiting approval, leave the node QUEUED: it joins the plan the user
         // approves at the gate.
-        if self.awaiting_approval {
+        if self.plans[plan_index].awaiting_approval {
             // Pre-approval: the node only joins the queue the user is reviewing, so this
             // is a gated change (notice only), not an autonomous one.
             self.notice = Some(format!(
@@ -8277,6 +8633,9 @@ impl App {
     /// jj-touching step rides the op-log (undoable). If the planner produced no runnable
     /// block, the current plan stands unchanged.
     fn evaluate_completed_rebase(&mut self, index: usize) {
+        // Capture belongs to the plan THIS orchestrator drives, not to whichever
+        // plan the user is currently looking at.
+        let plan_index = self.plan_index_for_run(index);
         // Drain + ingest the planner's FINAL buffered output before snapshotting (the
         // process may have blocked at a plan-mode approval prompt without exiting, so the
         // authoritative block can still be in the PTY). Mirrors evaluate_completed_plan.
@@ -8312,8 +8671,8 @@ impl App {
                     run.autosteered = false;
                     let _ = save_native_run_record(&self.cwd, run);
                 }
-                self.rebasing = false;
-                self.refining = false;
+                self.plans[plan_index].rebasing = false;
+                self.plans[plan_index].refining = false;
                 self.notice = Some(match other {
                     Err(error) => format!(
                         "rebase produced no runnable plan ({error}); the current plan still stands"
@@ -8357,7 +8716,7 @@ impl App {
                 context: run.current_prompt.clone(),
             })
             .collect();
-        let todo = self.planned_nodes.clone();
+        let todo = self.plans[plan_index].planned_nodes.clone();
 
         let diff = diff_plan(&running, &todo, &merged_ids, &new_tasks);
         let (added, regoaled, dropped, kept) = (
@@ -8388,15 +8747,15 @@ impl App {
         }
         // 3) Replace the TODO queue with the rebuilt one (planner ids; the permissive
         // dangling-dep rule keeps the DAG from deadlocking on any stale reference).
-        self.planned_nodes = diff.todo;
-        self.plan_summary = summary;
+        self.adopt_plan_nodes(plan_index, diff.todo);
+        self.plans[plan_index].plan_summary = summary;
         self.persist_plan_queue();
 
         // The rebase has landed: clear the rebase + refine flags + the planner's
         // capture-once flag (refining may have been set by an interleaved refine; leaving
         // it true would wedge the approval gate forever).
-        self.rebasing = false;
-        self.refining = false;
+        self.plans[plan_index].rebasing = false;
+        self.plans[plan_index].refining = false;
         if let Some(run) = self.agents.get_mut(index) {
             run.autosteered = false;
             let _ = save_native_run_record(&self.cwd, run);
@@ -8424,10 +8783,10 @@ impl App {
     /// re-mark the row interactive + not-autosteered (matching the initial spawn) so the
     /// completion router never treats this live session's later exit as a fresh plan.
     fn restore_interactive_conductor_after_rebase(&mut self, index: usize) {
-        if !self.rebase_restore_interactive {
+        if !self.plan().rebase_restore_interactive {
             return;
         }
-        self.rebase_restore_interactive = false;
+        self.plan_mut().rebase_restore_interactive = false;
         let cwd = self.cwd.clone();
         let Some(run) = self.agents.get_mut(index) else {
             return;
@@ -8892,10 +9251,9 @@ impl App {
     /// Live plan size = queued nodes + launched-but-not-merged plan agents. The
     /// auto-expansion backstop guards this against MAX_PLAN_TASKS.
     fn plan_node_count(&self) -> usize {
-        self.planned_nodes.len()
+        self.plan().planned_nodes.len()
             + self
-                .agents
-                .iter()
+                .active_plan_agents()
                 .filter(|run| run.node_id.is_some() && run.status != AgentStatus::Merged)
                 .count()
     }
@@ -8913,8 +9271,11 @@ impl App {
         if want.is_empty() {
             return true;
         }
-        self.planned_nodes.iter().any(|n| norm(&n.title) == want)
-            || self.agents.iter().any(|r| {
+        self.plan()
+            .planned_nodes
+            .iter()
+            .any(|n| norm(&n.title) == want)
+            || self.active_plan_agents().any(|r| {
                 r.node_id.is_some() && (norm(&r.task_summary) == want || norm(&r.task) == want)
             })
     }
@@ -8949,7 +9310,7 @@ impl App {
                 grew = true;
             }
         }
-        if grew && !self.awaiting_approval {
+        if grew && !self.plan().awaiting_approval {
             self.run_scheduler();
             self.mirror_graph();
         }
@@ -9161,7 +9522,7 @@ impl App {
             }
             self.mark_run_ingested(result.run_id);
         }
-        if grew && !self.awaiting_approval {
+        if grew && !self.plan().awaiting_approval {
             self.run_scheduler();
             self.mirror_graph();
         }
@@ -9209,17 +9570,12 @@ impl App {
     /// a mid-plan restart resumes the queued DAG instead of silently dropping it. Called on
     /// every queue mutation (plan captured, reconcile, rebase, approve, scheduler drain).
     fn persist_plan_queue(&self) {
-        let snapshot = PlanQueueSnapshot {
-            planned_nodes: self.planned_nodes.clone(),
-            launched_node_ids: self.plan_launched_node_ids.clone(),
-            merged_node_ids: self.plan_merged_node_ids.clone(),
-            capture_armed: self.plan_capture_armed,
-            planned_origin: self.planned_origin.clone(),
-            plan_request: self.plan_request.clone(),
-            plan_summary: self.plan_summary.clone(),
-            final_gate_status: self.final_gate_status,
-            final_gate_summary: self.final_gate_summary.clone(),
-            awaiting_approval: self.awaiting_approval,
+        let snapshot = PlanQueueFile {
+            plans: self
+                .plans
+                .iter()
+                .map(PlanQueueSnapshot::from_plan)
+                .collect(),
         };
         let Ok(json) = serde_json::to_string(&snapshot) else {
             return;
@@ -9236,27 +9592,29 @@ impl App {
     }
 
     pub(crate) fn ensure_plan_review_state(&mut self) {
-        if !self.awaiting_approval {
+        if !self.plan().awaiting_approval {
             return;
         }
-        let signature = plan_review_signature(&self.planned_nodes);
-        if self.plan_review.nodes.is_empty()
-            || (!self.plan_review.dirty && self.plan_review.signature != signature)
+        let signature = plan_review_signature(&self.plan().planned_nodes);
+        if self.plan().plan_review.nodes.is_empty()
+            || (!self.plan().plan_review.dirty && self.plan().plan_review.signature != signature)
         {
-            self.plan_review = PlanReviewState::from_planned_nodes(&self.planned_nodes);
+            self.plan_mut().plan_review =
+                PlanReviewState::from_planned_nodes(&self.plan().planned_nodes);
         }
     }
 
     fn reset_plan_review_from_nodes(&mut self) {
-        self.plan_review = PlanReviewState::from_planned_nodes(&self.planned_nodes);
+        self.plan_mut().plan_review =
+            PlanReviewState::from_planned_nodes(&self.plan().planned_nodes);
     }
 
     fn open_plan_review(&mut self) {
-        if self.planned_nodes.is_empty() {
+        if self.plan().planned_nodes.is_empty() {
             return;
         }
         self.reset_plan_review_from_nodes();
-        if let Some(index) = self.agents.iter().position(|run| run.is_orchestrator()) {
+        if let Some(index) = self.active_orchestrator_index() {
             self.selected_agent = index;
         }
         self.worker_view = WorkerView::PlanReview;
@@ -9286,6 +9644,7 @@ impl App {
         let mut errors = Vec::new();
         let mut warnings = Vec::new();
         let ids: Vec<String> = self
+            .plan()
             .plan_review
             .nodes
             .iter()
@@ -9296,7 +9655,7 @@ impl App {
             errors.push("node ids must be unique".to_string());
         }
         let mut tasks = Vec::new();
-        for node in &self.plan_review.nodes {
+        for node in &self.plan().plan_review.nodes {
             let id = node.id.trim();
             if id.is_empty() {
                 errors.push("node id cannot be empty".to_string());
@@ -9373,36 +9732,45 @@ impl App {
         Ok((nodes, warnings))
     }
 
+    /// Commit the draft edits of the plan the UI is acting on.
     fn commit_plan_review_edits(&mut self) -> bool {
+        let plan_index = self.active_plan_index();
+        self.commit_plan_review_edits_for(plan_index)
+    }
+
+    fn commit_plan_review_edits_for(&mut self, plan_index: usize) -> bool {
         let (nodes, warnings) = match self.plan_review_drafts_to_nodes() {
             Ok(result) => result,
             Err(errors) => {
-                self.plan_review.errors = errors;
-                self.plan_review.warnings.clear();
-                self.plan_review.dirty = true;
+                self.plans[plan_index].plan_review.errors = errors;
+                self.plans[plan_index].plan_review.warnings.clear();
+                self.plans[plan_index].plan_review.dirty = true;
                 self.notice = Some("fix the plan review errors before approval".to_string());
                 self.dirty = true;
                 return false;
             }
         };
-        self.planned_nodes = nodes;
+        self.adopt_plan_nodes(plan_index, nodes);
         self.persist_plan_queue();
         let tasks: Vec<RudderPlanTask> = self
+            .plan()
             .planned_nodes
             .iter()
             .map(PlannedNode::to_task)
             .collect();
         let block = rudder_plan_tasks_block(&tasks);
         if let Err(error) = replace_rudder_plan_block(&self.cwd, &block) {
-            self.plan_review.errors = vec![format!("could not update RUDDER.md: {error}")];
-            self.plan_review.warnings.clear();
-            self.plan_review.dirty = true;
+            self.plans[plan_index].plan_review.errors =
+                vec![format!("could not update RUDDER.md: {error}")];
+            self.plans[plan_index].plan_review.warnings.clear();
+            self.plans[plan_index].plan_review.dirty = true;
             self.notice = Some("plan saved to queue but RUDDER.md update failed".to_string());
             self.dirty = true;
             return false;
         }
-        self.plan_review = PlanReviewState::from_planned_nodes(&self.planned_nodes);
-        self.plan_review.warnings = warnings;
+        self.plans[plan_index].plan_review =
+            PlanReviewState::from_planned_nodes(&self.plans[plan_index].planned_nodes);
+        self.plans[plan_index].plan_review.warnings = warnings;
         self.notice = Some("plan updated".to_string());
         self.dirty = true;
         true
@@ -9412,7 +9780,7 @@ impl App {
     where
         F: FnOnce(&mut String, &mut usize),
     {
-        let state = &mut self.plan_review;
+        let state = &mut self.plan_mut().plan_review;
         let selected = state.selected;
         let field = state.field;
         let cursor = &mut state.cursor;
@@ -9436,14 +9804,14 @@ impl App {
     }
 
     fn select_plan_review_node(&mut self, delta: isize) {
-        let len = self.plan_review.nodes.len();
+        let len = self.plan().plan_review.nodes.len();
         if len == 0 {
             return;
         }
-        let current = self.plan_review.selected as isize;
+        let current = self.plan().plan_review.selected as isize;
         let next = (current + delta).clamp(0, len.saturating_sub(1) as isize) as usize;
-        self.plan_review.selected = next;
-        self.plan_review.cursor = self.plan_review.active_text().chars().count();
+        self.plan_mut().plan_review.selected = next;
+        self.plan_mut().plan_review.cursor = self.plan().plan_review.active_text().chars().count();
         self.dirty = true;
     }
 
@@ -9469,12 +9837,12 @@ impl App {
                 self.commit_plan_review_edits();
             }
             KeyCode::Tab => {
-                let field = self.plan_review.field.next();
-                self.plan_review.set_field(field);
+                let field = self.plan().plan_review.field.next();
+                self.plan_mut().plan_review.set_field(field);
             }
             KeyCode::BackTab => {
-                let field = self.plan_review.field.previous();
-                self.plan_review.set_field(field);
+                let field = self.plan().plan_review.field.previous();
+                self.plan_mut().plan_review.set_field(field);
             }
             KeyCode::Up | KeyCode::Char('k')
                 if !key
@@ -9492,20 +9860,22 @@ impl App {
             }
             KeyCode::PageUp => {
                 let page = page_scroll_rows(self.worker_area).max(1) as usize;
-                self.plan_review.scroll = self.plan_review.scroll.saturating_sub(page);
+                self.plan_mut().plan_review.scroll =
+                    self.plan().plan_review.scroll.saturating_sub(page);
             }
             KeyCode::PageDown => {
                 let page = page_scroll_rows(self.worker_area).max(1) as usize;
-                self.plan_review.scroll = self.plan_review.scroll.saturating_add(page);
+                self.plan_mut().plan_review.scroll =
+                    self.plan().plan_review.scroll.saturating_add(page);
             }
-            KeyCode::Enter if self.plan_review.field == PlanReviewField::Prompt => {
+            KeyCode::Enter if self.plan().plan_review.field == PlanReviewField::Prompt => {
                 self.with_plan_review_text_mut(|text, cursor| {
                     insert_char_at_cursor(text, cursor, '\n');
                 });
             }
             KeyCode::Enter => {
-                let field = self.plan_review.field.next();
-                self.plan_review.set_field(field);
+                let field = self.plan().plan_review.field.next();
+                self.plan_mut().plan_review.set_field(field);
             }
             KeyCode::Backspace => {
                 self.with_plan_review_text_mut(|text, cursor| {
@@ -9532,12 +9902,13 @@ impl App {
                     .intersects(KeyModifiers::ALT | KeyModifiers::META)
                 {
                     let pos = previous_word_position(
-                        self.plan_review.active_text(),
-                        self.plan_review.cursor,
+                        self.plan().plan_review.active_text(),
+                        self.plan().plan_review.cursor,
                     );
-                    self.plan_review.cursor = pos;
+                    self.plan_mut().plan_review.cursor = pos;
                 } else {
-                    self.plan_review.cursor = self.plan_review.cursor.saturating_sub(1);
+                    self.plan_mut().plan_review.cursor =
+                        self.plan().plan_review.cursor.saturating_sub(1);
                 }
             }
             KeyCode::Right => {
@@ -9545,19 +9916,23 @@ impl App {
                     .modifiers
                     .intersects(KeyModifiers::ALT | KeyModifiers::META)
                 {
-                    let pos =
-                        next_word_position(self.plan_review.active_text(), self.plan_review.cursor);
-                    self.plan_review.cursor = pos;
+                    let pos = next_word_position(
+                        self.plan().plan_review.active_text(),
+                        self.plan().plan_review.cursor,
+                    );
+                    self.plan_mut().plan_review.cursor = pos;
                 } else {
-                    let len = self.plan_review.active_text().chars().count();
-                    self.plan_review.cursor = (self.plan_review.cursor + 1).min(len);
+                    let len = self.plan().plan_review.active_text().chars().count();
+                    self.plan_mut().plan_review.cursor =
+                        (self.plan().plan_review.cursor + 1).min(len);
                 }
             }
             KeyCode::Home | KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.plan_review.cursor = 0;
+                self.plan_mut().plan_review.cursor = 0;
             }
             KeyCode::End | KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.plan_review.cursor = self.plan_review.active_text().chars().count();
+                self.plan_mut().plan_review.cursor =
+                    self.plan().plan_review.active_text().chars().count();
             }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.with_plan_review_text_mut(|text, cursor| {
@@ -9637,9 +10012,13 @@ impl App {
             );
             return false;
         }
-        // Every node id known to the plan (queued + launched). Used to (a) skip a batch
+        // A follow-up joins the plan that owns the node that reported it, never whichever
+        // plan the user happens to be looking at.
+        let plan_index = self.plan_index_for_node(node_id);
+        let plan_id = self.plans[plan_index].id.clone();
+        // Every node id known to that plan (queued + launched). Used to (a) skip a batch
         // whose finishing node is gone, and (b) validate explicit follow-up deps below.
-        let known = self.known_plan_node_ids();
+        let known = self.known_plan_node_ids_in(plan_index);
         // If the finishing node's agent was deleted while a backstop was in flight, there
         // is nothing to attach to; skip rather than soft-link to a ghost id.
         if !node_id.is_empty() && !known.iter().any(|id| id == node_id) {
@@ -9698,6 +10077,7 @@ impl App {
                 .unwrap_or_default();
             let mut node = PlannedNode {
                 id: self.uniquify_node_id("followup"),
+                plan_id: plan_id.clone(),
                 title: title.to_string(),
                 prompt,
                 goal: Some(title.to_string()),
@@ -9750,9 +10130,10 @@ impl App {
             }
             self.followup_gen.insert(node.id.clone(), gen + 1);
             self.persist_followup_gen();
-            self.planned_nodes.push(node);
-            self.final_gate_status = FinalGateStatus::Idle;
-            self.final_gate_summary = None;
+            self.push_plan_node(plan_index, node);
+            // New work reopens THIS plan's gate; another plan's verdict is untouched.
+            self.plans[plan_index].final_gate_status = FinalGateStatus::Idle;
+            self.plans[plan_index].final_gate_summary = None;
             added += 1;
         }
         if added > 0 {
@@ -9766,12 +10147,17 @@ impl App {
     /// numeric suffix (`-2`, `-3`, ...) until no collision remains so an appended
     /// node never shadows an existing node and its dep references still resolve.
     fn uniquify_node_id(&self, id: &str) -> String {
+        // Unique across the WHOLE fleet, not just this plan: `AgentRun.node_id` is the
+        // join key the panes and ledgers use, so a second plan reusing an id would cross
+        // their wires.
         let taken = |candidate: &str| -> bool {
-            self.planned_nodes.iter().any(|node| node.id == candidate)
-                || self
-                    .agents
-                    .iter()
-                    .any(|run| run.node_id.as_deref() == Some(candidate))
+            self.plans.iter().any(|plan| {
+                plan.planned_nodes.iter().any(|node| node.id == candidate)
+                    || plan.plan_launched_node_ids.contains(candidate)
+            }) || self
+                .agents
+                .iter()
+                .any(|run| run.node_id.as_deref() == Some(candidate))
         };
         if !taken(id) {
             return id.to_string();
@@ -9831,26 +10217,34 @@ impl App {
     /// APPROVE the pending plan: clear the approval gate and drain the queue into
     /// live workers. Ready nodes (hard deps satisfied, slot free) launch on this
     /// immediate scheduler pass; the rest stay in Todo until their deps merge.
+    /// Approve the plan the UI is acting on (empty-Enter in its orchestrator pane).
     fn approve_planned_queue(&mut self) {
-        if !self.awaiting_approval {
+        let plan_index = self.active_plan_index();
+        self.approve_planned_queue_for(plan_index);
+    }
+
+    fn approve_planned_queue_for(&mut self, plan_index: usize) {
+        if !self.plans[plan_index].awaiting_approval {
             return;
         }
         // A refine is in flight: the revised DAG is still being produced. Do NOT
         // approve/launch the stale plan; tell the user to wait for the update.
-        if self.refining {
+        if self.plans[plan_index].refining {
             self.notice = Some("still refining — the updated plan is on its way".to_string());
             return;
         }
-        if self.plan_review.dirty && !self.commit_plan_review_edits() {
+        if self.plans[plan_index].plan_review.dirty
+            && !self.commit_plan_review_edits_for(plan_index)
+        {
             return;
         }
-        if self.planned_nodes.is_empty() {
+        if self.plans[plan_index].planned_nodes.is_empty() {
             // Degenerate approval (e.g. a rebase diffed every task away): clear the
             // gate. Keep the interactive orchestrator alive so the user can keep
             // talking to the conductor even when there is nothing to launch.
-            self.awaiting_approval = false;
+            self.plans[plan_index].awaiting_approval = false;
             self.persist_plan_queue();
-            self.plan_review = PlanReviewState::default();
+            self.plans[plan_index].plan_review = PlanReviewState::default();
             self.worker_view = WorkerView::Terminal;
             if let Err(error) = clear_orchestrator_plan_markers(&self.cwd) {
                 self.notice = Some(format!("orchestrator marker cleanup warning: {error}"));
@@ -9858,23 +10252,28 @@ impl App {
             self.keep_orchestrator_after_approval();
             return;
         }
-        self.awaiting_approval = false;
-        self.planner_paused_for_input = false;
-        self.pending_questions.clear();
+        self.plans[plan_index].awaiting_approval = false;
+        self.plans[plan_index].planner_paused_for_input = false;
+        self.plans[plan_index].pending_questions.clear();
         self.persist_plan_queue();
-        self.plan_review = PlanReviewState::default();
+        self.plans[plan_index].plan_review = PlanReviewState::default();
         self.worker_view = WorkerView::Terminal;
         if let Err(error) = clear_orchestrator_plan_markers(&self.cwd) {
             self.notice = Some(format!("orchestrator marker cleanup warning: {error}"));
         }
         // Record the plan approval as a cross-cutting decision so the fleet has the
         // authoritative goal + shape in DECISIONS.md from the start.
-        let goal = if self.plan_request.trim().is_empty() {
-            self.planned_origin.clone()
+        let goal = if self.plans[plan_index].plan_request.trim().is_empty() {
+            self.plans[plan_index].planned_origin.clone()
         } else {
-            self.plan_request.clone()
+            self.plans[plan_index].plan_request.clone()
         };
-        let titles: Vec<String> = self.planned_nodes.iter().map(|n| n.title.clone()).collect();
+        let titles: Vec<String> = self
+            .plan()
+            .planned_nodes
+            .iter()
+            .map(|n| n.title.clone())
+            .collect();
         self.record_decision(
             "Plan approved",
             &format!(
@@ -9892,7 +10291,8 @@ impl App {
         self.mirror_graph();
         // Drain immediately so a ready node moves todo->in progress without waiting
         // a full scheduler interval (covers the trivial 1-node case visibly).
-        self.run_scheduler();
+        self.run_scheduler_for(plan_index);
+        self.mirror_graph();
         // Keep the interactive orchestrator alive as the high-level conductor. It
         // remains read-only for repository files, but can explain progress and write
         // RUDDER_* control markers that the dashboard consumes.
@@ -9940,11 +10340,10 @@ impl App {
 
     /// Node ids of agents that have reached Merged. These satisfy hard deps and
     /// unblock dependents on the next scheduler pass.
-    fn merged_node_ids(&self) -> Vec<String> {
-        let mut ids = self.plan_merged_node_ids.clone();
+    fn merged_node_ids_in(&self, plan_index: usize) -> Vec<String> {
+        let mut ids = self.plans[plan_index].plan_merged_node_ids.clone();
         ids.extend(
-            self.agents
-                .iter()
+            self.plan_agents(plan_index)
                 .filter(|run| run.status == AgentStatus::Merged)
                 .filter_map(|run| run.node_id.clone()),
         );
@@ -9971,8 +10370,9 @@ impl App {
     pub(crate) fn orchestrator_dag_tasks(&self) -> Vec<RudderPlanTask> {
         let mut tasks: Vec<RudderPlanTask> = Vec::new();
         // Launched nodes first (agents are appended in launch order, which tracks the
-        // plan order), reconstructed from their carrying agents.
-        for run in &self.agents {
+        // plan order), reconstructed from their carrying agents. Only THIS plan's agents:
+        // the pane renders one orchestrator's DAG, never a merge of every plan's.
+        for run in self.active_plan_agents() {
             let Some(id) = run.node_id.clone() else {
                 continue;
             };
@@ -10017,7 +10417,7 @@ impl App {
         }
         // Queued (not-yet-launched) nodes still in the scheduler's hands, skipping any
         // id already represented by a launched agent.
-        for node in &self.planned_nodes {
+        for node in &self.plan().planned_nodes {
             if tasks.iter().any(|task| task.id == node.id) {
                 continue;
             }
@@ -10038,8 +10438,10 @@ impl App {
     fn build_mirror_payload(&self) -> serde_json::Value {
         let mut nodes: Vec<serde_json::Value> = Vec::new();
 
-        // Queued planned nodes: not yet launched, status "planned".
-        for node in &self.planned_nodes {
+        // Queued planned nodes across EVERY plan: not yet launched, status "planned".
+        // The board sees the whole fleet; node ids are kept unique across plans at
+        // adoption (`adopt_plan_nodes`), so the flat list cannot cross two plans' wires.
+        for node in self.plans.iter().flat_map(|plan| plan.planned_nodes.iter()) {
             let mut deps: Vec<serde_json::Value> = node
                 .deps
                 .iter()
@@ -10279,7 +10681,7 @@ impl App {
     /// row, never touches `default` or a dir outside `.rudder-worktrees`, waits
     /// out the grace window, and skips while a resolver/rebase churns the op log.
     fn gc_orphan_workspaces(&mut self) {
-        if self.rebasing
+        if self.plan().rebasing
             || self
                 .agents
                 .iter()
@@ -10372,7 +10774,7 @@ impl App {
     /// place; `integrate_ready_plan_nodes` won't merge the node until it's marked
     /// reviewed by `finalize_node_reviews`.
     fn maybe_start_node_review(&mut self) {
-        if !self.node_review_enabled || !self.node_reviewers.is_empty() {
+        if !self.node_review_enabled || !self.plan().node_reviewers.is_empty() {
             return;
         }
         let claimed = self.review_all_claimed_source_ids();
@@ -10386,7 +10788,7 @@ impl App {
                 && run
                     .node_id
                     .as_deref()
-                    .is_some_and(|node_id| !self.reviewed_nodes.contains(node_id))
+                    .is_some_and(|node_id| !self.plan().reviewed_nodes.contains(node_id))
         });
         if let Some(index) = candidate {
             self.spawn_node_reviewer(index);
@@ -10446,7 +10848,7 @@ impl App {
                 run.terminal = Some(terminal);
                 run.status = AgentStatus::Running;
                 run.last_output_at = Instant::now();
-                self.node_reviewers.insert(reviewer_id, node_id);
+                self.plan_mut().node_reviewers.insert(reviewer_id, node_id);
                 self.agents.push(run);
                 self.notice = Some(format!(
                     "reviewing {node_label} (thermonuclear) before merge"
@@ -10455,7 +10857,7 @@ impl App {
             }
             Err(error) => {
                 // Fail open: never block the DAG on a reviewer that won't start.
-                self.reviewed_nodes.insert(node_id);
+                self.plan_mut().reviewed_nodes.insert(node_id);
                 self.notice = Some(format!(
                     "review could not start ({error}); merging {node_label} unreviewed"
                 ));
@@ -10468,10 +10870,11 @@ impl App {
     /// marks the node reviewed, so a broken review never permanently blocks the
     /// node or its dependents.
     fn finalize_node_reviews(&mut self) {
-        if self.node_reviewers.is_empty() {
+        if self.plan().node_reviewers.is_empty() {
             return;
         }
         let tracked: Vec<(String, String)> = self
+            .plan()
             .node_reviewers
             .iter()
             .map(|(reviewer_id, node_id)| (reviewer_id.clone(), node_id.clone()))
@@ -10488,8 +10891,8 @@ impl App {
             if !terminal {
                 continue;
             }
-            self.node_reviewers.remove(&reviewer_id);
-            self.reviewed_nodes.insert(node_id);
+            self.plan_mut().node_reviewers.remove(&reviewer_id);
+            self.plan_mut().reviewed_nodes.insert(node_id);
             if let Some(pos) = self.agents.iter().position(|run| run.id == reviewer_id) {
                 let removed = self.agents.remove(pos);
                 let _ = remove_native_run_record(&self.cwd, &removed.id);
@@ -10506,12 +10909,12 @@ impl App {
     }
 
     fn integrate_ready_plan_nodes(&mut self) {
-        // Hold integration steady while a structural rebase is in flight: merging would
-        // shift a RUNNING node into the MERGED zone mid-diff and the build-forward apply
-        // would compute its zones against a moving target. Resume once the rebase lands.
-        if self.rebasing {
-            return;
-        }
+        // Hold integration steady for a plan whose structural rebase is in flight: merging
+        // would shift a RUNNING node into the MERGED zone mid-diff and the build-forward
+        // apply would compute its zones against a moving target. Asked per plan below,
+        // so one plan's pivot does not freeze another plan's merges. Resume once that
+        // rebase lands.
+
         // Serialize integration through the shared jj workspace: while a merge-conflict
         // resolver is mid-flight it is resolving a conflict IN self.cwd, and starting another
         // merge there would stack a new merge change on top of the in-progress resolution —
@@ -10537,11 +10940,15 @@ impl App {
                     && !run.is_main()
                     && !run.merge_resolver
                     && !run.has_merge_conflict()
+                    && !(0..self.plans.len()).any(|index| {
+                        self.plans[index].rebasing && self.run_belongs_to_plan(run, index)
+                    })
                     && (!self.node_review_enabled
-                        || run
-                            .node_id
-                            .as_deref()
-                            .is_some_and(|node_id| self.reviewed_nodes.contains(node_id)))
+                        || run.node_id.as_deref().is_some_and(|node_id| {
+                            self.plans[self.plan_index_for_node(node_id)]
+                                .reviewed_nodes
+                                .contains(node_id)
+                        }))
             });
             let Some(index) = next else { break };
             let id = self.agents[index].id.clone();
@@ -10723,7 +11130,8 @@ impl App {
                     }
                 })
                 .or_else(|| {
-                    self.planned_nodes
+                    self.plan()
+                        .planned_nodes
                         .iter()
                         .find(|n| n.id == id)
                         .map(|n| n.title.clone())
@@ -10763,12 +11171,25 @@ impl App {
         )
     }
 
+    /// Dispatch every plan. Plans are independent — each has its own queue, ledgers and
+    /// workspaces — so they are scheduled one after another and share only the global
+    /// parallelism cap, which is a machine limit rather than a plan-level one.
     fn run_scheduler(&mut self) {
-        if self.planned_nodes.is_empty() {
+        for plan_index in 0..self.plans.len() {
+            self.run_scheduler_for(plan_index);
+        }
+        // MIRROR the plans into graph.json so the board reflects these DAGs. Covers
+        // both the just-launched nodes (now Running agents) and the queues that
+        // remain in Todo. Coalesced + non-fatal inside mirror_graph.
+        self.mirror_graph();
+    }
+
+    fn run_scheduler_for(&mut self, plan_index: usize) {
+        if self.plans[plan_index].planned_nodes.is_empty() {
             return;
         }
         let cap = max_parallel();
-        let planner_task = self.planned_origin.clone();
+        let planner_task = self.plans[plan_index].planned_origin.clone();
         let mut launched = 0usize;
 
         // Launch at most MAX_LAUNCH_PER_TICK nodes per pass. Each launch shells a
@@ -10780,14 +11201,16 @@ impl App {
         // launch decision is recomputed each iteration so a node launched this pass
         // (now Running) updates the cap accounting before the next pick.
         while launched < MAX_LAUNCH_PER_TICK {
-            let Some(position) = self.next_node_to_launch(cap) else {
+            let Some(position) = self.next_node_to_launch_in(plan_index, cap) else {
                 break;
             };
-            let node = self.planned_nodes.remove(position);
+            let node = self.plans[plan_index].planned_nodes.remove(position);
             // Persist the dequeue and at-most-once launch fact together BEFORE
             // spawning. A crash after the worker record is written can therefore
             // never resurrect this node from an older queue snapshot.
-            self.plan_launched_node_ids.insert(node.id.clone());
+            self.plans[plan_index]
+                .plan_launched_node_ids
+                .insert(node.id.clone());
             self.persist_plan_queue();
             let title = node.title.clone();
             let depends_on = self.dependency_context(&node);
@@ -10797,7 +11220,7 @@ impl App {
         }
 
         if launched > 0 {
-            let remaining = self.planned_nodes.len();
+            let remaining = self.plans[plan_index].planned_nodes.len();
             self.notice = Some(if remaining > 0 {
                 format!("launched {launched} node(s), {remaining} waiting in todo")
             } else {
@@ -10825,6 +11248,7 @@ impl App {
             };
             if !failed_ids.is_empty() {
                 let blocked: Vec<&str> = self
+                    .plan()
                     .planned_nodes
                     .iter()
                     .filter(|node| {
@@ -10845,10 +11269,6 @@ impl App {
             }
         }
 
-        // MIRROR the plan into graph.json so the board reflects this DAG. Covers
-        // both the just-launched nodes (now Running agents) and the queue that
-        // remains in Todo. Coalesced + non-fatal inside mirror_graph.
-        self.mirror_graph();
         // The queue shrank as nodes launched; persist so a restart does not re-launch
         // an already-launched node or lose the remaining queue.
         self.persist_plan_queue();
@@ -10857,34 +11277,54 @@ impl App {
     /// Position in `planned_nodes` of the next node to launch, or `None` when the
     /// cap is reached or no queued node is ready. Pure decision (no side effects)
     /// so the scheduler's dep-gating + cap can be tested without spawning PTYs.
+    /// Convenience wrapper over the plan the UI is acting on.
+    #[cfg(test)]
     fn next_node_to_launch(&self, cap: usize) -> Option<usize> {
+        self.next_node_to_launch_in(self.active_plan_index(), cap)
+    }
+
+    fn next_node_to_launch_in(&self, plan_index: usize, cap: usize) -> Option<usize> {
         if self.running_plan_agents() >= cap {
             return None;
         }
-        let merged = self.merged_node_ids();
-        let plan_ids = self.known_plan_node_ids();
-        self.planned_nodes.iter().position(|node| {
-            !self.plan_launched_node_ids.contains(&node.id)
-                && !self
-                    .agents
-                    .iter()
-                    .any(|run| run.node_id.as_deref() == Some(node.id.as_str()))
-                && node.is_ready(&merged, &plan_ids)
-        })
+        let merged = self.merged_node_ids_in(plan_index);
+        let plan_ids = self.known_plan_node_ids_in(plan_index);
+        self.plans[plan_index]
+            .planned_nodes
+            .iter()
+            .position(|node| {
+                !self.plans[plan_index]
+                    .plan_launched_node_ids
+                    .contains(&node.id)
+                    && !self
+                        .agents
+                        .iter()
+                        .any(|run| run.node_id.as_deref() == Some(node.id.as_str()))
+                    && node.is_ready(&merged, &plan_ids)
+            })
     }
 
     /// Every node id that belongs to the active plan: ids still queued in
     /// `planned_nodes` PLUS ids of agents already launched from a node. A dep id
     /// outside this set was never part of the plan and is treated as satisfied so
     /// the DAG cannot deadlock; a dep still inside it must merge before unblocking.
-    fn known_plan_node_ids(&self) -> Vec<String> {
+    fn known_plan_node_ids_in(&self, plan_index: usize) -> Vec<String> {
         let mut ids: Vec<String> = self
+            .plan()
             .planned_nodes
             .iter()
             .map(|node| node.id.clone())
             .collect();
-        ids.extend(self.agents.iter().filter_map(|run| run.node_id.clone()));
-        ids.extend(self.plan_launched_node_ids.iter().cloned());
+        ids.extend(
+            self.plan_agents(plan_index)
+                .filter_map(|run| run.node_id.clone()),
+        );
+        ids.extend(
+            self.plans[plan_index]
+                .plan_launched_node_ids
+                .iter()
+                .cloned(),
+        );
         ids
     }
 
@@ -11081,8 +11521,13 @@ impl App {
         // which is_ready treats as satisfied — the user removed the node, so
         // its dependents proceed.
         if let Some(node_id) = run.node_id.as_deref() {
-            if !self.plan_merged_node_ids.contains(node_id)
-                && self.plan_launched_node_ids.remove(node_id)
+            let plan_index = self.plan_index_for_node(node_id);
+            if !self.plans[plan_index]
+                .plan_merged_node_ids
+                .contains(node_id)
+                && self.plans[plan_index]
+                    .plan_launched_node_ids
+                    .remove(node_id)
             {
                 self.persist_plan_queue();
             }
@@ -11192,10 +11637,9 @@ impl App {
             // means the pane never got past its first prompt (a codex fork asking
             // which directory to use, an auth prompt), and the row still reads as
             // running — so point at the pane rather than at the backend.
-            let never_spoke = self
-                .agents
-                .get(self.selected_agent)
-                .is_some_and(|run| run.turns.is_empty() || run.last_output_at.elapsed() > Duration::from_secs(600));
+            let never_spoke = self.agents.get(self.selected_agent).is_some_and(|run| {
+                run.turns.is_empty() || run.last_output_at.elapsed() > Duration::from_secs(600)
+            });
             self.notice = Some(match (backend_for_notice, never_spoke) {
                 (Backend::Claude, _) => {
                     "nothing to branch: this agent has no session yet".to_string()
@@ -11369,6 +11813,7 @@ impl App {
             deps: Vec::new(),
             soft_deps: Vec::new(),
             node_id: None,
+            plan_id: None,
             reconcile_planner: false,
             plan_stream: None,
             plan_output_cache: None,
@@ -12699,9 +13144,11 @@ What to do\n\
         }
 
         let mut merged_node_ids = Vec::new();
-        let planned_merge = merge_indices
-            .iter()
-            .any(|index| self.agents.get(*index).is_some_and(|run| run.node_id.is_some()));
+        let planned_merge = merge_indices.iter().any(|index| {
+            self.agents
+                .get(*index)
+                .is_some_and(|run| run.node_id.is_some())
+        });
         self.emit_merge_finished(true, false, planned_merge);
         for index in &merge_indices {
             let Some(run) = self.agents.get(*index) else {
@@ -12739,13 +13186,22 @@ What to do\n\
                 run.needs_user_input = false;
                 run.restore_pre_conflict_identity();
                 if let Some(node_id) = run.node_id.clone() {
-                    merged_node_ids.push(node_id);
+                    // Credit the run's OWN plan: node ids are per-plan, so recording a
+                    // merge against the selected plan would unblock the wrong DAG.
+                    merged_node_ids.push((run.plan_id.clone(), node_id));
                 }
                 let _ = save_native_run_record(&self.cwd, run);
             }
         }
         if !merged_node_ids.is_empty() {
-            self.plan_merged_node_ids.extend(merged_node_ids);
+            for (plan_id, node_id) in merged_node_ids {
+                let plan_index =
+                    match plan_id.and_then(|id| self.plans.iter().position(|plan| plan.id == id)) {
+                        Some(index) => index,
+                        None => self.plan_index_for_node(&node_id),
+                    };
+                self.plans[plan_index].plan_merged_node_ids.insert(node_id);
+            }
             self.persist_plan_queue();
         }
         let _ = self.write_rudder_context_timed(None);
@@ -12800,10 +13256,7 @@ What to do\n\
     /// afterwards.
     fn reconcile_rows(&mut self) {
         const EVERY: Duration = Duration::from_secs(60);
-        if self
-            .last_reconcile
-            .is_some_and(|at| at.elapsed() < EVERY)
-        {
+        if self.last_reconcile.is_some_and(|at| at.elapsed() < EVERY) {
             return;
         }
         self.last_reconcile = Some(Instant::now());
@@ -12923,8 +13376,10 @@ What to do\n\
             let Ok(started_at_ms) = run.created_at.parse::<u64>() else {
                 continue;
             };
-            self.session_id_attempts.insert(run.id.clone(), attempts + 1);
-            self.session_id_last_try.insert(run.id.clone(), Instant::now());
+            self.session_id_attempts
+                .insert(run.id.clone(), attempts + 1);
+            self.session_id_last_try
+                .insert(run.id.clone(), Instant::now());
             let search_cwd = if run.cwd.as_os_str().is_empty() {
                 cwd.clone()
             } else {
@@ -13289,7 +13744,7 @@ What to do\n\
                 .is_some_and(|run| run.reconcile_planner);
             if is_reconcile {
                 self.evaluate_completed_reconcile(index);
-            } else if self.rebasing {
+            } else if self.plan().rebasing {
                 // A REBASE planner exits headless right after printing the revised DAG. It
                 // is not a reconcile planner, so without this branch it would fall to the
                 // initial-plan REPLACE path (evaluate_completed_plan), wiping the running
@@ -13322,8 +13777,8 @@ What to do\n\
         // Suppressed while a plan awaits approval: nothing launches until the user
         // approves the DAG at the gate.
         self.scheduler_tick = self.scheduler_tick.wrapping_add(1);
-        if !self.awaiting_approval
-            && !self.planned_nodes.is_empty()
+        if !self.plan().awaiting_approval
+            && !self.plan().planned_nodes.is_empty()
             && self.scheduler_tick % SCHEDULER_TICK_INTERVAL == 0
         {
             self.run_scheduler();
@@ -13342,7 +13797,7 @@ What to do\n\
         // Integrate clean finished plan nodes on the same cadence so their children
         // unblock and the chain flows without manual m/M. Runs even
         // when the queue is empty (to merge the final nodes), but not at the gate.
-        if !self.awaiting_approval && self.scheduler_tick % SCHEDULER_TICK_INTERVAL == 0 {
+        if !self.plan().awaiting_approval && self.scheduler_tick % SCHEDULER_TICK_INTERVAL == 0 {
             // Mark nodes whose reviewer just finished, so integrate can merge them.
             self.finalize_node_reviews();
             self.integrate_ready_plan_nodes();
@@ -13372,7 +13827,7 @@ What to do\n\
         // actually changed (it is not per-tick: terminal-byte churn does not move
         // the signature, which excludes volatile output). Non-fatal.
         if any_dirty
-            && (!self.planned_nodes.is_empty()
+            && (!self.plan().planned_nodes.is_empty()
                 || self.agents.iter().any(|run| run.node_id.is_some()))
         {
             self.mirror_graph();
@@ -14179,6 +14634,10 @@ fn parse_transcript_final_text(raw: &str) -> Option<String> {
 /// does not silently lose the queued DAG (the not-yet-launched nodes + the gate state).
 #[derive(serde::Serialize, serde::Deserialize, Default)]
 struct PlanQueueSnapshot {
+    /// Identity of the plan this queue belongs to. Empty in a file written before plans
+    /// had ids; restore mints a fresh one so the queue is never dropped on upgrade.
+    #[serde(default)]
+    id: String,
     #[serde(default)]
     planned_nodes: Vec<PlannedNode>,
     #[serde(default)]
@@ -14201,11 +14660,127 @@ struct PlanQueueSnapshot {
     awaiting_approval: bool,
 }
 
-fn reconcile_plan_queue_with_agents(snapshot: &mut PlanQueueSnapshot, agents: &[AgentRun]) {
+impl PlanQueueSnapshot {
+    fn from_plan(plan: &PlanState) -> Self {
+        Self {
+            id: plan.id.clone(),
+            planned_nodes: plan.planned_nodes.clone(),
+            launched_node_ids: plan.plan_launched_node_ids.clone(),
+            merged_node_ids: plan.plan_merged_node_ids.clone(),
+            capture_armed: plan.plan_capture_armed,
+            planned_origin: plan.planned_origin.clone(),
+            plan_request: plan.plan_request.clone(),
+            plan_summary: plan.plan_summary.clone(),
+            final_gate_status: plan.final_gate_status,
+            final_gate_summary: plan.final_gate_summary.clone(),
+            awaiting_approval: plan.awaiting_approval,
+        }
+    }
+
+    fn into_plan(self) -> PlanState {
+        // The approval-gate draft is a projection of the queue, so it is rebuilt rather
+        // than persisted: a restored plan at the gate must be editable immediately.
+        let plan_review = if self.awaiting_approval {
+            PlanReviewState::from_planned_nodes(&self.planned_nodes)
+        } else {
+            PlanReviewState::default()
+        };
+        PlanState {
+            id: if self.id.is_empty() {
+                new_plan_id()
+            } else {
+                self.id
+            },
+            planned_nodes: self.planned_nodes,
+            plan_launched_node_ids: self.launched_node_ids,
+            plan_merged_node_ids: self.merged_node_ids,
+            plan_capture_armed: self.capture_armed,
+            plan_review,
+            planned_origin: self.planned_origin,
+            plan_request: self.plan_request,
+            plan_summary: self.plan_summary,
+            final_gate_status: self.final_gate_status,
+            final_gate_summary: self.final_gate_summary,
+            awaiting_approval: self.awaiting_approval,
+            ..PlanState::default()
+        }
+    }
+}
+
+/// `.rudder/plan-queue.json`: EVERY live plan, because several `/plan`s run at once.
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct PlanQueueFile {
+    #[serde(default)]
+    plans: Vec<PlanQueueSnapshot>,
+}
+
+impl PlanQueueFile {
+    /// A file written before plans could coexist is a bare single-plan snapshot at the
+    /// top level, so parsing falls back to that shape rather than dropping the queue.
+    fn parse(raw: &str) -> Option<Self> {
+        if let Ok(file) = serde_json::from_str::<PlanQueueFile>(raw) {
+            if !file.plans.is_empty() {
+                return Some(file);
+            }
+        }
+        let legacy = serde_json::from_str::<PlanQueueSnapshot>(raw).ok()?;
+        Some(Self {
+            plans: vec![legacy],
+        })
+    }
+
+    /// Rebuild the live plan list. `App::plans` is never empty, so a file with no plans
+    /// still yields one (empty) plan for the dashboard to start from.
+    fn into_plans(self) -> Vec<PlanState> {
+        let plans: Vec<PlanState> = self
+            .plans
+            .into_iter()
+            .map(PlanQueueSnapshot::into_plan)
+            .collect();
+        if plans.is_empty() {
+            vec![PlanState {
+                id: new_plan_id(),
+                ..PlanState::default()
+            }]
+        } else {
+            plans
+        }
+    }
+}
+
+/// Mint a plan id. Plans outlive the orchestrator ROW that started them (refine and
+/// rebase relaunch that row), so the id is independent of any run id.
+fn new_plan_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "plan-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// Fold the persisted runs back into a restored queue so the crash window between a
+/// worker record being written and the shrunken queue being saved cannot relaunch a
+/// node. Only runs belonging to THIS plan count: a run stamped with another plan's id
+/// says nothing about this one. A run with no `plan_id` predates concurrent plans and
+/// is attributed to the only plan a file of that vintage can have (`sole_plan`).
+fn reconcile_plan_queue_with_agents(
+    snapshot: &mut PlanQueueSnapshot,
+    agents: &[AgentRun],
+    sole_plan: bool,
+) {
     for run in agents {
         let Some(node_id) = run.node_id.as_ref() else {
             continue;
         };
+        let owned = match run.plan_id.as_deref() {
+            Some(plan_id) => plan_id == snapshot.id,
+            None => sole_plan,
+        };
+        if !owned {
+            continue;
+        }
         snapshot.launched_node_ids.insert(node_id.clone());
         if run.status == AgentStatus::Merged {
             snapshot.merged_node_ids.insert(node_id.clone());
@@ -14216,9 +14791,9 @@ fn reconcile_plan_queue_with_agents(snapshot: &mut PlanQueueSnapshot, agents: &[
         .retain(|node| !snapshot.launched_node_ids.contains(&node.id));
 }
 
-fn load_plan_queue(cwd: &Path) -> Option<PlanQueueSnapshot> {
+fn load_plan_queue(cwd: &Path) -> Option<PlanQueueFile> {
     let raw = std::fs::read_to_string(cwd.join(".rudder").join("plan-queue.json")).ok()?;
-    serde_json::from_str::<PlanQueueSnapshot>(&raw).ok()
+    PlanQueueFile::parse(&raw)
 }
 
 /// True if any line of `output` is EXACTLY `RUDDER_APPROVE_PLAN` once ANSI escapes and

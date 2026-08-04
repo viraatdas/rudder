@@ -284,6 +284,11 @@ impl RudderPlanTask {
 pub(crate) struct PlannedNode {
     /// Stable node id (the plan task id). Becomes the launched `AgentRun.node_id`.
     pub(crate) id: String,
+    /// The plan that owns this node (`PlanState::id`). Node ids repeat across concurrent
+    /// plans, so this is what resolves a node back to ITS plan. Empty on a node parsed
+    /// before the owning plan is known; the plan stamps it when the node is queued.
+    #[serde(default)]
+    pub(crate) plan_id: String,
     pub(crate) title: String,
     pub(crate) prompt: String,
     pub(crate) goal: Option<String>,
@@ -313,6 +318,8 @@ impl PlannedNode {
             .collect();
         Self {
             id: task.id,
+            // Stamped by the plan that queues this node; a bare parse has no owner yet.
+            plan_id: String::new(),
             title: task.title,
             prompt: task.prompt,
             goal: task.goal,

@@ -339,6 +339,7 @@ fn dependency_context_names_parents_and_their_interfaces() {
     app.agents.push(parent);
 
     let node = PlannedNode {
+        plan_id: String::new(),
         id: "n1".to_string(),
         title: "app.js: wire auth".to_string(),
         prompt: "wire it".to_string(),
@@ -1174,7 +1175,10 @@ fn unknown_slash_command_reports_instead_of_spawning_an_agent() {
     app.notice = None;
     app.start_task_from_input("/tmp/repro.sh explain this script");
     assert!(
-        !app.notice.as_deref().unwrap_or("").contains("unknown command"),
+        !app.notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("unknown command"),
         "paths pass through"
     );
 }
@@ -1183,7 +1187,11 @@ fn unknown_slash_command_reports_instead_of_spawning_an_agent() {
 fn opencode_workers_auto_approve_but_opencode_planners_do_not() {
     // A worker is already isolated in its own workspace, so it runs unattended;
     // a planner must not silently edit the tree it is only supposed to read.
-    let worker = opencode_command("anthropic/claude-sonnet-4-5", Some("do the thing"), AgentMode::Execute);
+    let worker = opencode_command(
+        "anthropic/claude-sonnet-4-5",
+        Some("do the thing"),
+        AgentMode::Execute,
+    );
     assert_eq!(worker.program, "opencode");
     assert!(worker.args.iter().any(|arg| arg == "--auto"));
     assert!(worker
@@ -1243,7 +1251,8 @@ fn opencode_workers_get_a_real_completion_signal_not_a_guess() {
         "the signal is written atomically so the poll loop never reads a torn file"
     );
 
-    let config = signals::opencode_config_json(std::path::Path::new("/tmp/rudder-signals/run-1.js"));
+    let config =
+        signals::opencode_config_json(std::path::Path::new("/tmp/rudder-signals/run-1.js"));
     let parsed: serde_json::Value = serde_json::from_str(&config).expect("valid config json");
     assert_eq!(
         parsed["plugin"][0].as_str(),
@@ -1281,7 +1290,9 @@ fn opencode_model_list_keeps_provider_qualified_ids() {
     let raw = "opencode/big-pickle\nanthropic/claude-sonnet-4-5\n\nSome header line\n";
     let rows = parse_opencode_model_list(raw);
     assert_eq!(
-        rows.iter().map(|(_, id, _)| id.as_str()).collect::<Vec<_>>(),
+        rows.iter()
+            .map(|(_, id, _)| id.as_str())
+            .collect::<Vec<_>>(),
         vec!["opencode/big-pickle", "anthropic/claude-sonnet-4-5"],
         "prose lines are not models"
     );
@@ -1321,11 +1332,8 @@ fn write_codex_rollout(dir: &std::path::Path, id: &str, cwd: &str, started_iso: 
         "type": "session_meta",
         "payload": { "id": id, "cwd": cwd, "timestamp": started_iso },
     });
-    std::fs::write(
-        dir.join(format!("rollout-{id}.jsonl")),
-        format!("{meta}\n"),
-    )
-    .expect("write rollout");
+    std::fs::write(dir.join(format!("rollout-{id}.jsonl")), format!("{meta}\n"))
+        .expect("write rollout");
 }
 
 #[test]
@@ -1403,7 +1411,10 @@ fn main_command_starts_another_agent_in_the_checkout() {
     );
     for run in &app.agents {
         assert!(run.is_main(), "both rows run in the checkout");
-        assert!(run.worktree_path.is_none(), "no workspace, nothing to merge");
+        assert!(
+            run.worktree_path.is_none(),
+            "no workspace, nothing to merge"
+        );
     }
     // Distinct ids: their run records, hook configs and stop requests must not
     // collide, which is what makes several of them safe to run at once.
@@ -1469,7 +1480,11 @@ fn picking_a_model_leaves_a_running_main_row_alone() {
     });
 
     let row = app.agents.first().expect("row");
-    assert_eq!(row.backend, Backend::Claude, "the live row keeps its backend");
+    assert_eq!(
+        row.backend,
+        Backend::Claude,
+        "the live row keeps its backend"
+    );
     assert_eq!(row.model, "opus", "and the model it is actually running");
     // The DEFAULT for new agents did change.
     assert_eq!(app.backend, Backend::Codex);
@@ -1638,13 +1653,33 @@ fn a_codex_session_is_matched_by_start_time_not_by_being_newest() {
     let cwd = "/repo";
     // Rudder spawned the run at 2026-07-28T23:45:48Z.
     let started_at_ms = parse_iso8601_millis("2026-07-28T23:45:48.000Z").expect("parsed") as u64;
-    write_codex_rollout(&day, "019fabfa-0000-0000-0000-000000000001", cwd, "2026-07-28T23:45:49.186Z");
+    write_codex_rollout(
+        &day,
+        "019fabfa-0000-0000-0000-000000000001",
+        cwd,
+        "2026-07-28T23:45:49.186Z",
+    );
     // A LATER session in the same directory: newest, and not ours.
-    write_codex_rollout(&day, "019fabfa-0000-0000-0000-000000000002", cwd, "2026-07-28T23:52:00.000Z");
+    write_codex_rollout(
+        &day,
+        "019fabfa-0000-0000-0000-000000000002",
+        cwd,
+        "2026-07-28T23:52:00.000Z",
+    );
     // An earlier one, also not ours.
-    write_codex_rollout(&day, "019fabfa-0000-0000-0000-000000000003", cwd, "2026-07-28T22:00:00.000Z");
+    write_codex_rollout(
+        &day,
+        "019fabfa-0000-0000-0000-000000000003",
+        cwd,
+        "2026-07-28T22:00:00.000Z",
+    );
     // Same instant, different repo.
-    write_codex_rollout(&day, "019fabfa-0000-0000-0000-000000000004", "/other", "2026-07-28T23:45:49.000Z");
+    write_codex_rollout(
+        &day,
+        "019fabfa-0000-0000-0000-000000000004",
+        "/other",
+        "2026-07-28T23:45:49.000Z",
+    );
 
     let found = codex_session_id_for_run_in(&root, std::path::Path::new(cwd), started_at_ms);
 
@@ -1667,7 +1702,12 @@ fn no_codex_session_near_the_spawn_maps_to_nothing() {
     ));
     let day = root.join("2026").join("07").join("28");
     let started_at_ms = parse_iso8601_millis("2026-07-28T23:45:48.000Z").expect("parsed") as u64;
-    write_codex_rollout(&day, "019fabfa-0000-0000-0000-00000000000a", "/repo", "2026-07-28T21:00:00.000Z");
+    write_codex_rollout(
+        &day,
+        "019fabfa-0000-0000-0000-00000000000a",
+        "/repo",
+        "2026-07-28T21:00:00.000Z",
+    );
 
     assert_eq!(
         codex_session_id_for_run_in(&root, std::path::Path::new("/repo"), started_at_ms),
@@ -1679,9 +1719,15 @@ fn no_codex_session_near_the_spawn_maps_to_nothing() {
 #[test]
 fn iso8601_timestamps_parse_without_a_timezone_database() {
     assert_eq!(parse_iso8601_millis("1970-01-01T00:00:00.000Z"), Some(0));
-    assert_eq!(parse_iso8601_millis("2026-07-29T04:49:30.689Z"), Some(1785300570689));
+    assert_eq!(
+        parse_iso8601_millis("2026-07-29T04:49:30.689Z"),
+        Some(1785300570689)
+    );
     // Seconds-only form (no fraction) is still valid ISO 8601.
-    assert_eq!(parse_iso8601_millis("2026-07-29T04:49:30Z"), Some(1785300570000));
+    assert_eq!(
+        parse_iso8601_millis("2026-07-29T04:49:30Z"),
+        Some(1785300570000)
+    );
     assert_eq!(parse_iso8601_millis("nonsense"), None);
 }
 
@@ -1824,7 +1870,10 @@ fn a_curly_quote_is_text_in_the_task_pane_and_a_shortcut_everywhere_else() {
     app.task_input.clear();
     app.task_cursor = 0;
     app.handle_key(KeyEvent::new(KeyCode::Char('\u{2018}'), KeyModifiers::NONE));
-    assert_eq!(app.task_input, "\u{2018}", "typed into the draft, not swallowed");
+    assert_eq!(
+        app.task_input, "\u{2018}",
+        "typed into the draft, not swallowed"
+    );
     assert_eq!(app.selected_agent, 1, "selection untouched while composing");
 }
 
@@ -1832,7 +1881,10 @@ fn a_curly_quote_is_text_in_the_task_pane_and_a_shortcut_everywhere_else() {
 fn conversation_model_labels_keep_the_version_and_drop_the_release_stamp() {
     // "opus-4" (what the cost table shows) is not enough to choose between two
     // chats; the picker keeps the minor version and loses only the date.
-    assert_eq!(conversation_model_label("claude-opus-4-5-20251101"), "opus-4-5");
+    assert_eq!(
+        conversation_model_label("claude-opus-4-5-20251101"),
+        "opus-4-5"
+    );
     assert_eq!(conversation_model_label("claude-fable-5"), "fable-5");
     assert_eq!(conversation_model_label("gpt-5.6-sol"), "gpt-5.6-sol");
     assert_eq!(conversation_model_label(""), "");
@@ -1866,7 +1918,10 @@ fn a_resumed_row_is_named_after_the_conversation_not_its_uuid() {
 
     // The session is gone, so nothing spawns — and the refusal names the backend
     // that was asked, not a Claude-only assumption.
-    assert!(app.agents.is_empty(), "no workspace for a session that is gone");
+    assert!(
+        app.agents.is_empty(),
+        "no workspace for a session that is gone"
+    );
     assert!(
         app.notice
             .as_deref()
@@ -1919,9 +1974,9 @@ fn handoff_refuses_a_session_that_exists_nowhere() {
 
     assert!(app.agents.is_empty(), "no workspace for an unknown session");
     assert!(
-        app.notice
-            .as_deref()
-            .is_some_and(|notice| notice.contains("no claude, codex, or opencode conversation found")),
+        app.notice.as_deref().is_some_and(
+            |notice| notice.contains("no claude, codex, or opencode conversation found")
+        ),
         "notice was {:?}",
         app.notice
     );
@@ -1992,8 +2047,7 @@ fn handoff_palette_enter_selects_a_conversation_before_submitting() {
     app.handle_task_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
     assert_eq!(
-        app.task_input,
-        "/resume 11111111-1111-1111-1111-111111111111 ",
+        app.task_input, "/resume 11111111-1111-1111-1111-111111111111 ",
         "Enter filled in the chosen conversation and left room for an instruction"
     );
     assert!(app.agents.is_empty(), "nothing started yet");
@@ -2191,7 +2245,11 @@ fn cell_contents_round_trips_everything_the_parser_can_emit() {
     let widest = "\u{1f469}\u{200d}\u{1f469}\u{200d}\u{1f467}"; // 18 bytes
     for text in ["a", " ", "", "é", "→", "😀", "a\u{0301}", widest] {
         assert!(text.len() <= 21, "fixture outgrew the parser's own cap");
-        assert_eq!(CellContents::new(text).as_str(), text, "round trip {text:?}");
+        assert_eq!(
+            CellContents::new(text).as_str(),
+            text,
+            "round trip {text:?}"
+        );
     }
     assert_eq!(CellContents::SPACE.as_str(), " ");
     assert_eq!(CellContents::from_char('あ').as_str(), "あ");
@@ -4037,6 +4095,7 @@ fn readiness_parity_fixture() {
                 continue; // is_ready only governs queued nodes
             }
             let node = PlannedNode {
+                plan_id: String::new(),
                 id: id.clone(),
                 title: id.clone(),
                 prompt: "p".to_string(),
@@ -5466,11 +5525,11 @@ fn auto_expand_grows_dag_from_in_scope_followups() {
     let grew = app.apply_worker_followups("n0", &note);
     assert!(grew, "an in-scope follow-up grows the DAG");
     assert_eq!(
-        app.planned_nodes.len(),
+        app.plan().planned_nodes.len(),
         1,
         "only the in-scope follow-up is injected"
     );
-    let added = &app.planned_nodes[0];
+    let added = &app.plan().planned_nodes[0];
     assert_eq!(added.title, "add token refresh");
     assert!(
         added.soft_deps.contains(&"n0".to_string()),
@@ -5486,7 +5545,7 @@ fn auto_expand_grows_dag_from_in_scope_followups() {
         !app.apply_worker_followups("n0", &note),
         "duplicate title is skipped"
     );
-    assert_eq!(app.planned_nodes.len(), 1);
+    assert_eq!(app.plan().planned_nodes.len(), 1);
 }
 
 #[test]
@@ -5506,7 +5565,7 @@ fn auto_expand_skips_non_done_or_non_plan_workers() {
 
     app.maybe_ingest_worker_followups();
     assert!(
-        app.planned_nodes.is_empty(),
+        app.plan().planned_nodes.is_empty(),
         "no grow from running / non-plan workers"
     );
     assert!(
@@ -5535,7 +5594,9 @@ fn stop_agent_frees_slot_and_keeps_workspace_for_undo() {
         "stop frees the parallelism slot"
     );
     // A stopped node never enters the merged set, so hard dependents stay blocked.
-    assert!(!app.merged_node_ids().contains(&"n0".to_string()));
+    assert!(!app
+        .merged_node_ids_in(app.active_plan_index())
+        .contains(&"n0".to_string()));
     assert!(app.activity_log.iter().any(|l| l.contains("stopped n0")));
 }
 
@@ -5707,7 +5768,7 @@ fn auto_expand_respects_depth_cap() {
         !app.apply_worker_followups("deep", &note),
         "depth cap blocks runaway expansion"
     );
-    assert!(app.planned_nodes.is_empty());
+    assert!(app.plan().planned_nodes.is_empty());
     assert!(app.activity_log.iter().any(|l| l.contains("depth cap")));
     let _ = std::fs::remove_file(dir.join("DECISIONS.md"));
 }
@@ -5733,7 +5794,7 @@ fn planning_redraw_gate_tracks_running_not_parse_state() {
     );
 
     // A refine in flight keeps redraws coming even between status snapshots.
-    app.refining = true;
+    app.plan_mut().refining = true;
     assert!(app.has_planning_orchestrator(), "refining animates");
 }
 
@@ -6078,6 +6139,7 @@ fn test_agent_run(id: &str, task: &str) -> AgentRun {
         created_at: "1".to_string(),
         mode: AgentMode::Execute,
         task: task.to_string(),
+        plan_id: None,
         task_summary: summarize_task(task),
         current_prompt: task.to_string(),
         turns: vec![AgentTurn {
@@ -7697,6 +7759,7 @@ fn delete_agent_requires_second_d() {
         id: "run-1".to_string(),
         created_at: "1".to_string(),
         mode: AgentMode::Execute,
+        plan_id: None,
         task: "test task".to_string(),
         task_summary: summarize_task("test task"),
         current_prompt: "test task".to_string(),
@@ -8194,6 +8257,7 @@ fn v_and_escape_leave_review_view() {
 
 fn test_planned_node(id: &str, deps: &[&str]) -> PlannedNode {
     PlannedNode {
+        plan_id: String::new(),
         id: id.to_string(),
         title: id.to_string(),
         prompt: format!("do {id}"),
@@ -8250,17 +8314,21 @@ fn scheduler_launches_ready_root_but_holds_blocked_dependent() {
     let mut app = App::new();
     app.cwd = std::env::temp_dir();
     // n0 root + n1 hard-depends on n0. Nothing merged yet.
-    app.planned_nodes = vec![
+    app.plan_mut().planned_nodes = vec![
         test_planned_node("n0", &[]),
         test_planned_node("n1", &["n0"]),
     ];
 
     // With no merged ids, only the root n0 is ready.
     let position = app.next_node_to_launch(4).expect("a ready node");
-    assert_eq!(app.planned_nodes[position].id, "n0", "root launches first");
+    assert_eq!(
+        app.plan().planned_nodes[position].id,
+        "n0",
+        "root launches first"
+    );
 
     // Pretend n0 launched and is running: n1 is still blocked (n0 not merged).
-    app.planned_nodes.remove(position);
+    app.plan_mut().planned_nodes.remove(position);
     app.agents.push(node_agent("n0", AgentStatus::Running));
     assert!(
         app.next_node_to_launch(4).is_none(),
@@ -8271,7 +8339,8 @@ fn scheduler_launches_ready_root_but_holds_blocked_dependent() {
     app.agents[0].status = AgentStatus::Merged;
     let position = app.next_node_to_launch(4).expect("dependent now ready");
     assert_eq!(
-        app.planned_nodes[position].id, "n1",
+        app.plan().planned_nodes[position].id,
+        "n1",
         "merged parent unblocks n1"
     );
 }
@@ -8281,8 +8350,10 @@ fn deleting_a_launched_nodes_agent_unblocks_its_hard_dependents() {
     let mut app = App::new();
     app.cwd = std::env::temp_dir();
     // n0 launched (agent exists), n1 queued hard-dep'ing on n0.
-    app.planned_nodes = vec![test_planned_node("n1", &["n0"])];
-    app.plan_launched_node_ids.insert("n0".to_string());
+    app.plan_mut().planned_nodes = vec![test_planned_node("n1", &["n0"])];
+    app.plan_mut()
+        .plan_launched_node_ids
+        .insert("n0".to_string());
     app.agents.push(node_agent("n0", AgentStatus::Failed));
     app.selected_agent = 0;
 
@@ -8298,13 +8369,13 @@ fn deleting_a_launched_nodes_agent_unblocks_its_hard_dependents() {
     app.delete_selected_agent();
     assert!(app.agents.is_empty(), "agent deleted");
     assert!(
-        !app.plan_launched_node_ids.contains("n0"),
+        !app.plan().plan_launched_node_ids.contains("n0"),
         "deleted node id no longer counts as part of the plan"
     );
     let position = app
         .next_node_to_launch(4)
         .expect("dependent unblocked by the deletion");
-    assert_eq!(app.planned_nodes[position].id, "n1");
+    assert_eq!(app.plan().planned_nodes[position].id, "n1");
 }
 
 #[test]
@@ -8312,7 +8383,7 @@ fn scheduler_respects_parallelism_cap() {
     let mut app = App::new();
     app.cwd = std::env::temp_dir();
     // Three independent ready roots, but only 2 slots.
-    app.planned_nodes = vec![
+    app.plan_mut().planned_nodes = vec![
         test_planned_node("n0", &[]),
         test_planned_node("n1", &[]),
         test_planned_node("n2", &[]),
@@ -8335,7 +8406,8 @@ fn scheduler_respects_parallelism_cap() {
         .next_node_to_launch(2)
         .expect("a freed slot lets a waiting node launch");
     assert_eq!(
-        app.planned_nodes[position].id, "n2",
+        app.plan().planned_nodes[position].id,
+        "n2",
         "the scheduler must not relaunch queued copies of existing nodes"
     );
 }
@@ -8351,7 +8423,7 @@ fn startup_reconciles_queued_nodes_with_persisted_runs() {
     };
     let agents = vec![node_agent("n0", AgentStatus::Merged)];
 
-    reconcile_plan_queue_with_agents(&mut snapshot, &agents);
+    reconcile_plan_queue_with_agents(&mut snapshot, &agents, true);
 
     assert_eq!(
         snapshot
@@ -8370,7 +8442,7 @@ fn scheduler_treats_unknown_dep_as_satisfied() {
     let mut app = App::new();
     app.cwd = std::env::temp_dir();
     // n0 hard-depends on an id absent from the plan -> not a deadlock.
-    app.planned_nodes = vec![test_planned_node("n0", &["ghost"])];
+    app.plan_mut().planned_nodes = vec![test_planned_node("n0", &["ghost"])];
     assert!(
         app.next_node_to_launch(4).is_some(),
         "a node whose dep is absent from the plan is launchable"
@@ -8382,12 +8454,12 @@ fn d_key_does_not_discard_plan_queue() {
     // The plan is refined by typing into the task pane, never discarded with `d`.
     let mut app = App::new();
     app.cwd = std::env::temp_dir();
-    app.planned_nodes = vec![test_planned_node("n0", &[])];
+    app.plan_mut().planned_nodes = vec![test_planned_node("n0", &[])];
     app.focus = FocusPane::Agents;
 
     app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::empty()));
     assert_eq!(
-        app.planned_nodes.len(),
+        app.plan().planned_nodes.len(),
         1,
         "d no longer discards the plan queue"
     );
@@ -8400,36 +8472,40 @@ fn plan_review_saves_inline_edits_and_blocks_invalid_deps() {
     app.cwd = repo.clone();
     app.agents.push(planner_run("orch-1", false));
     app.selected_agent = 0;
-    app.awaiting_approval = true;
-    app.planned_nodes = vec![
+    app.plan_mut().awaiting_approval = true;
+    app.plan_mut().planned_nodes = vec![
         test_planned_node("n0", &[]),
         test_planned_node("n1", &["n0"]),
     ];
     app.open_plan_review();
 
-    app.plan_review.field = PlanReviewField::Title;
-    app.plan_review.cursor = app.plan_review.active_text().chars().count();
+    app.plan_mut().plan_review.field = PlanReviewField::Title;
+    app.plan_mut().plan_review.cursor = app.plan().plan_review.active_text().chars().count();
     for ch in " updated".chars() {
         app.handle_plan_review_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::empty()));
     }
-    assert!(app.plan_review.dirty, "typing marks the plan draft dirty");
+    assert!(
+        app.plan().plan_review.dirty,
+        "typing marks the plan draft dirty"
+    );
     assert!(app.commit_plan_review_edits(), "valid inline edit saves");
-    assert_eq!(app.planned_nodes[0].title, "n0 updated");
+    assert_eq!(app.plan().planned_nodes[0].title, "n0 updated");
     let text = fs::read_to_string(orchestrator_plan_path(&repo)).expect("RUDDER.md written");
     assert!(
         text.contains("n0 updated") && text.contains("RUDDER_PLAN_TASKS_START"),
         "saved edit is mirrored into RUDDER.md: {text}"
     );
 
-    app.plan_review.nodes[0].hard_deps = "missing".to_string();
-    app.plan_review.dirty = true;
+    app.plan_mut().plan_review.nodes[0].hard_deps = "missing".to_string();
+    app.plan_mut().plan_review.dirty = true;
     app.approve_planned_queue();
     assert!(
-        app.awaiting_approval,
+        app.plan().awaiting_approval,
         "invalid deps keep the approval gate closed"
     );
     assert!(
-        app.plan_review
+        app.plan()
+            .plan_review
             .errors
             .iter()
             .any(|error| error.contains("unknown hard dep")),
@@ -8447,9 +8523,9 @@ fn explicitly_armed_interactive_plan_remaps_historical_node_ids() {
     .unwrap();
     let mut app = App::new();
     app.cwd = repo;
-    app.plan_request = "old request".to_string();
-    app.planned_origin = "old request".to_string();
-    app.plan_capture_armed = true;
+    app.plan_mut().plan_request = "old request".to_string();
+    app.plan_mut().planned_origin = "old request".to_string();
+    app.plan_mut().plan_capture_armed = true;
     app.agents.push(node_agent("n0", AgentStatus::Merged));
     let mut orch = planner_run("orch-new", false);
     orch.task = "new request".to_string();
@@ -8463,13 +8539,13 @@ fn explicitly_armed_interactive_plan_remaps_historical_node_ids() {
     app.maybe_capture_orchestrator_plan();
 
     assert!(
-        app.awaiting_approval,
+        app.plan().awaiting_approval,
         "fresh plan captured despite old merged node"
     );
-    assert_eq!(app.planned_origin, "new request");
-    assert_eq!(app.planned_nodes[0].id, "n0-2");
+    assert_eq!(app.plan().planned_origin, "new request");
+    assert_eq!(app.plan().planned_nodes[0].id, "n0-2");
     assert_eq!(
-        app.planned_nodes[1].deps,
+        app.plan().planned_nodes[1].deps,
         vec!["n0-2".to_string()],
         "intra-plan deps remap with the renamed root"
     );
@@ -8494,8 +8570,8 @@ fn completed_dag_does_not_recapture_a_stale_rudder_plan() {
     app.maybe_capture_orchestrator_plan();
     app.scan_orchestrator_markers();
 
-    assert!(!app.awaiting_approval);
-    assert!(app.planned_nodes.is_empty());
+    assert!(!app.plan().awaiting_approval);
+    assert!(app.plan().planned_nodes.is_empty());
     assert_eq!(
         app.agents
             .iter()
@@ -8688,9 +8764,9 @@ fn completed_plan_queues_planned_nodes_and_pins_orchestrator() {
     assert!(orchestrators[0].is_orchestrator());
     assert!(!orchestrators[0].autosteered, "captured-once flag cleared");
     // APPROVAL GATE: both nodes queued, nothing launched, awaiting approval.
-    assert!(app.awaiting_approval, "plan gates for approval");
+    assert!(app.plan().awaiting_approval, "plan gates for approval");
     assert_eq!(
-        app.planned_nodes.len(),
+        app.plan().planned_nodes.len(),
         2,
         "all nodes queued, none launched"
     );
@@ -8701,15 +8777,15 @@ fn completed_plan_queues_planned_nodes_and_pins_orchestrator() {
 
     // APPROVE: Enter on the selected orchestrator launches the ready root.
     app.handle_agents_key(KeyEvent::from(KeyCode::Enter));
-    assert!(!app.awaiting_approval, "approval clears the gate");
+    assert!(!app.plan().awaiting_approval, "approval clears the gate");
     // n0 (root) launched -> an agent tagged with its node id. n1 stays in Todo
     // because its hard dep n0 has not merged.
     assert_eq!(
-        app.planned_nodes.len(),
+        app.plan().planned_nodes.len(),
         1,
         "blocked dependent stays in todo"
     );
-    assert_eq!(app.planned_nodes[0].id, "n1");
+    assert_eq!(app.plan().planned_nodes[0].id, "n1");
     assert!(
         app.agents
             .iter()
@@ -8732,11 +8808,11 @@ fn trivial_plan_gates_for_approval_then_launches_on_enter() {
 
     // Even a 1-node plan gates: it is queued, nothing launches, awaiting approval.
     assert!(
-        app.awaiting_approval,
+        app.plan().awaiting_approval,
         "1-node plan still gates for approval"
     );
     assert_eq!(
-        app.planned_nodes.len(),
+        app.plan().planned_nodes.len(),
         1,
         "the single node is queued, not launched"
     );
@@ -8747,9 +8823,9 @@ fn trivial_plan_gates_for_approval_then_launches_on_enter() {
 
     // APPROVE launches the single ready node.
     app.handle_agents_key(KeyEvent::from(KeyCode::Enter));
-    assert!(!app.awaiting_approval, "approval clears the gate");
+    assert!(!app.plan().awaiting_approval, "approval clears the gate");
     assert!(
-        app.planned_nodes.is_empty(),
+        app.plan().planned_nodes.is_empty(),
         "the single node launched after approval"
     );
     assert!(
@@ -8775,13 +8851,20 @@ fn first_turn_dag_is_captured_into_the_approval_gate() {
     app.evaluate_completed_plan(0);
 
     assert!(
-        !app.planner_paused_for_input,
+        !app.plan().planner_paused_for_input,
         "a captured DAG means the planner is not waiting on an answer"
     );
-    assert!(app.awaiting_approval, "the DAG gates for user approval");
-    assert_eq!(app.planned_nodes.len(), 1, "the first-turn DAG is queued");
     assert!(
-        app.pending_questions.is_empty(),
+        app.plan().awaiting_approval,
+        "the DAG gates for user approval"
+    );
+    assert_eq!(
+        app.plan().planned_nodes.len(),
+        1,
+        "the first-turn DAG is queued"
+    );
+    assert!(
+        app.plan().pending_questions.is_empty(),
         "no synthetic question is injected when a DAG was produced"
     );
     assert!(
@@ -9378,19 +9461,20 @@ fn final_gate_discovers_repository_checks_and_persists_result() {
 
     let mut app = App::new();
     app.cwd = repo.clone();
-    app.final_gate_status = FinalGateStatus::Running;
+    app.plan_mut().final_gate_status = FinalGateStatus::Running;
     app.final_gate_tx
         .send(FinalGateResult {
+            plan_id: app.plan().id.clone(),
             passed: true,
             summary: "all integrated · checks passed: test".to_string(),
         })
         .unwrap();
     app.poll_final_gate();
-    assert_eq!(app.final_gate_status, FinalGateStatus::Passed);
+    assert_eq!(app.plan().final_gate_status, FinalGateStatus::Passed);
     let queue: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(repo.join(".rudder/plan-queue.json")).unwrap())
             .unwrap();
-    assert_eq!(queue["final_gate_status"], "passed");
+    assert_eq!(queue["plans"][0]["final_gate_status"], "passed");
     let context = fs::read_to_string(repo.join("RUDDER.md")).unwrap();
     assert!(context.contains("## Final plan verification"));
     assert!(context.contains("status=passed"));
@@ -9536,7 +9620,7 @@ fn tui_harness_drives_planner_to_dag_and_renders_it() {
     let mut captured = false;
     for _ in 0..300 {
         app.poll_agents();
-        if app.awaiting_approval || !app.planned_nodes.is_empty() {
+        if app.plan().awaiting_approval || !app.plan().planned_nodes.is_empty() {
             captured = true;
             break;
         }
@@ -9548,17 +9632,20 @@ fn tui_harness_drives_planner_to_dag_and_renders_it() {
         captured,
         "planner produced a DAG via the ExitPlanMode capture"
     );
-    assert_eq!(app.planned_nodes.len(), 2, "both DAG nodes captured");
+    assert_eq!(app.plan().planned_nodes.len(), 2, "both DAG nodes captured");
     assert!(
-        app.planned_nodes
+        app.plan()
+            .planned_nodes
             .iter()
             .any(|n| n.title == "impl-mathutils")
             && app
+                .plan()
                 .planned_nodes
                 .iter()
                 .any(|n| n.title == "test-mathutils"),
         "captured nodes match the plan: {:?}",
-        app.planned_nodes
+        app.plan()
+            .planned_nodes
             .iter()
             .map(|n| &n.title)
             .collect::<Vec<_>>()
@@ -9615,7 +9702,7 @@ fn tui_harness_renders_the_plan_mode_card_when_the_planner_asks() {
     let mut paused = false;
     for _ in 0..300 {
         app.poll_agents();
-        if app.planner_paused_for_input && !app.pending_questions.is_empty() {
+        if app.plan().planner_paused_for_input && !app.plan().pending_questions.is_empty() {
             paused = true;
             break;
         }
@@ -9628,10 +9715,14 @@ fn tui_harness_renders_the_plan_mode_card_when_the_planner_asks() {
         "the planner's first turn paused for the question round"
     );
     assert!(
-        app.planned_nodes.is_empty(),
+        app.plan().planned_nodes.is_empty(),
         "no DAG captured on the asking turn"
     );
-    assert_eq!(app.pending_questions.len(), 2, "both questions parsed");
+    assert_eq!(
+        app.plan().pending_questions.len(),
+        2,
+        "both questions parsed"
+    );
 
     // The orchestrator pane renders the plan-mode card with the questions.
     app.selected_agent = 0;
@@ -9679,7 +9770,7 @@ fn tui_harness_interactive_orchestrator_captures_plan_file_and_renders_dag() {
     let mut captured = false;
     for _ in 0..300 {
         app.poll_agents();
-        if app.awaiting_approval && app.planned_nodes.len() == 2 {
+        if app.plan().awaiting_approval && app.plan().planned_nodes.len() == 2 {
             captured = true;
             break;
         }
@@ -9692,10 +9783,18 @@ fn tui_harness_interactive_orchestrator_captures_plan_file_and_renders_dag() {
         "the orchestrator's plan file was captured into the approval gate"
     );
     assert!(
-        app.planned_nodes.iter().any(|n| n.title == "impl-alpha")
-            && app.planned_nodes.iter().any(|n| n.title == "test-alpha"),
+        app.plan()
+            .planned_nodes
+            .iter()
+            .any(|n| n.title == "impl-alpha")
+            && app
+                .plan()
+                .planned_nodes
+                .iter()
+                .any(|n| n.title == "test-alpha"),
         "captured the DAG nodes: {:?}",
-        app.planned_nodes
+        app.plan()
+            .planned_nodes
             .iter()
             .map(|n| &n.title)
             .collect::<Vec<_>>()
@@ -9736,7 +9835,7 @@ fn write_rudder_context_preserves_orchestrator_plan_block() {
     )
     .unwrap();
 
-    write_rudder_context_with_history(&repo, &[], None, &[], None).expect("write RUDDER.md");
+    write_rudder_context_with_history(&repo, &[], None, &[], &[]).expect("write RUDDER.md");
     let text = fs::read_to_string(repo.join("RUDDER.md")).unwrap();
 
     assert!(text.contains("<!-- RUDDER_GENERATED_START -->"));
@@ -9761,7 +9860,7 @@ fn write_rudder_context_mirrors_shared_context_to_worktree() {
         workspace_name: None,
         jj_change_id: None,
     };
-    write_rudder_context_with_history(&repo, &[], Some(&pending), &[], None)
+    write_rudder_context_with_history(&repo, &[], Some(&pending), &[], &[])
         .expect("write RUDDER.md");
 
     let root_shared = fs::read_to_string(repo.join("RUDDER_SHARED.md")).unwrap();
@@ -9789,7 +9888,7 @@ fn write_rudder_context_redacts_secret_values_in_agent_previews() {
     agent.cwd = repo.clone();
     agent.current_prompt = "keep using APIFY_TOKEN=abc1234567 for the ingest".to_string();
 
-    write_rudder_context_with_history(&repo, &[agent], None, &[], None).expect("write RUDDER.md");
+    write_rudder_context_with_history(&repo, &[agent], None, &[], &[]).expect("write RUDDER.md");
     let text = fs::read_to_string(repo.join("RUDDER.md")).unwrap();
 
     assert!(text.contains("APIFY_TOKEN=[redacted]"));
@@ -9838,7 +9937,7 @@ fn write_rudder_context_includes_global_job_snapshot() {
         jj_change_id: None,
     };
 
-    write_rudder_context_with_history(&repo, &[running, done, merged], Some(&pending), &[], None)
+    write_rudder_context_with_history(&repo, &[running, done, merged], Some(&pending), &[], &[])
         .expect("write RUDDER.md");
     let text = fs::read_to_string(repo.join("RUDDER.md")).unwrap();
 
@@ -9908,7 +10007,7 @@ fn rudder_context_carries_session_memory_for_new_agents() {
         "also cover the timeout path".to_string(),
     ];
 
-    write_rudder_context_with_history(&repo, &[done], None, &history, None)
+    write_rudder_context_with_history(&repo, &[done], None, &history, &[])
         .expect("write RUDDER.md with history");
     let text = fs::read_to_string(repo.join("RUDDER.md")).expect("read RUDDER.md");
 
@@ -10277,10 +10376,10 @@ fn codex_headless_planner_ignores_stale_rudder_md_plan() {
     app.scan_orchestrator_markers();
 
     assert!(
-        !app.awaiting_approval,
+        !app.plan().awaiting_approval,
         "Codex headless planners must not capture stale RUDDER.md DAGs"
     );
-    assert!(app.planned_nodes.is_empty());
+    assert!(app.plan().planned_nodes.is_empty());
 
     let _ = fs::remove_dir_all(&repo);
 }
@@ -10323,8 +10422,8 @@ fn interactive_orchestrator_self_launches_on_approve_marker() {
     app.interactive_orchestrator = true; // per-App field, no global env
     app.cwd = repo.clone();
     app.backend = Backend::Codex;
-    app.planned_nodes = vec![titled_planned_node("n0", "do the thing")];
-    app.awaiting_approval = true;
+    app.plan_mut().planned_nodes = vec![titled_planned_node("n0", "do the thing")];
+    app.plan_mut().awaiting_approval = true;
 
     // An orchestrator PTY that printed the approve marker.
     let command = TerminalCommand::with_args(
@@ -10357,18 +10456,18 @@ fn interactive_orchestrator_self_launches_on_approve_marker() {
 
     app.scan_orchestrator_markers();
     assert!(
-        !app.awaiting_approval,
+        !app.plan().awaiting_approval,
         "the approve marker launched the plan (gate cleared)"
     );
     assert!(
-        app.planned_nodes.is_empty() || app.agents.iter().any(|run| run.node_id.is_some()),
+        app.plan().planned_nodes.is_empty() || app.agents.iter().any(|run| run.node_id.is_some()),
         "the planned node was launched into a worker"
     );
 
     // Idempotent: re-scanning the same (still-present) marker does nothing.
     let agents_after = app.agents.len();
     app.scan_orchestrator_markers();
-    assert!(!app.awaiting_approval);
+    assert!(!app.plan().awaiting_approval);
     assert_eq!(
         app.agents.len(),
         agents_after,
@@ -10395,8 +10494,8 @@ fn interactive_orchestrator_self_launches_from_plan_file_marker() {
     app.interactive_orchestrator = true; // per-App field, no global env
     app.cwd = repo.clone();
     app.backend = Backend::Codex;
-    app.planned_nodes = vec![titled_planned_node("n0", "do the thing")];
-    app.awaiting_approval = true;
+    app.plan_mut().planned_nodes = vec![titled_planned_node("n0", "do the thing")];
+    app.plan_mut().awaiting_approval = true;
     let mut orch = test_agent_run("orch-1", "plan it");
     orch.cwd = repo.clone();
     orch.mode = AgentMode::RudderPlan;
@@ -10415,11 +10514,11 @@ fn interactive_orchestrator_self_launches_from_plan_file_marker() {
 
     app.scan_orchestrator_markers();
     assert!(
-        !app.awaiting_approval,
+        !app.plan().awaiting_approval,
         "the plan-file approval marker launched the plan"
     );
     assert!(
-        app.planned_nodes.is_empty() || app.agents.iter().any(|run| run.node_id.is_some()),
+        app.plan().planned_nodes.is_empty() || app.agents.iter().any(|run| run.node_id.is_some()),
         "the planned node launched from the file-based approval"
     );
 
@@ -10438,8 +10537,8 @@ fn orchestrator_recaptures_dag_edits_before_launch() {
     let mut app = App::new();
     app.interactive_orchestrator = true;
     app.cwd = repo.clone();
-    app.awaiting_approval = true;
-    app.planned_nodes = vec![titled_planned_node("n0", "first")];
+    app.plan_mut().awaiting_approval = true;
+    app.plan_mut().planned_nodes = vec![titled_planned_node("n0", "first")];
 
     let mut orch = test_agent_run("orch-1", "plan it");
     orch.cwd = repo.clone();
@@ -10458,27 +10557,32 @@ fn orchestrator_recaptures_dag_edits_before_launch() {
         .unwrap();
 
     app.maybe_recapture_orchestrator_plan();
-    assert!(app.awaiting_approval, "the gate stays OPEN while iterating");
+    assert!(
+        app.plan().awaiting_approval,
+        "the gate stays OPEN while iterating"
+    );
     assert_eq!(
-        app.planned_nodes.len(),
+        app.plan().planned_nodes.len(),
         2,
         "the added task was recaptured live"
     );
     assert_eq!(
-        app.planned_nodes[0].id, "n0",
+        app.plan().planned_nodes[0].id,
+        "n0",
         "recapture preserves the orchestrator's stable ids"
     );
-    assert!(app.planned_nodes.iter().any(|n| n.id == "n1"));
+    assert!(app.plan().planned_nodes.iter().any(|n| n.id == "n1"));
 
-    app.plan_review.nodes[0].title = "local draft edit".to_string();
-    app.plan_review.dirty = true;
+    app.plan_mut().plan_review.nodes[0].title = "local draft edit".to_string();
+    app.plan_mut().plan_review.dirty = true;
 
     // Idempotent: re-reading the same file does not churn or reset an in-progress
     // inline review draft. This used to flip n0 -> n0-2 because the current preview
     // itself was treated as an id collision.
     app.maybe_recapture_orchestrator_plan();
     assert_eq!(
-        app.planned_nodes
+        app.plan()
+            .planned_nodes
             .iter()
             .map(|node| node.id.as_str())
             .collect::<Vec<_>>(),
@@ -10486,7 +10590,8 @@ fn orchestrator_recaptures_dag_edits_before_launch() {
         "no id churn on an unchanged file"
     );
     assert_eq!(
-        app.plan_review.nodes[0].title, "local draft edit",
+        app.plan().plan_review.nodes[0].title,
+        "local draft edit",
         "unchanged recapture does not reset the inline plan preview"
     );
 
@@ -10499,7 +10604,7 @@ fn orchestrator_recaptures_dag_edits_before_launch() {
         .unwrap();
     app.maybe_recapture_orchestrator_plan();
     assert_eq!(
-        app.planned_nodes.len(),
+        app.plan().planned_nodes.len(),
         2,
         "recapture defers to scan_orchestrator_markers when the approve marker is present"
     );
@@ -10524,8 +10629,8 @@ fn approval_keeps_the_orchestrator_live_and_mirrors_graph() {
     app.interactive_orchestrator = true;
     app.cwd = repo.clone();
     app.backend = Backend::Codex;
-    app.planned_nodes = vec![titled_planned_node("n0", "do the thing")];
-    app.awaiting_approval = true;
+    app.plan_mut().planned_nodes = vec![titled_planned_node("n0", "do the thing")];
+    app.plan_mut().awaiting_approval = true;
 
     // A LIVE interactive orchestrator PTY (RudderPlan, !reconcile_planner, Running).
     let command = TerminalCommand::with_args("/bin/sh", ["-lc", "sleep 5"]);
@@ -10556,7 +10661,7 @@ fn approval_keeps_the_orchestrator_live_and_mirrors_graph() {
 
     app.scan_orchestrator_markers();
 
-    assert!(!app.awaiting_approval, "approval cleared the gate");
+    assert!(!app.plan().awaiting_approval, "approval cleared the gate");
     // graph.json was mirrored on approval (the __graph-mirror shell-out is a no-op
     // under cfg(test), but mirror_graph still records the signature it computed,
     // proving the DAG was generated at the approval moment).
@@ -10583,7 +10688,7 @@ fn approval_keeps_the_orchestrator_live_and_mirrors_graph() {
     // workspace prep no-ops in this bare temp repo) — same tolerance as the
     // sibling self-launch test.
     assert!(
-        app.planned_nodes.is_empty() || app.agents.iter().any(|run| run.node_id.is_some()),
+        app.plan().planned_nodes.is_empty() || app.agents.iter().any(|run| run.node_id.is_some()),
         "the approved node launched a worker"
     );
 
@@ -10640,7 +10745,7 @@ fn task_input_reaches_the_orchestrator_while_a_plan_awaits_approval() {
     // parsed and waiting for approval, so a typed message is feedback on that draft.
     // Once a plan is running, the task pane starts its own worker instead and the
     // orchestrator is edited by talking to its own pane.
-    app.awaiting_approval = true;
+    app.plan_mut().awaiting_approval = true;
     app.start_task_from_input("what is happening?");
     // The submitting CR is deferred (paste-detection guard); force it due and flush.
     for pending in &mut app.pending_enters {
@@ -10715,7 +10820,7 @@ fn task_input_sends_enter_key_to_live_orchestrator() {
     worker.status = AgentStatus::Running;
     app.agents.push(worker);
 
-    app.awaiting_approval = true;
+    app.plan_mut().awaiting_approval = true;
     app.start_task_from_input("go!");
     // The submitting CR is deferred (paste-detection guard); force it due and flush.
     for pending in &mut app.pending_enters {
@@ -10831,8 +10936,8 @@ fn approval_does_not_stop_orchestrator_in_headless_mode() {
     app.interactive_orchestrator = false;
     app.cwd = repo.clone();
     app.backend = Backend::Codex;
-    app.planned_nodes = vec![titled_planned_node("n0", "do the thing")];
-    app.awaiting_approval = true;
+    app.plan_mut().planned_nodes = vec![titled_planned_node("n0", "do the thing")];
+    app.plan_mut().awaiting_approval = true;
 
     let mut orch = test_agent_run("orch-1", "plan it");
     orch.cwd = repo.clone();
@@ -10879,7 +10984,7 @@ fn stopped_orchestrator_renders_handoff_banner() {
         app.agents.push(w);
     }
     // A remaining queued node so the DAG pane renders the tree.
-    app.planned_nodes = vec![titled_planned_node("n2", "later task")];
+    app.plan_mut().planned_nodes = vec![titled_planned_node("n2", "later task")];
 
     app.selected_agent = 0; // the orchestrator
     app.focus = FocusPane::Worker;
@@ -10920,7 +11025,10 @@ fn orchestrator_dag_survives_queue_drain() {
         w.status = AgentStatus::Running;
         app.agents.push(w);
     }
-    assert!(app.planned_nodes.is_empty(), "queue is fully drained");
+    assert!(
+        app.plan().planned_nodes.is_empty(),
+        "queue is fully drained"
+    );
 
     app.selected_agent = 0; // the orchestrator
     app.focus = FocusPane::Worker;
@@ -10972,22 +11080,22 @@ fn self_launch_marker_is_inert_without_flag_or_gate() {
     let mut app = App::new();
     app.interactive_orchestrator = false; // per-App field, no global env
     app.cwd = std::env::temp_dir();
-    app.planned_nodes = vec![titled_planned_node("n0", "x")];
-    app.awaiting_approval = true;
+    app.plan_mut().planned_nodes = vec![titled_planned_node("n0", "x")];
+    app.plan_mut().awaiting_approval = true;
     let mut orch = test_agent_run("orch-1", "plan it");
     orch.mode = AgentMode::RudderPlan;
     app.agents.push(orch);
     app.scan_orchestrator_markers();
     assert!(
-        app.awaiting_approval,
+        app.plan().awaiting_approval,
         "headless mode → marker ignored, still awaiting approval"
     );
 
     // Interactive ON but NOT awaiting approval: nothing to launch, scan no-ops.
     app.interactive_orchestrator = true;
-    app.awaiting_approval = false;
+    app.plan_mut().awaiting_approval = false;
     app.scan_orchestrator_markers();
-    assert!(!app.awaiting_approval);
+    assert!(!app.plan().awaiting_approval);
 }
 
 #[test]
@@ -11028,8 +11136,8 @@ fn evaluate_populates_planned_nodes_without_launching() {
     app.evaluate_completed_plan(0);
 
     // The gate is set, every node is queued, and NO scheduler launch happened.
-    assert!(app.awaiting_approval);
-    assert_eq!(app.planned_nodes.len(), 2);
+    assert!(app.plan().awaiting_approval);
+    assert_eq!(app.plan().planned_nodes.len(), 2);
     assert!(
         app.agents.iter().all(|run| run.node_id.is_none()),
         "evaluate must not launch any worker"
@@ -11057,11 +11165,11 @@ fn a_typed_task_never_touches_a_running_plan() {
     // standalone worker, and editing a plan is done by talking to that
     // orchestrator's pane. With several plans able to run at once, a single global
     // input could not say which plan it meant.
-    app.planned_nodes = vec![test_planned_node("n0", &[])];
+    app.plan_mut().planned_nodes = vec![test_planned_node("n0", &[])];
     assert!(app.plan_is_active(), "queued nodes mean a plan is active");
 
     let before_agents = app.agents.len();
-    let before_nodes = app.planned_nodes.len();
+    let before_nodes = app.plan().planned_nodes.len();
     app.start_task_from_input("add a second feature");
 
     assert_eq!(app.agents.len(), before_agents + 1, "one worker spawned");
@@ -11074,7 +11182,7 @@ fn a_typed_task_never_touches_a_running_plan() {
     assert!(!spawned.reconcile_planner);
     assert!(spawned.node_id.is_none(), "it joins no DAG");
     assert_eq!(
-        app.planned_nodes.len(),
+        app.plan().planned_nodes.len(),
         before_nodes,
         "the running plan is left exactly as it was"
     );
@@ -11161,7 +11269,7 @@ fn completed_plan_does_not_hijack_a_new_task_into_refine() {
         "a completed plan must not look like a paused planner"
     );
     // Only when the planner actually paused for a clarifying question does it resume.
-    app.planner_paused_for_input = true;
+    app.plan_mut().planner_paused_for_input = true;
     assert!(
         app.planner_awaiting_input(),
         "a genuinely paused planner resumes on the next typed message"
@@ -11427,12 +11535,12 @@ fn evaluate_completed_reconcile_appends_and_does_not_replace() {
     app.cwd = std::env::temp_dir();
     // Existing plan: two queued nodes n0 + n1, gating for approval so the
     // append does not immediately schedule (we inspect the queue directly).
-    app.planned_nodes = vec![
+    app.plan_mut().planned_nodes = vec![
         test_planned_node("n0", &[]),
         test_planned_node("n1", &["n0"]),
     ];
-    app.planned_origin = "build it".to_string();
-    app.awaiting_approval = true;
+    app.plan_mut().planned_origin = "build it".to_string();
+    app.plan_mut().awaiting_approval = true;
 
     // Reconcile planner returns ONE node with a soft dep on the queued node n1.
     let block = "RUDDER_PLAN_TASKS_START\n{\"tasks\":[\
@@ -11446,9 +11554,14 @@ fn evaluate_completed_reconcile_appends_and_does_not_replace() {
 
     // Both existing queued nodes survived (NOT replaced); the new node was
     // APPENDED (push). The queue now holds n0, n1, and new.
-    let queued_ids: Vec<&str> = app.planned_nodes.iter().map(|n| n.id.as_str()).collect();
+    let queued_ids: Vec<&str> = app
+        .plan()
+        .planned_nodes
+        .iter()
+        .map(|n| n.id.as_str())
+        .collect();
     assert_eq!(
-        app.planned_nodes.len(),
+        app.plan().planned_nodes.len(),
         3,
         "appended, not replaced: {queued_ids:?}"
     );
@@ -11465,7 +11578,12 @@ fn evaluate_completed_reconcile_appends_and_does_not_replace() {
         "new node appended: {queued_ids:?}"
     );
     // The appended node carries its soft dep on the queued node n1.
-    let added = app.planned_nodes.iter().find(|n| n.id == "new").unwrap();
+    let added = app
+        .plan()
+        .planned_nodes
+        .iter()
+        .find(|n| n.id == "new")
+        .unwrap();
     assert_eq!(
         added.soft_deps,
         vec!["n1".to_string()],
@@ -11488,8 +11606,8 @@ fn evaluate_completed_reconcile_schedules_when_session_running() {
     // approved/running (not awaiting approval), so an appended ready node should
     // be drained into a live worker by the scheduler.
     app.agents.push(node_agent("n0", AgentStatus::Running));
-    app.planned_origin = "build it".to_string();
-    app.awaiting_approval = false;
+    app.plan_mut().planned_origin = "build it".to_string();
+    app.plan_mut().awaiting_approval = false;
 
     // The added node is fully independent (no deps), so it is ready immediately.
     let block = "RUDDER_PLAN_TASKS_START\n{\"tasks\":[\
@@ -11504,7 +11622,7 @@ fn evaluate_completed_reconcile_schedules_when_session_running() {
     // The scheduler launched the ready appended node: it left the queue and now
     // exists as a node-tagged worker agent.
     assert!(
-        app.planned_nodes.iter().all(|n| n.id != "new"),
+        app.plan().planned_nodes.iter().all(|n| n.id != "new"),
         "ready appended node was scheduled out of the queue"
     );
     assert!(
@@ -11522,8 +11640,8 @@ fn evaluate_completed_reconcile_uniquifies_colliding_id() {
     app.cwd = std::env::temp_dir();
     // An existing queued node already uses id "new"; the reconcile node also
     // claims "new" and must be uniquified so dep resolution stays unambiguous.
-    app.planned_nodes = vec![test_planned_node("new", &[])];
-    app.awaiting_approval = true; // initial plan still gating
+    app.plan_mut().planned_nodes = vec![test_planned_node("new", &[])];
+    app.plan_mut().awaiting_approval = true; // initial plan still gating
 
     let block = "RUDDER_PLAN_TASKS_START\n{\"tasks\":[\
             {\"id\":\"new\",\"title\":\"docs\",\"prompt\":\"write docs\",\"goal\":\"docs\",\"success\":\"ok\"}\
@@ -11534,8 +11652,17 @@ fn evaluate_completed_reconcile_uniquifies_colliding_id() {
 
     app.evaluate_completed_reconcile(planner_index);
 
-    let ids: Vec<&str> = app.planned_nodes.iter().map(|n| n.id.as_str()).collect();
-    assert_eq!(app.planned_nodes.len(), 2, "both nodes queued: {ids:?}");
+    let ids: Vec<&str> = app
+        .plan()
+        .planned_nodes
+        .iter()
+        .map(|n| n.id.as_str())
+        .collect();
+    assert_eq!(
+        app.plan().planned_nodes.len(),
+        2,
+        "both nodes queued: {ids:?}"
+    );
     assert!(ids.contains(&"new"), "original id kept: {ids:?}");
     assert!(
         ids.iter().any(|id| *id == "new-2"),
@@ -11555,9 +11682,9 @@ fn evaluate_completed_reconcile_no_deps_falls_back_to_soft_frontier() {
     app.cwd = std::env::temp_dir();
     // Frontier: one queued node n0 + one running plan-launched agent n1. Gate
     // for approval so the no-deps node stays queued (we inspect its soft edges).
-    app.planned_nodes = vec![test_planned_node("n0", &[])];
+    app.plan_mut().planned_nodes = vec![test_planned_node("n0", &[])];
     app.agents.push(node_agent("n1", AgentStatus::Running));
-    app.awaiting_approval = true;
+    app.plan_mut().awaiting_approval = true;
 
     // Reconcile planner returns a node with NO deps at all.
     let block = "RUDDER_PLAN_TASKS_START\n{\"tasks\":[\
@@ -11570,6 +11697,7 @@ fn evaluate_completed_reconcile_no_deps_falls_back_to_soft_frontier() {
     app.evaluate_completed_reconcile(planner_index);
 
     let added = app
+        .plan()
         .planned_nodes
         .iter()
         .find(|n| n.id == "new")
@@ -11610,9 +11738,10 @@ fn reconcile_planner_is_discriminated_from_initial_planner() {
     // plan (replace) and verify the queue holds exactly its node.
     app.agents.push(initial);
     app.evaluate_completed_plan(0);
-    assert_eq!(app.planned_nodes.len(), 1);
+    assert_eq!(app.plan().planned_nodes.len(), 1);
     assert_eq!(
-        app.planned_nodes[0].id, "n0",
+        app.plan().planned_nodes[0].id,
+        "n0",
         "initial plan captured via replace path"
     );
 }
@@ -11654,17 +11783,21 @@ fn d_on_orchestrator_does_not_discard_pending_plan() {
     orch.status = AgentStatus::Running;
     app.agents = vec![orch];
     app.selected_agent = 0;
-    app.planned_nodes = vec![
+    app.plan_mut().planned_nodes = vec![
         test_planned_node("n0", &[]),
         test_planned_node("n1", &["n0"]),
     ];
-    app.awaiting_approval = true;
+    app.plan_mut().awaiting_approval = true;
 
     // d on the orchestrator must NOT throw the plan away: the plan is refined by
     // typing into the task pane and approved with Enter. The gate stays open.
     app.handle_agents_key(KeyEvent::from(KeyCode::Char('d')));
-    assert_eq!(app.planned_nodes.len(), 2, "d does not discard the plan");
-    assert!(app.awaiting_approval, "the approval gate stays open");
+    assert_eq!(
+        app.plan().planned_nodes.len(),
+        2,
+        "d does not discard the plan"
+    );
+    assert!(app.plan().awaiting_approval, "the approval gate stays open");
 }
 
 // --- Plan refinement (plan-mode-style discussion before approval) --------
@@ -11700,26 +11833,30 @@ fn approve_is_blocked_while_refining() {
     // while a refine is in flight; the gate stays up until the revised DAG lands.
     let mut app = App::new();
     app.cwd = std::env::temp_dir();
-    app.planned_nodes = vec![
+    app.plan_mut().planned_nodes = vec![
         test_planned_node("n0", &[]),
         test_planned_node("n1", &["n0"]),
     ];
-    app.awaiting_approval = true;
-    app.refining = true;
+    app.plan_mut().awaiting_approval = true;
+    app.plan_mut().refining = true;
 
     app.approve_planned_queue();
 
     assert!(
-        app.awaiting_approval,
+        app.plan().awaiting_approval,
         "refining blocks approval; gate stays up"
     );
-    assert_eq!(app.planned_nodes.len(), 2, "the stale plan is not launched");
+    assert_eq!(
+        app.plan().planned_nodes.len(),
+        2,
+        "the stale plan is not launched"
+    );
 }
 
 #[test]
 fn current_plan_outline_lists_nodes_with_deps() {
     let mut app = App::new();
-    app.planned_nodes = vec![
+    app.plan_mut().planned_nodes = vec![
         test_planned_node("n0", &[]),
         test_planned_node("n1", &["n0"]),
     ];
@@ -12163,7 +12300,7 @@ fn render_orchestrator_pins_dag_and_shows_plan_prose() {
     orch.plan_stream = Some(stream);
     app.agents = vec![orch];
     app.selected_agent = 0;
-    app.plan_summary = Some("This plan scaffolds the project first.".to_string());
+    app.plan_mut().plan_summary = Some("This plan scaffolds the project first.".to_string());
 
     let text = render_worker_text(&mut app, 72, 24);
     assert!(
@@ -12217,7 +12354,7 @@ fn orchestrator_dag_shows_reconciled_nodes_added_after_launch() {
     app.agents = vec![orch];
     app.selected_agent = 0;
     // A reconciled node added after launch (distinct id/title not in the block).
-    app.planned_nodes = vec![test_planned_node("addeddocs", &["n0"])];
+    app.plan_mut().planned_nodes = vec![test_planned_node("addeddocs", &["n0"])];
 
     let text = render_worker_text(&mut app, 72, 24);
     assert!(text.contains("scaffold"), "initial node shown: {text}");
@@ -12231,8 +12368,8 @@ fn orchestrator_dag_shows_reconciled_nodes_added_after_launch() {
 fn task_hint_invites_adding_to_running_plan_post_launch() {
     let mut app = App::new();
     // A plan is active (queued node) but not awaiting approval -> post-launch.
-    app.planned_nodes = vec![test_planned_node("n0", &[])];
-    app.awaiting_approval = false;
+    app.plan_mut().planned_nodes = vec![test_planned_node("n0", &[])];
+    app.plan_mut().awaiting_approval = false;
     assert!(app.plan_is_active());
     let hint = task_default_hint(&app);
     assert!(
@@ -12393,7 +12530,7 @@ fn orchestrator_tree_nests_by_hard_edges_not_soft() {
 
 #[test]
 fn orchestrator_prose_reads_live_summary_when_frozen_is_empty() {
-    // The truncation bug: app.plan_summary was captured once at exit-detection,
+    // The truncation bug: app.plan().plan_summary was captured once at exit-detection,
     // before the planner's tail drained. The prose must re-extract from the LIVE
     // plan_stream so it shows the full summary even when the frozen copy is empty.
     let mut app = App::new();
@@ -12405,7 +12542,7 @@ fn orchestrator_prose_reads_live_summary_when_frozen_is_empty() {
     orch.plan_stream = Some(stream);
     app.agents = vec![orch];
     app.selected_agent = 0;
-    app.plan_summary = None; // not captured yet -> must read live
+    app.plan_mut().plan_summary = None; // not captured yet -> must read live
 
     let text = render_worker_text(&mut app, 80, 24);
     assert!(
@@ -12875,6 +13012,7 @@ fn followup_unknown_explicit_dep_falls_back_to_soft() {
     });
     assert!(app.apply_worker_followups("n0", &note));
     let node = app
+        .plan()
         .planned_nodes
         .iter()
         .find(|n| n.title == "wire it")
@@ -13016,7 +13154,7 @@ fn mirror_payload_includes_planned_nodes_with_typed_deps() {
     root.title = "build the parser".to_string();
     let mut child = test_planned_node("n1", &["n0"]);
     child.soft_deps = vec!["n0".to_string()];
-    app.planned_nodes = vec![root, child];
+    app.plan_mut().planned_nodes = vec![root, child];
 
     let payload = app.build_mirror_payload();
     let nodes = payload["nodes"].as_array().expect("nodes array");
@@ -13091,7 +13229,7 @@ fn mirror_payload_combines_queued_nodes_and_launched_agents() {
     app.cwd = std::env::temp_dir();
     // n0 launched (running), n1 still queued in Todo.
     app.agents = vec![node_agent("n0", AgentStatus::Running)];
-    app.planned_nodes = vec![test_planned_node("n1", &["n0"])];
+    app.plan_mut().planned_nodes = vec![test_planned_node("n1", &["n0"])];
 
     let payload = app.build_mirror_payload();
     let nodes = payload["nodes"].as_array().expect("nodes array");
@@ -13108,7 +13246,7 @@ fn mirror_graph_coalesce_guard_skips_when_signature_unchanged() {
     // a plan change moves the signature.
     let mut app = App::new();
     app.cwd = std::env::temp_dir();
-    app.planned_nodes = vec![test_planned_node("n0", &[])];
+    app.plan_mut().planned_nodes = vec![test_planned_node("n0", &[])];
     assert_eq!(app.last_mirror_signature, None);
 
     app.mirror_graph();
@@ -13122,7 +13260,9 @@ fn mirror_graph_coalesce_guard_skips_when_signature_unchanged() {
     );
 
     // Mutate the plan: the signature must change.
-    app.planned_nodes.push(test_planned_node("n1", &["n0"]));
+    app.plan_mut()
+        .planned_nodes
+        .push(test_planned_node("n1", &["n0"]));
     app.mirror_graph();
     assert_ne!(
         app.last_mirror_signature, first,
@@ -13328,7 +13468,7 @@ fn is_structural_direction_additive_request_is_not_structural() {
 fn classify_new_direction_reads_live_plan_titles() {
     let mut app = App::new();
     app.cwd = std::env::temp_dir();
-    app.planned_nodes = vec![
+    app.plan_mut().planned_nodes = vec![
         titled_planned_node("n0", "implement billing"),
         titled_planned_node("n1", "wire up notifications"),
     ];
@@ -13346,7 +13486,7 @@ fn classify_new_direction_reads_live_plan_titles() {
 fn rebasing_suppresses_plan_integration() {
     let mut app = App::new();
     app.cwd = std::env::temp_dir();
-    app.rebasing = true;
+    app.plan_mut().rebasing = true;
     // A clean Done node would normally be integrated; the rebase guard holds it.
     app.agents.push(node_agent("n0", AgentStatus::Done));
     app.integrate_ready_plan_nodes();
@@ -13441,7 +13581,7 @@ fn interactive_orchestrator_flag_survives_save_and_reload() {
     let mut app = App::new();
     app.cwd = repo.clone();
     app.interactive_orchestrator = false;
-    app.plan_capture_armed = true;
+    app.plan_mut().plan_capture_armed = true;
     let mut running = reloaded;
     running.status = AgentStatus::Running;
     app.agents.push(running);
@@ -13457,7 +13597,7 @@ fn interactive_orchestrator_flag_survives_save_and_reload() {
     .unwrap();
     app.maybe_capture_orchestrator_plan();
     assert!(
-        app.awaiting_approval && app.planned_nodes.len() == 1,
+        app.plan().awaiting_approval && app.plan().planned_nodes.len() == 1,
         "persisted interactive rows still capture their plan file after an env/default change"
     );
 
@@ -13666,7 +13806,7 @@ fn auto_expand_recovers_followups_from_sidecar_file_without_a_pty() {
     let repo = unique_test_repo("done-sidecar");
     let mut app = App::new();
     app.cwd = repo.clone();
-    app.awaiting_approval = true; // hold scheduling; we only assert the DAG grew
+    app.plan_mut().awaiting_approval = true; // hold scheduling; we only assert the DAG grew
 
     let mut worker = node_agent("n0", AgentStatus::Done); // mode Execute, node_id "n0"
     worker.cwd = repo.clone();
@@ -13685,11 +13825,11 @@ fn auto_expand_recovers_followups_from_sidecar_file_without_a_pty() {
     app.maybe_ingest_worker_followups();
 
     assert_eq!(
-        app.planned_nodes.len(),
+        app.plan().planned_nodes.len(),
         1,
         "the in-scope follow-up is recovered from the file (no PTY involved)"
     );
-    assert_eq!(app.planned_nodes[0].title, "add docs");
+    assert_eq!(app.plan().planned_nodes[0].title, "add docs");
     assert!(
         app.followups_ingested.contains("n0"),
         "the worker is marked ingested once"
@@ -13727,7 +13867,7 @@ fn backstop_result_grows_dag_via_poll() {
     // exactly like a real `rudder done` report would.
     let mut app = App::new();
     app.cwd = std::env::temp_dir();
-    app.awaiting_approval = true; // hold scheduling; assert the DAG grew
+    app.plan_mut().awaiting_approval = true; // hold scheduling; assert the DAG grew
     let mut worker = node_agent("n0", AgentStatus::Done); // run.id == node_id == "n0"
     worker.mode = AgentMode::Execute;
     app.agents = vec![worker];
@@ -13755,11 +13895,11 @@ fn backstop_result_grows_dag_via_poll() {
         "marked ingested (never re-summarized)"
     );
     assert_eq!(
-        app.planned_nodes.len(),
+        app.plan().planned_nodes.len(),
         1,
         "the reconstructed note grew the DAG"
     );
-    assert_eq!(app.planned_nodes[0].title, "add tests");
+    assert_eq!(app.plan().planned_nodes[0].title, "add tests");
 }
 
 #[test]
@@ -13809,7 +13949,7 @@ fn ingest_empty_followups_is_trusted_no_backstop() {
     let repo = unique_test_repo("ingest-empty");
     let mut app = App::new();
     app.cwd = repo.clone();
-    app.awaiting_approval = true;
+    app.plan_mut().awaiting_approval = true;
     app.agents = vec![done_worker_with_sidecar(
         &repo,
         "n0",
@@ -13827,7 +13967,7 @@ fn ingest_empty_followups_is_trusted_no_backstop() {
         app.completion_summary_pending.is_empty(),
         "no diff-backstop for an explicit empty list"
     );
-    assert!(app.planned_nodes.is_empty());
+    assert!(app.plan().planned_nodes.is_empty());
     let _ = fs::remove_dir_all(&repo);
 }
 
@@ -13837,7 +13977,7 @@ fn ingest_failed_worker_reads_note_but_never_backstops() {
     let repo = unique_test_repo("ingest-failed");
     let mut app = App::new();
     app.cwd = repo.clone();
-    app.awaiting_approval = true;
+    app.plan_mut().awaiting_approval = true;
     app.agents = vec![done_worker_with_sidecar(
             &repo,
             "n0",
@@ -13846,7 +13986,7 @@ fn ingest_failed_worker_reads_note_but_never_backstops() {
         )];
     let grew = app.ingest_worker_followups(0);
     assert!(grew, "a failed worker's filed follow-ups are still applied");
-    assert_eq!(app.planned_nodes[0].title, "finish the refactor");
+    assert_eq!(app.plan().planned_nodes[0].title, "finish the refactor");
 
     // …but a FAILED worker with only freeform prose never triggers the diff-backstop
     // (its half-finished diff would invite noise).
@@ -13922,11 +14062,11 @@ fn followup_scope_out_is_case_insensitive() {
     let grew = app.apply_worker_followups("n0", &note);
     assert!(grew);
     assert_eq!(
-        app.planned_nodes.len(),
+        app.plan().planned_nodes.len(),
         1,
         "the OUT (any case) follow-up is not injected"
     );
-    assert_eq!(app.planned_nodes[0].title, "in lane work");
+    assert_eq!(app.plan().planned_nodes[0].title, "in lane work");
 }
 
 #[test]
@@ -13986,12 +14126,12 @@ fn conductor_live_run_drains_dag_with_fake_workers() {
     app.backend = Backend::Codex;
     // Merge has its own tests; this harness simulates each integration event.
     // Seed a 2-node plan: a root + a child that HARD-depends on it.
-    app.planned_nodes = vec![titled_planned_node("setup", "scaffold the project"), {
+    app.plan_mut().planned_nodes = vec![titled_planned_node("setup", "scaffold the project"), {
         let mut n = titled_planned_node("feature", "build the feature");
         n.deps = vec!["setup".to_string()];
         n
     }];
-    app.planned_origin = "build a small app".to_string();
+    app.plan_mut().planned_origin = "build a small app".to_string();
 
     println!("\n=== conductor live run ===");
     println!("seed: [setup] (root)  ->hard->  [feature]");
@@ -14009,7 +14149,8 @@ fn conductor_live_run_drains_dag_with_fake_workers() {
     // been launched into an agent: the conductor launches a grown follow-up the same
     // tick it ingests it, so it leaves planned_nodes almost immediately.
     let followup_present = |app: &App| {
-        app.planned_nodes
+        app.plan()
+            .planned_nodes
             .iter()
             .any(|n| n.title == "write integration tests")
             || app
@@ -14059,7 +14200,7 @@ fn conductor_live_run_drains_dag_with_fake_workers() {
             .filter(|r| r.node_id.is_some() && r.status == AgentStatus::Running)
             .count();
         if saw_followup
-            && app.planned_nodes.is_empty()
+            && app.plan().planned_nodes.is_empty()
             && running == 0
             && node_status(&app, "setup") == Some(AgentStatus::Merged)
             && node_status(&app, "feature") == Some(AgentStatus::Merged)
@@ -14387,8 +14528,8 @@ fn model_switch_retires_a_planning_orchestrator() {
     let mut app = App::new();
     app.cwd = repo.clone();
     app.agents.push(planner_run("orch-1", false));
-    app.planned_nodes = vec![test_planned_node("n0", &[])];
-    app.awaiting_approval = true;
+    app.plan_mut().planned_nodes = vec![test_planned_node("n0", &[])];
+    app.plan_mut().awaiting_approval = true;
 
     let note = app.retire_planner_for_model_switch();
 
@@ -14397,8 +14538,11 @@ fn model_switch_retires_a_planning_orchestrator() {
         !app.agents.iter().any(|run| run.is_orchestrator()),
         "the planning orchestrator was retired"
     );
-    assert!(app.planned_nodes.is_empty(), "the pending plan was cleared");
-    assert!(!app.awaiting_approval, "no longer awaiting approval");
+    assert!(
+        app.plan().planned_nodes.is_empty(),
+        "the pending plan was cleared"
+    );
+    assert!(!app.plan().awaiting_approval, "no longer awaiting approval");
     assert!(
         !app.plan_is_active(),
         "a fresh task now starts a new planner instead of refining"
@@ -14553,19 +14697,20 @@ fn finalize_node_reviews_marks_reviewed_and_fails_open() {
     reviewer.mode = AgentMode::ReviewAll;
     reviewer.status = AgentStatus::Done;
     app.agents.push(reviewer);
-    app.node_reviewers
+    app.plan_mut()
+        .node_reviewers
         .insert("rev-1".to_string(), "n0".to_string());
 
     app.finalize_node_reviews();
     assert!(
-        app.reviewed_nodes.contains("n0"),
+        app.plan().reviewed_nodes.contains("n0"),
         "node marked reviewed -> eligible to merge"
     );
     assert!(
         !app.agents.iter().any(|r| r.id == "rev-1"),
         "transient reviewer row removed"
     );
-    assert!(app.node_reviewers.is_empty());
+    assert!(app.plan().node_reviewers.is_empty());
 
     // Fail open: a Failed reviewer must still mark the node reviewed so a broken
     // review never permanently blocks the node (and its dependents).
@@ -14573,11 +14718,12 @@ fn finalize_node_reviews_marks_reviewed_and_fails_open() {
     reviewer2.mode = AgentMode::ReviewAll;
     reviewer2.status = AgentStatus::Failed;
     app.agents.push(reviewer2);
-    app.node_reviewers
+    app.plan_mut()
+        .node_reviewers
         .insert("rev-2".to_string(), "n1".to_string());
     app.finalize_node_reviews();
     assert!(
-        app.reviewed_nodes.contains("n1"),
+        app.plan().reviewed_nodes.contains("n1"),
         "failed review fails open"
     );
 }
@@ -14593,13 +14739,14 @@ fn maybe_start_node_review_respects_disable_and_serializes() {
     app.agents.push(node);
     app.maybe_start_node_review();
     assert!(
-        app.node_reviewers.is_empty(),
+        app.plan().node_reviewers.is_empty(),
         "disabled: no reviewer spawned"
     );
 
     // Enabled but a reviewer already tracked -> serialize (no second spawn).
     app.node_review_enabled = true;
-    app.node_reviewers
+    app.plan_mut()
+        .node_reviewers
         .insert("rev-x".to_string(), "n9".to_string());
     let before = app.agents.len();
     app.maybe_start_node_review();
@@ -14648,14 +14795,363 @@ fn approve_marker_in_file_is_consumed_without_a_running_orchestrator() {
 
     let mut app = App::new();
     app.cwd = repo.clone();
-    app.awaiting_approval = true;
-    app.planned_nodes.clear(); // empty -> degenerate approve clears the gate, no spawn
+    app.plan_mut().awaiting_approval = true;
+    app.plan_mut().planned_nodes.clear(); // empty -> degenerate approve clears the gate, no spawn
 
     app.scan_orchestrator_markers();
     assert!(
-        !app.awaiting_approval,
+        !app.plan().awaiting_approval,
         "a file approval marker must be consumed with no running orchestrator"
     );
 
     let _ = std::fs::remove_dir_all(&repo);
+}
+
+// --- CHANGE: several concurrent plans, each owning its own DAG ------------
+
+/// Open a second plan the way `/plan` does, and return its index. Tests use this
+/// instead of poking `plans` directly so they exercise the real seam.
+fn add_test_plan(app: &mut App) -> usize {
+    app.plans.push(PlanState {
+        id: new_plan_id(),
+        ..PlanState::default()
+    });
+    app.plans.len() - 1
+}
+
+/// An orchestrator row driving `plan_index`, appended to the agent list.
+fn push_test_orchestrator(app: &mut App, run_id: &str, plan_index: usize) -> usize {
+    let mut run = test_agent_run(run_id, "goal");
+    run.mode = AgentMode::RudderPlan;
+    run.plan_id = Some(app.plans[plan_index].id.clone());
+    app.agents.push(run);
+    app.agents.len() - 1
+}
+
+#[test]
+fn two_plans_keep_their_own_queues_gates_and_ledgers() {
+    let mut app = App::new();
+    app.cwd = std::env::temp_dir();
+    let first = app.active_plan_index();
+    app.adopt_plan_nodes(first, vec![test_planned_node("n0", &[])]);
+    app.plans[first].awaiting_approval = true;
+    app.plans[first].planned_origin = "first goal".to_string();
+
+    let second = add_test_plan(&mut app);
+    app.adopt_plan_nodes(second, vec![test_planned_node("n0", &[])]);
+    app.plans[second].planned_origin = "second goal".to_string();
+
+    // The second plan reused the planner's `n0`; adoption renames it so `node_id`
+    // stays a unique key across the fleet, and the first plan keeps its own id.
+    assert_eq!(app.plans[first].planned_nodes[0].id, "n0");
+    assert_eq!(app.plans[second].planned_nodes[0].id, "n0-2");
+
+    // Neither plan's gate, queue or origin leaked into the other.
+    assert!(app.plans[first].awaiting_approval);
+    assert!(!app.plans[second].awaiting_approval);
+    assert_eq!(app.plans[first].planned_origin, "first goal");
+    assert_eq!(app.plans[second].planned_origin, "second goal");
+
+    // A merge on the second plan does not satisfy the first plan's dependencies.
+    app.plans[second]
+        .plan_merged_node_ids
+        .insert("n0-2".to_string());
+    assert!(!app.merged_node_ids_in(first).contains(&"n0-2".to_string()));
+    assert!(app.merged_node_ids_in(second).contains(&"n0-2".to_string()));
+}
+
+#[test]
+fn a_second_plan_does_not_retire_the_first_orchestrator() {
+    // The inverted invariant: `/plan` used to be AT-MOST-ONE and wiped the running
+    // plan. A second plan must now open beside the first, both rows intact.
+    let mut app = App::new();
+    app.cwd = std::env::temp_dir();
+    let first = app.active_plan_index();
+    app.adopt_plan_nodes(first, vec![test_planned_node("n0", &[])]);
+    app.plans[first].awaiting_approval = true;
+    let first_orch = push_test_orchestrator(&mut app, "orch-1", first);
+    app.selected_agent = first_orch;
+
+    // A plan holding work at the gate is not a spent slot, so a fresh plan needs a new one.
+    assert_eq!(app.spent_plan_index(), None);
+
+    let second = add_test_plan(&mut app);
+    push_test_orchestrator(&mut app, "orch-2", second);
+
+    assert_eq!(
+        app.agents
+            .iter()
+            .filter(|run| run.is_orchestrator())
+            .count(),
+        2,
+        "both orchestrator rows survive"
+    );
+    assert_eq!(
+        app.plans[first].planned_nodes.len(),
+        1,
+        "the first plan's queue survives a second plan starting"
+    );
+}
+
+#[test]
+fn a_node_resolves_to_its_own_plan_not_the_selected_one() {
+    let mut app = App::new();
+    app.cwd = std::env::temp_dir();
+    let first = app.active_plan_index();
+    let second = add_test_plan(&mut app);
+
+    // Same node id in both plans: a launched worker in the second, a queued node in
+    // the first. Only the run's own stamp can tell them apart.
+    app.adopt_plan_nodes(first, vec![test_planned_node("shared", &[])]);
+    let mut worker = node_agent("shared", AgentStatus::Running);
+    worker.plan_id = Some(app.plans[second].id.clone());
+    app.agents.push(worker);
+
+    assert_eq!(app.plan_index_for_node("shared"), second);
+
+    // Selecting the first plan's orchestrator does not move the node.
+    let orch = push_test_orchestrator(&mut app, "orch-1", first);
+    app.selected_agent = orch;
+    assert_eq!(app.active_plan_index(), first);
+    assert_eq!(app.plan_index_for_node("shared"), second);
+}
+
+#[test]
+fn talking_to_one_orchestrator_pane_leaves_the_other_plan_alone() {
+    let mut app = App::new();
+    app.cwd = std::env::temp_dir();
+    let first = app.active_plan_index();
+    app.adopt_plan_nodes(first, vec![test_planned_node("n0", &[])]);
+    app.plans[first].awaiting_approval = true;
+    let first_orch = push_test_orchestrator(&mut app, "orch-1", first);
+
+    let second = add_test_plan(&mut app);
+    app.adopt_plan_nodes(second, vec![test_planned_node("n0", &[])]);
+    app.plans[second].awaiting_approval = true;
+    let second_orch = push_test_orchestrator(&mut app, "orch-2", second);
+
+    // Empty Enter in the SECOND orchestrator's pane approves the SECOND plan only.
+    app.selected_agent = second_orch;
+    assert_eq!(app.active_plan_index(), second);
+    app.approve_planned_queue();
+
+    assert!(
+        !app.plans[second].awaiting_approval,
+        "the pane the user typed into is the plan that approved"
+    );
+    assert!(
+        app.plans[first].awaiting_approval,
+        "the other plan is still waiting at its own gate"
+    );
+
+    // And selecting the first orchestrator resolves back to the first plan.
+    app.selected_agent = first_orch;
+    assert_eq!(app.active_plan_index(), first);
+    assert!(app.plan().awaiting_approval);
+}
+
+#[test]
+fn the_scheduler_launches_each_plan_from_its_own_queue() {
+    let mut app = App::new();
+    app.cwd = std::env::temp_dir();
+    let first = app.active_plan_index();
+    let second = add_test_plan(&mut app);
+    // Each plan holds one node that hard-depends on an id the OTHER plan merged.
+    app.adopt_plan_nodes(first, vec![test_planned_node("a", &["gate"])]);
+    app.adopt_plan_nodes(second, vec![test_planned_node("b", &["gate"])]);
+    app.plans[second]
+        .plan_merged_node_ids
+        .insert("gate".to_string());
+    app.plans[second]
+        .plan_launched_node_ids
+        .insert("gate".to_string());
+
+    // The second plan's node is ready (its own dep merged). The first plan's dep is
+    // unknown TO IT, which `is_ready` treats as satisfied — never as the other plan's
+    // merge. Both are launchable, and each from its own queue position.
+    assert_eq!(app.next_node_to_launch_in(first, 4), Some(0));
+    assert_eq!(app.next_node_to_launch_in(second, 4), Some(0));
+
+    // A node already launched in ITS plan is not re-picked; the other plan is unaffected.
+    app.plans[first]
+        .plan_launched_node_ids
+        .insert("a".to_string());
+    assert_eq!(app.next_node_to_launch_in(first, 4), None);
+    assert_eq!(app.next_node_to_launch_in(second, 4), Some(0));
+}
+
+#[test]
+fn each_plan_runs_its_own_final_gate() {
+    let mut app = App::new();
+    app.cwd = std::env::temp_dir();
+    let first = app.active_plan_index();
+    let second = add_test_plan(&mut app);
+    app.plans[first]
+        .plan_launched_node_ids
+        .insert("a".to_string());
+    app.plans[first]
+        .plan_merged_node_ids
+        .insert("a".to_string());
+    app.plans[second]
+        .plan_launched_node_ids
+        .insert("b".to_string());
+    // The second plan still has unmerged work, so only the first plan gates.
+    app.maybe_start_final_gate();
+    assert_eq!(app.plans[first].final_gate_status, FinalGateStatus::Running);
+    assert_eq!(app.plans[second].final_gate_status, FinalGateStatus::Idle);
+
+    // The verdict is routed back by plan id, never to whichever plan is selected.
+    app.final_gate_tx
+        .send(FinalGateResult {
+            plan_id: app.plans[first].id.clone(),
+            passed: true,
+            summary: "checks passed".to_string(),
+        })
+        .unwrap();
+    app.poll_final_gate();
+    assert_eq!(app.plans[first].final_gate_status, FinalGateStatus::Passed);
+    assert_eq!(app.plans[second].final_gate_status, FinalGateStatus::Idle);
+}
+
+#[test]
+fn plan_queue_snapshot_round_trips_every_plan_and_reads_the_legacy_shape() {
+    let mut app = App::new();
+    let first = app.active_plan_index();
+    app.adopt_plan_nodes(first, vec![test_planned_node("n0", &[])]);
+    let second = add_test_plan(&mut app);
+    app.adopt_plan_nodes(second, vec![test_planned_node("n1", &[])]);
+
+    let file = PlanQueueFile {
+        plans: app.plans.iter().map(PlanQueueSnapshot::from_plan).collect(),
+    };
+    let raw = serde_json::to_string(&file).unwrap();
+    let restored = PlanQueueFile::parse(&raw).unwrap().into_plans();
+    assert_eq!(restored.len(), 2, "both plans survive a restart");
+    assert_eq!(restored[0].planned_nodes[0].id, "n0");
+    assert_eq!(restored[1].planned_nodes[0].id, "n1");
+    assert_eq!(restored[0].id, app.plans[first].id);
+    assert_eq!(restored[1].id, app.plans[second].id);
+
+    // A queue written before plans could coexist is a bare snapshot at the top level;
+    // it must resume as one plan rather than being dropped.
+    let legacy = serde_json::to_string(&PlanQueueSnapshot {
+        planned_nodes: vec![test_planned_node("n0", &[])],
+        awaiting_approval: true,
+        ..PlanQueueSnapshot::default()
+    })
+    .unwrap();
+    let restored = PlanQueueFile::parse(&legacy).unwrap().into_plans();
+    assert_eq!(restored.len(), 1);
+    assert_eq!(restored[0].planned_nodes[0].id, "n0");
+    assert!(restored[0].awaiting_approval);
+    assert!(!restored[0].id.is_empty(), "a legacy plan is given an id");
+}
+
+#[test]
+fn a_single_plan_still_claims_runs_that_carry_no_plan_id() {
+    // Runs persisted before plans had ids have no stamp. With one plan there is only
+    // one possible owner, so the single-plan session must behave exactly as before.
+    let mut app = App::new();
+    app.cwd = std::env::temp_dir();
+    let only = app.active_plan_index();
+    app.agents.push(node_agent("n0", AgentStatus::Running));
+    assert_eq!(app.active_plan_agents().count(), 1);
+    assert!(app.plan_is_active());
+    assert_eq!(
+        app.spent_plan_index(),
+        None,
+        "live work is not a spent plan"
+    );
+
+    // Add a second plan and the unstamped run belongs to neither: with two candidates
+    // there is no honest answer, so it is not silently attributed.
+    let second = add_test_plan(&mut app);
+    assert_eq!(app.plan_agents(only).count(), 0);
+    assert_eq!(app.plan_agents(second).count(), 0);
+}
+
+#[test]
+fn a_run_record_round_trips_its_owning_plan() {
+    // Node ids repeat across concurrent plans, so a restart that lost `planId` could
+    // not tell whose node a restored `nodeId` names.
+    let repo = unique_test_repo("plan-id-round-trip");
+    std::fs::create_dir_all(&repo).unwrap();
+    let mut run = node_agent("n0", AgentStatus::Running);
+    run.cwd = repo.clone();
+    run.plan_id = Some("plan-7".to_string());
+    save_native_run_record(&repo, &run).unwrap();
+
+    let loaded = load_persisted_agents(&repo);
+    let restored = loaded
+        .iter()
+        .find(|r| r.id == run.id)
+        .expect("the record reloads");
+    assert_eq!(restored.plan_id.as_deref(), Some("plan-7"));
+    assert_eq!(restored.node_id.as_deref(), Some("n0"));
+
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+#[test]
+fn concurrent_plans_each_keep_their_orchestrator_across_a_reload() {
+    // The reload path used to keep exactly ONE orchestrator row overall, which was
+    // correct while only one plan could exist. With concurrent plans it silently
+    // collapsed them: two orchestrators worked in memory and came back as one after
+    // any restart, taking the second plan's pane - and the only way to steer it -
+    // with it. Every in-memory test still passed, because none of them reloaded.
+    let repo_root = std::env::temp_dir().join(format!(
+        "rudder-two-plan-reload-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&repo_root).expect("create test repo root");
+
+    // Two live plans, each with its own pinned orchestrator, plus an older planner
+    // row belonging to plan A (what a refine leaves behind) that must NOT come back.
+    let mut older_a = test_agent_run("orch-a-old", "plan A, before refine");
+    older_a.mode = AgentMode::RudderPlan;
+    older_a.plan_id = Some("plan-a".to_string());
+    older_a.created_at = "2026-01-01T00:00:00Z".to_string();
+    save_native_run_record(&repo_root, &older_a).expect("save older plan A planner");
+
+    let mut orch_a = test_agent_run("orch-a", "plan A");
+    orch_a.mode = AgentMode::RudderPlan;
+    orch_a.plan_id = Some("plan-a".to_string());
+    orch_a.created_at = "2026-02-01T00:00:00Z".to_string();
+    save_native_run_record(&repo_root, &orch_a).expect("save plan A planner");
+
+    let mut orch_b = test_agent_run("orch-b", "plan B");
+    orch_b.mode = AgentMode::RudderPlan;
+    orch_b.plan_id = Some("plan-b".to_string());
+    orch_b.created_at = "2026-03-01T00:00:00Z".to_string();
+    save_native_run_record(&repo_root, &orch_b).expect("save plan B planner");
+
+    let loaded = load_persisted_agents(&repo_root);
+    let orchestrators: Vec<&AgentRun> =
+        loaded.iter().filter(|run| run.is_orchestrator()).collect();
+
+    assert_eq!(
+        orchestrators.len(),
+        2,
+        "both plans keep an orchestrator: {:?}",
+        orchestrators
+            .iter()
+            .map(|run| (&run.id, &run.plan_id))
+            .collect::<Vec<_>>()
+    );
+    let plan_ids: HashSet<Option<String>> = orchestrators
+        .iter()
+        .map(|run| run.plan_id.clone())
+        .collect();
+    assert!(plan_ids.contains(&Some("plan-a".to_string())));
+    assert!(plan_ids.contains(&Some("plan-b".to_string())));
+    // One per plan, newest wins: the pre-refine row for plan A stays gone.
+    assert!(
+        !orchestrators.iter().any(|run| run.id == "orch-a-old"),
+        "a superseded planner row for the same plan does not come back"
+    );
+
+    let _ = fs::remove_dir_all(&repo_root);
 }

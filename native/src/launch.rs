@@ -315,10 +315,7 @@ pub(crate) fn rudder_plan_refine_command(
         // the next turn; there is no headless streaming mode to parse, so the
         // revised plan block is read out of the pane exactly like the first turn.
         Backend::Opencode => {
-            let mut args = vec![
-                "--session".to_string(),
-                session_id.to_string(),
-            ];
+            let mut args = vec!["--session".to_string(), session_id.to_string()];
             push_opencode_model(&mut args, model);
             if !feedback_prompt.trim().is_empty() {
                 args.push("--prompt".to_string());
@@ -671,10 +668,7 @@ pub(crate) fn rudder_orchestrator_resume_command(
                 .with_env("CODEX_RUDDER_SCROLLBACK_SAFE", "1")
         }
         Backend::Opencode => {
-            let mut args = vec![
-                "--session".to_string(),
-                session_id.to_string(),
-            ];
+            let mut args = vec!["--session".to_string(), session_id.to_string()];
             push_opencode_model(&mut args, model);
             if !continuation.trim().is_empty() {
                 args.push("--prompt".to_string());
@@ -857,6 +851,7 @@ pub(crate) fn review_all_run(
         deps: Vec::new(),
         soft_deps: Vec::new(),
         node_id: None,
+        plan_id: None,
         reconcile_planner: false,
         plan_stream: None,
         plan_output_cache: None,
