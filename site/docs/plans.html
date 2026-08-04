@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Plans and the DAG — Rudder docs</title>
-    <meta name="description" content="When a goal needs several steps in a particular order, /plan gives you an orchestrator: it proposes a task graph, you edit it, then it runs and merges the nodes as their dependencies land." />
+    <meta name="description" content="When a goal needs several steps in a particular order, /plan gives you an orchestrator: it proposes a task graph, you edit it, then it runs and merges the nodes as their dependencies land. Several plans can run at once, each in its own pane." />
     <link rel="canonical" href="https://rudder.viraat.dev/docs/plans" />
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <meta name="theme-color" content="#ffffff" />
@@ -55,12 +55,19 @@
 
       <main class="docs-main" id="main">
         <h1>Plans and the DAG</h1>
-        <p class="docs-lede">When a goal needs several steps in a particular order, /plan gives you an orchestrator: it proposes a task graph, you edit it, then it runs and merges the nodes as their dependencies land.</p>
+        <p class="docs-lede">When a goal needs several steps in a particular order, /plan gives you an orchestrator: it proposes a task graph, you edit it, then it runs and merges the nodes as their dependencies land. Several plans can run at once, each in its own pane.</p>
 <h2 id="start">Starting a plan</h2>
 <pre><code>/plan add billing with Stripe, including the webhook handler</code></pre>
 <p>A read-only planner inspects the repository, asks a round of questions if the goal
 is ambiguous, and proposes a graph of tasks. <strong>Nothing is written to your code
 until you approve it.</strong></p>
+<p>Run <code>/plan</code> again for a different goal and you get a
+<strong>second orchestrator beside the first</strong>, with its own graph, its own
+pane, and its own workspaces. The two do not share state and merge independently; if
+they touch the same files, that is an ordinary merge conflict, handled the same way
+as any other. A plan that is finished - nothing queued, nothing running, nothing at
+the gate - is reused rather than piling up, so repeatedly planning does not leave a
+row per past goal.</p>
 
 <h2 id="edit">Editing before it runs</h2>
 <p>The plan is a draft, not a verdict. Press <kbd>v</kbd> on the orchestrator to open
@@ -84,7 +91,8 @@ in parallel does, and the plan blocks only where one task truly depends on anoth
 <p>As each node merges, its children unblock and launch on their own.</p>
 
 <h2 id="steer">Steering a running plan</h2>
-<p>Talk to the orchestrator's own pane. Select the orchestrator row, type into it, and
+<p>Talk to the orchestrator's own pane. With several plans running, the pane is what
+says which plan you mean, so a message reaches that plan and no other. Select the orchestrator row, type into it, and
 it will add tasks, re-plan structurally, stop or re-goal specific workers, or explain
 what is happening.</p>
 

@@ -257,7 +257,7 @@ sometimes what you want; managing what they do to each other is yours.</p>
 
   plans: {
     title: "Plans and the DAG",
-    lede: "When a goal needs several steps in a particular order, /plan gives you an orchestrator: it proposes a task graph, you edit it, then it runs and merges the nodes as their dependencies land.",
+    lede: "When a goal needs several steps in a particular order, /plan gives you an orchestrator: it proposes a task graph, you edit it, then it runs and merges the nodes as their dependencies land. Several plans can run at once, each in its own pane.",
     toc: [
       ["start", "Starting a plan"],
       ["edit", "Editing before it runs"],
@@ -270,6 +270,13 @@ sometimes what you want; managing what they do to each other is yours.</p>
 <p>A read-only planner inspects the repository, asks a round of questions if the goal
 is ambiguous, and proposes a graph of tasks. <strong>Nothing is written to your code
 until you approve it.</strong></p>
+<p>Run <code>/plan</code> again for a different goal and you get a
+<strong>second orchestrator beside the first</strong>, with its own graph, its own
+pane, and its own workspaces. The two do not share state and merge independently; if
+they touch the same files, that is an ordinary merge conflict, handled the same way
+as any other. A plan that is finished - nothing queued, nothing running, nothing at
+the gate - is reused rather than piling up, so repeatedly planning does not leave a
+row per past goal.</p>
 
 <h2 id="edit">Editing before it runs</h2>
 <p>The plan is a draft, not a verdict. Press <kbd>v</kbd> on the orchestrator to open
@@ -293,7 +300,8 @@ in parallel does, and the plan blocks only where one task truly depends on anoth
 <p>As each node merges, its children unblock and launch on their own.</p>
 
 <h2 id="steer">Steering a running plan</h2>
-<p>Talk to the orchestrator's own pane. Select the orchestrator row, type into it, and
+<p>Talk to the orchestrator's own pane. With several plans running, the pane is what
+says which plan you mean, so a message reaches that plan and no other. Select the orchestrator row, type into it, and
 it will add tasks, re-plan structurally, stop or re-goal specific workers, or explain
 what is happening.</p>
 
@@ -320,7 +328,7 @@ what is happening.</p>
   <thead><tr><th>input</th><th>result</th></tr></thead>
   <tbody>
     <tr><td>plain text</td><td>One isolated agent in its own workspace. The default, and the only thing that cannot touch your checkout.</td></tr>
-    <tr><td>/plan &lt;goal&gt;</td><td>An orchestrator that plans a task graph, then runs and merges it.</td></tr>
+    <tr><td>/plan &lt;goal&gt;</td><td>An orchestrator that plans a task graph, then runs and merges it. Several can run at once, each in its own pane.</td></tr>
     <tr><td>/main &lt;task&gt;</td><td>An agent in your real checkout. Nothing to merge. <code>/m</code> is the same thing.</td></tr>
   </tbody>
 </table>
