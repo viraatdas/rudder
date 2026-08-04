@@ -829,6 +829,7 @@ pub(crate) fn review_all_run(
         workspace_name: worktree.workspace_name.clone(),
         jj_change_id: worktree.jj_change_id.clone(),
         integration: IntegrationEvidence::default(),
+        publish: PublishEvidence::default(),
         delivery: DeliveryEvidence::default(),
         session_id,
         terminal: None,

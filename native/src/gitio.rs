@@ -242,6 +242,7 @@ pub(crate) fn create_main_agent(
         workspace_name: None,
         jj_change_id: None,
         integration: IntegrationEvidence::default(),
+        publish: PublishEvidence::default(),
         delivery: DeliveryEvidence::for_task(prompt),
         session_id: None,
         terminal: None,
@@ -475,6 +476,7 @@ pub(crate) fn agent_from_run_record(
         .filter(|value| !value.trim().is_empty())
         .map(ToOwned::to_owned);
     let integration = integration_evidence_from_record(&record);
+    let publish = publish_evidence_from_record(&record);
     let delivery = record
         .get("delivery")
         .and_then(|value| DeliveryEvidence::from_json(value, true))
@@ -637,6 +639,7 @@ pub(crate) fn agent_from_run_record(
         workspace_name,
         jj_change_id,
         integration,
+        publish,
         delivery,
         session_id,
         terminal: None,
@@ -1032,6 +1035,27 @@ pub(crate) fn save_native_run_record(repo_root: &Path, run: &AgentRun) -> Result
     if run.terminal.is_none() && run.status != AgentStatus::Running {
         if let Some(map) = record.as_object_mut() {
             map.remove("process");
+        }
+    }
+    // What Rudder DID when it published this row: the branch it pushed and the PR
+    // it opened. Only the identity is written. The PR's state (draft/open/merged)
+    // is GitHub's to answer and is re-derived on a poll, so persisting it here
+    // would be exactly the stale-cached-answer failure §12.7 exists to prevent.
+    if run.publish.is_published() || run.publish.branch.is_some() {
+        let mut published = serde_json::json!({});
+        if let Some(map) = published.as_object_mut() {
+            if let Some(branch) = run.publish.branch.as_ref() {
+                map.insert("branch".to_string(), serde_json::json!(branch));
+            }
+            if let Some(number) = run.publish.number {
+                map.insert("number".to_string(), serde_json::json!(number));
+            }
+            if let Some(url) = run.publish.url.as_ref() {
+                map.insert("url".to_string(), serde_json::json!(url));
+            }
+        }
+        if let Some(map) = record.as_object_mut() {
+            map.insert("publish".to_string(), published);
         }
     }
     // Best-effort token usage captured from the backend's session log at

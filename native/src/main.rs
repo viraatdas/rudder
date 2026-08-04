@@ -74,6 +74,8 @@ mod perf;
 use crate::perf::*;
 mod lifecycle;
 use crate::lifecycle::*;
+mod publish;
+use crate::publish::*;
 mod handoff;
 use crate::handoff::*;
 mod plan_stream;
@@ -760,6 +762,22 @@ struct App {
     /// merged agent has to be noticed promptly, so a rise here resets the backoff
     /// rather than leaving the new row's push badge stale for minutes.
     remote_state_watched: usize,
+    /// Whether this repo publishes reviewed work as pull requests instead of
+    /// merging it locally. `Unknown` until the first probe lands — deliberately
+    /// distinct from `Inactive`, because treating "not asked yet" as "cannot
+    /// publish" would make the first `m` after launch take the wrong road.
+    publish: PublishState,
+    publish_probe_rx: Option<mpsc::Receiver<PublishState>>,
+    /// Detection spawns up to four processes, two of them network round-trips, to
+    /// re-learn an answer (gh installed? logged in? which remote?) that changes
+    /// roughly never. Backed off per AGENTS.md 12.8.
+    publish_probe_interval: Duration,
+    last_publish_probe: Option<Instant>,
+    /// PR state (draft/open/merged) is GitHub's answer, re-derived rather than
+    /// stored (12.7). One `gh pr list` covers every published row.
+    publish_pr_state_rx: Option<mpsc::Receiver<HashMap<u64, String>>>,
+    publish_pr_state_interval: Duration,
+    last_publish_pr_state: Option<Instant>,
     /// Cadence gate for the merged-workspace GC sweep (gc_merged_workspaces).
     last_worktree_gc: Instant,
     /// Throttle for the web-board steer inbox poll (.rudder/steer/*.json): checked
@@ -881,9 +899,14 @@ struct CloudWorkspaceStatus {
     idle_minutes: Option<u32>,
 }
 
+#[derive(Debug)]
 enum MergeIntent {
     Selected { id: String, task: String },
     All { ids: Vec<String> },
+    /// The FIRST publish in a repo. Publishing is otherwise unprompted, so this
+    /// intent exists only to carry that one-time consent: accepting it records the
+    /// acceptance for the remote and then publishes.
+    Publish { id: String, task: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -946,6 +969,11 @@ struct AgentRun {
     /// merge/sync through jj for new (vcs:jj) runs.
     jj_change_id: Option<String>,
     integration: IntegrationEvidence,
+    /// What happened when this row was published as a pull request: the branch,
+    /// the PR number and its url. Empty on a repo where publishing is inactive
+    /// (there `m` merges locally and no PR ever exists). The PR's STATE is not in
+    /// here as stored data — see `PublishEvidence`.
+    publish: PublishEvidence,
     /// First-class outcome evidence for an explicitly requested push/deploy,
     /// orthogonal to process status and local jj integration.
     delivery: DeliveryEvidence,
@@ -1694,6 +1722,13 @@ impl App {
             last_remote_state_check: Instant::now(),
             remote_state_interval: REMOTE_STATE_BASE_INTERVAL,
             remote_state_watched: 0,
+            publish: PublishState::Unknown,
+            publish_probe_rx: None,
+            publish_probe_interval: PUBLISH_PROBE_BASE_INTERVAL,
+            last_publish_probe: None,
+            publish_pr_state_rx: None,
+            publish_pr_state_interval: PUBLISH_PR_STATE_BASE_INTERVAL,
+            last_publish_pr_state: None,
             last_worktree_gc: Instant::now(),
             last_steer_poll: Instant::now(),
             last_heartbeat_emit: Instant::now(),
@@ -4942,6 +4977,7 @@ impl App {
             workspace_name: None,
             jj_change_id: None,
             integration: IntegrationEvidence::default(),
+            publish: PublishEvidence::default(),
             delivery: DeliveryEvidence::default(),
             session_id,
             terminal: None,
@@ -5123,6 +5159,7 @@ impl App {
             workspace_name: worktree.workspace_name.clone(),
             jj_change_id: worktree.jj_change_id.clone(),
             integration: IntegrationEvidence::default(),
+            publish: PublishEvidence::default(),
             delivery: DeliveryEvidence::for_task(&goal_prompt),
             session_id,
             terminal: None,
@@ -5293,6 +5330,7 @@ impl App {
             workspace_name: None,
             jj_change_id: None,
             integration: IntegrationEvidence::default(),
+            publish: PublishEvidence::default(),
             delivery: DeliveryEvidence::default(),
             session_id,
             terminal: None,
@@ -7594,6 +7632,7 @@ impl App {
             workspace_name: None,
             jj_change_id: None,
             integration: IntegrationEvidence::default(),
+            publish: PublishEvidence::default(),
             delivery: DeliveryEvidence::default(),
             session_id: None,
             terminal: None,
@@ -11835,6 +11874,7 @@ impl App {
             workspace_name: worktree.workspace_name.clone(),
             jj_change_id: worktree.jj_change_id.clone(),
             integration: IntegrationEvidence::default(),
+            publish: PublishEvidence::default(),
             delivery: DeliveryEvidence::default(),
             // The fork mints its own fresh session id (Claude --fork-session prints
             // it; Codex records it under the fork's cwd, discovered at completion).
@@ -12074,6 +12114,43 @@ impl App {
                 Some("read the diff, then press m again to merge · Esc goes back".to_string());
             return;
         }
+        // THE FORK IN THE ROAD. Where publishing can work, this row's route to main
+        // is a pull request and NOT a local merge; where it cannot, it is the local
+        // merge below. Exactly one of the two runs for a given row, ever — two roads
+        // would mean the same work landing twice by two mechanisms with no single
+        // place to look for "did this ship?".
+        match self.merge_route_for(self.selected_agent) {
+            // Rudder has never pushed to a remote, so the first publish in a repo
+            // says exactly what it is about to do, to which remote and on which
+            // branch. Once accepted, this repo never asks again.
+            MergeRoute::ConfirmFirstPublish => {
+                let detail = self.publish_first_time_detail(self.selected_agent);
+                self.merge_confirm = Some(MergeConfirmation {
+                    intent: MergeIntent::Publish {
+                        id: run.id.clone(),
+                        task: run.task.clone(),
+                    },
+                    detail,
+                });
+                self.conflict_prompt = None;
+                self.notice = None;
+                return;
+            }
+            MergeRoute::Publish => {
+                let index = self.selected_agent;
+                self.publish_agent_at(index);
+                return;
+            }
+            MergeRoute::Checking => {
+                // One road or the other, but not a guess. The probe resolves within
+                // a second or two of launch, so this is a wait, not a wall.
+                self.notice =
+                    Some("checking whether this repo publishes · press m again".to_string());
+                self.dirty = true;
+                return;
+            }
+            MergeRoute::LocalMerge => {}
+        }
         // Merges run with --allow-dirty: uncommitted edits in the main checkout
         // become part of the merge parent. Surprising enough to warn about in
         // the modal instead of discovering it in the merge commit.
@@ -12232,6 +12309,16 @@ impl App {
                         );
                     }
                 }
+            }
+            MergeIntent::Publish { id, .. } => {
+                let Some(index) = self.agents.iter().position(|run| run.id == id) else {
+                    self.notice = Some("selected agent no longer exists".to_string());
+                    return;
+                };
+                self.delete_pending = None;
+                // `publish_agent_at` records the acceptance, so this repo goes
+                // straight to publishing from here on.
+                self.publish_agent_at(index);
             }
             MergeIntent::All { ids } => {
                 let total = ids.len();
@@ -13502,6 +13589,11 @@ What to do\n\
             self.refresh_remote_integration_state();
             self.last_remote_state_check = Instant::now();
         }
+
+        // Both of these own their own cadence and do their work on a background
+        // thread; calling them every tick only drains a channel.
+        self.maybe_refresh_publish_capability();
+        self.maybe_refresh_publish_pr_state();
 
         if self.last_worktree_gc.elapsed() >= Duration::from_secs(60) {
             self.gc_merged_workspaces();

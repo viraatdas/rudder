@@ -247,11 +247,11 @@ pub(crate) fn push_agent_row_with_trailing<'a>(
     first.extend(trailing.iter().cloned());
     lines.push(ListItem::new(Line::from(first)));
 
-    let (status_label, status_style): (&'static str, Style) =
+    let (status_label, status_style): (String, Style) =
         if agent.is_main() && agent.terminal.is_none() {
-            ("idle", muted_style(focused))
+            ("idle".to_string(), muted_style(focused))
         } else {
-            (agent_status_label(agent), agent_status_style(agent))
+            (agent_status_text(agent), agent_status_style(agent))
         };
     let badge_style = Style::default().fg(status_style.fg.unwrap_or(MUTED));
 
@@ -3931,8 +3931,10 @@ pub(crate) fn render_merge_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) 
     ) =
         &app.merge_confirm
     {
+        let publishing = matches!(confirm.intent, MergeIntent::Publish { .. });
         let headline = match &confirm.intent {
             MergeIntent::Selected { task, .. } => format!("Merge:  {}", short_task(task)),
+            MergeIntent::Publish { task, .. } => format!("Publish:  {}", short_task(task)),
             MergeIntent::All { ids } => format!(
                 "Merge {} completed worktree{}",
                 ids.len(),
@@ -3946,10 +3948,23 @@ pub(crate) fn render_merge_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) 
         let mut lines = vec![
             Line::from(Span::styled(headline, app_style())),
             Line::from(""),
-            key_choice_line(&[("y", "merge"), ("Esc", "cancel")]),
+            key_choice_line(&[
+                (
+                    "y",
+                    if publishing { "push and open PR" } else { "merge" },
+                ),
+                ("Esc", "cancel"),
+            ]),
             Line::from(""),
             Line::from(Span::styled(
-                "Dependent nodes unblock once it lands. A clean merge is mechanical (no AI); on conflict you can launch an AI resolver or resolve it yourself.",
+                if publishing {
+                    // The detail line below names the remote and branch. This one
+                    // says what the answer commits the repo to, because the prompt
+                    // is asked exactly once per repo.
+                    "The PR opens as a draft. Rudder will not ask again for this repo; from here on m publishes instead of merging locally."
+                } else {
+                    "Dependent nodes unblock once it lands. A clean merge is mechanical (no AI); on conflict you can launch an AI resolver or resolve it yourself."
+                },
                 muted_style(true),
             )),
         ];
@@ -3963,7 +3978,11 @@ pub(crate) fn render_merge_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) 
 
         (
             Span::styled(
-                " Confirm merge · y merges · Esc cancels ",
+                if publishing {
+                    " First publish · y pushes and opens a draft PR · Esc cancels "
+                } else {
+                    " Confirm merge · y merges · Esc cancels "
+                },
                 Style::default().fg(ACCENT),
             ),
             lines,
@@ -4452,6 +4471,16 @@ pub(crate) fn page_scroll_rows(area: Option<Rect>) -> isize {
 
 pub(crate) fn status_style(status: AgentStatus) -> Style {
     Style::default().fg(status_color(status))
+}
+
+/// The status a row actually shows. A published row's PR outranks every local
+/// label: once the work is a pull request, "done · press m to read the diff" is a
+/// stale instruction and `PR #123 · draft` is where the work now lives.
+pub(crate) fn agent_status_text(agent: &AgentRun) -> String {
+    if let Some(label) = agent.publish.label() {
+        return label;
+    }
+    agent_status_label(agent).to_string()
 }
 
 pub(crate) fn agent_status_label(agent: &AgentRun) -> &'static str {

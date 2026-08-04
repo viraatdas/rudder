@@ -63,6 +63,7 @@ plus a worker image, used only when a task is handed off to the cloud.
 │   ├── src/cloudio.rs     cloud command plumbing + Codex session-log scanning
 │   ├── src/usage.rs       token-usage accounting, pricing, date helpers
 │   ├── src/lifecycle.rs   integration evidence + final repository-check discovery
+│   ├── src/publish.rs     GitHub publishing: detection, gh/jj argv, DAG -> stacks
 │   ├── src/config.rs      ~/.rudder config + model defaults + update notices
 │   ├── src/textedit.rs    input editing (drafts, history, cursor/word ops)
 │   ├── src/keys.rs        key/mouse event -> terminal byte encoding
@@ -469,7 +470,7 @@ agent whose task is a `/review` over the combined diff. Native no longer creates
 integrates Git worktree branches.
 
 ### Tests
-`native/src/app_tests.rs` holds the dashboard tests (502, plus one `#[ignore]`d live
+`native/src/app_tests.rs` holds the dashboard tests (528, plus one `#[ignore]`d live
 conductor harness; declared `#[cfg(test)] mod app_tests;` in `main.rs`). Includes the
 leader/Option-key coverage: `ctrl_w_leader_then_digit_focuses_pane`,
 `ctrl_w_leader_is_one_shot`, `ctrl_w_leader_escape_cancels_without_action`,
@@ -876,6 +877,54 @@ Anything that changes is written through `App::record_event`, which is
 op). Prose alone could not answer "what happened to this merge?" three hours
 later; these lines join to `jj op log`, which is the only other record of the same
 events. `u` on a merged row undoes exactly that operation via `rudder undo <op>`.
+
+---
+
+## 12.75 Publishing to GitHub (`native/src/publish.rs`)
+
+The second road to main. `m` on a reviewed row either merges locally or opens a
+pull request — **never both for the same row**. `App::merge_route_for` is the one
+place that decision is made, and `MergeRoute` has four answers: `LocalMerge`
+(publishing inactive), `ConfirmFirstPublish`, `Publish`, and `Checking` (the probe
+has not landed; `m` waits rather than guessing a road that cannot be un-taken).
+
+- **Auto-enables when it can work.** No config command. `probe_publish_capability`
+  asks: is `origin` a GitHub url, is `gh` on PATH, does `gh auth status` pass, what
+  does `gh repo view --json nameWithOwner,isFork,defaultBranchRef` say, and is
+  `github/gh-stack` installed. Missing extension or a fork costs STACKING only, not
+  publishing.
+- **Cheap and cached.** The probe runs on a background thread (it makes network
+  round-trips) with the §12.8 backoff, 20s → 600s. PR state (draft/open/merged) is
+  re-derived by ONE `gh pr list --json` covering every published row, not one
+  `gh pr view` per row.
+- **Consent is asked once per remote.** Rudder had never pushed to a remote, so the
+  first publish in a repo shows a modal naming the exact remote, branch and base.
+  The acceptance is recorded in `.rudder/publish.json` against the REMOTE URL, so
+  repointing `origin` asks again — a different remote is a different promise.
+- **Draft, and never the default branch.** `gh pr create --draft`; for stacks,
+  `gh stack submit --auto` WITHOUT `--open` (that is what leaves them drafts).
+  `stage_publish_branch` refuses a subject whose branch resolved to trunk.
+- **A plan is decomposed, not linearized.** `decompose_plan_for_publish` maps the
+  DAG to units: a linear hard chain (parent has exactly one hard child, child
+  exactly one hard parent) becomes one stack bottom-to-top; a JOIN (≥2 hard
+  parents) cannot be stacked and targets trunk; anything else is an independent PR.
+  Stacking parallel work would tell a reviewer PR 2 needs PR 1 first, which is
+  false.
+- **`gh stack sync`, never `gh stack push`.** Push is documented as non-atomic ("a
+  branch may update even if another branch is rejected"); sync pushes with
+  `--force-with-lease --atomic` and restores every branch on a rebase conflict.
+  `classify_stack_sync_failure` turns that safe abort into an actionable notice
+  instead of a blind retry. Stack state is read from `gh stack view --json`, never
+  scraped from its glyph table.
+- **Derive-don't-cache (§12.7).** `PublishEvidence` persists `branch`/`number`/`url`
+  — facts about what Rudder did — and never the PR's state, which is GitHub's
+  answer.
+
+Command CONSTRUCTION is separated from execution (the `launch.rs` split): every
+`gh`/`jj` argv is a pure function asserted in tests, and nothing in the suite
+shells out to real GitHub. Every execution goes through `bounded_output`, which
+spawns, polls `try_wait` against a deadline and kills on overrun — a synchronous
+network call on the 33ms render loop is a freeze, not a slow frame.
 
 ---
 

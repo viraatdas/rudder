@@ -6159,6 +6159,7 @@ fn test_agent_run(id: &str, task: &str) -> AgentRun {
         workspace_name: None,
         jj_change_id: None,
         integration: IntegrationEvidence::default(),
+        publish: PublishEvidence::default(),
         delivery: DeliveryEvidence::default(),
         session_id: None,
         terminal: None,
@@ -7845,6 +7846,7 @@ fn delete_agent_requires_second_d() {
         workspace_name: None,
         jj_change_id: None,
         integration: IntegrationEvidence::default(),
+        publish: PublishEvidence::default(),
         delivery: DeliveryEvidence::default(),
         session_id: None,
         terminal: None,
@@ -15220,4 +15222,549 @@ fn concurrent_plans_each_keep_their_orchestrator_across_a_reload() {
     );
 
     let _ = fs::remove_dir_all(&repo_root);
+}
+
+// ---------------------------------------------------------------------------
+// Publishing reviewed work as pull requests (native/src/publish.rs)
+//
+// Nothing here shells out to GitHub. Command CONSTRUCTION is asserted on its own
+// (the argv is a pure function of the inputs, the launch.rs split), the DAG
+// decomposition is pure, and the routing tests stop at the decision rather than
+// executing it.
+// ---------------------------------------------------------------------------
+
+/// A repo directory nothing else in the suite touches. Publishing records its
+/// per-repo consent inside `.rudder/`, so these tests must not share a root.
+fn publish_test_repo(tag: &str) -> PathBuf {
+    let root = std::env::temp_dir().join(format!(
+        "rudder-publish-{tag}-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&root).expect("create publish test repo");
+    root
+}
+
+fn test_capability() -> PublishCapability {
+    PublishCapability {
+        remote: "origin".to_string(),
+        remote_url: "https://github.com/acme/widgets.git".to_string(),
+        name_with_owner: "acme/widgets".to_string(),
+        default_branch: "main".to_string(),
+        is_fork: false,
+        has_gh_stack: true,
+    }
+}
+
+/// A finished, reviewed workspace row: the exact shape `m` acts on.
+fn publishable_run(id: &str, task: &str) -> AgentRun {
+    let mut run = test_agent_run(id, task);
+    run.status = AgentStatus::Done;
+    run.worktree_path = Some(std::env::temp_dir().join(id));
+    run.workspace_name = Some(format!("rudder-{id}"));
+    run.jj_change_id = Some(format!("change-{id}"));
+    run.reviewed_at = Some("2026-08-04T00:00:00Z".to_string());
+    run
+}
+
+#[test]
+fn publishing_replaces_local_merge_when_it_is_active() {
+    // The whole point: one road to main. Where publishing works, `m` on a reviewed
+    // row opens a PR and the local merge never runs.
+    let repo = publish_test_repo("replaces");
+    let mut app = App::new();
+    app.cwd = repo.clone();
+    app.publish = PublishState::Active(test_capability());
+    app.agents.push(publishable_run("run-1", "add the widget"));
+
+    // Never asked before, so the first press asks.
+    assert_eq!(app.merge_route_for(0), MergeRoute::ConfirmFirstPublish);
+    app.request_merge_selected_agent();
+    match app.merge_confirm.as_ref().map(|c| &c.intent) {
+        Some(MergeIntent::Publish { id, .. }) => assert_eq!(id, "run-1"),
+        other => panic!("publishing routes to the publish confirmation, got {other:?}"),
+    }
+
+    // Accepted: from here the row publishes, and the LOCAL merge intent is never
+    // reachable for it again.
+    record_publish_acceptance(&repo, "https://github.com/acme/widgets.git").expect("record");
+    assert_eq!(app.merge_route_for(0), MergeRoute::Publish);
+
+    let _ = fs::remove_dir_all(&repo);
+}
+
+#[test]
+fn local_merge_still_happens_when_publishing_is_inactive() {
+    // A repo with no GitHub remote (or no gh) behaves exactly as it always has:
+    // `m` on a reviewed row opens the local merge confirmation.
+    let repo = publish_test_repo("inactive");
+    let mut app = App::new();
+    app.cwd = repo.clone();
+    app.publish = PublishState::Inactive(PublishBlocker::NotGitHub);
+    app.agents.push(publishable_run("run-1", "add the widget"));
+
+    assert_eq!(app.merge_route_for(0), MergeRoute::LocalMerge);
+    app.request_merge_selected_agent();
+    match app.merge_confirm.as_ref().map(|c| &c.intent) {
+        Some(MergeIntent::Selected { id, .. }) => assert_eq!(id, "run-1"),
+        other => panic!("an inactive repo still merges locally, got {other:?}"),
+    }
+
+    let _ = fs::remove_dir_all(&repo);
+}
+
+#[test]
+fn a_repo_that_cannot_publish_says_why_rather_than_that_it_failed() {
+    // "publishing is not active" tells someone who expected a PR nothing. The
+    // blocker names the problem and the fix.
+    let logged_out = PublishBlocker::GhUnauthenticated.explain();
+    assert!(logged_out.contains("gh auth login"), "{logged_out}");
+    let missing = PublishBlocker::GhMissing.explain();
+    assert!(missing.contains("merges locally"), "{missing}");
+}
+
+#[test]
+fn the_first_publish_confirmation_fires_once_per_repo_and_not_again() {
+    // Rudder has never pushed to a remote, so the first time must not be silent —
+    // and every time after it must not nag.
+    let repo = publish_test_repo("consent");
+    let mut app = App::new();
+    app.cwd = repo.clone();
+    app.publish = PublishState::Active(test_capability());
+    app.agents.push(publishable_run("run-1", "add the widget"));
+
+    let detail = app
+        .publish_first_time_detail(0)
+        .expect("the first publish in a repo is confirmed");
+    // It NAMES the remote and the branch. A prompt that says "push?" without
+    // saying where is not consent to anything in particular.
+    assert!(detail.contains("origin"), "{detail}");
+    assert!(
+        detail.contains("https://github.com/acme/widgets.git"),
+        "{detail}"
+    );
+    assert!(detail.contains("rudder/"), "{detail}");
+    assert!(detail.contains("main"), "{detail}");
+
+    record_publish_acceptance(&repo, "https://github.com/acme/widgets.git").expect("record");
+    assert!(
+        app.publish_first_time_detail(0).is_none(),
+        "an accepted repo never asks again"
+    );
+    assert!(app.publish_accepted());
+
+    // A repointed origin is a different promise, so consent does not carry over.
+    app.publish = PublishState::Active(PublishCapability {
+        remote_url: "https://github.com/acme/other.git".to_string(),
+        ..test_capability()
+    });
+    assert!(
+        app.publish_first_time_detail(0).is_some(),
+        "consent is recorded against the remote, not just the directory"
+    );
+
+    let _ = fs::remove_dir_all(&repo);
+}
+
+#[test]
+fn a_join_node_is_never_stacked() {
+    // n2 hard-depends on BOTH n0 and n1. A stack has exactly one base, so there is
+    // no branch for n2 to sit on: its PR targets the default branch and waits for
+    // its parents' PRs to merge.
+    let nodes = vec![
+        ("n0".to_string(), vec![]),
+        ("n1".to_string(), vec![]),
+        ("n2".to_string(), vec!["n0".to_string(), "n1".to_string()]),
+    ];
+    let units = decompose_plan_for_publish(&nodes);
+    let join = units
+        .iter()
+        .find(|unit| unit.ids == vec!["n2".to_string()])
+        .expect("the join node is its own unit");
+    assert_eq!(join.kind, PublishUnitKind::Join);
+    assert!(
+        units.iter().all(|unit| unit.kind != PublishUnitKind::Stack),
+        "a fan-in produces no stack: {units:?}"
+    );
+}
+
+#[test]
+fn independent_nodes_are_never_linearized_into_a_stack() {
+    // Three nodes with no hard edge between them are genuinely parallel. Stacking
+    // them would tell a reviewer PR 2 needs PR 1 first, which is false.
+    let nodes = vec![
+        ("n0".to_string(), vec![]),
+        ("n1".to_string(), vec![]),
+        ("n2".to_string(), vec![]),
+    ];
+    let units = decompose_plan_for_publish(&nodes);
+    assert_eq!(units.len(), 3);
+    assert!(
+        units
+            .iter()
+            .all(|unit| unit.kind == PublishUnitKind::Independent && unit.ids.len() == 1),
+        "no stack is invented: {units:?}"
+    );
+}
+
+#[test]
+fn a_linear_hard_chain_becomes_one_stack_bottom_to_top() {
+    let nodes = vec![
+        ("n0".to_string(), vec![]),
+        ("n1".to_string(), vec!["n0".to_string()]),
+        ("n2".to_string(), vec!["n1".to_string()]),
+    ];
+    let units = decompose_plan_for_publish(&nodes);
+    assert_eq!(units.len(), 1);
+    assert_eq!(units[0].kind, PublishUnitKind::Stack);
+    assert_eq!(units[0].ids, vec!["n0", "n1", "n2"], "dependency order");
+}
+
+#[test]
+fn a_fan_out_parent_does_not_stack_one_arbitrary_child() {
+    // n0 has two hard children. Picking either to stack on it would invent an
+    // order between the siblings, so all three go out independently.
+    let nodes = vec![
+        ("n0".to_string(), vec![]),
+        ("n1".to_string(), vec!["n0".to_string()]),
+        ("n2".to_string(), vec!["n0".to_string()]),
+    ];
+    let units = decompose_plan_for_publish(&nodes);
+    assert_eq!(units.len(), 3);
+    assert!(
+        units.iter().all(|unit| unit.kind == PublishUnitKind::Independent),
+        "a fork point produces no stack: {units:?}"
+    );
+}
+
+#[test]
+fn every_planned_node_reaches_exactly_one_unit() {
+    // A mixed DAG: a chain, a fan-in, and a loose node. Nothing may be dropped and
+    // nothing may be published twice.
+    let nodes = vec![
+        ("n0".to_string(), vec![]),
+        ("n1".to_string(), vec!["n0".to_string()]),
+        ("n2".to_string(), vec!["n0".to_string(), "n1".to_string()]),
+        ("n3".to_string(), vec![]),
+        ("n4".to_string(), vec!["n3".to_string()]),
+    ];
+    let units = decompose_plan_for_publish(&nodes);
+    let mut seen: Vec<&str> = units
+        .iter()
+        .flat_map(|unit| unit.ids.iter().map(String::as_str))
+        .collect();
+    seen.sort_unstable();
+    assert_eq!(seen, vec!["n0", "n1", "n2", "n3", "n4"]);
+    assert_eq!(seen.len(), 5, "no node appears in two units");
+}
+
+#[test]
+fn a_fork_remote_falls_back_to_independent_prs_and_says_so() {
+    // gh-stack cannot stack across forks. The shape degrades, and the reason is
+    // reported rather than the user discovering from GitHub that nothing stacked.
+    let fork = PublishCapability {
+        is_fork: true,
+        ..test_capability()
+    };
+    let blocker = fork.stack_blocker().expect("a fork cannot stack");
+    assert!(blocker.contains("fork"), "{blocker}");
+
+    let nodes = vec![
+        ("n0".to_string(), vec![]),
+        ("n1".to_string(), vec!["n0".to_string()]),
+        ("n2".to_string(), vec!["n1".to_string()]),
+    ];
+    let units = decompose_plan_for_publish(&nodes);
+    assert_eq!(units[0].kind, PublishUnitKind::Stack, "would have stacked");
+    let flattened = flatten_units_to_independent(&units);
+    assert_eq!(flattened.len(), 3);
+    assert!(
+        flattened
+            .iter()
+            .all(|unit| unit.kind == PublishUnitKind::Independent && unit.ids.len() == 1),
+        "the fork fallback is one PR per node: {flattened:?}"
+    );
+}
+
+#[test]
+fn a_missing_gh_stack_extension_blocks_stacking_but_not_publishing() {
+    let no_extension = PublishCapability {
+        has_gh_stack: false,
+        ..test_capability()
+    };
+    let blocker = no_extension.stack_blocker().expect("no extension, no stack");
+    assert!(blocker.contains("gh extension install"), "{blocker}");
+    // Single PRs are unaffected: the capability is still Active.
+    assert!(test_capability().stack_blocker().is_none());
+}
+
+#[test]
+fn publish_branches_are_namespaced_and_never_the_default_branch() {
+    let branch = publish_branch_name("run-abcdef12", "Add the widget", "main");
+    assert!(branch.starts_with("rudder/"), "{branch}");
+    assert!(branch.contains("add-the-widget"), "{branch}");
+    assert_ne!(branch, "main");
+
+    // Two rows with the same summary get different branches; a collision would
+    // silently repoint the earlier row's branch at the later row's work.
+    let other = publish_branch_name("run-99887766", "Add the widget", "main");
+    assert_ne!(branch, other);
+
+    // Decision 5: publishing never pushes the default branch, even when the name
+    // would otherwise land exactly on it.
+    let collides = publish_branch_name("x", "y", "rudder/y-x");
+    assert_ne!(collides, "rudder/y-x");
+}
+
+#[test]
+fn gh_argv_is_built_as_specified() {
+    // Draft is not optional (decision 4) and the base/head are explicit rather
+    // than inferred from whatever branch the checkout happens to be on.
+    let create = gh_pr_create_argv("main", "rudder/thing-1", "Add thing", "body");
+    assert_eq!(
+        create,
+        vec![
+            "pr",
+            "create",
+            "--draft",
+            "--base",
+            "main",
+            "--head",
+            "rudder/thing-1",
+            "--title",
+            "Add thing",
+            "--body",
+            "body"
+        ]
+    );
+
+    // Stacks: init adopts the exported branches bottom-to-top against trunk.
+    let init = gh_stack_init_argv(
+        "main",
+        &["rudder/a".to_string(), "rudder/b".to_string()],
+    );
+    assert_eq!(
+        init,
+        vec!["stack", "init", "--base", "main", "rudder/a", "rudder/b"]
+    );
+
+    // sync, never push: push is documented as non-atomic.
+    assert_eq!(gh_stack_sync_argv(), vec!["stack", "sync"]);
+    assert!(
+        !gh_stack_sync_argv().contains(&"push".to_string()),
+        "gh stack push must never be built"
+    );
+
+    // submit runs non-interactively and, crucially, WITHOUT --open, which is what
+    // leaves the new PRs as drafts.
+    let submit = gh_stack_submit_argv();
+    assert_eq!(submit, vec!["stack", "submit", "--auto"]);
+    assert!(!submit.contains(&"--open".to_string()), "drafts by default");
+
+    // State is read as JSON, never scraped from the glyph table.
+    assert_eq!(gh_stack_view_json_argv(), vec!["stack", "view", "--json"]);
+
+    // submit has no title flags, so the real title arrives by a follow-up edit.
+    assert_eq!(
+        gh_pr_edit_argv(12, "Real title", "Real body"),
+        vec!["pr", "edit", "12", "--title", "Real title", "--body", "Real body"]
+    );
+}
+
+#[test]
+fn jj_argv_points_the_bookmark_and_pushes_only_that_bookmark() {
+    assert_eq!(
+        jj_bookmark_set_argv("rudder/thing-1", "zzzzabcd"),
+        vec!["bookmark", "set", "rudder/thing-1", "-r", "zzzzabcd"]
+    );
+    assert_eq!(jj_git_export_argv(), vec!["git", "export"]);
+    // No --allow-new: it was removed in jj 0.40 and a plain --bookmark push
+    // creates the remote bookmark (AGENTS.md 12).
+    let push = jj_git_push_argv("origin", "rudder/thing-1");
+    assert_eq!(
+        push,
+        vec![
+            "git",
+            "push",
+            "--remote",
+            "origin",
+            "--bookmark",
+            "rudder/thing-1"
+        ]
+    );
+    assert!(!push.contains(&"--allow-new".to_string()));
+}
+
+#[test]
+fn publishing_onto_the_default_branch_is_refused_before_anything_runs() {
+    // The guard sits in front of the jj calls, so a subject that resolved to trunk
+    // never reaches a bookmark write.
+    let subject = PublishSubject {
+        run_id: "run-1".to_string(),
+        node_id: None,
+        change_id: "zzzz".to_string(),
+        branch: "main".to_string(),
+        title: "t".to_string(),
+        body: "b".to_string(),
+    };
+    let error = stage_publish_branch(&std::env::temp_dir(), &subject, "main")
+        .expect_err("trunk is refused");
+    assert!(error.contains("default branch"), "{error}");
+}
+
+#[test]
+fn a_stack_sync_conflict_is_reported_as_a_safe_abort_not_a_retry() {
+    // sync restores every branch on a rebase conflict, so the honest report is
+    // "nothing moved, here is the command that fixes it".
+    let conflict = classify_stack_sync_failure("error: rebase conflict in src/main.rs");
+    assert!(conflict.contains("gh stack rebase"), "{conflict}");
+    // A divergence in a non-interactive terminal aborts without pushing. Rudder is
+    // always non-interactive here, so that is a normal outcome to explain.
+    let diverged = classify_stack_sync_failure("local and remote stacks have diverged");
+    assert!(diverged.contains("without pushing"), "{diverged}");
+    // Anything else still names the actual complaint.
+    let other = classify_stack_sync_failure("fatal: could not read from remote");
+    assert!(other.contains("could not read from remote"), "{other}");
+}
+
+#[test]
+fn a_pr_number_is_only_reported_when_gh_actually_printed_one() {
+    assert_eq!(
+        parse_pr_url("https://github.com/acme/widgets/pull/42"),
+        Some((42, "https://github.com/acme/widgets/pull/42".to_string()))
+    );
+    // Chatter before the url does not confuse it.
+    assert_eq!(
+        parse_pr_url("Warning: 3 uncommitted changes\nhttps://github.com/a/b/pull/7\n")
+            .map(|(number, _)| number),
+        Some(7)
+    );
+    // No url means no PR to claim.
+    assert!(parse_pr_url("Creating draft pull request...").is_none());
+}
+
+#[test]
+fn pr_state_is_derived_from_github_with_draft_outranking_open() {
+    // GitHub reports a draft PR's state as OPEN. A row that said "open" for
+    // something nobody can merge yet would tell the wrong story.
+    let states = parse_pr_states(
+        r#"[{"number":1,"state":"OPEN","isDraft":true},
+            {"number":2,"state":"OPEN","isDraft":false},
+            {"number":3,"state":"MERGED","isDraft":false}]"#,
+    );
+    assert_eq!(states.get(&1).map(String::as_str), Some("draft"));
+    assert_eq!(states.get(&2).map(String::as_str), Some("open"));
+    assert_eq!(states.get(&3).map(String::as_str), Some("merged"));
+}
+
+#[test]
+fn a_published_row_reads_as_its_pr_and_never_invents_a_state() {
+    let mut run = publishable_run("run-1", "add the widget");
+    // Before any refresh lands, the number is known and the state is not. The row
+    // says what it knows rather than guessing "draft".
+    run.publish.number = Some(123);
+    assert_eq!(agent_status_text(&run), "PR #123");
+    run.publish.state = Some("draft".to_string());
+    assert_eq!(agent_status_text(&run), "PR #123 · draft");
+    // A row with no PR falls back to the local lifecycle label.
+    let unpublished = publishable_run("run-2", "other work");
+    assert_ne!(agent_status_text(&unpublished), "PR #123");
+}
+
+#[test]
+fn publish_evidence_persists_identity_and_re_derives_state() {
+    // The PR number is a fact about what Rudder did and survives a restart; the
+    // PR's state belongs to GitHub and is asked for again (AGENTS.md 12.7).
+    let repo = publish_test_repo("persist");
+    let mut run = publishable_run("run-1", "add the widget");
+    run.publish.branch = Some("rudder/add-the-widget-1".to_string());
+    run.publish.number = Some(321);
+    run.publish.url = Some("https://github.com/acme/widgets/pull/321".to_string());
+    run.publish.state = Some("draft".to_string());
+    save_native_run_record(&repo, &run).expect("save record");
+
+    let raw = fs::read_to_string(native_run_dir(&repo, "run-1").join("run.json")).expect("read");
+    let record: serde_json::Value = serde_json::from_str(&raw).expect("parse");
+    assert_eq!(record["publish"]["number"], 321);
+    assert!(
+        record["publish"].get("state").is_none(),
+        "a PR's state is never written to disk: {}",
+        record["publish"]
+    );
+
+    let restored = publish_evidence_from_record(&record);
+    assert_eq!(restored.number, Some(321));
+    assert_eq!(
+        restored.branch.as_deref(),
+        Some("rudder/add-the-widget-1")
+    );
+    assert!(restored.state.is_none(), "state is re-derived, never loaded");
+
+    let _ = fs::remove_dir_all(&repo);
+}
+
+#[test]
+fn only_github_remotes_activate_publishing() {
+    assert_eq!(
+        github_slug_from_remote("https://github.com/acme/widgets.git").as_deref(),
+        Some("acme/widgets")
+    );
+    assert_eq!(
+        github_slug_from_remote("git@github.com:acme/widgets.git").as_deref(),
+        Some("acme/widgets")
+    );
+    assert!(github_slug_from_remote("https://gitlab.com/acme/widgets.git").is_none());
+    assert!(github_slug_from_remote("").is_none());
+}
+
+#[test]
+fn stack_view_json_is_read_not_scraped() {
+    // gh-stack is v0.1.0 and its key names are not a stable contract, so the
+    // reader accepts the obvious spellings and returns nothing it cannot read.
+    let states = parse_stack_view_json(
+        r#"{"branches":[{"branch":"rudder/a","pr":{"number":5,"url":"https://x/pull/5"}},
+                        {"name":"rudder/b","number":6,"needsRebase":true}]}"#,
+    );
+    assert_eq!(states.len(), 2);
+    assert_eq!(states[0].branch, "rudder/a");
+    assert_eq!(states[0].number, Some(5));
+    assert!(!states[0].needs_rebase);
+    assert_eq!(states[1].number, Some(6));
+    assert!(states[1].needs_rebase, "a needs-rebase branch is surfaced");
+    // Unparseable output yields nothing rather than a guess.
+    assert!(parse_stack_view_json("✗ not part of a stack").is_empty());
+}
+
+#[test]
+fn m_waits_rather_than_guessing_the_road_before_detection_lands() {
+    // Between launch and the first probe result, which road this row takes is
+    // genuinely unknown. Merging locally "for now" would be a choice that a later
+    // answer cannot undo, so `m` says wait instead.
+    let repo = publish_test_repo("checking");
+    let mut app = App::new();
+    app.cwd = repo.clone();
+    assert_eq!(app.publish, PublishState::Unknown);
+    app.agents.push(publishable_run("run-1", "add the widget"));
+
+    assert_eq!(app.merge_route_for(0), MergeRoute::Checking);
+    app.request_merge_selected_agent();
+    assert!(
+        app.merge_confirm.is_none(),
+        "nothing is merged or published while detection is in flight"
+    );
+    let notice = app.notice.as_deref().unwrap_or_default();
+    assert!(notice.contains("press m again"), "{notice}");
+
+    // A row with no workspace to publish is unaffected: it takes the local road
+    // whatever the probe eventually says.
+    let mut plain = test_agent_run("run-2", "main checkout work");
+    plain.status = AgentStatus::Done;
+    plain.jj_change_id = None;
+    app.agents.push(plain);
+    assert_eq!(app.merge_route_for(1), MergeRoute::LocalMerge);
+
+    let _ = fs::remove_dir_all(&repo);
 }
