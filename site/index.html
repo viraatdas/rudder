@@ -37,10 +37,11 @@
       STORY: A developer with three changes in flight sees them logged side by
       side on one sheet, understands each is isolated, and installs.
       FIRST VIEWPORT: Title block and install in a single left column at a
-      deliberate measure; then the sheet head carrying the run's stamped facts,
-      the ruled track sheet with four tracks in flight, closed by the sum bus
-      labelled main. (An earlier draft put the stamp in a right-hand column; it
-      left a dead void, so the stamp moved onto the sheet it describes.)
+      deliberate measure, then the dashboard itself: a mode rail on the left and
+      the real three panes beside it, agents list and live worker. (Earlier drafts
+      opened on an abstract ruled track sheet. Once the real panes were drawn, the
+      two read as the same table twice, so the abstraction went and the product
+      stayed.)
       FORM: studio track sheet; candidate 4 of the ordered list; seed 9b5209e6.
       FINISH: unreviewed and undocumented is unfinished; this build ends with the finish review, the verdict, and DESIGN.md
     -->
@@ -64,11 +65,9 @@
           <div class="titleblock-main">
             <h1 id="title">Three changes to one repo. None of them touching.</h1>
             <p class="lede">
-              Rudder runs Claude Code, Codex and opencode in parallel on the same
-              repository. Every agent works in
-              <strong>its own jj workspace</strong>, so work in flight cannot
-              collide, cannot half-land in your checkout, and reaches main only
-              when you merge it.
+              Run Claude Code, Codex and opencode in parallel on one repo. Each
+              gets <strong>its own workspace</strong>, so they cannot touch each
+              other's work — or yours.
             </p>
             <div class="install">
               <code id="install-command"
@@ -92,150 +91,138 @@
 
         </section>
 
-        <section aria-labelledby="sheet-title">
-          <div class="sheet-head">
-            <h2 id="sheet-title">session sheet</h2>
-            <dl class="stamp">
-              <div class="stamp-row">
-                <dt class="field-label">runs on</dt>
-                <dd>macOS · Linux</dd>
-              </div>
-              <div class="stamp-row">
-                <dt class="field-label">agents</dt>
-                <dd>claude · codex · opencode</dd>
-              </div>
-              <div class="stamp-row">
-                <dt class="field-label">isolation</dt>
-                <dd>jj workspaces</dd>
-              </div>
-            </dl>
-          </div>
-          <div class="sheet-wrap">
-            <table class="tracks">
-              <caption>
-                One row per agent. Read the column, not the rows: nothing here
-                shares a working tree.
-              </caption>
-              <thead>
-                <tr>
-                  <th scope="col">no.</th>
-                  <th scope="col">task</th>
-                  <th scope="col">workspace</th>
-                  <th scope="col">state</th>
-                </tr>
-              </thead>
-              <tbody>
-                <tr>
-                  <td class="t-no" data-label="no.">01</td>
-                  <td class="t-task" data-label="task">rate-limit the public API</td>
-                  <td class="t-ws" data-label="workspace">.rudder-worktrees/rate-limit</td>
-                  <td class="t-state" data-label="state">
-                    <span class="state state--running">running</span>
-                  </td>
-                </tr>
-                <tr>
-                  <td class="t-no" data-label="no.">02</td>
-                  <td class="t-task" data-label="task">port the settings screen to the new form</td>
-                  <td class="t-ws" data-label="workspace">.rudder-worktrees/settings-form</td>
-                  <td class="t-state" data-label="state">
-                    <span class="state state--review">done · ready to merge</span>
-                  </td>
-                </tr>
-                <tr>
-                  <td class="t-no" data-label="no.">03</td>
-                  <td class="t-task" data-label="task">drop the legacy session table</td>
-                  <td class="t-ws" data-label="workspace">.rudder-worktrees/drop-sessions</td>
-                  <td class="t-state" data-label="state">
-                    <span class="state state--merged">merged</span>
-                  </td>
-                </tr>
-                <tr>
-                  <td class="t-no" data-label="no.">04</td>
-                  <td class="t-task" data-label="task">write the migration guide</td>
-                  <td class="t-ws" data-label="workspace">.rudder-worktrees/migration-doc</td>
-                  <td class="t-state" data-label="state">
-                    <span class="state state--running">running</span>
-                  </td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
-          <p class="bus">
-            <span class="bus-label">
-              <svg
-                class="bus-arrow"
-                viewBox="0 0 8 12"
-                aria-hidden="true"
-                focusable="false"
-              >
-                <path
-                  d="M4 0 V10 M0.5 6.5 L4 10.5 L7.5 6.5"
-                  fill="none"
-                  stroke="currentColor"
-                  stroke-width="1"
-                />
-              </svg>
-              main
-            </span>
-            <span class="bus-note">
-              Track 03 landed. The other three are still in their own trees and
-              have changed nothing you can see.
-            </span>
-          </p>
-        </section>
-
-        <section class="section" aria-labelledby="how-title">
+        <section class="section showcase" aria-labelledby="desk-title">
           <div class="section-head">
-            <h2 id="how-title">Isolation is the whole trick.</h2>
-            <p>
-              Parallel agents are easy. Parallel agents that do not corrupt each
-              other's work is the part that needs a mechanism, and jj workspaces
-              are it.
-            </p>
+            <h2 id="desk-title">This is the whole dashboard.</h2>
+            <p><kbd>Option-1</kbd>, <kbd>Option-2</kbd>, <kbd>Option-3</kbd>.</p>
           </div>
-          <div class="movements">
-            <div class="movement">
-              <h3>A workspace per agent</h3>
-              <p>
-                Each agent gets its own jj workspace: a private copy of the repo,
-                gitignored, beside your checkout and never in it. It cannot see,
-                stash, or overwrite anyone else's edits.
-              </p>
-            </div>
-            <div class="movement">
-              <h3>All of them at once</h3>
-              <p>
-                Claude Code, Codex and opencode run side by side, on the same
-                repository, without a single branch checkout between them.
-              </p>
-            </div>
-            <div class="movement">
-              <h3>A real diff, per row</h3>
-              <p>
-                Nothing lands that you have not been shown. <kbd>m</kbd> on work
-                you have not read opens its live
-                <code class="mono">jj diff</code> instead of merging; a second
-                <kbd>m</kbd> lands it.
-              </p>
-            </div>
-            <div class="movement">
-              <h3>One road to main</h3>
-              <p>
-                On a repo with a GitHub remote, that second <kbd>m</kbd> opens a
-                draft pull request. Without one, it merges locally and
-                <kbd>u</kbd> undoes it. Never both, so nothing lands twice.
-              </p>
+
+          <div class="showcase-body">
+            <!-- Radios, not JS: every frame is in the DOM and the first is checked,
+                 so this works with scripting off and in a headless render. -->
+            <input class="mode-input" type="radio" name="mode" id="mode-run" checked />
+            <input class="mode-input" type="radio" name="mode" id="mode-talk" />
+            <input class="mode-input" type="radio" name="mode" id="mode-diff" />
+            <input class="mode-input" type="radio" name="mode" id="mode-plan" />
+
+            <ul class="modes">
+              <li><label for="mode-run"><span>Run several at once</span><em>agents</em></label></li>
+              <li><label for="mode-talk"><span>Talk to any of them</span><em>worker</em></label></li>
+              <li><label for="mode-diff"><span>Read what changed</span><em>diff</em></label></li>
+              <li><label for="mode-plan"><span>Plan a graph</span><em>orchestrator</em></label></li>
+            </ul>
+
+            <div class="screen" aria-live="polite">
+              <div class="screen-chrome">
+                <span class="mono">rudder</span>
+                <span class="mono screen-cwd">~/code/api</span>
+              </div>
+
+              <!-- 1. agents -->
+              <div class="frame frame-run">
+                <div class="pane pane-list">
+                  <div class="pane-label">agents · option-1</div>
+                  <div class="row-group">/main<span>1 agent · shared checkout</span></div>
+                  <div class="row"><span class="row-task">tag the release</span><span class="state state--running">running</span></div>
+                  <div class="row-group">worktrees<span>3 agents</span></div>
+                  <div class="row is-selected"><span class="row-task">rate-limit the public API</span><span class="state state--running">running</span></div>
+                  <div class="row"><span class="row-task">port the settings screen</span><span class="state state--review">done</span></div>
+                  <div class="row"><span class="row-task">drop the legacy session table</span><span class="state state--merged">merged</span></div>
+                </div>
+                <div class="pane pane-main">
+                  <div class="pane-label">worker · option-2</div>
+                  <pre class="tty"><span class="dim">rate-limit the public API</span>
+<span class="dim">workspace</span> .rudder-worktrees/rate-limit
+
+<span class="ok">●</span> Read src/server/middleware.ts
+<span class="ok">●</span> Edit src/server/rate-limit.ts <span class="add">+64</span>
+<span class="ok">●</span> Bash npm test <span class="dim">— 41 passed</span>
+
+<span class="run">▌</span> writing the burst-window test…</pre>
+                </div>
+              </div>
+
+              <!-- 2. worker -->
+              <div class="frame frame-talk">
+                <div class="pane pane-list">
+                  <div class="pane-label">agents · option-1</div>
+                  <div class="row-group">worktrees<span>3 agents</span></div>
+                  <div class="row is-selected"><span class="row-task">rate-limit the public API</span><span class="state state--running">running</span></div>
+                  <div class="row"><span class="row-task">port the settings screen</span><span class="state state--review">done</span></div>
+                  <div class="row"><span class="row-task">drop the legacy session table</span><span class="state state--merged">merged</span></div>
+                </div>
+                <div class="pane pane-main">
+                  <div class="pane-label">worker · option-2 · you are typing to Claude</div>
+                  <pre class="tty"><span class="run">▌</span> also cap it per API key, not just per IP
+
+<span class="dim">Understood. Keying the bucket on the API key when</span>
+<span class="dim">one is present, falling back to IP for anonymous</span>
+<span class="dim">requests.</span>
+
+<span class="ok">●</span> Edit src/server/rate-limit.ts <span class="add">+18</span> <span class="del">−4</span></pre>
+                  <div class="tty-input"><span class="dim">›</span> <span class="caret"></span></div>
+                </div>
+              </div>
+
+              <!-- 3. diff -->
+              <div class="frame frame-diff">
+                <div class="pane pane-list">
+                  <div class="pane-label">agents · option-1</div>
+                  <div class="row-group">worktrees<span>3 agents</span></div>
+                  <div class="row"><span class="row-task">rate-limit the public API</span><span class="state state--running">running</span></div>
+                  <div class="row is-selected"><span class="row-task">port the settings screen</span><span class="state state--review">done</span></div>
+                  <div class="row"><span class="row-task">drop the legacy session table</span><span class="state state--merged">merged</span></div>
+                </div>
+                <div class="pane pane-main">
+                  <div class="pane-label">diff · press v · nothing here is yours yet</div>
+                  <pre class="tty"><span class="dim">jj diff — .rudder-worktrees/settings-form</span>
+
+<span class="dim">src/settings/Form.tsx</span>
+<span class="del">- const [state, setState] = useState(initial)</span>
+<span class="add">+ const form = useForm({ defaultValues: initial })</span>
+<span class="add">+ const { isDirty } = form.formState</span>
+
+<span class="dim">src/settings/index.tsx</span>
+<span class="add">+ import { Form } from "./Form"</span></pre>
+                  <div class="tty-input"><span class="dim">m merges it · u undoes that</span></div>
+                </div>
+              </div>
+
+              <!-- 4. orchestrator -->
+              <div class="frame frame-plan">
+                <div class="pane pane-list">
+                  <div class="pane-label">agents · option-1</div>
+                  <div class="row-group">orchestrator<span>ship billing v2</span></div>
+                  <div class="row is-selected"><span class="row-task">plan · 4 nodes</span><span class="state state--running">running</span></div>
+                  <div class="row-group">worktrees<span>4 nodes</span></div>
+                  <div class="row"><span class="row-task">n0 schema</span><span class="state state--merged">merged</span></div>
+                  <div class="row"><span class="row-task">n1 stripe client</span><span class="state state--running">running</span></div>
+                  <div class="row"><span class="row-task">n2 webhook handler</span><span class="state state--idle">waiting on n1</span></div>
+                </div>
+                <div class="pane pane-main">
+                  <div class="pane-label">orchestrator · the graph it proposed</div>
+                  <pre class="tty"><span class="dim">ship billing v2</span>
+
+<span class="ok">✓</span> n0  schema migration            <span class="dim">merged</span>
+<span class="run">▌</span> n1  stripe client               <span class="dim">running</span>
+<span class="dim">│   └─ hard dep: n0</span>
+<span class="idle">○</span> n2  webhook handler            <span class="dim">waiting</span>
+<span class="dim">│   └─ hard dep: n1</span>
+<span class="idle">○</span> n3  billing settings screen    <span class="dim">waiting</span>
+<span class="dim">    └─ hard dep: n0</span>
+
+<span class="dim">n3 is independent of n1 and n2, so it runs</span>
+<span class="dim">as soon as n0 lands.</span></pre>
+                  <div class="tty-input"><span class="dim">type here to change the plan · v to edit a node</span></div>
+                </div>
+              </div>
             </div>
           </div>
         </section>
-
         <section class="section" aria-labelledby="type-title">
           <div class="section-head">
             <h2 id="type-title">Three things you can type.</h2>
-            <p>
-              The task box takes plain language. What you type decides where the
-              work lands, and that is the only decision you have to make.
-            </p>
+            <p>What you type decides where the work lands.</p>
           </div>
           <div class="table-wrap">
             <table class="commands">
@@ -252,8 +239,7 @@
                   <td class="c-what" data-label="what happens">
                     One isolated agent
                     <span
-                      >Plain text is the default. It never touches your checkout
-                      and merges with <kbd>m</kbd>.</span
+                      >Never touches your checkout.</span
                     >
                   </td>
                   <td class="c-where" data-label="where it works">its own workspace</td>
@@ -263,11 +249,8 @@
                   <td class="c-what" data-label="what happens">
                     An orchestrator
                     <span
-                      >Breaks the goal into a task graph you can edit, then runs
-                      and merges the nodes as their dependencies land. Run it
-                      again for a second goal and you get a second orchestrator
-                      beside the first, each with its own graph and its own
-                      pane.</span
+                      >A task graph you can edit before it runs. Several plans
+                      can run side by side.</span
                     >
                   </td>
                   <td class="c-where" data-label="where it works">one workspace per node</td>
@@ -277,8 +260,7 @@
                   <td class="c-what" data-label="what happens">
                     An agent in your checkout
                     <span
-                      >For the jobs that are actually about your working tree.
-                      Nothing to merge, because it is already here.</span
+                      >For jobs that are about your tree. Nothing to merge.</span
                     >
                   </td>
                   <td class="c-where" data-label="where it works">your real checkout</td>
@@ -288,51 +270,13 @@
           </div>
         </section>
 
-        <section class="section" aria-labelledby="desk-title">
-          <div class="section-head">
-            <h2 id="desk-title">Three panes, three jumps.</h2>
-            <p>
-              <kbd>Option-1</kbd>, <kbd>Option-2</kbd> and <kbd>Option-3</kbd>
-              always mean the same three places. The worker pane belongs to the
-              agent, so dashboard keys from inside it take the
-              <kbd>Ctrl-W</kbd> leader.
-            </p>
-          </div>
-          <div class="desk">
-            <div class="strip">
-              <span class="field-label">option-1</span>
-              <h3>Agents</h3>
-              <p>
-                Every run on one sheet. Move with <kbd>j</kbd>/<kbd>k</kbd>, then
-                review, merge, rename or delete.
-              </p>
-            </div>
-            <div class="strip">
-              <span class="field-label">option-2</span>
-              <h3>Worker</h3>
-              <p>
-                The agent's own terminal, unmodified. Talk to Claude or Codex
-                directly; their prompts stay native.
-              </p>
-            </div>
-            <div class="strip">
-              <span class="field-label">option-3</span>
-              <h3>Task</h3>
-              <p>
-                Where work starts. Type a task, or steer a plan that is already
-                running.
-              </p>
-            </div>
-          </div>
-        </section>
 
         <section class="section" aria-labelledby="options-title">
           <div class="section-head">
             <h2 id="options-title">Set once. The next agent picks it up.</h2>
             <p>
-              <code class="mono">/model</code> sets the backend, model and
-              reasoning effort Rudder will use, and remembers it. A running agent
-              keeps whatever it launched with.
+              <code class="mono">/model</code> sets these and remembers them. A
+              running agent keeps what it launched with.
             </p>
           </div>
           <div class="options">
@@ -369,10 +313,7 @@
 
         <section class="close" aria-labelledby="close-title">
           <h2 id="close-title">Put four things in flight.</h2>
-          <p>
-            Install it, type four tasks, and watch four workspaces fill up while
-            your checkout stays exactly where you left it.
-          </p>
+          <p>Type four tasks. Watch four workspaces fill up.</p>
           <div class="install">
             <code id="install-command-2"
               ><span class="prompt">$ </span

@@ -48,12 +48,46 @@ const PAGES = {
     title: "Overview",
     lede: "Rudder runs coding agents in parallel on one repository. Every agent works in its own jj workspace, so several changes in flight cannot collide, and you review and merge them from one dashboard.",
     toc: [
+      ["start", "Start in 60 seconds"],
+      ["the-loop", "The whole loop"],
       ["what-it-is", "What it is"],
-      ["the-problem", "The problem it solves"],
-      ["how-it-works", "How it works"],
+      ["the-problem", "Why isolation"],
       ["requirements", "Requirements"],
     ],
     body: `
+<h2 id="start">Start in 60 seconds</h2>
+<pre><code><span class="prompt">$ </span>npm install -g @viraatdas/rudder@latest
+<span class="prompt">$ </span>cd ~/code/your-project
+<span class="prompt">$ </span>rudder</code></pre>
+<p>Type a task into the box at the bottom and press Enter:</p>
+<pre><code>fix the login redirect losing the query string</code></pre>
+<p>That is it. One agent is now working in its own copy of the repo. Type another
+task and a second one starts beside it, unable to see or overwrite the first.</p>
+<p>When a row says <span class="state state--review">done</span>, press
+<kbd>m</kbd>. Rudder shows you the diff. Press <kbd>m</kbd> again and it lands.</p>
+
+<h2 id="the-loop">The whole loop</h2>
+<table class="docs-table">
+  <thead><tr><th>key</th><th>what happens</th></tr></thead>
+  <tbody>
+    <tr><td>type a task</td><td>One isolated agent starts in its own workspace.</td></tr>
+    <tr><td>Option-1 / 2 / 3</td><td>Agents list · the agent's terminal · the task box.</td></tr>
+    <tr><td>j / k</td><td>Move between agents.</td></tr>
+    <tr><td>m</td><td>Show me the diff. Then: land it.</td></tr>
+    <tr><td>u</td><td>Undo that.</td></tr>
+    <tr><td>x</td><td>Stop an agent.</td></tr>
+  </tbody>
+</table>
+<p>Everything else in these docs is detail on top of those six lines.</p>
+
+<div class="note">
+  <span class="field-label">the one thing to know</span>
+  <p><strong>Nothing lands that you have not been shown.</strong> The first
+  <kbd>m</kbd> opens the diff; the second one lands it. On a repo with a GitHub
+  remote, landing means a draft pull request rather than a local merge - and
+  Rudder asks once, naming the remote, before it ever pushes.</p>
+</div>
+
 <h2 id="what-it-is">What it is</h2>
 <p>Rudder is a terminal dashboard that starts, watches, reviews and merges coding
 agents. It drives <strong>Claude Code</strong>, <strong>Codex</strong> and
@@ -62,36 +96,14 @@ terminal, with its own native prompts, inside a pane you can talk to.</p>
 <p>What Rudder adds is everything around the agent: where it works, what it can
 touch, how you see what it did, and how that reaches your main branch.</p>
 
-<h2 id="the-problem">The problem it solves</h2>
+<h2 id="the-problem">Why isolation</h2>
 <p>Running one agent is easy. Running four on the same repository is where it falls
 apart: they stash over each other, leave half-finished edits in your working tree,
 and you lose track of which branch holds what.</p>
-<p>Rudder's answer is isolation. Every agent gets a <strong>jj workspace</strong> of
-its own: a private copy of the repo, gitignored, beside your checkout and never
-in it. Four agents editing the same file are four separate
-trees. Nothing merges until you say so, and your own checkout stays exactly where
-you left it the whole time.</p>
-
-<h2 id="how-it-works">How it works</h2>
-<ol>
-  <li><strong>You type a task.</strong> Plain text starts one isolated agent.</li>
-  <li><strong>It gets a workspace.</strong> Created under
-  <code>.rudder-worktrees/</code>, never nested in your checkout.</li>
-  <li><strong>You watch it.</strong> The worker pane is the agent's own terminal.</li>
-  <li><strong>You review it.</strong> <code>v</code> shows the live
-  <code>jj diff</code> of that workspace.</li>
-  <li><strong>You merge it.</strong> <code>m</code> merges one row into your
-  branch, <code>u</code> undoes it.</li>
-</ol>
-
-<div class="note">
-  <span class="field-label">worth knowing early</span>
-  <p><strong>Nothing reaches a remote without you.</strong> On a repo with no GitHub
-  remote (or no signed-in <code>gh</code>), Rudder integrates into your local git and
-  never pushes or deploys. Where it can open pull requests, it asks once, naming the
-  exact remote and branch, before the first push; after that <code>m</code> opens a
-  draft PR instead of merging locally.</p>
-</div>
+<p>Rudder's answer is a <strong>jj workspace</strong> per agent: a private copy of the
+repo, gitignored, beside your checkout and never in it. Four agents editing the same
+file are four separate trees. Nothing merges until you say so, and your own checkout
+stays exactly where you left it the whole time.</p>
 
 <h2 id="requirements">Requirements</h2>
 <ul>
@@ -102,6 +114,8 @@ you left it the whole time.</p>
   first install if it is missing</li>
   <li>At least one of the Claude Code, Codex or opencode CLIs, signed in</li>
 </ul>
+<p>Next: <a href="/docs/first-agent">walk through your first agent</a>, or read
+<a href="/docs/workspaces">how the isolation works</a>.</p>
 `,
   },
 

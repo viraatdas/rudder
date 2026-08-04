@@ -354,49 +354,274 @@
   color: var(--ink-2);
 }
 
-/* ---------- the desk ---------- */
+/* ---------- the dashboard, shown rather than described ----------
+ *
+ * The page's own world is a printed form, but a form cannot show a terminal
+ * doing its job, and "prove, don't claim" outranks consistency here. So this
+ * one region renders the ACTUAL three panes, in the same stock and ink as
+ * everything else, with the machine face carrying everything the machine says.
+ *
+ * Switching is radio inputs and :checked, not script: every frame ships in the
+ * DOM, the first is checked, and the section is complete with JS off and in a
+ * headless render.
+ */
 
-/* The pane key IS the content here, so it sets in the key column rather than
- * floating above the heading as a label. Was a fully boxed 3-up: the only boxed
- * element on a page whose thesis is rules and not boxes, and the third n-up grid
- * in a row. Now it is the same ruled two-column form as everything else, with
- * the keys aligned down their own column so they read as a keyboard map. */
-.desk {
+.showcase-body {
+  display: grid;
+  grid-template-columns: minmax(0, 15rem) minmax(0, 1fr);
+  gap: clamp(20px, 3vw, 44px);
+  align-items: start;
+}
+
+.mode-input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.modes {
+  list-style: none;
+  margin: 0;
+  padding: 0;
   border-top: var(--hair) solid var(--rule-strong);
 }
 
-.strip {
+.modes label {
   display: grid;
-  grid-template-columns: minmax(0, 7rem) minmax(0, 1fr);
-  gap: 6px clamp(20px, 4vw, 56px);
-  align-items: baseline;
-  padding: 16px 0;
+  gap: 2px;
+  padding: 14px 0;
   border-bottom: var(--hair) solid var(--rule);
+  cursor: pointer;
+  transition: color 140ms var(--ease-quint);
 }
 
-.strip .field-label {
-  font-size: 0.78rem;
+.modes label span {
+  font-size: 1rem;
+  font-weight: 500;
+  color: var(--ink-3);
+  transition: color 140ms var(--ease-quint);
+}
+
+.modes label em {
+  font-style: normal;
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  letter-spacing: 0.04em;
+  color: var(--ink-3);
+}
+
+.modes label:hover span {
   color: var(--ink);
 }
 
-.strip h3 {
-  margin: 0;
+/* The selected mode is marked by a rule in the working ink, not by a fill:
+ * the page has no filled chips anywhere else. */
+#mode-run:checked ~ .modes li:nth-child(1) label,
+#mode-talk:checked ~ .modes li:nth-child(2) label,
+#mode-diff:checked ~ .modes li:nth-child(3) label,
+#mode-plan:checked ~ .modes li:nth-child(4) label {
+  box-shadow: inset 2px 0 0 var(--work);
+  padding-left: 12px;
 }
 
-.strip p {
-  grid-column: 2;
-  font-size: 0.94rem;
+#mode-run:checked ~ .modes li:nth-child(1) label span,
+#mode-talk:checked ~ .modes li:nth-child(2) label span,
+#mode-diff:checked ~ .modes li:nth-child(3) label span,
+#mode-plan:checked ~ .modes li:nth-child(4) label span {
+  color: var(--ink);
+}
+
+.mode-input:focus-visible ~ .modes label {
+  outline: none;
+}
+#mode-run:focus-visible ~ .modes li:nth-child(1) label,
+#mode-talk:focus-visible ~ .modes li:nth-child(2) label,
+#mode-diff:focus-visible ~ .modes li:nth-child(3) label,
+#mode-plan:focus-visible ~ .modes li:nth-child(4) label {
+  outline: 2px solid var(--work);
+  outline-offset: 2px;
+}
+
+/* ---------- the screen ---------- */
+
+.screen {
+  border: var(--hair) solid var(--rule-strong);
+  background: var(--stock);
+  min-width: 0;
+  overflow: hidden;
+}
+
+.screen-chrome {
+  display: flex;
+  gap: 14px;
+  align-items: baseline;
+  padding: 8px 12px;
+  border-bottom: var(--hair) solid var(--rule);
+  background: var(--stock-band);
+  font-size: 0.72rem;
+  color: var(--ink-3);
+}
+
+.screen-cwd {
+  color: var(--ink-3);
+}
+
+.frame {
+  display: none;
+  grid-template-columns: minmax(0, 17rem) minmax(0, 1fr);
+  min-height: 22rem;
+}
+
+#mode-run:checked ~ .screen .frame-run,
+#mode-talk:checked ~ .screen .frame-talk,
+#mode-diff:checked ~ .screen .frame-diff,
+#mode-plan:checked ~ .screen .frame-plan {
+  display: grid;
+}
+
+.pane {
+  min-width: 0;
+  padding: 10px 12px 14px;
+}
+
+.pane-list {
+  border-right: var(--hair) solid var(--rule);
+  background: var(--stock-band);
+}
+
+.pane-label {
+  font-family: var(--font-mono);
+  font-size: 0.64rem;
+  letter-spacing: 0.04em;
+  color: var(--ink-3);
+  padding-bottom: 9px;
+  margin-bottom: 6px;
+  border-bottom: var(--hair) solid var(--rule);
+}
+
+.row-group {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  font-family: var(--font-mono);
+  font-size: 0.66rem;
+  color: var(--ink-3);
+  margin: 12px 0 5px;
+}
+
+.row-group:first-of-type {
+  margin-top: 2px;
+}
+
+.row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 10px;
+  padding: 5px 6px 5px 8px;
+  font-size: 0.8rem;
   color: var(--ink-2);
-  max-width: 60ch;
 }
 
-@media (max-width: 620px) {
-  .strip {
-    grid-template-columns: minmax(0, 1fr);
-    gap: 4px;
+/* Selection is a rule in the working ink, matching the mode rail. */
+.row.is-selected {
+  background: var(--stock);
+  box-shadow: inset 2px 0 0 var(--work);
+  color: var(--ink);
+  font-weight: 500;
+}
+
+.row-task {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.row .state {
+  font-size: 0.63rem;
+  flex: none;
+}
+
+/* ---------- the terminal ---------- */
+
+.tty {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 0.76rem;
+  line-height: 1.75;
+  color: var(--ink);
+  white-space: pre;
+  overflow-x: auto;
+}
+
+.tty .dim {
+  color: var(--ink-3);
+}
+.tty .ok {
+  color: var(--st-merged);
+}
+.tty .run {
+  color: var(--st-running);
+}
+.tty .idle {
+  color: var(--st-idle);
+}
+.tty .add {
+  color: var(--st-merged);
+}
+.tty .del {
+  color: var(--st-conflict);
+}
+
+.tty-input {
+  margin-top: 14px;
+  padding-top: 10px;
+  border-top: var(--hair) solid var(--rule);
+  font-family: var(--font-mono);
+  font-size: 0.74rem;
+  color: var(--ink-3);
+}
+
+.caret {
+  display: inline-block;
+  width: 0.5em;
+  height: 1em;
+  background: var(--work);
+  vertical-align: text-bottom;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  @keyframes caret-blink {
+    0%,
+    49% {
+      opacity: 1;
+    }
+    50%,
+    100% {
+      opacity: 0;
+    }
   }
-  .strip p {
-    grid-column: 1;
+  .caret {
+    animation: caret-blink 1.1s steps(1) infinite;
+  }
+}
+
+@media (max-width: 900px) {
+  .showcase-body {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .modes {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 0 20px;
+  }
+  .frame {
+    grid-template-columns: minmax(0, 1fr);
+    min-height: 0;
+  }
+  .pane-list {
+    border-right: 0;
+    border-bottom: var(--hair) solid var(--rule);
   }
 }
 
