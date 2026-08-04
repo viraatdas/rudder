@@ -212,16 +212,18 @@
             <div class="movement">
               <h3>A real diff, per row</h3>
               <p>
-                Press <kbd>v</kbd> on any agent for the live <code class="mono">jj diff</code>
-                of its workspace, before any of it is yours.
+                Nothing lands that you have not been shown. <kbd>m</kbd> on work
+                you have not read opens its live
+                <code class="mono">jj diff</code> instead of merging; a second
+                <kbd>m</kbd> lands it.
               </p>
             </div>
             <div class="movement">
-              <h3>Only when you say</h3>
+              <h3>One road to main</h3>
               <p>
-                <kbd>m</kbd> merges one, <kbd>M</kbd> merges everything ready.
-                Conflicts are recorded in the change rather than blocking it, and
-                <kbd>u</kbd> undoes the merge.
+                On a repo with a GitHub remote, that second <kbd>m</kbd> opens a
+                draft pull request. Without one, it merges locally and
+                <kbd>u</kbd> undoes it. Never both, so nothing lands twice.
               </p>
             </div>
           </div>

@@ -86,8 +86,11 @@ you left it the whole time.</p>
 
 <div class="note">
   <span class="field-label">worth knowing early</span>
-  <p><strong>Merged means local.</strong> Rudder integrates into your local git and
-  never pushes or deploys on its own. Nothing is on a remote until you push it.</p>
+  <p><strong>Nothing reaches a remote without you.</strong> On a repo with no GitHub
+  remote (or no signed-in <code>gh</code>), Rudder integrates into your local git and
+  never pushes or deploys. Where it can open pull requests, it asks once, naming the
+  exact remote and branch, before the first push; after that <code>m</code> opens a
+  draft PR instead of merging locally.</p>
 </div>
 
 <h2 id="requirements">Requirements</h2>
@@ -401,9 +404,15 @@ remotes keep working exactly as they did. Rudder adds workspaces under
 your history behind you.</p>
 
 <h2 id="push">Does it push or deploy anything?</h2>
-<p>No. <strong>Merged means merged into local git.</strong> Rudder never pushes to a
-remote and never runs a deploy on its own. If you want the result shipped, that is an
-explicit step you ask for.</p>
+<p>It never deploys. Whether it pushes depends on the repo, and it tells you which
+before it does anything.</p>
+<p>With no GitHub remote, or without a signed-in <code>gh</code>, <strong>merged means
+merged into local git</strong> and nothing leaves your machine. Where Rudder can open
+pull requests, <code>m</code> on a reviewed row pushes a fresh branch and opens a
+<strong>draft</strong> PR instead of merging locally. The first time in a given repo it
+asks first, naming the remote and the branch; after you accept, it stops asking for that
+repo. It never pushes your default branch, and there is only ever one route to main for
+a given row: a PR or a local merge, never both.</p>
 
 <h2 id="teammates">Do my teammates need jj?</h2>
 <p>No. What they see is ordinary git commits on ordinary branches. jj is a local tool

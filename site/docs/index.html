@@ -88,8 +88,11 @@ you left it the whole time.</p>
 
 <div class="note">
   <span class="field-label">worth knowing early</span>
-  <p><strong>Merged means local.</strong> Rudder integrates into your local git and
-  never pushes or deploys on its own. Nothing is on a remote until you push it.</p>
+  <p><strong>Nothing reaches a remote without you.</strong> On a repo with no GitHub
+  remote (or no signed-in <code>gh</code>), Rudder integrates into your local git and
+  never pushes or deploys. Where it can open pull requests, it asks once, naming the
+  exact remote and branch, before the first push; after that <code>m</code> opens a
+  draft PR instead of merging locally.</p>
 </div>
 
 <h2 id="requirements">Requirements</h2>
