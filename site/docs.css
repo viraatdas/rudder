@@ -215,6 +215,138 @@
   overflow-x: auto;
 }
 
+/* A picture of the thing the next paragraph tells you to press keys in.
+ * Borrows the landing page's pane classes wholesale (.screen/.pane/.tty/.row),
+ * so there is one dashboard drawing on the site and not two that drift. Those
+ * live in sections.css, which docs.css does not import, so the handful of rules
+ * they need are restated here rather than pulling in the whole landing page. */
+.docs-shot {
+  margin: 0 0 24px;
+  max-width: none;
+}
+
+.docs-shot figcaption {
+  margin-top: 9px;
+  font-size: 0.84rem;
+  color: var(--ink-3);
+  max-width: 62ch;
+}
+
+.docs-shot .screen {
+  border: var(--hair) solid var(--rule-strong);
+  background: var(--stock);
+  overflow: hidden;
+}
+
+.docs-shot .screen-chrome {
+  display: flex;
+  gap: 14px;
+  align-items: baseline;
+  padding: 7px 11px;
+  border-bottom: var(--hair) solid var(--rule);
+  background: var(--stock-band);
+  font-size: 0.7rem;
+  color: var(--ink-3);
+}
+
+.docs-shot .frame-static {
+  display: grid;
+  grid-template-columns: minmax(0, 15rem) minmax(0, 1fr);
+}
+
+.docs-shot .pane {
+  min-width: 0;
+  padding: 9px 11px 12px;
+}
+
+.docs-shot .pane-list {
+  border-right: var(--hair) solid var(--rule);
+  background: var(--stock-band);
+}
+
+.docs-shot .pane-label {
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+  letter-spacing: 0.04em;
+  color: var(--ink-3);
+  padding-bottom: 8px;
+  margin-bottom: 5px;
+  border-bottom: var(--hair) solid var(--rule);
+}
+
+.docs-shot .row-group {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  font-family: var(--font-mono);
+  font-size: 0.63rem;
+  color: var(--ink-3);
+  margin: 10px 0 4px;
+}
+
+.docs-shot .row-group:first-of-type {
+  margin-top: 2px;
+}
+
+.docs-shot .row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 10px;
+  padding: 4px 5px 4px 7px;
+  font-size: 0.76rem;
+  color: var(--ink-2);
+}
+
+.docs-shot .row.is-selected {
+  background: var(--stock);
+  box-shadow: inset 2px 0 0 var(--work);
+  color: var(--ink);
+  font-weight: 500;
+}
+
+.docs-shot .row-task {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.docs-shot .row .state {
+  font-size: 0.6rem;
+  flex: none;
+}
+
+/* `.docs-main pre` gives code blocks a border and a tinted background, which
+ * made the terminal render as a bordered box nested inside the pane box. The
+ * pane IS the container here. */
+.docs-shot .tty {
+  margin: 0;
+  border: 0;
+  background: none;
+  padding: 0;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  line-height: 1.7;
+  color: var(--ink);
+  white-space: pre;
+  overflow-x: auto;
+}
+
+.docs-shot .tty .dim { color: var(--ink-3); }
+.docs-shot .tty .ok { color: var(--st-merged); }
+.docs-shot .tty .run { color: var(--st-running); }
+.docs-shot .tty .add { color: var(--st-merged); }
+
+@media (max-width: 700px) {
+  .docs-shot .frame-static {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .docs-shot .pane-list {
+    border-right: 0;
+    border-bottom: var(--hair) solid var(--rule);
+  }
+}
+
 /* ---------- right: on this page ---------- */
 
 .docs-toc {

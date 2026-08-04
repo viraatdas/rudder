@@ -66,6 +66,37 @@ task and a second one starts beside it, unable to see or overwrite the first.</p
 <p>When a row says <span class="state state--review">done</span>, press
 <kbd>m</kbd>. Rudder shows you the diff. Press <kbd>m</kbd> again and it lands.</p>
 
+<figure class="docs-shot">
+  <div class="screen">
+    <div class="screen-chrome"><span class="mono">rudder</span><span class="mono">~/code/api</span></div>
+    <div class="frame frame-static">
+      <div class="pane pane-list">
+        <div class="pane-label">agents</div>
+        <div class="row-group">/main<span>1 agent</span></div>
+        <div class="row"><span class="row-task">tag the release</span><span class="state state--running">running</span></div>
+        <div class="row-group">worktrees<span>3 agents</span></div>
+        <div class="row is-selected"><span class="row-task">rate-limit the public API</span><span class="state state--running">running</span></div>
+        <div class="row"><span class="row-task">port the settings screen</span><span class="state state--review">done</span></div>
+        <div class="row"><span class="row-task">drop the legacy session table</span><span class="state state--merged">merged</span></div>
+      </div>
+      <div class="pane pane-main">
+        <div class="pane-label">rate-limit the public API</div>
+        <pre class="tty"><span class="dim">workspace</span> .rudder-worktrees/rate-limit
+
+<span class="ok">●</span> Read src/server/middleware.ts
+<span class="ok">●</span> Edit src/server/rate-limit.ts <span class="add">+64</span>
+<span class="ok">●</span> Bash npm test <span class="dim">· 41 passed</span>
+
+<span class="run">▌</span> writing the burst-window test…</pre>
+      </div>
+    </div>
+  </div>
+  <figcaption>
+    Three agents in their own workspaces, one in your checkout, and the selected
+    agent's own terminal beside them.
+  </figcaption>
+</figure>
+
 <h2 id="the-loop">The whole loop</h2>
 <table class="docs-table">
   <thead><tr><th>you do</th><th>what happens</th></tr></thead>
@@ -188,6 +219,37 @@ inside, and adds a row to the agents list.</p>
   <p>Typing a task can never touch your working tree. If you actually want an agent
   in your real checkout, that is <code>/main</code>, and you have to ask for it.</p>
 </div>
+
+<figure class="docs-shot">
+  <div class="screen">
+    <div class="screen-chrome"><span class="mono">rudder</span><span class="mono">~/code/api</span></div>
+    <div class="frame frame-static">
+      <div class="pane pane-list">
+        <div class="pane-label">agents</div>
+        <div class="row-group">/main<span>1 agent</span></div>
+        <div class="row"><span class="row-task">tag the release</span><span class="state state--running">running</span></div>
+        <div class="row-group">worktrees<span>3 agents</span></div>
+        <div class="row is-selected"><span class="row-task">rate-limit the public API</span><span class="state state--running">running</span></div>
+        <div class="row"><span class="row-task">port the settings screen</span><span class="state state--review">done</span></div>
+        <div class="row"><span class="row-task">drop the legacy session table</span><span class="state state--merged">merged</span></div>
+      </div>
+      <div class="pane pane-main">
+        <div class="pane-label">rate-limit the public API</div>
+        <pre class="tty"><span class="dim">workspace</span> .rudder-worktrees/rate-limit
+
+<span class="ok">●</span> Read src/server/middleware.ts
+<span class="ok">●</span> Edit src/server/rate-limit.ts <span class="add">+64</span>
+<span class="ok">●</span> Bash npm test <span class="dim">· 41 passed</span>
+
+<span class="run">▌</span> writing the burst-window test…</pre>
+      </div>
+    </div>
+  </div>
+  <figcaption>
+    Three agents in their own workspaces, one in your checkout, and the selected
+    agent's own terminal beside them.
+  </figcaption>
+</figure>
 
 <h2 id="watch">Watch it</h2>
 <p>Press <kbd>Option-2</kbd> for the worker pane. That is the agent's own terminal,
