@@ -852,6 +852,7 @@ pub(crate) fn review_all_run(
         soft_deps: Vec::new(),
         node_id: None,
         plan_id: None,
+        reviewed_at: None,
         reconcile_planner: false,
         plan_stream: None,
         plan_output_cache: None,

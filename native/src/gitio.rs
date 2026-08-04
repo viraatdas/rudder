@@ -265,6 +265,7 @@ pub(crate) fn create_main_agent(
         soft_deps: Vec::new(),
         node_id: None,
         plan_id: None,
+        reviewed_at: None,
         reconcile_planner: false,
         plan_stream: None,
         plan_output_cache: None,
@@ -514,6 +515,14 @@ pub(crate) fn agent_from_run_record(
         .and_then(|value| value.as_str())
         .filter(|value| !value.trim().is_empty())
         .map(ToOwned::to_owned);
+    // The review gate has to survive a restart: a crash between reviewing and
+    // merging must not silently re-arm the gate, or the user reviews twice and
+    // learns to distrust it.
+    let reviewed_at = record
+        .get("reviewedAt")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned);
     if deps.is_empty() {
         if let Some(plan_deps) = record.get("planDeps").and_then(|value| value.as_array()) {
             deps = plan_deps
@@ -612,6 +621,7 @@ pub(crate) fn agent_from_run_record(
         created_at,
         mode,
         plan_id,
+        reviewed_at,
         task,
         task_summary,
         current_prompt,
@@ -929,6 +939,7 @@ pub(crate) fn save_native_run_record(repo_root: &Path, run: &AgentRun) -> Result
         // The plan this run belongs to. Node ids repeat across concurrent plans, so
         // without this a restart could not tell whose node `nodeId` names.
         "planId": run.plan_id,
+        "reviewedAt": run.reviewed_at,
         "planDeps": run.deps,
         "delivery": run.delivery.to_json(),
         "session": run.session_id.as_ref().map(|sid| serde_json::json!({ "nativeSessionId": sid })),

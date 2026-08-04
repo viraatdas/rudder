@@ -6140,6 +6140,7 @@ fn test_agent_run(id: &str, task: &str) -> AgentRun {
         mode: AgentMode::Execute,
         task: task.to_string(),
         plan_id: None,
+        reviewed_at: None,
         task_summary: summarize_task(task),
         current_prompt: task.to_string(),
         turns: vec![AgentTurn {
@@ -7080,6 +7081,8 @@ fn merge_request_clears_pending_delete() {
     run.status = AgentStatus::Done;
     run.worktree_branch = Some("rudder/test".to_string());
     run.worktree_path = Some(app.cwd.join("worktree"));
+    // Reviewed, so this reaches the confirm modal rather than the diff gate.
+    run.reviewed_at = Some("2026-08-04T00:00:00Z".to_string());
     app.agents.push(run);
     app.delete_pending = Some("run-1".to_string());
 
@@ -7087,6 +7090,68 @@ fn merge_request_clears_pending_delete() {
 
     assert!(app.delete_pending.is_none());
     assert!(app.merge_confirm.is_some());
+}
+
+#[test]
+fn unread_work_cannot_be_merged_without_being_shown_first() {
+    // The gate. Work does not reach the user's branch until its diff has been put in
+    // front of them, and `m` is the key that does the showing - refusing outright and
+    // making them hunt for the diff key would just train them to press two keys.
+    let mut app = App::new();
+    let mut run = test_agent_run("run-1", "change something");
+    run.status = AgentStatus::Done;
+    run.worktree_branch = Some("rudder/test".to_string());
+    run.worktree_path = Some(app.cwd.join("worktree"));
+    app.agents.push(run);
+    app.delete_pending = Some("run-1".to_string());
+
+    // First press: no merge, the diff opens instead.
+    app.request_merge_selected_agent();
+    assert!(
+        app.merge_confirm.is_none(),
+        "unread work does not reach the merge confirmation"
+    );
+    assert_eq!(app.worker_view, WorkerView::Diff, "its diff is opened");
+    assert!(
+        app.agents[0].reviewed_at.is_some(),
+        "being shown the diff is what marks it reviewed"
+    );
+    assert!(
+        app.delete_pending.is_none(),
+        "an armed delete is disarmed by reaching for merge, gate or no gate"
+    );
+    let notice = app.notice.as_deref().unwrap_or_default();
+    assert!(
+        notice.contains("press m again"),
+        "the notice says what to do next: {notice}"
+    );
+
+    // Second press: now it merges.
+    app.request_merge_selected_agent();
+    assert!(
+        app.merge_confirm.is_some(),
+        "a row whose diff has been read reaches the merge confirmation"
+    );
+}
+
+#[test]
+fn rows_with_nothing_to_merge_never_claim_to_be_reviewed() {
+    // A main-checkout or one-off agent edits the user's tree directly and can never
+    // be merged, so labelling it "reviewed" would advertise a gate it never passes.
+    let mut app = App::new();
+    let mut main = test_agent_run("main-1", "tag the release");
+    main.mode = AgentMode::Main;
+    main.status = AgentStatus::Done;
+    app.agents.push(main);
+
+    app.worker_view = WorkerView::Terminal;
+    app.toggle_worker_view();
+
+    assert_eq!(app.worker_view, WorkerView::Diff);
+    assert!(
+        app.agents[0].reviewed_at.is_none(),
+        "a main-checkout row has no merge to gate"
+    );
 }
 
 #[test]
@@ -7760,6 +7825,7 @@ fn delete_agent_requires_second_d() {
         created_at: "1".to_string(),
         mode: AgentMode::Execute,
         plan_id: None,
+        reviewed_at: None,
         task: "test task".to_string(),
         task_summary: summarize_task("test task"),
         current_prompt: "test task".to_string(),

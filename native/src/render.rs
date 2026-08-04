@@ -4500,8 +4500,13 @@ pub(crate) fn agent_status_label(agent: &AgentRun) -> &'static str {
         // happening and never said WHO merges next.
         if agent.node_id.is_some() {
             "done · auto-merging"
+        } else if agent.reviewed_at.is_some() {
+            // The gate is only visible if the two sides look different. Without this
+            // both a read and an unread row said "press m to merge", and the extra
+            // keystroke on unread work read as the dashboard misbehaving.
+            "reviewed · press m to merge"
         } else {
-            "done · press m to merge"
+            "done · press m to read the diff"
         }
     } else {
         agent.lifecycle_label()

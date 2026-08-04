@@ -984,6 +984,22 @@ struct AgentRun {
     /// repeat across concurrent plans, so `node_id` alone cannot identify a node — the
     /// pair does. `None` for manually started agents that belong to no plan.
     plan_id: Option<String>,
+    /// When the user last looked at this row's diff, and the gate between done and
+    /// merged: work does not reach the user's branch until someone has actually seen
+    /// what it changed. Set by opening the diff, because "you have seen this" is a
+    /// claim the dashboard can honestly make; "you approved this" is not.
+    ///
+    /// Deliberately an attribute rather than an `AgentStatus` variant. Review is
+    /// orthogonal to the lifecycle — a row is Done whether or not it has been read —
+    /// and adding a status would mean auditing every `== AgentStatus::Done` in the
+    /// codebase to also admit the new one, which is how a state machine grows holes.
+    /// The agents list still RENDERS it as a state, because that is what makes the
+    /// gate visible.
+    ///
+    /// Distinct from a plan's `reviewed_nodes`/`node_reviewers`, which track AI
+    /// reviewer AGENTS over DAG nodes and are off by default. This is the human, and
+    /// it applies to any row with a workspace, plan node or not.
+    reviewed_at: Option<String>,
     /// True when this is a RECONCILE planner: a RudderPlan agent spawned to fold
     /// one ADDED task into an already-active plan. The poll loop routes its
     /// completion to the APPEND path (`evaluate_completed_reconcile`) instead of
@@ -2928,6 +2944,7 @@ impl App {
         self.worker_view = match self.worker_view {
             WorkerView::Terminal => {
                 self.ensure_review_diff();
+                self.mark_selected_reviewed();
                 WorkerView::Diff
             }
             WorkerView::Diff => {
@@ -2937,6 +2954,31 @@ impl App {
             WorkerView::PlanReview => WorkerView::Terminal,
         };
         self.focus = FocusPane::Worker;
+    }
+
+    /// Record that this row's diff has been put in front of the user. This is the
+    /// review gate, and it is deliberately weak: it claims only that the change was
+    /// SHOWN, which is a thing the dashboard can actually observe. A stronger claim
+    /// ("approved") would need a second keystroke that people learn to hammer, which
+    /// buys a stricter-sounding gate and no more real review.
+    ///
+    /// Only rows with something to merge are marked. A main-checkout or one-off agent
+    /// has no workspace and never reaches the gate, so marking it would put a
+    /// "reviewed" label on a row that can never be merged.
+    fn mark_selected_reviewed(&mut self) {
+        let cwd = self.cwd.clone();
+        let Some(run) = self.agents.get_mut(self.selected_agent) else {
+            return;
+        };
+        if run.is_main() || run.is_oneoff() || run.is_orchestrator() {
+            return;
+        }
+        if run.reviewed_at.is_some() {
+            return;
+        }
+        run.reviewed_at = Some(now_stamp());
+        let _ = save_native_run_record(&cwd, run);
+        self.dirty = true;
     }
 
     fn review_all_ready(&mut self) {
@@ -4880,6 +4922,7 @@ impl App {
             created_at: created_at.clone(),
             mode: AgentMode::RudderPlan,
             plan_id: Some(plan_id),
+            reviewed_at: None,
             task: input.to_string(),
             task_summary: format!("add {}", summarize_task(input)),
             current_prompt: input.to_string(),
@@ -5103,6 +5146,7 @@ impl App {
             soft_deps: Vec::new(),
             node_id,
             plan_id,
+            reviewed_at: None,
             reconcile_planner: false,
             plan_stream: None,
             plan_output_cache: None,
@@ -5229,6 +5273,7 @@ impl App {
             // This row DRIVES the plan opened above; that link is what lets each
             // orchestrator's pane keep talking to its own plan.
             plan_id: Some(plan_id),
+            reviewed_at: None,
             task: input.to_string(),
             task_summary: format!("plan {}", summarize_task(input)),
             current_prompt: input.to_string(),
@@ -7572,6 +7617,7 @@ impl App {
             soft_deps: Vec::new(),
             node_id: None,
             plan_id: None,
+            reviewed_at: None,
             reconcile_planner: false,
             plan_stream: None,
             plan_output_cache: None,
@@ -11814,6 +11860,7 @@ impl App {
             soft_deps: Vec::new(),
             node_id: None,
             plan_id: None,
+            reviewed_at: None,
             reconcile_planner: false,
             plan_stream: None,
             plan_output_cache: None,
@@ -12012,7 +12059,21 @@ impl App {
             self.notice = Some("selected agent has no workspace to merge".to_string());
             return;
         }
+        // Reaching for merge at all means the armed `dd` is not what you want, so it
+        // is disarmed before the gate rather than after it. Otherwise pressing `m` on
+        // unreviewed work left a delete primed behind the diff you were reading.
         self.delete_pending = None;
+        // THE GATE: nothing reaches the user's branch that they have not been shown.
+        // Rather than refuse and make them find the diff key, this IS the diff key —
+        // `m` on unreviewed work opens the diff, and a second `m` merges it. The cost
+        // is one keystroke on work nobody has looked at, which is the entire point.
+        if run.reviewed_at.is_none() {
+            self.worker_view = WorkerView::Terminal;
+            self.toggle_worker_view();
+            self.notice =
+                Some("read the diff, then press m again to merge · Esc goes back".to_string());
+            return;
+        }
         // Merges run with --allow-dirty: uncommitted edits in the main checkout
         // become part of the merge parent. Surprising enough to warn about in
         // the modal instead of discovering it in the merge commit.
