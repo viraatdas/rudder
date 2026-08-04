@@ -43,13 +43,24 @@ is plain, not warm. Neutrals lean very slightly cool, toward the ink, never warm
 State colors carry meaning only, and every one is paired with its word in the
 markup so nothing is conveyed by color alone:
 
-| Token | Meaning |
-| --- | --- |
-| `--st-running` | running |
-| `--st-review` | needs review |
-| `--st-merged` | merged |
-| `--st-conflict` | conflict |
-| `--st-idle` | idle |
+| Token | Meaning | Contrast on stock | Rendered today |
+| --- | --- | --- | --- |
+| `--st-running` | running | 6.40:1 | yes |
+| `--st-review` | done, ready to merge | 5.52:1 | yes |
+| `--st-merged` | merged | 6.08:1 | yes |
+| `--st-conflict` | conflict | 6.36:1 | defined, unused |
+| `--st-idle` | idle | 4.94:1 | defined, unused |
+
+`.state` renders at 0.7rem, which WCAG counts as small text, so every one of these
+needs 4.5:1 rather than 3:1. `--st-idle` was 62% lightness (3.55:1) and would have
+failed the moment it was used; it is held at 54%. Measured values are OKLCH →
+OKLab → linear sRGB → WCAG relative luminance, against `--stock` and re-checked
+against `--stock-band` since rows tint on hover.
+
+Copy note: the words in the Meaning column must match shipped statuses
+(`running / done / merged / failed / stopped / paused / orphaned / migrated`).
+An earlier draft used "needs review", which is not a state Rudder has and implied
+an approval gate that does not exist.
 
 ## Typography
 

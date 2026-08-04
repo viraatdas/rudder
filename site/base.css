@@ -38,7 +38,10 @@
   --st-review: oklch(52% 0.125 70);
   --st-merged: oklch(48% 0.105 150);
   --st-conflict: oklch(50% 0.150 15);
-  --st-idle: oklch(62% 0.008 240);
+  /* Held at 54%, not the lighter grey it wants to be: `.state` renders at
+   * 0.7rem, which WCAG counts as small text, so this needs 4.5:1 rather than 3:1.
+   * 62% measured 3.55:1 on stock and would have failed the moment it was used. */
+  --st-idle: oklch(54% 0.008 240);
 
   --measure: 68ch;
 
@@ -243,7 +246,9 @@ kbd {
   font-family: var(--font-mono);
   font-size: 0.74rem;
   padding: 0.16em 0.42em;
-  border: var(--hair) solid var(--rule-mid);
+  /* --rule-mid measured 1.82:1 and the border is what makes this read as a
+   * key rather than as inline code, so it takes the stronger rule. */
+  border: var(--hair) solid var(--rule-strong);
   border-radius: var(--radius);
   background: var(--stock-band);
   color: var(--ink);

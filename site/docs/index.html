@@ -69,7 +69,8 @@ touch, how you see what it did, and how that reaches your main branch.</p>
 apart: they stash over each other, leave half-finished edits in your working tree,
 and you lose track of which branch holds what.</p>
 <p>Rudder's answer is isolation. Every agent gets a <strong>jj workspace</strong> of
-its own, outside your checkout. Four agents editing the same file are four separate
+its own: a private copy of the repo, gitignored, beside your checkout and never
+in it. Four agents editing the same file are four separate
 trees. Nothing merges until you say so, and your own checkout stays exactly where
 you left it the whole time.</p>
 
@@ -103,6 +104,12 @@ you left it the whole time.</p>
       <nav class="docs-pager" aria-label="Pagination">
         <a class="next" href="/docs/install"><span class="field-label">next</span>Install</a>
       </nav>
+        <div class="docs-foot">
+          <a href="/">Rudder home</a>
+          <a href="https://github.com/viraatdas/rudder">GitHub</a>
+          <a href="https://www.npmjs.com/package/@viraatdas/rudder">npm</a>
+          <a href="https://github.com/viraatdas/rudder/issues">Report an issue</a>
+        </div>
       </main>
 
       <aside class="docs-toc">

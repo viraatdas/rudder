@@ -50,6 +50,9 @@
 
   .bus {
     position: relative;
+    /* The static border would sit under the drawn rule in the same colour and
+     * hide the animation entirely; the ::before IS the rule while it draws. */
+    border-top-color: transparent;
   }
 
   /* The bus rule draws itself once, after the last row has landed. */

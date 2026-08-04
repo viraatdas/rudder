@@ -103,7 +103,7 @@
 
 .docs-main p,
 .docs-main li {
-  max-width: 68ch;
+  max-width: 62ch;
   color: var(--ink-2);
 }
 
@@ -250,6 +250,27 @@
   color: var(--work);
 }
 
+/* Docs footer: a doc's last screen should still offer a way out. */
+.docs-foot {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 20px;
+  margin-top: 34px;
+  padding-top: 18px;
+  border-top: var(--hair) solid var(--rule);
+  font-size: 0.82rem;
+  color: var(--ink-3);
+}
+
+.docs-foot a {
+  color: var(--ink-2);
+  text-decoration: none;
+}
+
+.docs-foot a:hover {
+  color: var(--work);
+}
+
 /* ---------- prev / next ---------- */
 
 .docs-pager {
@@ -295,9 +316,13 @@
   .docs {
     grid-template-columns: minmax(0, 1fr);
   }
+  /* `height: auto`, not `max-height: none`: the desktop rule sets HEIGHT to
+   * 100vh, so a max-height reset is a no-op and the nav stayed pinned to a full
+   * viewport. Every docs page opened on a phone showed a table of contents and
+   * nothing else, with the title and body pushed below the fold. */
   .docs-nav {
     position: static;
-    max-height: none;
+    height: auto;
     border-right: 0;
     border-bottom: var(--hair) solid var(--rule);
     padding: 18px 0;

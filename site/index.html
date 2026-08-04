@@ -36,9 +36,11 @@
       working ink; other color is state only, always paired with a word.
       STORY: A developer with three changes in flight sees them logged side by
       side on one sheet, understands each is isolated, and installs.
-      FIRST VIEWPORT: Title block left, revision stamp right, install beneath;
-      then the ruled track sheet, four tracks in flight, closed by the sum bus
-      labelled main.
+      FIRST VIEWPORT: Title block and install in a single left column at a
+      deliberate measure; then the sheet head carrying the run's stamped facts,
+      the ruled track sheet with four tracks in flight, closed by the sum bus
+      labelled main. (An earlier draft put the stamp in a right-hand column; it
+      left a dead void, so the stamp moved onto the sheet it describes.)
       FORM: studio track sheet; candidate 4 of the ordered list; seed 9b5209e6.
       FINISH: unreviewed and undocumented is unfinished; this build ends with the finish review, the verdict, and DESIGN.md
     -->
@@ -136,7 +138,7 @@
                   <td class="t-task" data-label="task">port the settings screen to the new form</td>
                   <td class="t-ws" data-label="workspace">.rudder-worktrees/settings-form</td>
                   <td class="t-state" data-label="state">
-                    <span class="state state--review">needs review</span>
+                    <span class="state state--review">done · ready to merge</span>
                   </td>
                 </tr>
                 <tr>
@@ -178,15 +180,14 @@
           </div>
           <div class="movements">
             <div class="movement">
-              <span class="field-label">isolate</span>
               <h3>A workspace per agent</h3>
               <p>
-                Each agent gets its own jj workspace outside your checkout. It
-                cannot see, stash, or overwrite anyone else's edits.
+                Each agent gets its own jj workspace: a private copy of the repo,
+                gitignored, beside your checkout and never in it. It cannot see,
+                stash, or overwrite anyone else's edits.
               </p>
             </div>
             <div class="movement">
-              <span class="field-label">run</span>
               <h3>All of them at once</h3>
               <p>
                 Claude Code, Codex and opencode run side by side, on the same
@@ -194,7 +195,6 @@
               </p>
             </div>
             <div class="movement">
-              <span class="field-label">review</span>
               <h3>A real diff, per row</h3>
               <p>
                 Press <kbd>v</kbd> on any agent for the live <code class="mono">jj diff</code>
@@ -202,7 +202,6 @@
               </p>
             </div>
             <div class="movement">
-              <span class="field-label">merge</span>
               <h3>Only when you say</h3>
               <p>
                 <kbd>m</kbd> merges one, <kbd>M</kbd> merges everything ready.
@@ -309,11 +308,11 @@
 
         <section class="section" aria-labelledby="options-title">
           <div class="section-head">
-            <h2 id="options-title">Set per agent, changed mid-session.</h2>
+            <h2 id="options-title">Set once. The next agent picks it up.</h2>
             <p>
-              Backend, model and reasoning effort are per row, not global. Switch
-              with <code class="mono">/model</code> and the next agent picks it
-              up.
+              <code class="mono">/model</code> sets the backend, model and
+              reasoning effort Rudder will use, and remembers it. A running agent
+              keeps whatever it launched with.
             </p>
           </div>
           <div class="options">
@@ -331,8 +330,10 @@
               <p>How long it thinks before it writes.</p>
               <ul class="option-list">
                 <li><span>low</span><em>mechanical edits</em></li>
-                <li><span>medium</span><em>the default</em></li>
+                <li><span>medium</span><em>balanced</em></li>
                 <li><span>high</span><em>design and debugging</em></li>
+                <li><span>xhigh</span><em>the default</em></li>
+                <li><span>max</span><em>where it is offered</em></li>
               </ul>
             </div>
             <div class="option-group">

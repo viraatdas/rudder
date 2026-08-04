@@ -510,6 +510,14 @@
     overflow-wrap: normal;
   }
 
+  /* `.c-what` holds a bare text node AND a span, so the text becomes an
+   * anonymous grid item and auto-placement drops the span into column 1 - the
+   * 6.5rem label gutter - where every explanation wrapped three words wide with
+   * the row empty beside it. Pin the span to the content column. */
+  .commands .c-what span {
+    grid-column: 2;
+  }
+
   .tracks td::before,
   .commands td::before {
     content: attr(data-label);
@@ -536,6 +544,12 @@
 @media (max-width: 560px) {
   .titleblock {
     padding-top: 36px;
+  }
+  /* The install command is the page's one primary action; clipping it mid-scope
+   * at `@viraatdas/rudder@` with no scroll affordance hid what you are running. */
+  .install code {
+    white-space: normal;
+    overflow-wrap: anywhere;
   }
   .sheet-head {
     align-items: flex-start;

@@ -67,7 +67,8 @@ touch, how you see what it did, and how that reaches your main branch.</p>
 apart: they stash over each other, leave half-finished edits in your working tree,
 and you lose track of which branch holds what.</p>
 <p>Rudder's answer is isolation. Every agent gets a <strong>jj workspace</strong> of
-its own, outside your checkout. Four agents editing the same file are four separate
+its own: a private copy of the repo, gitignored, beside your checkout and never
+in it. Four agents editing the same file are four separate
 trees. Nothing merges until you say so, and your own checkout stays exactly where
 you left it the whole time.</p>
 
@@ -179,7 +180,7 @@ directly. <kbd>Option-1</kbd> goes back to the agents list.</p>
 between them from any pane.</p>
 
 <h2 id="review">Review the diff</h2>
-<p>When the row says <span class="state state--review">needs review</span>, select it
+<p>When the row says <span class="state state--review">done</span>, select it
 and press <kbd>v</kbd>. That is the live <code>jj diff</code> of that agent's
 workspace: exactly what it changed, and nothing of it is in your checkout yet.</p>
 
@@ -328,7 +329,7 @@ what is happening.</p>
 <table class="docs-table">
   <thead><tr><th>command</th><th>what it does</th></tr></thead>
   <tbody>
-    <tr><td>/model</td><td>Switch backend, model and reasoning effort for the next agent.</td></tr>
+    <tr><td>/model</td><td>Set the backend, model and reasoning effort for the next agent. Effort runs low, medium, high, xhigh, max; xhigh is the default where a model offers it, and opencode takes none. A running agent keeps what it launched with.</td></tr>
     <tr><td>/fast</td><td>Toggle faster output on supported models.</td></tr>
     <tr><td>/resume</td><td>Continue an existing Claude, Codex or opencode chat as an agent.</td></tr>
     <tr><td>/restore</td><td>Reopen a specific session id in a new pane.</td></tr>
@@ -502,6 +503,12 @@ ${navHtml(slug)}
         <p class="docs-lede">${page.lede}</p>
 ${page.body.trim()}
 ${pagerHtml(slug)}
+        <div class="docs-foot">
+          <a href="/">Rudder home</a>
+          <a href="https://github.com/viraatdas/rudder">GitHub</a>
+          <a href="https://www.npmjs.com/package/@viraatdas/rudder">npm</a>
+          <a href="https://github.com/viraatdas/rudder/issues">Report an issue</a>
+        </div>
       </main>
 
 ${tocHtml(page.toc)}
