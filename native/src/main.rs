@@ -12103,17 +12103,6 @@ impl App {
         // is disarmed before the gate rather than after it. Otherwise pressing `m` on
         // unreviewed work left a delete primed behind the diff you were reading.
         self.delete_pending = None;
-        // THE GATE: nothing reaches the user's branch that they have not been shown.
-        // Rather than refuse and make them find the diff key, this IS the diff key —
-        // `m` on unreviewed work opens the diff, and a second `m` merges it. The cost
-        // is one keystroke on work nobody has looked at, which is the entire point.
-        if run.reviewed_at.is_none() {
-            self.worker_view = WorkerView::Terminal;
-            self.toggle_worker_view();
-            self.notice =
-                Some("read the diff, then press m again to merge · Esc goes back".to_string());
-            return;
-        }
         // THE FORK IN THE ROAD. Where publishing can work, this row's route to main
         // is a pull request and NOT a local merge; where it cannot, it is the local
         // merge below. Exactly one of the two runs for a given row, ever — two roads
@@ -12150,6 +12139,21 @@ impl App {
                 return;
             }
             MergeRoute::LocalMerge => {}
+        }
+        // THE GATE, and it belongs to the LOCAL road only.
+        //
+        // Nothing merges into the user's checkout that they have not been shown, and
+        // `m` is the key that shows it: unread work opens its diff, a second `m`
+        // merges. On the publishing road there is no gate, because the pull request
+        // IS the review surface — a draft PR requests no review and the diff gets
+        // read there. Gating both roads meant reading the same change twice for one
+        // landing, and a review you are made to do twice is one you learn to skim.
+        if run.reviewed_at.is_none() {
+            self.worker_view = WorkerView::Terminal;
+            self.toggle_worker_view();
+            self.notice =
+                Some("read the diff, then press m again to merge · Esc goes back".to_string());
+            return;
         }
         // Merges run with --allow-dirty: uncommitted edits in the main checkout
         // become part of the merge parent. Surprising enough to warn about in

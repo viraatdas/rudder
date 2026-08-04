@@ -15768,3 +15768,60 @@ fn m_waits_rather_than_guessing_the_road_before_detection_lands() {
 
     let _ = fs::remove_dir_all(&repo);
 }
+
+#[test]
+fn the_diff_gate_guards_the_local_road_only() {
+    // Two roads, one gate. Merging into the user's checkout is the last chance to
+    // look, so it is gated. Publishing is not: a draft PR IS the review surface, and
+    // gating it too meant reading the same change once in the pane and again on
+    // GitHub for a single landing. A review you are made to do twice is one you
+    // learn to skim.
+    //
+    // Every other publish test uses a fixture that pre-marks reviewed_at, which is
+    // exactly why moving the gate changed behavior and no test noticed.
+    let repo = publish_test_repo("gate-local-only");
+
+    // PUBLISHING ROAD: unread work goes straight to the PR, no diff detour.
+    let mut app = App::new();
+    app.cwd = repo.clone();
+    app.publish = PublishState::Active(test_capability());
+    let mut unread = publishable_run("run-pub", "add the widget");
+    unread.reviewed_at = None;
+    app.agents.push(unread);
+    record_publish_acceptance(&repo, "https://github.com/acme/widgets.git").expect("record");
+
+    assert_eq!(app.merge_route_for(0), MergeRoute::Publish);
+    app.request_merge_selected_agent();
+    assert_ne!(
+        app.worker_view,
+        WorkerView::Diff,
+        "publishing does not send you to the pane diff first"
+    );
+    assert!(
+        app.agents[0].reviewed_at.is_none(),
+        "publishing does not mark the row reviewed on the user's behalf"
+    );
+
+    // LOCAL ROAD: the same unread work IS gated.
+    let mut local = App::new();
+    local.cwd = repo.clone();
+    local.publish = PublishState::Inactive(PublishBlocker::NotGitHub);
+    let mut unread = publishable_run("run-local", "add the widget");
+    unread.reviewed_at = None;
+    unread.worktree_branch = Some("rudder/local".to_string());
+    local.agents.push(unread);
+
+    assert_eq!(local.merge_route_for(0), MergeRoute::LocalMerge);
+    local.request_merge_selected_agent();
+    assert_eq!(
+        local.worker_view,
+        WorkerView::Diff,
+        "the local road shows the diff before it touches the checkout"
+    );
+    assert!(
+        local.merge_confirm.is_none(),
+        "and does not merge on that press"
+    );
+
+    let _ = fs::remove_dir_all(&repo);
+}
