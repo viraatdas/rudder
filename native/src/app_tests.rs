@@ -110,10 +110,62 @@ fn render_screen(app: &mut App, width: u16, height: u16) -> String {
 /// whole test (set env -> use -> remove).
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-fn env_guard() -> std::sync::MutexGuard<'static, ()> {
-    ENV_LOCK
+/// Every process-global var the harness injects. `EnvGuard` snapshots these on
+/// acquisition and puts them back on drop, so the list must stay a superset of what
+/// the tests set — a var missing here is a var that can leak.
+const GUARDED_ENV: [&str; 8] = [
+    "HOME",
+    "PATH",
+    "RUDDER_CLAUDE_BIN",
+    "RUDDER_CODEX_BIN",
+    "RUDDER_HOME",
+    "RUDDER_INTERACTIVE_ORCHESTRATOR",
+    "RUDDER_NATIVE_PERF",
+    "RUDDER_WORKTREE_GC_GRACE_SECS",
+];
+
+/// Holds `ENV_LOCK` and restores every guarded var when it drops — including while
+/// unwinding from a failed assertion.
+///
+/// The lock alone was not enough. Each env-mutating test ended in a hand-written
+/// `remove_var`, so ANY assertion that fired before it left (say) RUDDER_CLAUDE_BIN
+/// pointing at a `/tmp` shell script for the rest of the process. The next test to
+/// build a command then got `/tmp/fake-claude.sh` where it asserted `claude` and
+/// failed for a reason that had nothing to do with it — one timing-sensitive PTY test
+/// losing a race turned into a second, baffling failure somewhere else. The mutex
+/// cannot catch this: it is deliberately poison-tolerant (a panicking test must not
+/// wedge the other 41), so it hands the leaked value straight to the next holder.
+/// Restoring on drop makes the leak unrepresentable, which is why the individual
+/// `remove_var` calls that remain are now belt-and-braces rather than load-bearing.
+struct EnvGuard {
+    // Declared first so it drops LAST: the env is back to normal before the next
+    // test is allowed to take the lock.
+    _lock: std::sync::MutexGuard<'static, ()>,
+    prior: Vec<(&'static str, Option<std::ffi::OsString>)>,
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        for (key, value) in &self.prior {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
+
+fn env_guard() -> EnvGuard {
+    let lock = ENV_LOCK
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    EnvGuard {
+        prior: GUARDED_ENV
+            .iter()
+            .map(|key| (*key, std::env::var_os(key)))
+            .collect(),
+        _lock: lock,
+    }
 }
 
 /// Write `body` as an executable script at `path` (the fake `claude`/`codex` the
@@ -6981,11 +7033,20 @@ fn restart_preserves_interactive_orchestrator_profile_from_run_record() {
     let repo = unique_test_repo("restart-interactive-orch");
     let fake = repo.join("fake-claude.sh");
     let args_file = repo.join("claude-args.txt");
+    // Write to a scratch path and RENAME it into place. A plain `> args_file` makes the
+    // file appear the moment the shell opens the redirect, long before printf's output
+    // is flushed — and an interactive orchestrator's argv is several KB of system
+    // prompt, so it lands in more than one write. Under load this test caught the file
+    // mid-flight and read a prefix that stopped short of `--append-system-prompt`,
+    // failing as though the restart had used the wrong command profile. Rename is
+    // atomic, so the file existing now MEANS the args are complete, which is the
+    // condition the poll below actually wants to wait on.
     write_fake_bin(
         &fake,
         &format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\nsleep 2\n",
-            shell_single_quote(&args_file.to_string_lossy())
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > {tmp}\nmv {tmp} {final}\nsleep 2\n",
+            tmp = shell_single_quote(&args_file.with_extension("partial").to_string_lossy()),
+            final = shell_single_quote(&args_file.to_string_lossy())
         ),
     );
     std::env::set_var("RUDDER_INTERACTIVE_ORCHESTRATOR", "0");
@@ -7020,9 +7081,10 @@ fn restart_preserves_interactive_orchestrator_profile_from_run_record() {
         "interactive orchestrators must not restart as headless/autosteered planners"
     );
 
-    // Generous wait: under parallel test load the fake child's spawn + first write
-    // can lag well past 1s, so poll up to ~5s before giving up (this is the flaky
-    // assertion that used to fail and cascade an env leak into the next test).
+    // Wait for the CONDITION, not a duration: the fake backend renames the args into
+    // place only once it has written all of them, so `exists()` here means "the args
+    // are complete and readable". Under parallel test load the child's spawn can lag
+    // well past 1s, hence the ~5s ceiling — it bounds the failure, it is not the wait.
     for _ in 0..200 {
         if args_file.exists() {
             break;
@@ -14177,6 +14239,9 @@ const FAKE_CONDUCTOR_WORKER: &str = "#!/bin/sh\n\
 #[test]
 #[ignore = "live conductor simulation: spawns fake worker processes + sleeps; run with --ignored --nocapture"]
 fn conductor_live_run_drains_dag_with_fake_workers() {
+    // #[ignore]d by default, but `--ignored` runs it alongside the rest: it injects
+    // RUDDER_CODEX_BIN, so it has to take the same lock everything else does.
+    let _env = env_guard();
     let repo = unique_test_repo("conductor-live");
     let worker = repo.join("fake-worker.sh");
     fs::write(&worker, FAKE_CONDUCTOR_WORKER).expect("write fake worker");
@@ -14823,6 +14888,8 @@ fn maybe_start_node_review_respects_disable_and_serializes() {
 
 #[test]
 fn gc_orphan_workspaces_protects_live_and_reaps_orphans() {
+    // Sets RUDDER_WORKTREE_GC_GRACE_SECS, which is process-global like any other.
+    let _env = env_guard();
     let repo = unique_test_repo("gc-orphans");
     let group = repo.join(".rudder-worktrees").join("proj");
     let live_dir = group.join("live-node");
@@ -15160,6 +15227,116 @@ fn a_run_record_round_trips_its_owning_plan() {
     let _ = std::fs::remove_dir_all(&repo);
 }
 
+// ---------------------------------------------------------------------------
+// The restart harness
+//
+// Rudder derives its state on restart from jj, the filesystem and the process
+// table (AGENTS.md §12.7) — but for a long time nothing in the suite crossed that
+// boundary. Every test built an `App` in memory and asserted on it in memory, so
+// the derivations were only ever exercised in the one place they do not run. That
+// is how two concurrent plans came back as one: 502 tests passed because not one
+// of them reloaded.
+//
+// `ReloadHarness` is the missing half. It persists a fleet the way the running
+// dashboard does (`save_native_run_record`, `App::persist_plan_queue`) and brings
+// it back through `restore_persisted_state` — the SAME function `App::new()` calls
+// at startup, not a copy of it, so a change that breaks a real restart breaks
+// these tests too.
+// ---------------------------------------------------------------------------
+
+/// A scratch repo plus the plans staged for its `.rudder/plan-queue.json`.
+///
+/// Runs are written through as you add them; plans are written on `reload`, since
+/// the queue file holds all of them at once.
+struct ReloadHarness {
+    repo: PathBuf,
+    plans: Vec<PlanState>,
+}
+
+impl ReloadHarness {
+    fn new(tag: &str) -> Self {
+        Self {
+            repo: unique_test_repo(tag),
+            plans: Vec::new(),
+        }
+    }
+
+    /// Persist a run exactly as the dashboard does on every state transition.
+    ///
+    /// Takes the row by `&mut` to enforce the one invariant the record shape assumes:
+    /// a workspace row's cwd IS its workspace. The record stores a single path and the
+    /// loader hands it back as BOTH `cwd` and `worktree_path`, so a row saved with the
+    /// two disagreeing would reload into a shape no real repo ever produces — and the
+    /// assertions after it would be measuring the harness, not the code.
+    fn save(&self, run: &mut AgentRun) -> &Self {
+        run.cwd = run
+            .worktree_path
+            .clone()
+            .unwrap_or_else(|| self.repo.clone());
+        save_native_run_record(&self.repo, run).expect("persist run record");
+        self
+    }
+
+    /// Stage a plan under a KNOWN id. Ids are what a restored run's `plan_id` joins
+    /// against, so tests need to name them rather than take a minted one.
+    fn plan(&mut self, id: &str) -> &mut Self {
+        self.plans.push(PlanState {
+            id: id.to_string(),
+            ..PlanState::default()
+        });
+        self
+    }
+
+    /// The restart. Flushes any staged plans through the real writer, then rebuilds
+    /// the fleet and the plans the way startup does, and hands back the `App` the
+    /// next process would come up with — cwd pointed at this repo, so the §12.7
+    /// reconcile passes can be run against it directly.
+    fn reload(&mut self) -> App {
+        if !self.plans.is_empty() {
+            // `persist_plan_queue` is the only writer of plan-queue.json; going
+            // through it means these tests round-trip the real on-disk shape.
+            let mut writer = App::new();
+            writer.cwd = self.repo.clone();
+            writer.plans = std::mem::take(&mut self.plans);
+            writer.persist_plan_queue();
+        }
+        let (agents, plans) = restore_persisted_state(&self.repo);
+        let mut app = App::new();
+        app.cwd = self.repo.clone();
+        app.agents = agents;
+        app.plans = plans;
+        app
+    }
+}
+
+impl Drop for ReloadHarness {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.repo);
+    }
+}
+
+/// Find a restored row by id, with a message that names what was actually there —
+/// "None" tells you nothing when the interesting failure is a row coming back under
+/// a different identity.
+fn restored_run<'a>(app: &'a App, id: &str) -> &'a AgentRun {
+    app.agents.iter().find(|run| run.id == id).unwrap_or_else(|| {
+        panic!(
+            "{id} did not come back; restored rows were {:?}",
+            app.agents.iter().map(|run| &run.id).collect::<Vec<_>>()
+        )
+    })
+}
+
+/// A finished worker row: `Done`, with a workspace and a change to merge. The shape
+/// every reload assertion below starts from.
+fn reloadable_worker(id: &str, task: &str) -> AgentRun {
+    let mut run = test_agent_run(id, task);
+    run.status = AgentStatus::Done;
+    run.jj_change_id = Some(format!("change-{id}"));
+    run.workspace_name = Some(format!("rudder-{id}"));
+    run
+}
+
 #[test]
 fn concurrent_plans_each_keep_their_orchestrator_across_a_reload() {
     // The reload path used to keep exactly ONE orchestrator row overall, which was
@@ -15222,6 +15399,284 @@ fn concurrent_plans_each_keep_their_orchestrator_across_a_reload() {
     );
 
     let _ = fs::remove_dir_all(&repo_root);
+}
+
+#[test]
+fn a_reload_gives_every_live_plan_its_own_steerable_orchestrator() {
+    // The test above stops at the loader. The loader is only half the answer: it
+    // keeps the newest planner per plan, but every plan that ever ran left a planner
+    // row on disk, and a planner whose plan did not come back is a row nobody can
+    // steer. Which rows survive therefore depends on which PLANS survived, and only
+    // the full restore knows both — so only the full restore can be trusted here.
+    let mut harness = ReloadHarness::new("reload-two-plans");
+    harness.plan("plan-a").plan("plan-b");
+
+    for (id, plan) in [("orch-a", "plan-a"), ("orch-b", "plan-b")] {
+        let mut orch = test_agent_run(id, plan);
+        orch.mode = AgentMode::RudderPlan;
+        orch.plan_id = Some(plan.to_string());
+        orch.created_at = "2026-02-01T00:00:00Z".to_string();
+        harness.save(&mut orch);
+    }
+    // A planner left behind by a plan that is no longer in the queue.
+    let mut dead = test_agent_run("orch-dead", "plan-c");
+    dead.mode = AgentMode::RudderPlan;
+    dead.plan_id = Some("plan-c".to_string());
+    dead.created_at = "2026-01-01T00:00:00Z".to_string();
+    harness.save(&mut dead);
+
+    let app = harness.reload();
+
+    assert_eq!(app.plans.len(), 2, "both live plans came back");
+    let mut owners: Vec<String> = app
+        .agents
+        .iter()
+        .filter(|run| run.is_orchestrator())
+        .map(|run| run.plan_id.clone().unwrap_or_default())
+        .collect();
+    owners.sort();
+    assert_eq!(
+        owners,
+        vec!["plan-a".to_string(), "plan-b".to_string()],
+        "one orchestrator per live plan — no collapse, and no ghost for the dead plan"
+    );
+}
+
+/// Build a colocated jj repo holding two changes: one the working copy descends from
+/// (so it is in trunk) and one orphaned off `root()` (so it is not). Returns None if
+/// jj is not installed or refuses the setup — this is the one derivation whose
+/// authority is an external binary, and faking it would test nothing.
+fn jj_repo_with_reachable_and_orphaned_change(repo: &Path) -> Option<(String, String)> {
+    let jj = |args: &[&str]| -> Option<String> {
+        let out = std::process::Command::new("jj")
+            .args(args)
+            .current_dir(repo)
+            .env("JJ_USER", "Rudder Test")
+            .env("JJ_EMAIL", "test@example.invalid")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+    let head = |args: &[&str]| -> Option<String> {
+        jj(args).filter(|id| !id.is_empty())
+    };
+    jj(&["git", "init", "--colocate"])?;
+    fs::write(repo.join("landed.txt"), "the work that stuck\n").ok()?;
+    jj(&["describe", "-m", "merged work"])?;
+    let reachable = head(&["log", "--no-graph", "-r", "@", "-T", "change_id.short()"])?;
+    // A change off root() is a real head that nothing descends from — exactly what a
+    // merge that was undone, abandoned or rebased away leaves behind.
+    jj(&["new", "root()", "-m", "orphaned work"])?;
+    let orphaned = head(&["log", "--no-graph", "-r", "@", "-T", "change_id.short()"])?;
+    // Put the working copy back on the reachable line, so `trunk() | @` covers it.
+    jj(&["new", &reachable, "-m", "current"])?;
+    Some((reachable, orphaned))
+}
+
+#[cfg(not(windows))]
+#[test]
+fn a_merged_row_whose_change_left_trunk_reloads_as_not_in_main() {
+    // "Merged" is the one status the pane cannot re-check by looking at itself, and a
+    // merge that history was rewritten under keeps claiming success forever. Both rows
+    // here were persisted CLAIMING to be in trunk; one of them is now lying, and jj is
+    // the only thing that knows which.
+    let mut harness = ReloadHarness::new("reload-merge-drift");
+    let Some((reachable, orphaned)) = jj_repo_with_reachable_and_orphaned_change(&harness.repo)
+    else {
+        eprintln!("skipping a_merged_row_whose_change_left_trunk_reloads_as_not_in_main: no jj");
+        return;
+    };
+
+    for (id, change) in [("landed", &reachable), ("drifted", &orphaned)] {
+        let mut run = reloadable_worker(id, "work that was merged");
+        run.status = AgentStatus::Merged;
+        run.integration.merge_change_id = Some(change.clone());
+        run.integration.in_trunk = Some(true);
+        harness.save(&mut run);
+    }
+
+    let mut app = harness.reload();
+    // Step one: the stale claim does not survive the trip. `in_trunk` is DERIVED and
+    // never loaded (§12.7), so a record cannot vouch for itself.
+    assert_eq!(
+        restored_run(&app, "drifted").integration.in_trunk,
+        None,
+        "a reload restored an in-trunk claim from the record instead of asking jj"
+    );
+
+    // Step two: the first reconcile after launch asks the authority.
+    app.reconcile_rows();
+    assert_eq!(
+        restored_run(&app, "landed").integration.in_trunk,
+        Some(true),
+        "work still reachable from trunk reads as merged"
+    );
+    assert_eq!(
+        restored_run(&app, "drifted").integration.in_trunk,
+        Some(false),
+        "the row says merged and jj says the change is gone, so it must read merged · NOT in main"
+    );
+}
+
+#[test]
+fn a_reloaded_row_whose_workspace_is_gone_is_flagged_not_resurrected() {
+    // A workspace deleted while the dashboard was not running cannot be diffed,
+    // merged or branched, but the record it left behind looks exactly like a healthy
+    // finished row. The filesystem is the authority and nothing else can answer.
+    let mut harness = ReloadHarness::new("reload-missing-ws");
+    let alive = harness.repo.join("workspaces").join("alive");
+    fs::create_dir_all(&alive).expect("create the surviving workspace");
+
+    let mut here = reloadable_worker("here", "still has its workspace");
+    here.worktree_path = Some(alive);
+    harness.save(&mut here);
+
+    let mut gone = reloadable_worker("gone", "workspace deleted underneath it");
+    gone.worktree_path = Some(harness.repo.join("workspaces").join("vanished"));
+    harness.save(&mut gone);
+
+    let mut app = harness.reload();
+    // It comes back looking perfectly healthy — that is the whole problem, and the
+    // reason this is a question for the reconcile pass and not a flag on the row.
+    assert_eq!(restored_run(&app, "gone").status, AgentStatus::Done);
+
+    app.reconcile_rows();
+    assert!(
+        app.rows_missing_workspace.contains("gone"),
+        "a row pointing at a workspace that is gone came back as healthy work"
+    );
+    assert!(
+        !app.rows_missing_workspace.contains("here"),
+        "a row whose workspace is still on disk must not be flagged"
+    );
+}
+
+#[test]
+fn reviewed_at_survives_a_reload_so_the_merge_gate_does_not_re_arm() {
+    // `m` shows unread work before it merges it. If the review stamp does not survive
+    // a restart the gate silently re-arms, and the user is made to read a diff they
+    // already approved — which is how a review becomes something you learn to skim.
+    let mut harness = ReloadHarness::new("reload-reviewed");
+    let workspace = harness.repo.join("workspaces").join("reviewed");
+    fs::create_dir_all(&workspace).expect("create workspace");
+
+    let mut reviewed = reloadable_worker("reviewed", "already read this diff");
+    reviewed.reviewed_at = Some("2026-08-04T00:00:00Z".to_string());
+    reviewed.worktree_path = Some(workspace);
+    harness.save(&mut reviewed);
+
+    let mut app = harness.reload();
+    assert_eq!(
+        restored_run(&app, "reviewed").reviewed_at.as_deref(),
+        Some("2026-08-04T00:00:00Z"),
+        "the review stamp did not survive the restart"
+    );
+
+    // And the gate that reads it: `m` on an already-read row goes to the merge
+    // confirmation rather than back to the diff. The gate belongs to the LOCAL road,
+    // so pin publishing off — an unprobed repo answers `Checking` and `m` waits.
+    app.publish = PublishState::Inactive(PublishBlocker::NotGitHub);
+    app.selected_agent = app
+        .agents
+        .iter()
+        .position(|run| run.id == "reviewed")
+        .expect("the reviewed row is selectable");
+    app.request_merge_selected_agent();
+    assert!(
+        app.merge_confirm.is_some(),
+        "the review gate re-armed across a restart; notice was {:?}",
+        app.notice
+    );
+}
+
+#[test]
+fn publish_evidence_survives_a_reload_so_a_row_is_not_published_twice() {
+    // What Rudder DID when it published — the branch it pushed, the PR it opened — is
+    // a fact about Rudder's own actions and must persist. A published row that reloads
+    // as unpublished gets a second pull request for the same work.
+    let mut harness = ReloadHarness::new("reload-publish");
+    let mut published = reloadable_worker("published", "already opened a PR");
+    published.publish = PublishEvidence {
+        branch: Some("rudder/published".to_string()),
+        number: Some(4213),
+        url: Some("https://github.com/acme/widgets/pull/4213".to_string()),
+        // The PR's STATE is GitHub's answer, not Rudder's: it is re-derived by one
+        // `gh pr list` on every probe and must never come back off disk (§12.75).
+        state: Some("draft".to_string()),
+    };
+    harness.save(&mut published);
+
+    let app = harness.reload();
+    let row = restored_run(&app, "published");
+    assert_eq!(
+        row.publish.number,
+        Some(4213),
+        "the PR number was lost, so this row looks unpublished and gets published again"
+    );
+    assert_eq!(row.publish.branch.as_deref(), Some("rudder/published"));
+    assert_eq!(
+        row.publish.url.as_deref(),
+        Some("https://github.com/acme/widgets/pull/4213")
+    );
+    assert!(row.publish.is_published());
+    assert_eq!(
+        row.publish.state, None,
+        "the PR's state is GitHub's to answer and must be re-derived, never restored"
+    );
+}
+
+#[test]
+fn a_run_with_no_plan_id_is_adopted_by_the_only_restored_plan() {
+    // Runs persisted before plans had ids carry no `plan_id`. With one plan restored
+    // there is exactly one answer, and withholding it makes the whole fleet look
+    // ownerless and the plan read as already spent.
+    let mut harness = ReloadHarness::new("reload-adopt-one");
+    harness.plan("plan-only");
+    let mut legacy = reloadable_worker("legacy", "persisted before plans had ids");
+    legacy.node_id = Some("n1".to_string());
+    legacy.plan_id = None;
+    harness.save(&mut legacy);
+
+    let app = harness.reload();
+    assert_eq!(
+        restored_run(&app, "legacy").plan_id.as_deref(),
+        Some("plan-only"),
+        "the sole restored plan adopts the unstamped run"
+    );
+    assert_eq!(
+        app.plan_agents(0).count(),
+        1,
+        "and the plan can see the worker it owns"
+    );
+}
+
+#[test]
+fn a_run_with_no_plan_id_is_not_guessed_into_one_of_several_plans() {
+    // The same run, two plans: now there is no honest answer. Adopting it anyway would
+    // hand one plan another's worker, and the node it carries would gate the wrong DAG.
+    let mut harness = ReloadHarness::new("reload-adopt-many");
+    harness.plan("plan-a").plan("plan-b");
+    let mut legacy = reloadable_worker("legacy", "persisted before plans had ids");
+    legacy.node_id = Some("n1".to_string());
+    legacy.plan_id = None;
+    harness.save(&mut legacy);
+
+    let app = harness.reload();
+    assert_eq!(
+        restored_run(&app, "legacy").plan_id,
+        None,
+        "with several candidates an unstamped run stays unowned rather than being guessed at"
+    );
+    for index in 0..app.plans.len() {
+        assert_eq!(
+            app.plan_agents(index).count(),
+            0,
+            "no plan claims a run it cannot prove is its own"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

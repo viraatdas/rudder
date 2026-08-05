@@ -1542,10 +1542,18 @@ impl App {
             config::initial_color_mode()
         };
         set_color_mode(dashboard_color_mode);
-        let agents = if cfg!(test) {
-            Vec::new()
+        // The fleet and the live plans come back TOGETHER (see `restore_persisted_state`):
+        // which planner rows survive depends on which plans returned, and which nodes a
+        // plan still owes depends on which runs returned. It lives outside this
+        // constructor so a test can drive the real restore against a temp repo — every
+        // `App::new()` in the suite would otherwise read the developer's own `.rudder/`,
+        // so this arm must stay short-circuited, and that is precisely the blind spot
+        // that let two concurrent plans collapse into one across a restart with a green
+        // suite behind it.
+        let (agents, restored_plans) = if cfg!(test) {
+            (Vec::new(), PlanQueueFile::default().into_plans())
         } else {
-            load_persisted_agents(&cwd)
+            restore_persisted_state(&cwd)
         };
         // Restore the ingested-run ledger so a worker handled before the last exit is not
         // re-ingested (or re-summarized) when its Done record reloads. Empty in tests.
@@ -1560,52 +1568,6 @@ impl App {
         } else {
             load_followup_gen(&cwd)
         };
-        // Restore the approval-gate queue (queued nodes + gate state) so a mid-plan restart
-        // resumes the plan instead of silently losing it. awaiting_approval is restored
-        // TOGETHER with the queue, so the scheduler never launches an un-approved plan.
-        let mut restored_queue = if cfg!(test) {
-            PlanQueueFile::default()
-        } else {
-            load_plan_queue(&cwd).unwrap_or_default()
-        };
-        let sole_plan = restored_queue.plans.len() <= 1;
-        for snapshot in &mut restored_queue.plans {
-            reconcile_plan_queue_with_agents(snapshot, &agents, sole_plan);
-            if snapshot.final_gate_status == FinalGateStatus::Running {
-                snapshot.final_gate_status = FinalGateStatus::Idle;
-                snapshot.final_gate_summary = None;
-            }
-        }
-        let restored_plans = restored_queue.into_plans();
-        // Runs persisted before plans had ids carry no `plan_id`. With one restored plan
-        // there is exactly one answer, so adopt them into it — otherwise the restored
-        // fleet would look ownerless and the plan would read as spent.
-        let mut agents = agents;
-        if restored_plans.len() == 1 {
-            let plan_id = restored_plans[0].id.clone();
-            for run in &mut agents {
-                if run.plan_id.is_none() && (run.node_id.is_some() || run.is_orchestrator()) {
-                    run.plan_id = Some(plan_id.clone());
-                }
-            }
-        }
-        // Drop orchestrator rows whose plan did not come back. `load_persisted_agents`
-        // now keeps the newest planner PER PLAN, which is what stops concurrent plans
-        // collapsing into one across a restart — but every plan that ever ran left a
-        // planner row on disk, so without this the pane fills with orchestrators for
-        // plans that no longer exist and cannot be steered. This is the only place that
-        // knows which plans were actually restored. Rows with no plan id predate
-        // concurrent plans and are left alone; the loader already collapsed those.
-        if !restored_plans.is_empty() {
-            let live: HashSet<&str> = restored_plans.iter().map(|plan| plan.id.as_str()).collect();
-            agents.retain(|run| {
-                !run.is_orchestrator()
-                    || run
-                        .plan_id
-                        .as_deref()
-                        .is_none_or(|plan_id| live.contains(plan_id))
-            });
-        }
         // Main is no longer auto-pinned. If the user wants one, they type
         // /main from the task pane. Main records render in their own section
         // instead of being mixed into ordinary worktree agents.
@@ -14951,6 +14913,64 @@ fn reconcile_plan_queue_with_agents(
 fn load_plan_queue(cwd: &Path) -> Option<PlanQueueFile> {
     let raw = std::fs::read_to_string(cwd.join(".rudder").join("plan-queue.json")).ok()?;
     PlanQueueFile::parse(&raw)
+}
+
+/// The whole startup restore: persisted run records plus `.rudder/plan-queue.json` in,
+/// the reconciled fleet and the live plans out. `App::new()` calls this and nothing else
+/// to rebuild what the last process was doing.
+///
+/// It is one function rather than two because the two answers are entangled: a plan's
+/// remaining nodes are decided by which RUNS came back (a node whose worker is already on
+/// disk must not relaunch), and which PLANNER ROWS survive is decided by which plans came
+/// back (every plan that ever ran left a planner row behind). Restoring them separately is
+/// what made the concurrent-plan collapse possible.
+fn restore_persisted_state(cwd: &Path) -> (Vec<AgentRun>, Vec<PlanState>) {
+    let mut agents = load_persisted_agents(cwd);
+    // Restore the approval-gate queue (queued nodes + gate state) so a mid-plan restart
+    // resumes the plan instead of silently losing it. awaiting_approval is restored
+    // TOGETHER with the queue, so the scheduler never launches an un-approved plan.
+    let mut restored_queue = load_plan_queue(cwd).unwrap_or_default();
+    let sole_plan = restored_queue.plans.len() <= 1;
+    for snapshot in &mut restored_queue.plans {
+        reconcile_plan_queue_with_agents(snapshot, &agents, sole_plan);
+        // A final gate that was mid-flight when the process died has no process behind it
+        // any more, so it re-arms as Idle rather than claiming a run that is not happening.
+        if snapshot.final_gate_status == FinalGateStatus::Running {
+            snapshot.final_gate_status = FinalGateStatus::Idle;
+            snapshot.final_gate_summary = None;
+        }
+    }
+    let restored_plans = restored_queue.into_plans();
+    // Runs persisted before plans had ids carry no `plan_id`. With one restored plan
+    // there is exactly one answer, so adopt them into it — otherwise the restored
+    // fleet would look ownerless and the plan would read as spent. With SEVERAL plans
+    // there is no answer, and guessing would hand one plan another's workers.
+    if restored_plans.len() == 1 {
+        let plan_id = restored_plans[0].id.clone();
+        for run in &mut agents {
+            if run.plan_id.is_none() && (run.node_id.is_some() || run.is_orchestrator()) {
+                run.plan_id = Some(plan_id.clone());
+            }
+        }
+    }
+    // Drop orchestrator rows whose plan did not come back. `load_persisted_agents`
+    // now keeps the newest planner PER PLAN, which is what stops concurrent plans
+    // collapsing into one across a restart — but every plan that ever ran left a
+    // planner row on disk, so without this the pane fills with orchestrators for
+    // plans that no longer exist and cannot be steered. This is the only place that
+    // knows which plans were actually restored. Rows with no plan id predate
+    // concurrent plans and are left alone; the loader already collapsed those.
+    if !restored_plans.is_empty() {
+        let live: HashSet<&str> = restored_plans.iter().map(|plan| plan.id.as_str()).collect();
+        agents.retain(|run| {
+            !run.is_orchestrator()
+                || run
+                    .plan_id
+                    .as_deref()
+                    .is_none_or(|plan_id| live.contains(plan_id))
+        });
+    }
+    (agents, restored_plans)
 }
 
 /// True if any line of `output` is EXACTLY `RUDDER_APPROVE_PLAN` once ANSI escapes and
