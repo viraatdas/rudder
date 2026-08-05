@@ -257,6 +257,9 @@ kbd {
 
 .skip-link {
   position: absolute;
+  min-height: 44px;
+  display: inline-flex;
+  align-items: center;
   left: -9999px;
   top: 0;
   z-index: var(--z-nav);
@@ -352,14 +355,52 @@ kbd {
   color: var(--work);
 }
 
+/* Touch targets.
+ *
+ * The nav links were 21px tall and the brand 24px, because they were sized by
+ * their line box alone. WCAG 2.5.8 asks for 24px and Apple's guidance for 44px;
+ * a 21px target on a phone is a link you miss and re-aim at. The height comes
+ * from padding rather than font size, so nothing about the type changes.
+ *
+ * Applied by POINTER TYPE, not width: a small window on a laptop still has a
+ * mouse and does not need thumb-sized rows, while a large phone does. */
+@media (pointer: coarse) {
+  .site-nav a,
+  .site-foot a,
+  .docs-foot a,
+  .actions-row a {
+    display: inline-flex;
+    align-items: center;
+    min-height: 44px;
+    padding: 0 2px;
+  }
+
+  .brand {
+    min-height: 44px;
+  }
+
+  .docs-nav a {
+    min-height: 44px;
+    padding-top: 10px;
+    padding-bottom: 10px;
+  }
+
+  .docs-toc a,
+  .docs-pager a {
+    display: inline-block;
+    padding: 6px 0;
+  }
+}
+
 @media (max-width: 560px) {
   .site-head {
     height: auto;
-    padding: 14px 0;
+    padding: 6px 0;
     flex-wrap: wrap;
   }
   .site-nav {
     width: 100%;
     justify-content: flex-start;
+    gap: 18px;
   }
 }

@@ -341,6 +341,16 @@
   .docs-shot .frame-static {
     grid-template-columns: minmax(0, 1fr);
   }
+  /* Same reason as the landing page mockup: this is readable text, not texture. */
+  .docs-shot .pane-label {
+    font-size: 0.7rem;
+  }
+  .docs-shot .row {
+    font-size: 0.85rem;
+  }
+  .docs-shot .tty {
+    font-size: 0.8rem;
+  }
   .docs-shot .pane-list {
     border-right: 0;
     border-bottom: var(--hair) solid var(--rule);

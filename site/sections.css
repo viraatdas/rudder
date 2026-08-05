@@ -610,6 +610,25 @@
   .showcase-body {
     grid-template-columns: minmax(0, 1fr);
   }
+
+  /* The mockup is a picture of an interface, but it is REAL TEXT carrying the
+   * point of the section: which agents exist, what state each is in, what the
+   * selected one is doing. At desktop sizes it reads as a terminal because it is
+   * small; on a phone that same size is just unreadable, and a section nobody
+   * can read does not demonstrate anything. The frame stacks to one column here,
+   * so the width to grow into is already there. */
+  .pane-label {
+    font-size: 0.72rem;
+  }
+  .row {
+    font-size: 0.875rem;
+  }
+  .row .state {
+    font-size: 0.7rem;
+  }
+  .tty {
+    font-size: 0.82rem;
+  }
   .modes {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
@@ -765,6 +784,16 @@
 
   .tracks .t-ws {
     overflow-wrap: normal;
+  }
+
+  /* Stacked rows are read as prose, not scanned as a column, so the smallest
+   * cells come up to the size of the ones beside them. */
+  .commands .c-where,
+  .commands .c-in {
+    font-size: 0.84rem;
+  }
+  .commands .c-what span {
+    font-size: 0.9rem;
   }
 
   /* `.c-what` holds a bare text node AND a span, so the text becomes an
