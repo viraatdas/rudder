@@ -6805,14 +6805,13 @@ impl App {
                     .unwrap_or_default()
                     .trim()
                     .to_string();
-                let mut tokens = rest.splitn(2, char::is_whitespace);
-                let session_id = tokens.next().unwrap_or_default().trim().to_string();
-                let instruction = tokens.next().map(str::trim).unwrap_or_default().to_string();
+                let (target, session_id, instruction) =
+                    crate::handoff::parse_resume_args(&rest);
                 if session_id.is_empty() {
                     self.maybe_refresh_handoff_candidates();
                     let found = self.handoff_candidates.len();
                     self.notice = Some(format!(
-                        "/resume <session-id> [next step] — continue an existing claude/codex/opencode chat as a worker ({found} in the palette) · from inside that chat: rudder handoff \"<next step>\""
+                        "/resume <session-id> [next step] — continue an existing claude/codex/opencode chat in an isolated worker ({found} in the palette) · add --here to continue it in the main checkout instead · from inside that chat: rudder handoff \"<next step>\""
                     ));
                 } else {
                     // The id may be TRUNCATED: every TUI cuts it to fit its pane,
@@ -6849,7 +6848,7 @@ impl App {
                     self.start_handoff_task(HandoffRequest {
                         session_id,
                         backend,
-                        target: HandoffTarget::Worker,
+                        target,
                         instruction: (!instruction.is_empty()).then_some(instruction),
                         title: None,
                         created_at_ms: None,
@@ -11661,6 +11660,15 @@ impl App {
             return;
         }
         let backend_for_notice = run.backend;
+        // Read the "has this pane said anything" state BEFORE the session lookup
+        // below, not after. That lookup walks the backend's whole session tree and
+        // can take minutes on a machine with thousands of rollouts, and the check
+        // is an elapsed-time one — measuring it afterwards folds the scan's own
+        // duration into the answer and reports "never started a conversation"
+        // about a pane that was talking when the key was pressed.
+        let never_spoke = self.agents.get(self.selected_agent).is_some_and(|run| {
+            run.turns.is_empty() || run.last_output_at.elapsed() > Duration::from_secs(600)
+        });
         // Codex and opencode runs only learn their session id later; for a live
         // branch, fall back to the newest session recorded for that workspace.
         let session_id = run
@@ -11684,9 +11692,6 @@ impl App {
             // means the pane never got past its first prompt (a codex fork asking
             // which directory to use, an auth prompt), and the row still reads as
             // running — so point at the pane rather than at the backend.
-            let never_spoke = self.agents.get(self.selected_agent).is_some_and(|run| {
-                run.turns.is_empty() || run.last_output_at.elapsed() > Duration::from_secs(600)
-            });
             self.notice = Some(match (backend_for_notice, never_spoke) {
                 (Backend::Claude, _) => {
                     "nothing to branch: this agent has no session yet".to_string()

@@ -230,15 +230,20 @@ pub(crate) fn handoff_suggestions(app: &App, rest: &str) -> Vec<Suggestion> {
             score,
             Suggestion {
                 label: truncate_chars(&candidate.title, 64),
-                // Backend + MODEL + age + the id itself: enough to tell two similar
-                // conversations apart, and to see what the fork will run on.
+                // Backend + MODEL + WHERE IT RAN + age + the id itself: enough to
+                // tell two similar conversations apart, to see what the fork will
+                // run on, and to know whether this chat was about the main
+                // checkout or a subfolder before it is picked up somewhere else.
                 detail: format!(
-                    "{} · {}{} · {}",
+                    "{} · {}{}{} · {}",
                     candidate.backend.as_str(),
                     candidate
                         .model
                         .as_deref()
                         .map(|model| format!("{} · ", conversation_model_label(model)))
+                        .unwrap_or_default(),
+                    crate::handoff::origin_label(candidate.cwd.as_deref(), &app.cwd)
+                        .map(|origin| format!("{origin} · "))
                         .unwrap_or_default(),
                     crate::handoff::relative_age(candidate.modified, now),
                     short_session_label(&candidate.session_id),

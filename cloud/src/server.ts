@@ -2832,11 +2832,13 @@ async function reuseOrRestartWorkspace(
   // or fingerprint mismatch (user's local state changed). Need a fresh
   // snapshot from the CLI. Also destroy + recreate the volume so the user
   // sees their new repo state instead of the cached one on the old disk.
-  if (workspace.machineId && machine && machine.state !== "destroyed" && machine.state !== "destroying") {
-    await flyRequest<FlyMachine>(
-      `/v1/apps/${encodeURIComponent(flyAppName)}/machines/${encodeURIComponent(workspace.machineId)}?force=true`,
-      { method: "DELETE" },
-    );
+  // `machine` is null both when the machine is genuinely gone AND when the GET
+  // above simply failed, because that lookup swallows its error. Keying the
+  // delete off it meant one flaky Fly read left the machine alive, still holding
+  // the volume, and the recreate died on "volume is currently bound to machine".
+  // A DELETE against a machine that no longer exists is a 404 this tolerates.
+  if (workspace.machineId && machine?.state !== "destroyed" && machine?.state !== "destroying") {
+    await destroyFlyMachine(workspace.machineId);
   }
   // Clone workspaces recreate by re-cloning from origin — no snapshot upload.
   // Keep a surviving volume: the staged clone on it short-circuits re-staging.
@@ -3145,11 +3147,37 @@ async function createWorkspaceVolumeNamed(name: string, region: string): Promise
   );
 }
 
+/** Force-destroy a Fly machine. A machine that is already gone counts as done. */
+async function destroyFlyMachine(machineId: string): Promise<void> {
+  try {
+    await flyRequest<FlyMachine>(
+      `/v1/apps/${encodeURIComponent(flyAppName)}/machines/${encodeURIComponent(machineId)}?force=true`,
+      { method: "DELETE" },
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!/not found|404/i.test(message)) {
+      throw error;
+    }
+  }
+}
+
+/**
+ * The machine Fly says is holding a volume, read out of its own refusal:
+ * "failed_precondition: volume is currently bound to machine: 80e966df155e08".
+ */
+function machineHoldingVolume(message: string): string | null {
+  return /bound to machine:?\s*([0-9a-z]+)/i.exec(message)?.[1] ?? null;
+}
+
 async function destroyWorkspaceVolume(volumeId: string): Promise<void> {
   if (!flyApiToken || !flyAppName) {
     throw new Error("Fly is not configured; cannot destroy workspace volume");
   }
   let lastError: unknown;
+  // Detaching after a machine destroy is not instant, so this retries rather
+  // than failing on the first refusal.
+  const freed = new Set<string>();
   for (let attempt = 1; attempt <= 12; attempt += 1) {
     try {
       await flyRequest<FlyVolume>(
@@ -3163,6 +3191,30 @@ async function destroyWorkspaceVolume(volumeId: string): Promise<void> {
         return;
       }
       lastError = error;
+      // A volume still bound to a machine will refuse forever, so retrying the
+      // same DELETE just burns the budget and reports a precondition the caller
+      // cannot act on. Fly names the machine in the refusal: destroy THAT one.
+      //
+      // It is not always the machine this workspace has on record. The recreate
+      // path only deletes `workspace.machineId`, and it skips even that when the
+      // machine GET happened to fail, so an orphan from an earlier half-finished
+      // recreate can sit on the volume with nothing pointing at it.
+      const holder = machineHoldingVolume(message);
+      if (holder && !freed.has(holder)) {
+        freed.add(holder);
+        console.warn(
+          `volume ${volumeId} is held by machine ${holder}; destroying it to release the volume`,
+        );
+        try {
+          await destroyFlyMachine(holder);
+        } catch (destroyError) {
+          const detail =
+            destroyError instanceof Error ? destroyError.message : String(destroyError);
+          throw new Error(
+            `destroy volume ${volumeId} failed: it is bound to machine ${holder}, which could not be destroyed: ${detail}`,
+          );
+        }
+      }
       if (attempt < 12) {
         await sleep(1_000);
       }

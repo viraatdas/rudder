@@ -81,6 +81,32 @@ test("createNodeWorkspace parents the workspace on a change id when given", asyn
   assert.match(await readLog(env.log), /workspace add .* --name rudder-node-abc-[a-f0-9]{6} -r basechange/);
 });
 
+test("createNodeWorkspace recovers when the main checkout is stale", async (t) => {
+  // A sibling worker's operation leaves the main checkout stale, and
+  // `jj workspace add` snapshots the workspace it runs FROM. Without recovery
+  // this failed every launch in the repo — typed tasks, plan nodes, /resume,
+  // review-all — until the user ran `jj workspace update-stale` by hand.
+  const env = await setupFakeJj(t);
+  process.env.JJ_ADD_STALE_ONCE = "1";
+
+  const workspace = await createNodeWorkspace({
+    repoRoot: env.repo,
+    nodeId: "node-stale",
+  });
+
+  assert.equal(await pathExists(workspace.path), true);
+  const log = await readLog(env.log);
+  const steps = log
+    .split("\n")
+    .map((line) => line.split("|")[1] ?? "")
+    .filter((args) => /^workspace (add|update-stale)/.test(args));
+  assert.deepEqual(
+    steps.map((args) => args.split(" ").slice(0, 2).join(" ")),
+    ["workspace add", "workspace update-stale", "workspace add"],
+    log,
+  );
+});
+
 test("currentJjChangeId reads the @ change id", async (t) => {
   const env = await setupFakeJj(t);
   process.env.JJ_TARGET_CHANGE = "targetchange";
@@ -332,6 +358,7 @@ async function setupFakeJj(t) {
     JJ_RESOLVE_LIST: process.env.JJ_RESOLVE_LIST,
     JJ_RESOLVE_LIST_PRE: process.env.JJ_RESOLVE_LIST_PRE,
     JJ_DIFF_STALE_ONCE: process.env.JJ_DIFF_STALE_ONCE,
+    JJ_ADD_STALE_ONCE: process.env.JJ_ADD_STALE_ONCE,
     JJ_OP_STALE_ONCE: process.env.JJ_OP_STALE_ONCE,
     JJ_OP_FAIL: process.env.JJ_OP_FAIL,
     JJ_NEW_FAIL: process.env.JJ_NEW_FAIL,
@@ -352,6 +379,7 @@ async function setupFakeJj(t) {
   delete process.env.JJ_RESOLVE_LIST;
   delete process.env.JJ_RESOLVE_LIST_PRE;
   delete process.env.JJ_DIFF_STALE_ONCE;
+  delete process.env.JJ_ADD_STALE_ONCE;
   delete process.env.JJ_OP_STALE_ONCE;
   delete process.env.JJ_OP_FAIL;
   delete process.env.JJ_NEW_FAIL;
@@ -397,6 +425,11 @@ case "\${1:-}" in
   workspace)
     case "\${2:-}" in
       add)
+        if [ "\${JJ_ADD_STALE_ONCE:-0}" = "1" ] && [ ! -e "\${MARK}.addstale" ]; then
+          : > "\${MARK}.addstale"
+          echo "Error: The working copy is stale (not updated since operation a1c7dbf6725c)." >&2
+          exit 1
+        fi
         mkdir -p "\${3:?missing destination}/.jj"
         exit 0
         ;;

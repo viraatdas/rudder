@@ -418,7 +418,7 @@ what is happening.</p>
   <tbody>
     <tr><td>/model</td><td>Set the backend, model and reasoning effort for the next agent. Effort runs low, medium, high, xhigh, max; xhigh is the default where a model offers it, and opencode takes none. A running agent keeps what it launched with.</td></tr>
     <tr><td>/fast</td><td>Toggle faster output on supported models.</td></tr>
-    <tr><td>/resume</td><td>Continue an existing Claude, Codex or opencode chat as an agent.</td></tr>
+    <tr><td>/resume</td><td>Continue an existing Claude, Codex or opencode chat as an agent. The picker lists this repo's recent chats and says which directory each one ran in. It lands in an isolated workspace like plain text does; add <code>--here</code> to continue it in your real checkout instead.</td></tr>
     <tr><td>/restore</td><td>Reopen a specific session id in a new pane.</td></tr>
     <tr><td>/share</td><td>Durable local context every agent reads. For tokens, URLs, env details.</td></tr>
     <tr><td>/goal</td><td>Set or change the session's overall goal.</td></tr>

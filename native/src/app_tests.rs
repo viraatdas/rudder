@@ -1956,6 +1956,7 @@ fn a_resumed_row_is_named_after_the_conversation_not_its_uuid() {
         backend: Backend::Codex,
         title: "rudder eats too much CPU".to_string(),
         model: Some("gpt-5.6-sol".to_string()),
+        cwd: None,
         modified: SystemTime::now(),
     }];
 
@@ -2043,6 +2044,7 @@ fn handoff_palette_lists_conversations_then_gets_out_of_the_way() {
             backend: Backend::Claude,
             title: "rewrite the auth middleware".to_string(),
             model: Some("claude-opus-4-5-20251101".to_string()),
+            cwd: None,
             modified: SystemTime::now(),
         },
         ConversationCandidate {
@@ -2050,6 +2052,7 @@ fn handoff_palette_lists_conversations_then_gets_out_of_the_way() {
             backend: Backend::Claude,
             title: "diff pane shows the wrong repo".to_string(),
             model: None,
+            cwd: None,
             modified: SystemTime::now(),
         },
     ];
@@ -2077,6 +2080,64 @@ fn handoff_palette_lists_conversations_then_gets_out_of_the_way() {
 }
 
 #[test]
+fn a_handoff_row_says_which_directory_the_chat_ran_in() {
+    // Adopting a chat moves it somewhere else, so the row has to say where it
+    // came from: a conversation about the main checkout and one about a subfolder
+    // read identically otherwise.
+    let mut app = App::new();
+    app.handoff_candidates = vec![
+        ConversationCandidate {
+            session_id: "11111111-1111-1111-1111-111111111111".to_string(),
+            backend: Backend::Claude,
+            title: "rewrite the auth middleware".to_string(),
+            model: None,
+            cwd: Some(app.cwd.clone()),
+            modified: SystemTime::now(),
+        },
+        ConversationCandidate {
+            session_id: "22222222-2222-2222-2222-222222222222".to_string(),
+            backend: Backend::Claude,
+            title: "fix the sidebar spacing".to_string(),
+            model: None,
+            cwd: Some(app.cwd.join("site")),
+            modified: SystemTime::now(),
+        },
+    ];
+
+    app.task_input = "/resume auth".to_string();
+    let detail = suggestions_for(&app)[0].detail.clone();
+    assert!(detail.contains("main"), "the main checkout, named: {detail}");
+
+    app.task_input = "/resume sidebar".to_string();
+    let detail = suggestions_for(&app)[0].detail.clone();
+    assert!(detail.contains("site"), "the subfolder, named: {detail}");
+}
+
+#[test]
+fn resume_defaults_to_a_worker_and_here_keeps_it_in_the_main_checkout() {
+    // The destination was invisible AND unchangeable from the dashboard: every
+    // /resume forked an isolated workspace, with no way to say "this chat was
+    // already about my tree, continue it there".
+    use crate::handoff::parse_resume_args;
+
+    let (target, ..) = parse_resume_args("11111111-1111-1111-1111-111111111111 keep going");
+    assert_eq!(target, HandoffTarget::Worker);
+
+    let (target, id, instruction) =
+        parse_resume_args("11111111-1111-1111-1111-111111111111 --here keep going");
+    assert_eq!(target, HandoffTarget::Here);
+    assert_eq!(id, "11111111-1111-1111-1111-111111111111");
+    assert_eq!(instruction, "keep going");
+
+    // And a bare /resume teaches the flag rather than leaving it undiscoverable.
+    let mut app = App::new();
+    app.start_task_from_input("/resume");
+    let notice = app.notice.as_deref().unwrap_or_default();
+    assert!(notice.contains("--here"), "{notice}");
+    assert!(notice.contains("isolated worker"), "{notice}");
+}
+
+#[test]
 fn handoff_palette_enter_selects_a_conversation_before_submitting() {
     let mut app = App::new();
     app.focus = FocusPane::Task;
@@ -2085,6 +2146,7 @@ fn handoff_palette_enter_selects_a_conversation_before_submitting() {
         backend: Backend::Claude,
         title: "rewrite the auth middleware".to_string(),
         model: Some("claude-opus-4-5-20251101".to_string()),
+        cwd: None,
         modified: SystemTime::now(),
     }];
     app.task_input = "/resume auth".to_string();

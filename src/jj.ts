@@ -142,6 +142,32 @@ async function jjReadInWorkspace(
 }
 
 /**
+ * The same recovery for a jj command that WRITES.
+ *
+ * Reads had this and writes did not, which left the main checkout able to wedge
+ * every launch in a repo: `jj workspace add` snapshots the workspace it is run
+ * FROM, so once a sibling worker's operation left the main checkout stale, every
+ * new agent — a typed task, a plan node, a `/resume`, review-all — died on
+ * "The working copy is stale" until the user ran `update-stale` by hand. The
+ * recovery is exactly what jj's own hint says to do, and it snapshots the
+ * working copy rather than discarding it, so nothing on disk is lost.
+ */
+async function jjWriteWithStaleRecovery(
+  cwd: string,
+  args: string[],
+): Promise<{ stdout: string; stderr: string; code: number }> {
+  let result = await runCommand("jj", args, { cwd, allowFailure: true });
+  // jj reports staleness on stderr, but check both: the message has moved
+  // between jj releases and a missed match reintroduces the wedge.
+  if (result.code !== 0 && isStaleWorkingCopy(`${result.stderr}\n${result.stdout}`)) {
+    if (await recoverStaleWorkspace(cwd)) {
+      result = await runCommand("jj", args, { cwd, allowFailure: true });
+    }
+  }
+  return result;
+}
+
+/**
  * The change id of `@` (the working-copy commit) in the given workspace.
  */
 export async function currentJjChangeId(workspacePath: string): Promise<string> {
@@ -228,7 +254,13 @@ export async function createEmptyChange(params: {
   const marker = `rudder-node:${shortHash(`${params.description}:${Date.now()}:${Math.random()}`)}`;
   const description = `${marker} ${params.description}`.trim();
   const args = ["new", ...params.parents.filter(Boolean), "-m", description, "--no-edit"];
-  await runCommand("jj", args, { cwd: params.repoRoot });
+  // Same stale exposure as `workspace add`: the scheduler creates a node's base
+  // change in the main checkout moments before its workspace, so one stale main
+  // checkout would fail the plan a step earlier instead.
+  const created = await jjWriteWithStaleRecovery(params.repoRoot, args);
+  if (created.code !== 0) {
+    throw new Error(created.stderr.trim() || created.stdout.trim() || "jj new failed.");
+  }
   // jj normalizes descriptions to end with a trailing newline, and
   // `description(exact:...)` matches the full stored description, so the revset
   // literal must include the trailing "\n".
@@ -284,18 +316,21 @@ export async function createNodeWorkspace(params: {
   await fsp.mkdir(path.dirname(targetPath), { recursive: true });
 
   const baseArgs = ["workspace", "add", targetPath, "--name", workspaceName];
-  if (params.atChangeId) {
-    const withRevision = await runCommand("jj", [...baseArgs, "-r", params.atChangeId], {
-      cwd: params.repoRoot,
-      allowFailure: true,
-    });
-    if (withRevision.code !== 0) {
-      // Older jj without `workspace add -r`: add, then edit onto the change.
-      await runCommand("jj", baseArgs, { cwd: params.repoRoot });
+  let added = await jjWriteWithStaleRecovery(
+    params.repoRoot,
+    params.atChangeId ? [...baseArgs, "-r", params.atChangeId] : baseArgs,
+  );
+  if (added.code !== 0 && params.atChangeId) {
+    // Older jj without `workspace add -r`: add, then edit onto the change.
+    added = await jjWriteWithStaleRecovery(params.repoRoot, baseArgs);
+    if (added.code === 0) {
       await runCommand("jj", ["edit", params.atChangeId], { cwd: targetPath, allowFailure: true });
     }
-  } else {
-    await runCommand("jj", baseArgs, { cwd: params.repoRoot });
+  }
+  if (added.code !== 0) {
+    throw new Error(
+      added.stderr.trim() || added.stdout.trim() || `jj ${baseArgs.join(" ")} failed.`,
+    );
   }
   // Describe the workspace's OWN working-copy change (@) so `jj log` shows what
   // this agent is doing instead of "(no description set)". Rudder agents read

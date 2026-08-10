@@ -53,6 +53,58 @@ impl HandoffTarget {
     }
 }
 
+/// Split `/resume`'s arguments into where it should run, which conversation, and
+/// what to say next.
+///
+/// The default is an isolated worker, matching what bare task input does: a chat
+/// adopted from outside the dashboard is new work, and new work gets reviewed and
+/// merged like everything else. `--here` (or `--main`) opts out and continues the
+/// conversation in the main checkout, which is what you want when the chat was
+/// already about the files sitting in your tree. The flag is accepted on either
+/// side of the id, because the palette inserts the id and the user types after it.
+pub(crate) fn parse_resume_args(rest: &str) -> (HandoffTarget, String, String) {
+    let mut target = HandoffTarget::Worker;
+    let mut remaining = rest.trim();
+    // Leading flags, then the id.
+    let mut session_id = String::new();
+    while let Some((token, tail)) = next_token(remaining) {
+        remaining = tail;
+        if is_here_flag(token) {
+            target = HandoffTarget::Here;
+            continue;
+        }
+        session_id = token.to_string();
+        break;
+    }
+    // A trailing flag is the likelier spelling: the palette inserts the id and
+    // leaves the cursor after it. Only the token IMMEDIATELY after the id counts,
+    // so "--here" further into a sentence stays part of the instruction.
+    if let Some((token, tail)) = next_token(remaining) {
+        if is_here_flag(token) {
+            target = HandoffTarget::Here;
+            remaining = tail;
+        }
+    }
+    (target, session_id, remaining.trim().to_string())
+}
+
+fn is_here_flag(token: &str) -> bool {
+    matches!(token, "--here" | "--main" | "-here" | "-main")
+}
+
+/// The next whitespace-delimited token and the untouched remainder after it. The
+/// remainder keeps its own spacing: it becomes an instruction handed to an agent.
+fn next_token(text: &str) -> Option<(&str, &str)> {
+    let text = text.trim_start();
+    if text.is_empty() {
+        return None;
+    }
+    Some(match text.find(char::is_whitespace) {
+        Some(index) => (&text[..index], &text[index..]),
+        None => (text, ""),
+    })
+}
+
 /// One queued `rudder handoff` request read off `.rudder/handoffs/`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct HandoffRequest {
@@ -74,7 +126,41 @@ pub(crate) struct ConversationCandidate {
     /// The model that conversation was running on, as the backend recorded it.
     /// None when the backend does not write one down (opencode's session list).
     pub(crate) model: Option<String>,
+    /// The directory the conversation ran in, as the backend recorded it. This is
+    /// what tells `main` apart from a chat started in a subfolder, and it is read
+    /// from the transcript rather than inferred from the project folder name,
+    /// which encodes `/` as `-` and cannot be decoded back without ambiguity.
+    pub(crate) cwd: Option<PathBuf>,
     pub(crate) modified: SystemTime,
+}
+
+/// Where a conversation ran, phrased for a picker row: `main` for the dashboard's
+/// own checkout, the repo-relative directory for a chat started in a subfolder.
+/// None when the backend recorded nothing, so the row simply omits the field
+/// rather than guessing.
+pub(crate) fn origin_label(cwd: Option<&Path>, dashboard_root: &Path) -> Option<String> {
+    let cwd = cwd?;
+    let root = std::fs::canonicalize(dashboard_root).unwrap_or_else(|_| dashboard_root.to_path_buf());
+    let resolved = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    if resolved == root || cwd == dashboard_root {
+        return Some("main".to_string());
+    }
+    // Try both spellings for the same reason the Codex scan does: canonicalizing
+    // resolves symlinks, but the transcript recorded whatever the shell was in.
+    let relative = resolved
+        .strip_prefix(&root)
+        .ok()
+        .or_else(|| cwd.strip_prefix(dashboard_root).ok())?;
+    let shown = relative.display().to_string();
+    (!shown.is_empty()).then_some(shown)
+}
+
+/// Is this conversation one of Rudder's own agent panes? Those live under
+/// `.rudder-worktrees` and are branched in place with `b`, so they do not belong
+/// in a picker whose whole purpose is adopting chats from OUTSIDE the dashboard.
+pub(crate) fn is_worktree_conversation(cwd: &Path) -> bool {
+    cwd.components()
+        .any(|component| component.as_os_str() == ".rudder-worktrees")
 }
 
 /// A session id is spliced onto a `claude`/`codex` command line, and handoff requests
@@ -220,6 +306,7 @@ pub(crate) fn recent_claude_conversations_in(
             backend: Backend::Claude,
             title: head.title,
             model: head.model,
+            cwd: head.cwd,
             modified,
         };
         if head.interactive && interactive.len() < limit {
@@ -303,6 +390,12 @@ pub(crate) fn recent_codex_conversations_in(
         if !session_cwd.starts_with(&target) && !Path::new(&head.cwd).starts_with(cwd) {
             continue;
         }
+        // Rudder's own agent panes are branched with `b`, not adopted with
+        // /resume. Claude's scan has always dropped them; Codex's did not, so a
+        // worker's chat could be offered back as if it were the user's own.
+        if is_worktree_conversation(&session_cwd) {
+            continue;
+        }
         // Resuming a Codex session writes ANOTHER rollout file with the same id;
         // the newest one wins (files are walked newest-first).
         if !seen.insert(head.session_id.clone()) {
@@ -313,6 +406,7 @@ pub(crate) fn recent_codex_conversations_in(
             backend: Backend::Codex,
             title: head.title,
             model: head.model,
+            cwd: Some(PathBuf::from(&head.cwd)),
             modified,
         });
     }
@@ -753,7 +847,8 @@ pub(crate) fn parse_opencode_sessions(
         .iter()
         .filter_map(|session| {
             let directory = session.get("directory").and_then(serde_json::Value::as_str)?;
-            if !Path::new(directory).starts_with(cwd) {
+            if !Path::new(directory).starts_with(cwd) || is_worktree_conversation(Path::new(directory))
+            {
                 return None;
             }
             let session_id = session.get("id").and_then(serde_json::Value::as_str)?;
@@ -777,6 +872,7 @@ pub(crate) fn parse_opencode_sessions(
                 // opencode's session list carries no model, and Rudder does not
                 // read its database: better blank than invented.
                 model: None,
+                cwd: Some(PathBuf::from(directory)),
                 modified: SystemTime::UNIX_EPOCH + Duration::from_millis(updated),
             })
         })
@@ -814,6 +910,8 @@ pub(crate) struct TranscriptHead {
     /// titles, completion notes, the plan decomposer) do not, which is exactly how
     /// they are kept out of the picker.
     pub(crate) interactive: bool,
+    /// The directory the session ran in. Claude stamps it on every entry.
+    pub(crate) cwd: Option<PathBuf>,
 }
 
 fn scan_transcript_head(path: &Path) -> Option<TranscriptHead> {
@@ -830,11 +928,20 @@ pub(crate) fn scan_transcript_lines(
     let mut interactive = false;
     let mut title: Option<String> = None;
     let mut model: Option<String> = None;
+    let mut cwd: Option<PathBuf> = None;
     for line in lines.take(HEAD_SCAN_LINES) {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line.as_ref()) else {
             continue;
         };
         interactive |= is_interactive_marker(&value);
+        if cwd.is_none() {
+            cwd = value
+                .get("cwd")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
+                .map(PathBuf::from);
+        }
         if title.is_none() {
             // The mode markers are written before the first user turn, so by the
             // time a title exists the interactive question is already answered.
@@ -851,8 +958,8 @@ pub(crate) fn scan_transcript_lines(
                 .map(ToString::to_string);
         }
         // The model lands on the first assistant reply, just after the opening
-        // prompt; stop once both are known rather than reading the whole head.
-        if title.is_some() && model.is_some() {
+        // prompt; stop once all three are known rather than reading the whole head.
+        if title.is_some() && model.is_some() && cwd.is_some() {
             break;
         }
     }
@@ -860,6 +967,7 @@ pub(crate) fn scan_transcript_lines(
         title,
         model,
         interactive,
+        cwd,
     })
 }
 
@@ -1086,13 +1194,28 @@ mod tests {
     /// One transcript: `interactive` writes the session-mode marker a REPL records
     /// and a one-shot `claude -p` call does not.
     fn write_transcript(dir: &Path, session_id: &str, prompt: &str, interactive: bool) {
+        write_transcript_from(dir, session_id, prompt, interactive, None);
+    }
+
+    /// Same, but stamping the directory Claude recorded the session in — which is
+    /// what the picker reads to say `main` or a subfolder.
+    fn write_transcript_from(
+        dir: &Path,
+        session_id: &str,
+        prompt: &str,
+        interactive: bool,
+        cwd: Option<&Path>,
+    ) {
         std::fs::create_dir_all(dir).expect("create project dir");
         let mut lines = Vec::new();
         if interactive {
             lines.push(r#"{"type":"mode","mode":"normal"}"#.to_string());
         }
+        let stamp = cwd
+            .map(|path| format!(r#""cwd":{},"#, serde_json::json!(path.display().to_string())))
+            .unwrap_or_default();
         lines.push(format!(
-            r#"{{"type":"user","message":{{"role":"user","content":"{prompt}"}}}}"#
+            r#"{{{stamp}"type":"user","message":{{"role":"user","content":"{prompt}"}}}}"#
         ));
         std::fs::write(dir.join(format!("{session_id}.jsonl")), lines.join("\n")).expect("write");
     }
@@ -1147,6 +1270,100 @@ mod tests {
             "other repos stay out: {titles:?}"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_claude_candidate_remembers_which_directory_it_ran_in() {
+        let (projects, cwd, root) = scratch_projects("origin");
+        let encoded = crate::encode_claude_project_dir(&cwd);
+        write_transcript_from(
+            &projects.join(&encoded),
+            "11111111-1111-1111-1111-111111111111",
+            "repo root chat",
+            true,
+            Some(&cwd),
+        );
+        write_transcript_from(
+            &projects.join(format!("{encoded}-src")),
+            "22222222-2222-2222-2222-222222222222",
+            "subdirectory chat",
+            true,
+            Some(&cwd.join("src")),
+        );
+
+        let found =
+            recent_claude_conversations_in(&projects, &cwd, 10, &std::collections::HashSet::new());
+        let origin = |title: &str| {
+            found
+                .iter()
+                .find(|candidate| candidate.title == title)
+                .and_then(|candidate| origin_label(candidate.cwd.as_deref(), &cwd))
+        };
+
+        assert_eq!(origin("repo root chat").as_deref(), Some("main"));
+        assert_eq!(origin("subdirectory chat").as_deref(), Some("src"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resume_args_take_a_here_flag_on_either_side_of_the_id() {
+        // Default: an isolated worker, same as bare task input.
+        let (target, id, instruction) = parse_resume_args(" abc12345 write the tests ");
+        assert_eq!(target, HandoffTarget::Worker);
+        assert_eq!(id, "abc12345");
+        assert_eq!(instruction, "write the tests");
+
+        // Trailing is the likelier spelling: the palette inserts the id and the
+        // user keeps typing after it.
+        let (target, id, instruction) = parse_resume_args("abc12345 --here write the tests");
+        assert_eq!(target, HandoffTarget::Here);
+        assert_eq!(id, "abc12345");
+        assert_eq!(instruction, "write the tests");
+
+        let (target, id, _) = parse_resume_args("--main abc12345");
+        assert_eq!(target, HandoffTarget::Here);
+        assert_eq!(id, "abc12345");
+
+        // Deeper in the sentence it is the user's prose, not a switch: an agent
+        // told to "explain why --here exists" must still run where it was sent.
+        let (target, _, instruction) = parse_resume_args("abc12345 explain why --here exists");
+        assert_eq!(target, HandoffTarget::Worker);
+        assert_eq!(instruction, "explain why --here exists");
+    }
+
+    #[test]
+    fn origin_label_names_main_and_subdirectories() {
+        let root = std::env::temp_dir().join(format!("rudder-origin-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("src")).expect("create");
+
+        assert_eq!(origin_label(Some(&root), &root).as_deref(), Some("main"));
+        assert_eq!(
+            origin_label(Some(&root.join("src")), &root).as_deref(),
+            Some("src")
+        );
+        // Nothing recorded means nothing shown; the row must not invent a place.
+        assert_eq!(origin_label(None, &root), None);
+        // Outside the repo entirely: no relative reading exists, so no label.
+        assert_eq!(origin_label(Some(Path::new("/elsewhere")), &root), None);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn opencode_scan_drops_rudders_own_worker_chats() {
+        // Claude's scan has always dropped worker panes; opencode's kept them, so
+        // an agent's own chat could be offered back as if the user had started it.
+        let raw = serde_json::json!([
+            {"id": "aaaaaaaa-1111", "title": "my own chat", "directory": "/repo", "updated": 20},
+            {"id": "bbbbbbbb-2222", "title": "worker pane chat",
+             "directory": "/repo/.rudder-worktrees/repo-abc/n0", "updated": 30},
+        ])
+        .to_string();
+
+        let found = parse_opencode_sessions(&raw, Path::new("/repo"), 10);
+
+        assert_eq!(titles(&found), vec!["my own chat"]);
+        assert_eq!(found[0].cwd.as_deref(), Some(Path::new("/repo")));
     }
 
     #[test]
