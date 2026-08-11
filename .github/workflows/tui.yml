@@ -38,6 +38,11 @@ jobs:
       - name: Build native debug binary
         run: cargo build --manifest-path native/Cargo.toml
 
+      - name: Build CLI (dist/index.js)
+        run: |
+          npx tsc -p tsconfig.json
+          npm run chmod-cli
+
       - name: TUI end-to-end tests
         run: npm run test:tui:report
 
