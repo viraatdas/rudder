@@ -105,9 +105,19 @@ jobs:
         run: |
           brew install jj
           chmod +x prebuilt-native/rudder-native-darwin-arm64/rudder-native
-          npm run test:tui
+          npm run test:tui:report
         env:
           RUDDER_NATIVE_BIN: ${{ github.workspace }}/prebuilt-native/rudder-native-darwin-arm64/rudder-native
+
+      # The report embeds the final screen of every session — on a red run it
+      # shows exactly what the dashboard displayed when the test gave up.
+      - name: Upload TUI report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tui-report
+          path: tui-report.html
+          if-no-files-found: ignore
 
       # `npm publish` runs `prepack` (tsc + cargo build --release + copy-native),
       # and copy-native folds the downloaded native artifacts into dist/native.

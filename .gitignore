@@ -11,3 +11,5 @@ RUDDER.md
 RUDDER_SHARED.md
 DECISIONS.md
 *.tgz
+tui-report.html
+.tui-report/
