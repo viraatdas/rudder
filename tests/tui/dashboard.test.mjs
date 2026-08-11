@@ -19,6 +19,32 @@ import {
 
 assertPrerequisites();
 
+/**
+ * Press the merge key until the review gate opens. The first press can land
+ * while the publish-route probe is still running; the notice then reads
+ * "checking whether this repo publishes · press m again" — literal
+ * instructions, which slow CI runners actually exercise (a fast local machine
+ * always resolved the probe before the notice rendered).
+ */
+async function pressMergeUntilReview(session, { timeout = 30_000 } = {}) {
+  const deadline = Date.now() + timeout;
+  for (;;) {
+    await session.press("Ctrl+W");
+    await session.press("m");
+    const screen = await session.waitFor(
+      (s) => s.includes("read the diff") || s.includes("press m again"),
+      { timeout: 10_000, label: "the review gate or the publish probe" },
+    );
+    if (screen.includes("read the diff")) {
+      return;
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(`review gate never opened:\n${screen}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 300));
+  }
+}
+
 /** Poll for a file the way waits poll the screen: no fixed sleeps. */
 async function waitForFile(file, timeout) {
   const deadline = Date.now() + timeout;
@@ -115,11 +141,10 @@ test("merge gate: first m shows the diff, second m merges", { timeout: 120_000 }
   // "Done when:" objective text while the agent is still running.
   await session.waitForText("press m to read the d", { timeout: 60_000 });
 
-  // Ctrl+W is the leader; m is its merge binding. First press on unreviewed
-  // work must open the diff and demand a second press, not merge.
-  await session.press("Ctrl+W");
-  await session.press("m");
-  await session.waitForText("read the diff", { timeout: 20_000 });
+  // Ctrl+W is the leader; m is its merge binding. The first press on
+  // unreviewed work must open the diff and demand a second press, not merge
+  // (pressMergeUntilReview absorbs the async publish-route probe).
+  await pressMergeUntilReview(session);
 
   await session.press("Ctrl+W");
   await session.press("m");
@@ -219,9 +244,7 @@ test("recorded work survives renaming the repo directory", { timeout: 120_000 },
   assert.ok(!screen.includes("agent process exited"), `row died after rename:\n${screen}`);
 
   // And the recorded workspace still merges from its new home.
-  await session.press("Ctrl+W");
-  await session.press("m");
-  await session.waitForText("read the diff", { timeout: 20_000 });
+  await pressMergeUntilReview(session);
   await session.press("Ctrl+W");
   await session.press("m");
   await session.waitForText("[y] merge", { timeout: 20_000 });
