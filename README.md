@@ -6,6 +6,7 @@
   </a>
 </p>
 
+[![TUI e2e](https://github.com/viraatdas/rudder/actions/workflows/tui.yml/badge.svg)](https://github.com/viraatdas/rudder/actions/workflows/tui.yml)
 [![npm version](https://img.shields.io/npm/v/@viraatdas/rudder.svg)](https://www.npmjs.com/package/@viraatdas/rudder)
 [![npm downloads](https://img.shields.io/npm/dm/@viraatdas/rudder.svg)](https://www.npmjs.com/package/@viraatdas/rudder)
 [![Node >=20](https://img.shields.io/badge/node-%3E%3D20-43853d.svg)](https://nodejs.org/)

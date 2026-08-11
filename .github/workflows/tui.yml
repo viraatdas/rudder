@@ -1,0 +1,50 @@
+name: TUI e2e
+
+# Screen-level integration tests for the dashboard TUI, run on every push to
+# main and every PR. Builds the debug native binary (tests default to
+# target/debug/rudder-native) and drives it via tui-integration-tests.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: macos-latest
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install jj
+        run: brew install jj
+
+      - name: Cache cargo artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            target
+            ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-${{ hashFiles('native/**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - run: npm ci
+
+      - name: Build native debug binary
+        run: cargo build --manifest-path native/Cargo.toml
+
+      - name: TUI end-to-end tests
+        run: npm run test:tui:report
+
+      - name: Upload TUI report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tui-report
+          path: tui-report.html
+          if-no-files-found: ignore
