@@ -26,7 +26,7 @@
     "prepack": "npm run build",
     "postinstall": "node scripts/postinstall.mjs",
     "start": "node dist/index.js",
-    "test:tui:report": "node --test --test-reporter=spec --test-reporter-destination=stdout --test-reporter=tui-integration-tests/reporter --test-reporter-destination=tui-report.html tests/tui/*.test.mjs"
+    "test:tui:report": "rm -rf .tui-report tui-report.html && node --test --test-reporter=spec --test-reporter-destination=stdout --test-reporter=tui-integration-tests/reporter --test-reporter-destination=tui-report.html tests/tui/*.test.mjs"
   },
   "files": [
     "dist/",
@@ -47,7 +47,7 @@
     "@types/ws": "^8.5.13",
     "esbuild": "^0.24.0",
     "preact": "^10.25.0",
-    "tui-integration-tests": "^0.4.0",
+    "tui-integration-tests": "^0.4.1",
     "typescript": "^5.8.3"
   },
   "dependencies": {
