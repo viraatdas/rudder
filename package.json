@@ -46,7 +46,7 @@
     "@types/ws": "^8.5.13",
     "esbuild": "^0.24.0",
     "preact": "^10.25.0",
-    "tui-integration-tests": "github:viraatdas/tui-integration-tests#9e94c2c",
+    "tui-integration-tests": "^0.1.0",
     "typescript": "^5.8.3"
   },
   "dependencies": {
