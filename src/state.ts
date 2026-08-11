@@ -461,6 +461,9 @@ const inflightLlmSummaries = new Set<string>();
 
 export async function loadRunRecord(repoRoot: string, runId: string): Promise<RunRecord | null> {
   const record = await readJson<RunRecord>(runRecordPath(repoRoot, runId));
+  if (record) {
+    healMovedRepoPaths(record, repoRoot);
+  }
   if (record && !record.taskSummary) {
     record.taskSummary = summarizeTask(record.task);
   }
@@ -468,6 +471,56 @@ export async function loadRunRecord(repoRoot: string, runId: string): Promise<Ru
     maybeBackgroundLlmSummarize(record);
   }
   return record;
+}
+
+/**
+ * Recorded absolute paths survive a repo RENAME or MOVE; the repo does not.
+ * Everything a run record points at (worktrees, cwds) lives INSIDE the repo
+ * and moves with it, so when the record's repoRoot disagrees with the root we
+ * are actually reading it from, every stored path under the old root has an
+ * exact counterpart under the new one. Rewrite the prefix and the record is
+ * true again — the same reason jj survives a rename: its workspace pointers
+ * are relative. In-memory only; the healed record persists whenever the
+ * record is next saved.
+ */
+export function healMovedRepoPaths(record: RunRecord, actualRepoRoot: string): void {
+  const currentRoot = path.resolve(actualRepoRoot);
+  // Rule 1's key: the stored root, IF it disagrees. Rule 2 exists because
+  // rule 1 is not enough — a later save can rewrite repoRoot alone (observed:
+  // repoRoot said the new name while worktree.path still said the old one).
+  // Worktrees always live at <root>/.rudder-worktrees/..., so whatever
+  // precedes that marker is some spelling of the root; rebase it.
+  const storedRoot =
+    record.repoRoot && record.repoRoot !== currentRoot ? record.repoRoot : null;
+  const marker = `${path.sep}.rudder-worktrees${path.sep}`;
+  const remap = (value: unknown): unknown => {
+    if (typeof value === "string") {
+      if (storedRoot) {
+        if (value === storedRoot) return currentRoot;
+        if (value.startsWith(storedRoot + path.sep)) {
+          return currentRoot + value.slice(storedRoot.length);
+        }
+      }
+      const index = value.indexOf(marker);
+      if (index >= 0 && !value.startsWith(currentRoot)) {
+        return currentRoot + value.slice(index);
+      }
+      return value;
+    }
+    if (Array.isArray(value)) {
+      for (let i = 0; i < value.length; i += 1) value[i] = remap(value[i]);
+      return value;
+    }
+    if (value && typeof value === "object") {
+      const obj = value as Record<string, unknown>;
+      for (const key of Object.keys(obj)) obj[key] = remap(obj[key]);
+      return value;
+    }
+    return value;
+  };
+  remap(record as unknown as Record<string, unknown>);
+  // A record inside <root>/.rudder/runs belongs to <root> by construction.
+  record.repoRoot = currentRoot;
 }
 
 /**

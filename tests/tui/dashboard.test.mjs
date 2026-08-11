@@ -19,6 +19,22 @@ import {
 
 assertPrerequisites();
 
+/** Poll for a file the way waits poll the screen: no fixed sleeps. */
+async function waitForFile(file, timeout) {
+  const deadline = Date.now() + timeout;
+  for (;;) {
+    try {
+      await fsp.access(file);
+      return;
+    } catch {
+      if (Date.now() >= deadline) {
+        throw new Error(`timed out waiting for ${file} to exist`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 150));
+    }
+  }
+}
+
 async function scratch(t, prefix) {
   const repo = await scratchRepo(prefix);
   t.after(() => removeScratch(repo));
@@ -107,7 +123,14 @@ test("merge gate: first m shows the diff, second m merges", { timeout: 120_000 }
 
   await session.press("Ctrl+W");
   await session.press("m");
-  await session.waitForText("merged", { timeout: 30_000 });
+  // Second m does not merge yet: it opens the merge confirmation.
+  await session.waitForText("[y] merge", { timeout: 20_000 });
+  await session.press("y");
+  // The row's own state stamp — a bare "merged" would match the ever-present
+  // "cc clear merged" legend and pass without any merge happening.
+  await session.waitForText("● merged", { timeout: 30_000 });
+  // The screen can say what it likes; the merged file must be in the checkout.
+  await waitForFile(path.join(repo, "DONE.txt"), 20_000);
 });
 
 test("/resume shows where each conversation ran, and --here stays in the checkout", { timeout: 90_000 }, async (t) => {
@@ -135,6 +158,76 @@ test("/resume shows where each conversation ran, and --here stays in the checkou
   await session.type("11111111-1111-1111-1111-111111111111 --here keep going");
   await session.press("Enter");
   await session.waitForText("in the main checkout", { timeout: 30_000 });
+});
+
+test("dd deletes a running /main row instead of dead-ending", { timeout: 60_000 }, async (t) => {
+  // The reported symptom: "sometimes dd doesn't work, for main". Root cause
+  // was a three-layer dead end — dd on a live main row said "stop it with x",
+  // the x handler excluded main rows, and stop_agent_at refused them again
+  // underneath. The row was undeletable while running, with advice that could
+  // not be followed.
+  const { repo, sleeper } = await scratch(t, "rudder-tui-dd-main-");
+  const session = await launchRudder(t, { repo, claudeBin: sleeper });
+  await session.waitForText("Type a task", { timeout: 20_000 });
+
+  await session.type("/main long running chore");
+  await session.press("Enter");
+  await session.waitForText("long running chore", { timeout: 30_000 });
+
+  // Focus the agents pane, then the two-press delete on the LIVE row.
+  await session.press("Ctrl+W");
+  await session.press("1");
+  await session.press("d");
+  await session.waitForText("press d again to stop it and delete", { timeout: 20_000 });
+  await session.press("d");
+
+  // A POSITIVE post-state, not waitForGone: an absence assertion can match a
+  // mid-repaint frame where the row text is transiently blank (observed — it
+  // green-lit a build where deletion was provably refused). Deleting the only
+  // row brings the empty-list placeholder back, which only exists afterwards.
+  await session.waitForText("no agents yet", { timeout: 20_000 });
+});
+
+test("recorded work survives renaming the repo directory", { timeout: 120_000 }, async (t) => {
+  // The incident, verbatim: the user ran `mv aws-v2 libra` and every recorded
+  // row died with "agent process exited (exit 1)" because run.json stored
+  // absolute paths under the old name. After the heal, a rename is invisible:
+  // the respawned dashboard rebases recorded paths onto the root it actually
+  // finds them in, and the work still merges.
+  const { repo, completer } = await scratch(t, "rudder-tui-rename-");
+  let session = await launchRudder(t, { repo, claudeBin: completer });
+  await session.waitForText("Type a task", { timeout: 20_000 });
+
+  await session.type("write the done marker");
+  await session.press("Enter");
+  await session.waitForText("press m to read the d", { timeout: 60_000 });
+
+  await session.kill();
+  await session.close();
+
+  // The rename. Everything inside (worktrees, .rudder state, jj) moves along.
+  const renamed = `${repo}-renamed`;
+  await fsp.rename(repo, renamed);
+  t.after(() => removeScratch(renamed));
+
+  session = await launchRudder(t, { repo: renamed, claudeBin: path.join(renamed, "fake-bin", "claude-completer") });
+  t.after(() => session.close());
+  await session.waitForText("write the done marker", { timeout: 30_000 });
+
+  // The row must not be the incident's failure shape.
+  const screen = await session.screen();
+  assert.ok(!screen.includes("agent process exited"), `row died after rename:\n${screen}`);
+
+  // And the recorded workspace still merges from its new home.
+  await session.press("Ctrl+W");
+  await session.press("m");
+  await session.waitForText("read the diff", { timeout: 20_000 });
+  await session.press("Ctrl+W");
+  await session.press("m");
+  await session.waitForText("[y] merge", { timeout: 20_000 });
+  await session.press("y");
+  await session.waitForText("● merged", { timeout: 30_000 });
+  await waitForFile(path.join(renamed, "DONE.txt"), 20_000);
 });
 
 test("resize reflows without a panic and stays interactive", { timeout: 60_000 }, async (t) => {

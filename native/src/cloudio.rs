@@ -624,6 +624,16 @@ pub(crate) fn visit_codex_session_dir(
         let Ok(kind) = entry.file_type() else {
             continue;
         };
+        // Symlinked rollouts are SKIPPED, deliberately. Cloud-offload tools
+        // replace old sessions with symlinks into a file-provider mount
+        // (observed: ~/Library/CloudStorage/StowAgent-Stow), and opening one
+        // makes macOS materialize it on demand — which BLOCKS INDEFINITELY at
+        // 0% CPU when the provider hangs. This walk runs on the UI thread from
+        // a `b` press; an archived chat missing from a picker beats a wedged
+        // dashboard. file_type() here is lstat semantics: it does not follow.
+        if kind.is_symlink() {
+            continue;
+        }
         if kind.is_dir() {
             visit_codex_session_dir(&path, target_cwd, best, depth + 1);
             continue;

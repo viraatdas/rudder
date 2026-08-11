@@ -1549,7 +1549,7 @@ fn picking_a_model_leaves_a_running_main_row_alone() {
 }
 
 #[test]
-fn a_dead_main_row_can_be_deleted_but_a_live_one_says_why_not() {
+fn a_dead_main_row_deletes_and_a_live_one_stops_on_confirm() {
     // "main agent: delete disabled" explained nothing and applied always, so a main
     // row orphaned by a crash could never be cleared off the list.
     let mut app = App::new();
@@ -1571,7 +1571,11 @@ fn a_dead_main_row_can_be_deleted_but_a_live_one_says_why_not() {
     app.delete_selected_agent();
     assert!(app.agents.is_empty(), "a dead main row is deletable");
 
-    // A LIVE one is refused, with the action that unblocks it.
+    // A LIVE one takes the same two-press flow, folding the stop in. The old
+    // behavior refused with "stop it with x" — advice that could not be
+    // followed, because x excluded main rows and stop_agent_at refused them
+    // again underneath. Three layers deep, the row was undeletable while
+    // running; the reported symptom was simply "dd doesn't work".
     let mut live = test_agent_run(MAIN_AGENT_ID, "own the checkout");
     live.mode = AgentMode::Main;
     live.status = AgentStatus::Running;
@@ -1592,20 +1596,20 @@ fn a_dead_main_row_can_be_deleted_but_a_live_one_says_why_not() {
     app.delete_pending = None;
 
     app.delete_selected_agent();
-
-    assert_eq!(app.agents.len(), 1, "a running main row is kept");
+    assert_eq!(app.agents.len(), 1, "first press arms the confirm, keeps the row");
     assert!(
         app.notice
             .as_deref()
-            .is_some_and(|notice| notice.contains("stop it with x")),
-        "the refusal names the way out: {:?}",
+            .is_some_and(|notice| notice.contains("press d again to stop it and delete")),
+        "the confirm says the second press will stop the agent: {:?}",
         app.notice
     );
-    if let Some(run) = app.agents.first_mut() {
-        if let Some(terminal) = run.terminal.as_mut() {
-            terminal.terminate_and_wait();
-        }
-    }
+
+    app.delete_selected_agent();
+    assert!(
+        app.agents.is_empty(),
+        "the confirmed press stops the live main agent and deletes the row"
+    );
 }
 
 #[test]
@@ -6915,6 +6919,15 @@ fn fork_commands_branch_the_session_without_touching_the_original() {
 
 #[test]
 fn branch_guards_main_orchestrator_and_sessionless_runs() {
+    // HERMETIC HOME: the Codex arm below falls back to scanning
+    // ~/.codex/sessions for a session id. Against the developer's REAL home
+    // that walk once wedged this test for 25+ minutes at 0% CPU — a
+    // cloud-offload tool had replaced old rollouts with symlinks into a
+    // CloudStorage mount and a hung provider blocked the read forever. A unit
+    // test must never leave its sandbox; point HOME at an empty scratch dir.
+    let _env = env_guard();
+    let home = unique_test_repo("branch-guards-home");
+    std::env::set_var("HOME", &home);
     let mut app = App::new();
 
     // A MAIN row is branchable now: it is just a conversation in the checkout, and
@@ -6976,6 +6989,7 @@ fn branch_guards_main_orchestrator_and_sessionless_runs() {
             && notice.contains("first reply"),
         "notice was {notice:?}"
     );
+    let _ = fs::remove_dir_all(&home);
 }
 
 #[test]
@@ -13893,6 +13907,44 @@ fn load_persisted_agents_drops_reconcile_planners() {
     assert!(
         loaded.iter().all(|run| !run.reconcile_planner),
         "no reconcile planner is ever reloaded"
+    );
+
+    let _ = fs::remove_dir_all(&repo);
+}
+
+#[test]
+fn a_renamed_repo_heals_its_recorded_paths_on_load() {
+    // The incident this encodes: `mv aws-v2 libra` made every relaunch spawn
+    // into the dead path and exit 1. Worse, the record found in the field had
+    // repoRoot ALREADY rewritten to the new name (a later save did it) while
+    // worktree.path still said the old one — so the heal cannot key on
+    // "stored root differs"; it must rebase anything before the
+    // `.rudder-worktrees` marker onto the actual root.
+    let repo = unique_test_repo("renamed-heal");
+    let mut run = test_agent_run("run-moved", "carry work across a rename");
+    run.cwd = repo.join(".rudder-worktrees/old-name-abc123/task-deadbeef");
+    save_native_run_record(&repo, &run).expect("save run");
+
+    // Simulate the rename by rewriting the record the way the field showed it:
+    // repoRoot current, nested paths stale.
+    let run_json = native_run_dir(&repo, "run-moved").join("run.json");
+    let raw = fs::read_to_string(&run_json).expect("read");
+    let stale = raw.replace(
+        &format!("{}/.rudder-worktrees", repo.display()),
+        "/gone/old-spelling/.rudder-worktrees",
+    );
+    assert_ne!(raw, stale, "fixture must actually contain a worktree path");
+    fs::write(&run_json, stale).expect("write stale record");
+
+    let loaded = load_persisted_agents(&repo);
+    let healed = loaded
+        .iter()
+        .find(|run| run.id == "run-moved")
+        .expect("run reloads");
+    assert_eq!(
+        healed.cwd,
+        repo.join(".rudder-worktrees/old-name-abc123/task-deadbeef"),
+        "the worktree path is rebased onto the repo the record was read from"
     );
 
     let _ = fs::remove_dir_all(&repo);

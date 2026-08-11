@@ -321,13 +321,14 @@ pub(crate) fn load_persisted_agents(repo_root: &Path) -> Vec<AgentRun> {
             Ok(raw) => raw,
             Err(_) => continue, // not a run dir (no run.json); normal, stay quiet
         };
-        let record = match serde_json::from_str::<serde_json::Value>(&raw) {
+        let mut record = match serde_json::from_str::<serde_json::Value>(&raw) {
             Ok(record) => record,
             Err(error) => {
                 eprintln!("rudder: skipping unreadable {}: {error}", path.display());
                 continue;
             }
         };
+        heal_moved_repo_paths(&mut record, repo_root);
         match agent_from_run_record(repo_root, record) {
             Some(agent) => agents.push(agent),
             None => eprintln!(
@@ -378,6 +379,74 @@ pub(crate) fn stop_requested(repo_root: &Path, run_id: &str) -> bool {
 
 pub(crate) fn clear_stop_request(repo_root: &Path, run_id: &str) {
     let _ = fs::remove_file(stop_request_path(repo_root, run_id));
+}
+
+/// Recorded absolute paths survive a repo RENAME or MOVE; the repo does not.
+/// A run record's worktree and cwd live INSIDE the repo and moved with it, so
+/// when the record's `repoRoot` disagrees with the root the record was read
+/// from, every stored path under the old root has an exact counterpart under
+/// the new one. Rewriting the prefix makes the record true again — without
+/// this, one `mv` of the repo directory made every relaunch spawn into a
+/// nonexistent cwd and die with "agent process exited (exit 1)". (jj survives
+/// the same rename because its workspace pointers are relative; this is the
+/// derive-don't-cache principle applied to our own records.)
+pub(crate) fn heal_moved_repo_paths(record: &mut serde_json::Value, actual_root: &Path) {
+    let current = actual_root.to_string_lossy().to_string();
+    // Rule 1: prefix-remap against the STORED root, when it disagrees.
+    let stored_root = record
+        .get("repoRoot")
+        .and_then(serde_json::Value::as_str)
+        .filter(|root| !root.is_empty() && *root != current)
+        .map(ToString::to_string);
+    // Rule 2 exists because rule 1 is not enough: a later save can rewrite
+    // repoRoot alone (observed in the field: repoRoot said the new name while
+    // worktree.path still said the old one), which makes the stored root
+    // USELESS as a key. Worktrees always live at
+    // <root>/.rudder-worktrees/..., so whatever precedes that marker in a
+    // stored path is some spelling of the root — rebase it onto the real one.
+    remap_strings(record, stored_root.as_deref(), &current);
+    // Rule 3: a record inside <root>/.rudder/runs belongs to <root> by
+    // construction; the field is derivable, so derive it.
+    if let Some(root_field) = record.get_mut("repoRoot") {
+        if root_field.is_string() {
+            *root_field = serde_json::Value::String(current);
+        }
+    }
+}
+
+const WORKTREES_MARKER: &str = "/.rudder-worktrees/";
+
+fn remap_strings(value: &mut serde_json::Value, old_root: Option<&str>, new_root: &str) {
+    match value {
+        serde_json::Value::String(text) => {
+            if let Some(old_root) = old_root {
+                if text == old_root {
+                    *text = new_root.to_string();
+                    return;
+                }
+                if let Some(rest) = text.strip_prefix(&format!("{old_root}/")) {
+                    *text = format!("{new_root}/{rest}");
+                    return;
+                }
+            }
+            if let Some(index) = text.find(WORKTREES_MARKER) {
+                if !text.starts_with(new_root) {
+                    *text = format!("{new_root}{}", &text[index..]);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                remap_strings(item, old_root, new_root);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (_, item) in map.iter_mut() {
+                remap_strings(item, old_root, new_root);
+            }
+        }
+        _ => {}
+    }
 }
 
 pub(crate) fn agent_from_run_record(

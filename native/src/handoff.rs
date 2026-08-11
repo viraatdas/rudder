@@ -276,6 +276,12 @@ pub(crate) fn recent_claude_conversations_in(
             if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
                 continue;
             }
+            // Same cloud-offload guard as the Codex scan: a symlinked
+            // transcript can block indefinitely while macOS asks a hung file
+            // provider to materialize it. Skip; recency is what pickers want.
+            if session.file_type().is_ok_and(|kind| kind.is_symlink()) {
+                continue;
+            }
             let modified = session
                 .metadata()
                 .and_then(|meta| meta.modified())
@@ -422,6 +428,15 @@ fn collect_jsonl_files(dir: &Path, out: &mut Vec<(SystemTime, PathBuf)>, depth: 
     };
     for entry in entries.flatten() {
         let path = entry.path();
+        // Skip symlinks entirely: cloud-offload tools stow old rollouts behind
+        // symlinks into a CloudStorage mount, and reading one can block
+        // indefinitely while macOS asks a hung provider to materialize it.
+        // This scan feeds the /resume palette on keystrokes; omitting an
+        // archived chat beats wedging the dashboard. (lstat semantics — the
+        // entry's file_type does not follow the link.)
+        if entry.file_type().is_ok_and(|kind| kind.is_symlink()) {
+            continue;
+        }
         if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
             collect_jsonl_files(&path, out, depth + 1);
             continue;

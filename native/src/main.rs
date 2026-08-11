@@ -2423,9 +2423,12 @@ impl App {
             }
             KeyCode::Char('x') => {
                 // Stop the selected worker: drops its PTY, marks it Stopped, frees a
-                // parallelism slot, and keeps its jj workspace (undoable). Not the
-                // main agent or the orchestrator.
-                if !self.selected_is_main() && !self.selected_is_orchestrator() {
+                // parallelism slot, and keeps its jj workspace (undoable). Main rows
+                // are stoppable too — they are just a conversation in the checkout,
+                // and excluding them created a dead end where the dd flow's own
+                // advice ("stop it with x") did nothing. Only the orchestrator is
+                // off-limits: its lifecycle belongs to the plan.
+                if !self.selected_is_orchestrator() {
                     let idx = self.selected_agent;
                     self.stop_agent_at(idx);
                 }
@@ -11517,26 +11520,18 @@ impl App {
         if self.agents.is_empty() {
             return;
         }
-        // A main row used to be undeletable, full stop, with a notice that
-        // explained nothing. Nothing requires one to exist (typing a task recreates
-        // it), and crashes leave dead main rows — one orphaned since a kernel panic
-        // could never be cleared. Refuse only while it is LIVE, and say what to do.
-        if self.selected_is_main() {
-            let live = self
-                .agents
-                .get(self.selected_agent)
-                .is_some_and(|run| run.terminal.is_some() && run.status == AgentStatus::Running);
-            if live {
-                self.notice = Some(
-                    "main agent is still running — stop it with x, then d twice to delete the row"
-                        .to_string(),
-                );
-                return;
-            }
-        }
         let Some(selected) = self.agents.get(self.selected_agent) else {
             return;
         };
+        // A LIVE main row used to dead-end here: the refusal said "stop it with
+        // x", but the x handler excludes main rows, so a running main agent
+        // could be neither stopped nor deleted — dd just re-printed advice that
+        // could not be followed. Deleting is already a confirmed two-press flow,
+        // so fold the stop into it: say the second press will stop the agent,
+        // and on confirm actually do so before deleting.
+        let live_main = self.selected_is_main()
+            && selected.terminal.is_some()
+            && selected.status == AgentStatus::Running;
         if self.delete_pending.as_deref() != Some(&selected.id) {
             self.delete_pending = Some(selected.id.clone());
             let label = if selected.task_summary.trim().is_empty() {
@@ -11547,12 +11542,25 @@ impl App {
             // Name WHAT is being deleted and spell out both outcomes; the bare
             // "press d again" read as a generic hint and was easy to act on with
             // the wrong row selected.
-            self.notice = Some(if selected.worktree_path.is_some() {
+            self.notice = Some(if live_main {
+                format!("{label} is still running — press d again to stop it and delete the row · any other key cancels")
+            } else if selected.worktree_path.is_some() {
                 format!("delete {label} and remove its worktree? press d again to confirm · any other key cancels")
             } else {
                 format!("delete {label}? press d again to confirm · any other key cancels")
             });
             return;
+        }
+        if live_main {
+            let idx = self.selected_agent;
+            // If the stop fails, do NOT delete: removing the row while its PTY
+            // lives would leak the process with nothing left pointing at it.
+            if !self.stop_agent_at(idx) {
+                self.delete_pending = None;
+                self.notice =
+                    Some("could not stop the main agent — row not deleted".to_string());
+                return;
+            }
         }
 
         let run = self.agents.remove(self.selected_agent);
@@ -12722,9 +12730,11 @@ impl App {
             let Some(run) = self.agents.get_mut(index) else {
                 return false;
             };
-            if run.is_main() {
-                return false;
-            }
+            // Main rows are stoppable: the body below only kills the PTY and
+            // records Stopped — nothing here touches a worktree. The old
+            // is_main() refusal here was the bottom of a three-layer dead end
+            // (dd said "stop it with x", x excluded main, and this guard made
+            // even a permitted call a silent no-op).
             let was_conflict_resolver = run.merge_resolver || run.merge_conflict;
             let unresolved = if was_conflict_resolver {
                 jj_unresolved_conflicts(&run.cwd)
