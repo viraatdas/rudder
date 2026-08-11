@@ -19,6 +19,7 @@
     "build-native": "cargo build --release --manifest-path native/Cargo.toml",
     "check": "tsc -p tsconfig.json --noEmit",
     "test": "tsc -p tsconfig.json && npm run chmod-cli && node --test tests/*.test.mjs",
+    "test:tui": "node --test tests/tui/*.test.mjs",
     "test:worker-scroll": "cargo test --manifest-path native/Cargo.toml top_origin_scroll_region_history_scrolls_like_terminal_scrollback && cargo test --manifest-path native/Cargo.toml worker_wheel && cargo test --manifest-path native/Cargo.toml wheel_scroll && cargo test --manifest-path native/Cargo.toml worker_page && cargo test --manifest-path native/Cargo.toml codex_alternate_screen_page_key",
     "copy-native": "node scripts/copy-native.mjs",
     "chmod-cli": "node -e \"require('fs').chmodSync('dist/index.js',0o755)\"",
@@ -45,6 +46,7 @@
     "@types/ws": "^8.5.13",
     "esbuild": "^0.24.0",
     "preact": "^10.25.0",
+    "tui-integration-tests": "github:viraatdas/tui-integration-tests#9e94c2c",
     "typescript": "^5.8.3"
   },
   "dependencies": {

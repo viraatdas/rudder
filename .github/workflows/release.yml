@@ -97,6 +97,18 @@ jobs:
       - name: Native tests
         run: cargo test --manifest-path native/Cargo.toml
 
+      # Screen-level e2e: the REAL prebuilt dashboard binary in a real PTY,
+      # driven by keystrokes via tui-integration-tests (which fetches its own
+      # sha256-pinned driver). Uses the darwin-arm64 artifact this job already
+      # downloaded; download-artifact does not preserve the execute bit.
+      - name: TUI end-to-end tests
+        run: |
+          brew install jj
+          chmod +x prebuilt-native/rudder-native-darwin-arm64/rudder-native
+          npm run test:tui
+        env:
+          RUDDER_NATIVE_BIN: ${{ github.workspace }}/prebuilt-native/rudder-native-darwin-arm64/rudder-native
+
       # `npm publish` runs `prepack` (tsc + cargo build --release + copy-native),
       # and copy-native folds the downloaded native artifacts into dist/native.
       - name: Publish to npm
