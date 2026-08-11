@@ -113,8 +113,7 @@ export async function launchRudder(t, { repo, claudeBin, home, cols = 120, rows 
       ...(home ? { HOME: home } : {}),
       ...env,
     },
-  });
-  t.after(() => session.close());
+  }, t);
   return session;
 }
 

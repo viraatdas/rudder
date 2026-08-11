@@ -91,7 +91,6 @@ test("two /plan orchestrators survive a process restart", { timeout: 120_000 }, 
 
   await session.kill();
   session = await session.respawn();
-  t.after(() => session.close());
 
   // Both plans must come back. Before the fix, reload kept exactly one.
   await session.waitForText("alpha objective", { timeout: 30_000 });
