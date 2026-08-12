@@ -120,3 +120,46 @@ test("a single merge then undo round-trips the checkout", { timeout: 120_000 }, 
   await session.waitForText("Restored jj to operation", { timeout: 30_000 });
   await waitFile(path.join(repo, "DONE.txt"), false);
 });
+
+test("a merged row survives a restart with its identity intact", { timeout: 120_000 }, async (t) => {
+  // The mutation loop found this gap: dropping a row's workspace identity
+  // during merge is invisible to a single-pass test — the file lands, the
+  // screen says "merged". It only surfaces on the NEXT life of the dashboard,
+  // where a row that lost its workspaceName reloads as broken. Restart is the
+  // highest-value class precisely because corruption hides until then; this is
+  // the merge-persistence sequence no test covered.
+  const repo = await scratchRepo("rudder-tui-merge-restart-");
+  t.after(() => removeScratch(repo));
+  const { completer } = await fakeBackends(repo);
+  let session = await launchRudder(t, { repo, claudeBin: completer });
+  await session.waitForText("Type a task", { timeout: 20_000 });
+
+  await session.type("write the done marker");
+  await session.press("Enter");
+  await session.waitForText("press m to read", { timeout: 30_000 });
+  await session.press("Ctrl+W");
+  await session.press("M");
+  await session.waitForText("[y] merge", { timeout: 20_000 });
+  await session.press("y");
+  await session.waitForText("merged locally", { timeout: 30_000 });
+  await waitFile(path.join(repo, "DONE.txt"), true);
+
+  // Restart. The merged row must reload as merged, still owning its workspace
+  // (so it remains undoable) — not orphaned, failed, or identity-stripped.
+  await session.kill();
+  session = await session.respawn();
+  await session.waitForText("write the done marker", { timeout: 30_000 });
+  await session.waitForText("merged", { timeout: 20_000 });
+  const screen = await session.screen();
+  if (/orphaned|identity|no jj workspace/i.test(screen)) {
+    throw new Error(`merged row lost its identity across restart:\n${screen}`);
+  }
+
+  // Proof the reloaded row is still fully operable: undo works from its new
+  // life, which requires the workspace identity to have survived the save.
+  await session.press("Ctrl+W");
+  await session.press("1");
+  await session.press("u");
+  await session.waitForText("Restored jj to operation", { timeout: 30_000 });
+  await waitFile(path.join(repo, "DONE.txt"), false);
+});
