@@ -2795,6 +2795,13 @@ async function reuseOrRestartWorkspace(
       `workspace ${workspace.id}: fingerprint mismatch (stored ${workspace.snapshotFingerprint?.slice(0, 8) ?? "none"}, incoming ${incomingFingerprint?.slice(0, 8) ?? "none"}) — recreate path`,
     );
   }
+  // The recreate decision has several SILENT inputs beyond the fingerprint
+  // (machine lookup returned null, machine in an unexpected state, workspace
+  // marked failed, no snapshot key). When the expensive path is about to be
+  // taken anyway, name the full condition set once — chasing a spurious
+  // rebuild without this took hours of log archaeology.
+  const explainRecreate = () =>
+    `machine=${machine ? `${machine.id}:${machine.state}` : "null"} recordedMachineId=${workspace.machineId ?? "none"} fingerprintMatches=${fingerprintMatches} snapshotKey=${workspace.snapshotKey ? "yes" : "no"} status=${workspace.status}`;
 
   // Path 2: warm restart — machine exists but is stopped, and the user's
   // local state hasn't changed (fingerprint matches). With a persistent
@@ -2864,8 +2871,10 @@ async function reuseOrRestartWorkspace(
   // the CLI died between probe and re-upload, stranding the workspace with
   // no machine at all). Validate first; destroy only when rebuild can follow.
   if (!isClone && !snapshotInput) {
+    console.info(`workspace ${workspace.id}: probe reached recreate path (${explainRecreate()})`);
     throw badRequest("snapshot is required to (re)create this workspace");
   }
+  console.info(`workspace ${workspace.id}: recreating (${explainRecreate()})`);
   // `machine` is null both when the machine is genuinely gone AND when the GET
   // above simply failed, because that lookup swallows its error. Keying the
   // delete off it meant one flaky Fly read left the machine alive, still holding
@@ -3044,10 +3053,22 @@ async function startFlyMachine(machineId: string, label: string): Promise<FlyMac
   let lastError: unknown;
   for (let attempt = 1; attempt <= 12; attempt += 1) {
     try {
-      return await flyRequest<FlyMachine>(
+      const started = await flyRequest<FlyMachine>(
         `/v1/apps/${encodeURIComponent(flyAppName)}/machines/${encodeURIComponent(machineId)}/start`,
         { method: "POST", body: {} },
       );
+      // Fly's start endpoint responds with {previous_state, migrated, ...} —
+      // NO id and NO state. Callers persist `.id` into the workspace row; when
+      // this returned the raw start response, every create/recreate stored
+      // machineId=NULL, so the next attach couldn't find the machine and did
+      // a full ~40s destroy+rebuild instead of an instant reuse. The row only
+      // healed when the supervisor's heartbeat reported the id minutes later.
+      // Always return an object that carries the id and a usable state.
+      return {
+        ...started,
+        id: started?.id ?? machineId,
+        state: started?.state ?? "starting",
+      };
     } catch (error) {
       lastError = error;
       const machine = await flyRequest<FlyMachine>(

@@ -12,6 +12,22 @@ pub(crate) fn is_cloud_worker_session() -> bool {
 }
 
 pub(crate) fn read_cloud_summary() -> CloudSummary {
+    // Inside a cloud worker VM there is no user auth file and no
+    // RUDDER_CLOUD_TOKEN — the machine authenticates with its own
+    // RUDDER_WORKER_TOKEN. Without this, every in-VM dashboard rendered
+    // "cloud offline" about the very cloud it was running in.
+    if is_cloud_worker_session()
+        && env::var("RUDDER_WORKER_TOKEN")
+            .ok()
+            .is_some_and(|token| !token.trim().is_empty())
+    {
+        return CloudSummary {
+            connected: true,
+            runtime: env::var("RUDDER_CLOUD_RUNTIME")
+                .ok()
+                .filter(|value| !value.trim().is_empty()),
+        };
+    }
     if env::var("RUDDER_CLOUD_TOKEN")
         .ok()
         .is_some_and(|token| !token.trim().is_empty())
@@ -74,6 +90,19 @@ pub(crate) fn cloud_workspace_label(workspace: Option<&CloudWorkspaceStatus>) ->
 }
 
 pub(crate) fn query_cloud_workspace_status(cwd: &Path) -> Option<CloudWorkspaceStatus> {
+    // Inside the worker VM, the workspace is not something to look up — it is
+    // the machine's own identity, delivered by env. The CLI query below would
+    // run unauthenticated there and fail, which rendered "cloud workspace ·
+    // none" inside every cloud workspace.
+    if let Ok(id) = env::var("RUDDER_WORKSPACE_ID") {
+        if !id.trim().is_empty() {
+            return Some(CloudWorkspaceStatus {
+                id: Some(id),
+                status: Some("running".to_string()),
+                ..CloudWorkspaceStatus::default()
+            });
+        }
+    }
     let rudder = locate_rudder_cli()?;
     let mut child = Command::new(rudder)
         .args(["cloud", "workspace", "status", "--json"])
