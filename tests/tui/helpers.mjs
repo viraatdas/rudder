@@ -95,6 +95,72 @@ export async function fakeBackends(dir) {
   return { sleeper, completer, completerUnique, completerConflict };
 }
 
+/**
+ * A backend shaped like a REAL agent: a leader process that spawns a
+ * long-lived descendant (think claude's node/MCP subprocesses), each
+ * recording its PID into `pidDir`. Lets a test assert that deleting or
+ * stopping an ongoing session reaps the WHOLE process group — no orphans —
+ * which is invisible to any screen assertion (the row is gone; the leaked
+ * process is not). Returns the backend path.
+ */
+export async function leakDetectorBackend(dir, pidDir) {
+  await fsp.mkdir(pidDir, { recursive: true });
+  const bin = path.join(dir, "fake-bin");
+  await fsp.mkdir(bin, { recursive: true });
+  const file = path.join(bin, "claude-leaky");
+  // The descendant IGNORES SIGHUP and stays in the leader's process group —
+  // the shape of a real MCP/node subprocess that does not die just because
+  // its parent did or the PTY hung up. That makes the negative-pgid group
+  // kill the ONLY thing that reaps it: a leader-only kill (pgid, not -pgid)
+  // leaves it orphaned. Without SIGHUP-immunity the PTY hangup reaps it
+  // anyway and the test cannot tell a group kill from a leader kill —
+  // mutation testing caught exactly that weakness.
+  await fsp.writeFile(
+    file,
+    `#!/bin/sh
+echo $$ > "${pidDir}/leader.pid"
+sh -c 'trap "" HUP; echo $$ > "${pidDir}/descendant.pid"; exec sleep 600' </dev/null >/dev/null 2>&1 &
+wait
+`,
+  );
+  await fsp.chmod(file, 0o755);
+  return file;
+}
+
+/** Read a PID written by leakDetectorBackend, waiting briefly for the file. */
+export async function readPid(pidDir, name, timeout = 15_000) {
+  const file = path.join(pidDir, name);
+  const deadline = Date.now() + timeout;
+  for (;;) {
+    const raw = await fsp.readFile(file, "utf8").catch(() => "");
+    const pid = Number.parseInt(raw.trim(), 10);
+    if (Number.isInteger(pid) && pid > 1) return pid;
+    if (Date.now() >= deadline) throw new Error(`no pid in ${file} after ${timeout}ms`);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
+
+/** True if the process is still alive (signal 0 probes without killing). */
+export function pidAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code === "EPERM"; // exists but not ours — still "alive"
+  }
+}
+
+/** Poll until a pid is gone, or throw (naming it a leak) on timeout. */
+export async function waitPidGone(pid, label, timeout = 15_000) {
+  const deadline = Date.now() + timeout;
+  while (pidAlive(pid)) {
+    if (Date.now() >= deadline) {
+      throw new Error(`${label} (pid ${pid}) is still alive — orphaned/leaked`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 150));
+  }
+}
+
 /** Run-id slugs like `verify-launch-works-856351af` churn per run. */
 const rudderNormalizers = [
   ...defaultNormalizers,
