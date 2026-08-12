@@ -527,6 +527,13 @@ pub(crate) fn agent_from_run_record(
     let cwd = worktree
         .and_then(|value| value.get("path"))
         .and_then(|value| value.as_str())
+        // An EMPTY string is not a usable cwd. Without this filter a record
+        // whose worktree.path is "" (corruption, a half-written record, an
+        // interrupted rename) loads with an empty cwd, and every spawn against
+        // that row fails silently — a row that is simply "not working" with no
+        // error. Fall through to the repo root, the right home for a
+        // main-checkout agent anyway.
+        .filter(|value| !value.trim().is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| repo_root.to_path_buf());
     let worktree_branch = worktree
