@@ -2787,6 +2787,14 @@ async function reuseOrRestartWorkspace(
       && workspace.snapshotFingerprint
       && incomingFingerprint === workspace.snapshotFingerprint,
   );
+  // A mismatch triggers the expensive destroy+recreate path, so name the
+  // reason: which side is missing, or that both exist and differ. Prefixes
+  // only — fingerprints hash credentials-adjacent inputs.
+  if (!isClone && !fingerprintMatches) {
+    console.info(
+      `workspace ${workspace.id}: fingerprint mismatch (stored ${workspace.snapshotFingerprint?.slice(0, 8) ?? "none"}, incoming ${incomingFingerprint?.slice(0, 8) ?? "none"}) — recreate path`,
+    );
+  }
 
   // Path 2: warm restart — machine exists but is stopped, and the user's
   // local state hasn't changed (fingerprint matches). With a persistent
@@ -2795,6 +2803,21 @@ async function reuseOrRestartWorkspace(
   // (~1-2s total). Without a volume, the marker is on the ephemeral rootfs
   // and the supervisor re-downloads using a fresh URL via the snapshot-url
   // endpoint (~10-30s). Either way, no destroy+recreate is needed.
+  // A machine caught mid-"stopping" (the supervisor just exited) is seconds
+  // from being warm-restartable; without this wait it missed both reuse paths
+  // and fell through to a full destroy+recreate. Poll briefly for it to
+  // settle — if it doesn't, the recreate fallthrough still applies.
+  if (machine?.id && machine.state === "stopping") {
+    const machineId = machine.id;
+    for (let attempt = 0; attempt < 15 && machine?.state === "stopping"; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      machine = await flyRequest<FlyMachine>(
+        `/v1/apps/${encodeURIComponent(flyAppName)}/machines/${encodeURIComponent(machineId)}`,
+        { method: "GET" },
+      ).catch(() => machine);
+    }
+  }
+
   if (
     machine
     && machine.id
@@ -2832,6 +2855,17 @@ async function reuseOrRestartWorkspace(
   // or fingerprint mismatch (user's local state changed). Need a fresh
   // snapshot from the CLI. Also destroy + recreate the volume so the user
   // sees their new repo state instead of the cached one on the old disk.
+  //
+  // REFUSE BEFORE DESTROYING ANYTHING. Recreating a snapshot workspace needs
+  // a snapshot in hand; the CLI's first attach is a cheap probe without one.
+  // This check used to live after the machine and volume destroys, so the
+  // probe demolished a healthy stopped machine, THEN 400'd "snapshot is
+  // required" — turning every warm reuse into a 40s full rebuild (and, had
+  // the CLI died between probe and re-upload, stranding the workspace with
+  // no machine at all). Validate first; destroy only when rebuild can follow.
+  if (!isClone && !snapshotInput) {
+    throw badRequest("snapshot is required to (re)create this workspace");
+  }
   // `machine` is null both when the machine is genuinely gone AND when the GET
   // above simply failed, because that lookup swallows its error. Keying the
   // delete off it meant one flaky Fly read left the machine alive, still holding
