@@ -67,6 +67,16 @@ const MUTATIONS = [
     guards: "plan pipeline",
   },
   {
+    id: "empty-cwd",
+    file: "gitio.rs",
+    // Anchor on the unique comment so the whitespace-sensitive multi-line
+    // match is unambiguous (bare `.filter(...)` recurs all over the loader).
+    find: "// main-checkout agent anyway.\n        .filter(|value| !value.trim().is_empty())\n        .map(PathBuf::from)",
+    replace: "// main-checkout agent anyway.\n        .map(PathBuf::from)",
+    guards: "empty-path agent loads a usable cwd",
+    unit: "a_record_with_an_empty",
+  },
+  {
     id: "rename-heal",
     file: "gitio.rs",
     find: 'const WORKTREES_MARKER: &str = "/.rudder-worktrees/";',
