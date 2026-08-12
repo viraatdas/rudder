@@ -13953,6 +13953,40 @@ fn a_renamed_repo_heals_its_recorded_paths_on_load() {
 }
 
 #[test]
+fn a_record_with_an_empty_worktree_path_loads_a_usable_cwd() {
+    // The "agent that just does not work" shape: a run record whose
+    // worktree.path is an empty string (corruption / interrupted rename).
+    // It must NOT load with an empty cwd — every spawn against that would fail
+    // silently. It falls through to the repo root, a usable home.
+    let repo = unique_test_repo("empty-cwd");
+    let run_dir = native_run_dir(&repo, "run-empty");
+    fs::create_dir_all(&run_dir).unwrap();
+    let record = serde_json::json!({
+        "id": "run-empty",
+        "task": "a task whose record lost its path",
+        "createdAt": "2026-08-12T00:00:00Z",
+        "mode": "execute",
+        "backend": "claude",
+        "status": "running",
+        "worktree": { "enabled": true, "path": "" },
+    });
+    fs::write(run_dir.join("run.json"), record.to_string()).unwrap();
+
+    let loaded = load_persisted_agents(&repo);
+    let agent = loaded
+        .iter()
+        .find(|run| run.id == "run-empty")
+        .expect("the record still loads");
+    assert!(
+        !agent.cwd.as_os_str().is_empty(),
+        "an empty worktree.path must not yield an empty cwd"
+    );
+    assert_eq!(agent.cwd, repo, "it falls through to the repo root");
+
+    let _ = fs::remove_dir_all(&repo);
+}
+
+#[test]
 fn load_persisted_agents_keeps_only_newest_orchestrator() {
     let repo = unique_test_repo("orch-dedupe");
     // Two initial planners from two past plans (both reconcile_planner=false). Every
