@@ -1,0 +1,44 @@
+name: TUI mutation score
+
+# Proves the TUI suite has TEETH: plants known bugs, checks each is caught,
+# and fails on any survivor. Too slow for every push (rebuilds per mutation),
+# so it runs nightly and on demand — a standing guarantee that coverage has
+# not rotted, not a per-commit gate.
+
+on:
+  schedule:
+    - cron: "0 8 * * *" # 08:00 UTC daily
+  workflow_dispatch:
+
+jobs:
+  mutate:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install jj
+        run: brew install jj
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            target
+            ~/.cargo/registry
+          key: mutation-${{ runner.os }}-${{ hashFiles('native/**/Cargo.toml') }}
+
+      - run: npm ci
+
+      - name: Build native (debug)
+        run: cargo build --manifest-path native/Cargo.toml
+
+      - name: Prefetch TUI driver
+        run: node node_modules/tui-integration-tests/harness/fetch-driver.mjs
+
+      # Exits non-zero on any surviving mutation, failing the run.
+      - name: Mutation score
+        run: npm run mutate:tui
