@@ -127,6 +127,47 @@ wait
   return file;
 }
 
+/**
+ * A DUAL-MODE fake for the /plan pipeline. Rudder invokes the same backend
+ * two ways, told apart by argv: the PLANNER runs without bypassPermissions
+ * and must emit a RUDDER_PLAN_TASKS block; each WORKER runs WITH
+ * bypassPermissions and must produce a diff. This one script is both — the
+ * planner prints a `nodeCount`-node DAG, each worker writes a unique
+ * NODE-<workspace>.txt so a clean merge lands every node's file.
+ * Requires RUDDER_INTERACTIVE_ORCHESTRATOR=0 (the headless decomposer, which
+ * scrapes the block from the planner's output).
+ */
+export async function planPipelineBackend(dir, nodeCount = 2) {
+  const bin = path.join(dir, "fake-bin");
+  await fsp.mkdir(bin, { recursive: true });
+  const nodes = Array.from({ length: nodeCount }, (_, i) => ({
+    id: `n${i}`,
+    title: `node ${i}`,
+    prompt: `do node ${i}`,
+    goal: `g${i}`,
+    success: `s${i}`,
+    deps: [],
+  }));
+  const block = `RUDDER_PLAN_TASKS_START\n${JSON.stringify({ tasks: nodes })}\nRUDDER_PLAN_TASKS_END`;
+  const file = path.join(bin, "claude-planner");
+  await fsp.writeFile(
+    file,
+    `#!/bin/sh
+if echo "$*" | grep -q "bypassPermissions"; then
+  slug=$(basename "$PWD" | tr -cd 'a-z0-9' | tail -c 6)
+  echo "node work" > "NODE-$slug.txt"
+  sleep 1
+  exit 0
+else
+  printf '%s\\n' '${block}'
+  exit 0
+fi
+`,
+  );
+  await fsp.chmod(file, 0o755);
+  return { claudeBin: file, nodeCount };
+}
+
 /** Read a PID written by leakDetectorBackend, waiting briefly for the file. */
 export async function readPid(pidDir, name, timeout = 15_000) {
   const file = path.join(pidDir, name);
