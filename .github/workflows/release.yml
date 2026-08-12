@@ -105,6 +105,7 @@ jobs:
         run: |
           brew install jj
           chmod +x prebuilt-native/rudder-native-darwin-arm64/rudder-native
+          node node_modules/tui-integration-tests/harness/fetch-driver.mjs
           npm run test:tui:report
         env:
           RUDDER_NATIVE_BIN: ${{ github.workspace }}/prebuilt-native/rudder-native-darwin-arm64/rudder-native

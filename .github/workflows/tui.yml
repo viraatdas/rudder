@@ -43,6 +43,10 @@ jobs:
           npx tsc -p tsconfig.json
           npm run chmod-cli
 
+      # Serialize the driver fetch before the parallel test files need it.
+      - name: Prefetch TUI driver
+        run: node node_modules/tui-integration-tests/harness/fetch-driver.mjs
+
       - name: TUI end-to-end tests
         run: npm run test:tui:report
 
