@@ -26,7 +26,8 @@
     "prepack": "npm run build",
     "postinstall": "node scripts/postinstall.mjs",
     "start": "node dist/index.js",
-    "test:tui:report": "rm -rf .tui-report tui-report.html && node --test --test-reporter=spec --test-reporter-destination=stdout --test-reporter=tui-integration-tests/reporter --test-reporter-destination=tui-report.html tests/tui/*.test.mjs"
+    "test:tui:report": "rm -rf .tui-report tui-report.html && node --test --test-reporter=spec --test-reporter-destination=stdout --test-reporter=tui-integration-tests/reporter --test-reporter-destination=tui-report.html tests/tui/*.test.mjs",
+    "mutate:tui": "node tests/tui/mutate.mjs"
   },
   "files": [
     "dist/",
