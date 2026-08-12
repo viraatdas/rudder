@@ -89,6 +89,19 @@ const MUTATIONS = [
   },
 ];
 
+// SAFETY: this runner `git checkout -- native/src` between mutations, which
+// discards uncommitted changes there. Refuse to run with a dirty native/src
+// so it can never eat work in progress (it did once, during development).
+const dirty = execSync("git status --porcelain native/src", { cwd: repo }).toString().trim();
+if (dirty) {
+  console.error(
+    "refusing to run: native/src has uncommitted changes this tool would discard.\n" +
+      "commit or stash native/src first:\n" +
+      dirty,
+  );
+  process.exit(2);
+}
+
 const filter = process.argv.slice(2);
 const selected = filter.length
   ? MUTATIONS.filter((m) => filter.some((f) => m.id.includes(f) || m.guards.includes(f)))
