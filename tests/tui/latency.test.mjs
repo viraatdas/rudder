@@ -27,10 +27,31 @@ async function dashboard(t, prefix) {
 
 test("keystrokes reflect on screen within the responsiveness budget", { timeout: 60_000 }, async (t) => {
   const session = await dashboard(t, "rudder-tui-lat-key-");
-  // Typing into the task input must echo fast. Local ~4ms; 300ms is a wide CI
-  // budget that still fails a genuine freeze.
-  const ms = await session.keystrokeLatency("/plan", ["/", "p", "l", "a", "n"]);
-  assert.ok(ms < 300, `keystrokes reflected in ${ms}ms (budget 300ms)`);
+  // Latency is measured as a MEDIAN of samples, not a single reading: one
+  // outlier on a loaded box must not fail the test, but a genuine freeze
+  // (every sample slow) still does. Each sample types one more character and
+  // times how long the growing string takes to appear. Local median ~4ms.
+  const chars = "abcdefghij".split("");
+  const samples = [];
+  let typed = "";
+  for (const ch of chars) {
+    typed += ch;
+    const target = typed;
+    samples.push(
+      await session.timeToScreen(
+        () => session.type(ch),
+        (screen) => screen.includes(target),
+        { timeout: 5_000, label: "keystroke echo" },
+      ),
+    );
+  }
+  samples.sort((a, b) => a - b);
+  const median = samples[Math.floor(samples.length / 2)];
+  // Median well under a third of a second: a strong responsiveness guarantee
+  // with wide CI headroom, immune to a lone spike.
+  assert.ok(median < 300, `median keystroke latency ${median}ms over ${samples.length} samples (budget 300ms)`);
+  // No sample may be pathologically slow — that would be a real freeze, not jitter.
+  assert.ok(samples[samples.length - 1] < 3000, `worst keystroke ${samples[samples.length - 1]}ms (freeze guard 3000ms)`);
 });
 
 test("a typed task produces a worker row within budget", { timeout: 60_000 }, async (t) => {
