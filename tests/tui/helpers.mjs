@@ -80,7 +80,19 @@ export async function fakeBackends(dir) {
     "claude-completer",
     '#!/bin/sh\nprintf "doing the work\\n"\necho "done marker" > DONE.txt\nsleep 1\nprintf "finished\\n"\nexit 0\n',
   );
-  return { sleeper, completer };
+  // Writes a file whose NAME is unique per workspace (derived from the cwd),
+  // so two such workers merge cleanly — the merge-all fixture.
+  const completerUnique = await write(
+    "claude-completer-unique",
+    '#!/bin/sh\nslug=$(basename "$PWD" | tr -cd "a-z0-9" | tail -c 6)\necho "work from $PWD" > "DONE-$slug.txt"\nsleep 1\nexit 0\n',
+  );
+  // Writes the SAME file with per-workspace CONTENT, so merging two such
+  // workers conflicts — the conflict-flow fixture.
+  const completerConflict = await write(
+    "claude-completer-conflict",
+    '#!/bin/sh\necho "my version: $PWD" > CONFLICT.txt\nsleep 1\nexit 0\n',
+  );
+  return { sleeper, completer, completerUnique, completerConflict };
 }
 
 /** Run-id slugs like `verify-launch-works-856351af` churn per run. */

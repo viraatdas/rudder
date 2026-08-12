@@ -986,6 +986,10 @@ struct AgentRun {
     last_output_at: Instant,
     completed_at: Option<Instant>,
     autosteered: bool,
+    /// A pane running a plain process (a rudder CLI command such as `undo`)
+    /// rather than an agent conversation. Its completion IS process exit, so
+    /// the worker-lifecycle-hooks sweep must not police it.
+    plain_process: bool,
     /// True only for an orchestrator launched as a live interactive PTY. Headless
     /// planners also use `AgentMode::RudderPlan`, so this must not be inferred from
     /// `autosteered` once a plan is captured.
@@ -4953,6 +4957,7 @@ impl App {
             last_output_at: Instant::now(),
             completed_at: None,
             autosteered: true,
+            plain_process: false,
             interactive_orchestrator: false,
             needs_permission: false,
             needs_user_input: false,
@@ -5135,6 +5140,7 @@ impl App {
             last_output_at: Instant::now(),
             completed_at: None,
             autosteered: false,
+            plain_process: false,
             interactive_orchestrator: false,
             needs_permission: false,
             needs_user_input: false,
@@ -5306,6 +5312,7 @@ impl App {
             last_output_at: Instant::now(),
             completed_at: None,
             autosteered: true,
+            plain_process: false,
             interactive_orchestrator: interactive_planner,
             needs_permission: false,
             needs_user_input: false,
@@ -7562,7 +7569,13 @@ impl App {
         env_overrides: &[(&str, &str)],
     ) {
         let id = new_run_id(label);
-        let mut command = TerminalCommand::with_args("rudder", args);
+        // Resolve the CLI like every other spawn path (RUDDER_CLI, then a real
+        // PATH search) instead of handing a bare "rudder" to the PTY builder;
+        // this was the file's only unresolved spawn.
+        let program = crate::cloudio::locate_rudder_cli()
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_else(|| "rudder".to_string());
+        let mut command = TerminalCommand::with_args(program, args);
         for (key, value) in env_overrides {
             command = command.with_env(*key, *value);
         }
@@ -7607,6 +7620,7 @@ impl App {
             last_output_at: Instant::now(),
             completed_at: None,
             autosteered: true,
+            plain_process: true,
             interactive_orchestrator: false,
             needs_permission: false,
             needs_user_input: false,
@@ -11862,6 +11876,7 @@ impl App {
             last_output_at: Instant::now(),
             completed_at: None,
             autosteered: false,
+            plain_process: false,
             interactive_orchestrator: false,
             needs_permission: false,
             needs_user_input: false,
@@ -13806,7 +13821,15 @@ What to do\n\
                                 }
                             }
                             None => {
+                                // Plain-process panes (rudder CLI commands like
+                                // `undo`) have no lifecycle hooks BY DESIGN:
+                                // their completion is process exit. This sweep
+                                // used to execute them within a tick of spawning
+                                // — every `u` undo pane died at ~1ms, killed by
+                                // our own hook police, and the death note blamed
+                                // the process ("agent process exited").
                                 if !is_orchestrator
+                                    && !run.plain_process
                                     && !signals::worker_has_config(&run.id, run.backend)
                                 {
                                     terminal.terminate_and_wait();

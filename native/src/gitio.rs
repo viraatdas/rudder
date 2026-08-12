@@ -253,6 +253,7 @@ pub(crate) fn create_main_agent(
         last_output_at: Instant::now(),
         completed_at: None,
         autosteered: false,
+        plain_process: false,
         interactive_orchestrator: false,
         needs_permission: false,
         needs_user_input: false,
@@ -688,6 +689,7 @@ pub(crate) fn agent_from_run_record(
         });
 
     let mut run = AgentRun {
+        plain_process: false,
         id,
         created_at,
         mode,

@@ -450,7 +450,10 @@ async function mergeJjRunIntoCurrentWorkspaceLocked(run: RunRecord, allowDirty: 
   }
 
   if (merge.conflictedFiles.length === 0) {
-    run.merge = { ...run.merge, operationId: merge.opId || run.merge?.operationId };
+    // KEEP the pre-merge operationId captured above: it is the undo waypoint.
+    // Overwriting it with the POST-merge op id (as this used to) made
+    // `rudder undo <op>` restore to the state after the merge — a perfect
+    // no-op that reported success while changing nothing.
     return await finalizeJjIntegration(run, merge.mergeChangeId);
   }
 
@@ -461,7 +464,7 @@ async function mergeJjRunIntoCurrentWorkspaceLocked(run: RunRecord, allowDirty: 
     status: "conflict",
     conflictedFiles: merge.conflictedFiles,
     mergeChangeId: merge.mergeChangeId,
-    operationId: merge.opId || run.merge?.operationId,
+    // Pre-merge op stays the undo waypoint (see the clean-merge path above).
     error: "jj merge created conflicts.",
   };
   await saveRunRecord(run);
