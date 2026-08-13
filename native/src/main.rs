@@ -168,6 +168,7 @@ pub(crate) const SPINNER_FRAMES: [&str; 10] = [
 ];
 const AGENT_PANE_HINTS: &[&str] = &[
     "j/k move",
+    "⌥j/k scroll",
     "Enter focus",
     "r rename",
     "v diff",
@@ -2273,6 +2274,37 @@ impl App {
                 return false;
             }
             _ => {}
+        }
+
+        // Alt+j/k/u/d scroll the selected worker's scrollback from anywhere
+        // except the task composer (Option+letter types a composed character
+        // there, which is far more likely to be text than a scroll). Focused
+        // pane included: bare letters forward to the agent, the Alt chord is
+        // the dashboard's — same claim rule as the Alt+[/] stepper above.
+        if self.focus != FocusPane::Task {
+            if let Some(rows) = alt_scroll_rows(key, self.worker_area) {
+                self.scroll_worker_scrollback(rows);
+                return false;
+            }
+            // Terminals without option-as-meta type the composed character
+            // instead: Option+j → ∆, Option+k → ˚, Option+d → ∂ (Option+u is
+            // a dead key, no composed fallback exists). Same fallback rule the
+            // Alt+[/] stepper uses above.
+            match key.code {
+                KeyCode::Char('\u{2206}') => {
+                    self.scroll_worker_scrollback(-1);
+                    return false;
+                }
+                KeyCode::Char('\u{02da}') => {
+                    self.scroll_worker_scrollback(1);
+                    return false;
+                }
+                KeyCode::Char('\u{2202}') => {
+                    self.scroll_worker_scrollback(-(page_scroll_rows(self.worker_area) / 2).max(1));
+                    return false;
+                }
+                _ => {}
+            }
         }
 
         match self.focus {
@@ -4492,6 +4524,19 @@ impl App {
             return true;
         }
         moved || forwarded
+    }
+
+    /// Alt-modified scrollback for the worker pane. Unlike PageUp/Down this
+    /// NEVER forwards bytes to the agent: Alt+j would arrive as ESC+j, which
+    /// vim-like TUIs interpret as a cursor move — scrolling must not type.
+    /// On an alternate-screen app the pane has no scrollback to move, so the
+    /// keys are simply absorbed.
+    fn scroll_worker_scrollback(&mut self, rows: isize) {
+        if let Some(terminal) = self.selected_terminal_mut() {
+            if !terminal.uses_alternate_screen_snapshot() {
+                terminal.scrollback_by(rows);
+            }
+        }
     }
 
     fn handle_worker_page_key(&mut self, key: KeyEvent, rows: isize) {

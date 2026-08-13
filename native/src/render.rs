@@ -4469,6 +4469,26 @@ pub(crate) fn page_scroll_rows(area: Option<Rect>) -> isize {
     height.saturating_sub(1).max(1) as isize
 }
 
+/// Scrollback rows for an Alt-modified key in the worker pane, or None when
+/// the key is not an alt-scroll binding. Vim grammar, held behind Alt so the
+/// bare letters still reach the agent when the pane is focused:
+///   Alt+k / Alt+Up   → one line up        Alt+j / Alt+Down → one line down
+///   Alt+u            → half a page up     Alt+d            → half a page down
+/// Positive rows scroll toward history (up), matching scrollback_by.
+pub(crate) fn alt_scroll_rows(key: KeyEvent, area: Option<Rect>) -> Option<isize> {
+    if !key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::META) {
+        return None;
+    }
+    let half = (page_scroll_rows(area) / 2).max(1);
+    match key.code {
+        KeyCode::Char('k') | KeyCode::Up => Some(1),
+        KeyCode::Char('j') | KeyCode::Down => Some(-1),
+        KeyCode::Char('u') => Some(half),
+        KeyCode::Char('d') => Some(-half),
+        _ => None,
+    }
+}
+
 pub(crate) fn status_style(status: AgentStatus) -> Style {
     Style::default().fg(status_color(status))
 }

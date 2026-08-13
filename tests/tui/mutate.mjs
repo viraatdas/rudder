@@ -77,6 +77,13 @@ const MUTATIONS = [
     unit: "a_record_with_an_empty",
   },
   {
+    id: "alt-scroll-dead",
+    file: "render.rs",
+    find: "pub(crate) fn alt_scroll_rows(key: KeyEvent, area: Option<Rect>) -> Option<isize> {\n    if !key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::META) {",
+    replace: "pub(crate) fn alt_scroll_rows(key: KeyEvent, area: Option<Rect>) -> Option<isize> {\n    if true || !key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::META) {",
+    guards: "Alt+j/k/u/d worker scrollback",
+  },
+  {
     id: "cloud-worker-identity",
     file: "cloudio.rs",
     // The Project_Ramsey field bug: the in-VM dashboard hunting for laptop
