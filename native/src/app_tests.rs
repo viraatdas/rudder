@@ -369,6 +369,31 @@ fn slash_command_rest_ignores_leading_whitespace_before_command() {
 }
 
 #[test]
+fn a_scroll_burst_throttles_draws_instead_of_debouncing_them() {
+    // A trackpad flick delivers a wheel event every few ms. The draw deferral
+    // must be a THROTTLE (deadline fixed once armed, one draw per window) —
+    // when each event re-armed it, the deadline outran the burst and nothing
+    // repainted until the gesture paused: a frozen pane that then jumped.
+    let mut app = App::new();
+    app.note_scroll_dirty();
+    let armed = app.scroll_draw_defer_until.expect("first event arms the window");
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    app.note_scroll_dirty();
+    app.note_scroll_dirty();
+    assert_eq!(
+        app.scroll_draw_defer_until,
+        Some(armed),
+        "later events in the burst must not push the draw deadline out"
+    );
+    assert_eq!(app.scroll_events_since_draw, 3, "events still counted for stats");
+    // Once a draw consumes the window, the next event opens a fresh one.
+    app.consume_scroll_draw_stats();
+    app.note_scroll_dirty();
+    let rearmed = app.scroll_draw_defer_until.expect("fresh window after a draw");
+    assert!(rearmed > armed, "the new window starts after the old one");
+}
+
+#[test]
 fn dependency_context_names_parents_and_their_interfaces() {
     // A launching worker should be told its deps by title + the parent's rudder-done
     // interface, so it builds on merged prerequisites instead of reimplementing them.

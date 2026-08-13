@@ -77,6 +77,16 @@ const MUTATIONS = [
     unit: "a_record_with_an_empty",
   },
   {
+    id: "scroll-debounce",
+    file: "main.rs",
+    // The rubber-band bug: re-arming the draw deadline on every wheel event
+    // meant a continuous flick never repainted until the gesture paused.
+    find: "        if self.scroll_draw_defer_until.is_none() {\n            self.scroll_draw_defer_until = Some(Instant::now() + SCROLL_DRAW_DEFER);\n        }",
+    replace: "        self.scroll_draw_defer_until = Some(Instant::now() + SCROLL_DRAW_DEFER);",
+    guards: "scroll draws throttle (not debounce) during a wheel burst",
+    unit: "a_scroll_burst_throttles",
+  },
+  {
     id: "alt-scroll-dead",
     file: "render.rs",
     find: "pub(crate) fn alt_scroll_rows(key: KeyEvent, area: Option<Rect>) -> Option<isize> {\n    if !key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::META) {",

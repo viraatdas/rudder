@@ -1795,7 +1795,15 @@ impl App {
     }
 
     fn note_scroll_dirty(&mut self) {
-        self.scroll_draw_defer_until = Some(Instant::now() + SCROLL_DRAW_DEFER);
+        // THROTTLE, never debounce. Re-arming the deadline on every event let a
+        // continuous trackpad flick (an event every few ms) push "draw after"
+        // forever forward, so nothing repainted until the gesture PAUSED — the
+        // pane froze, then jumped. Arming only once per window caps repaints
+        // at one per SCROLL_DRAW_DEFER while the burst is live, which is
+        // continuous motion; the coalescing benefit is identical.
+        if self.scroll_draw_defer_until.is_none() {
+            self.scroll_draw_defer_until = Some(Instant::now() + SCROLL_DRAW_DEFER);
+        }
         self.scroll_events_since_draw = self.scroll_events_since_draw.saturating_add(1);
     }
 
