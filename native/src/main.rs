@@ -7701,6 +7701,19 @@ impl App {
     }
 
     fn refresh_cloud_workspace_status(&mut self) {
+        // Inside a worker VM the workspace identity is the machine's own env —
+        // no network, no CLI spawn, nothing to poll. Resolve it before the
+        // offline gate: gating it there left the label at "none" whenever the
+        // network path was disabled, even though the answer was local.
+        if is_cloud_worker_session() {
+            let snapshot = query_cloud_workspace_status(&self.cwd);
+            if snapshot.is_some() && self.cloud_workspace != snapshot {
+                self.cloud_workspace = snapshot;
+                self.dirty = true;
+            }
+            self.workspace_status_rx = None;
+            return;
+        }
         if env::var("RUDDER_OFFLINE")
             .ok()
             .is_some_and(|value| value == "1")

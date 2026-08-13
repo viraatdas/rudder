@@ -77,6 +77,16 @@ const MUTATIONS = [
     unit: "a_record_with_an_empty",
   },
   {
+    id: "cloud-worker-identity",
+    file: "cloudio.rs",
+    // The Project_Ramsey field bug: the in-VM dashboard hunting for laptop
+    // auth instead of trusting the worker's own env identity, rendering
+    // "cloud offline · workspace none" inside the cloud itself.
+    find: "if is_cloud_worker_session()\n        && env::var(\"RUDDER_WORKER_TOKEN\")",
+    replace: "if false && is_cloud_worker_session()\n        && env::var(\"RUDDER_WORKER_TOKEN\")",
+    guards: "in-VM cloud status shows connected + own workspace",
+  },
+  {
     id: "rename-heal",
     file: "gitio.rs",
     find: 'const WORKTREES_MARKER: &str = "/.rudder-worktrees/";',

@@ -75,17 +75,26 @@ pub(crate) fn cloud_workspace_label(workspace: Option<&CloudWorkspaceStatus>) ->
         return "cloud workspace · none".to_string();
     };
     let status = workspace.status.as_deref().unwrap_or("unknown");
+    // Name the workspace, not just its state: "cloud workspace · running" told
+    // the user nothing about WHICH workspace they were in (unclear enough to
+    // be reported). The id is the identity users see in `rudder cloud list`.
+    let name = workspace
+        .id
+        .as_deref()
+        .filter(|id| !id.trim().is_empty())
+        .map(|id| format!(" · {id}"))
+        .unwrap_or_default();
     if workspace.client_count > 0 {
         format!(
-            "cloud workspace · {status} · {} attached",
+            "cloud workspace{name} · {status} · {} attached",
             workspace.client_count
         )
     } else if workspace.active_agents {
-        format!("cloud workspace · {status} · active")
+        format!("cloud workspace{name} · {status} · active")
     } else if let Some(idle) = workspace.idle_minutes {
-        format!("cloud workspace · {status} · idle {idle}m")
+        format!("cloud workspace{name} · {status} · idle {idle}m")
     } else {
-        format!("cloud workspace · {status}")
+        format!("cloud workspace{name} · {status}")
     }
 }
 
