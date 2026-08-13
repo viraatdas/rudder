@@ -169,6 +169,7 @@ pub(crate) const SPINNER_FRAMES: [&str; 10] = [
 const AGENT_PANE_HINTS: &[&str] = &[
     "j/k move",
     "⌥j/k scroll",
+    "⌥h/l agents",
     "Enter focus",
     "r rename",
     "v diff",
@@ -2262,6 +2263,19 @@ impl App {
                 self.select_next_agent();
                 return false;
             }
+            // Vim-grammar aliases for the stepper: with Alt+j/k scrolling the
+            // pane vertically, Alt+h/l are the matching horizontal moves —
+            // left/right across agents. A PTY wraps at the pane width, so
+            // there is no horizontal scrollback for these to mean instead.
+            // Not while composing a task, same rule as every Option+letter.
+            KeyCode::Char('h') if stepper_like && self.focus != FocusPane::Task => {
+                self.select_previous_agent();
+                return false;
+            }
+            KeyCode::Char('l') if stepper_like && self.focus != FocusPane::Task => {
+                self.select_next_agent();
+                return false;
+            }
             // Terminals that swallow the modifier send what Option+[ / Option+]
             // TYPE on a US layout instead. Not honored while composing a task,
             // where a curly quote is far more likely to be text than a shortcut.
@@ -2287,10 +2301,18 @@ impl App {
                 return false;
             }
             // Terminals without option-as-meta type the composed character
-            // instead: Option+j → ∆, Option+k → ˚, Option+d → ∂ (Option+u is
-            // a dead key, no composed fallback exists). Same fallback rule the
-            // Alt+[/] stepper uses above.
+            // instead: Option+j → ∆, Option+k → ˚, Option+d → ∂, Option+h → ˙,
+            // Option+l → ¬ (Option+u is a dead key, no composed fallback
+            // exists). Same fallback rule the Alt+[/] stepper uses above.
             match key.code {
+                KeyCode::Char('\u{02d9}') => {
+                    self.select_previous_agent();
+                    return false;
+                }
+                KeyCode::Char('\u{00ac}') => {
+                    self.select_next_agent();
+                    return false;
+                }
                 KeyCode::Char('\u{2206}') => {
                     self.scroll_worker_scrollback(-1);
                     return false;

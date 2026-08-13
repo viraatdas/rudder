@@ -65,6 +65,18 @@ test("j/k move the selection up and down the agents list", { timeout: 60_000 }, 
   await waitSelected(session, "beta worker");
 });
 
+test("Alt+h/l step across agents — vim-grammar aliases for the [/] stepper", { timeout: 60_000 }, async (t) => {
+  const { session } = await twoWorkerDashboard(t, "rudder-tui-hlstep-");
+  // With Alt+j/k scrolling the pane vertically, Alt+h/l are the matching
+  // horizontal moves. A PTY wraps at the pane width, so there is no
+  // horizontal scrollback these could have meant instead.
+  await waitSelected(session, "beta worker");
+  await session.press("Alt+h");
+  await waitSelected(session, "alpha worker");
+  await session.press("Alt+l");
+  await waitSelected(session, "beta worker");
+});
+
 test("v opens the diff/review view and toggles back", { timeout: 60_000 }, async (t) => {
   const { session } = await twoWorkerDashboard(t, "rudder-tui-diff-");
   await session.press("v");
