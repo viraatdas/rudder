@@ -6007,10 +6007,9 @@ impl App {
     }
 
     fn start_rename_selected_agent(&mut self) {
-        if self.selected_is_main() {
-            self.notice = Some("main agent: rename disabled".to_string());
-            return;
-        }
+        // Main rows rename like any other: the rename only touches
+        // task_summary and the saved record, both of which main rows have.
+        // The old is-main refusal ("rename disabled") guarded nothing.
         let Some(run) = self.agents.get(self.selected_agent) else {
             self.notice = Some("no agent selected".to_string());
             return;

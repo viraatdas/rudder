@@ -7969,6 +7969,29 @@ fn c_key_in_agents_pane_routes_to_clear_merged() {
 }
 
 #[test]
+fn a_main_row_renames_like_any_other() {
+    // Field report: r on a main-session row said "rename disabled". The
+    // rename only touches task_summary and the saved record — both of which
+    // main rows have — so the refusal guarded nothing.
+    let mut app = App::new();
+    let mut main = test_agent_run("run-main", "long-lived main chat");
+    main.mode = AgentMode::Main;
+    main.worktree_path = None;
+    app.agents.push(main);
+    app.selected_agent = 0;
+
+    app.start_rename_selected_agent();
+    assert!(
+        app.rename_input.is_some(),
+        "rename opens on a main row instead of refusing: {:?}",
+        app.notice
+    );
+    app.rename_input = Some("ops copilot".to_string());
+    app.commit_rename();
+    assert_eq!(app.agents[0].task_summary, "ops copilot");
+}
+
+#[test]
 fn buffered_dd_bursts_cannot_cascade_across_rows() {
     // The field failure: a slow (synchronous) worktree removal froze the UI,
     // the user hammered dd, and the buffered presses replayed as arm+confirm
@@ -8154,7 +8177,7 @@ fn task_summary_worker_updates_main_agent_label() {
 }
 
 #[test]
-fn main_agent_blocks_merge_and_rename() {
+fn main_agent_blocks_merge_but_renames() {
     let mut app = App::new();
     let mut main = test_agent_run(MAIN_AGENT_ID, "main branch");
     main.mode = AgentMode::Main;
@@ -8164,9 +8187,8 @@ fn main_agent_blocks_merge_and_rename() {
     app.selected_agent = 0;
 
     // Delete is NOT blocked outright any more — see
-    // `a_dead_main_row_can_be_deleted_but_a_live_one_says_why_not`. Merge and
-    // rename still are: a main row owns the checkout, so there is nothing to merge
-    // and nothing to rename.
+    // `a_dead_main_row_can_be_deleted_but_a_live_one_says_why_not`. Merge still
+    // is: a main row owns the checkout, so there is nothing to merge.
     app.notice = None;
     app.request_merge_selected_agent();
     assert!(app.merge_confirm.is_none());
@@ -8176,14 +8198,11 @@ fn main_agent_blocks_merge_and_rename() {
         .unwrap_or_default()
         .contains("main agent"));
 
+    // Rename is ALLOWED: the row's title is its task_summary, which a main
+    // row has like any other (field report: "rename disabled" on main).
     app.notice = None;
     app.start_rename_selected_agent();
-    assert!(app.rename_input.is_none());
-    assert!(app
-        .notice
-        .as_deref()
-        .unwrap_or_default()
-        .contains("main agent"));
+    assert!(app.rename_input.is_some(), "rename opens on a main row");
 }
 
 #[test]
