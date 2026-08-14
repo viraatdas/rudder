@@ -1593,6 +1593,7 @@ fn a_dead_main_row_deletes_and_a_live_one_stops_on_confirm() {
         .notice
         .as_deref()
         .is_some_and(|notice| notice.contains("press d again")));
+    app.frames_drawn += 1; // the notice renders before the user presses again
     app.delete_selected_agent();
     assert!(app.agents.is_empty(), "a dead main row is deletable");
 
@@ -1630,6 +1631,7 @@ fn a_dead_main_row_deletes_and_a_live_one_stops_on_confirm() {
         app.notice
     );
 
+    app.frames_drawn += 1; // the notice renders before the user presses again
     app.delete_selected_agent();
     assert!(
         app.agents.is_empty(),
@@ -7967,6 +7969,35 @@ fn c_key_in_agents_pane_routes_to_clear_merged() {
 }
 
 #[test]
+fn buffered_dd_bursts_cannot_cascade_across_rows() {
+    // The field failure: a slow (synchronous) worktree removal froze the UI,
+    // the user hammered dd, and the buffered presses replayed as arm+confirm
+    // pairs against successive rows — deleting every tree on the board. A
+    // confirm now only counts after a frame RENDERS post-arm (the user saw
+    // the notice). With no frames between presses, any number of d presses
+    // may arm but never confirm.
+    let mut app = App::new();
+    for i in 0..3 {
+        app.agents.push(test_agent_run(&format!("run-{i}"), "task"));
+    }
+    app.selected_agent = 0;
+    for _ in 0..8 {
+        app.delete_selected_agent();
+    }
+    assert_eq!(
+        app.agents.len(),
+        3,
+        "a burst with no rendered frame deletes nothing"
+    );
+    // The normal human cadence still works: arm, see the notice, confirm.
+    app.frames_drawn += 1;
+    app.delete_selected_agent(); // re-arm (the burst left it armed at this frame)
+    app.frames_drawn += 1;
+    app.delete_selected_agent();
+    assert_eq!(app.agents.len(), 2, "a seen confirm still deletes exactly one row");
+}
+
+#[test]
 fn delete_prompt_for_worktree_requires_second_d_without_merge_offer() {
     let mut app = App::new();
     let mut run = test_agent_run("run-1", "test task");
@@ -8052,6 +8083,7 @@ fn delete_agent_requires_second_d() {
     assert_eq!(app.agents.len(), 1);
     assert_eq!(app.delete_pending.as_deref(), Some("run-1"));
 
+    app.frames_drawn += 1; // the notice renders before the user presses again
     app.delete_selected_agent();
     assert!(app.agents.is_empty());
     assert!(app.delete_pending.is_none());
@@ -8599,6 +8631,7 @@ fn deleting_a_launched_nodes_agent_unblocks_its_hard_dependents() {
     // id must leave plan_launched_node_ids, or n1 would wait on a node that can
     // never merge — a permanent, unexplained stall.
     app.delete_selected_agent();
+    app.frames_drawn += 1; // the notice renders before the user presses again
     app.delete_selected_agent();
     assert!(app.agents.is_empty(), "agent deleted");
     assert!(

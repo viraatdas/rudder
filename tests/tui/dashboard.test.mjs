@@ -212,6 +212,53 @@ test("dd deletes a running /main row instead of dead-ending", { timeout: 60_000 
   await session.waitForText("no agents yet", { timeout: 20_000 });
 });
 
+test("a hammered dd burst deletes at most the row you saw confirmed", { timeout: 90_000 }, async (t) => {
+  // The field failure that wiped a board: a slow synchronous worktree removal
+  // froze the UI, the user hammered dd, and the buffered presses replayed as
+  // arm+confirm pairs against successive rows — every tree deleted. The
+  // confirm is now frame-gated (it only counts after the confirmation notice
+  // has rendered), and removal happens off-thread so the UI never freezes.
+  const { repo, sleeper } = await scratch(t, "rudder-tui-dd-burst-");
+  const session = await launchRudder(t, { repo, claudeBin: sleeper });
+  await session.waitForText("Type a task", { timeout: 20_000 });
+
+  // Selection sits on the NEWEST row, so beta (created second) is the one
+  // the burst arms and the confirm deletes; alpha must survive untouched.
+  await session.type("alpha survivor");
+  await session.press("Enter");
+  await session.waitForText("working", { timeout: 30_000 });
+  await session.press("Ctrl+W");
+  await session.press("3");
+  await session.type("beta victim");
+  await session.press("Enter");
+  await session.waitFor((screen) => screen.includes("alpha") && screen.includes("beta"), {
+    timeout: 30_000,
+    label: "both rows on the board",
+  });
+
+  await session.press("Ctrl+W");
+  await session.press("1");
+  // The burst: six d's delivered as one batch — exactly what buffered keys
+  // look like after a stall. At most the first can arm; the rest replay
+  // sight-unseen and must NOT confirm.
+  await session.type("dddddd");
+  // The arm notice appearing proves the whole burst was processed; both rows
+  // must still be on the board (stablePolls: repaint-safe).
+  await session.waitForText("press d again to confirm", { timeout: 15_000 });
+  await session.waitFor(
+    (screen) => screen.includes("alpha") && screen.includes("beta"),
+    { timeout: 10_000, stablePolls: 3, label: "burst deleted nothing" },
+  );
+
+  // The notice has rendered — the user has seen it. ONE fresh press now
+  // confirms, deleting exactly the named row; the other survives.
+  await session.press("d");
+  await session.waitFor(
+    (screen) => !screen.includes("beta") && screen.includes("alpha"),
+    { timeout: 20_000, stablePolls: 3, label: "exactly one row deleted" },
+  );
+});
+
 test("recorded work survives renaming the repo directory", { timeout: 120_000 }, async (t) => {
   // The incident, verbatim: the user ran `mv aws-v2 libra` and every recorded
   // row died with "agent process exited (exit 1)" because run.json stored

@@ -666,6 +666,19 @@ struct App {
     notice: Option<String>,
     cloud_prompt: Option<CloudLaunchPrompt>,
     delete_pending: Option<String>,
+    /// Frame counter + the frame at which `delete_pending` was armed. The
+    /// confirming `d` only counts once at least one frame has RENDERED after
+    /// arming — i.e. the user has actually seen the confirmation notice.
+    /// Without this gate, keys buffered during a UI stall replayed as
+    /// arm+confirm pairs: each pair deleted the next row (selection advances
+    /// after a delete), so hammering dd during a slow delete serially wiped
+    /// every worktree on the board. Field report 2026-08-14.
+    frames_drawn: u64,
+    delete_armed_frame: u64,
+    /// Results from background work (worktree removal) land here; poll_agents
+    /// drains them into the notice line.
+    bg_notice_tx: mpsc::Sender<String>,
+    bg_notice_rx: mpsc::Receiver<String>,
     merge_confirm: Option<MergeConfirmation>,
     conflict_prompt: Option<MergeConflictPrompt>,
     /// Conflicted files reported by a jj `rudder merge`/`rudder sync` shell-out.
@@ -1542,6 +1555,7 @@ impl App {
             .map(|path| dashboard_root(&path))
             .unwrap_or_else(|_| PathBuf::from("."));
         let selection = initial_selection();
+        let bg_notices = mpsc::channel::<String>();
         let dashboard_color_mode = if cfg!(test) {
             ColorMode::Terminal
         } else {
@@ -1653,6 +1667,10 @@ impl App {
             notice: None,
             cloud_prompt: None,
             delete_pending: None,
+            frames_drawn: 0,
+            delete_armed_frame: 0,
+            bg_notice_tx: bg_notices.0,
+            bg_notice_rx: bg_notices.1,
             merge_confirm: None,
             conflict_prompt: None,
             pending_jj_conflict: None,
@@ -11634,8 +11652,14 @@ impl App {
         let live_main = self.selected_is_main()
             && selected.terminal.is_some()
             && selected.status == AgentStatus::Running;
-        if self.delete_pending.as_deref() != Some(&selected.id) {
+        // The confirm only counts once a frame has RENDERED since arming — the
+        // user must have seen the notice. A `d` buffered during a UI stall
+        // re-arms (refreshing the notice) instead of confirming, so a replayed
+        // key burst can never cascade into deleting rows sight-unseen.
+        let seen = self.frames_drawn > self.delete_armed_frame;
+        if self.delete_pending.as_deref() != Some(&selected.id) || !seen {
             self.delete_pending = Some(selected.id.clone());
+            self.delete_armed_frame = self.frames_drawn;
             let label = if selected.task_summary.trim().is_empty() {
                 short_task(&selected.task)
             } else {
@@ -11697,34 +11721,54 @@ impl App {
         if was_ingested || was_pending {
             self.persist_ingested_runs();
         }
-        let worktree_error = run.worktree_path.as_ref().and_then(|path| {
-            if run.workspace_name.is_some() {
-                // jj workspace: forget the registry entry AND remove the checkout.
-                // `git worktree remove` (used here before) fails on a jj workspace
-                // and leaked both the directory and jj's workspace list.
-                forget_jj_workspace(&self.cwd, run.workspace_name.as_deref().unwrap_or(""), path)
-                    .err()
-                    .map(|error| format!("failed to remove jj workspace: {error}"))
-            } else {
-                // Legacy git-worktree run.
-                let output = Command::new("git")
-                    .args(["worktree", "remove", "--force"])
-                    .arg(path)
-                    .current_dir(&self.cwd)
-                    .output()
-                    .ok()?;
-                if output.status.success() {
-                    None
-                } else {
-                    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                    Some(if stderr.is_empty() {
-                        "failed to remove worktree".to_string()
+        // Worktree removal runs in the BACKGROUND: remove_dir_all on a tree
+        // with node_modules takes seconds, and doing it here froze the whole
+        // UI — the freeze that buffered the key bursts this flow now guards
+        // against. The row is already gone from the board; only the disk
+        // cleanup is deferred, and its outcome lands in the notice line via
+        // the bg-notice channel.
+        if let Some(path) = run.worktree_path.clone() {
+            let cwd = self.cwd.clone();
+            let workspace_name = run.workspace_name.clone();
+            let tx = self.bg_notice_tx.clone();
+            thread::Builder::new()
+                .name("rudder-worktree-remove".to_string())
+                .spawn(move || {
+                    let error = if let Some(name) = workspace_name.as_deref() {
+                        // jj workspace: forget the registry entry AND remove the
+                        // checkout. `git worktree remove` fails on a jj workspace
+                        // and leaked both the directory and jj's workspace list.
+                        forget_jj_workspace(&cwd, name, &path)
+                            .err()
+                            .map(|error| format!("failed to remove jj workspace: {error}"))
                     } else {
-                        format!("failed to remove worktree: {stderr}")
-                    })
-                }
-            }
-        });
+                        // Legacy git-worktree run.
+                        match Command::new("git")
+                            .args(["worktree", "remove", "--force"])
+                            .arg(&path)
+                            .current_dir(&cwd)
+                            .output()
+                        {
+                            Ok(output) if output.status.success() => None,
+                            Ok(output) => {
+                                let stderr =
+                                    String::from_utf8_lossy(&output.stderr).trim().to_string();
+                                Some(if stderr.is_empty() {
+                                    "failed to remove worktree".to_string()
+                                } else {
+                                    format!("failed to remove worktree: {stderr}")
+                                })
+                            }
+                            Err(error) => Some(format!("failed to remove worktree: {error}")),
+                        }
+                    };
+                    let _ = tx.send(
+                        error.unwrap_or_else(|| "deleted agent and removed worktree".to_string()),
+                    );
+                })
+                .ok();
+        }
+        let worktree_error: Option<String> = None;
         let last = self.agents.len().saturating_sub(1);
         self.selected_agent = self.selected_agent.min(last);
         if !self.agents.is_empty() {
@@ -11741,7 +11785,7 @@ impl App {
         self.delete_pending = None;
         self.notice = Some(worktree_error.unwrap_or_else(|| {
             if run.worktree_path.is_some() {
-                "deleted agent and removed worktree".to_string()
+                "deleted agent · removing worktree in background".to_string()
             } else {
                 "deleted agent from dashboard".to_string()
             }
@@ -13659,6 +13703,11 @@ What to do\n\
 
     fn poll_agents(&mut self) {
         let poll_started = Instant::now();
+        // Background work (worktree removal) reports its outcome here.
+        while let Ok(message) = self.bg_notice_rx.try_recv() {
+            self.notice = Some(message);
+            self.dirty = true;
+        }
         self.emit_dashboard_opened_once();
         self.flush_pending_enters();
         self.maybe_start_queued_reconcile();
@@ -14592,6 +14641,9 @@ fn run(terminal: &mut Tui) -> Result<()> {
                 render(frame, &mut app);
                 render_build_us = render_started.elapsed().as_micros() as u64;
             })?;
+            // The frame counter gates destructive confirms (dd): a confirm
+            // only counts after the confirmation notice has actually rendered.
+            app.frames_drawn = app.frames_drawn.wrapping_add(1);
             let scroll_events = app.consume_scroll_draw_stats();
             let draw_duration = draw_started.elapsed();
             app.record_perf_duration("terminal_draw", draw_duration);

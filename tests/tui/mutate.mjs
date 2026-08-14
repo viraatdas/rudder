@@ -77,6 +77,16 @@ const MUTATIONS = [
     unit: "a_record_with_an_empty",
   },
   {
+    id: "dd-cascade",
+    file: "main.rs",
+    // The board-wiping field bug: keys buffered during a UI stall replayed as
+    // arm+confirm pairs, deleting every row. The confirm must be frame-gated.
+    find: "        let seen = self.frames_drawn > self.delete_armed_frame;",
+    replace: "        let seen = true; // MUTANT: confirm counts even sight-unseen",
+    guards: "buffered dd bursts cannot cascade across rows",
+    unit: "buffered_dd_bursts_cannot_cascade",
+  },
+  {
     id: "scroll-debounce",
     file: "main.rs",
     // The rubber-band bug: re-arming the draw deadline on every wheel event
