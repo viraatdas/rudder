@@ -3219,14 +3219,14 @@ pub(crate) fn plan_review_lines(app: &mut App, height: usize, width: usize) -> V
     lines.push(Line::from(vec![
         Span::styled("Tab", accent_style(focused)),
         Span::styled(" field  ", muted_style(focused)),
-        Span::styled("j/k", accent_style(focused)),
+        Span::styled("\u{2191}/\u{2193}", accent_style(focused)),
         Span::styled(" task  ", muted_style(focused)),
         Span::styled("Ctrl+S", accent_style(focused)),
         Span::styled(" save  ", muted_style(focused)),
         Span::styled("Ctrl+Enter", accent_style(focused)),
         Span::styled(" approve  ", muted_style(focused)),
-        Span::styled("Task pane text", accent_style(focused)),
-        Span::styled(" still refines with the planner", muted_style(focused)),
+        Span::styled("just type", accent_style(focused)),
+        Span::styled(" to refine with the planner", muted_style(focused)),
     ]));
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled("Tasks", muted_style(focused))));

@@ -3688,9 +3688,7 @@ impl App {
                     }
                     self.clear_selected_attention_flags();
                     let prompts = self.capture_selected_worker_paste(&text, capture_as_prompt);
-                    for prompt in prompts {
-                        self.record_selected_worker_prompt(prompt);
-                    }
+                    self.record_selected_worker_prompts(prompts);
                 }
             }
             FocusPane::Task => {
@@ -3772,13 +3770,31 @@ impl App {
     }
 
     fn record_selected_worker_prompt(&mut self, prompt: String) {
-        let prompt = prompt.trim().to_string();
-        if prompt.is_empty() {
+        self.record_selected_worker_prompts(vec![prompt]);
+    }
+
+    /// Record prompts as ONE batch. A paste finishes a prompt at every newline,
+    /// so the per-prompt version cost two disk operations PER LINE — a run-record
+    /// write plus a full RUDDER.md regeneration — all on the UI thread. Pasting a
+    /// few hundred lines into a worker sitting at its prompt (the usual case: the
+    /// readiness check passes whenever an agent is idle) meant hundreds of writes
+    /// before the paste appeared. Same effect, O(1) writes instead of O(lines).
+    fn record_selected_worker_prompts(&mut self, prompts: Vec<String>) {
+        let prompts: Vec<String> = prompts
+            .into_iter()
+            .map(|prompt| prompt.trim().to_string())
+            .filter(|prompt| !prompt.is_empty())
+            .collect();
+        if prompts.is_empty() {
             return;
         }
-        self.remember_task_history(&prompt);
+        for prompt in &prompts {
+            self.remember_task_history(prompt);
+        }
         if let Some(run) = self.agents.get_mut(self.selected_agent) {
-            record_agent_prompt(run, prompt, "user");
+            for prompt in prompts {
+                record_agent_prompt(run, prompt, "user");
+            }
             let _ = save_native_run_record(&self.cwd, run);
         }
         // A finished worker stays CONVERSABLE: a new instruction typed into its live
@@ -9786,7 +9802,14 @@ impl App {
             self.selected_agent = index;
         }
         self.worker_view = WorkerView::PlanReview;
-        self.focus = FocusPane::Worker;
+        // Focus stays on the TASK pane: when a plan lands, the user's next move
+        // is almost always "tell the planner to change it", and the review pane
+        // header says so ("Task pane text still refines with the planner").
+        // Stealing focus here sent that sentence into a node's TITLE field
+        // instead of the orchestrator — the plan silently mutated and no
+        // refine ever happened. ^W 2 (or v) still opens the editor for inline
+        // edits.
+        self.focus = FocusPane::Task;
         self.orch_selection = None;
         self.worker_selection = None;
         self.dirty = true;
@@ -10012,18 +10035,20 @@ impl App {
                 let field = self.plan().plan_review.field.previous();
                 self.plan_mut().plan_review.set_field(field);
             }
-            KeyCode::Up | KeyCode::Char('k')
-                if !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::META) =>
-            {
+            // Task navigation is ARROWS ONLY here. Bare j/k used to move between
+            // tasks, which made every field un-typable: the k in "make" jumped
+            // rows instead of inserting, silently editing a DIFFERENT node.
+            // Alt+j/k still step for muscle memory.
+            KeyCode::Up => {
                 self.select_plan_review_node(-1);
             }
-            KeyCode::Down | KeyCode::Char('j')
-                if !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::META) =>
-            {
+            KeyCode::Down => {
+                self.select_plan_review_node(1);
+            }
+            KeyCode::Char('k') if key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::META) => {
+                self.select_plan_review_node(-1);
+            }
+            KeyCode::Char('j') if key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::META) => {
                 self.select_plan_review_node(1);
             }
             KeyCode::PageUp => {

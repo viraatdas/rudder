@@ -77,6 +77,15 @@ const MUTATIONS = [
     unit: "a_record_with_an_empty",
   },
   {
+    id: "plan-refine-focus",
+    file: "main.rs",
+    // The field bug: capturing a plan stole focus into the review editor, so a
+    // typed refinement went into a node's title instead of to the planner.
+    find: "        self.focus = FocusPane::Task;\n        self.orch_selection = None;",
+    replace: "        self.focus = FocusPane::Worker;\n        self.orch_selection = None;",
+    guards: "typing after a plan lands refines with the planner",
+  },
+  {
     id: "dd-cascade",
     file: "main.rs",
     // The board-wiping field bug: keys buffered during a UI stall replayed as

@@ -285,3 +285,48 @@ export function assertPrerequisites() {
     throw new Error("jj is required for the TUI test suite");
   }
 }
+
+/**
+ * An INTERACTIVE orchestrator (rudder's default): it writes the task DAG into
+ * RUDDER.md — the interactive control channel, not the PTY stream the headless
+ * planner uses — then stays alive reading stdin like a real Claude session, so
+ * a test can prove refinements actually reach it. Returns the binary plus the
+ * path of the log every stdin line lands in.
+ */
+export async function interactiveOrchestratorBackend(dir, nodeCount = 2) {
+  const bin = path.join(dir, "fake-bin");
+  await fsp.mkdir(bin, { recursive: true });
+  const stdinLog = path.join(dir, "orchestrator-stdin.log");
+  const nodes = Array.from({ length: nodeCount }, (_, i) => ({
+    id: `n${i}`,
+    title: `node ${i}`,
+    prompt: `do node ${i}`,
+    goal: `g${i}`,
+    success: `s${i}`,
+    deps: [],
+  }));
+  const block = `RUDDER_PLAN_TASKS_START\n${JSON.stringify({ tasks: nodes })}\nRUDDER_PLAN_TASKS_END`;
+  const file = path.join(bin, "claude-interactive-orchestrator");
+  await fsp.writeFile(
+    file,
+    `#!/bin/sh
+if echo "$*" | grep -q "bypassPermissions"; then
+  echo "node work" > "NODE-$(basename "$PWD" | tr -cd 'a-z0-9' | tail -c 6).txt"
+  sleep 1
+  exit 0
+fi
+cat > "${path.join(dir, "RUDDER.md")}" <<'RUDDERMD'
+# Plan
+${block}
+RUDDERMD
+echo "orchestrator ready"
+while IFS= read -r line; do
+  printf 'GOT[%s]\\n' "$line" >> "${stdinLog}"
+  printf 'ack\\n'
+done
+`,
+    { mode: 0o755 },
+  );
+  await fsp.chmod(file, 0o755);
+  return { claudeBin: file, stdinLog, nodeCount };
+}

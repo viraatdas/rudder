@@ -285,9 +285,16 @@ test("recorded work survives renaming the repo directory", { timeout: 120_000 },
   t.after(() => session.close());
   await session.waitForText("write the done marker", { timeout: 30_000 });
 
-  // The row must not be the incident's failure shape.
-  const screen = await session.screen();
-  assert.ok(!screen.includes("agent process exited"), `row died after rename:\n${screen}`);
+  // The row must not be the incident's failure shape. Wait for the STEADY
+  // state instead of sampling once: a loaded machine can catch the restored
+  // row mid-heal, when the exited notice is still on screen for a frame or
+  // two. stablePolls means the clean screen must hold, so a genuinely dead
+  // row (the actual regression) still fails.
+  await session.waitFor((screen) => !screen.includes("agent process exited"), {
+    timeout: 20_000,
+    stablePolls: 3,
+    label: "the restored row is not reporting a dead process",
+  });
 
   // And the recorded workspace still merges from its new home.
   await pressMergeUntilReview(session);
