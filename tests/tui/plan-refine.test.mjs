@@ -86,3 +86,27 @@ test("the plan review editor can type letters that are also nav keys", { timeout
     label: "j and k typed into the focused field",
   });
 });
+
+
+test("a task in a plain directory says isolation is off instead of failing quietly", { timeout: 60_000 }, async (t) => {
+  // Field report (job-nikita): a whole session of agents ran in a folder that
+  // was never a git repo. Workspace creation "succeeds" there by falling back
+  // to the checkout itself, so nothing complained — the agents just had no
+  // isolation and nothing that could ever merge, and the rows only looked
+  // "failed". The dashboard must SAY so, and name the fix.
+  const fsp = await import("node:fs/promises");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const dir = await fsp.realpath(await fsp.mkdtemp(path.join(os.tmpdir(), "rudder-tui-norepo-")));
+  t.after(() => removeScratch(dir));
+  await fsp.writeFile(path.join(dir, "README.md"), "not a repo\n");
+  const { claudeBin } = await interactiveOrchestratorBackend(dir, 1);
+
+  const session = await launchRudder(t, { repo: dir, claudeBin });
+  await session.waitForText("Type a task", { timeout: 20_000 });
+  await session.type("do some work here");
+  await session.press("Enter");
+
+  await session.waitForText("no git repo here", { timeout: 30_000 });
+  await session.waitForText("git init", { timeout: 10_000 });
+});

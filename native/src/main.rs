@@ -7800,8 +7800,13 @@ impl App {
                     .as_deref()
                     .is_some_and(|notice| notice.starts_with("jj workspace failed:"))
             {
+                // Name the CONSEQUENCE and the fix. The old wording stated a
+                // fact ("no merge step outside a git repo") that read as
+                // incidental, so a whole session could run unisolated in the
+                // user's files without them realising nothing could ever be
+                // merged or undone (field report: job-nikita).
                 self.notice = Some(
-                    "worker running in the current checkout; no merge step outside a git repo"
+                    "no git repo here — this worker edits your checkout directly, with no isolation and nothing to merge · run `git init` for isolated workspaces"
                         .to_string(),
                 );
             }
