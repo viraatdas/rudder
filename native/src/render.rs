@@ -4500,7 +4500,39 @@ pub(crate) fn agent_status_text(agent: &AgentRun) -> String {
     if let Some(label) = agent.publish.label() {
         return label;
     }
-    agent_status_label(agent).to_string()
+    let label = agent_status_label(agent).to_string();
+    // A row that says "working" says exactly the same thing whether the agent
+    // is mid-thought or has been parked for a day and a half. In ~/code/battery
+    // an orchestrator sat at "running" for 32 HOURS with a live-but-idle
+    // process and nothing on screen distinguished it from real work. Once a
+    // running agent has been silent well past any normal pause, say how long.
+    // (The clock restarts when a dashboard reloads a row, so this reports
+    // silence within the current session, never a fabricated longer one.)
+    if agent.status == AgentStatus::Running && !agent.needs_permission && !agent.needs_user_input {
+        let quiet = agent.last_output_at.elapsed();
+        if quiet >= QUIET_AGENT_THRESHOLD {
+            return format!("{label} · quiet {}", humanize_quiet(quiet));
+        }
+    }
+    label
+}
+
+/// How long a running agent may go without output before the row says so.
+/// Long enough that a thinking model or a slow build never trips it.
+const QUIET_AGENT_THRESHOLD: Duration = Duration::from_secs(15 * 60);
+
+fn humanize_quiet(quiet: Duration) -> String {
+    let minutes = quiet.as_secs() / 60;
+    if minutes < 90 {
+        format!("{minutes}m")
+    } else {
+        let hours = minutes / 60;
+        if hours < 48 {
+            format!("{hours}h")
+        } else {
+            format!("{}d", hours / 24)
+        }
+    }
 }
 
 pub(crate) fn agent_status_label(agent: &AgentRun) -> &'static str {

@@ -86,6 +86,17 @@ const MUTATIONS = [
     guards: "typing after a plan lands refines with the planner",
   },
   {
+    id: "silent-deadlock",
+    file: "main.rs",
+    // ~/code/battery: stopping n1/n2 deadlocked n3/n4 for 32 hours in silence,
+    // because the stall notice matched only Failed (a stopped run records as
+    // "cancelled" = AgentStatus::Stopped).
+    find: "                        matches!(\n                            run.status,\n                            AgentStatus::Failed | AgentStatus::Stopped | AgentStatus::Orphaned\n                        )",
+    replace: "                        run.status == AgentStatus::Failed",
+    guards: "a stopped dependency stalls the plan out loud",
+    unit: "a_stopped_dependency_stalls",
+  },
+  {
     id: "dd-cascade",
     file: "main.rs",
     // The board-wiping field bug: keys buffered during a UI stall replayed as

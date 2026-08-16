@@ -7992,6 +7992,62 @@ fn a_main_row_renames_like_any_other() {
 }
 
 #[test]
+fn a_stopped_dependency_stalls_the_plan_out_loud() {
+    // ~/code/battery: the user stopped n1/n2, so n3/n4 could never become
+    // ready (is_ready only satisfies a MERGED dep) and sat in Todo for 32
+    // hours. The deadlock notice existed but matched only AgentStatus::Failed,
+    // and a stopped run is recorded as "cancelled" — so nothing was ever said.
+    let mut app = App::new();
+    let mut blocker = test_agent_run("run-n1", "sampler daemon");
+    blocker.node_id = Some("n1".to_string());
+    blocker.status = AgentStatus::Stopped;
+    app.agents.push(blocker);
+    app.plans[0].planned_nodes = vec![PlannedNode {
+        plan_id: String::new(),
+        id: "n3".to_string(),
+        title: "menu bar app".to_string(),
+        prompt: "build the menu bar app".to_string(),
+        goal: None,
+        success: None,
+        deps: vec!["n1".to_string()],
+        soft_deps: vec![],
+        backend: None,
+        model: None,
+        effort: None,
+    }];
+    app.plans[0].awaiting_approval = false;
+
+    app.notice = None;
+    app.run_scheduler_for(0);
+    let notice = app.notice.as_deref().unwrap_or_default();
+    assert!(
+        notice.contains("stalled") && notice.contains("n1"),
+        "a stopped dependency must name the stall: {notice:?}"
+    );
+}
+
+#[test]
+fn a_long_silent_running_row_says_how_long_it_has_been_quiet() {
+    // The battery orchestrator sat at "running" for 32 hours with a live but
+    // idle process; the row read identically to one doing real work.
+    let mut run = test_agent_run("run-quiet", "orchestrating");
+    run.status = AgentStatus::Running;
+    run.last_output_at = Instant::now() - Duration::from_secs(3 * 3600);
+    let text = agent_status_text(&run);
+    assert!(text.contains("quiet"), "a silent row must say so: {text:?}");
+    assert!(text.contains("3h"), "and for how long: {text:?}");
+
+    // A freshly active agent stays clean — no nag on normal work.
+    let mut busy = test_agent_run("run-busy", "orchestrating");
+    busy.status = AgentStatus::Running;
+    busy.last_output_at = Instant::now();
+    assert!(
+        !agent_status_text(&busy).contains("quiet"),
+        "an active row must not be labelled quiet"
+    );
+}
+
+#[test]
 fn buffered_dd_bursts_cannot_cascade_across_rows() {
     // The field failure: a slow (synchronous) worktree removal froze the UI,
     // the user hammered dd, and the buffered presses replayed as arm+confirm

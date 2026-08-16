@@ -11435,12 +11435,23 @@ impl App {
             // nothing launched simply because every slot is busy — not because a dependency
             // failed. Suppress the notice then to avoid a spurious "blocked by FAILED dep".
             let cap_saturated = self.running_plan_agents() >= max_parallel();
+            // ANY terminal non-merged state blocks dependents identically —
+            // is_ready only ever satisfies a dep that MERGED. Filtering on
+            // Failed alone meant a node the user STOPPED (recorded as
+            // "cancelled") deadlocked the rest of the plan in total silence:
+            // observed in ~/code/battery, where stopping n1/n2 left n3/n4
+            // sitting in Todo for 32 hours with nothing on screen to say why.
             let failed_ids: Vec<String> = if cap_saturated {
                 Vec::new()
             } else {
                 self.agents
                     .iter()
-                    .filter(|run| run.status == AgentStatus::Failed)
+                    .filter(|run| {
+                        matches!(
+                            run.status,
+                            AgentStatus::Failed | AgentStatus::Stopped | AgentStatus::Orphaned
+                        )
+                    })
                     .filter_map(|run| run.node_id.clone())
                     .collect()
             };
@@ -11458,7 +11469,7 @@ impl App {
                     .collect();
                 if !blocked.is_empty() {
                     self.notice = Some(format!(
-                        "{} task(s) blocked by a FAILED dependency ({}) — retry or re-goal the failed node to unblock, or delete it",
+                        "plan stalled: {} task(s) blocked by {} — that node never merged, so nothing downstream can start · retry or re-goal it, or delete it to unblock",
                         blocked.len(),
                         failed_ids.join(", ")
                     ));
