@@ -10834,7 +10834,6 @@ Files involved: {}
             ));
             return false;
         }
-        let frontier: Vec<String> = self.plan_frontier().into_iter().map(|(id, _)| id).collect();
         let mut added = 0usize;
         for f in &followups {
             // Out-of-lane work is recorded by the worker in DECISIONS.md, not auto-injected.
@@ -10908,78 +10907,7 @@ Files involved: {}
                     files,
                 });
                 added += 1;
-                continue;
             }
-            #[allow(unreachable_code)]
-            let explicit: Vec<String> = f
-                .get("deps")
-                .and_then(serde_json::Value::as_array)
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|d| d.as_str().map(str::to_string))
-                        .collect()
-                })
-                .unwrap_or_default();
-            let mut node = PlannedNode {
-                id: self.uniquify_node_id("followup"),
-                plan_id: plan_id.clone(),
-                title: title.to_string(),
-                prompt,
-                goal: Some(title.to_string()),
-                success: None,
-                deps: Vec::new(),
-                soft_deps: Vec::new(),
-                backend: None,
-                model: None,
-                effort: None,
-            };
-            // Explicit hard deps must reference real, LIVE plan nodes. A dep absent from the
-            // plan is treated as already-satisfied by is_ready, so a typo'd id (e.g. "n_0"
-            // for "n0") would make the node launch IMMEDIATELY, losing the gate. A dep that
-            // resolves to a FAILED/STOPPED node is the opposite trap: is_ready only satisfies
-            // a hard dep that MERGED, so it would deadlock forever. Treat BOTH (unknown and
-            // dead) as bad: fall back to the soft-frontier edge and surface it.
-            let dead: Vec<String> = self
-                .agents
-                .iter()
-                .filter(|r| {
-                    matches!(
-                        r.status,
-                        AgentStatus::Failed | AgentStatus::Stopped | AgentStatus::Orphaned
-                    )
-                })
-                .filter_map(|r| r.node_id.clone())
-                .collect();
-            let unknown: Vec<&str> = explicit
-                .iter()
-                .filter(|d| !known.iter().any(|k| k == *d) || dead.iter().any(|x| x == *d))
-                .map(String::as_str)
-                .collect();
-            if explicit.is_empty() || !unknown.is_empty() {
-                if !unknown.is_empty() {
-                    self.push_activity(format!(
-                        "follow-up '{title}' had unknown or failed dep(s) {unknown:?}; soft-linked instead of hard-gated"
-                    ));
-                }
-                // Default / fallback: a SOFT edge to the finishing node + the frontier, so
-                // the new work is aware of in-flight work but never gates/deadlocks.
-                let mut soft = vec![node_id.to_string()];
-                soft.extend(frontier.iter().cloned());
-                soft.retain(|id| !id.is_empty());
-                soft.sort();
-                soft.dedup();
-                node.soft_deps = soft;
-            } else {
-                // The agent said this follow-up consumes those nodes (all resolve): hard.
-                node.deps = explicit;
-            }
-            self.followup_gen.insert(node.id.clone(), gen + 1);
-            self.persist_followup_gen();
-            self.push_plan_node(plan_index, node);
-            // New work reopens THIS plan's gate; another plan's verdict is untouched.
-            self.plans[plan_index].final_gate_status = FinalGateStatus::Idle;
-            self.plans[plan_index].final_gate_summary = None;
-            added += 1;
         }
         if added > 0 {
             self.followup_gen.insert(node_id.to_string(), gen + 1);
