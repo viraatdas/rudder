@@ -44,6 +44,22 @@ test("parseJjConflictedFiles strips common conflict prefixes", () => {
   assert.deepEqual(parseJjConflictedFiles("Conflict in src/a.ts\n* src/b.ts\n"), ["src/a.ts", "src/b.ts"]);
 });
 
+test("parseJjConflictedFiles returns PATHS, not jj's descriptor lines", () => {
+  // Real `jj resolve --list` output. Callers treat these as paths: the mechanical
+  // resolver keys on the file name, so a trailing "2-sided conflict" made every
+  // lookup miss and silently resolved nothing.
+  assert.deepEqual(
+    parseJjConflictedFiles(
+      [
+        "DECISIONS.md                     4-sided conflict",
+        "src/router/index.ts              3-sided conflict including 1 deletion",
+        "src/lanes/my file.ts             2-sided conflict",
+      ].join("\n"),
+    ),
+    ["DECISIONS.md", "src/router/index.ts", "src/lanes/my file.ts"],
+  );
+});
+
 test("createRunJjWorkspace names the workspace with the rudder prefix", async (t) => {
   const env = await setupFakeJj(t);
 

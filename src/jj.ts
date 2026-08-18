@@ -592,6 +592,14 @@ export function parseJjConflictedFiles(stdout: string): string[] {
     .map((line) => line.trim())
     .filter(Boolean)
     .map((line) => line.replace(/^[-*]\s+/, "").replace(/^conflict in\s+/i, "").trim())
+    // `jj resolve --list` prints "path/to/file    2-sided conflict" (and
+    // "... including 1 deletion"). Everything downstream treats these as PATHS:
+    // they are joined into merge errors, stored on run.merge.conflictedFiles, and
+    // fed to the mechanical resolver, which keys on the file NAME. Leaving the
+    // descriptor attached makes every one of those miss. Split on the run of
+    // whitespace jj uses as the separator so paths containing single spaces
+    // survive intact.
+    .map((line) => line.replace(/\s{2,}\d+-sided conflict.*$/, "").trim())
     .filter((line) => line && !isRudderMetadataPath(line));
 }
 
