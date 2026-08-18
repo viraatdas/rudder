@@ -68,7 +68,7 @@ function fakeBackend(id: BackendId): BackendAdapter {
       if (delayMs > 0) {
         await new Promise((resolve) => setTimeout(resolve, delayMs));
       }
-      const root = request.run.worktree?.path ?? request.run.repoRoot;
+      const root = request.run.workspace?.path ?? request.run.repoRoot;
       const source = request.run.task ?? request.prompt ?? "";
       const blocks = [...source.matchAll(/\[\[FAKE_FILE:(.+?)\]\]\n([\s\S]*?)\n\[\[\/FAKE_FILE\]\]/g)];
       const written: string[] = [];
@@ -150,7 +150,7 @@ function claudeBackend(): BackendAdapter {
       return await spawnAndStream({
         command: "claude",
         args,
-        cwd: request.run.worktree.path,
+        cwd: request.run.workspace.path,
         env,
         request,
         emit,
@@ -211,7 +211,7 @@ function codexBackend(): BackendAdapter {
       return await spawnAndStream({
         command,
         args,
-        cwd: request.run.worktree.path,
+        cwd: request.run.workspace.path,
         env,
         request,
         emit,
@@ -253,7 +253,7 @@ function opencodeBackend(): BackendAdapter {
       return await spawnAndStream({
         command: "opencode",
         args,
-        cwd: request.run.worktree.path,
+        cwd: request.run.workspace.path,
         env: process.env,
         request,
         emit,
@@ -285,7 +285,7 @@ function acpxBackend(): BackendAdapter {
       };
       await saveBackendRun(request.run);
       await runCommand("acpx", ["codex", "sessions", "ensure", "--name", sessionName], {
-        cwd: request.run.worktree.path,
+        cwd: request.run.workspace.path,
         env,
       });
       const args = [
@@ -294,7 +294,7 @@ function acpxBackend(): BackendAdapter {
         "json",
         ...(model ? ["--model", model] : []),
         "--cwd",
-        request.run.worktree.path,
+        request.run.workspace.path,
         "codex",
         "-s",
         sessionName,
@@ -303,7 +303,7 @@ function acpxBackend(): BackendAdapter {
       return await spawnAndStream({
         command: "acpx",
         args,
-        cwd: request.run.worktree.path,
+        cwd: request.run.workspace.path,
         env,
         request,
         emit,

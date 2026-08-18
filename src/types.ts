@@ -83,7 +83,7 @@ export type RudderConfig = {
   // and manual runs merge via m/M.
   runPolicy: {
     sameCheckout: "single-active";
-    concurrentPromptMode: "worktree" | "queue";
+    concurrentPromptMode: "workspace" | "queue";
   };
   acpx: {
     install: "latest";
@@ -229,7 +229,7 @@ export type TaskNode = {
   effort?: EffortLevel;
   status: NodeStatus;
   runId?: string; // links to .rudder/runs/<runId> once scheduled
-  worktree?: { path: string; workspaceName?: string };
+  workspace?: { path: string; workspaceName?: string };
   jjChangeId?: string; // the node's jj change
   deps: string[]; // edge ids where this node is `to` (fast ready-check)
   lastLine?: string;
@@ -322,7 +322,7 @@ export type RunRecord = {
   repoRoot: string;
   targetBranch: string;
   baseCommit: string;
-  worktree: {
+  workspace: {
     enabled: boolean;
     path: string;
     branch?: string;
@@ -561,7 +561,7 @@ export type BoardNode = {
   deps: { hard: string[]; soft: string[] };
   createdAt: string;
   updatedAt: string;
-  worktree: { path: string; workspaceName?: string } | null;
+  workspace: { path: string; workspaceName?: string } | null;
   merge: MergeState | null;
   delivery?: DeliveryEvidence;
   /** User-authored follow-up turns, oldest first. The initial task is omitted. */

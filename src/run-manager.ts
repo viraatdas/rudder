@@ -17,6 +17,8 @@ import {
   loadConfig,
   loadRunRecord,
   outputPath,
+  AGENT_WORKSPACES_DIR,
+  LEGACY_AGENT_WORKSPACES_DIR,
   registerProject,
   rememberBackendSelection,
   resolveRun,
@@ -81,7 +83,7 @@ export async function startRun(params: {
   model?: string;
   effort?: EffortLevel;
   detach?: boolean;
-  worktree?: boolean;
+  workspace?: boolean;
   queue?: boolean;
   json?: boolean;
   exitOnComplete?: boolean;
@@ -117,11 +119,11 @@ export async function startRun(params: {
   if (params.queue && active.length > 0) {
     throw new Error("Queue mode is not implemented yet; omit --queue to create a workspace run.");
   }
-  const useWorktree = Boolean(params.worktree || active.length > 0);
+  const useWorkspace = Boolean(params.workspace || active.length > 0);
   const baseCommit = await baseRevision(repoRoot);
   const targetBranch = await targetRevision(repoRoot);
   const id = newRunId(params.task);
-  const worktreeInfo = useWorktree
+  const workspaceInfo = useWorkspace
     ? await createRunWorkspace({ repoRoot, runId: id, task: params.task })
     : { path: repoRoot, workspaceName: undefined, jjChangeId: undefined };
   const run = await createRunRecord({
@@ -134,17 +136,17 @@ export async function startRun(params: {
     targetBranch,
     baseCommit,
     vcs: "jj",
-    useWorktree,
-    worktreeWorkspaceName: worktreeInfo.workspaceName,
-    worktreeJjChangeId: worktreeInfo.jjChangeId,
-    worktreePath: worktreeInfo.path,
+    useWorkspace,
+    workspaceName: workspaceInfo.workspaceName,
+    workspaceChangeId: workspaceInfo.jjChangeId,
+    workspacePath: workspaceInfo.path,
   });
   await emit(run, {
     ts: nowIso(),
     runId: run.id,
     type: "run.created",
-    message: useWorktree
-      ? `Created jj workspace ${shortenHome(worktreeInfo.path)}`
+    message: useWorkspace
+      ? `Created jj workspace ${shortenHome(workspaceInfo.path)}`
       : "Created run in current checkout",
   });
   await writeAgentContext(repoRoot);
@@ -174,7 +176,7 @@ export async function startRun(params: {
   if (!params.quiet && !params.silent) {
     console.log(`Started ${run.id}`);
     console.log(`  backend: ${backend}${model ? ` (${model})` : ""}`);
-    console.log(`  mode:    ${useWorktree ? `worktree ${shortenHome(worktreeInfo.path)}` : "current checkout"}`);
+    console.log(`  mode:    ${useWorkspace ? `workspace ${shortenHome(workspaceInfo.path)}` : "current checkout"}`);
   }
   if (params.detach || !isTty()) {
     if (params.silent) {
@@ -759,8 +761,8 @@ function formatRunSnapshot(context: ContextRunBuckets): string[] {
 }
 
 function formatAgentContextRun(run: RunRecord): string {
-  const location = run.worktree.enabled
-    ? `${workspaceKind(run)}=${shortenHome(run.worktree.path)}`
+  const location = run.workspace.enabled
+    ? `${workspaceKind(run)}=${shortenHome(run.workspace.path)}`
     : "current checkout";
   const prompt = run.currentPrompt && run.currentPrompt !== run.task ? ` current="${previewAgentContext(run.currentPrompt, 140)}"` : "";
   return `- ${run.id}: ${run.status}, ${run.backend}, ${location}, task="${previewAgentContext(run.task, 140)}"${prompt}`;
@@ -774,14 +776,15 @@ function previewAgentContext(value: string, max: number): string {
 async function writeRudderContextFiles(repoRoot: string, runs: RunRecord[], content: string): Promise<void> {
   await ensureLine(path.join(repoRoot, ".gitignore"), "RUDDER.md");
   await ensureLine(path.join(repoRoot, ".gitignore"), SHARED_CONTEXT_FILE);
-  // Worktrees live INSIDE the project at <repo>/.rudder-worktrees; ignore them in the
+  // Workspaces live INSIDE the project at <repo>/<agent-workspaces-dir>; ignore them in the
   // user's repo so each worker checkout does not show up as untracked files (Rust parity:
   // gitio.rs write_rudder_context).
-  await ensureLine(path.join(repoRoot, ".gitignore"), ".rudder-worktrees/");
+  await ensureLine(path.join(repoRoot, ".gitignore"), `${AGENT_WORKSPACES_DIR}/`);
+  await ensureLine(path.join(repoRoot, ".gitignore"), `${LEGACY_AGENT_WORKSPACES_DIR}/`);
   const workspaces = new Set<string>([repoRoot]);
   for (const run of runs) {
-    if (run.worktree.path && await pathExists(run.worktree.path)) {
-      workspaces.add(run.worktree.path);
+    if (run.workspace.path && await pathExists(run.workspace.path)) {
+      workspaces.add(run.workspace.path);
     }
   }
   // RUDDER.md has concurrent writer processes (Rust TUI, other CLI invocations,
@@ -841,7 +844,7 @@ async function createRunWorkspace(params: {
 }
 
 // Route through the run's recorded vcs. New runs are always jj; legacy git
-// worktree runs (run.vcs === "git") still merge/sync through the git helpers.
+// workspace runs (run.vcs === "git") still merge/sync through the git helpers.
 async function mergeRunIntoCurrentBranch(
   run: RunRecord,
   allowDirty: boolean,
@@ -853,7 +856,7 @@ async function mergeRunIntoCurrentBranch(
   return await mergeGitRunIntoCurrentBranch(run, allowDirty, strategy);
 }
 
-async function syncRunWorktree(run: RunRecord, baseBranch: string): Promise<RunRecord> {
+async function syncRunWorkspace(run: RunRecord, baseBranch: string): Promise<RunRecord> {
   if ((run.vcs ?? "git") === "jj") {
     return await syncJjRunWorkspace(run, baseBranch);
   }
@@ -865,10 +868,10 @@ async function removeRunWorkspace(run: RunRecord, force = true): Promise<void> {
     await removeJjRunWorkspace(run);
     return;
   }
-  if (!run.worktree.enabled) {
+  if (!run.workspace.enabled) {
     return;
   }
-  await removeGitWorktree(run.repoRoot, run.worktree.path, force);
+  await removeGitWorktree(run.repoRoot, run.workspace.path, force);
 }
 
 async function baseRevision(repoRoot: string): Promise<string> {
@@ -900,7 +903,7 @@ function shortRunTask(run: RunRecord): string {
 }
 
 function workspaceKind(run: RunRecord): string {
-  return (run.vcs ?? "git") === "jj" ? "jj-workspace" : "worktree";
+  return (run.vcs ?? "git") === "jj" ? "jj-workspace" : "git-worktree";
 }
 
 export async function statusRuns(options?: { json?: boolean }): Promise<void> {
@@ -930,7 +933,7 @@ export async function listProjectRuns(options?: { json?: boolean }): Promise<voi
     return;
   }
   for (const run of runs) {
-    const wt = run.worktree.enabled ? ` ${workspaceKind(run)}=${shortenHome(run.worktree.path)}` : "";
+    const wt = run.workspace.enabled ? ` ${workspaceKind(run)}=${shortenHome(run.workspace.path)}` : "";
     console.log(`${run.id}  ${run.status}  ${run.backend}${wt}  ${run.task}`);
   }
 }
@@ -1080,7 +1083,7 @@ export async function mergeRun(runId: string, allowDirty = false, options?: { si
         console.log(`  ${file}`);
       }
       if (merged.merge.conflictKind === "rebase") {
-        console.log(`Resolve in ${shortenHome(merged.worktree.path)}, run git rebase --continue, then retry rudder merge ${runId}.`);
+        console.log(`Resolve in ${shortenHome(merged.workspace.path)}, run git rebase --continue, then retry rudder merge ${runId}.`);
       }
     } else {
       console.log(`Merge failed for ${runId}: ${merged.merge?.error ?? "unknown error"}`);
@@ -1095,7 +1098,7 @@ export async function syncRun(runId?: string, options?: { silent?: boolean }): P
   if (!run) {
     throw new Error("No runs found.");
   }
-  const hasIsolation = run.worktree.enabled && (run.worktree.workspaceName || run.worktree.branch);
+  const hasIsolation = run.workspace.enabled && (run.workspace.workspaceName || run.workspace.branch);
   if (!hasIsolation) {
     throw new Error(`Run ${run.id} has no workspace to sync.`);
   }
@@ -1107,7 +1110,7 @@ export async function syncRun(runId?: string, options?: { silent?: boolean }): P
   }
   const current = await currentBranch(repoRoot);
   const baseBranch = current === "HEAD" ? run.targetBranch : current;
-  const synced = await syncRunWorktree(run, baseBranch);
+  const synced = await syncRunWorkspace(run, baseBranch);
   await emit(synced, {
     ts: nowIso(),
     runId: synced.id,
@@ -1124,7 +1127,7 @@ export async function syncRun(runId?: string, options?: { silent?: boolean }): P
       for (const file of synced.sync.conflictedFiles ?? []) {
         console.log(`  ${file}`);
       }
-      console.log(`Resolve in ${shortenHome(synced.worktree.path)}, run git rebase --continue, then retry rudder sync ${synced.id}.`);
+      console.log(`Resolve in ${shortenHome(synced.workspace.path)}, run git rebase --continue, then retry rudder sync ${synced.id}.`);
     } else {
       console.log(`Sync failed for ${synced.id}: ${synced.sync?.error ?? "unknown error"}`);
     }
@@ -1155,7 +1158,7 @@ export async function deleteRun(runId: string, options?: { mergeFirst?: boolean;
     throw new Error(`Merge failed for ${runId}; run was not deleted. ${message}`);
   }
   await interruptWorkerAttempt(repoRoot, latest);
-  if (latest.worktree.enabled) {
+  if (latest.workspace.enabled) {
     await removeRunWorkspace(latest, options?.force ?? true).catch(() => undefined);
   }
   await fsp.rm(runDir(repoRoot, runId), { recursive: true, force: true });
@@ -1174,7 +1177,7 @@ function mergeResultMessage(run: RunRecord): string {
   if (run.merge?.status === "conflict") {
     const files = (run.merge.conflictedFiles ?? []).join(", ") || "unknown files";
     if (run.merge.conflictKind === "rebase") {
-      return `Rebase conflict before merge: ${files}. Resolve in the worktree, run git rebase --continue, then retry merge.`;
+      return `Rebase conflict before merge: ${files}. Resolve in the workspace, run git rebase --continue, then retry merge.`;
     }
     return `Merge conflict: ${files}`;
   }
@@ -1190,7 +1193,7 @@ function syncResultMessage(run: RunRecord): string {
   }
   if (run.sync?.status === "conflict") {
     const files = (run.sync.conflictedFiles ?? []).join(", ") || "unknown files";
-    return `Rebase conflict while syncing: ${files}. Resolve in the worktree, run git rebase --continue, then retry sync.`;
+    return `Rebase conflict while syncing: ${files}. Resolve in the workspace, run git rebase --continue, then retry sync.`;
   }
   if (run.sync?.status === "failed") {
     return `Sync failed: ${run.sync.error ?? "unknown error"}`;
@@ -1207,16 +1210,16 @@ export async function cleanupRuns(force = false): Promise<void> {
     }
     try {
       await removeRunWorkspace(run, force);
-      console.log(`Removed ${shortenHome(run.worktree.path)}`);
+      console.log(`Removed ${shortenHome(run.workspace.path)}`);
     } catch {
-      // Best-effort cleanup matches the existing git worktree behavior.
+      // Best-effort cleanup matches the existing git workspace behavior.
     }
   }
   await writeAgentContext(repoRoot);
 }
 
 function canCleanupRun(run: RunRecord, force: boolean): boolean {
-  if (!run.worktree.enabled) {
+  if (!run.workspace.enabled) {
     return false;
   }
   if (force) {
@@ -1315,8 +1318,8 @@ function renderShellEvent(
   if (event.type === "run.created") {
     const message = event.message?.startsWith("Created jj workspace ")
       ? event.message.replace("Created jj workspace ", "workspace ")
-      : event.message?.startsWith("Created worktree ")
-        ? event.message.replace("Created worktree ", "worktree ")
+      : event.message?.startsWith("Created workspace ")
+        ? event.message.replace("Created workspace ", "workspace ")
         : undefined;
     return { text: message, sawStreamingText, partialOpen };
   }
@@ -1509,8 +1512,8 @@ function isContextCompletedStatus(status: RunRecord["status"]): boolean {
 
 function runHasMergeSource(run: RunRecord): boolean {
   return Boolean(
-    run.worktree.enabled &&
-      (run.worktree.path || run.worktree.branch || run.worktree.workspaceName || run.worktree.jjChangeId),
+    run.workspace.enabled &&
+      (run.workspace.path || run.workspace.branch || run.workspace.workspaceName || run.workspace.jjChangeId),
   );
 }
 

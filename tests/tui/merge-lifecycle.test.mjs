@@ -59,12 +59,12 @@ test("merge-all lands two workers, undo takes the work back out", { timeout: 180
   await story.step("M opens the merge-all confirm", async () => {
     await session.press("Ctrl+W");
     await session.press("M");
-    await session.waitForText("Merge 2 completed worktrees", { timeout: 20_000 });
+    await session.waitForText("Merge 2 completed workspaces", { timeout: 20_000 });
   });
 
   await story.step("y merges both; the checkout has both files", async () => {
     await session.press("y");
-    await session.waitForText("merged 2 worktrees", { timeout: 30_000 });
+    await session.waitForText("merged 2 workspaces", { timeout: 30_000 });
     // Each fake worker writes DONE-<workspace-slug>.txt; exactly two land.
     const files = (await fsp.readdir(repo)).filter((name) => name.startsWith("DONE-"));
     if (files.length !== 2) {
@@ -111,7 +111,8 @@ test("a single merge then undo round-trips the checkout", { timeout: 120_000 }, 
   await session.press("M");
   await session.waitForText("[y] merge", { timeout: 20_000 });
   await session.press("y");
-  await session.waitForText("merged locally", { timeout: 30_000 });
+  // The merged row is inside the `done` drawer now; the header carries its count.
+  await session.waitForText("done 1", { timeout: 30_000 });
   await waitFile(path.join(repo, "DONE.txt"), true);
 
   await session.press("Ctrl+W");
@@ -141,7 +142,8 @@ test("a merged row survives a restart with its identity intact", { timeout: 120_
   await session.press("M");
   await session.waitForText("[y] merge", { timeout: 20_000 });
   await session.press("y");
-  await session.waitForText("merged locally", { timeout: 30_000 });
+  // The merged row is inside the `done` drawer now; the header carries its count.
+  await session.waitForText("done 1", { timeout: 30_000 });
   await waitFile(path.join(repo, "DONE.txt"), true);
 
   // Restart. The merged row must reload as merged, still owning its workspace

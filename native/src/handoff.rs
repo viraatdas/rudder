@@ -140,7 +140,8 @@ pub(crate) struct ConversationCandidate {
 /// rather than guessing.
 pub(crate) fn origin_label(cwd: Option<&Path>, dashboard_root: &Path) -> Option<String> {
     let cwd = cwd?;
-    let root = std::fs::canonicalize(dashboard_root).unwrap_or_else(|_| dashboard_root.to_path_buf());
+    let root =
+        std::fs::canonicalize(dashboard_root).unwrap_or_else(|_| dashboard_root.to_path_buf());
     let resolved = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
     if resolved == root || cwd == dashboard_root {
         return Some("main".to_string());
@@ -156,11 +157,10 @@ pub(crate) fn origin_label(cwd: Option<&Path>, dashboard_root: &Path) -> Option<
 }
 
 /// Is this conversation one of Rudder's own agent panes? Those live under
-/// `.rudder-worktrees` and are branched in place with `b`, so they do not belong
+/// `.rudder-workspaces` and are branched in place with `b`, so they do not belong
 /// in a picker whose whole purpose is adopting chats from OUTSIDE the dashboard.
-pub(crate) fn is_worktree_conversation(cwd: &Path) -> bool {
-    cwd.components()
-        .any(|component| component.as_os_str() == ".rudder-worktrees")
+pub(crate) fn is_workspace_conversation(cwd: &Path) -> bool {
+    crate::gitio::is_under_agent_workspaces(cwd)
 }
 
 /// A session id is spliced onto a `claude`/`codex` command line, and handoff requests
@@ -234,7 +234,7 @@ pub(crate) fn parse_handoff_request(
 /// so a chat started in `src/` lives in a sibling folder — both are this repo's.
 ///
 /// What is EXCLUDED matters as much as what is found. The picker is useless if it
-/// is full of Rudder's own machinery: sessions inside `.rudder-worktrees` (already
+/// is full of Rudder's own machinery: sessions inside `.rudder-workspaces` (already
 /// agent panes — `b` branches those in place), the session ids of live agent rows,
 /// and the one-shot `claude -p` calls Rudder makes for titles and completion notes.
 pub(crate) fn recent_claude_conversations(
@@ -265,7 +265,7 @@ pub(crate) fn recent_claude_conversations_in(
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
         let in_repo = name == encoded || name.starts_with(&format!("{encoded}-"));
-        if !in_repo || name.contains("-rudder-worktrees-") {
+        if !in_repo || name.contains("-rudder-workspaces-") || name.contains("-rudder-worktrees-") {
             continue;
         }
         let Ok(sessions) = std::fs::read_dir(entry.path()) else {
@@ -399,7 +399,7 @@ pub(crate) fn recent_codex_conversations_in(
         // Rudder's own agent panes are branched with `b`, not adopted with
         // /resume. Claude's scan has always dropped them; Codex's did not, so a
         // worker's chat could be offered back as if it were the user's own.
-        if is_worktree_conversation(&session_cwd) {
+        if is_workspace_conversation(&session_cwd) {
             continue;
         }
         // Resuming a Codex session writes ANOTHER rollout file with the same id;
@@ -498,7 +498,9 @@ pub(crate) fn parse_codex_session_head(raw: &str) -> Option<CodexSessionHead> {
             if let Some(payload) = payload {
                 // A subagent thread is the model talking to itself, like Claude's
                 // sidechains: never a conversation to hand off.
-                if payload.get("thread_source").and_then(serde_json::Value::as_str)
+                if payload
+                    .get("thread_source")
+                    .and_then(serde_json::Value::as_str)
                     == Some("subagent")
                 {
                     return None;
@@ -799,7 +801,10 @@ pub(crate) fn codex_session_exists_in(root: &Path, session_id: &str) -> bool {
 /// files, and ships the query: `opencode session list --format json` reports id,
 /// title, directory and update time. Rudder shells out for it (throttled, never on
 /// the render path) instead of reading a schema it does not own.
-pub(crate) fn recent_opencode_conversations(cwd: &Path, limit: usize) -> Vec<ConversationCandidate> {
+pub(crate) fn recent_opencode_conversations(
+    cwd: &Path,
+    limit: usize,
+) -> Vec<ConversationCandidate> {
     let Some(raw) = opencode_session_list_json(limit.saturating_mul(4).max(limit)) else {
         return Vec::new();
     };
@@ -861,8 +866,11 @@ pub(crate) fn parse_opencode_sessions(
     let mut candidates: Vec<ConversationCandidate> = sessions
         .iter()
         .filter_map(|session| {
-            let directory = session.get("directory").and_then(serde_json::Value::as_str)?;
-            if !Path::new(directory).starts_with(cwd) || is_worktree_conversation(Path::new(directory))
+            let directory = session
+                .get("directory")
+                .and_then(serde_json::Value::as_str)?;
+            if !Path::new(directory).starts_with(cwd)
+                || is_workspace_conversation(Path::new(directory))
             {
                 return None;
             }
@@ -960,8 +968,8 @@ pub(crate) fn scan_transcript_lines(
         if title.is_none() {
             // The mode markers are written before the first user turn, so by the
             // time a title exists the interactive question is already answered.
-            title = user_prompt_from_entry(&value)
-                .filter(|prompt| !is_rudder_generated_prompt(prompt));
+            title =
+                user_prompt_from_entry(&value).filter(|prompt| !is_rudder_generated_prompt(prompt));
         }
         if model.is_none() {
             model = value
@@ -1084,10 +1092,7 @@ fn opening_tag(line: &str) -> Option<&str> {
 
 /// Compact age for the picker ("just now", "12m", "3h", "2d").
 pub(crate) fn relative_age(modified: SystemTime, now: SystemTime) -> String {
-    let seconds = now
-        .duration_since(modified)
-        .unwrap_or_default()
-        .as_secs();
+    let seconds = now.duration_since(modified).unwrap_or_default().as_secs();
     match seconds {
         0..=59 => "just now".to_string(),
         60..=3_599 => format!("{}m ago", seconds / 60),
@@ -1126,7 +1131,9 @@ mod tests {
         ]
         .join("\n");
         assert_eq!(
-            scan_transcript_lines(raw.lines()).map(|head| head.title).as_deref(),
+            scan_transcript_lines(raw.lines())
+                .map(|head| head.title)
+                .as_deref(),
             Some("add a handoff command")
         );
     }
@@ -1135,7 +1142,9 @@ mod tests {
     fn first_user_prompt_reads_text_blocks_and_ignores_tool_results() {
         let raw = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"noise"},{"type":"text","text":"fix the diff pane"}]}}"#;
         assert_eq!(
-            scan_transcript_lines(raw.lines()).map(|head| head.title).as_deref(),
+            scan_transcript_lines(raw.lines())
+                .map(|head| head.title)
+                .as_deref(),
             Some("fix the diff pane")
         );
     }
@@ -1175,7 +1184,10 @@ mod tests {
             "createdAt": 1_000_u64,
         });
         let fresh = 1_000 + REQUEST_MAX_AGE.as_millis() as u64;
-        assert!(parse_handoff_request(&value, fresh).is_some(), "at the edge");
+        assert!(
+            parse_handoff_request(&value, fresh).is_some(),
+            "at the edge"
+        );
         assert!(
             parse_handoff_request(&value, fresh + 1).is_none(),
             "past the edge"
@@ -1227,7 +1239,12 @@ mod tests {
             lines.push(r#"{"type":"mode","mode":"normal"}"#.to_string());
         }
         let stamp = cwd
-            .map(|path| format!(r#""cwd":{},"#, serde_json::json!(path.display().to_string())))
+            .map(|path| {
+                format!(
+                    r#""cwd":{},"#,
+                    serde_json::json!(path.display().to_string())
+                )
+            })
             .unwrap_or_default();
         lines.push(format!(
             r#"{{{stamp}"type":"user","message":{{"role":"user","content":"{prompt}"}}}}"#
@@ -1243,7 +1260,7 @@ mod tests {
     }
 
     #[test]
-    fn recent_conversations_scan_subdirs_but_skip_rudder_worktrees() {
+    fn recent_conversations_scan_subdirs_but_skip_rudder_workspaces() {
         let (projects, cwd, root) = scratch_projects("scan");
         let encoded = crate::encode_claude_project_dir(&cwd);
         write_transcript(
@@ -1259,7 +1276,7 @@ mod tests {
             true,
         );
         write_transcript(
-            &projects.join(format!("{encoded}--rudder-worktrees-n0")),
+            &projects.join(format!("{encoded}--rudder-workspaces-n0")),
             "33333333-3333-3333-3333-333333333333",
             "worker pane chat",
             true,
@@ -1371,7 +1388,7 @@ mod tests {
         let raw = serde_json::json!([
             {"id": "aaaaaaaa-1111", "title": "my own chat", "directory": "/repo", "updated": 20},
             {"id": "bbbbbbbb-2222", "title": "worker pane chat",
-             "directory": "/repo/.rudder-worktrees/repo-abc/n0", "updated": 30},
+             "directory": "/repo/.rudder-workspaces/repo-abc/n0", "updated": 30},
         ])
         .to_string();
 
@@ -1406,9 +1423,8 @@ mod tests {
             "an agent already running in a pane",
             true,
         );
-        let mine = std::collections::HashSet::from([
-            "33333333-3333-3333-3333-333333333333".to_string()
-        ]);
+        let mine =
+            std::collections::HashSet::from(["33333333-3333-3333-3333-333333333333".to_string()]);
 
         let found = recent_claude_conversations_in(&projects, &cwd, 10, &mine);
 
@@ -1444,7 +1460,10 @@ mod tests {
             Some("019f7cde-6d6f-7be0-8359-67e68c2deec6")
         );
         // A timestamp alone is not a session id.
-        assert_eq!(codex_session_id_from_file_stem("rollout-2026-07-19T17-12-59"), None);
+        assert_eq!(
+            codex_session_id_from_file_stem("rollout-2026-07-19T17-12-59"),
+            None
+        );
         assert_eq!(codex_session_id_from_file_stem("nonsense"), None);
     }
 
@@ -1470,7 +1489,10 @@ mod tests {
 
         let ids = claude_session_ids_starting_with_in(&projects, &cwd, "3503304e-5818-45d5");
 
-        assert_eq!(ids, vec!["3503304e-5818-45d5-8b5b-4ea15a857e09".to_string()]);
+        assert_eq!(
+            ids,
+            vec!["3503304e-5818-45d5-8b5b-4ea15a857e09".to_string()]
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1672,7 +1694,9 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["newest chat here", "older chat here"]
         );
-        assert!(found.iter().all(|candidate| candidate.backend == Backend::Opencode));
+        assert!(found
+            .iter()
+            .all(|candidate| candidate.backend == Backend::Opencode));
     }
 
     #[test]

@@ -150,6 +150,17 @@ fn record_agent_rows(start: usize, end: usize, agent_index: usize) {
     AGENT_ROW_SPANS.with(|spans| spans.borrow_mut().push((start, end, agent_index)));
 }
 
+// Same idea for the collapsed drawer headers: they are sidebar rows that resolve to a
+// bucket rather than to an agent, so a click on "done 27" opens that drawer.
+thread_local! {
+    static DRAWER_ROW_SPANS: std::cell::RefCell<Vec<(usize, Bucket)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn record_drawer_row(row: usize, bucket: Bucket) {
+    DRAWER_ROW_SPANS.with(|spans| spans.borrow_mut().push((row, bucket)));
+}
+
 /// Render one agent into the list: a task-label line, a status badge line, and an
 /// optional diff line. `prefix` is prepended to the task-label line and
 /// `cont_prefix` to the status/diff continuation lines. Both are empty in flat
@@ -391,7 +402,7 @@ impl Bucket {
     ];
 
     /// Short header label (the left pane is only 34 cols wide).
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Bucket::OneOff => "one-off",
             Bucket::Todo => "todo",
@@ -401,6 +412,52 @@ impl Bucket {
             Bucket::Closed => "closed",
         }
     }
+
+    /// Finished work collapses to a single sidebar row instead of one row per run.
+    /// A long session ends with dozens of merged and failed rows; listing them all
+    /// buries the two or three that are still moving.
+    ///
+    /// `done` and `closed` always collapse. `review` is the awkward one: it is
+    /// finished work that still needs a merge decision, so a handful of rows belongs
+    /// inline where the user can act on it — but a session that ends with 25 of them
+    /// (which is what a long fleet run actually produces) is not scannable at four
+    /// lines a row, and the section you must act on is the one whose shape you cannot
+    /// see. Past the threshold it collapses like the rest.
+    pub(crate) fn always_drawer(self) -> bool {
+        matches!(self, Bucket::Done | Bucket::Closed)
+    }
+}
+
+/// Review stays inline up to this many rows, then collapses. Sized so a normal plan
+/// (a few nodes awaiting merge) reads exactly as before.
+pub(crate) const REVIEW_INLINE_LIMIT: usize = 5;
+
+/// Is this bucket currently drawn as a collapsed drawer? Depends on the fleet, because
+/// `review` collapses only once it is too long to read.
+pub(crate) fn bucket_is_drawer(agents: &[AgentRun], bucket: Bucket) -> bool {
+    if bucket.always_drawer() {
+        return true;
+    }
+    bucket == Bucket::Review && bucket_members(agents, bucket).len() > REVIEW_INLINE_LIMIT
+}
+
+/// The buckets currently collapsed, in sidebar (Bucket::ORDER) order, so navigation
+/// and rendering agree on which header rows exist and where.
+pub(crate) fn drawer_buckets(agents: &[AgentRun]) -> Vec<Bucket> {
+    Bucket::ORDER
+        .into_iter()
+        .filter(|&bucket| bucket_is_drawer(agents, bucket))
+        .collect()
+}
+
+/// Indices of the runs a drawer holds, in sidebar order.
+pub(crate) fn drawer_members(agents: &[AgentRun], bucket: Bucket) -> Vec<usize> {
+    bucket_members(agents, bucket)
+}
+
+/// Is this run tucked inside a collapsed drawer (and so not its own sidebar row)?
+pub(crate) fn in_drawer(agents: &[AgentRun], agent: &AgentRun) -> bool {
+    !agent.is_main() && !agent.is_pinned_planner() && bucket_is_drawer(agents, status_bucket(agent))
 }
 
 /// Map an agent to its status section.
@@ -714,6 +771,30 @@ fn render_status_section<'a>(
     }
     if leading_blank {
         lines.push(ListItem::new(Line::default()));
+    }
+    if bucket_is_drawer(&app.agents, bucket) {
+        // One row for the whole section. The chevron is the affordance: `›` closed,
+        // `⌄` open, and the row carries the selection marker when the sidebar cursor
+        // is on it, exactly like an agent row.
+        let selected = app.drawer_cursor == Some(bucket);
+        let open = app.drawer_open() == Some(bucket);
+        let marker = if selected { "▶ " } else { "  " };
+        let chevron = if open { "⌄" } else { "›" };
+        record_drawer_row(lines.len(), bucket);
+        lines.push(ListItem::new(Line::from(vec![
+            Span::styled(
+                marker,
+                if selected {
+                    accent_style(focused)
+                } else {
+                    muted_style(focused)
+                },
+            ),
+            Span::styled(bucket.label(), header_style(focused)),
+            Span::styled(format!(" {}", members.len()), muted_style(focused)),
+            Span::styled(format!("  {chevron}"), muted_style(focused)),
+        ])));
+        return true;
     }
     lines.push(ListItem::new(Line::from(vec![
         Span::styled(bucket.label(), header_style(focused)),
@@ -1207,6 +1288,8 @@ pub(crate) fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let focused = app.focus == FocusPane::Agents;
     // Fresh row-span recording for this frame; harvested into app.agent_row_map below.
     AGENT_ROW_SPANS.with(|spans| spans.borrow_mut().clear());
+    DRAWER_ROW_SPANS.with(|spans| spans.borrow_mut().clear());
+    app.normalize_drawer_state();
     let diff_summaries: Vec<Option<String>> = {
         // Pinned planners (orchestrator + plan-mode front-end) run in the MAIN repo
         // and are rendered via push_orchestrator_row (no diff line), so a diff summary
@@ -1477,6 +1560,15 @@ pub(crate) fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         }
     });
     app.agent_row_map = row_map;
+    let mut drawer_map: Vec<Option<Bucket>> = vec![None; lines.len()];
+    DRAWER_ROW_SPANS.with(|spans| {
+        for &(row, bucket) in spans.borrow().iter() {
+            if let Some(slot) = drawer_map.get_mut(row) {
+                *slot = Some(bucket);
+            }
+        }
+    });
+    app.drawer_row_map = drawer_map;
 
     // Scroll the pane to follow the selection. The list was rendered stateless before,
     // so it always drew from the top: with more agents than fit, the selected row (and
@@ -1488,12 +1580,25 @@ pub(crate) fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     if view_h > 0 {
         let mut first: Option<usize> = None;
         let mut last: Option<usize> = None;
-        for (i, m) in app.agent_row_map.iter().enumerate() {
-            if *m == Some(app.selected_agent) {
-                if first.is_none() {
+        // The cursor is EITHER on an agent's row group or on a collapsed drawer
+        // header. Following only the agent case left the drawer headers unreachable
+        // whenever they sat below the fold: j walked onto them and the pane never
+        // scrolled, so the marker vanished off-screen.
+        if let Some(bucket) = app.drawer_cursor {
+            for (i, m) in app.drawer_row_map.iter().enumerate() {
+                if *m == Some(bucket) {
                     first = Some(i);
+                    last = Some(i);
                 }
-                last = Some(i);
+            }
+        } else {
+            for (i, m) in app.agent_row_map.iter().enumerate() {
+                if *m == Some(app.selected_agent) {
+                    if first.is_none() {
+                        first = Some(i);
+                    }
+                    last = Some(i);
+                }
             }
         }
         if let (Some(first), Some(last)) = (first, last) {
@@ -1842,7 +1947,25 @@ pub(crate) fn visible_agent_indices(agents: &[AgentRun]) -> Vec<usize> {
     // Navigation follows the rendered order: main agents first, then each status
     // section nested by dependency. Sharing `sectioned_agent_order` guarantees the
     // selection marker lands exactly where j/k move.
+    //
+    // Drawer members are drawn inside their drawer rather than as sidebar rows, so the
+    // sectioned view's navigation skips them (see `App::visible_agent_indices`). This
+    // free function stays the full rendered order: nest view (`g`) still draws every
+    // run as its own row, and filtering here would desync that view's j/k.
     sectioned_agent_order(agents)
+}
+
+/// The sectioned view's navigable rows: everything except the runs that a collapsed
+/// drawer holds.
+pub(crate) fn sidebar_agent_indices(agents: &[AgentRun]) -> Vec<usize> {
+    visible_agent_indices(agents)
+        .into_iter()
+        .filter(|&index| {
+            agents
+                .get(index)
+                .is_none_or(|agent| !in_drawer(agents, agent))
+        })
+        .collect()
 }
 
 /// The navigation order for the NEST view (`g`), mirroring `render_agents_nest` exactly
@@ -3059,10 +3182,145 @@ pub(crate) fn render_done_worker_card(frame: &mut Frame<'_>, area: Rect, app: &m
     }
 }
 
+/// One line per finished run in a drawer: node label (or `·` when it has none), the
+/// task summary, and its diff size when the run recorded one. Pure so tests can
+/// assert the list without a terminal.
+pub(crate) fn drawer_list_lines(
+    agents: &[AgentRun],
+    members: &[usize],
+    selected: usize,
+    focused: bool,
+    width: usize,
+) -> Vec<Line<'static>> {
+    members
+        .iter()
+        .enumerate()
+        .filter_map(|(position, &index)| {
+            let run = agents.get(index)?;
+            let is_selected = position == selected;
+            let label = run.node_id.clone().unwrap_or_else(|| "·".to_string());
+            let title = if run.task_summary.trim().is_empty() {
+                summarize_task(&run.task)
+            } else {
+                run.task_summary.clone()
+            };
+            // The label column is fixed so the titles line up into a readable column.
+            let label_width = 4usize;
+            // marker(2) + badge(2) + label + gap(2) + status label.
+            let status_text = agent_status_text(run);
+            let text_width = width
+                .saturating_sub(label_width + 6 + status_text.chars().count())
+                .max(8);
+            Some(Line::from(vec![
+                Span::styled(
+                    if is_selected { "▶ " } else { "  " },
+                    if is_selected {
+                        accent_style(focused)
+                    } else {
+                        muted_style(focused)
+                    },
+                ),
+                // The status badge keeps state legible at a glance inside the drawer,
+                // the way it is on a sidebar row: merged green, failed red. Collapsing
+                // the section must not cost the color coding.
+                Span::styled(BADGE, status_style(run.status)),
+                Span::raw(" "),
+                Span::styled(
+                    format!("{label:<label_width$}"),
+                    if is_selected {
+                        accent_style(focused)
+                    } else {
+                        muted_style(focused)
+                    },
+                ),
+                Span::styled(truncate_chars(&title, text_width), pane_text_style(focused)),
+                Span::raw("  "),
+                Span::styled(status_text, status_style(run.status)),
+            ]))
+        })
+        .collect()
+}
+
+/// The drawer view: the finished runs on top, the highlighted run's result card
+/// below. Mirrors `render_done_worker_card`'s split so the two read the same, but the
+/// top half is the LIST rather than one run's card.
+pub(crate) fn render_drawer(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    let focused = app.focus == FocusPane::Worker || app.focus == FocusPane::Agents;
+    let Some(bucket) = app.drawer_open() else {
+        return;
+    };
+    let members = drawer_members(&app.agents, bucket);
+    let selected = app.drawer_selection().min(members.len().saturating_sub(1));
+    let (list_area, detail_area) = done_card_areas(area);
+
+    let list_inner = block_inner(list_area);
+    let mut lines = drawer_list_lines(
+        &app.agents,
+        &members,
+        selected,
+        focused,
+        list_inner.width as usize,
+    );
+    // Keep the highlighted row on screen when the drawer holds more runs than fit.
+    let view_h = list_inner.height as usize;
+    if view_h > 0 && lines.len() > view_h {
+        let start = selected.saturating_sub(view_h.saturating_sub(1));
+        lines = lines.into_iter().skip(start).take(view_h).collect();
+    }
+    frame.render_widget(
+        Paragraph::new(lines).style(app_style()).block(pane_block(
+            &format!("{} · {}", bucket.label(), members.len()),
+            focused,
+            app.nav_mode,
+        )),
+        list_area,
+    );
+
+    let (title, detail) = match members
+        .get(selected)
+        .and_then(|&index| app.agents.get(index))
+    {
+        Some(run) => {
+            let label = run.node_id.clone().unwrap_or_else(|| "run".to_string());
+            let summary = if run.task_summary.trim().is_empty() {
+                summarize_task(&run.task)
+            } else {
+                run.task_summary.clone()
+            };
+            (
+                format!("{label} · {summary}"),
+                done_worker_card_lines(run, focused),
+            )
+        }
+        None => (
+            format!("{} · nothing here", bucket.label()),
+            vec![Line::from(Span::styled(
+                "This drawer is empty.",
+                muted_style(focused),
+            ))],
+        ),
+    };
+    frame.render_widget(
+        Paragraph::new(detail)
+            .style(app_style())
+            .block(pane_block(&title, focused, app.nav_mode))
+            .wrap(Wrap { trim: false }),
+        detail_area,
+    );
+}
+
 pub(crate) fn render_worker(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let inner = block_inner(area);
     let terminal_size = TerminalSize::new(inner.height.max(1), inner.width.max(1)).ok();
     let focused = app.focus == FocusPane::Worker;
+
+    // An open drawer owns this pane: the finished runs it holds, then the highlighted
+    // one's result. It replaces the terminal view because a merged or failed run has
+    // nothing live to show, and the point of collapsing them was to read the results.
+    if app.drawer_open().is_some() {
+        render_drawer(frame, area, app);
+        return;
+    }
 
     // The selected orchestrator gets the custom DAG command-center view ONLY once
     // its plan is ready. While it is still planning, show its raw PTY so the live
@@ -3936,7 +4194,7 @@ pub(crate) fn render_merge_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) 
             MergeIntent::Selected { task, .. } => format!("Merge:  {}", short_task(task)),
             MergeIntent::Publish { task, .. } => format!("Publish:  {}", short_task(task)),
             MergeIntent::All { ids } => format!(
-                "Merge {} completed worktree{}",
+                "Merge {} completed workspace{}",
                 ids.len(),
                 if ids.len() == 1 { "" } else { "s" }
             ),
@@ -3951,7 +4209,11 @@ pub(crate) fn render_merge_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) 
             key_choice_line(&[
                 (
                     "y",
-                    if publishing { "push and open PR" } else { "merge" },
+                    if publishing {
+                        "push and open PR"
+                    } else {
+                        "merge"
+                    },
                 ),
                 ("Esc", "cancel"),
             ]),
@@ -4476,7 +4738,10 @@ pub(crate) fn page_scroll_rows(area: Option<Rect>) -> isize {
 ///   Alt+u            → half a page up     Alt+d            → half a page down
 /// Positive rows scroll toward history (up), matching scrollback_by.
 pub(crate) fn alt_scroll_rows(key: KeyEvent, area: Option<Rect>) -> Option<isize> {
-    if !key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::META) {
+    if !key
+        .modifiers
+        .intersects(KeyModifiers::ALT | KeyModifiers::META)
+    {
         return None;
     }
     let half = (page_scroll_rows(area) / 2).max(1);
@@ -4571,7 +4836,7 @@ pub(crate) fn agent_status_label(agent: &AgentRun) -> &'static str {
     } else if agent.status == AgentStatus::Done && agent.delivery.required {
         // A deploy/publish task's delivery state (deployed / delivery blocked /
         // delivery proof needed) outranks the generic merge hint — these labels
-        // were unreachable for worktree runs because the awaits-merge branch
+        // were unreachable for workspace runs because the awaits-merge branch
         // below always won.
         agent.lifecycle_label()
     } else if agent.status == AgentStatus::Done && agent_awaits_merge(agent) {

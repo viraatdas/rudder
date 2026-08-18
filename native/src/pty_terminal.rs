@@ -979,7 +979,7 @@ impl TerminalPane {
     /// is a session/process-group leader and its pgid equals its pid. Signaling
     /// the negative pgid hits the agent *and* its descendants (tool shells, MCP
     /// servers, `node`), which otherwise orphan and keep holding the jj/git
-    /// worktree and the slave PTY open. We must also `wait()` the direct child
+    /// workspace and the slave PTY open. We must also `wait()` the direct child
     /// or it lingers as a zombie for the lifetime of the process.
     fn terminate_child(&mut self) {
         #[cfg(unix)]

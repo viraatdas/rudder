@@ -221,7 +221,11 @@ pub(crate) fn handoff_suggestions(app: &App, rest: &str) -> Vec<Suggestion> {
         let score = if normalized.is_empty() {
             0
         } else {
-            match text_match_score(&normalize_search_text(&candidate.title), &normalized, 10_000) {
+            match text_match_score(
+                &normalize_search_text(&candidate.title),
+                &normalized,
+                10_000,
+            ) {
                 Some(score) => score,
                 None => continue,
             }
@@ -519,13 +523,19 @@ pub(crate) fn command_suggestions() -> Vec<Suggestion> {
         },
         Suggestion {
             label: "/review-all".to_string(),
-            detail: "review all completed worktrees before merge".to_string(),
+            detail: "review all completed workspaces before merge".to_string(),
             action: SuggestionAction::RunCommand("/review-all".to_string()),
         },
         Suggestion {
             label: "/merge-all".to_string(),
-            detail: "merge all completed worktrees".to_string(),
+            detail: "merge all completed workspaces".to_string(),
             action: SuggestionAction::RunCommand("/merge-all".to_string()),
+        },
+        Suggestion {
+            label: "/nudge <message>".to_string(),
+            detail: "send one message to every in-flight worker (dead ones are resumed)"
+                .to_string(),
+            action: SuggestionAction::Insert("/nudge ".to_string()),
         },
         Suggestion {
             label: "/verify".to_string(),

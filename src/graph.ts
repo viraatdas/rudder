@@ -12,7 +12,7 @@ import type {
   RunStatus,
   TaskNode,
 } from "./types.js";
-import { ensureProjectRuntimeIgnored, projectStateDir } from "./state.js";
+import { adoptLegacyWorkspaceKey, ensureProjectRuntimeIgnored, projectStateDir } from "./state.js";
 import { nowIso, pathExists, readJson, shortHash, updateJson } from "./util.js";
 
 // ---------------------------------------------------------------------------
@@ -46,12 +46,24 @@ export async function readGraph(repoRoot: string): Promise<RudderGraph> {
       version: 1,
       repoRoot: graph.repoRoot || repoRoot,
       ...(graph.integrationChangeId ? { integrationChangeId: graph.integrationChangeId } : {}),
-      nodes: graph.nodes,
+      nodes: adoptLegacyNodeWorkspaceKeys(graph.nodes),
       edges: graph.edges,
       updatedAt: graph.updatedAt || nowIso(),
     };
   }
   return emptyGraph(repoRoot);
+}
+
+/**
+ * Nodes written before the worktree->workspace rename store isolation info under
+ * `worktree`. Promote it in place so the scheduler, board and TUI only ever read
+ * `workspace`; the next updateGraph persists the new key.
+ */
+function adoptLegacyNodeWorkspaceKeys(nodes: Record<string, TaskNode>): Record<string, TaskNode> {
+  for (const node of Object.values(nodes)) {
+    adoptLegacyWorkspaceKey(node);
+  }
+  return nodes;
 }
 
 /**
@@ -125,7 +137,7 @@ export type MirrorNode = {
   backend?: string;
   model?: string;
   effort?: string;
-  worktreePath?: string;
+  workspacePath?: string;
   deps?: MirrorDep[];
 };
 
@@ -229,7 +241,7 @@ export function mirrorPlanIntoGraph(graph: RudderGraph, payload: MirrorPayload):
       ...(effort ? { effort } : {}),
       status,
       ...(incoming.runId ? { runId: incoming.runId } : {}),
-      ...(incoming.worktreePath ? { worktree: { path: incoming.worktreePath } } : {}),
+      ...(incoming.workspacePath ? { workspace: { path: incoming.workspacePath } } : {}),
       ...(incoming.jjChangeId ? { jjChangeId: incoming.jjChangeId } : {}),
       deps: incomingEdgeIds,
       source: existing?.source ?? "planner",

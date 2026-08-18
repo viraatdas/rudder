@@ -248,10 +248,10 @@ test("e2e: hard-edge DAG serializes, isolates workers, and merges through jj", {
   const implRun = await readJson(path.join(ws.repo, ".rudder", "runs", impl.runId, "run.json"));
   const tstRun = await readJson(path.join(ws.repo, ".rudder", "runs", tst.runId, "run.json"));
   for (const [label, r] of [["impl", implRun], ["test", tstRun]]) {
-    assert.ok(r.worktree?.path, `${label} has a worktree`);
-    assert.notEqual(path.resolve(r.worktree.path), path.resolve(ws.repo), `${label} ran OUTSIDE the main repo`);
+    assert.ok(r.workspace?.path, `${label} has a workspace`);
+    assert.notEqual(path.resolve(r.workspace.path), path.resolve(ws.repo), `${label} ran OUTSIDE the main repo`);
   }
-  assert.notEqual(path.resolve(implRun.worktree.path), path.resolve(tstRun.worktree.path), "distinct workspaces");
+  assert.notEqual(path.resolve(implRun.workspace.path), path.resolve(tstRun.workspace.path), "distinct workspaces");
 
   // HARD edge respected: the test worker started only after the impl finished.
   assert.ok(implRun.process?.endedAt && tstRun.process?.startedAt, "both runs recorded timing");

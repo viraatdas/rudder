@@ -461,7 +461,7 @@ enum AgentMode {
     /// DAG node. `/ask` used to spawn these; it is gone, and the survivors are
     /// `/restore` and `/resume --here`, which adopt an existing chat that was already
     /// about the user's real files. Structurally like Main (main checkout, no jj
-    /// worktree, bypass-permissions tools), distinct in intent + its own list section.
+    /// workspace, bypass-permissions tools), distinct in intent + its own list section.
     OneOff,
 }
 
@@ -585,6 +585,15 @@ struct PlanState {
     pending_questions: Vec<String>,
 }
 
+/// An open finished-work drawer: which bucket, and which member is highlighted.
+/// `selected` indexes the bucket's member list (not `app.agents`), because runs
+/// enter and leave a bucket while the drawer is open; it is clamped on every use.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DrawerState {
+    bucket: Bucket,
+    selected: usize,
+}
+
 struct App {
     focus: FocusPane,
     nav_mode: bool,
@@ -593,7 +602,7 @@ struct App {
     leader_pending: bool,
     worker_view: WorkerView,
     /// When true, the agents pane renders a topological dependency tree (nest view)
-    /// instead of the flat main/worktrees/merged sections. Toggled with `g`.
+    /// instead of the flat main/workspaces/merged sections. Toggled with `g`.
     nest_view: bool,
     /// Waker installed on every PTY pane so child output wakes the main event loop
     /// immediately (see `run`). `None` until `run` builds it; panes spawned while it
@@ -672,10 +681,10 @@ struct App {
     /// Without this gate, keys buffered during a UI stall replayed as
     /// arm+confirm pairs: each pair deleted the next row (selection advances
     /// after a delete), so hammering dd during a slow delete serially wiped
-    /// every worktree on the board. Field report 2026-08-14.
+    /// every workspace on the board. Field report 2026-08-14.
     frames_drawn: u64,
     delete_armed_frame: u64,
-    /// Results from background work (worktree removal) land here; poll_agents
+    /// Results from background work (workspace removal) land here; poll_agents
     /// drains them into the notice line.
     bg_notice_tx: mpsc::Sender<String>,
     bg_notice_rx: mpsc::Receiver<String>,
@@ -731,6 +740,17 @@ struct App {
     /// (render_agents). Mouse clicks resolve through this so hit-testing always
     /// matches what is actually drawn (headers, hints, sections, wrapped rows).
     agent_row_map: Vec<Option<usize>>,
+    /// Agents-pane row -> collapsed drawer header (done/closed), same harvest as
+    /// `agent_row_map`, so a click on "done 27" resolves to that bucket.
+    drawer_row_map: Vec<Option<Bucket>>,
+    /// Which drawer header the sidebar cursor sits on. `None` means the cursor is on
+    /// an agent row (`selected_agent`); the two are mutually exclusive, and j/k walk
+    /// agent rows first, then the drawer headers in `Bucket::DRAWERS` order.
+    drawer_cursor: Option<Bucket>,
+    /// The open drawer and which of its members is highlighted. Enter on a drawer
+    /// header opens it; Esc closes it. While open, the worker pane shows the drawer
+    /// (finished-run list on top, that run's result card below) instead of a terminal.
+    drawer: Option<DrawerState>,
     /// Conductor activity log: an append-only, bounded record of every autonomous
     /// action the orchestrator takes (auto-expanded a node, steered an agent, etc.),
     /// shown in the orchestrator pane. The "visible" half of the no-confirm bargain.
@@ -794,10 +814,13 @@ struct App {
     publish_pr_state_interval: Duration,
     last_publish_pr_state: Option<Instant>,
     /// Cadence gate for the merged-workspace GC sweep (gc_merged_workspaces).
-    last_worktree_gc: Instant,
+    last_workspace_gc: Instant,
     /// Throttle for the web-board steer inbox poll (.rudder/steer/*.json): checked
     /// ~once/sec from poll_agents so a browser "steer" reaches the right agent's PTY.
     last_steer_poll: Instant,
+    /// Outcomes of the orchestrator's recent control markers, newest last. Bounded;
+    /// rendered into RUDDER.md so the conductor can see what its own markers did.
+    control_results: Vec<ControlResult>,
     /// Throttle for the periodic activity-feed heartbeat: emits a one-line "what's
     /// happening" status into .rudder/activity.jsonl every ~45s while work is live.
     last_heartbeat_emit: Instant,
@@ -857,7 +880,7 @@ struct App {
 struct MigratedAgent {
     run_id: String,
     session_id: String,
-    worktree_path: PathBuf,
+    workspace_path: PathBuf,
     fresh_prompt: Option<String>,
 }
 
@@ -916,12 +939,20 @@ struct CloudWorkspaceStatus {
 
 #[derive(Debug)]
 enum MergeIntent {
-    Selected { id: String, task: String },
-    All { ids: Vec<String> },
+    Selected {
+        id: String,
+        task: String,
+    },
+    All {
+        ids: Vec<String>,
+    },
     /// The FIRST publish in a repo. Publishing is otherwise unprompted, so this
     /// intent exists only to carry that one-time consent: accepting it records the
     /// acceptance for the remote and then publishes.
-    Publish { id: String, task: String },
+    Publish {
+        id: String,
+        task: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -930,7 +961,7 @@ struct ReviewAllSource {
     revision: String,
     task: String,
     summary: String,
-    worktree_path: Option<PathBuf>,
+    workspace_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -949,10 +980,34 @@ struct MergeConflictPrompt {
     repo_root: PathBuf,
     target_branch: Option<String>,
     source_branch: Option<String>,
-    worktree_path: Option<PathBuf>,
+    workspace_path: Option<PathBuf>,
     /// The id of the agent whose merge stopped. We reuse its row for the AI
     /// conflict resolver so we never grow a fresh dashboard pane mid-merge.
     agent_id: Option<String>,
+}
+
+/// One marker the orchestrator wrote, and what Rudder actually did with it.
+///
+/// The orchestrator pane is the fleet's control surface, but until this existed
+/// the channel ran one way: the conductor wrote a marker, Rudder stripped the
+/// line and acted, and the conductor never learned the result. So a marker aimed
+/// at a node id that does not exist, or a nudge that reached zero workers, still
+/// read to the conductor as success — and it reported that success to the user.
+/// These entries are rendered back into RUDDER.md so the conductor can tell what
+/// landed, retry what did not, and describe the fleet honestly.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ControlResult {
+    marker: String,
+    outcome: String,
+}
+
+/// How a fleet-wide nudge reaches one worker. A worker with a live terminal takes
+/// the message as a normal turn; one whose process is gone has to be resumed in
+/// its own workspace with the message as the new direction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NudgeDelivery {
+    Inject,
+    Resume,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -975,8 +1030,8 @@ struct AgentRun {
     effort: Option<EffortLevel>,
     status: AgentStatus,
     cwd: PathBuf,
-    worktree_branch: Option<String>,
-    worktree_path: Option<PathBuf>,
+    workspace_branch: Option<String>,
+    workspace_path: Option<PathBuf>,
     /// jj workspace name for runs isolated in a jj workspace. `None` for the
     /// main agent and legacy git-worktree runs.
     workspace_name: Option<String>,
@@ -1160,7 +1215,9 @@ impl AgentRun {
 
     /// Finished worker runs are mergeable only with a durable jj workspace/change.
     fn has_merge_source(&self) -> bool {
-        self.worktree_path.is_some() || self.workspace_name.is_some() || self.jj_change_id.is_some()
+        self.workspace_path.is_some()
+            || self.workspace_name.is_some()
+            || self.jj_change_id.is_some()
     }
 
     fn has_merge_conflict(&self) -> bool {
@@ -1590,7 +1647,7 @@ impl App {
         };
         // Main is no longer auto-pinned. If the user wants one, they type
         // /main from the task pane. Main records render in their own section
-        // instead of being mixed into ordinary worktree agents.
+        // instead of being mixed into ordinary workspace agents.
         let (task_input, task_cursor) = (String::new(), 0);
         let pending_migration_resumes = if cfg!(test) {
             Vec::new()
@@ -1691,6 +1748,9 @@ impl App {
             orch_selection: None,
             orch_visible_rows: Vec::new(),
             agent_row_map: Vec::new(),
+            drawer_row_map: Vec::new(),
+            drawer_cursor: None,
+            drawer: None,
             activity_log: Vec::new(),
             followups_ingested,
             followup_gen,
@@ -1715,8 +1775,9 @@ impl App {
             publish_pr_state_rx: None,
             publish_pr_state_interval: PUBLISH_PR_STATE_BASE_INTERVAL,
             last_publish_pr_state: None,
-            last_worktree_gc: Instant::now(),
+            last_workspace_gc: Instant::now(),
             last_steer_poll: Instant::now(),
+            control_results: Vec::new(),
             last_heartbeat_emit: Instant::now(),
             cloud_workspace: None,
             last_workspace_check: None,
@@ -1861,7 +1922,7 @@ impl App {
             .log_duration_over(event, duration, threshold, fields);
     }
 
-    fn write_rudder_context_timed(&mut self, pending: Option<&WorktreeInfo>) -> Result<()> {
+    fn write_rudder_context_timed(&mut self, pending: Option<&WorkspaceInfo>) -> Result<()> {
         let started = Instant::now();
         // Every plan reports its own verdict: each verifies only the nodes it launched.
         let final_gates: Vec<(FinalGateStatus, Option<&str>)> = self
@@ -1870,12 +1931,18 @@ impl App {
             .filter(|plan| plan.final_gate_status != FinalGateStatus::Idle)
             .map(|plan| (plan.final_gate_status, plan.final_gate_summary.as_deref()))
             .collect();
+        let control_results: Vec<(String, String)> = self
+            .control_results
+            .iter()
+            .map(|entry| (entry.marker.clone(), entry.outcome.clone()))
+            .collect();
         let result = write_rudder_context_with_history(
             &self.cwd,
             &self.agents,
             pending,
             &self.task_history,
             &final_gates,
+            &control_results,
         );
         let duration = started.elapsed();
         self.record_perf_duration("write_rudder_context", duration);
@@ -2187,6 +2254,16 @@ impl App {
             return self.handle_leader_key(key);
         }
 
+        // An open drawer is a pane-level overlay, so Esc backs out of it from
+        // ANY focus. Routing this per-pane meant Esc silently did nothing whenever
+        // focus had drifted (a merge, for instance, leaves it on the task pane) and
+        // the drawer could only be closed by first re-focusing the sidebar.
+        if key.code == KeyCode::Esc && self.drawer.is_some() {
+            self.close_drawer();
+            self.focus = FocusPane::Agents;
+            return false;
+        }
+
         if self.handle_cloud_prompt_key(key) {
             return false;
         }
@@ -2462,10 +2539,21 @@ impl App {
             KeyCode::Up | KeyCode::Char('k') => self.select_previous_agent(),
             KeyCode::Down | KeyCode::Char('j') => self.select_next_agent(),
             KeyCode::Enter => {
-                // APPROVAL GATE: while a plan awaits approval and the pinned
-                // orchestrator is selected, Enter approves the plan and launches the
-                // ready nodes rather than focusing the worker pane.
-                if self.plan().awaiting_approval && self.selected_is_orchestrator() {
+                // The sidebar cursor is on a collapsed drawer header: Enter opens it
+                // (or closes an already-open one), which is the only thing that row
+                // can mean. Checked before every agent action below, because no agent
+                // is "selected" in the sidebar sense while the cursor sits here.
+                if let Some(bucket) = self.drawer_cursor {
+                    self.delete_pending = None;
+                    if self.drawer_open() == Some(bucket) {
+                        self.close_drawer();
+                    } else {
+                        self.open_drawer(bucket);
+                    }
+                } else if self.plan().awaiting_approval && self.selected_is_orchestrator() {
+                    // APPROVAL GATE: while a plan awaits approval and the pinned
+                    // orchestrator is selected, Enter approves the plan and launches
+                    // the ready nodes rather than focusing the worker pane.
                     self.delete_pending = None;
                     self.approve_planned_queue();
                 } else if !self.agents.is_empty() {
@@ -2522,6 +2610,8 @@ impl App {
             KeyCode::Char('u') => self.undo_selected_merge(),
             KeyCode::Char('P') => self.open_main_model_switcher(),
             KeyCode::Char('o') => self.open_web_ui(),
+            // Esc backs out of an open drawer, leaving the cursor on its header row.
+            KeyCode::Esc | KeyCode::Left if self.drawer.is_some() => self.close_drawer(),
             _ => {}
         }
         false
@@ -2551,6 +2641,25 @@ impl App {
     }
 
     fn handle_worker_key(&mut self, key: KeyEvent) -> bool {
+        // While a drawer is open it OWNS this pane: there is no terminal on screen to
+        // type into, so keys move the drawer's list or back out of it. Without this,
+        // focusing the worker pane wrote keystrokes into a finished agent's hidden PTY.
+        if self.drawer.is_some() {
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => self.move_drawer_selection(-1),
+                KeyCode::Down | KeyCode::Char('j') => self.move_drawer_selection(1),
+                KeyCode::Esc | KeyCode::Left => {
+                    self.close_drawer();
+                    self.focus = FocusPane::Agents;
+                }
+                // Enter drops into the highlighted run itself: close the drawer and
+                // hand the pane back to that run's session.
+                KeyCode::Enter => self.close_drawer(),
+                KeyCode::Char('q') => return self.confirm_or_quit(),
+                _ => {}
+            }
+            return false;
+        }
         if self.worker_view == WorkerView::PlanReview {
             return self.handle_plan_review_key(key);
         }
@@ -2950,27 +3059,184 @@ impl App {
         }
     }
 
+    /// Which drawer is open, if any.
+    pub(crate) fn drawer_open(&self) -> Option<Bucket> {
+        self.drawer.map(|drawer| drawer.bucket)
+    }
+
+    /// Reconcile the drawer cursor with the fleet, which moves underneath it: a run
+    /// finishes and falls into `done`, `c` clears merged rows, a drawer empties. Called
+    /// before the sidebar is drawn so the marker is never on a row that is not there.
+    pub(crate) fn normalize_drawer_state(&mut self) {
+        if let Some(drawer) = self.drawer {
+            let len = crate::render::drawer_members(&self.agents, drawer.bucket).len();
+            // A drawer that is no longer collapsed (review fell back under the inline
+            // limit) has its rows in the sidebar again, so the drawer view must go.
+            if !crate::render::bucket_is_drawer(&self.agents, drawer.bucket) {
+                self.drawer = None;
+            } else if len == 0 {
+                self.drawer = None;
+            } else if drawer.selected >= len {
+                self.drawer = Some(DrawerState {
+                    bucket: drawer.bucket,
+                    selected: len - 1,
+                });
+            }
+        }
+        // Drop a cursor whose header is gone: the bucket emptied, or it stopped being a
+        // drawer at all (review fell back under the inline limit).
+        if let Some(bucket) = self.drawer_cursor {
+            if crate::render::drawer_members(&self.agents, bucket).is_empty()
+                || !crate::render::bucket_is_drawer(&self.agents, bucket)
+            {
+                self.drawer_cursor = None;
+            }
+        }
+        // Then re-home a cursorless sidebar: if the selected run now sits inside a
+        // drawer, put the cursor on that drawer's header rather than leaving the pane
+        // with no marker at all. The worker pane keeps showing the run. This runs after
+        // the drop above, not as its `else` — a cursor that was just dropped still needs
+        // somewhere to land, which is exactly the case where its rows moved buckets.
+        if self.drawer_cursor.is_none() {
+            let landed_in = self.agents.get(self.selected_agent).and_then(|run| {
+                crate::render::in_drawer(&self.agents, run)
+                    .then(|| crate::render::status_bucket(run))
+            });
+            if let Some(bucket) = landed_in {
+                self.drawer_cursor = Some(bucket);
+            }
+        }
+    }
+
+    /// Which member of the open drawer is highlighted (0 when none is open).
+    pub(crate) fn drawer_selection(&self) -> usize {
+        self.drawer.map(|drawer| drawer.selected).unwrap_or(0)
+    }
+
+    /// The drawer headers that currently have rows in the sidebar, in drawn order.
+    /// An empty bucket draws no header, so it must not be navigable either.
+    fn drawer_rows(&self) -> Vec<Bucket> {
+        crate::render::drawer_buckets(&self.agents)
+            .into_iter()
+            .filter(|&bucket| !crate::render::drawer_members(&self.agents, bucket).is_empty())
+            .collect()
+    }
+
+    /// Agent index behind the drawer's highlighted row, if the drawer still has one.
+    fn drawer_selected_agent(&self) -> Option<usize> {
+        let drawer = self.drawer?;
+        let members = crate::render::drawer_members(&self.agents, drawer.bucket);
+        members
+            .get(drawer.selected.min(members.len().saturating_sub(1)))
+            .copied()
+    }
+
+    /// Open a drawer with its first member highlighted. `selected_agent` follows the
+    /// highlight so the row keys (m/d/b/r) keep acting on what the user is looking at.
+    fn open_drawer(&mut self, bucket: Bucket) {
+        if crate::render::drawer_members(&self.agents, bucket).is_empty() {
+            return;
+        }
+        self.drawer = Some(DrawerState {
+            bucket,
+            selected: 0,
+        });
+        self.drawer_cursor = Some(bucket);
+        self.sync_selection_to_drawer();
+    }
+
+    fn close_drawer(&mut self) {
+        self.drawer = None;
+    }
+
+    /// Move the highlight inside the open drawer. Saturating, not wrapping: a list of
+    /// finished work reads top-to-bottom, and wrapping past the end is disorienting
+    /// when the list is long enough to scroll.
+    fn move_drawer_selection(&mut self, delta: isize) {
+        let Some(drawer) = self.drawer else {
+            return;
+        };
+        let len = crate::render::drawer_members(&self.agents, drawer.bucket).len();
+        if len == 0 {
+            self.close_drawer();
+            return;
+        }
+        let current = drawer.selected.min(len - 1) as isize;
+        let next = (current + delta).clamp(0, len as isize - 1) as usize;
+        self.drawer = Some(DrawerState {
+            bucket: drawer.bucket,
+            selected: next,
+        });
+        self.sync_selection_to_drawer();
+    }
+
+    fn sync_selection_to_drawer(&mut self) {
+        if let Some(index) = self.drawer_selected_agent() {
+            self.selected_agent = index;
+            self.worker_view = WorkerView::Terminal;
+            self.worker_selection = None;
+        }
+    }
+
+    /// j/k inside an OPEN drawer move within its list rather than leaving it. The
+    /// drawer is a focused sub-list; Esc is how you get back out to the sidebar.
+    fn drawer_takes_navigation(&self) -> bool {
+        self.drawer.is_some() && self.drawer_cursor == self.drawer_open()
+    }
+
     fn select_previous_agent(&mut self) {
         self.delete_pending = None;
         self.orch_dag_scroll = 0;
         self.orch_dag_max_scroll = 0;
         self.orch_follow_bottom = true;
         self.orch_selection = None;
+        if self.drawer_takes_navigation() {
+            self.move_drawer_selection(-1);
+            return;
+        }
         let visible = self.visible_agent_indices();
-        if visible.is_empty() {
+        let drawers = self.drawer_rows();
+        if visible.is_empty() && drawers.is_empty() {
             self.selected_agent = 0;
             return;
         }
-        let position = visible
-            .iter()
-            .position(|&index| index == self.selected_agent)
-            .unwrap_or_else(|| {
-                visible
-                    .iter()
-                    .position(|&index| index >= self.selected_agent)
-                    .unwrap_or_else(|| visible.len().saturating_sub(1))
-            });
-        self.selected_agent = visible[position.saturating_sub(1)];
+        // One combined cursor line: agent rows first, then the drawer headers, which
+        // is exactly the drawn order.
+        let position = match self.drawer_cursor.and_then(|bucket| {
+            drawers
+                .iter()
+                .position(|&candidate| candidate == bucket)
+                .map(|offset| visible.len() + offset)
+        }) {
+            Some(position) => position,
+            None => visible
+                .iter()
+                .position(|&index| index == self.selected_agent)
+                .unwrap_or_else(|| {
+                    visible
+                        .iter()
+                        .position(|&index| index >= self.selected_agent)
+                        .unwrap_or_else(|| visible.len().saturating_sub(1))
+                }),
+        };
+        self.apply_sidebar_position(position.saturating_sub(1), &visible, &drawers);
+    }
+
+    /// Land the sidebar cursor on combined-order slot `position`: an agent row when it
+    /// falls in the agent range, otherwise a drawer header.
+    fn apply_sidebar_position(&mut self, position: usize, visible: &[usize], drawers: &[Bucket]) {
+        if position < visible.len() {
+            self.drawer_cursor = None;
+            self.selected_agent = visible[position];
+            return;
+        }
+        let offset = position - visible.len();
+        if let Some(&bucket) = drawers.get(offset.min(drawers.len().saturating_sub(1))) {
+            self.drawer_cursor = Some(bucket);
+        } else if let Some(&last) = visible.last() {
+            self.drawer_cursor = None;
+            self.selected_agent = last;
+        }
     }
 
     fn select_next_agent(&mut self) {
@@ -2979,25 +3245,40 @@ impl App {
         self.orch_dag_max_scroll = 0;
         self.orch_follow_bottom = true;
         self.orch_selection = None;
+        if self.drawer_takes_navigation() {
+            self.move_drawer_selection(1);
+            return;
+        }
         let visible = self.visible_agent_indices();
-        if visible.is_empty() {
+        let drawers = self.drawer_rows();
+        if visible.is_empty() && drawers.is_empty() {
             self.selected_agent = 0;
             return;
         }
-        let exact = visible
-            .iter()
-            .position(|&index| index == self.selected_agent);
-        let step = match exact {
-            // Still visible: advance to the following agent.
-            Some(position) => position + 1,
-            // Hidden/removed: the first visible index at or after the old
-            // selection already IS the natural next agent, so do not skip it.
-            None => visible
+        let step = match self.drawer_cursor.and_then(|bucket| {
+            drawers
                 .iter()
-                .position(|&index| index >= self.selected_agent)
-                .unwrap_or_else(|| visible.len().saturating_sub(1)),
+                .position(|&candidate| candidate == bucket)
+                .map(|offset| visible.len() + offset)
+        }) {
+            Some(position) => position + 1,
+            None => match visible
+                .iter()
+                .position(|&index| index == self.selected_agent)
+            {
+                // Still visible: advance to the following agent.
+                Some(position) => position + 1,
+                // Hidden/removed (including a run that just fell into a drawer): the
+                // first visible index at or after the old selection already IS the
+                // natural next agent, so do not skip it.
+                None => visible
+                    .iter()
+                    .position(|&index| index >= self.selected_agent)
+                    .unwrap_or(visible.len()),
+            },
         };
-        self.selected_agent = visible[step.min(visible.len().saturating_sub(1))];
+        let last = visible.len() + drawers.len() - 1;
+        self.apply_sidebar_position(step.min(last), &visible, &drawers);
     }
 
     fn visible_agent_indices(&self) -> Vec<usize> {
@@ -3005,10 +3286,13 @@ impl App {
         // view walks the dependency tree globally (crossing status buckets), while the
         // default view nests within each status section. Using the wrong one makes j/k
         // land on a different row than the highlighted one.
+        // Nest view draws every run as its own row (no status sections, so no drawers);
+        // the sectioned view hides finished runs inside their drawer, and navigation
+        // must skip what is not drawn.
         if self.nest_view {
             nest_agent_order(&self.agents)
         } else {
-            visible_agent_indices(&self.agents)
+            sidebar_agent_indices(&self.agents)
         }
     }
 
@@ -3069,7 +3353,7 @@ impl App {
         let sources = self.review_all_sources();
 
         if sources.is_empty() {
-            self.notice = Some("no completed worktrees ready to review".to_string());
+            self.notice = Some("no completed workspaces ready to review".to_string());
             return;
         }
 
@@ -3103,7 +3387,7 @@ impl App {
                     } else {
                         run.task_summary.trim().to_string()
                     },
-                    worktree_path: run.worktree_path.clone(),
+                    workspace_path: run.workspace_path.clone(),
                 })
             })
             .collect()
@@ -3119,11 +3403,11 @@ impl App {
 
     #[cfg(test)]
     fn start_review_all_test_agent(&mut self, sources: Vec<ReviewAllSource>) {
-        let worktree = WorktreeInfo {
+        let workspace = WorkspaceInfo {
             id: new_run_id("review all"),
             path: self.cwd.join(".rudder-review-all-test"),
             branch: None,
-            path_is_worktree: true,
+            path_is_workspace: true,
             workspace_name: Some("rudder-test-review-all".to_string()),
             jj_change_id: Some("review-change".to_string()),
         };
@@ -3136,12 +3420,12 @@ impl App {
         };
         let prompt = review_all_prompt(
             current_branch_at(&self.cwd).as_deref().unwrap_or("HEAD"),
-            &worktree,
+            &workspace,
             &sources,
             &premerge,
         );
         let (review_backend, review_model, review_effort) = self.review_agent_profile();
-        let mut run = review_all_run(worktree, prompt, sources, None);
+        let mut run = review_all_run(workspace, prompt, sources, None);
         run.backend = review_backend;
         run.model = review_model.to_string();
         run.effort = Some(review_effort);
@@ -3199,11 +3483,11 @@ impl App {
                     .map(|value| value.trim().to_string())
             })
             .unwrap_or_else(|| "HEAD".to_string());
-        let mut worktree =
-            prepare_jj_workspace_at(&self.cwd, "review all completed worktrees", None)?;
-        let premerge = premerge_review_all_sources(&worktree.path, &sources);
-        worktree.jj_change_id = jj_workspace_change_id(&worktree.path);
-        let prompt = review_all_prompt(&target_ref, &worktree, &sources, &premerge);
+        let mut workspace =
+            prepare_jj_workspace_at(&self.cwd, "review all completed workspaces", None)?;
+        let premerge = premerge_review_all_sources(&workspace.path, &sources);
+        workspace.jj_change_id = jj_workspace_change_id(&workspace.path);
+        let prompt = review_all_prompt(&target_ref, &workspace, &sources, &premerge);
         let (review_backend, review_model, review_effort) = self.review_agent_profile();
         let session_id = mint_session_id_for(review_backend);
         let mut command = agent_command(
@@ -3218,14 +3502,14 @@ impl App {
             &mut command,
             review_backend,
             AgentMode::ReviewAll,
-            &worktree.id,
+            &workspace.id,
         );
         let options = TerminalPaneOptions {
             size: TerminalSize::default(),
-            cwd: Some(worktree.path.clone()),
+            cwd: Some(workspace.path.clone()),
             ..TerminalPaneOptions::default()
         };
-        let mut run = review_all_run(worktree, prompt, sources, session_id);
+        let mut run = review_all_run(workspace, prompt, sources, session_id);
         // Keep the row's shown model honest with what actually spawned.
         run.backend = review_backend;
         run.model = review_model;
@@ -3262,7 +3546,7 @@ impl App {
                 .unwrap_or(0);
             let (_, review_model, _) = self.review_agent_profile();
             self.notice = Some(format!(
-                "started {review_model} thermonuclear review-all for {count} worktree{}; press m on that row when done",
+                "started {review_model} thermonuclear review-all for {count} workspace{}; press m on that row when done",
                 if count == 1 { "" } else { "s" }
             ));
         }
@@ -4027,6 +4311,16 @@ impl App {
         }
 
         self.delete_pending = None;
+        // A click on a collapsed drawer header toggles it, mirroring Enter on that row.
+        if let Some(bucket) = drawer_bucket_from_mouse(self, mouse, area) {
+            self.drawer_cursor = Some(bucket);
+            if self.drawer_open() == Some(bucket) {
+                self.close_drawer();
+            } else {
+                self.open_drawer(bucket);
+            }
+            return;
+        }
         if let Some(index) = agent_index_from_mouse(self, mouse, area) {
             if index != self.selected_agent {
                 self.orch_dag_scroll = 0;
@@ -4034,6 +4328,9 @@ impl App {
                 self.orch_follow_bottom = true;
                 self.orch_selection = None;
             }
+            // Clicking a live row leaves the drawer: the cursor is on an agent again.
+            self.drawer_cursor = None;
+            self.close_drawer();
             self.selected_agent = index;
         }
     }
@@ -5050,8 +5347,8 @@ impl App {
             effort,
             status: AgentStatus::Running,
             cwd: self.cwd.clone(),
-            worktree_branch: None,
-            worktree_path: None,
+            workspace_branch: None,
+            workspace_path: None,
             workspace_name: None,
             jj_change_id: None,
             integration: IntegrationEvidence::default(),
@@ -5136,22 +5433,22 @@ impl App {
             .map(ToString::to_string)
             .or_else(|| rudder_plan_worker_title_from_prompt(input));
         let should_generate_summary = planner_title.is_none();
-        let worktree_label = planner_title.as_deref().unwrap_or(input);
+        let workspace_label = planner_title.as_deref().unwrap_or(input);
         let task_summary = planner_title
             .as_deref()
             .map(|title| truncate_chars(title, 56))
             .unwrap_or_else(|| summarize_task(input));
-        let worktree = match prepare_jj_workspace(&self.cwd, worktree_label) {
-            Ok(worktree) => worktree,
+        let workspace = match prepare_jj_workspace(&self.cwd, workspace_label) {
+            Ok(workspace) => workspace,
             Err(error) => {
                 // New runs are jj-isolated; never silently fall back to git.
                 // Surface the failure and run in the current checkout so the user
                 // sees the error rather than a half-broken merge later.
                 self.notice = Some(format!("jj workspace failed: {error}"));
-                WorktreeInfo::current(self.cwd.clone())
+                WorkspaceInfo::current(self.cwd.clone())
             }
         };
-        if let Err(error) = self.write_rudder_context_timed(Some(&worktree)) {
+        if let Err(error) = self.write_rudder_context_timed(Some(&workspace)) {
             self.notice = Some(format!("context warning: {error}"));
         }
 
@@ -5201,22 +5498,22 @@ impl App {
         // never snapshotted into the merge. The env propagates to the `rudder done`
         // subprocess the agent spawns. A missing report is reconstructed from the diff.
         if let Some(id) = node_id.as_deref() {
-            let done_file = worker_done_file(&worktree.path, id);
+            let done_file = worker_done_file(&workspace.path, id);
             command = command.with_env("RUDDER_DONE_FILE", done_file.to_string_lossy().to_string());
         }
         // Official completion signal: wire the backend's own Stop hook (Claude) /
         // notify (Codex) so it deterministically reports turn-end. Keyed by the run id the poll loop
         // reads. See signals.rs.
-        signals::augment_worker_command(&mut command, backend, AgentMode::Execute, &worktree.id);
+        signals::augment_worker_command(&mut command, backend, AgentMode::Execute, &workspace.id);
         let options = TerminalPaneOptions {
             size: TerminalSize::default(),
-            cwd: Some(worktree.path.clone()),
+            cwd: Some(workspace.path.clone()),
             ..TerminalPaneOptions::default()
         };
 
         let created_at = now_stamp();
         let mut run = AgentRun {
-            id: worktree.id.clone(),
+            id: workspace.id.clone(),
             created_at: created_at.clone(),
             mode: AgentMode::Execute,
             task: goal_prompt.clone(),
@@ -5232,11 +5529,13 @@ impl App {
             model,
             effort,
             status: AgentStatus::Running,
-            cwd: worktree.path.clone(),
-            worktree_branch: worktree.branch.clone(),
-            worktree_path: worktree.path_is_worktree.then_some(worktree.path.clone()),
-            workspace_name: worktree.workspace_name.clone(),
-            jj_change_id: worktree.jj_change_id.clone(),
+            cwd: workspace.path.clone(),
+            workspace_branch: workspace.branch.clone(),
+            workspace_path: workspace
+                .path_is_workspace
+                .then_some(workspace.path.clone()),
+            workspace_name: workspace.workspace_name.clone(),
+            jj_change_id: workspace.jj_change_id.clone(),
             integration: IntegrationEvidence::default(),
             publish: PublishEvidence::default(),
             delivery: DeliveryEvidence::for_task(&goal_prompt),
@@ -5405,8 +5704,8 @@ impl App {
             effort,
             status: AgentStatus::Running,
             cwd: self.cwd.clone(),
-            worktree_branch: None,
-            worktree_path: None,
+            workspace_branch: None,
+            workspace_path: None,
             workspace_name: None,
             jj_change_id: None,
             integration: IntegrationEvidence::default(),
@@ -5880,7 +6179,7 @@ impl App {
                     MigratedAgent {
                         run_id: run.id.clone(),
                         session_id: run.session_id.clone().unwrap_or_default(),
-                        worktree_path: run.worktree_path.clone().unwrap_or(run.cwd.clone()),
+                        workspace_path: run.workspace_path.clone().unwrap_or(run.cwd.clone()),
                         fresh_prompt: None,
                     },
                 ))
@@ -5951,10 +6250,10 @@ impl App {
         if run.terminal.is_some() && run.status == AgentStatus::Running {
             return false;
         }
-        let cwd = if entry.worktree_path.as_os_str().is_empty() {
+        let cwd = if entry.workspace_path.as_os_str().is_empty() {
             run.cwd.clone()
         } else {
-            entry.worktree_path.clone()
+            entry.workspace_path.clone()
         };
         let mut command = if !entry.session_id.is_empty() && run.backend == Backend::Claude {
             claude_resume_command(run, &entry.session_id)
@@ -6337,7 +6636,7 @@ impl App {
     }
 
     /// Spawn a ONE-OFF agent: a single conversational agent in the MAIN checkout (no jj
-    /// worktree, no DAG node) that the user talks to for a question or a small change. It
+    /// workspace, no DAG node) that the user talks to for a question or a small change. It
     /// can edit the working tree directly. Selected + focused so the user can converse
     /// immediately (keys forward to its PTY via the normal worker path).
     /// `/restore claude|codex <session-id>`: reopen an existing CLI conversation
@@ -6923,8 +7222,7 @@ impl App {
                     .unwrap_or_default()
                     .trim()
                     .to_string();
-                let (target, session_id, instruction) =
-                    crate::handoff::parse_resume_args(&rest);
+                let (target, session_id, instruction) = crate::handoff::parse_resume_args(&rest);
                 if session_id.is_empty() {
                     self.maybe_refresh_handoff_candidates();
                     let found = self.handoff_candidates.len();
@@ -7101,6 +7399,20 @@ impl App {
                 self.request_merge_all_ready();
                 true
             }
+            // Handled by Rudder itself, NOT forwarded to the orchestrator agent.
+            // The case this exists for is a dropped connection, which can have
+            // killed the orchestrator too — asking a dead conductor to write
+            // RUDDER_NUDGE_ALL would leave the fleet stalled with no way back.
+            Some("/nudge") => {
+                let message = command_rest(input, "/nudge").trim().to_string();
+                if message.is_empty() {
+                    self.notice =
+                        Some("usage: /nudge <message to every in-flight worker>".to_string());
+                } else {
+                    self.nudge_all_workers(&message);
+                }
+                true
+            }
             Some("/verify") => {
                 self.plan_mut().final_gate_status = FinalGateStatus::Idle;
                 self.plan_mut().final_gate_summary = None;
@@ -7114,7 +7426,7 @@ impl App {
             }
             Some("/sync") => {
                 // Retired: jj keeps node workspaces current automatically, so manual
-                // worktree sync no longer fits the orchestrator paradigm.
+                // workspace sync no longer fits the orchestrator paradigm.
                 self.notice = Some(
                     "sync is retired; jj keeps node workspaces current automatically".to_string(),
                 );
@@ -7651,7 +7963,7 @@ impl App {
             let entry = MigratedAgent {
                 run_id: run_id.clone(),
                 session_id: self.agents[index].session_id.clone().unwrap_or_default(),
-                worktree_path: self.agents[index].cwd.clone(),
+                workspace_path: self.agents[index].cwd.clone(),
                 fresh_prompt: Some(format!(
                     "Cloud migration failed. Continue the original task locally from the existing workspace: {}",
                     self.agents[index].task
@@ -7712,8 +8024,8 @@ impl App {
             effort: self.effort,
             status: AgentStatus::Running,
             cwd: self.cwd.clone(),
-            worktree_branch: None,
-            worktree_path: None,
+            workspace_branch: None,
+            workspace_path: None,
             workspace_name: None,
             jj_change_id: None,
             integration: IntegrationEvidence::default(),
@@ -8215,7 +8527,16 @@ impl App {
         }
         let _ = std::fs::write(&path, rewritten);
         for action in actions {
+            // The handlers report through self.notice on BOTH paths (push_activity
+            // on success, a message on rejection), so clearing it first makes the
+            // notice we read back belong to this marker and no earlier one.
+            self.notice = None;
             self.handle_orchestrator_skill_marker(&action);
+            let outcome = self
+                .notice
+                .clone()
+                .unwrap_or_else(|| "acted".to_string());
+            self.record_control_result(&action, outcome);
         }
         self.dirty = true;
     }
@@ -8352,11 +8673,19 @@ impl App {
             self.notice = Some("RUDDER_INJECT requires <node-or-run-id> <message>".to_string());
             return;
         }
+        if let Some(rest) = marker.strip_prefix("RUDDER_NUDGE_ALL ") {
+            self.nudge_all_workers(rest.trim());
+            return;
+        }
+        if marker == "RUDDER_NUDGE_ALL" {
+            self.notice = Some("RUDDER_NUDGE_ALL requires a message".to_string());
+            return;
+        }
         match marker {
             "RUDDER_USAGE" => self.show_usage_summary(),
             "RUDDER_HELP" => {
                 self.notice = Some(
-                    "skills: model, main, goal, monitor, add/replan, merge/stop/regoal/inject, usage, cloud, review-all"
+                    "skills: model, main, goal, monitor, add/replan, merge/stop/regoal/inject, nudge-all, usage, cloud, review-all"
                         .to_string(),
                 );
             }
@@ -8403,8 +8732,8 @@ impl App {
         }
         let task = run.task.clone();
         let label = run.node_id.clone().unwrap_or_else(|| run.id.clone());
-        let source_branch = run.worktree_branch.clone();
-        let worktree_path = run.worktree_path.clone();
+        let source_branch = run.workspace_branch.clone();
+        let workspace_path = run.workspace_path.clone();
         let agent_id = Some(run.id.clone());
         match self.merge_agent_at(index) {
             Ok(()) => {
@@ -8412,7 +8741,7 @@ impl App {
                 self.run_scheduler();
             }
             Err(error) => {
-                self.handle_merge_error(task, error, None, source_branch, worktree_path, agent_id);
+                self.handle_merge_error(task, error, None, source_branch, workspace_path, agent_id);
             }
         }
     }
@@ -8493,6 +8822,94 @@ impl App {
         } else {
             self.notice = Some(format!("{token} has no live terminal for injection"));
         }
+    }
+
+    /// Which rows a fleet-wide nudge targets, and how each one must be reached.
+    /// Pure so the selection rule is testable without a PTY or a live App.
+    ///
+    /// Finished work (Done/Merged/Migrated) is NEVER a target: a nudge is a
+    /// "carry on" to work still in flight, and restarting a merged worker would
+    /// redo landed work. The orchestrator is excluded because it is the thing
+    /// issuing the nudge.
+    fn nudge_targets(&self) -> Vec<(usize, NudgeDelivery)> {
+        self.agents
+            .iter()
+            .enumerate()
+            .filter(|(_, run)| !run.is_orchestrator())
+            .filter_map(|(index, run)| {
+                let delivery = match run.status {
+                    AgentStatus::Running | AgentStatus::Paused => {
+                        // A live PTY takes the note as a normal turn, which keeps
+                        // the worker's context. Without one the process is gone
+                        // (this is the connection-drop case), so resuming its
+                        // session in the same workspace is the only way through.
+                        if run.terminal.is_some() {
+                            NudgeDelivery::Inject
+                        } else {
+                            NudgeDelivery::Resume
+                        }
+                    }
+                    AgentStatus::Stopped | AgentStatus::Failed | AgentStatus::Orphaned => {
+                        NudgeDelivery::Resume
+                    }
+                    AgentStatus::Done | AgentStatus::Merged | AgentStatus::Migrated => {
+                        return None;
+                    }
+                };
+                // `restart_agent_at` refuses the main-checkout row, so a main
+                // worker with no terminal cannot be nudged at all.
+                if delivery == NudgeDelivery::Resume && run.is_main() {
+                    return None;
+                }
+                Some((index, delivery))
+            })
+            .collect()
+    }
+
+    /// Send one message to every in-flight worker: typed into the ones still
+    /// live, and used as the resume direction for the ones whose process died.
+    /// This is the "I lost my connection, everyone keep going" action.
+    fn nudge_all_workers(&mut self, message: &str) {
+        let message = message.trim();
+        if message.is_empty() {
+            self.notice = Some("RUDDER_NUDGE_ALL requires a message".to_string());
+            return;
+        }
+        let targets = self.nudge_targets();
+        if targets.is_empty() {
+            self.notice = Some("no in-flight workers to nudge".to_string());
+            return;
+        }
+        let mut injected = 0usize;
+        let mut resumed = 0usize;
+        let mut failed = 0usize;
+        for (index, delivery) in targets {
+            let ok = match delivery {
+                NudgeDelivery::Inject => self.live_inject_at(index, message),
+                NudgeDelivery::Resume => self.restart_agent_at(index, message, None),
+            };
+            if !ok {
+                failed += 1;
+            } else if delivery == NudgeDelivery::Inject {
+                injected += 1;
+            } else {
+                resumed += 1;
+            }
+        }
+        let reached = injected + resumed;
+        let mut summary = format!(
+            "nudged {reached} worker{}",
+            if reached == 1 { "" } else { "s" }
+        );
+        if resumed > 0 {
+            summary.push_str(&format!(" ({injected} live, {resumed} resumed)"));
+        }
+        if failed > 0 {
+            summary.push_str(&format!("; {failed} could not be reached"));
+        }
+        self.push_activity(summary.clone());
+        self.notice = Some(summary);
+        self.dirty = true;
     }
 
     fn evaluate_completed_plan(&mut self, index: usize) {
@@ -9033,6 +9450,23 @@ impl App {
         self.record_activity(msg);
     }
 
+    /// Remember what one orchestrator marker did. Kept short and bounded: this is
+    /// a feedback channel for the conductor's next turn, not an audit log.
+    fn record_control_result(&mut self, marker: &str, outcome: impl Into<String>) {
+        // The verb plus a little of its target is enough for the conductor to
+        // match the entry to the line it wrote; a full prompt would crowd out the
+        // rest of RUDDER.md.
+        let marker = preview_text(marker.trim(), 120);
+        let outcome = preview_text(outcome.into().trim(), 200);
+        self.control_results.push(ControlResult { marker, outcome });
+        const MAX_CONTROL_RESULTS: usize = 12;
+        if self.control_results.len() > MAX_CONTROL_RESULTS {
+            let overflow = self.control_results.len() - MAX_CONTROL_RESULTS;
+            self.control_results.drain(0..overflow);
+        }
+        self.dirty = true;
+    }
+
     /// Append a one-line entry to the conductor activity log without taking over
     /// the task-pane notice. Used when a modal is already carrying the active prompt.
     fn record_activity(&mut self, msg: impl Into<String>) {
@@ -9244,6 +9678,9 @@ impl App {
             let result = match kind.as_str() {
                 "cancel" => self.deliver_cancel_request(&task_id),
                 "merge" => self.deliver_merge_request(&task_id),
+                // Fleet-wide nudge: one message to every in-flight worker, with
+                // no task id. Same at-most-once ledger as a single steer.
+                "nudge-all" => self.deliver_nudge_all_request(&instruction),
                 _ => self.deliver_steer_request(&task_id, &instruction),
             };
             let _ = self.write_steer_receipt(&request_id, &result);
@@ -9391,6 +9828,16 @@ impl App {
         } else {
             SteerDelivery::Failed(format!("{task_id} could not be stopped"))
         }
+    }
+
+    fn deliver_nudge_all_request(&mut self, instruction: &str) -> SteerDelivery {
+        // As with merge, a stale notice would masquerade as this nudge's error.
+        self.notice = None;
+        if self.nudge_targets().is_empty() {
+            return SteerDelivery::Failed("no in-flight workers to nudge".to_string());
+        }
+        self.nudge_all_workers(instruction);
+        SteerDelivery::Delivered
     }
 
     fn deliver_merge_request(&mut self, task_id: &str) -> SteerDelivery {
@@ -10050,10 +10497,18 @@ impl App {
             KeyCode::Down => {
                 self.select_plan_review_node(1);
             }
-            KeyCode::Char('k') if key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::META) => {
+            KeyCode::Char('k')
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::ALT | KeyModifiers::META) =>
+            {
                 self.select_plan_review_node(-1);
             }
-            KeyCode::Char('j') if key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::META) => {
+            KeyCode::Char('j')
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::ALT | KeyModifiers::META) =>
+            {
                 self.select_plan_review_node(1);
             }
             KeyCode::PageUp => {
@@ -10630,7 +11085,7 @@ impl App {
     ///   - every queued `planned_node` (status "planned", with its hard + soft deps)
     ///   - every plan-launched agent (those carrying a `node_id`), status mapped
     ///     from AgentStatus (Running->running, Done->review, Merged->merged,
-    ///     Failed/Stopped->failed), carrying its runId, jjChangeId, worktree path,
+    ///     Failed/Stopped->failed), carrying its runId, jjChangeId, workspace path,
     ///     and its deps/soft_deps.
     /// Pure (no IO) so the builder can be unit-tested without a shell-out.
     fn build_mirror_payload(&self) -> serde_json::Value {
@@ -10723,8 +11178,8 @@ impl App {
             if let Some(change) = &run.jj_change_id {
                 value["jjChangeId"] = serde_json::json!(change);
             }
-            if let Some(path) = &run.worktree_path {
-                value["worktreePath"] = serde_json::json!(path.to_string_lossy());
+            if let Some(path) = &run.workspace_path {
+                value["workspacePath"] = serde_json::json!(path.to_string_lossy());
             }
             nodes.push(value);
         }
@@ -10812,7 +11267,7 @@ impl App {
     /// After merging, drain the
     /// scheduler so newly-ready children launch.
     /// Reclaim disk from MERGED nodes' jj workspaces. Each agent runs in a full
-    /// working-copy checkout under `.rudder-worktrees`; once a node is merged its
+    /// working-copy checkout under `.rudder-workspaces`; once a node is merged its
     /// code lives in main, so the checkout is pure redundancy. We keep it for a
     /// short grace window (default 1h, `RUDDER_WORKTREE_GC_GRACE_SECS`) so a
     /// just-merged node stays re-goalable, then this sweep forgets the workspace
@@ -10837,7 +11292,7 @@ impl App {
             if cleaned >= MAX_PER_SWEEP {
                 break;
             }
-            let (Some(name), Some(path)) = (run.workspace_name.clone(), run.worktree_path.clone())
+            let (Some(name), Some(path)) = (run.workspace_name.clone(), run.workspace_path.clone())
             else {
                 continue;
             };
@@ -10845,7 +11300,7 @@ impl App {
                 continue;
             }
             if forget_jj_workspace(&repo, &name, &path).is_ok() {
-                run.worktree_path = None;
+                run.workspace_path = None;
                 let _ = save_native_run_record(&repo, run);
                 cleaned += 1;
                 // Durable, not just a notice: "where did my workspace go?" has to
@@ -10871,12 +11326,12 @@ impl App {
         }
     }
 
-    /// Sweep ORPHANED jj workspaces — ones under `.rudder-worktrees` (or in jj's
+    /// Sweep ORPHANED jj workspaces — ones under `.rudder-workspaces` (or in jj's
     /// registry) that no live agent row owns, e.g. after rows were cleared or a
     /// plan was collapsed on reload. `gc_merged_workspaces` only reaches merged
     /// ROWS; without this, orphans pile up on disk (observed: 4.1 GB / 10 dirs).
     /// Safe by construction: it never touches a path owned by any current agent
-    /// row, never touches `default` or a dir outside `.rudder-worktrees`, waits
+    /// row, never touches `default` or a dir outside `.rudder-workspaces`, waits
     /// out the grace window, and skips while a resolver/rebase churns the op log.
     fn gc_orphan_workspaces(&mut self) {
         if self.plan().rebasing
@@ -10900,7 +11355,11 @@ impl App {
         let live_paths: HashSet<PathBuf> = self
             .agents
             .iter()
-            .map(|run| run.worktree_path.clone().unwrap_or_else(|| run.cwd.clone()))
+            .map(|run| {
+                run.workspace_path
+                    .clone()
+                    .unwrap_or_else(|| run.cwd.clone())
+            })
             .collect();
         let live_names: HashSet<String> = self
             .agents
@@ -10930,28 +11389,35 @@ impl App {
             }
         }
 
-        // 2) Remove orphan directories under .rudder-worktrees/<group>/<node> that
+        // 2) Remove orphan directories under .rudder-workspaces/<group>/<node> that
         // no live row owns and that have sat idle past the grace window.
-        let root = repo.join(".rudder-worktrees");
         let mut removed = 0usize;
-        if let Ok(groups) = fs::read_dir(&root) {
-            for group in groups.flatten() {
-                let Ok(entries) = fs::read_dir(group.path()) else {
-                    continue;
-                };
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if !path.is_dir() || live_paths.contains(&path) {
+        // Both spellings: a repo that ran a pre-rename Rudder still has orphan
+        // directories under the legacy path, and they are just as reclaimable.
+        for dir in [
+            crate::gitio::AGENT_WORKSPACES_DIR,
+            crate::gitio::LEGACY_AGENT_WORKSPACES_DIR,
+        ] {
+            let root = repo.join(dir);
+            if let Ok(groups) = fs::read_dir(&root) {
+                for group in groups.flatten() {
+                    let Ok(entries) = fs::read_dir(group.path()) else {
                         continue;
-                    }
-                    let idle = fs::metadata(&path)
-                        .and_then(|meta| meta.modified())
-                        .ok()
-                        .and_then(|mtime| now.duration_since(mtime).ok())
-                        .map(|age| age >= grace)
-                        .unwrap_or(false);
-                    if idle && fs::remove_dir_all(&path).is_ok() {
-                        removed += 1;
+                    };
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if !path.is_dir() || live_paths.contains(&path) {
+                            continue;
+                        }
+                        let idle = fs::metadata(&path)
+                            .and_then(|meta| meta.modified())
+                            .ok()
+                            .and_then(|mtime| now.duration_since(mtime).ok())
+                            .map(|age| age >= grace)
+                            .unwrap_or(false);
+                        if idle && fs::remove_dir_all(&path).is_ok() {
+                            removed += 1;
+                        }
                     }
                 }
             }
@@ -11181,7 +11647,7 @@ impl App {
                         repo_root: self.cwd.clone(),
                         target_branch: None,
                         source_branch: None,
-                        worktree_path: None,
+                        workspace_path: None,
                         agent_id: Some(id.clone()),
                     });
                     self.start_conflict_resolution_agent();
@@ -11710,8 +12176,8 @@ impl App {
             // the wrong row selected.
             self.notice = Some(if live_main {
                 format!("{label} is still running — press d again to stop it and delete the row · any other key cancels")
-            } else if selected.worktree_path.is_some() {
-                format!("delete {label} and remove its worktree? press d again to confirm · any other key cancels")
+            } else if selected.workspace_path.is_some() {
+                format!("delete {label} and remove its workspace? press d again to confirm · any other key cancels")
             } else {
                 format!("delete {label}? press d again to confirm · any other key cancels")
             });
@@ -11723,8 +12189,7 @@ impl App {
             // lives would leak the process with nothing left pointing at it.
             if !self.stop_agent_at(idx) {
                 self.delete_pending = None;
-                self.notice =
-                    Some("could not stop the main agent — row not deleted".to_string());
+                self.notice = Some("could not stop the main agent — row not deleted".to_string());
                 return;
             }
         }
@@ -11761,18 +12226,18 @@ impl App {
         if was_ingested || was_pending {
             self.persist_ingested_runs();
         }
-        // Worktree removal runs in the BACKGROUND: remove_dir_all on a tree
+        // Workspace removal runs in the BACKGROUND: remove_dir_all on a tree
         // with node_modules takes seconds, and doing it here froze the whole
         // UI — the freeze that buffered the key bursts this flow now guards
         // against. The row is already gone from the board; only the disk
         // cleanup is deferred, and its outcome lands in the notice line via
         // the bg-notice channel.
-        if let Some(path) = run.worktree_path.clone() {
+        if let Some(path) = run.workspace_path.clone() {
             let cwd = self.cwd.clone();
             let workspace_name = run.workspace_name.clone();
             let tx = self.bg_notice_tx.clone();
             thread::Builder::new()
-                .name("rudder-worktree-remove".to_string())
+                .name("rudder-workspace-remove".to_string())
                 .spawn(move || {
                     let error = if let Some(name) = workspace_name.as_deref() {
                         // jj workspace: forget the registry entry AND remove the
@@ -11794,21 +12259,21 @@ impl App {
                                 let stderr =
                                     String::from_utf8_lossy(&output.stderr).trim().to_string();
                                 Some(if stderr.is_empty() {
-                                    "failed to remove worktree".to_string()
+                                    "failed to remove workspace".to_string()
                                 } else {
-                                    format!("failed to remove worktree: {stderr}")
+                                    format!("failed to remove workspace: {stderr}")
                                 })
                             }
-                            Err(error) => Some(format!("failed to remove worktree: {error}")),
+                            Err(error) => Some(format!("failed to remove workspace: {error}")),
                         }
                     };
                     let _ = tx.send(
-                        error.unwrap_or_else(|| "deleted agent and removed worktree".to_string()),
+                        error.unwrap_or_else(|| "deleted agent and removed workspace".to_string()),
                     );
                 })
                 .ok();
         }
-        let worktree_error: Option<String> = None;
+        let workspace_error: Option<String> = None;
         let last = self.agents.len().saturating_sub(1);
         self.selected_agent = self.selected_agent.min(last);
         if !self.agents.is_empty() {
@@ -11823,9 +12288,9 @@ impl App {
             }
         }
         self.delete_pending = None;
-        self.notice = Some(worktree_error.unwrap_or_else(|| {
-            if run.worktree_path.is_some() {
-                "deleted agent · removing worktree in background".to_string()
+        self.notice = Some(workspace_error.unwrap_or_else(|| {
+            if run.workspace_path.is_some() {
+                "deleted agent · removing workspace in background".to_string()
             } else {
                 "deleted agent from dashboard".to_string()
             }
@@ -11978,37 +12443,37 @@ impl App {
         {
             return Err("no session transcript found to fork".to_string());
         }
-        let worktree = prepare_jj_workspace_at(&self.cwd, &label, base_change.as_deref())
+        let workspace = prepare_jj_workspace_at(&self.cwd, &label, base_change.as_deref())
             .map_err(|error| error.to_string())?;
-        if let Err(error) = self.write_rudder_context_timed(Some(&worktree)) {
+        if let Err(error) = self.write_rudder_context_timed(Some(&workspace)) {
             self.notice = Some(format!("context warning: {error}"));
         }
         // Stage the source transcript into the fork workspace's project folder so
         // `--resume <sid> --fork-session` can find the conversation from its new cwd.
         if backend == Backend::Claude {
-            stage_claude_session_for_cwd(&source_cwd, &session_id, &worktree.path)?;
+            stage_claude_session_for_cwd(&source_cwd, &session_id, &workspace.path)?;
         }
         // A seeded fork wakes up in a DIFFERENT directory than the conversation it
         // remembers; say so before the instruction so it re-reads instead of trusting
         // its memory of the other checkout.
         let seed = seed
-            .map(|text| worker_orientation(&worktree.path, &text))
+            .map(|text| worker_orientation(&workspace.path, &text))
             .filter(|text| !text.trim().is_empty());
         let mut command = match backend {
             Backend::Claude => claude_fork_command(&model, effort, &session_id, seed.as_deref()),
             Backend::Codex => codex_fork_command(&model, effort, &session_id, seed.as_deref()),
             Backend::Opencode => opencode_fork_command(&model, &session_id, seed.as_deref()),
         };
-        signals::augment_worker_command(&mut command, backend, AgentMode::Execute, &worktree.id);
+        signals::augment_worker_command(&mut command, backend, AgentMode::Execute, &workspace.id);
         let options = TerminalPaneOptions {
             size: TerminalSize::default(),
-            cwd: Some(worktree.path.clone()),
+            cwd: Some(workspace.path.clone()),
             ..TerminalPaneOptions::default()
         };
 
         let created_at = now_stamp();
         let mut run = AgentRun {
-            id: worktree.id.clone(),
+            id: workspace.id.clone(),
             created_at: created_at.clone(),
             mode: AgentMode::Execute,
             task,
@@ -12029,11 +12494,13 @@ impl App {
             model,
             effort,
             status: AgentStatus::Running,
-            cwd: worktree.path.clone(),
-            worktree_branch: worktree.branch.clone(),
-            worktree_path: worktree.path_is_worktree.then_some(worktree.path.clone()),
-            workspace_name: worktree.workspace_name.clone(),
-            jj_change_id: worktree.jj_change_id.clone(),
+            cwd: workspace.path.clone(),
+            workspace_branch: workspace.branch.clone(),
+            workspace_path: workspace
+                .path_is_workspace
+                .then_some(workspace.path.clone()),
+            workspace_name: workspace.workspace_name.clone(),
+            jj_change_id: workspace.jj_change_id.clone(),
             integration: IntegrationEvidence::default(),
             publish: PublishEvidence::default(),
             delivery: DeliveryEvidence::default(),
@@ -12146,7 +12613,7 @@ impl App {
             signals::cleanup_run_signals(&run.id);
             persist_ledger |= self.followups_ingested.remove(&run.id);
             persist_ledger |= self.completion_summary_pending.remove(&run.id);
-            if let Some(path) = run.worktree_path.as_ref() {
+            if let Some(path) = run.workspace_path.as_ref() {
                 // Merged workspaces are integrated leftovers; best-effort removal,
                 // same command the single-delete path uses.
                 let _ = Command::new("git")
@@ -12193,7 +12660,9 @@ impl App {
 
         let operation = run.merge_conflict_operation;
         let repo_root = if operation == ConflictOperation::Rebase {
-            run.worktree_path.clone().unwrap_or_else(|| run.cwd.clone())
+            run.workspace_path
+                .clone()
+                .unwrap_or_else(|| run.cwd.clone())
         } else {
             self.cwd.clone()
         };
@@ -12221,8 +12690,8 @@ impl App {
                 .unwrap_or_else(|| "merge conflict is still unresolved".to_string()),
             repo_root,
             target_branch: current_branch_at(&self.cwd),
-            source_branch: run.worktree_branch.clone(),
-            worktree_path: run.worktree_path.clone(),
+            source_branch: run.workspace_branch.clone(),
+            workspace_path: run.workspace_path.clone(),
             agent_id: Some(run.id.clone()),
         });
         self.merge_confirm = None;
@@ -12388,7 +12857,7 @@ impl App {
         });
         self.conflict_prompt = None;
         self.record_activity(format!(
-            "merge-all ready: {count} worktree{} ({})",
+            "merge-all ready: {count} workspace{} ({})",
             if count == 1 { "" } else { "s" },
             summarize_labels(&labels, 8)
         ));
@@ -12426,7 +12895,7 @@ impl App {
                         .is_some_and(|prompt| prompt.operation == ConflictOperation::Rebase);
                     self.conflict_prompt = None;
                     self.notice = Some(if rebase {
-                        "resolve the rebase conflicts in the worktree, then run git rebase --continue"
+                        "resolve the rebase conflicts in the workspace, then run git rebase --continue"
                             .to_string()
                     } else {
                         "resolve the jj conflicts manually, then press m to finalize".to_string()
@@ -12456,8 +12925,8 @@ impl App {
                     self.notice = Some("selected agent no longer exists".to_string());
                     return;
                 };
-                let source_branch = self.agents[index].worktree_branch.clone();
-                let worktree_path = self.agents[index].worktree_path.clone();
+                let source_branch = self.agents[index].workspace_branch.clone();
+                let workspace_path = self.agents[index].workspace_path.clone();
                 let agent_id = Some(self.agents[index].id.clone());
                 match self.merge_agent_at(index) {
                     Ok(()) => {
@@ -12470,7 +12939,7 @@ impl App {
                             error,
                             None,
                             source_branch,
-                            worktree_path,
+                            workspace_path,
                             agent_id,
                         );
                     }
@@ -12499,7 +12968,7 @@ impl App {
                     })
                     .collect::<Vec<_>>();
                 self.push_activity(format!(
-                    "merge-all started: {total} worktree{} ({})",
+                    "merge-all started: {total} workspace{} ({})",
                     if total == 1 { "" } else { "s" },
                     summarize_labels(&labels, 8)
                 ));
@@ -12514,8 +12983,8 @@ impl App {
                         continue;
                     }
                     let task = self.agents[index].task.clone();
-                    let source_branch = self.agents[index].worktree_branch.clone();
-                    let worktree_path = self.agents[index].worktree_path.clone();
+                    let source_branch = self.agents[index].workspace_branch.clone();
+                    let workspace_path = self.agents[index].workspace_path.clone();
                     let agent_id = Some(self.agents[index].id.clone());
                     if let Err(error) = self.merge_agent_at(index) {
                         // Integration is serialized through the shared workspace, so a
@@ -12528,7 +12997,7 @@ impl App {
                             error,
                             Some(merged),
                             source_branch,
-                            worktree_path,
+                            workspace_path,
                             agent_id,
                         );
                         if let Some(notice) = self.notice.take() {
@@ -12549,7 +13018,7 @@ impl App {
                 }
                 self.delete_pending = None;
                 self.push_activity(format!(
-                    "merged {merged} worktree{}",
+                    "merged {merged} workspace{}",
                     if merged == 1 { "" } else { "s" }
                 ));
             }
@@ -12580,7 +13049,7 @@ impl App {
         error: anyhow::Error,
         merged_before_error: Option<usize>,
         source_branch: Option<String>,
-        worktree_path: Option<PathBuf>,
+        workspace_path: Option<PathBuf>,
         agent_id: Option<String>,
     ) {
         let mut operation = ConflictOperation::Merge;
@@ -12592,12 +13061,12 @@ impl App {
         let mut conflicts = jj_conflicts.unwrap_or_else(|| conflicted_files(&self.cwd));
         self.emit_merge_finished(false, !conflicts.is_empty(), agent_id.is_none());
         if conflicts.is_empty() {
-            if let Some(path) = worktree_path.as_ref() {
-                let worktree_conflicts = conflicted_files(path);
-                if !worktree_conflicts.is_empty() {
+            if let Some(path) = workspace_path.as_ref() {
+                let workspace_conflicts = conflicted_files(path);
+                if !workspace_conflicts.is_empty() {
                     operation = ConflictOperation::Rebase;
                     conflict_root = path.clone();
-                    conflicts = worktree_conflicts;
+                    conflicts = workspace_conflicts;
                 }
             }
         }
@@ -12626,6 +13095,13 @@ impl App {
         let count = conflicts.len();
         let target_branch = current_branch_at(&self.cwd);
         let conflict_files = conflicts.clone();
+        // Captured BEFORE the block below clears `merge_resolver`: a resolver that
+        // conflicts AGAIN must not silently respawn itself in a loop, and after
+        // that clear there is no way left to tell the two cases apart.
+        let already_resolver_attempt = agent_id
+            .as_deref()
+            .and_then(|id| self.agents.iter().find(|run| run.id == id))
+            .is_some_and(|run| run.merge_resolver);
         self.conflict_prompt = Some(MergeConflictPrompt {
             operation,
             task,
@@ -12634,7 +13110,7 @@ impl App {
             repo_root: conflict_root,
             target_branch,
             source_branch: source_branch.clone(),
-            worktree_path: worktree_path.clone(),
+            workspace_path: workspace_path.clone(),
             agent_id: agent_id.clone(),
         });
         if let Some(index) = agent_id
@@ -12661,13 +13137,48 @@ impl App {
         } else {
             "merge"
         };
+        let conflict_task =
+            short_task(&self.conflict_prompt.as_ref().map(|p| p.task.clone()).unwrap_or_default());
+
+        // A conflict must NEVER stop the fleet. Integration is automatic, so its
+        // failure path has to be automatic too: this used to raise a y/n modal and
+        // wait, and an unanswered prompt left finished nodes parked in review while
+        // every node that hard-depended on them stayed unlaunchable — a whole plan
+        // halted on one keypress nobody was there to press. Start the resolver
+        // ourselves and let the user watch it in the row it already owns.
+        if !already_resolver_attempt && self.can_auto_resolve_conflict() {
+            let message = format!(
+                "{operation_label} conflict in {conflict_task} ({count} file{}): resolving automatically",
+                if count == 1 { "" } else { "s" }
+            );
+            self.notice = Some(message.clone());
+            self.record_activity(message);
+            self.start_conflict_resolution_agent();
+            return;
+        }
+
+        // Fallback only: there is no row to host a resolver (e.g. the agent was
+        // deleted mid-merge), or a resolver already tried and conflicted again.
+        // Ask rather than silently looping.
         let message = format!(
-            "{operation_label} conflict in {} ({count} file{}): press y to let AI resolve & complete the merge, or n to do it manually",
-            short_task(&self.conflict_prompt.as_ref().map(|p| p.task.clone()).unwrap_or_default()),
+            "{operation_label} conflict in {conflict_task} ({count} file{}): press y to let AI resolve & complete the merge, or n to do it manually",
             if count == 1 { "" } else { "s" }
         );
         self.notice = Some(message.clone());
         self.record_activity(message);
+    }
+
+    /// Whether the pending conflict has a row to host a resolver agent. Without
+    /// one (the agent was deleted mid-merge) there is nothing to start, so the
+    /// prompt stays as the fallback.
+    fn can_auto_resolve_conflict(&self) -> bool {
+        let Some(prompt) = self.conflict_prompt.as_ref() else {
+            return false;
+        };
+        let Some(agent_id) = prompt.agent_id.as_deref() else {
+            return false;
+        };
+        self.agents.iter().any(|run| run.id == agent_id)
     }
 
     /// STEERING: re-goal a running/finished worker by RESUMING its session (so it
@@ -12918,7 +13429,7 @@ impl App {
                 return false;
             };
             // Main rows are stoppable: the body below only kills the PTY and
-            // records Stopped — nothing here touches a worktree. The old
+            // records Stopped — nothing here touches a workspace. The old
             // is_main() refusal here was the bottom of a three-layer dead end
             // (dd said "stop it with x", x excluded main, and this guard made
             // even a permitted call a silent no-op).
@@ -13083,7 +13594,7 @@ impl App {
                 p.operation,
                 p.repo_root.clone(),
                 p.source_branch.clone(),
-                p.worktree_path.clone(),
+                p.workspace_path.clone(),
                 p.conflicted_files.clone(),
             )
         });
@@ -13106,7 +13617,7 @@ impl App {
         let model = self.agents[index].model.clone();
         let effort = self.agents[index].effort;
         let terminal_size = self.agents[index].terminal_size.unwrap_or_default();
-        let (operation, resolver_cwd, source_branch, worktree_path, conflicted_files) =
+        let (operation, resolver_cwd, source_branch, workspace_path, conflicted_files) =
             conflict_context.unwrap_or((
                 ConflictOperation::Merge,
                 self.cwd.clone(),
@@ -13159,11 +13670,11 @@ impl App {
                     run.terminal = Some(terminal);
                     run.status = AgentStatus::Running;
                     if operation == ConflictOperation::Rebase {
-                        run.worktree_path = worktree_path.or_else(|| Some(resolver_cwd.clone()));
-                        run.worktree_branch = source_branch;
+                        run.workspace_path = workspace_path.or_else(|| Some(resolver_cwd.clone()));
+                        run.workspace_branch = source_branch;
                     } else {
-                        run.worktree_path = None;
-                        run.worktree_branch = None;
+                        run.workspace_path = None;
+                        run.workspace_branch = None;
                     }
                     run.session_id = session_id;
                     run.completed_at = None;
@@ -13266,11 +13777,11 @@ impl App {
             .unwrap_or_else(|| "(unknown branch)".to_string());
         if prompt.operation == ConflictOperation::Rebase {
             return Some(format!(
-                "A git rebase stopped with conflicts in the agent worktree.\n\
+                "A git rebase stopped with conflicts in the agent workspace.\n\
 \n\
 Where you are working\n\
-- You are running inside the conflicted worktree at: {repo}\n\
-- The worktree branch being rebased is: {source}\n\
+- You are running inside the conflicted workspace at: {repo}\n\
+- The workspace branch being rebased is: {source}\n\
 - The base branch is: {target}\n\
 \n\
 What was being attempted\n\
@@ -13336,6 +13847,34 @@ What to do\n\
         run.workspace_name.is_some() || run.jj_change_id.is_some()
     }
 
+    /// Clear the MECHANICAL conflicts already sitting in the integration workspace, so a
+    /// stale collision cannot block every subsequent merge. Returns the conflicts left
+    /// behind (empty when there were none to begin with).
+    ///
+    /// Deliberately a no-op while a merge resolver is live: that agent is mid-edit on the
+    /// conflicted change, and rewriting the files under it would bury its work.
+    fn clear_mechanical_integration_conflicts(&mut self) -> Vec<String> {
+        let resolver_live = self
+            .agents
+            .iter()
+            .any(|run| run.merge_resolver && run.status == AgentStatus::Running);
+        if resolver_live {
+            return Vec::new();
+        }
+        let preexisting = jj_unresolved_conflicts(&self.cwd);
+        if preexisting.is_empty() {
+            return Vec::new();
+        }
+        let remaining = auto_resolve_mechanical_conflicts(&self.cwd, &preexisting);
+        let cleared = preexisting.len().saturating_sub(remaining.len());
+        if cleared > 0 {
+            self.record_activity(format!(
+                "cleared {cleared} mechanical conflict(s) blocking integration"
+            ));
+        }
+        remaining
+    }
+
     fn merge_agent_at(&mut self, index: usize) -> Result<()> {
         self.pending_jj_conflict = None;
         let Some(run) = self.agents.get(index) else {
@@ -13358,6 +13897,16 @@ What to do\n\
         let run_id = run.id.clone();
 
         if is_jj {
+            // PRE-FLIGHT. A conflicted integration workspace refuses EVERY later merge
+            // ("integration workspace already has unresolved conflicts"), so one
+            // unresolved package.json collision strands the whole remaining fleet: the
+            // rows pile up in review, and the conductor starts hand-copying files out of
+            // workspaces instead. The mechanical classes (package.json, DECISIONS.md,
+            // lock files) are the dominant cause and have an unambiguous answer, and we
+            // already resolve them for conflicts a NEW merge reports — this applies the
+            // same resolution to conflicts that were already sitting in @. Anything
+            // non-mechanical still blocks exactly as before.
+            self.clear_mechanical_integration_conflicts();
             if let Some(run) = self.agents.get_mut(index) {
                 run.integration.phase = IntegrationPhase::Integrating;
                 let _ = save_native_run_record(&self.cwd, run);
@@ -13414,7 +13963,7 @@ What to do\n\
             );
         }
         // Successful merge: keep the agent's row in the dashboard but flip it
-        // to Merged so it appears in a dedicated section. Keep the worktree
+        // to Merged so it appears in a dedicated section. Keep the workspace
         // path on the record and defer cleanup to delete, which keeps merge
         // confirmation responsive. Never touch the dedicated main agent.
         if index < self.agents.len() && !self.agents[index].is_main() {
@@ -13493,7 +14042,7 @@ What to do\n\
                 } else {
                     IntegrationPhase::MergedLocal
                 };
-                run.worktree_branch = None;
+                run.workspace_branch = None;
                 run.completed_at = Some(Instant::now());
                 run.merge_resolver = false;
                 run.merge_conflict = false;
@@ -13625,7 +14174,7 @@ What to do\n\
         let mut missing_now: HashSet<String> = HashSet::new();
         for run in self.agents.iter() {
             let missing = run
-                .worktree_path
+                .workspace_path
                 .as_ref()
                 .is_some_and(|path| !path.is_dir());
             if !missing {
@@ -13635,7 +14184,7 @@ What to do\n\
             if !self.rows_missing_workspace.contains(&run.id) {
                 vanished.push((
                     run.id.clone(),
-                    run.worktree_path
+                    run.workspace_path
                         .as_ref()
                         .map(|path| path.display().to_string())
                         .unwrap_or_default(),
@@ -13743,7 +14292,7 @@ What to do\n\
 
     fn poll_agents(&mut self) {
         let poll_started = Instant::now();
-        // Background work (worktree removal) reports its outcome here.
+        // Background work (workspace removal) reports its outcome here.
         while let Ok(message) = self.bg_notice_rx.try_recv() {
             self.notice = Some(message);
             self.dirty = true;
@@ -13768,10 +14317,10 @@ What to do\n\
         self.maybe_refresh_publish_capability();
         self.maybe_refresh_publish_pr_state();
 
-        if self.last_worktree_gc.elapsed() >= Duration::from_secs(60) {
+        if self.last_workspace_gc.elapsed() >= Duration::from_secs(60) {
             self.gc_merged_workspaces();
             self.gc_orphan_workspaces();
-            self.last_worktree_gc = Instant::now();
+            self.last_workspace_gc = Instant::now();
         }
 
         if self.last_cloud_check.elapsed() >= Duration::from_secs(2) {
@@ -14847,7 +15396,7 @@ fn merged_workspace_is_sweepable(
     if run.terminal.is_some() {
         return false;
     }
-    let Some(path) = run.worktree_path.as_ref() else {
+    let Some(path) = run.workspace_path.as_ref() else {
         return false;
     };
     // Grace: only sweep once the checkout has been idle past the window. The dir
@@ -15266,6 +15815,7 @@ fn is_orchestrator_skill_marker(line: &str) -> bool {
         "RUDDER_RESUME",
         "RUDDER_REGOAL",
         "RUDDER_INJECT",
+        "RUDDER_NUDGE_ALL",
         "RUDDER_ADD_TASK",
         "RUDDER_REPLAN",
         "RUDDER_PLAN",

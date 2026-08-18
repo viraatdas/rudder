@@ -2,6 +2,7 @@ import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { JsonValue, RunRecord } from "./types.js";
+import { adoptLegacyWorkspaceKey } from "./state.js";
 import { pathExists, readJson, shortHash, slugPrefix } from "./util.js";
 
 export type MigrationDecision = "migrate" | "migrate-fresh" | "stay" | "stop";
@@ -12,11 +13,11 @@ export type MigrationCandidate = {
   taskSummary?: string;
   backend: string;
   status: string;
-  worktreePath: string;
-  worktreeBranch?: string;
+  workspacePath: string;
+  workspaceBranch?: string;
   sessionId?: string;
   sessionJsonlPath?: string;
-  reason: "resumable" | "no-session" | "no-jsonl" | "unsupported-backend" | "missing-worktree" | "not-running";
+  reason: "resumable" | "no-session" | "no-jsonl" | "unsupported-backend" | "missing-workspace" | "not-running";
   decision: MigrationDecision;
 };
 
@@ -33,13 +34,13 @@ export type MigrationManifestEntry = {
   backend: string;
   model?: string;
   sessionId: string;
-  /** Path of the worktree on the local machine. */
-  localWorktreePath: string;
-  /** Relative path (under repo root / snapshot stage) the worktree maps to on cloud. */
-  cloudWorktreeRelativePath: string;
+  /** Path of the workspace on the local machine. */
+  localWorkspacePath: string;
+  /** Relative path (under repo root / snapshot stage) the workspace maps to on cloud. */
+  cloudWorkspaceRelativePath: string;
   /** Relative path inside the snapshot tar where the session jsonl is staged. */
   sessionJsonlSnapshotPath: string;
-  worktreeBranch?: string;
+  workspaceBranch?: string;
   createdAt?: string;
   /**
    * Prompt-engineered handoff for fresh restarts (when no resumable session
@@ -85,7 +86,7 @@ const RESUMABLE_BACKENDS = new Set(["claude"]);
 /**
  * Discover candidate local agents that could be migrated to the cloud.
  *
- * "Running" is interpreted loosely: any run record whose worktree still exists
+ * "Running" is interpreted loosely: any run record whose workspace still exists
  * on disk and whose backend is resumable. We can't tell whether the PTY is
  * literally alive (the dashboard quits before this runs), but the Claude
  * session jsonl is persisted, so anything with a session id and an existing
@@ -111,6 +112,10 @@ export async function findMigrationCandidates(repoRoot: string): Promise<Migrati
     if (!record || record.id !== entry.name) {
       continue;
     }
+    // Read run.json directly (no loadRunRecord side effects), so promote the
+    // pre-rename `worktree` key here too or every legacy record classifies as
+    // "not isolated" and silently never migrates.
+    adoptLegacyWorkspaceKey(record);
     const candidate = await classify(record);
     if (candidate) {
       out.push(candidate);
@@ -126,25 +131,25 @@ async function classify(record: RunRecord): Promise<MigrationCandidate | null> {
   if (status === "completed" || status === "merged" || status === "cancelled" || status === "paused" || status === "failed") {
     return null;
   }
-  const worktreePath = record.worktree?.path;
+  const workspacePath = record.workspace?.path;
   // Main/orchestrator/cloud-command records point at the repo root even though
   // they are not isolated workers. Only migrate real workspaces.
-  if (!record.worktree?.enabled || !worktreePath) {
+  if (!record.workspace?.enabled || !workspacePath) {
     return null;
   }
-  const worktreeExists = await pathExists(worktreePath);
+  const workspaceExists = await pathExists(workspacePath);
   const base: Omit<MigrationCandidate, "reason" | "decision"> = {
     runId: record.id,
     task: record.task,
     taskSummary: record.taskSummary,
     backend: record.backend,
     status,
-    worktreePath,
-    worktreeBranch: record.worktree?.branch,
+    workspacePath,
+    workspaceBranch: record.workspace?.branch,
     sessionId: record.session?.nativeSessionId,
   };
-  if (!worktreeExists) {
-    return { ...base, reason: "missing-worktree", decision: "stay" };
+  if (!workspaceExists) {
+    return { ...base, reason: "missing-workspace", decision: "stay" };
   }
   if (!RESUMABLE_BACKENDS.has(record.backend)) {
     // Non-Claude backends can't resume a conversation, but we can still move
@@ -155,7 +160,7 @@ async function classify(record: RunRecord): Promise<MigrationCandidate | null> {
   if (!sessionId) {
     return { ...base, reason: "no-session", decision: "migrate-fresh" };
   }
-  const jsonl = claudeSessionJsonlPath(worktreePath, sessionId);
+  const jsonl = claudeSessionJsonlPath(workspacePath, sessionId);
   if (!(await pathExists(jsonl))) {
     return { ...base, reason: "no-jsonl", sessionJsonlPath: jsonl, decision: "migrate-fresh" };
   }
@@ -182,19 +187,19 @@ export function claudeSessionJsonlPath(cwd: string, sessionId: string): string {
 }
 
 /**
- * Cloud-side absolute worktree path that the supervisor will stage a migrated
- * agent's worktree at. Mirrors the layout in supervisor.mjs.
+ * Cloud-side absolute workspace path that the supervisor will stage a migrated
+ * agent's workspace at. Mirrors the layout in supervisor.mjs.
  */
 export function cloudWorkspacePath(repoName: string): string {
   return path.posix.join("/workspace", repoName);
 }
 
-export function cloudWorktreeAbsolutePath(repoName: string, runId: string, task?: string): string {
-  // Mirrors src/state.ts worktreePath() but rooted at the cloud workspace.
-  return path.posix.join("/workspace", ".rudder-worktrees", repoName, cloudWorktreeDirName(runId, task));
+export function cloudWorkspaceAbsolutePath(repoName: string, runId: string, task?: string): string {
+  // Mirrors src/state.ts workspacePath() but rooted at the cloud workspace.
+  return path.posix.join("/workspace", ".rudder-workspaces", repoName, cloudWorkspaceDirName(runId, task));
 }
 
-function cloudWorktreeDirName(runId: string, task?: string): string {
+function cloudWorkspaceDirName(runId: string, task?: string): string {
   const slug = slugPrefix(task ?? runId, "task");
   return `${slug}-${shortHash(runId).slice(0, 8)}`;
 }
@@ -209,8 +214,8 @@ export function formatCandidateReason(candidate: MigrationCandidate): string {
       return "Claude session jsonl missing locally";
     case "unsupported-backend":
       return `${candidate.backend} not resumable`;
-    case "missing-worktree":
-      return "worktree gone";
+    case "missing-workspace":
+      return "workspace gone";
     case "not-running":
       return "not running";
     default:

@@ -150,9 +150,10 @@ test("merge gate: first m shows the diff, second m merges", { timeout: 120_000 }
   // Second m does not merge yet: it opens the merge confirmation.
   await session.waitForText("[y] merge", { timeout: 20_000 });
   await session.press("y");
-  // The row's own state stamp — a bare "merged" would match the ever-present
-  // "cc clear merged" legend and pass without any merge happening.
-  await session.waitForText("● merged", { timeout: 30_000 });
+  // The merged row collapses into the `done` drawer, so its state stamp is the
+  // drawer's count — "done 1" cannot match the ever-present "cc clear merged"
+  // legend, so it still fails if no merge happened.
+  await session.waitForText("done 1", { timeout: 30_000 });
   // The screen can say what it likes; the merged file must be in the checkout.
   await waitForFile(path.join(repo, "DONE.txt"), 20_000);
 });
@@ -213,7 +214,7 @@ test("dd deletes a running /main row instead of dead-ending", { timeout: 60_000 
 });
 
 test("a hammered dd burst deletes at most the row you saw confirmed", { timeout: 90_000 }, async (t) => {
-  // The field failure that wiped a board: a slow synchronous worktree removal
+  // The field failure that wiped a board: a slow synchronous workspace removal
   // froze the UI, the user hammered dd, and the buffered presses replayed as
   // arm+confirm pairs against successive rows — every tree deleted. The
   // confirm is now frame-gated (it only counts after the confirmation notice
@@ -276,7 +277,7 @@ test("recorded work survives renaming the repo directory", { timeout: 120_000 },
   await session.kill();
   await session.close();
 
-  // The rename. Everything inside (worktrees, .rudder state, jj) moves along.
+  // The rename. Everything inside (workspaces, .rudder state, jj) moves along.
   const renamed = `${repo}-renamed`;
   await fsp.rename(repo, renamed);
   t.after(() => removeScratch(renamed));
@@ -302,7 +303,7 @@ test("recorded work survives renaming the repo directory", { timeout: 120_000 },
   await session.press("m");
   await session.waitForText("[y] merge", { timeout: 20_000 });
   await session.press("y");
-  await session.waitForText("● merged", { timeout: 30_000 });
+  await session.waitForText("done 1", { timeout: 30_000 });
   await waitForFile(path.join(renamed, "DONE.txt"), 20_000);
 });
 

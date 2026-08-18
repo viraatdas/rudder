@@ -153,9 +153,9 @@ test("jj merge captures merge.operationId and merges cleanly", async (t) => {
     targetBranch: "targetchange",
     baseCommit: "basechange",
     vcs: "jj",
-    useWorktree: true,
-    worktreePath: workspace,
-    worktreeWorkspaceName: "rudder-run-merge",
+    useWorkspace: true,
+    workspacePath: workspace,
+    workspaceName: "rudder-run-merge",
   });
 
   const merged = await mergeJjRunIntoCurrentWorkspace(run);
@@ -189,9 +189,9 @@ test("jj merge records conflicted files and mergeChangeId on conflict", async (t
     targetBranch: "targetchange",
     baseCommit: "basechange",
     vcs: "jj",
-    useWorktree: true,
-    worktreePath: workspace,
-    worktreeWorkspaceName: "rudder-run-conflict",
+    useWorkspace: true,
+    workspacePath: workspace,
+    workspaceName: "rudder-run-conflict",
   });
 
   const merged = await mergeJjRunIntoCurrentWorkspace(run);
@@ -221,9 +221,9 @@ test("resolved jj conflict finalizes the existing merge change without stacking 
     targetBranch: "main",
     baseCommit: "basechange",
     vcs: "jj",
-    useWorktree: true,
-    worktreePath: workspace,
-    worktreeWorkspaceName: "rudder-run-resolved-conflict",
+    useWorkspace: true,
+    workspacePath: workspace,
+    workspaceName: "rudder-run-resolved-conflict",
   });
 
   const conflicted = await mergeJjRunIntoCurrentWorkspace(run);
@@ -256,9 +256,9 @@ test("jj export failure never records a run as merged", async (t) => {
     targetBranch: "main",
     baseCommit: "basechange",
     vcs: "jj",
-    useWorktree: true,
-    worktreePath: workspace,
-    worktreeWorkspaceName: "rudder-run-export-failure",
+    useWorkspace: true,
+    workspacePath: workspace,
+    workspaceName: "rudder-run-export-failure",
   });
 
   await assert.rejects(() => mergeJjRunIntoCurrentWorkspace(run), /git export exploded/);
@@ -284,9 +284,9 @@ test("jj merge refuses when the integration workspace already has unresolved con
     targetBranch: "targetchange",
     baseCommit: "basechange",
     vcs: "jj",
-    useWorktree: true,
-    worktreePath: workspace,
-    worktreeWorkspaceName: "rudder-run-guard",
+    useWorkspace: true,
+    workspacePath: workspace,
+    workspaceName: "rudder-run-guard",
   });
 
   // allowDirty=true mirrors the TUI; the conflict guard must fire regardless.

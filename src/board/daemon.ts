@@ -599,6 +599,36 @@ async function handleProjectApi(
     sendJson(res, queued.status === "queued" ? 202 : 200, queued);
     return;
   }
+  // Fleet nudge: one message to EVERY in-flight worker at once. Same inbox and
+  // at-most-once ledger as a single steer, but with no task id — the native
+  // poller resolves the target set itself, since only it knows which rows still
+  // hold a live terminal and which have to be resumed.
+  if (rest === "/nudge-all" && method === "POST") {
+    const body = await readJsonBody(req);
+    const instruction = typeof body.instruction === "string"
+      ? body.instruction.trim()
+      : typeof body.text === "string"
+        ? body.text.trim()
+        : "";
+    if (!instruction) {
+      sendJson(res, 400, { error: "missing instruction" });
+      return;
+    }
+    if (instruction.length > 8_000) {
+      sendJson(res, 413, { error: "instruction is too long (maximum 8000 characters)" });
+      return;
+    }
+    const queued = await writeSteerRequest(
+      project.repoRoot,
+      "fleet",
+      instruction,
+      "nudge-all",
+      requestIdFromBody(body),
+    );
+    sendJson(res, queued.status === "queued" ? 202 : 200, queued);
+    return;
+  }
+
   // Conductor-level steer: same inbox, target "conductor".
   if (rest === "/steer" && method === "POST") {
     const body = await readJsonBody(req);
@@ -642,7 +672,7 @@ async function writeSteerRequest(
   repoRoot: string,
   taskId: string,
   instruction: string,
-  kind: "steer" | "task" | "merge" | "cancel",
+  kind: "steer" | "task" | "merge" | "cancel" | "nudge-all",
   requestedRequestId?: string,
 ): Promise<{ ok: true } & SteerReceiptPayload> {
   const dir = path.join(projectStateDir(repoRoot), "steer");
@@ -1173,7 +1203,7 @@ export function hasVerifiedDelivery(run: RunRecord): boolean {
 /** Process completion is terminal for direct/main-checkout work, but a requested
  * delivery remains in review until its structured target + smoke proof exists. */
 export function columnForRun(run: RunRecord): BoardNode["column"] {
-  if (run.status === "completed" && !run.worktree.enabled) {
+  if (run.status === "completed" && !run.workspace.enabled) {
     return run.delivery?.required && !hasVerifiedDelivery(run) ? "review" : "done";
   }
   return columnForStatus(run.status);
@@ -1206,8 +1236,8 @@ function projectRunToNode(run: RunRecord, lastLine: string | null, graphNode?: T
     deps: { hard: [], soft: [] },
     createdAt: run.createdAt,
     updatedAt: run.updatedAt,
-    worktree: run.worktree
-      ? { path: run.worktree.path, workspaceName: run.worktree.workspaceName }
+    workspace: run.workspace
+      ? { path: run.workspace.path, workspaceName: run.workspace.workspaceName }
       : null,
     merge: run.merge ?? null,
     delivery: run.delivery,
@@ -1258,7 +1288,7 @@ function projectTaskNodeToBoardNode(
     deps,
     createdAt: node.createdAt,
     updatedAt: node.updatedAt,
-    worktree: node.worktree ? { path: node.worktree.path, workspaceName: node.worktree.workspaceName } : null,
+    workspace: node.workspace ? { path: node.workspace.path, workspaceName: node.workspace.workspaceName } : null,
     merge: null,
     updates: [],
   };

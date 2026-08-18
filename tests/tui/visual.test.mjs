@@ -54,7 +54,14 @@ test("running and merged statuses render in DIFFERENT colors", { timeout: 120_00
   await session.press("M");
   await session.waitForText("[y] merge", { timeout: 20_000 });
   await session.press("y");
-  await session.waitForText("merged locally", { timeout: 30_000 });
+  // A merged row collapses into the `done` drawer, so its status label lives in the
+  // drawer's list. Open the drawer and sample the color there: collapsing the
+  // section must not cost the state-at-a-glance color coding.
+  await session.waitForText("done 1", { timeout: 30_000 });
+  await session.press("Ctrl+W");
+  await session.press("1");
+  await session.press("Enter");
+  await session.waitForText("merged locally", { timeout: 20_000 });
 
   const merged = await session.styleAt("merged locally");
   assert.ok(merged, "the merged status is on screen");

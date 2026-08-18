@@ -3,7 +3,7 @@ import path from "node:path";
 import { RUDDER_CODEX_RELEASE } from "./codex-binary.js";
 import { findRepoRoot } from "./git.js";
 import { LOG_KEEP_ROTATED, LOG_MAX_BYTES, logsDir } from "./logger.js";
-import { loadRunRecord, runsDir } from "./state.js";
+import { AGENT_WORKSPACES_DIR, LEGACY_AGENT_WORKSPACES_DIR, loadRunRecord, runsDir } from "./state.js";
 import type { RunRecord } from "./types.js";
 import { pathExists, rudderHome } from "./util.js";
 
@@ -29,7 +29,7 @@ export async function runGc(options: { dryRun?: boolean } = {}): Promise<void> {
     ...await daemonLogCandidates(home),
     ...await oldBinaryCandidates(home),
     ...await finishedRunCandidates(repoRoot),
-    ...await nestedWorktreeRunCandidates(repoRoot),
+    ...await nestedWorkspaceRunCandidates(repoRoot),
   ];
 
   let removed = 0;
@@ -146,7 +146,7 @@ async function finishedRunCandidates(repoRoot: string | null): Promise<GcCandida
     if (!run || !canCollectRunRecord(run)) continue;
     const stamp = Date.parse(run.updatedAt || run.createdAt);
     if (Number.isFinite(stamp) && Date.now() - stamp < RUN_TTL_MS) continue;
-    if (run.worktree.enabled && run.worktree.path && await pathExists(run.worktree.path)) {
+    if (run.workspace.enabled && run.workspace.path && await pathExists(run.workspace.path)) {
       continue;
     }
     const fullPath = path.join(dir, entry.name);
@@ -160,12 +160,16 @@ async function finishedRunCandidates(repoRoot: string | null): Promise<GcCandida
   return candidates;
 }
 
-async function nestedWorktreeRunCandidates(repoRoot: string | null): Promise<GcCandidate[]> {
+async function nestedWorkspaceRunCandidates(repoRoot: string | null): Promise<GcCandidate[]> {
   if (!repoRoot) {
     return [];
   }
-  const root = path.join(repoRoot, ".rudder-worktrees");
-  const runsDirs = await findNestedRunsDirs(root);
+  // Both the current and pre-rename workspace directories: a repo that ran an
+  // older Rudder still has reclaimable workspaces under the legacy path.
+  const runsDirs: string[] = [];
+  for (const dir of [AGENT_WORKSPACES_DIR, LEGACY_AGENT_WORKSPACES_DIR]) {
+    runsDirs.push(...(await findNestedRunsDirs(path.join(repoRoot, dir))));
+  }
   const candidates: GcCandidate[] = [];
   for (const dir of runsDirs) {
     const entries = await fsp.readdir(dir, { withFileTypes: true }).catch(() => []);
@@ -175,7 +179,7 @@ async function nestedWorktreeRunCandidates(repoRoot: string | null): Promise<GcC
       const stat = await fsp.stat(fullPath).catch(() => null);
       if (!stat || Date.now() - stat.mtimeMs < RUN_TTL_MS) continue;
       candidates.push({
-        category: "worktree runs",
+        category: "agent workspaces",
         path: fullPath,
         bytes: await pathSize(fullPath),
         reason: "ttl",

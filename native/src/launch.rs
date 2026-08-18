@@ -111,7 +111,7 @@ const ORCHESTRATOR_SKILLS: &[OrchestratorSkill] = &[
         slug: "rudder-worker-control",
         name: "rudder-worker-control",
         description: "Use when the user asks to control, pause, resume, re-goal, or change the model of a worker.",
-        body: "Read RUDDER.md first and resolve phrases such as 'current task' or 'all running tasks' to the live node ids. Use node ids such as n0/n1 when available; otherwise use run ids. Write one or more control lines to RUDDER.md: RUDDER_STOP <node-or-run-id> pauses a worker while preserving its workspace; RUDDER_RESUME <node-or-run-id> <claude|codex> <model> [low|medium|high|xhigh|max|auto] [new direction] resumes it in the same workspace on that model; RUDDER_REGOAL <node-or-run-id> <new goal> resumes it without changing model; RUDDER_INJECT <node-or-run-id> <message> sends a note into its live terminal; RUDDER_MERGE <node-or-run-id> merges one completed worker. For 'pause and resume on model X', write STOP then RESUME for every matching live worker. Never target the orchestrator with these markers.",
+        body: "Read RUDDER.md first and resolve phrases such as 'current task' or 'all running tasks' to the live node ids. Use node ids such as n0/n1 when available; otherwise use run ids. Write one or more control lines to RUDDER.md: RUDDER_STOP <node-or-run-id> pauses a worker while preserving its workspace; RUDDER_RESUME <node-or-run-id> <claude|codex> <model> [low|medium|high|xhigh|max|auto] [new direction] resumes it in the same workspace on that model; RUDDER_REGOAL <node-or-run-id> <new goal> resumes it without changing model; RUDDER_INJECT <node-or-run-id> <message> sends a note into its live terminal; RUDDER_NUDGE_ALL <message> sends one message to EVERY in-flight worker at once (live ones are typed into, dead ones are resumed in their workspace) and is the right marker for \"keep going\"/\"carry on\" fleet nudges; RUDDER_MERGE <node-or-run-id> merges one completed worker. For 'pause and resume on model X', write STOP then RESUME for every matching live worker. Never target the orchestrator with these markers.",
     },
     OrchestratorSkill {
         slug: "rudder-help",
@@ -796,7 +796,7 @@ pub(crate) fn claude_program() -> String {
 }
 
 pub(crate) fn review_all_run(
-    worktree: WorktreeInfo,
+    workspace: WorkspaceInfo,
     prompt: String,
     sources: Vec<ReviewAllSource>,
     session_id: Option<String>,
@@ -807,11 +807,11 @@ pub(crate) fn review_all_run(
         .map(|source| source.id.clone())
         .collect::<Vec<_>>();
     AgentRun {
-        id: worktree.id,
+        id: workspace.id,
         created_at: created_at.clone(),
         mode: AgentMode::ReviewAll,
         task: prompt.clone(),
-        task_summary: format!("review all {} worktrees", source_ids.len()),
+        task_summary: format!("review all {} workspaces", source_ids.len()),
         current_prompt: prompt.clone(),
         turns: vec![AgentTurn {
             ts: created_at.clone(),
@@ -823,11 +823,11 @@ pub(crate) fn review_all_run(
         model: REVIEW_ALL_MODEL.to_string(),
         effort: Some(REVIEW_ALL_EFFORT),
         status: AgentStatus::Running,
-        cwd: worktree.path.clone(),
-        worktree_branch: worktree.branch.clone(),
-        worktree_path: worktree.path_is_worktree.then_some(worktree.path),
-        workspace_name: worktree.workspace_name.clone(),
-        jj_change_id: worktree.jj_change_id.clone(),
+        cwd: workspace.path.clone(),
+        workspace_branch: workspace.branch.clone(),
+        workspace_path: workspace.path_is_workspace.then_some(workspace.path),
+        workspace_name: workspace.workspace_name.clone(),
+        jj_change_id: workspace.jj_change_id.clone(),
         integration: IntegrationEvidence::default(),
         publish: PublishEvidence::default(),
         delivery: DeliveryEvidence::default(),
@@ -893,11 +893,11 @@ Instructions\n\
 
 pub(crate) fn review_all_prompt(
     target_ref: &str,
-    worktree: &WorktreeInfo,
+    workspace: &WorkspaceInfo,
     sources: &[ReviewAllSource],
     premerge: &ReviewAllPremerge,
 ) -> String {
-    let aggregate_change = worktree
+    let aggregate_change = workspace
         .jj_change_id
         .as_deref()
         .unwrap_or("current jj change");
@@ -906,12 +906,12 @@ pub(crate) fn review_all_prompt(
         .enumerate()
         .map(|(index, source)| {
             let path = source
-                .worktree_path
+                .workspace_path
                 .as_ref()
                 .map(|path| path.display().to_string())
-                .unwrap_or_else(|| "(unknown worktree path)".to_string());
+                .unwrap_or_else(|| "(unknown workspace path)".to_string());
             format!(
-                "{}. {} ({})\n   jj revision: {}\n   worktree: {}\n   task: {}",
+                "{}. {} ({})\n   jj revision: {}\n   workspace: {}\n   task: {}",
                 index + 1,
                 source.summary,
                 source.id,
@@ -953,16 +953,16 @@ pub(crate) fn review_all_prompt(
     };
 
     format!(
-        "Review the combined Rudder agent worktree changes against `{target_ref}`.\n\
+        "Review the combined Rudder agent workspace changes against `{target_ref}`.\n\
 \n\
 You are the Rudder review-all integration agent. You are running in an aggregate jj workspace that will become one reviewed integration.\n\
 \n\
-Aggregate worktree\n\
+Aggregate workspace\n\
 - path: {path}\n\
 - jj change: {aggregate_change}\n\
 - target/base ref: {target_ref}\n\
 \n\
-Source worktrees included in this review\n\
+Source workspaces included in this review\n\
 {source_lines}\n\
 \n\
 Pre-merge state\n\
@@ -978,11 +978,11 @@ Instructions\n\
 1. Run `jj status` and `jj resolve --list` first. Resolve conflicts by editing files; do not use `git add` or create commits.\n\
 2. If a revision remains under \"Still not fully merged\", report it; Rudder stopped before stacking another change on a conflict.\n\
 3. If the `thermonuclear` code-review skill/plugin is available, invoke it over `jj diff --from {target_ref}` (use the Skill tool, or type `/thermonuclear` if your CLI exposes it as a command). If it is NOT installed, do an equivalent thorough review yourself — a missing skill is NOT an error, just review manually.\n\
-4. Fix real review findings directly in this aggregate worktree. Do not edit the original source worktrees.\n\
+4. Fix real review findings directly in this aggregate workspace. Do not edit the original source workspaces.\n\
 5. Run the relevant tests/checks for the files touched. If a check cannot run, say exactly why.\n\
 6. Do not run jj commit/new/squash or Git branch/merge commands. When the aggregate change is ready, stop and say: `Rudder review-all change is ready; press m on this row to integrate it.`\n",
         target_ref = target_ref,
-        path = worktree.path.display(),
+        path = workspace.path.display(),
         aggregate_change = aggregate_change,
         source_lines = source_lines,
         merged = merged,

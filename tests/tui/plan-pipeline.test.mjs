@@ -65,7 +65,7 @@ test("plan → approve → workers → merge lands every node's work", { timeout
     for (;;) {
       const files = [];
       const roots = await fsp.readdir(repo, { withFileTypes: true }).catch(() => []);
-      const wt = roots.find((e) => e.name === ".rudder-worktrees");
+      const wt = roots.find((e) => e.name === ".rudder-workspaces");
       if (wt) {
         const walk = async (dir) => {
           for (const e of await fsp.readdir(dir, { withFileTypes: true }).catch(() => [])) {
@@ -74,7 +74,7 @@ test("plan → approve → workers → merge lands every node's work", { timeout
             else if (e.name.startsWith("NODE-")) files.push(p);
           }
         };
-        await walk(`${repo}/.rudder-worktrees`);
+        await walk(`${repo}/.rudder-workspaces`);
       }
       if (files.length >= nodeCount) break;
       if (Date.now() >= deadline) {

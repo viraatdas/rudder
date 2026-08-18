@@ -3,7 +3,7 @@ import path from "node:path";
 
 import { projectNodeStatus, readGraph, readyNodes } from "./graph.js";
 import { mergeGeneratedRudderMd, withRudderMdLock } from "./rudder-md.js";
-import { agentContextPath, loadRunRecord } from "./state.js";
+import { AGENT_WORKSPACES_DIR, LEGACY_AGENT_WORKSPACES_DIR, agentContextPath, loadRunRecord } from "./state.js";
 import type { RudderGraph, TaskNode } from "./types.js";
 import { ensureDir, nowIso, pathExists, runCommand, shortenHome } from "./util.js";
 
@@ -466,7 +466,7 @@ export async function renderLiveRudderMd(repoRoot: string): Promise<void> {
     for (const node of nodes) {
       const status = statusByNode.get(node.id) ?? node.status;
       const deps = depLabels(graph, node.id);
-      const workspace = node.worktree?.path ? shortenHome(node.worktree.path) : "—";
+      const workspace = node.workspace?.path ? shortenHome(node.workspace.path) : "—";
       const task = oneLine(node.title || node.prompt, 60);
       lines.push(`| ${node.id} | ${STATUS_BADGE[status]} | ${deps} | ${workspace} | ${task} |`);
     }
@@ -513,12 +513,13 @@ function oneLine(value: string, max: number): string {
 async function writeLiveRudderMd(repoRoot: string, graph: RudderGraph, content: string): Promise<void> {
   await ensureLine(path.join(repoRoot, ".gitignore"), "RUDDER.md");
   await ensureLine(path.join(repoRoot, ".gitignore"), SHARED_CONTEXT_FILE);
-  // Worktrees live inside the project; ignore them so worker checkouts are not untracked.
-  await ensureLine(path.join(repoRoot, ".gitignore"), ".rudder-worktrees/");
+  // Workspaces live inside the project; ignore them so worker checkouts are not untracked.
+  await ensureLine(path.join(repoRoot, ".gitignore"), `${AGENT_WORKSPACES_DIR}/`);
+  await ensureLine(path.join(repoRoot, ".gitignore"), `${LEGACY_AGENT_WORKSPACES_DIR}/`);
   const workspaces = new Set<string>([repoRoot]);
   for (const node of Object.values(graph.nodes)) {
-    if (node.worktree?.path) {
-      workspaces.add(node.worktree.path);
+    if (node.workspace?.path) {
+      workspaces.add(node.workspace.path);
     }
   }
   // RUDDER.md has concurrent writer processes (Rust TUI, CLI invocations like

@@ -51,8 +51,8 @@ async function seedReviewNode(repo) {
     targetBranch: "main",
     baseCommit: "base",
     vcs: "jj",
-    useWorktree: false,
-    worktreePath: repo,
+    useWorkspace: false,
+    workspacePath: repo,
   });
   run.status = "completed";
   await saveRunRecord(run);
@@ -170,8 +170,8 @@ test("standalone board redirects a running worker and returns it through review"
     targetBranch: "main",
     baseCommit: "HEAD",
     vcs: "jj",
-    useWorktree: false,
-    worktreePath: repo,
+    useWorkspace: false,
+    workspacePath: repo,
   });
   const firstAttempt = "initial-attempt";
   run.status = "running";
@@ -266,7 +266,7 @@ test("standalone board redirects a running worker and returns it through review"
     "retrying the same request id does not append or launch a duplicate turn",
   );
   assert.equal(redirected.id, run.id);
-  assert.equal(redirected.worktree.path, repo, "steering preserves the workspace");
+  assert.equal(redirected.workspace.path, repo, "steering preserves the workspace");
   assert.notEqual(redirected.process?.attemptId, firstAttempt, "a fresh attempt owns redirected state");
   run.status = "failed";
   const staleSaved = await saveRunRecord(run, { expectedAttemptId: firstAttempt });
@@ -312,4 +312,60 @@ test("standalone board redirects a running worker and returns it through review"
   );
   const inboxFiles = await fsp.readdir(path.join(repo, ".rudder", "steer")).catch(() => []);
   assert.equal(inboxFiles.filter((name) => name.endsWith(".json")).length, 0, "headless steer never strands an inbox file");
+});
+
+test("fleet nudge queues one inbox request for every in-flight worker at once", async (t) => {
+  // "keep it going, I lost internet for a bit" has to be ONE action, not one
+  // steer per node. The daemon writes a single kind:"nudge-all" request and the
+  // native owner resolves the target set, because only it knows which rows still
+  // hold a live terminal and which have to be resumed.
+  const { repo, project } = await fixture(t, "nudge");
+  await seedReviewNode(repo);
+  const server = await startBoardDaemon({
+    port: 0,
+    repoRoot: repo,
+    bus: new RudderBus(),
+    controlMode: "projector",
+  });
+  t.after(() => server.close());
+
+  const headers = {
+    "content-type": "application/json",
+    "x-rudder-token": getBoardToken(),
+  };
+  const url = `${server.url}/api/projects/${project.slug}/nudge-all`;
+
+  const empty = await fetch(url, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ requestId: "nudge-request-0001", instruction: "   " }),
+  });
+  assert.equal(empty.status, 400, "an empty nudge is rejected before it reaches the inbox");
+
+  const nudge = await fetch(url, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      requestId: "nudge-request-0001",
+      instruction: "keep it going, I lost internet for a bit",
+    }),
+  });
+  assert.equal(nudge.status, 202);
+  assert.equal((await nudge.json()).requestId, "nudge-request-0001");
+
+  const inbox = path.join(repo, ".rudder", "steer");
+  const requests = await Promise.all(
+    (await fsp.readdir(inbox)).filter((name) => name.endsWith(".json"))
+      .map(async (name) => JSON.parse(await fsp.readFile(path.join(inbox, name), "utf8"))),
+  );
+  assert.equal(requests.length, 1, "one fleet request, not one per worker");
+  assert.equal(requests[0].kind, "nudge-all");
+  assert.equal(requests[0].instruction, "keep it going, I lost internet for a bit");
+
+  const unauthorized = await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ instruction: "should never reach the fleet" }),
+  });
+  assert.ok(unauthorized.status >= 400, "a fleet nudge is behind the same token guard as a steer");
 });

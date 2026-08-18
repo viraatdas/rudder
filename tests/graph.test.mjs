@@ -480,7 +480,7 @@ test("mirrorPlanIntoGraph upserts nodes with mapped status and metadata", () => 
   const g = mirrorPlanIntoGraph(emptyGraph(), {
     nodes: [
       { id: "n0", title: "build api", status: "merged", backend: "codex", model: "o3", effort: "high" },
-      { id: "n1", title: "build ui", status: "running", runId: "run-1", jjChangeId: "z123", worktreePath: "/w/n1" },
+      { id: "n1", title: "build ui", status: "running", runId: "run-1", jjChangeId: "z123", workspacePath: "/w/n1" },
     ],
   });
   assert.deepEqual(Object.keys(g.nodes).sort(), ["n0", "n1"]);
@@ -491,7 +491,7 @@ test("mirrorPlanIntoGraph upserts nodes with mapped status and metadata", () => 
   assert.equal(g.nodes.n1.status, "running");
   assert.equal(g.nodes.n1.runId, "run-1");
   assert.equal(g.nodes.n1.jjChangeId, "z123");
-  assert.deepEqual(g.nodes.n1.worktree, { path: "/w/n1" });
+  assert.deepEqual(g.nodes.n1.workspace, { path: "/w/n1" });
 });
 
 test("mirrorPlanIntoGraph rebuilds edges from deps and stores edge ids on the node", () => {
@@ -656,4 +656,76 @@ test("projectNodeStatus still projects a completed run to review for a running n
   assert.equal(projectNodeStatus(node("n0", "running"), { status: "failed" }), "failed");
   assert.equal(projectNodeStatus(node("n0", "ready"), undefined), "ready");
   assert.equal(projectNodeStatus(node("n0", "planned"), undefined), "planned");
+});
+
+test("legacy `worktree` keys are promoted to `workspace` on read", async () => {
+  // Every run.json and graph.json written before the worktree->workspace rename
+  // stores isolation info under `worktree`. If the promotion regresses, running
+  // agents lose their workspace path: the scheduler stops finding their changes,
+  // merges have no source, and the rows look like main-checkout agents.
+  const repo = await fsp.mkdtemp(path.join(os.tmpdir(), "rudder-legacy-key-"));
+  const { loadRunRecord, runDir } = await import("../dist/state.js");
+  const { readGraph } = await import("../dist/graph.js");
+
+  await fsp.mkdir(runDir(repo, "legacy-run"), { recursive: true });
+  await fsp.writeFile(
+    path.join(runDir(repo, "legacy-run"), "run.json"),
+    JSON.stringify({
+      id: "legacy-run",
+      status: "completed",
+      task: "legacy shape",
+      backend: "claude",
+      vcs: "jj",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      repoRoot: repo,
+      targetBranch: "main",
+      baseCommit: "abc",
+      worktree: {
+        enabled: true,
+        path: path.join(repo, ".rudder-worktrees", "g", "n0"),
+        workspaceName: "rudder-n0",
+        jjChangeId: "zzz",
+      },
+      currentPrompt: "x",
+      turns: [],
+    }),
+  );
+
+  const run = await loadRunRecord(repo, "legacy-run");
+  assert.equal(run.workspace.workspaceName, "rudder-n0");
+  assert.equal(run.workspace.jjChangeId, "zzz");
+  // The path is NOT rewritten: a jj workspace stays registered under the
+  // absolute path it was created at, legacy directory name included.
+  assert.equal(run.workspace.path, path.join(repo, ".rudder-worktrees", "g", "n0"));
+  assert.equal(run.worktree, undefined, "the legacy key is dropped after promotion");
+
+  await fsp.mkdir(path.join(repo, ".rudder"), { recursive: true });
+  await fsp.writeFile(
+    graphPath(repo),
+    JSON.stringify({
+      version: 1,
+      repoRoot: repo,
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      edges: {},
+      nodes: {
+        n0: {
+          id: "n0",
+          title: "legacy node",
+          prompt: "p",
+          backend: "claude",
+          status: "running",
+          deps: [],
+          createdAt: "2026-01-01T00:00:00.000Z",
+          updatedAt: "2026-01-01T00:00:00.000Z",
+          worktree: { path: path.join(repo, ".rudder-worktrees", "g", "n0"), workspaceName: "rudder-n0" },
+        },
+      },
+    }),
+  );
+
+  const graph = await readGraph(repo);
+  assert.equal(graph.nodes.n0.workspace.workspaceName, "rudder-n0");
+  assert.equal(graph.nodes.n0.worktree, undefined);
+  await fsp.rm(repo, { recursive: true, force: true });
 });

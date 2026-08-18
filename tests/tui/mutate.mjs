@@ -136,11 +136,11 @@ const MUTATIONS = [
   {
     id: "rename-heal",
     file: "gitio.rs",
-    find: 'const WORKTREES_MARKER: &str = "/.rudder-worktrees/";',
-    replace: 'const WORKTREES_MARKER: &str = "/.rudder-worktrees-NEVER/";',
+    find: 'const WORKSPACES_MARKERS: [&str; 2] = ["/.rudder-workspaces/", "/.rudder-worktrees/"];',
+    replace: 'const WORKSPACES_MARKERS: [&str; 2] = ["/.rudder-workspaces-NEVER/", "/.rudder-worktrees-NEVER/"];',
     guards: "repo rename heal",
     // The marker-rebase rule fires only for a field-observed shape (repoRoot
-    // rewritten, worktree.path stale) the e2e cannot construct — so it is
+    // rewritten, workspace.path stale) the e2e cannot construct — so it is
     // guarded by this native unit test, not the screen.
     unit: "a_renamed_repo_heals",
   },

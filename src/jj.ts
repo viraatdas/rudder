@@ -10,7 +10,8 @@ import {
   runCommandSync,
   shortHash,
 } from "./util.js";
-import { ensureProjectRuntimeIgnored, saveRunRecord, worktreePath } from "./state.js";
+import { ensureProjectRuntimeIgnored, saveRunRecord, workspacePath } from "./state.js";
+import { DECISIONS_HEADER } from "./surfaces.js";
 import { withIntegrationLock } from "./rudder-md.js";
 
 // Minimum jj version we are confident in. Older releases may lack flags we use
@@ -312,7 +313,7 @@ export async function createNodeWorkspace(params: {
     throw new Error("createNodeWorkspace requires nodeId or runId.");
   }
   const workspaceName = workspaceNameFor(id);
-  const targetPath = worktreePath(params.repoRoot, params.runId ?? id, params.task);
+  const targetPath = workspacePath(params.repoRoot, params.runId ?? id, params.task);
   await fsp.mkdir(path.dirname(targetPath), { recursive: true });
 
   const baseArgs = ["workspace", "add", targetPath, "--name", workspaceName];
@@ -386,11 +387,11 @@ export async function mergeJjRunIntoCurrentWorkspace(run: RunRecord, allowDirty 
 }
 
 async function mergeJjRunIntoCurrentWorkspaceLocked(run: RunRecord, allowDirty: boolean): Promise<RunRecord> {
-  if (!run.worktree.workspaceName) {
+  if (!run.workspace.workspaceName) {
     throw new Error("Run has no jj workspace name to merge.");
   }
   ensureJjRepo(run.repoRoot);
-  ensureJjRepo(run.worktree.path);
+  ensureJjRepo(run.workspace.path);
   // A resolver edits the already-created merge change in place. Once its
   // conflicts are gone, finalize that transaction instead of creating a second
   // merge change on top of it.
@@ -416,7 +417,12 @@ async function mergeJjRunIntoCurrentWorkspaceLocked(run: RunRecord, allowDirty: 
   // merge parented on a still-conflicted @ (e.g. the user declined the resolver
   // after a previous conflicted merge) nests conflicts, so this guard is
   // unconditional.
-  const preexistingConflicts = await jjConflictedFiles(run.repoRoot);
+  // PRE-FLIGHT. A conflicted integration workspace refuses EVERY later merge, so
+  // one unresolved DECISIONS.md used to strand an entire plan: finished nodes sat
+  // in review and everything hard-depending on them stayed unlaunchable. Settle
+  // what needs no judgment first; only a real product conflict should ever stop
+  // integration.
+  const preexistingConflicts = await autoResolveMechanicalConflicts(run.repoRoot);
   if (preexistingConflicts.length > 0) {
     const error = `integration workspace already has unresolved conflicts (${preexistingConflicts.join(", ")}); resolve them before merging another run`;
     await markMergeFailed(run, error);
@@ -431,7 +437,7 @@ async function mergeJjRunIntoCurrentWorkspaceLocked(run: RunRecord, allowDirty: 
   };
   await saveRunRecord(run);
 
-  const sourceChangeId = await currentJjChangeId(run.worktree.path);
+  const sourceChangeId = await currentJjChangeId(run.workspace.path);
   if (!sourceChangeId) {
     await markMergeFailed(run, "Could not determine jj change id for run workspace.");
     throw new Error("Could not determine jj change id for run workspace.");
@@ -665,16 +671,16 @@ export async function forgetWorkspace(params: {
 }
 
 export async function removeRunWorkspace(run: RunRecord): Promise<void> {
-  if (!run.worktree.enabled) {
+  if (!run.workspace.enabled) {
     return;
   }
-  if (!run.worktree.workspaceName) {
+  if (!run.workspace.workspaceName) {
     throw new Error("Run has no jj workspace name to remove.");
   }
   await forgetWorkspace({
     repoRoot: run.repoRoot,
-    workspaceName: run.worktree.workspaceName,
-    workspacePath: run.worktree.path,
+    workspaceName: run.workspace.workspaceName,
+    workspacePath: run.workspace.path,
   });
 }
 
@@ -683,11 +689,11 @@ export async function removeRunWorkspace(run: RunRecord): Promise<void> {
  * never blocks, so there is no rebase-in-progress dance.
  */
 export async function syncRunWorkspace(run: RunRecord, baseBranch: string): Promise<RunRecord> {
-  if (!run.worktree.workspaceName) {
+  if (!run.workspace.workspaceName) {
     throw new Error("Run has no jj workspace to sync.");
   }
   ensureJjRepo(run.repoRoot);
-  const nodeChange = run.worktree.jjChangeId || (await currentJjChangeId(run.worktree.path));
+  const nodeChange = run.workspace.jjChangeId || (await currentJjChangeId(run.workspace.path));
   if (!nodeChange) {
     run.sync = {
       ...run.sync,
@@ -728,7 +734,7 @@ export async function syncRunWorkspace(run: RunRecord, baseBranch: string): Prom
     }
   }
 
-  const conflicted = await jjConflictedFiles(run.worktree.path);
+  const conflicted = await jjConflictedFiles(run.workspace.path);
   if (conflicted.length) {
     run.hadMergeConflict = true;
   }
@@ -847,4 +853,208 @@ function compareVersions(a: string, b: string): number {
     }
   }
   return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Mechanical conflict resolution.
+//
+// A conflict in one of Rudder's own coordination files is never a real product
+// disagreement, and neither is a lockfile: they are the dominant cause of the
+// N-sided pileups that used to wedge integration. The native side pre-flights
+// the same classes before every interactive merge; this is the same rule for
+// the scheduler/daemon path, which had none and so could still freeze a whole
+// plan behind one DECISIONS.md conflict.
+// ---------------------------------------------------------------------------
+
+const CONFLICT_MARKER = /^(<{7}|={7}|>{7}|%{7}|\+{7})/;
+
+export function containsConflictMarkers(content: string): boolean {
+  return content.split(/\r?\n/).some((line) => CONFLICT_MARKER.test(line));
+}
+
+/** The parent revisions of `@`; a merge has two or more. */
+export async function jjParentRevs(repoRoot: string): Promise<string[]> {
+  const result = await jjReadInWorkspace(repoRoot, [
+    "log",
+    "--no-graph",
+    "--no-pager",
+    "-r",
+    "@-",
+    "-T",
+    'change_id.short() ++ "\\n"',
+  ]);
+  if (result.code !== 0) {
+    return [];
+  }
+  return result.stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+}
+
+async function jjFileShow(repoRoot: string, rev: string, filePath: string): Promise<string> {
+  const result = await runCommand("jj", ["file", "show", "-r", rev, filePath], {
+    cwd: repoRoot,
+    allowFailure: true,
+  });
+  return result.code === 0 ? result.stdout : "";
+}
+
+/** Union of `- ` bullet entries across every side, order-preserving and deduped. */
+export function mergeDecisionsSides(sides: string[]): string | undefined {
+  const seen = new Set<string>();
+  const entries: string[] = [];
+  for (const side of sides) {
+    for (const entry of side.split(/\n(?=- )/)) {
+      const normalized = entry.trim();
+      if (!normalized.startsWith("- ") || containsConflictMarkers(normalized)) {
+        continue;
+      }
+      if (!seen.has(normalized)) {
+        seen.add(normalized);
+        entries.push(normalized);
+      }
+    }
+  }
+  if (!entries.length) {
+    return longestCleanSide(sides);
+  }
+  return `${DECISIONS_HEADER}\n\n${entries.join("\n\n")}\n`;
+}
+
+function longestCleanSide(sides: string[]): string | undefined {
+  return sides
+    .filter((side) => !containsConflictMarkers(side))
+    .sort((a, b) => b.length - a.length)[0];
+}
+
+/** Deep-union of dependency/script maps; scalar ties keep the earlier side. */
+export function mergePackageJsonSides(sides: string[]): string | undefined {
+  const parsed: Array<Record<string, unknown>> = [];
+  for (const side of sides) {
+    if (!side.trim()) {
+      continue;
+    }
+    try {
+      const value = JSON.parse(side) as unknown;
+      if (!value || typeof value !== "object" || Array.isArray(value)) {
+        return undefined;
+      }
+      parsed.push(value as Record<string, unknown>);
+    } catch {
+      // A side that is not valid JSON means this is not a mechanical conflict.
+      return undefined;
+    }
+  }
+  if (!parsed.length) {
+    return undefined;
+  }
+  const merged = parsed.reduce((acc, value) => deepMergePreferringFirst(acc, value));
+  return `${JSON.stringify(merged, null, 2)}\n`;
+}
+
+function deepMergePreferringFirst(
+  left: Record<string, unknown>,
+  right: Record<string, unknown>,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...left };
+  for (const [key, value] of Object.entries(right)) {
+    const existing = out[key];
+    if (existing === undefined) {
+      out[key] = value;
+    } else if (isPlainObject(existing) && isPlainObject(value)) {
+      out[key] = deepMergePreferringFirst(existing, value);
+    }
+    // Scalar/array collision: keep the earlier side, matching the native rule.
+  }
+  return out;
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+/** Union of non-empty lines, order-preserving. */
+function unionLines(sides: string[]): string {
+  const seen = new Set<string>();
+  const lines: string[] = [];
+  for (const side of sides) {
+    for (const line of side.split(/\r?\n/)) {
+      if (containsConflictMarkers(line)) {
+        continue;
+      }
+      const key = line.trim();
+      if (key && seen.has(key)) {
+        continue;
+      }
+      if (key) {
+        seen.add(key);
+      }
+      lines.push(line);
+    }
+  }
+  return `${lines.join("\n").replace(/\n+$/, "")}\n`;
+}
+
+/**
+ * The mechanical resolution for one conflicted path, or undefined to leave it to
+ * the LLM resolver. Keyed on file NAME so it works at any depth.
+ */
+export function mechanicalMergeFor(fileName: string, sides: string[]): string | undefined {
+  switch (fileName) {
+    case "DECISIONS.md":
+      return mergeDecisionsSides(sides);
+    case "RUDDER.md":
+    case "RUDDER_SHARED.md":
+      // Regenerated by the orchestrator right after the merge.
+      return longestCleanSide(sides);
+    case ".gitignore":
+      return unionLines(sides);
+    case "package.json":
+      return mergePackageJsonSides(sides);
+    case "package-lock.json":
+    case "pnpm-lock.yaml":
+    case "yarn.lock":
+      // Regenerable: take the most complete side, install rebuilds it.
+      return longestCleanSide(sides);
+    default:
+      return undefined;
+  }
+}
+
+/**
+ * Resolve every conflict Rudder can settle without judgment, and return what is
+ * left. Never writes content that still carries conflict markers.
+ */
+export async function autoResolveMechanicalConflicts(repoRoot: string): Promise<string[]> {
+  const conflicted = await jjConflictedFiles(repoRoot);
+  if (!conflicted.length) {
+    return [];
+  }
+  const parents = await jjParentRevs(repoRoot);
+  if (parents.length < 2) {
+    return conflicted;
+  }
+  let resolvedAny = false;
+  for (const filePath of conflicted) {
+    const fileName = path.basename(filePath);
+    const sides = await Promise.all(parents.map((rev) => jjFileShow(repoRoot, rev, filePath)));
+    const merged = mechanicalMergeFor(fileName, sides);
+    // Never snapshot a "resolution" that still carries markers: it would commit
+    // literal <<<<<<< lines into history for every agent to read.
+    if (merged === undefined || containsConflictMarkers(merged)) {
+      continue;
+    }
+    await fsp.writeFile(path.join(repoRoot, filePath), merged, "utf8").then(
+      () => {
+        resolvedAny = true;
+      },
+      () => undefined,
+    );
+  }
+  if (!resolvedAny) {
+    return conflicted;
+  }
+  // jj is the source of truth for what is still conflicted after the writes.
+  return await jjConflictedFiles(repoRoot);
 }

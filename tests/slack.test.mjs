@@ -5,7 +5,7 @@ import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 // The cloud/ subproject has its own build (see AGENTS.md section 11). In a
-// checkout where it was never built (a fresh worktree, for example), skip
+// checkout where it was never built (a fresh workspace, for example), skip
 // instead of erroring so `npm test` stays green without a network install.
 const slackModuleUrl = new URL("../cloud/dist/slack.js", import.meta.url);
 const cloudBuilt = existsSync(fileURLToPath(slackModuleUrl));

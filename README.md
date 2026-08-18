@@ -159,13 +159,13 @@ command, even while typing inside the worker pane:
 | --- | --- |
 | `1` / `2` / `3` | Focus agents / worker / task |
 | `v` | Toggle review |
-| `m` | Merge the selected completed worktree |
-| `M` | Merge all completed worktrees |
-| `R` | Review all completed worktrees (Codex review-all agent) |
+| `m` | Merge the selected completed workspace |
+| `M` | Merge all completed workspaces |
+| `R` | Review all completed workspaces (Codex review-all agent) |
 | `r` | Rename the selected agent |
 | `b` | Branch the selected agent's chat into a new worker |
 | `u` | Undo the selected row's merge (restores the jj operation it ran as) |
-| `d` | Delete the selected agent and its worktree |
+| `d` | Delete the selected agent and its workspace |
 | `j` / `k` | Move the agent selection |
 | `q` | Quit |
 | `Esc` | Cancel the leader |
@@ -179,8 +179,16 @@ scroll the pane.
 
 **In the agents pane:** `j` / `k` or arrows move the selection, `Enter` focuses
 the worker, `m` / `M` / `R` / `r` / `d` act on the selection, `x` stops a running
-agent (keeping its worktree), `c` clears all merged agents from the list (press
+agent (keeping its workspace), `c` clears all merged agents from the list (press
 twice to confirm), `g` toggles the nested DAG view, and `o` opens the web board.
+
+**Finished work collapses.** A long session ends with dozens of merged and failed
+rows, which bury the two or three still moving, so `done` and `closed` each render
+as a single row with a count and a chevron (`done 27 ›`). `j` / `k` walk onto that
+row and `Enter` opens the drawer: the finished runs list in the worker pane with
+the highlighted one's result below it, and `Esc` backs out. `review` stays inline
+up to five rows — merge-ready work should be one keystroke away — and collapses the
+same way past that, because a 25-row review section is not scannable either.
 
 ## Commands and Orchestrator Skills
 
@@ -197,8 +205,8 @@ running, Rudder also exposes matching project skills; the orchestrator can write
 | `/ask <text>` | Start a one-off conversational agent in the main checkout |
 | `/share <text>` | Save gitignored shared context for all agents in `RUDDER_SHARED.md` |
 | `/main` or `/m` | Start a new main-branch agent |
-| `/review-all` | Combine completed worktrees and start a Codex review-all agent |
-| `/merge-all` | Merge all completed worktrees |
+| `/review-all` | Combine completed workspaces and start a Codex review-all agent |
+| `/merge-all` | Merge all completed workspaces |
 | `/verify` | Re-run the final repository checks after every DAG node is integrated |
 | `/color terminal\|paper` | Choose the native dashboard color mode; `terminal` uses your terminal foreground/background, `paper` restores the white canvas |
 | `/login` | Browser login for Rudder Cloud |
@@ -282,7 +290,7 @@ implementation.
    with their dependencies) above the orchestrator terminal. Type feedback in the
    task input to refine it, or press empty `Enter` to approve/launch.
 3. **The fleet runs.** The scheduler drains the DAG (todo → in-progress → review → done) as
-   dependencies merge, each task in its own isolated worktree.
+   dependencies merge, each task in its own isolated jj workspace.
 
 After launch, typing a new task folds it into the running DAG as a new node. When a worker
 finishes, Rudder reads back what it did and what work it found remaining (reconstructing it
@@ -341,7 +349,7 @@ them yourself. There is no `/automerge` command or config flag — this split is
 the behavior.
 
 Planned and `/run` worker tasks run in their own jj workspaces under a sibling
-`.rudder-worktrees` area, so parallel agents never edit the same checkout. Plain
+`.rudder-workspaces` area, so parallel agents never edit the same checkout. Plain
 main-owner and `/ask` agents intentionally run in the main checkout. Run records
 live under `.rudder/runs/`. If you quit Rudder, live workers become `paused`, keep
 their workspace/session metadata, and stay listed when you reopen the repo.
@@ -362,7 +370,7 @@ Choose the merge behavior in `~/.rudder/config.json`:
 ```
 
 - `"merge"` (default): `git merge --no-ff`.
-- `"rebase"`: rebase the worktree onto the latest base, then `git merge --ff-only`.
+- `"rebase"`: rebase the workspace onto the latest base, then `git merge --ff-only`.
 
 Command-line equivalents:
 
@@ -392,10 +400,10 @@ instead of incorrectly moving to deployed.
 
 ## Review
 
-Press `v` on an agent to toggle a review of its worktree, showing the run's diff.
+Press `v` on an agent to toggle a review of its workspace, showing the run's diff.
 Press `v` or `Esc` to return to the worker.
 
-Press `R` to review all completed worktrees as one bundle: Rudder builds an
+Press `R` to review all completed workspaces as one bundle: Rudder builds an
 aggregate branch and starts a Codex review-all agent over the combined diff. When
 that row is done, press `m` on it to merge the reviewed bundle into your checkout.
 
@@ -486,7 +494,7 @@ batch job (launchd on macOS, not a resident daemon) that:
    merge conflicts, verifier misses) using the advisor pattern: a Sonnet
    executor consults a Fable 5 advisor mid-generation, so most tokens bill at
    the executor rate.
-3. **Proposes** fixes with headless agents in isolated worktrees of the
+3. **Proposes** fixes with headless agents in isolated git worktrees of the
    rudder repo, each briefed with a rich context pack (finding, evidence,
    surface map, prior failed attempts, repo conventions).
 4. **Judges** each candidate with the repo's full test gates plus a

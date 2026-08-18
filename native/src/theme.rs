@@ -127,7 +127,7 @@ pub(crate) fn status_color(status: AgentStatus) -> Color {
     }
 }
 
-/// Section-header style ("main" / "worktrees" / "merged"): a quiet, thin label.
+/// Section-header style ("main" / "workspaces" / "merged"): a quiet, thin label.
 /// No bold (the theme is thin); hierarchy comes from color + spacing.
 pub(crate) fn header_style(focused: bool) -> Style {
     Style::default().fg(if focused { MUTED } else { FAINT })

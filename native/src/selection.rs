@@ -57,6 +57,21 @@ pub(crate) fn agent_index_from_mouse(app: &App, mouse: MouseEvent, area: Rect) -
     app.agent_row_map.get(row).copied().flatten()
 }
 
+/// Resolve a sidebar click to a collapsed drawer header, through the same
+/// last-frame row map the agent hit-test uses.
+pub(crate) fn drawer_bucket_from_mouse(
+    app: &App,
+    mouse: MouseEvent,
+    area: Rect,
+) -> Option<crate::render::Bucket> {
+    let inner = block_inner(area);
+    if !rect_contains(inner, mouse.column, mouse.row) {
+        return None;
+    }
+    let row = mouse.row.saturating_sub(inner.y) as usize;
+    app.drawer_row_map.get(row).copied().flatten()
+}
+
 pub(crate) fn task_visible_input_start(app: &App, area: Rect, input_lines: &[String]) -> usize {
     let width = task_inner_width(area);
     let (cursor_line, _) = task_cursor_position(&app.task_input, app.task_cursor, width);

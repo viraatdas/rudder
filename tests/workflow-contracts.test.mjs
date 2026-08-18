@@ -19,7 +19,7 @@ function run(overrides = {}) {
     repoRoot: "/tmp/repo",
     targetBranch: "main",
     baseCommit: "abc",
-    worktree: { enabled: false, path: "/tmp/repo" },
+    workspace: { enabled: false, path: "/tmp/repo" },
     ...overrides,
   };
 }
@@ -60,7 +60,7 @@ test("direct completion is done, but requested delivery stays review until proof
   assert.equal(columnForRun(delivered), "done");
 
   assert.equal(
-    columnForRun(run({ worktree: { enabled: true, path: "/tmp/worker" } })),
+    columnForRun(run({ workspace: { enabled: true, path: "/tmp/worker" } })),
     "review",
     "an isolated worker still needs integration",
   );

@@ -57,7 +57,7 @@ type Parsed = {
     detach?: boolean;
     watch?: boolean;
     follow?: boolean;
-    worktree?: boolean;
+    workspace?: boolean;
     queue?: boolean;
     allowDirty?: boolean;
     dryRun?: boolean;
@@ -125,7 +125,7 @@ export async function main(): Promise<void> {
         backend: parsed.flags.backend,
         model: parsed.flags.model,
         detach: parsed.flags.detach,
-        worktree: parsed.flags.worktree,
+        workspace: parsed.flags.workspace,
         queue: parsed.flags.queue,
         json: parsed.flags.json,
         view: "shell",
@@ -221,7 +221,7 @@ export async function main(): Promise<void> {
         backend: parsed.flags.backend,
         model: parsed.flags.model,
         detach: parsed.flags.detach,
-        worktree: parsed.flags.worktree,
+        workspace: parsed.flags.workspace,
         queue: parsed.flags.queue,
         json: parsed.flags.json,
         view: "shell",
@@ -243,7 +243,7 @@ export async function main(): Promise<void> {
         backend: parsed.command,
         model: parsed.flags.model,
         detach: parsed.flags.detach,
-        worktree: parsed.flags.worktree,
+        workspace: parsed.flags.workspace,
         queue: parsed.flags.queue,
         json: parsed.flags.json,
         view: "shell",
@@ -265,7 +265,7 @@ export async function main(): Promise<void> {
         backend: "acpx",
         model: parsed.flags.model,
         detach: parsed.flags.detach,
-        worktree: parsed.flags.worktree,
+        workspace: parsed.flags.workspace,
         queue: parsed.flags.queue,
         json: parsed.flags.json,
         view: "shell",
@@ -410,7 +410,7 @@ export async function main(): Promise<void> {
         backend: parsed.flags.backend,
         model: parsed.flags.model,
         detach: parsed.flags.detach,
-        worktree: parsed.flags.worktree,
+        workspace: parsed.flags.workspace,
         queue: parsed.flags.queue,
         json: parsed.flags.json,
         view: "shell",
@@ -470,8 +470,10 @@ function parseArgs(argv: string[]): Parsed {
       parsed.flags.follow = true;
       continue;
     }
-    if (arg === "--worktree") {
-      parsed.flags.worktree = true;
+    // `--worktree` is the pre-rename spelling. Still accepted so muscle memory
+    // and existing scripts keep working; help only documents `--workspace`.
+    if (arg === "--workspace" || arg === "--worktree") {
+      parsed.flags.workspace = true;
       continue;
     }
     if (arg === "--queue") {
@@ -832,7 +834,7 @@ async function runBoard(parsed: Parsed): Promise<void> {
 
 /**
  * `rudder __launch-node`: the native TUI calls this synchronously to isolate a
- * worker in a jj workspace (replacing `git worktree add`). It colocates jj with
+ * worker in a jj workspace (replacing `git workspace add`). It colocates jj with
  * the git repo, creates a per-node workspace, reads back its change id, and
  * prints a single JSON line {path, workspaceName, jjChangeId} to stdout. Errors
  * go to stderr and exit non-zero so the native side surfaces a clear failure.
@@ -1014,7 +1016,7 @@ async function runShare(text: string): Promise<void> {
   const runs = await listRuns(repoRoot).catch(() => []);
   await syncSharedContextToWorkspaces(
     repoRoot,
-    runs.map((run) => run.worktree.path),
+    runs.map((run) => run.workspace.path),
   ).catch(() => undefined);
   console.log(`Shared. Appended to ${SHARED_CONTEXT_FILE} (gitignored, mirrored to agents).`);
 }
@@ -1225,7 +1227,7 @@ Cloud:
 
 Options:
   -d, --detach                    Start in background
-      --worktree                  Always isolate in a worktree/workspace
+      --workspace                  Always isolate the run in its own jj workspace
       --queue                     Queue mode (reserved)
   -m, --model <model>             Backend model
   -b, --backend <backend>         claude, codex, or opencode
@@ -1242,7 +1244,7 @@ Options:
 
 Rebase-first merge:
   Set {"mergeStrategy":"rebase"} in ~/.rudder/config.json to rebase before
-  merging. If that rebase conflicts, Rudder leaves the worktree mid-rebase so
+  merging. If that rebase conflicts, Rudder leaves the workspace mid-rebase so
   you can resolve it, run git rebase --continue, and retry sync or merge.
 `);
 }

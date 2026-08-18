@@ -100,14 +100,14 @@ export async function hasChanges(repoRoot: string): Promise<boolean> {
 // status/diff; legacy git runs read git status/diff.
 export async function workspaceStatus(run: RunRecord): Promise<string[]> {
   return (run.vcs ?? "git") === "jj"
-    ? await jjStatus(run.worktree.path)
-    : await gitStatus(run.worktree.path);
+    ? await jjStatus(run.workspace.path)
+    : await gitStatus(run.workspace.path);
 }
 
 export async function workspaceDiff(run: RunRecord): Promise<string> {
   return (run.vcs ?? "git") === "jj"
-    ? await jjDiff(run.worktree.path)
-    : await gitDiff(run.worktree.path);
+    ? await jjDiff(run.workspace.path)
+    : await gitDiff(run.workspace.path);
 }
 
 export async function runHasChanges(run: RunRecord): Promise<boolean> {
@@ -138,7 +138,7 @@ export async function activeRunsForCheckout(repoRoot: string, checkoutPath: stri
     if (!["created", "running", "verifying"].includes(run.status)) {
       continue;
     }
-    if (!(await sameFilesystemPath(run.worktree.path, checkoutPath))) {
+    if (!(await sameFilesystemPath(run.workspace.path, checkoutPath))) {
       continue;
     }
     if (runProcessAlive(run)) {
@@ -195,7 +195,7 @@ export async function mergeGitRunIntoCurrentBranch(
   allowDirty = false,
   strategy: MergeStrategy = "merge",
 ): Promise<RunRecord> {
-  if (!run.worktree.branch) {
+  if (!run.workspace.branch) {
     throw new Error("Run has no worktree branch to merge.");
   }
   if (!allowDirty && (await hasChanges(run.repoRoot))) {
@@ -218,7 +218,7 @@ export async function mergeGitRunIntoCurrentBranch(
   if (strategy === "rebase") {
     const rebase = await rebaseWorktreeOntoBase({
       repoRoot: run.repoRoot,
-      worktreePath: run.worktree.path,
+      worktreePath: run.workspace.path,
       baseBranch: targetBranch,
     });
     if (!rebase.success) {
@@ -234,7 +234,7 @@ export async function mergeGitRunIntoCurrentBranch(
       return run;
     }
 
-    const fastForward = await runCommand("git", ["merge", "--ff-only", run.worktree.branch], {
+    const fastForward = await runCommand("git", ["merge", "--ff-only", run.workspace.branch], {
       cwd: run.repoRoot,
       allowFailure: true,
     });
@@ -261,7 +261,7 @@ export async function mergeGitRunIntoCurrentBranch(
     return run;
   }
 
-  const merge = await runCommand("git", ["merge", "--no-ff", run.worktree.branch], {
+  const merge = await runCommand("git", ["merge", "--no-ff", run.workspace.branch], {
     cwd: run.repoRoot,
     allowFailure: true,
   });
@@ -289,7 +289,7 @@ export async function mergeGitRunIntoCurrentBranch(
 }
 
 export async function syncGitRunWorktree(run: RunRecord, baseBranch: string): Promise<RunRecord> {
-  if (!run.worktree.branch) {
+  if (!run.workspace.branch) {
     throw new Error("Run has no worktree branch to sync.");
   }
   const targetBranch = baseBranch.trim() === "HEAD" ? run.targetBranch : baseBranch;
@@ -309,7 +309,7 @@ export async function syncGitRunWorktree(run: RunRecord, baseBranch: string): Pr
 
   const rebase = await rebaseWorktreeOntoBase({
     repoRoot: run.repoRoot,
-    worktreePath: run.worktree.path,
+    worktreePath: run.workspace.path,
     baseBranch: targetBranch,
   });
   if (rebase.success) {
@@ -413,26 +413,26 @@ export async function resolveRebaseBaseRef(repoRoot: string, baseBranch: string)
 }
 
 async function commitWorktreeChanges(run: RunRecord): Promise<void> {
-  const unresolved = await conflictedFiles(run.worktree.path);
+  const unresolved = await conflictedFiles(run.workspace.path);
   if (unresolved.length > 0) {
     throw new Error(`Worktree has unresolved conflicts: ${unresolved.join(", ")}`);
   }
-  if (await rebaseInProgress(run.worktree.path)) {
-    throw new Error(`Worktree has an unfinished rebase. Resolve it in ${run.worktree.path}, run git rebase --continue, then retry.`);
+  if (await rebaseInProgress(run.workspace.path)) {
+    throw new Error(`Worktree has an unfinished rebase. Resolve it in ${run.workspace.path}, run git rebase --continue, then retry.`);
   }
-  if (!(await hasChanges(run.worktree.path))) {
+  if (!(await hasChanges(run.workspace.path))) {
     return;
   }
   await runCommand("git", ["add", "-A"], {
-    cwd: run.worktree.path,
+    cwd: run.workspace.path,
   });
   const message = `rudder: ${run.task.slice(0, 72)}`;
   const commit = await runCommand("git", ["commit", "-m", message], {
-    cwd: run.worktree.path,
+    cwd: run.workspace.path,
     allowFailure: true,
   });
   if (commit.code !== 0) {
-    const stillChanged = await hasChanges(run.worktree.path);
+    const stillChanged = await hasChanges(run.workspace.path);
     if (stillChanged) {
       throw new Error(commit.stderr.trim() || commit.stdout.trim() || "Failed to commit worktree changes.");
     }

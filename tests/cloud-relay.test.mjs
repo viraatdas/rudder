@@ -19,7 +19,7 @@ const repoRoot = path.resolve(here, "..");
 const cloudDir = path.join(repoRoot, "cloud");
 
 // The cloud/ subproject has its own build and dependencies (see AGENTS.md
-// section 11). In a checkout where it was never built (a fresh worktree, for
+// section 11). In a checkout where it was never built (a fresh workspace, for
 // example), skip instead of erroring so `npm test` stays green without a
 // network install.
 const cloudReady =

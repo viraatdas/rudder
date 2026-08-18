@@ -59,7 +59,7 @@ plus a worker image, used only when a task is handed off to the cloud.
 │   ├── src/models.rs      model/effort tables, model picker, suggestion ranking
 │   ├── src/launch.rs      agent launch/resume command building, review-all runs
 │   ├── src/tasks.rs       prompt construction, task summaries, rudder-plan parsing
-│   ├── src/gitio.rs       git/worktree/run-record persistence + fs helpers
+│   ├── src/gitio.rs       git/jj-workspace/run-record persistence + fs helpers
 │   ├── src/cloudio.rs     cloud command plumbing + Codex session-log scanning
 │   ├── src/usage.rs       token-usage accounting, pricing, date helpers
 │   ├── src/lifecycle.rs   integration evidence + final repository-check discovery
@@ -127,7 +127,7 @@ process spawns, not a socket.
 - Shebang `#!/usr/bin/env node`. Dynamically imports `main.js` so the cwd-recovery
   guard runs first.
 - `recoverCwdIfNeeded()`: if `process.cwd()` throws (deleted/unreadable dir, common
-  after a worktree is removed), it walks `$PWD` ancestors, then `~`, `/tmp`, `/`,
+  after a workspace is removed), it walks `$PWD` ancestors, then `~`, `/tmp`, `/`,
   and `chdir`s to the first readable one. Surfaces a notice.
 - Top-level try/catch turns any thrown error into `rudder: <message>` + `exit(1)`,
   with `MissingToolError` printed as-is (it carries an install hint).
@@ -135,7 +135,7 @@ process spawns, not a socket.
 ### Dispatch: `src/main.ts`
 - `parseArgs(argv)` builds `{ command, args[], flags{} }`. Flags include
   `--version/-v`, `--help/-h`, `--json`, `--quiet/-q`, `--detach/-d`, `--watch`,
-  `--follow/-f`, `--worktree`, `--queue`, `--allow-dirty`, `--force`,
+  `--follow/-f`, `--workspace` (alias `--worktree`), `--queue`, `--allow-dirty`, `--force`,
   `--non-interactive`, `--cwd`, `--repo`, `--run`, `--backend`, and `--model`.
 - `main()` flow:
   - Before user-facing command dispatch, `autoUpdateAndRerunIfNeeded` checks npm
@@ -155,7 +155,7 @@ Public commands (the `switch (parsed.command)`):
 
 | Command | Purpose |
 |---|---|
-| `run <task>` | Start a run (worktree-isolated by default policy) |
+| `run <task>` | Start a run (workspace-isolated by default policy) |
 | `claude` / `codex` / `acpx [args]` | Start a run pinned to a backend |
 | `dashboard` | Open the native dashboard (default when no args + TTY) |
 | `restart` | Reset the local Rudder session, then open the dashboard |
@@ -191,14 +191,14 @@ Implemented in `src/run-manager.ts`.
      auto-colocated (`jj git init --colocate`) so the repo still externally looks
      like git.
    - Decide jj workspace vs current checkout. Policy: a second concurrent run on
-     the same checkout forces a workspace (`activeRunsForCheckout`). `--worktree`
+     the same checkout forces a workspace (`activeRunsForCheckout`). `--workspace`
      forces one explicitly.
    - `baseCommit = currentJjChangeId(repoRoot)`. `targetBranch =
      currentJjChangeId(repoRoot)` (else `currentBranch`).
    - `createRunWorkspace` -> `jj.ts::createRunJjWorkspace`: `jj workspace add` at
-     `../.rudder-worktrees/<repo>-<hash>/<task-slug>-<hash>` with name
+     `.rudder-workspaces/<repo>-<hash>/<task-slug>-<hash>` with name
      `rudder-<id..>-<hash>`. The run records `vcs:"jj"` and
-     `worktree.jjChangeId`.
+     `workspace.jjChangeId`.
    - `createRunRecord` (`state.ts`) writes `.rudder/runs/<id>/run.json`.
    - `writeAgentContext` regenerates `RUDDER.md` and excludes it via
      `.git/info/exclude`.
@@ -264,7 +264,7 @@ The important shapes:
   `lifecyclePhase` (`working`, `verifying`, `integrating`, `resolving`,
   `merged-locally`, `pushed`, `deployed`, `delivery proof needed`, `orphaned`, or
   `cloud-owned`). Holds
-  `worktree{enabled,path,branch?,workspaceName?,jjChangeId?}`,
+  `workspace{enabled,path,branch?,workspaceName?,jjChangeId?}` (pre-rename records use the `worktree` key and are promoted on read),
   `vcs:"jj"|"git"`, `process{pid,...}`, `turns[]`, `autoSteer`,
   `session{nativeSessionId,...}`, `terminal{kind:"tmux",...}`, `verification`,
   `merge` (with `operationId`/`mergeChangeId`), `sync`,
@@ -299,7 +299,7 @@ Per repo (`<repo>/.rudder/`):
 - `undo-stack.json` (`UndoEntry[]`, atomic via `updateJson`)
 
 jj workspaces live outside the repo at
-`../.rudder-worktrees/<repoSlug>-<repoHash>/<taskSlug>-<runHash>` so they never
+`.rudder-workspaces/<repoSlug>-<repoHash>/<taskSlug>-<runHash>` so they never
 nest inside the checkout. `RUDDER.md` is generated at the repo root and inside
 each active workspace, and excluded via each checkout's `.git/info/exclude`.
 
@@ -388,7 +388,7 @@ days.
 ### Panes and focus
 `FocusPane = Agents | Worker | Task`.
 - **Agents**: the run list. Grouped: a `main`-branch agent section first, then
-  worktree runs, then a merged section. Select with `j/k` or arrows; `Enter`
+  workspace runs, then a merged section. Select with `j/k` or arrows; `Enter`
   focuses/starts; `m` merge, `d` delete, `r` rename, `v` review, `x` stop (a running
   plan worker; keeps its workspace), `g` toggle nested DAG view. (The `u` sync key was
   removed along with `/sync`; jj keeps workspaces current.)
@@ -544,7 +544,7 @@ metadata, packaged as a `.tgz` (`repo/`, `home/`, `env/cloud-env.json`,
 `manifest.json`) and stored to S3 at `snapshots/{accountId}/{date}/{uuid}.tgz`
 (AES256, 1-hour presigned URLs). Ordinary snapshots deliberately EXCLUDE secrets and
 bulk: `.ssh`, `.gnupg`, keychains, `.env*`, key files, and
-`.cache`/`node_modules`/worktrees. Explicit multi-agent `cloud workspace attach`
+`.cache`/`node_modules`/workspaces. Explicit multi-agent `cloud workspace attach`
 migration is the exception for project `.env*` files: it copies repo and nested-package
 dotenv files into the staged repo and every migrated worker workspace. On
 macOS it extracts Claude OAuth tokens from the Keychain into `.claude/.credentials.json`
@@ -591,7 +591,7 @@ SSH tunnel: no key distribution, simpler firewall traversal, but Fly must not st
 `Dockerfile` (base `node:22-slim`, runs as non-root `rudder`) + `entrypoint.sh` +
 `supervisor.mjs`. The supervisor installs the agent CLIs (claude-code, codex, acpx,
 hunkdiff), fetches + restores the snapshot from `RUDDER_SNAPSHOT_URL`, handles migrated
-agents (`migration.json`), spawns `rudder` (workspace) or `rudder codex --worktree
+agents (`migration.json`), spawns `rudder` (workspace) or `rudder codex --workspace
 <task>` (sail) under a `node-pty` 120x32, bridges I/O to the control-plane WS, and
 reports a final heartbeat on exit. On restart it checks `.rudder-staged.json` and
 re-fetches a fresh signed URL from the snapshot-url endpoint.
@@ -744,7 +744,7 @@ is a separate piece of work.
   `runCommand("jj", ...)`); `git.ts` keeps only the externally-git contract
   (root/branch/commit, status+diff for Hunk) plus the legacy git merge/sync
   helpers behind a `run.vcs === "git"` guard. New runs always record
-  `vcs:"jj"` + `worktree.jjChangeId`. Use `exportToGit` after each merge. Global
+  `vcs:"jj"` + `workspace.jjChangeId`. Use `exportToGit` after each merge. Global
   undo is free via `jj op restore` (`rudder undo`). jj 0.40 note: `jj rebase`
   uses `-o`/`--onto` (not `-d`); `jj git push --allow-new` is gone (plain
   `--bookmark` push handles new bookmarks) - both have fallbacks in `jj.ts`.
@@ -801,7 +801,7 @@ Invariants worth keeping:
   (`claude_transcript_path` / `codex_session_exists` / `opencode_session_exists`).
 - **Session ids are spliced onto a command line**, so `valid_session_id` gates
   every path, including requests read off disk.
-- **Discovery excludes Rudder's own machinery**: `.rudder-worktrees` project dirs,
+- **Discovery excludes Rudder's own machinery**: `.rudder-workspaces` (and legacy `.rudder-worktrees`) project dirs,
   live agent rows' session ids, and non-interactive transcripts (Rudder's one-shot
   `claude -p` calls for titles and completion notes record no session-mode marker).
   If that filter ever empties the list, the unfiltered list is shown instead — a
@@ -1290,7 +1290,7 @@ A FRESH task (no active plan) has a deterministic ownership contract:
 - **`/ask <text>`** is the explicit escape hatch for one-off work. It calls
   `start_oneoff_task`, spawning a single conversational **`AgentMode::OneOff`**
   agent in the MAIN checkout (`create_oneoff_agent`, cwd = repo root, NO jj
-  worktree, NO `node_id`) with bypassPermissions tools and a `RUDDER_DONE_FILE`
+  workspace, NO `node_id`) with bypassPermissions tools and a `RUDDER_DONE_FILE`
   sidecar keyed by run id.
   Keys forward to its PTY. It is explicitly excluded from selected merge /
   merge-all / review-all, and implicitly excluded from plan integration / graph-mirror /
@@ -1383,7 +1383,7 @@ verification time, and one or more checks. Only complete evidence may render `de
 - **`RUDDER.md`** — read-only, orchestrator-owned, `freshness:`-stamped projection of
   the plan/status that workers re-read (`renderLiveRudderMd`). Git-excluded.
   Native dashboard context writes must mirror the same generated block to every
-  known agent workspace, not only the root checkout or a pending worktree.
+  known agent workspace, not only the root checkout or a pending workspace.
   The generated status sections are intentionally separate: Active means live or
   waiting, Ready means completed work awaiting review or merge, and Completed is
   terminal history.

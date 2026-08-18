@@ -25,8 +25,8 @@ test("redactText: home directories and absolute paths never leave the machine", 
     "merge failed in <path>",
   );
   assert.equal(
-    redactText("worktree /private/var/folders/xy/T/rudder-abc is stale", home),
-    "worktree <path> is stale",
+    redactText("workspace /private/var/folders/xy/T/rudder-abc is stale", home),
+    "workspace <path> is stale",
   );
   // Short, non-path slashes survive: "and/or" is prose, not a filesystem path.
   assert.equal(redactText("merge and/or rebase", home), "merge and/or rebase");

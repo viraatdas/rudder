@@ -82,7 +82,7 @@ function codexArgs(run: RunRecord, prompt: string, contract: string, codexComman
     effort ? "-c" : undefined,
     effort ? `model_reasoning_effort="${effort}"` : undefined,
     "--cd",
-    run.worktree.path,
+    run.workspace.path,
     [contract, "", prompt].join("\n"),
   ].filter((value): value is string => Boolean(value));
 }
@@ -141,7 +141,7 @@ function codexPlanArgs(run: RunRecord, prompt: string, codexCommand = "codex"): 
     effort ? "-c" : undefined,
     effort ? `model_reasoning_effort="${effort}"` : undefined,
     "--cd",
-    run.worktree.path,
+    run.workspace.path,
     `${PLAN_MODE_CONTRACT}\n\n${prompt}`,
   ]);
 }

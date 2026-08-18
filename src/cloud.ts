@@ -12,7 +12,7 @@ import {
   type MigrationSnapshotManifest,
   applyDefaultDecisions,
   buildFreshHandoffPrompt,
-  cloudWorktreeAbsolutePath,
+  cloudWorkspaceAbsolutePath,
   findMigrationCandidates,
   migrationSummary,
   summaryAsJson,
@@ -173,7 +173,7 @@ const BULKY_HOME_PATH_PARTS = new Set([
   "skills",
   "telemetry",
   "todos",
-  "worktrees",
+  "workspaces",
 ]);
 const SECRET_BASENAMES = new Set([
   ".env",
@@ -568,11 +568,11 @@ async function onload(args: string[], options: CloudCommandOptions): Promise<voi
   const runRecord = runId
     ? await readJson<JsonValue>(path.join(repoRoot, ".rudder", "runs", runId, "run.json"))
     : null;
-  const worktreePath = runRecord && typeof runRecord === "object" && !Array.isArray(runRecord)
-    ? (runRecord as Record<string, JsonValue>).worktree
+  const workspacePath = runRecord && typeof runRecord === "object" && !Array.isArray(runRecord)
+    ? (runRecord as Record<string, JsonValue>).workspace
     : undefined;
-  const sourceRoot = worktreePath && typeof worktreePath === "object" && !Array.isArray(worktreePath)
-    ? ((worktreePath as Record<string, JsonValue>).path as string | undefined)
+  const sourceRoot = workspacePath && typeof workspacePath === "object" && !Array.isArray(workspacePath)
+    ? ((workspacePath as Record<string, JsonValue>).path as string | undefined)
     : undefined;
   const snapshotRoot = sourceRoot && await pathExists(sourceRoot) ? sourceRoot : repoRoot;
   const snapshot = await createSnapshot(snapshotRoot, options.homePaths ?? [], { includeRudderState: !runId });
@@ -1481,11 +1481,11 @@ async function stageMigratedAgents(
   repoName: string,
   migrated: MigrationCandidate[],
 ): Promise<MigrationManifestEntry[]> {
-  const worktreesStage = path.join(stageDir, "migrated-worktrees");
+  const workspacesStage = path.join(stageDir, "migrated-workspaces");
   const sessionsStage = path.join(stageDir, "migrated-sessions");
   const entries: MigrationManifestEntry[] = [];
   for (const candidate of migrated) {
-    if (!(await pathExists(candidate.worktreePath))) {
+    if (!(await pathExists(candidate.workspacePath))) {
       continue;
     }
     const hasSession = Boolean(
@@ -1493,14 +1493,14 @@ async function stageMigratedAgents(
         && candidate.sessionJsonlPath
         && (await pathExists(candidate.sessionJsonlPath)),
     );
-    const worktreeDest = path.join(worktreesStage, candidate.runId);
-    await ensureDir(worktreeDest);
-    await copyWorktreeFiles(candidate.worktreePath, worktreeDest, repoRoot);
-    await copyProjectEnvFiles(candidate.worktreePath, worktreeDest);
-    if (path.resolve(candidate.worktreePath) !== path.resolve(repoRoot)) {
+    const workspaceDest = path.join(workspacesStage, candidate.runId);
+    await ensureDir(workspaceDest);
+    await copyWorkspaceFiles(candidate.workspacePath, workspaceDest, repoRoot);
+    await copyProjectEnvFiles(candidate.workspacePath, workspaceDest);
+    if (path.resolve(candidate.workspacePath) !== path.resolve(repoRoot)) {
       // Ignored dotenv files do not normally exist in a jj workspace. Overlay
       // the source repo's project environment into every migrated worker.
-      await copyProjectEnvFiles(repoRoot, worktreeDest);
+      await copyProjectEnvFiles(repoRoot, workspaceDest);
     }
     let sessionJsonlSnapshotPath: string | undefined;
     if (hasSession) {
@@ -1509,7 +1509,7 @@ async function stageMigratedAgents(
       await fsp.cp(candidate.sessionJsonlPath!, jsonlDest, { force: true });
       sessionJsonlSnapshotPath = path.posix.join("migrated-sessions", `${candidate.runId}.jsonl`);
     }
-    const cloudWorktreeAbs = cloudWorktreeAbsolutePath(repoName, candidate.runId, candidate.task);
+    const cloudWorkspaceAbs = cloudWorkspaceAbsolutePath(repoName, candidate.runId, candidate.task);
     // For fresh restarts, build a prompt-engineered handoff from the local
     // run record so the new agent gets context instead of just the bare task.
     let freshPrompt: string | undefined;
@@ -1525,31 +1525,31 @@ async function stageMigratedAgents(
       taskSummary: candidate.taskSummary,
       backend: candidate.backend,
       sessionId: candidate.sessionId ?? "",
-      localWorktreePath: candidate.worktreePath,
-      cloudWorktreeRelativePath: cloudWorktreeAbs,
+      localWorkspacePath: candidate.workspacePath,
+      cloudWorkspaceRelativePath: cloudWorkspaceAbs,
       sessionJsonlSnapshotPath: sessionJsonlSnapshotPath ?? "",
-      worktreeBranch: candidate.worktreeBranch,
+      workspaceBranch: candidate.workspaceBranch,
       freshPrompt,
     });
   }
   return entries;
 }
 
-async function copyWorktreeFiles(worktreePath: string, target: string, _repoRoot: string): Promise<void> {
+async function copyWorkspaceFiles(workspacePath: string, target: string, _repoRoot: string): Promise<void> {
   const result = await runCommand("git", ["ls-files", "-z", "--cached", "--others", "--exclude-standard"], {
-    cwd: worktreePath,
+    cwd: workspacePath,
     allowFailure: true,
   });
   const files = result.code === 0
     ? result.stdout.split("\0").filter(Boolean)
-    : await listFiles(worktreePath);
+    : await listFiles(workspacePath);
   for (const relative of files) {
     if (!relative || relative.startsWith(".git/") || relative === ".git" || relative.startsWith(".rudder/")) {
       continue;
     }
-    const source = path.join(worktreePath, relative);
+    const source = path.join(workspacePath, relative);
     const dest = path.join(target, relative);
-    if (!isInside(worktreePath, source) || !isInside(target, dest)) {
+    if (!isInside(workspacePath, source) || !isInside(target, dest)) {
       continue;
     }
     const stat = await fsp.lstat(source).catch(() => null);
@@ -1564,7 +1564,7 @@ async function copyWorktreeFiles(worktreePath: string, target: string, _repoRoot
 /** Copy project dotenv files only for explicit multi-agent workspace migration. */
 export async function copyProjectEnvFiles(sourceRoot: string, targetRoot: string): Promise<number> {
   let copied = 0;
-  const ignoredDirs = new Set([".git", ".jj", ".rudder", ".rudder-worktrees", "node_modules"]);
+  const ignoredDirs = new Set([".git", ".jj", ".rudder", ".rudder-workspaces", ".rudder-worktrees", "node_modules"]);
   async function walk(current: string): Promise<void> {
     const entries = await fsp.readdir(current, { withFileTypes: true }).catch(() => []);
     for (const entry of entries) {

@@ -98,7 +98,7 @@ test("guard-notice keys each fire: R (review-all), o (web), b (branch)", { timeo
   const { session } = await twoWorkerDashboard(t, "rudder-tui-guards-");
   // R: nothing is done yet, so review-all says exactly that.
   await session.press("R");
-  await session.waitForText("no completed worktrees ready to review", { timeout: 15_000 });
+  await session.waitForText("no completed workspaces ready to review", { timeout: 15_000 });
   // o: opens the project's web view (offline: it still emits the notice).
   await session.press("o");
   await session.waitForText("web view", { timeout: 15_000 });
@@ -147,7 +147,8 @@ test("cc clears merged rows from the list (two-press)", { timeout: 120_000 }, as
   await session.press("M");
   await session.waitForText("[y] merge", { timeout: 20_000 });
   await session.press("y");
-  await session.waitForText("merged locally", { timeout: 30_000 });
+  // Merged rows live in the collapsed `done` drawer; its count is the proof.
+  await session.waitForText("done 1", { timeout: 30_000 });
 
   // c arms the clear confirm; a second c removes every merged row.
   await session.press("Ctrl+W");

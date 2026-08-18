@@ -53,9 +53,24 @@ export function projectStateDir(repoRoot: string): string {
   return path.join(repoRoot, ".rudder");
 }
 
+/**
+ * Directory INSIDE the repo holding one jj workspace per agent. Named for what
+ * it holds: `jj workspace add` targets, not git worktrees.
+ */
+export const AGENT_WORKSPACES_DIR = ".rudder-workspaces";
+/**
+ * The pre-rename name for the same directory. Still recognized everywhere a path
+ * is CLASSIFIED (ignore rules, path healing, gc scans, dashboard-root walks): a
+ * jj workspace is registered in `.jj` under the absolute path it was created at,
+ * so workspaces made before the rename must keep resolving. Only NEW workspaces
+ * are created under AGENT_WORKSPACES_DIR.
+ */
+export const LEGACY_AGENT_WORKSPACES_DIR = ".rudder-worktrees";
+
 const PROJECT_RUNTIME_IGNORES = [
   ".rudder/",
-  ".rudder-worktrees/",
+  `${AGENT_WORKSPACES_DIR}/`,
+  `${LEGACY_AGENT_WORKSPACES_DIR}/`,
   "RUDDER.md",
   "RUDDER_SHARED.md",
 ];
@@ -151,16 +166,16 @@ export function verifierPath(repoRoot: string, runId: string): string {
   return path.join(runDir(repoRoot, runId), "verifier.json");
 }
 
-export function worktreePath(repoRoot: string, runId: string, task?: string): string {
-  // Worktrees live INSIDE the project (gitignored .rudder-worktrees/), not in the parent
+export function workspacePath(repoRoot: string, runId: string, task?: string): string {
+  // Workspaces live INSIDE the project (gitignored .rudder-workspaces/), not in the parent
   // directory. This keeps every Rudder path within the project boundary, so a planner or
   // agent confined to the project never reads outside it — which is what triggered
   // Claude's "allow reading outside the project?" permission prompt.
   const repoName = `${slugify(path.basename(repoRoot), "repo")}-${shortHash(repoRoot)}`;
-  return path.join(repoRoot, ".rudder-worktrees", repoName, worktreeDirName(runId, task));
+  return path.join(repoRoot, AGENT_WORKSPACES_DIR, repoName, workspaceDirName(runId, task));
 }
 
-function worktreeDirName(runId: string, task?: string): string {
+function workspaceDirName(runId: string, task?: string): string {
   const slug = slugPrefix(task ?? runId, "task");
   const suffix = shortHash(runId).slice(0, 8);
   return `${slug}-${suffix}`;
@@ -182,7 +197,7 @@ export function defaultConfig(): RudderConfig {
     colorMode: "terminal",
     runPolicy: {
       sameCheckout: "single-active",
-      concurrentPromptMode: "worktree",
+      concurrentPromptMode: "workspace",
     },
     acpx: { install: "latest" },
     backends: {
@@ -374,11 +389,11 @@ export async function createRunRecord(params: {
   baseCommit: string;
   vcs?: VcsMode;
   resolverFor?: string;
-  useWorktree: boolean;
-  worktreeBranch?: string;
-  worktreeWorkspaceName?: string;
-  worktreeJjChangeId?: string;
-  worktreePath?: string;
+  useWorkspace: boolean;
+  workspaceBranch?: string;
+  workspaceName?: string;
+  workspaceChangeId?: string;
+  workspacePath?: string;
 }): Promise<RunRecord> {
   const id = params.id ?? newRunId(params.task);
   const createdAt = nowIso();
@@ -398,12 +413,12 @@ export async function createRunRecord(params: {
     repoRoot: params.repoRoot,
     targetBranch: params.targetBranch,
     baseCommit: params.baseCommit,
-    worktree: {
-      enabled: params.useWorktree,
-      path: params.worktreePath ?? params.repoRoot,
-      branch: params.worktreeBranch,
-      workspaceName: params.worktreeWorkspaceName,
-      ...(params.worktreeJjChangeId ? { jjChangeId: params.worktreeJjChangeId } : {}),
+    workspace: {
+      enabled: params.useWorkspace,
+      path: params.workspacePath ?? params.repoRoot,
+      branch: params.workspaceBranch,
+      workspaceName: params.workspaceName,
+      ...(params.workspaceChangeId ? { jjChangeId: params.workspaceChangeId } : {}),
     },
     currentPrompt: params.task,
     turns: [{ ts: createdAt, prompt: params.task, source: "user" }],
@@ -459,9 +474,26 @@ export async function saveRunRecord(
 
 const inflightLlmSummaries = new Set<string>();
 
+/**
+ * Records written before the worktree->workspace rename carry the isolation info
+ * under a `worktree` key. Lift it onto `workspace` on read so every consumer
+ * speaks one name; the next save persists the new key. Reading a record must
+ * never throw on the old shape, so this is a pure in-memory promotion.
+ */
+export function adoptLegacyWorkspaceKey<T extends object>(record: T): T {
+  const raw = record as Record<string, unknown>;
+  if (raw.workspace === undefined && raw.worktree !== undefined) {
+    raw.workspace = raw.worktree;
+  }
+
+  delete raw.worktree;
+  return record;
+}
+
 export async function loadRunRecord(repoRoot: string, runId: string): Promise<RunRecord | null> {
   const record = await readJson<RunRecord>(runRecordPath(repoRoot, runId));
   if (record) {
+    adoptLegacyWorkspaceKey(record);
     healMovedRepoPaths(record, repoRoot);
   }
   if (record && !record.taskSummary) {
@@ -475,7 +507,7 @@ export async function loadRunRecord(repoRoot: string, runId: string): Promise<Ru
 
 /**
  * Recorded absolute paths survive a repo RENAME or MOVE; the repo does not.
- * Everything a run record points at (worktrees, cwds) lives INSIDE the repo
+ * Everything a run record points at (workspaces, cwds) lives INSIDE the repo
  * and moves with it, so when the record's repoRoot disagrees with the root we
  * are actually reading it from, every stored path under the old root has an
  * exact counterpart under the new one. Rewrite the prefix and the record is
@@ -487,12 +519,15 @@ export function healMovedRepoPaths(record: RunRecord, actualRepoRoot: string): v
   const currentRoot = path.resolve(actualRepoRoot);
   // Rule 1's key: the stored root, IF it disagrees. Rule 2 exists because
   // rule 1 is not enough — a later save can rewrite repoRoot alone (observed:
-  // repoRoot said the new name while worktree.path still said the old one).
-  // Worktrees always live at <root>/.rudder-worktrees/..., so whatever
+  // repoRoot said the new name while workspace.path still said the old one).
+  // Workspaces always live at <root>/<agent-workspaces-dir>/..., so whatever
   // precedes that marker is some spelling of the root; rebase it.
   const storedRoot =
     record.repoRoot && record.repoRoot !== currentRoot ? record.repoRoot : null;
-  const marker = `${path.sep}.rudder-worktrees${path.sep}`;
+  const markers = [
+    `${path.sep}${AGENT_WORKSPACES_DIR}${path.sep}`,
+    `${path.sep}${LEGACY_AGENT_WORKSPACES_DIR}${path.sep}`,
+  ];
   const remap = (value: unknown): unknown => {
     if (typeof value === "string") {
       if (storedRoot) {
@@ -501,9 +536,11 @@ export function healMovedRepoPaths(record: RunRecord, actualRepoRoot: string): v
           return currentRoot + value.slice(storedRoot.length);
         }
       }
-      const index = value.indexOf(marker);
-      if (index >= 0 && !value.startsWith(currentRoot)) {
-        return currentRoot + value.slice(index);
+      for (const marker of markers) {
+        const index = value.indexOf(marker);
+        if (index >= 0 && !value.startsWith(currentRoot)) {
+          return currentRoot + value.slice(index);
+        }
       }
       return value;
     }

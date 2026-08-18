@@ -376,7 +376,9 @@ fn a_scroll_burst_throttles_draws_instead_of_debouncing_them() {
     // repainted until the gesture paused: a frozen pane that then jumped.
     let mut app = App::new();
     app.note_scroll_dirty();
-    let armed = app.scroll_draw_defer_until.expect("first event arms the window");
+    let armed = app
+        .scroll_draw_defer_until
+        .expect("first event arms the window");
     std::thread::sleep(std::time::Duration::from_millis(2));
     app.note_scroll_dirty();
     app.note_scroll_dirty();
@@ -385,11 +387,16 @@ fn a_scroll_burst_throttles_draws_instead_of_debouncing_them() {
         Some(armed),
         "later events in the burst must not push the draw deadline out"
     );
-    assert_eq!(app.scroll_events_since_draw, 3, "events still counted for stats");
+    assert_eq!(
+        app.scroll_events_since_draw, 3,
+        "events still counted for stats"
+    );
     // Once a draw consumes the window, the next event opens a fresh one.
     app.consume_scroll_draw_stats();
     app.note_scroll_dirty();
-    let rearmed = app.scroll_draw_defer_until.expect("fresh window after a draw");
+    let rearmed = app
+        .scroll_draw_defer_until
+        .expect("fresh window after a draw");
     assert!(rearmed > armed, "the new window starts after the old one");
 }
 
@@ -951,7 +958,7 @@ fn codex_idle_chrome_is_recognized_for_prompt_input() {
         "Worked for 4m 46s".to_string(),
         "1 background terminal running \u{00b7} /ps to view \u{00b7} /stop to close".to_string(),
         "> Run /review on my current changes".to_string(),
-        "gpt-5.5 xhigh fast \u{00b7} ~/Documents/.rudder-worktrees/foo-bar".to_string(),
+        "gpt-5.5 xhigh fast \u{00b7} ~/Documents/.rudder-workspaces/foo-bar".to_string(),
     ];
     assert!(terminal_looks_ready_for_input_from_lines(
         Backend::Codex,
@@ -1134,7 +1141,7 @@ fn jj_merge_conflict_prompt_uses_jj_not_git() {
         repo_root: std::env::temp_dir(),
         target_branch: None,
         source_branch: None,
-        worktree_path: None,
+        workspace_path: None,
         agent_id: Some("agent-1".to_string()),
     });
     let prompt = app.conflict_resolution_prompt().expect("merge prompt");
@@ -1489,7 +1496,7 @@ fn main_command_starts_another_agent_in_the_checkout() {
     for run in &app.agents {
         assert!(run.is_main(), "both rows run in the checkout");
         assert!(
-            run.worktree_path.is_none(),
+            run.workspace_path.is_none(),
             "no workspace, nothing to merge"
         );
     }
@@ -1582,8 +1589,8 @@ fn a_dead_main_row_deletes_and_a_live_one_stops_on_confirm() {
     main.mode = AgentMode::Main;
     main.status = AgentStatus::Orphaned;
     // A main row works in the checkout itself: deleting it must never remove a
-    // worktree, and there is none to remove.
-    assert!(main.worktree_path.is_none());
+    // workspace, and there is none to remove.
+    assert!(main.workspace_path.is_none());
     app.agents.push(main);
     app.selected_agent = 0;
 
@@ -1622,7 +1629,11 @@ fn a_dead_main_row_deletes_and_a_live_one_stops_on_confirm() {
     app.delete_pending = None;
 
     app.delete_selected_agent();
-    assert_eq!(app.agents.len(), 1, "first press arms the confirm, keeps the row");
+    assert_eq!(
+        app.agents.len(),
+        1,
+        "first press arms the confirm, keeps the row"
+    );
     assert!(
         app.notice
             .as_deref()
@@ -1648,7 +1659,7 @@ fn a_save_never_erases_the_workspace_identity_already_on_disk() {
     let repo = unique_test_repo("record-identity");
     let mut run = test_agent_run("run-1", "some work");
     run.cwd = repo.join("ws");
-    run.worktree_path = Some(run.cwd.clone());
+    run.workspace_path = Some(run.cwd.clone());
     run.workspace_name = Some("rudder-ws-1".to_string());
     run.jj_change_id = Some("qyywqtlworvr".to_string());
     save_native_run_record(&repo, &run).expect("first save");
@@ -1662,12 +1673,12 @@ fn a_save_never_erases_the_workspace_identity_already_on_disk() {
     let raw = fs::read_to_string(native_run_dir(&repo, "run-1").join("run.json")).expect("record");
     let record: serde_json::Value = serde_json::from_str(&raw).expect("valid json");
     assert_eq!(
-        record["worktree"]["workspaceName"].as_str(),
+        record["workspace"]["workspaceName"].as_str(),
         Some("rudder-ws-1"),
         "identity survives a save that did not know it"
     );
     assert_eq!(
-        record["worktree"]["jjChangeId"].as_str(),
+        record["workspace"]["jjChangeId"].as_str(),
         Some("qyywqtlworvr"),
         "the change id is what makes the row mergeable later"
     );
@@ -1690,7 +1701,7 @@ fn a_merged_workspace_with_a_live_agent_in_it_is_never_swept() {
     let mut run = test_agent_run("run-1", "some work");
     run.status = AgentStatus::Merged;
     run.workspace_name = Some("rudder-ws".to_string());
-    run.worktree_path = Some(workspace.clone());
+    run.workspace_path = Some(workspace.clone());
 
     // With no pane, an idle merged workspace is collectable.
     assert!(
@@ -2137,7 +2148,10 @@ fn a_handoff_row_says_which_directory_the_chat_ran_in() {
 
     app.task_input = "/resume auth".to_string();
     let detail = suggestions_for(&app)[0].detail.clone();
-    assert!(detail.contains("main"), "the main checkout, named: {detail}");
+    assert!(
+        detail.contains("main"),
+        "the main checkout, named: {detail}"
+    );
 
     app.task_input = "/resume sidebar".to_string();
     let detail = suggestions_for(&app)[0].detail.clone();
@@ -4347,11 +4361,41 @@ fn persisted_rudder_plan_worker_uses_worker_title_summary() {
         "backend": "codex",
         "model": "gpt-5.5",
         "createdAt": "1",
-        "worktree": { "enabled": false, "path": "/tmp/repo", "branch": null }
+        "workspace": { "enabled": false, "path": "/tmp/repo", "branch": null }
     });
 
     let run = agent_from_run_record(Path::new("/tmp/repo"), record).expect("run");
     assert_eq!(run.task_summary, "Libra Issues product UI");
+}
+
+#[test]
+fn legacy_worktree_key_still_loads_as_a_jj_workspace_run() {
+    // Records written before the worktree->workspace rename keep the old key.
+    // Reading must still recover the workspace name and change id, or every
+    // pre-rename agent row loses its identity and stops being mergeable.
+    let record = serde_json::json!({
+        "id": "run-legacy",
+        "status": "completed",
+        "mode": "execute",
+        "task": "legacy shape",
+        "backend": "claude",
+        "model": "sonnet",
+        "createdAt": "1",
+        "worktree": {
+            "enabled": true,
+            "path": "/tmp/repo/.rudder-worktrees/g/n0",
+            "workspaceName": "rudder-n0",
+            "jjChangeId": "zzz"
+        }
+    });
+
+    let run = agent_from_run_record(Path::new("/tmp/repo"), record).expect("run");
+    assert_eq!(run.workspace_name.as_deref(), Some("rudder-n0"));
+    assert_eq!(run.jj_change_id.as_deref(), Some("zzz"));
+    assert_eq!(
+        run.workspace_path.as_deref(),
+        Some(Path::new("/tmp/repo/.rudder-worktrees/g/n0"))
+    );
 }
 
 #[test]
@@ -4368,8 +4412,8 @@ fn jj_run_record_writes_vcs_jj_and_workspace_fields() {
 
     let mut run = test_agent_run("jj-run-1", "wire up jj isolation");
     run.cwd = repo_root.join("workspace");
-    run.worktree_path = Some(run.cwd.clone());
-    run.worktree_branch = None;
+    run.workspace_path = Some(run.cwd.clone());
+    run.workspace_branch = None;
     run.workspace_name = Some("rudder-jj-run-1-abc123".to_string());
     run.jj_change_id = Some("zzzzzzzz".to_string());
 
@@ -4379,17 +4423,17 @@ fn jj_run_record_writes_vcs_jj_and_workspace_fields() {
     let value: serde_json::Value = serde_json::from_str(&raw).expect("parse run.json");
 
     assert_eq!(value.get("vcs").and_then(|v| v.as_str()), Some("jj"));
-    let worktree = value.get("worktree").expect("worktree object");
+    let workspace = value.get("workspace").expect("workspace object");
     assert_eq!(
-        worktree.get("workspaceName").and_then(|v| v.as_str()),
+        workspace.get("workspaceName").and_then(|v| v.as_str()),
         Some("rudder-jj-run-1-abc123")
     );
     assert_eq!(
-        worktree.get("jjChangeId").and_then(|v| v.as_str()),
+        workspace.get("jjChangeId").and_then(|v| v.as_str()),
         Some("zzzzzzzz")
     );
     // jj runs omit the legacy git branch field.
-    assert!(worktree.get("branch").is_none());
+    assert!(workspace.get("branch").is_none());
 
     let _ = fs::remove_dir_all(repo_root);
 }
@@ -4496,7 +4540,7 @@ fn merge_conflict_run_record_round_trips_actionable_state() {
     let repo_root = unique_test_repo("merge-conflict-record");
     let run_dir = native_run_dir(&repo_root, "conflict-run-1");
     fs::create_dir_all(&run_dir).expect("create run dir");
-    let worktree = repo_root.join("worktree");
+    let workspace = repo_root.join("workspace");
     let record = serde_json::json!({
         "id": "conflict-run-1",
         "status": "merge-conflict",
@@ -4507,9 +4551,9 @@ fn merge_conflict_run_record_round_trips_actionable_state() {
         "backend": "claude",
         "model": "sonnet",
         "createdAt": "2026-06-26T00:00:00.000Z",
-        "worktree": {
+        "workspace": {
             "enabled": true,
-            "path": worktree,
+            "path": workspace,
             "workspaceName": "rudder-conflict-run-1",
             "jjChangeId": "abc123",
         },
@@ -4803,10 +4847,10 @@ fn legacy_git_run_record_keeps_vcs_git_and_branch() {
     ));
     fs::create_dir_all(&repo_root).expect("create test repo root");
 
-    let mut run = test_agent_run("git-run-1", "legacy worktree run");
-    run.cwd = repo_root.join("worktree");
-    run.worktree_path = Some(run.cwd.clone());
-    run.worktree_branch = Some("rudder/legacy-1".to_string());
+    let mut run = test_agent_run("git-run-1", "legacy workspace run");
+    run.cwd = repo_root.join("workspace");
+    run.workspace_path = Some(run.cwd.clone());
+    run.workspace_branch = Some("rudder/legacy-1".to_string());
     run.workspace_name = None;
     run.jj_change_id = None;
 
@@ -4816,12 +4860,12 @@ fn legacy_git_run_record_keeps_vcs_git_and_branch() {
     let value: serde_json::Value = serde_json::from_str(&raw).expect("parse run.json");
 
     assert_eq!(value.get("vcs").and_then(|v| v.as_str()), Some("git"));
-    let worktree = value.get("worktree").expect("worktree object");
+    let workspace = value.get("workspace").expect("workspace object");
     assert_eq!(
-        worktree.get("branch").and_then(|v| v.as_str()),
+        workspace.get("branch").and_then(|v| v.as_str()),
         Some("rudder/legacy-1")
     );
-    assert!(worktree.get("workspaceName").is_none());
+    assert!(workspace.get("workspaceName").is_none());
 
     let _ = fs::remove_dir_all(repo_root);
 }
@@ -4989,8 +5033,8 @@ fn cloud_prompt_upload_without_selected_run_is_not_scratch() {
 fn cloud_fleet_migration_quiesces_only_live_isolated_workers() {
     let _env = env_guard();
     let repo = unique_test_repo("cloud-fleet-migrate");
-    let worktree = repo.join("worker");
-    fs::create_dir_all(&worktree).unwrap();
+    let workspace = repo.join("worker");
+    fs::create_dir_all(&workspace).unwrap();
     let fake_rudder = repo.join("rudder");
     write_fake_bin(&fake_rudder, "#!/bin/sh\nsleep 5\n");
     let old_path = std::env::var_os("PATH").unwrap_or_default();
@@ -5014,8 +5058,8 @@ fn cloud_fleet_migration_quiesces_only_live_isolated_workers() {
     let mut worker = test_agent_run_with_terminal(&app, terminal);
     worker.id = "worker-1".to_string();
     worker.node_id = Some("n0".to_string());
-    worker.cwd = worktree.clone();
-    worker.worktree_path = Some(worktree);
+    worker.cwd = workspace.clone();
+    worker.workspace_path = Some(workspace);
     worker.workspace_name = Some("rudder-worker-1".to_string());
     app.agents.push(worker);
 
@@ -5238,7 +5282,7 @@ fn task_summary_turns_request_into_agent_label() {
         );
     assert_eq!(
             summarize_task_to(
-                "ok another thing for you to work on is when merge happens label the thing on the side merged and when you delete then only it deletes the worktree",
+                "ok another thing for you to work on is when merge happens label the thing on the side merged and when you delete then only it deletes the workspace",
                 40,
             ),
             "merge happens label thing side merged..."
@@ -6137,7 +6181,7 @@ fn render_merge_conflict_modal_lists_files_and_hint() {
         repo_root: std::env::temp_dir(),
         target_branch: None,
         source_branch: None,
-        worktree_path: None,
+        workspace_path: None,
         agent_id: None,
     });
 
@@ -6299,8 +6343,8 @@ fn test_agent_run(id: &str, task: &str) -> AgentRun {
         effort: None,
         status: AgentStatus::Running,
         cwd: std::env::temp_dir(),
-        worktree_branch: None,
-        worktree_path: None,
+        workspace_branch: None,
+        workspace_path: None,
         workspace_name: None,
         jj_change_id: None,
         integration: IntegrationEvidence::default(),
@@ -7209,7 +7253,7 @@ fn restart_preserves_interactive_orchestrator_profile_from_run_record() {
 }
 
 #[test]
-fn agent_navigation_follows_visible_order_with_merged_section() {
+fn agent_navigation_follows_visible_order_and_ends_on_the_done_drawer() {
     let mut app = App::new();
     let mut merged = test_agent_run("run-merged", "merged task");
     merged.status = AgentStatus::Merged;
@@ -7217,12 +7261,18 @@ fn agent_navigation_follows_visible_order_with_merged_section() {
     app.agents.push(test_agent_run("run-live", "live task"));
     app.selected_agent = 1;
 
-    assert_eq!(app.visible_agent_indices(), vec![1, 0]);
+    // The merged run lives in the `done` drawer now, so it is not a navigable row:
+    // only the live run is.
+    assert_eq!(app.visible_agent_indices(), vec![1]);
 
+    // j past the last agent row lands on the drawer header rather than dead-ending.
     app.select_next_agent();
-    assert_eq!(app.selected_agent, 0);
+    assert_eq!(app.drawer_cursor, Some(Bucket::Done));
+    assert_eq!(app.selected_agent, 1, "the pane still shows the live run");
 
+    // k comes back out of the drawer header onto the agent row.
     app.select_previous_agent();
+    assert_eq!(app.drawer_cursor, None);
     assert_eq!(app.selected_agent, 1);
 }
 
@@ -7238,7 +7288,8 @@ fn agent_navigation_keeps_main_section_first() {
     app.agents.push(main);
     app.agents.push(merged);
 
-    assert_eq!(app.visible_agent_indices(), vec![1, 0, 2]);
+    // Main first, then the live worker. The merged run is inside the `done` drawer.
+    assert_eq!(app.visible_agent_indices(), vec![1, 0]);
 }
 
 #[test]
@@ -7246,8 +7297,8 @@ fn merge_request_clears_pending_delete() {
     let mut app = App::new();
     let mut run = test_agent_run("run-1", "test task");
     run.status = AgentStatus::Done;
-    run.worktree_branch = Some("rudder/test".to_string());
-    run.worktree_path = Some(app.cwd.join("worktree"));
+    run.workspace_branch = Some("rudder/test".to_string());
+    run.workspace_path = Some(app.cwd.join("workspace"));
     // Reviewed, so this reaches the confirm modal rather than the diff gate.
     run.reviewed_at = Some("2026-08-04T00:00:00Z".to_string());
     app.agents.push(run);
@@ -7267,8 +7318,8 @@ fn unread_work_cannot_be_merged_without_being_shown_first() {
     let mut app = App::new();
     let mut run = test_agent_run("run-1", "change something");
     run.status = AgentStatus::Done;
-    run.worktree_branch = Some("rudder/test".to_string());
-    run.worktree_path = Some(app.cwd.join("worktree"));
+    run.workspace_branch = Some("rudder/test".to_string());
+    run.workspace_path = Some(app.cwd.join("workspace"));
     app.agents.push(run);
     app.delete_pending = Some("run-1".to_string());
 
@@ -7326,8 +7377,8 @@ fn merge_request_refuses_running_agent() {
     let mut app = App::new();
     let mut run = test_agent_run("run-1", "test task");
     run.status = AgentStatus::Running;
-    run.worktree_branch = Some("rudder/test".to_string());
-    run.worktree_path = Some(app.cwd.join("worktree"));
+    run.workspace_branch = Some("rudder/test".to_string());
+    run.workspace_path = Some(app.cwd.join("workspace"));
     app.agents.push(run);
 
     app.request_merge_selected_agent();
@@ -7344,8 +7395,8 @@ fn merge_agent_at_refuses_running_agent() {
     let mut app = App::new();
     let mut run = test_agent_run("run-1", "test task");
     run.status = AgentStatus::Running;
-    run.worktree_branch = Some("rudder/test".to_string());
-    run.worktree_path = Some(app.cwd.join("worktree"));
+    run.workspace_branch = Some("rudder/test".to_string());
+    run.workspace_path = Some(app.cwd.join("workspace"));
     app.agents.push(run);
 
     let result = app.merge_agent_at(0);
@@ -7404,8 +7455,8 @@ fn merge_all_can_be_triggered_from_nav_mode() {
     let mut app = App::new();
     let mut run = test_agent_run("run-1", "test task");
     run.status = AgentStatus::Done;
-    run.worktree_branch = Some("rudder/test".to_string());
-    run.worktree_path = Some(app.cwd.join("worktree"));
+    run.workspace_branch = Some("rudder/test".to_string());
+    run.workspace_path = Some(app.cwd.join("workspace"));
     app.agents.push(run);
     app.selected_agent = 0;
     app.focus = FocusPane::Worker;
@@ -7478,8 +7529,8 @@ fn merge_all_command_opens_confirmation() {
     let mut app = App::new();
     let mut run = test_agent_run("run-1", "test task");
     run.status = AgentStatus::Done;
-    run.worktree_branch = Some("rudder/test".to_string());
-    run.worktree_path = Some(app.cwd.join("worktree"));
+    run.workspace_branch = Some("rudder/test".to_string());
+    run.workspace_path = Some(app.cwd.join("workspace"));
     app.agents.push(run);
 
     assert!(app.handle_command("/merge-all"));
@@ -7540,11 +7591,11 @@ fn merge_all_confirmation_names_ready_nodes_and_logs_action() {
     let mut first = test_agent_run("run-1", "first task");
     first.status = AgentStatus::Done;
     first.node_id = Some("n1".to_string());
-    first.worktree_path = Some(app.cwd.join("worktree-1"));
+    first.workspace_path = Some(app.cwd.join("workspace-1"));
     let mut second = test_agent_run("run-2", "second task");
     second.status = AgentStatus::Done;
     second.node_id = Some("n2".to_string());
-    second.worktree_path = Some(app.cwd.join("worktree-2"));
+    second.workspace_path = Some(app.cwd.join("workspace-2"));
     app.agents.push(first);
     app.agents.push(second);
 
@@ -7559,7 +7610,7 @@ fn merge_all_confirmation_names_ready_nodes_and_logs_action() {
     assert!(app
         .activity_log
         .iter()
-        .any(|line| line.contains("merge-all ready: 2 worktrees (n1, n2)")));
+        .any(|line| line.contains("merge-all ready: 2 workspaces (n1, n2)")));
     assert!(app.notice.is_none());
 }
 
@@ -7569,12 +7620,12 @@ fn merge_all_ignores_oneoff_agents_even_if_they_have_workspace_fields() {
     let mut oneoff = test_agent_run("oneoff-1", "quick question");
     oneoff.mode = AgentMode::OneOff;
     oneoff.status = AgentStatus::Done;
-    oneoff.worktree_branch = Some("rudder/oneoff".to_string());
-    oneoff.worktree_path = Some(app.cwd.join("oneoff-worktree"));
+    oneoff.workspace_branch = Some("rudder/oneoff".to_string());
+    oneoff.workspace_path = Some(app.cwd.join("oneoff-workspace"));
     let mut run = test_agent_run("run-1", "test task");
     run.status = AgentStatus::Done;
-    run.worktree_branch = Some("rudder/test".to_string());
-    run.worktree_path = Some(app.cwd.join("worktree"));
+    run.workspace_branch = Some("rudder/test".to_string());
+    run.workspace_path = Some(app.cwd.join("workspace"));
     app.agents.push(oneoff);
     app.agents.push(run);
 
@@ -7592,8 +7643,8 @@ fn selected_oneoff_agent_cannot_be_merged() {
     let mut oneoff = test_agent_run("oneoff-1", "quick question");
     oneoff.mode = AgentMode::OneOff;
     oneoff.status = AgentStatus::Done;
-    oneoff.worktree_branch = Some("rudder/oneoff".to_string());
-    oneoff.worktree_path = Some(app.cwd.join("oneoff-worktree"));
+    oneoff.workspace_branch = Some("rudder/oneoff".to_string());
+    oneoff.workspace_path = Some(app.cwd.join("oneoff-workspace"));
     app.agents.push(oneoff);
     app.selected_agent = 0;
 
@@ -7613,11 +7664,11 @@ fn review_all_starts_codex_aggregate_agent() {
     let mut first = test_agent_run("run-1", "first task");
     first.status = AgentStatus::Done;
     first.jj_change_id = Some("rudder/first".to_string());
-    first.worktree_path = Some(app.cwd.join("worktree-1"));
+    first.workspace_path = Some(app.cwd.join("workspace-1"));
     let mut second = test_agent_run("run-2", "second task");
     second.status = AgentStatus::Done;
     second.jj_change_id = Some("rudder/second".to_string());
-    second.worktree_path = Some(app.cwd.join("worktree-2"));
+    second.workspace_path = Some(app.cwd.join("workspace-2"));
     app.agents.push(first);
     app.agents.push(second);
     app.focus = FocusPane::Agents;
@@ -7695,14 +7746,14 @@ fn review_all_premerge_combines_real_jj_changes() {
             revision: first_revision,
             task: "one".to_string(),
             summary: "one".to_string(),
-            worktree_path: Some(first_path.clone()),
+            workspace_path: Some(first_path.clone()),
         },
         ReviewAllSource {
             id: "two".to_string(),
             revision: second_revision,
             task: "two".to_string(),
             summary: "two".to_string(),
-            worktree_path: Some(second_path.clone()),
+            workspace_path: Some(second_path.clone()),
         },
     ];
 
@@ -7732,11 +7783,11 @@ fn review_all_ignores_oneoff_agents_even_if_they_have_workspace_fields() {
     oneoff.mode = AgentMode::OneOff;
     oneoff.status = AgentStatus::Done;
     oneoff.jj_change_id = Some("rudder/oneoff".to_string());
-    oneoff.worktree_path = Some(app.cwd.join("oneoff-worktree"));
+    oneoff.workspace_path = Some(app.cwd.join("oneoff-workspace"));
     let mut run = test_agent_run("run-1", "test task");
     run.status = AgentStatus::Done;
     run.jj_change_id = Some("rudder/test".to_string());
-    run.worktree_path = Some(app.cwd.join("worktree"));
+    run.workspace_path = Some(app.cwd.join("workspace"));
     app.agents.push(oneoff);
     app.agents.push(run);
 
@@ -7753,7 +7804,7 @@ fn review_all_can_be_triggered_from_nav_mode() {
     let mut run = test_agent_run("run-1", "test task");
     run.status = AgentStatus::Done;
     run.jj_change_id = Some("rudder/test".to_string());
-    run.worktree_path = Some(app.cwd.join("worktree"));
+    run.workspace_path = Some(app.cwd.join("workspace"));
     app.agents.push(run);
     app.selected_agent = 0;
     app.focus = FocusPane::Worker;
@@ -7773,7 +7824,7 @@ fn review_all_command_starts_codex_review_agent() {
     let mut run = test_agent_run("run-1", "test task");
     run.status = AgentStatus::Done;
     run.jj_change_id = Some("rudder/test".to_string());
-    run.worktree_path = Some(app.cwd.join("worktree"));
+    run.workspace_path = Some(app.cwd.join("workspace"));
     app.agents.push(run);
 
     assert!(app.handle_command("/review-all"));
@@ -7784,7 +7835,7 @@ fn review_all_command_starts_codex_review_agent() {
 }
 
 #[test]
-fn review_all_without_ready_worktrees_shows_notice() {
+fn review_all_without_ready_workspaces_shows_notice() {
     let mut app = App::new();
 
     app.review_all_ready();
@@ -7793,7 +7844,7 @@ fn review_all_without_ready_worktrees_shows_notice() {
     assert!(app
         .notice
         .as_deref()
-        .is_some_and(|notice| notice.contains("no completed worktrees")));
+        .is_some_and(|notice| notice.contains("no completed workspaces")));
 }
 
 #[test]
@@ -7802,12 +7853,12 @@ fn review_all_claimed_sources_are_not_merge_all_ready() {
     let mut source = test_agent_run("run-1", "source task");
     source.status = AgentStatus::Done;
     source.jj_change_id = Some("rudder/source".to_string());
-    source.worktree_path = Some(app.cwd.join("source"));
+    source.workspace_path = Some(app.cwd.join("source"));
     let mut review = test_agent_run("review-1", "review all");
     review.mode = AgentMode::ReviewAll;
     review.status = AgentStatus::Running;
-    review.worktree_branch = Some("rudder/review-all".to_string());
-    review.worktree_path = Some(app.cwd.join("review"));
+    review.workspace_branch = Some("rudder/review-all".to_string());
+    review.workspace_path = Some(app.cwd.join("review"));
     review.review_source_ids = vec!["run-1".to_string()];
     app.agents.push(source);
     app.agents.push(review);
@@ -7833,7 +7884,7 @@ fn merging_review_all_row_moves_source_agents_to_merged_section() {
     let mut review = test_agent_run("review-1", "review all");
     review.mode = AgentMode::ReviewAll;
     review.status = AgentStatus::Done;
-    review.worktree_branch = Some("rudder/review-all".to_string());
+    review.workspace_branch = Some("rudder/review-all".to_string());
     review.review_source_ids = vec!["run-1".to_string(), "run-2".to_string()];
     let live = test_agent_run("run-live", "live task");
     app.agents.push(first);
@@ -7846,10 +7897,16 @@ fn merging_review_all_row_moves_source_agents_to_merged_section() {
     assert_eq!(app.agents[0].status, AgentStatus::Merged);
     assert_eq!(app.agents[1].status, AgentStatus::Merged);
     assert_eq!(app.agents[2].status, AgentStatus::Merged);
-    assert!(app.agents[0].worktree_branch.is_none());
-    assert!(app.agents[1].worktree_branch.is_none());
-    assert!(app.agents[2].worktree_branch.is_none());
-    assert_eq!(app.visible_agent_indices(), vec![3, 0, 1, 2]);
+    assert!(app.agents[0].workspace_branch.is_none());
+    assert!(app.agents[1].workspace_branch.is_none());
+    assert!(app.agents[2].workspace_branch.is_none());
+    // All three merged rows moved into the `done` drawer, leaving the live run as the
+    // only navigable agent row; the drawer holds them in section order.
+    assert_eq!(app.visible_agent_indices(), vec![3]);
+    assert_eq!(
+        crate::render::drawer_members(&app.agents, Bucket::Done),
+        vec![0, 1, 2]
+    );
 }
 
 #[test]
@@ -7976,7 +8033,7 @@ fn a_main_row_renames_like_any_other() {
     let mut app = App::new();
     let mut main = test_agent_run("run-main", "long-lived main chat");
     main.mode = AgentMode::Main;
-    main.worktree_path = None;
+    main.workspace_path = None;
     app.agents.push(main);
     app.selected_agent = 0;
 
@@ -8049,7 +8106,7 @@ fn a_long_silent_running_row_says_how_long_it_has_been_quiet() {
 
 #[test]
 fn buffered_dd_bursts_cannot_cascade_across_rows() {
-    // The field failure: a slow (synchronous) worktree removal froze the UI,
+    // The field failure: a slow (synchronous) workspace removal froze the UI,
     // the user hammered dd, and the buffered presses replayed as arm+confirm
     // pairs against successive rows — deleting every tree on the board. A
     // confirm now only counts after a frame RENDERS post-arm (the user saw
@@ -8073,14 +8130,18 @@ fn buffered_dd_bursts_cannot_cascade_across_rows() {
     app.delete_selected_agent(); // re-arm (the burst left it armed at this frame)
     app.frames_drawn += 1;
     app.delete_selected_agent();
-    assert_eq!(app.agents.len(), 2, "a seen confirm still deletes exactly one row");
+    assert_eq!(
+        app.agents.len(),
+        2,
+        "a seen confirm still deletes exactly one row"
+    );
 }
 
 #[test]
-fn delete_prompt_for_worktree_requires_second_d_without_merge_offer() {
+fn delete_prompt_for_workspace_requires_second_d_without_merge_offer() {
     let mut app = App::new();
     let mut run = test_agent_run("run-1", "test task");
-    run.worktree_path = Some(app.cwd.join("worktree"));
+    run.workspace_path = Some(app.cwd.join("workspace"));
     app.agents.push(run);
 
     app.delete_selected_agent();
@@ -8115,8 +8176,8 @@ fn delete_agent_requires_second_d() {
         effort: None,
         status: AgentStatus::Done,
         cwd: app.cwd.clone(),
-        worktree_branch: None,
-        worktree_path: None,
+        workspace_branch: None,
+        workspace_path: None,
         workspace_name: None,
         jj_change_id: None,
         integration: IntegrationEvidence::default(),
@@ -8237,8 +8298,8 @@ fn main_agent_blocks_merge_but_renames() {
     let mut app = App::new();
     let mut main = test_agent_run(MAIN_AGENT_ID, "main branch");
     main.mode = AgentMode::Main;
-    main.worktree_branch = None;
-    main.worktree_path = None;
+    main.workspace_branch = None;
+    main.workspace_path = None;
     app.agents.push(main);
     app.selected_agent = 0;
 
@@ -8537,8 +8598,8 @@ fn merge_cleanup_preserves_main_agent() {
     let mut app = App::new();
     let mut main = test_agent_run(MAIN_AGENT_ID, "main branch");
     main.mode = AgentMode::Main;
-    main.worktree_branch = None;
-    main.worktree_path = None;
+    main.workspace_branch = None;
+    main.workspace_path = None;
     app.agents.push(main);
     // The defensive guard in merge_agent_at's cleanup branch must never
     // remove main even if invoked at index 0.
@@ -9697,7 +9758,7 @@ fn merge_conflict_resolver_spawn_wires_its_completion_signal() {
         repo_root: repo.clone(),
         target_branch: None,
         source_branch: None,
-        worktree_path: None,
+        workspace_path: None,
         agent_id: Some(run_id.to_string()),
     });
 
@@ -10176,7 +10237,7 @@ fn write_rudder_context_preserves_orchestrator_plan_block() {
     )
     .unwrap();
 
-    write_rudder_context_with_history(&repo, &[], None, &[], &[]).expect("write RUDDER.md");
+    write_rudder_context_with_history(&repo, &[], None, &[], &[], &[]).expect("write RUDDER.md");
     let text = fs::read_to_string(repo.join("RUDDER.md")).unwrap();
 
     assert!(text.contains("<!-- RUDDER_GENERATED_START -->"));
@@ -10187,21 +10248,21 @@ fn write_rudder_context_preserves_orchestrator_plan_block() {
 }
 
 #[test]
-fn write_rudder_context_mirrors_shared_context_to_worktree() {
+fn write_rudder_context_mirrors_shared_context_to_workspace() {
     let repo = unique_test_repo("shared-context-mirror");
     let workspace = repo.join("worker");
     fs::create_dir_all(&workspace).unwrap();
 
     append_shared_context(&repo, "test", "APIFY_TOKEN=abc1234567").unwrap();
-    let pending = WorktreeInfo {
+    let pending = WorkspaceInfo {
         id: "run-1".to_string(),
         path: workspace.clone(),
         branch: None,
-        path_is_worktree: true,
+        path_is_workspace: true,
         workspace_name: None,
         jj_change_id: None,
     };
-    write_rudder_context_with_history(&repo, &[], Some(&pending), &[], &[])
+    write_rudder_context_with_history(&repo, &[], Some(&pending), &[], &[], &[])
         .expect("write RUDDER.md");
 
     let root_shared = fs::read_to_string(repo.join("RUDDER_SHARED.md")).unwrap();
@@ -10229,7 +10290,7 @@ fn write_rudder_context_redacts_secret_values_in_agent_previews() {
     agent.cwd = repo.clone();
     agent.current_prompt = "keep using APIFY_TOKEN=abc1234567 for the ingest".to_string();
 
-    write_rudder_context_with_history(&repo, &[agent], None, &[], &[]).expect("write RUDDER.md");
+    write_rudder_context_with_history(&repo, &[agent], None, &[], &[], &[]).expect("write RUDDER.md");
     let text = fs::read_to_string(repo.join("RUDDER.md")).unwrap();
 
     assert!(text.contains("APIFY_TOKEN=[redacted]"));
@@ -10242,11 +10303,11 @@ fn write_rudder_context_redacts_secret_values_in_agent_previews() {
 #[test]
 fn write_rudder_context_includes_global_job_snapshot() {
     let repo = unique_test_repo("rudder-md-global-job-snapshot");
-    let worktree = repo.join("worker-starting");
-    fs::create_dir_all(&worktree).unwrap();
+    let workspace = repo.join("worker-starting");
+    fs::create_dir_all(&workspace).unwrap();
 
     let mut running = test_agent_run("run-codex", "monitor running codex work");
-    running.cwd = repo.join("codex-worktree");
+    running.cwd = repo.join("codex-workspace");
     running.backend = Backend::Codex;
     running.model = "gpt-5.1-codex-max".to_string();
     running.node_id = Some("n1".to_string());
@@ -10256,7 +10317,7 @@ fn write_rudder_context_includes_global_job_snapshot() {
     fs::create_dir_all(&running.cwd).unwrap();
 
     let mut done = test_agent_run("run-claude", "finish claude worker");
-    done.cwd = repo.join("claude-worktree");
+    done.cwd = repo.join("claude-workspace");
     done.status = AgentStatus::Done;
     done.node_id = Some("n3".to_string());
     done.workspace_name = Some("rudder-run-claude-test".to_string());
@@ -10264,21 +10325,21 @@ fn write_rudder_context_includes_global_job_snapshot() {
     fs::create_dir_all(&done.cwd).unwrap();
 
     let mut merged = test_agent_run("run-merged", "already merged worker");
-    merged.cwd = repo.join("merged-worktree");
+    merged.cwd = repo.join("merged-workspace");
     merged.status = AgentStatus::Merged;
     merged.node_id = Some("n4".to_string());
     fs::create_dir_all(&merged.cwd).unwrap();
 
-    let pending = WorktreeInfo {
+    let pending = WorkspaceInfo {
         id: "pending-1".to_string(),
-        path: worktree,
+        path: workspace,
         branch: Some("feature/global-view".to_string()),
-        path_is_worktree: true,
+        path_is_workspace: true,
         workspace_name: None,
         jj_change_id: None,
     };
 
-    write_rudder_context_with_history(&repo, &[running, done, merged], Some(&pending), &[], &[])
+    write_rudder_context_with_history(&repo, &[running, done, merged], Some(&pending), &[], &[], &[])
         .expect("write RUDDER.md");
     let text = fs::read_to_string(repo.join("RUDDER.md")).unwrap();
 
@@ -10323,13 +10384,13 @@ fn write_rudder_context_includes_global_job_snapshot() {
     assert!(completed_section
         .contains("run-merged node=n4 mode=execute status=merged-locally backend=claude"));
     assert!(text.contains("status=starting backend=pending model=pending"));
-    let worker_text = fs::read_to_string(repo.join("codex-worktree").join("RUDDER.md"))
+    let worker_text = fs::read_to_string(repo.join("codex-workspace").join("RUDDER.md"))
         .expect("running workspace RUDDER.md");
     assert_eq!(worker_text, text);
-    let ready_text = fs::read_to_string(repo.join("claude-worktree").join("RUDDER.md"))
+    let ready_text = fs::read_to_string(repo.join("claude-workspace").join("RUDDER.md"))
         .expect("ready workspace RUDDER.md");
     assert_eq!(ready_text, text);
-    let completed_text = fs::read_to_string(repo.join("merged-worktree").join("RUDDER.md"))
+    let completed_text = fs::read_to_string(repo.join("merged-workspace").join("RUDDER.md"))
         .expect("completed workspace RUDDER.md");
     assert_eq!(completed_text, text);
 
@@ -10348,7 +10409,7 @@ fn rudder_context_carries_session_memory_for_new_agents() {
         "also cover the timeout path".to_string(),
     ];
 
-    write_rudder_context_with_history(&repo, &[done], None, &history, &[])
+    write_rudder_context_with_history(&repo, &[done], None, &history, &[], &[])
         .expect("write RUDDER.md with history");
     let text = fs::read_to_string(repo.join("RUDDER.md")).expect("read RUDDER.md");
 
@@ -13283,8 +13344,17 @@ fn sectioned_order_groups_by_status_then_nests_children() {
     failed.status = AgentStatus::Failed;
     app.agents = vec![parent, child, merged, failed];
 
-    // in progress: parent(0) then nested child(1); done: merged(2); closed: failed(3).
-    assert_eq!(app.visible_agent_indices(), vec![0, 1, 2, 3]);
+    // in progress: parent(0) then nested child(1). The merged and failed runs are
+    // inside the done/closed drawers, so they are not navigable sidebar rows.
+    assert_eq!(app.visible_agent_indices(), vec![0, 1]);
+    assert_eq!(
+        crate::render::drawer_members(&app.agents, Bucket::Done),
+        vec![2]
+    );
+    assert_eq!(
+        crate::render::drawer_members(&app.agents, Bucket::Closed),
+        vec![3]
+    );
 }
 
 #[test]
@@ -13326,8 +13396,8 @@ fn nest_view_selection_order_matches_nest_render_across_buckets() {
     app.nest_view = false;
     assert_eq!(
         app.visible_agent_indices(),
-        vec![0, 1],
-        "sectioned: by bucket"
+        vec![0],
+        "sectioned: the merged parent is inside the done drawer, not a row"
     );
 
     app.nest_view = true;
@@ -13391,7 +13461,7 @@ fn sectioned_render_emits_status_headers_with_counts() {
     // "done" header (note: the row-2 "agents N runs" line never says "done").
     assert!(text.contains("done"), "done header present: {text}");
     // The old grouping headers must be gone; neither agent label uses these words.
-    assert!(!text.contains("worktrees"), "no worktrees header");
+    assert!(!text.contains("workspaces"), "no workspaces header");
 }
 
 #[test]
@@ -13522,7 +13592,7 @@ fn mirror_payload_maps_agent_status_and_carries_run_metadata() {
     let mut running = node_agent("n0", AgentStatus::Running);
     running.id = "run-a".to_string();
     running.jj_change_id = Some("zchange".to_string());
-    running.worktree_path = Some(PathBuf::from("/tmp/w/n0"));
+    running.workspace_path = Some(PathBuf::from("/tmp/w/n0"));
     running.deps = vec![];
 
     let mut done = node_agent("n1", AgentStatus::Done);
@@ -13551,11 +13621,11 @@ fn mirror_payload_maps_agent_status_and_carries_run_metadata() {
     assert_eq!(by_id("n3")["status"], "failed");
     assert_eq!(by_id("n4")["status"], "failed");
 
-    // The running node carries its run id, jj change, and worktree path.
+    // The running node carries its run id, jj change, and workspace path.
     let n0 = by_id("n0");
     assert_eq!(n0["runId"], "run-a");
     assert_eq!(n0["jjChangeId"], "zchange");
-    assert_eq!(n0["worktreePath"], "/tmp/w/n0");
+    assert_eq!(n0["workspacePath"], "/tmp/w/n0");
 
     // The Done agent's hard dep on n0 becomes a typed edge in the payload.
     let n1_deps = by_id("n1")["deps"].as_array().unwrap().clone();
@@ -14052,12 +14122,12 @@ fn a_renamed_repo_heals_its_recorded_paths_on_load() {
     // The incident this encodes: `mv aws-v2 libra` made every relaunch spawn
     // into the dead path and exit 1. Worse, the record found in the field had
     // repoRoot ALREADY rewritten to the new name (a later save did it) while
-    // worktree.path still said the old one — so the heal cannot key on
+    // workspace.path still said the old one — so the heal cannot key on
     // "stored root differs"; it must rebase anything before the
-    // `.rudder-worktrees` marker onto the actual root.
+    // `.rudder-workspaces` marker onto the actual root.
     let repo = unique_test_repo("renamed-heal");
     let mut run = test_agent_run("run-moved", "carry work across a rename");
-    run.cwd = repo.join(".rudder-worktrees/old-name-abc123/task-deadbeef");
+    run.cwd = repo.join(".rudder-workspaces/old-name-abc123/task-deadbeef");
     save_native_run_record(&repo, &run).expect("save run");
 
     // Simulate the rename by rewriting the record the way the field showed it:
@@ -14065,10 +14135,10 @@ fn a_renamed_repo_heals_its_recorded_paths_on_load() {
     let run_json = native_run_dir(&repo, "run-moved").join("run.json");
     let raw = fs::read_to_string(&run_json).expect("read");
     let stale = raw.replace(
-        &format!("{}/.rudder-worktrees", repo.display()),
-        "/gone/old-spelling/.rudder-worktrees",
+        &format!("{}/.rudder-workspaces", repo.display()),
+        "/gone/old-spelling/.rudder-workspaces",
     );
-    assert_ne!(raw, stale, "fixture must actually contain a worktree path");
+    assert_ne!(raw, stale, "fixture must actually contain a workspace path");
     fs::write(&run_json, stale).expect("write stale record");
 
     let loaded = load_persisted_agents(&repo);
@@ -14078,17 +14148,17 @@ fn a_renamed_repo_heals_its_recorded_paths_on_load() {
         .expect("run reloads");
     assert_eq!(
         healed.cwd,
-        repo.join(".rudder-worktrees/old-name-abc123/task-deadbeef"),
-        "the worktree path is rebased onto the repo the record was read from"
+        repo.join(".rudder-workspaces/old-name-abc123/task-deadbeef"),
+        "the workspace path is rebased onto the repo the record was read from"
     );
 
     let _ = fs::remove_dir_all(&repo);
 }
 
 #[test]
-fn a_record_with_an_empty_worktree_path_loads_a_usable_cwd() {
+fn a_record_with_an_empty_workspace_path_loads_a_usable_cwd() {
     // The "agent that just does not work" shape: a run record whose
-    // worktree.path is an empty string (corruption / interrupted rename).
+    // workspace.path is an empty string (corruption / interrupted rename).
     // It must NOT load with an empty cwd — every spawn against that would fail
     // silently. It falls through to the repo root, a usable home.
     let repo = unique_test_repo("empty-cwd");
@@ -14101,7 +14171,7 @@ fn a_record_with_an_empty_worktree_path_loads_a_usable_cwd() {
         "mode": "execute",
         "backend": "claude",
         "status": "running",
-        "worktree": { "enabled": true, "path": "" },
+        "workspace": { "enabled": true, "path": "" },
     });
     fs::write(run_dir.join("run.json"), record.to_string()).unwrap();
 
@@ -14112,7 +14182,7 @@ fn a_record_with_an_empty_worktree_path_loads_a_usable_cwd() {
         .expect("the record still loads");
     assert!(
         !agent.cwd.as_os_str().is_empty(),
-        "an empty worktree.path must not yield an empty cwd"
+        "an empty workspace.path must not yield an empty cwd"
     );
     assert_eq!(agent.cwd, repo, "it falls through to the repo root");
 
@@ -15079,23 +15149,29 @@ fn final_gate_treats_clean_jj_resolve_list_as_passing() {
 }
 
 #[test]
-fn forget_jj_workspace_refuses_paths_outside_rudder_worktrees() {
+fn forget_jj_workspace_refuses_paths_outside_rudder_workspaces() {
     use crate::gitio::forget_jj_workspace;
-    // The safety guard must refuse anything not under .rudder-worktrees so a bad
+    // The safety guard must refuse anything not under .rudder-workspaces so a bad
     // or empty record can never delete the main checkout or an unrelated tree.
     let repo = unique_test_repo("forget-guard");
     std::fs::create_dir_all(&repo).unwrap();
-    let danger = repo.join("src"); // NOT under .rudder-worktrees
+    let danger = repo.join("src"); // NOT under .rudder-workspaces
     std::fs::create_dir_all(&danger).unwrap();
     let err = forget_jj_workspace(&repo, "rudder-x", &danger);
-    assert!(err.is_err(), "must refuse a path outside .rudder-worktrees");
+    assert!(
+        err.is_err(),
+        "must refuse a path outside .rudder-workspaces"
+    );
     assert!(
         danger.exists(),
         "the refused directory must be left untouched"
     );
-    // A path under .rudder-worktrees is allowed (jj forget is best-effort; the
+    // A path under .rudder-workspaces is allowed (jj forget is best-effort; the
     // dir removal is what we assert).
-    let ok_path = repo.join(".rudder-worktrees").join("proj").join("node-abc");
+    let ok_path = repo
+        .join(".rudder-workspaces")
+        .join("proj")
+        .join("node-abc");
     std::fs::create_dir_all(&ok_path).unwrap();
     let _ = forget_jj_workspace(&repo, "rudder-y", &ok_path);
     assert!(
@@ -15174,7 +15250,7 @@ fn gc_orphan_workspaces_protects_live_and_reaps_orphans() {
     // Sets RUDDER_WORKTREE_GC_GRACE_SECS, which is process-global like any other.
     let _env = env_guard();
     let repo = unique_test_repo("gc-orphans");
-    let group = repo.join(".rudder-worktrees").join("proj");
+    let group = repo.join(".rudder-workspaces").join("proj");
     let live_dir = group.join("live-node");
     let orphan_dir = group.join("orphan-node");
     std::fs::create_dir_all(&live_dir).unwrap();
@@ -15187,7 +15263,7 @@ fn gc_orphan_workspaces_protects_live_and_reaps_orphans() {
     // A live agent owns live_dir; orphan_dir is owned by nobody.
     let mut live = test_agent_run("run-live", "task");
     live.status = AgentStatus::Running;
-    live.worktree_path = Some(live_dir.clone());
+    live.workspace_path = Some(live_dir.clone());
     app.agents.push(live);
 
     app.gc_orphan_workspaces();
@@ -15548,12 +15624,12 @@ impl ReloadHarness {
     ///
     /// Takes the row by `&mut` to enforce the one invariant the record shape assumes:
     /// a workspace row's cwd IS its workspace. The record stores a single path and the
-    /// loader hands it back as BOTH `cwd` and `worktree_path`, so a row saved with the
+    /// loader hands it back as BOTH `cwd` and `workspace_path`, so a row saved with the
     /// two disagreeing would reload into a shape no real repo ever produces — and the
     /// assertions after it would be measuring the harness, not the code.
     fn save(&self, run: &mut AgentRun) -> &Self {
         run.cwd = run
-            .worktree_path
+            .workspace_path
             .clone()
             .unwrap_or_else(|| self.repo.clone());
         save_native_run_record(&self.repo, run).expect("persist run record");
@@ -15602,12 +15678,15 @@ impl Drop for ReloadHarness {
 /// "None" tells you nothing when the interesting failure is a row coming back under
 /// a different identity.
 fn restored_run<'a>(app: &'a App, id: &str) -> &'a AgentRun {
-    app.agents.iter().find(|run| run.id == id).unwrap_or_else(|| {
-        panic!(
-            "{id} did not come back; restored rows were {:?}",
-            app.agents.iter().map(|run| &run.id).collect::<Vec<_>>()
-        )
-    })
+    app.agents
+        .iter()
+        .find(|run| run.id == id)
+        .unwrap_or_else(|| {
+            panic!(
+                "{id} did not come back; restored rows were {:?}",
+                app.agents.iter().map(|run| &run.id).collect::<Vec<_>>()
+            )
+        })
 }
 
 /// A finished worker row: `Done`, with a workspace and a change to merge. The shape
@@ -15657,8 +15736,7 @@ fn concurrent_plans_each_keep_their_orchestrator_across_a_reload() {
     save_native_run_record(&repo_root, &orch_b).expect("save plan B planner");
 
     let loaded = load_persisted_agents(&repo_root);
-    let orchestrators: Vec<&AgentRun> =
-        loaded.iter().filter(|run| run.is_orchestrator()).collect();
+    let orchestrators: Vec<&AgentRun> = loaded.iter().filter(|run| run.is_orchestrator()).collect();
 
     assert_eq!(
         orchestrators.len(),
@@ -15743,9 +15821,7 @@ fn jj_repo_with_reachable_and_orphaned_change(repo: &Path) -> Option<(String, St
             .success()
             .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
     };
-    let head = |args: &[&str]| -> Option<String> {
-        jj(args).filter(|id| !id.is_empty())
-    };
+    let head = |args: &[&str]| -> Option<String> { jj(args).filter(|id| !id.is_empty()) };
     jj(&["git", "init", "--colocate"])?;
     fs::write(repo.join("landed.txt"), "the work that stuck\n").ok()?;
     jj(&["describe", "-m", "merged work"])?;
@@ -15814,11 +15890,11 @@ fn a_reloaded_row_whose_workspace_is_gone_is_flagged_not_resurrected() {
     fs::create_dir_all(&alive).expect("create the surviving workspace");
 
     let mut here = reloadable_worker("here", "still has its workspace");
-    here.worktree_path = Some(alive);
+    here.workspace_path = Some(alive);
     harness.save(&mut here);
 
     let mut gone = reloadable_worker("gone", "workspace deleted underneath it");
-    gone.worktree_path = Some(harness.repo.join("workspaces").join("vanished"));
+    gone.workspace_path = Some(harness.repo.join("workspaces").join("vanished"));
     harness.save(&mut gone);
 
     let mut app = harness.reload();
@@ -15848,7 +15924,7 @@ fn reviewed_at_survives_a_reload_so_the_merge_gate_does_not_re_arm() {
 
     let mut reviewed = reloadable_worker("reviewed", "already read this diff");
     reviewed.reviewed_at = Some("2026-08-04T00:00:00Z".to_string());
-    reviewed.worktree_path = Some(workspace);
+    reviewed.workspace_path = Some(workspace);
     harness.save(&mut reviewed);
 
     let mut app = harness.reload();
@@ -16001,7 +16077,7 @@ fn test_capability() -> PublishCapability {
 fn publishable_run(id: &str, task: &str) -> AgentRun {
     let mut run = test_agent_run(id, task);
     run.status = AgentStatus::Done;
-    run.worktree_path = Some(std::env::temp_dir().join(id));
+    run.workspace_path = Some(std::env::temp_dir().join(id));
     run.workspace_name = Some(format!("rudder-{id}"));
     run.jj_change_id = Some(format!("change-{id}"));
     run.reviewed_at = Some("2026-08-04T00:00:00Z".to_string());
@@ -16173,7 +16249,9 @@ fn a_fan_out_parent_does_not_stack_one_arbitrary_child() {
     let units = decompose_plan_for_publish(&nodes);
     assert_eq!(units.len(), 3);
     assert!(
-        units.iter().all(|unit| unit.kind == PublishUnitKind::Independent),
+        units
+            .iter()
+            .all(|unit| unit.kind == PublishUnitKind::Independent),
         "a fork point produces no stack: {units:?}"
     );
 }
@@ -16233,7 +16311,9 @@ fn a_missing_gh_stack_extension_blocks_stacking_but_not_publishing() {
         has_gh_stack: false,
         ..test_capability()
     };
-    let blocker = no_extension.stack_blocker().expect("no extension, no stack");
+    let blocker = no_extension
+        .stack_blocker()
+        .expect("no extension, no stack");
     assert!(blocker.contains("gh extension install"), "{blocker}");
     // Single PRs are unaffected: the capability is still Active.
     assert!(test_capability().stack_blocker().is_none());
@@ -16280,10 +16360,7 @@ fn gh_argv_is_built_as_specified() {
     );
 
     // Stacks: init adopts the exported branches bottom-to-top against trunk.
-    let init = gh_stack_init_argv(
-        "main",
-        &["rudder/a".to_string(), "rudder/b".to_string()],
-    );
+    let init = gh_stack_init_argv("main", &["rudder/a".to_string(), "rudder/b".to_string()]);
     assert_eq!(
         init,
         vec!["stack", "init", "--base", "main", "rudder/a", "rudder/b"]
@@ -16308,7 +16385,15 @@ fn gh_argv_is_built_as_specified() {
     // submit has no title flags, so the real title arrives by a follow-up edit.
     assert_eq!(
         gh_pr_edit_argv(12, "Real title", "Real body"),
-        vec!["pr", "edit", "12", "--title", "Real title", "--body", "Real body"]
+        vec![
+            "pr",
+            "edit",
+            "12",
+            "--title",
+            "Real title",
+            "--body",
+            "Real body"
+        ]
     );
 }
 
@@ -16435,11 +16520,11 @@ fn publish_evidence_persists_identity_and_re_derives_state() {
 
     let restored = publish_evidence_from_record(&record);
     assert_eq!(restored.number, Some(321));
-    assert_eq!(
-        restored.branch.as_deref(),
-        Some("rudder/add-the-widget-1")
+    assert_eq!(restored.branch.as_deref(), Some("rudder/add-the-widget-1"));
+    assert!(
+        restored.state.is_none(),
+        "state is re-derived, never loaded"
     );
-    assert!(restored.state.is_none(), "state is re-derived, never loaded");
 
     let _ = fs::remove_dir_all(&repo);
 }
@@ -16546,7 +16631,7 @@ fn the_diff_gate_guards_the_local_road_only() {
     local.publish = PublishState::Inactive(PublishBlocker::NotGitHub);
     let mut unread = publishable_run("run-local", "add the widget");
     unread.reviewed_at = None;
-    unread.worktree_branch = Some("rudder/local".to_string());
+    unread.workspace_branch = Some("rudder/local".to_string());
     local.agents.push(unread);
 
     assert_eq!(local.merge_route_for(0), MergeRoute::LocalMerge);
@@ -16562,4 +16647,916 @@ fn the_diff_gate_guards_the_local_road_only() {
     );
 
     let _ = fs::remove_dir_all(&repo);
+}
+
+// ---------------------------------------------------------------------------
+// Finished-work drawers: `done` and `closed` collapse to one sidebar row each,
+// and open into a list + result view in the worker pane.
+// ---------------------------------------------------------------------------
+
+/// A fleet with two live rows, three merged rows and one failed row.
+fn drawer_fleet() -> App {
+    let mut app = App::new();
+    let live = test_agent_run("run-live", "wire up the escrow chips");
+    let second = test_agent_run("run-live-2", "fix the invite flow");
+    let mut merged_a = test_agent_run("run-m1", "identity consolidation");
+    merged_a.status = AgentStatus::Merged;
+    merged_a.node_id = Some("n2".to_string());
+    merged_a.done_summary = Some("one human, one account".to_string());
+    let mut merged_b = test_agent_run("run-m2", "payments and escrow");
+    merged_b.status = AgentStatus::Merged;
+    merged_b.node_id = Some("n3".to_string());
+    let mut merged_c = test_agent_run("run-m3", "brand identity");
+    merged_c.status = AgentStatus::Merged;
+    let mut failed = test_agent_run("run-f", "comments threading");
+    failed.status = AgentStatus::Failed;
+    app.agents = vec![live, second, merged_a, merged_b, merged_c, failed];
+    app
+}
+
+#[test]
+fn done_and_closed_always_collapse_and_live_work_never_does() {
+    assert!(Bucket::Done.always_drawer());
+    assert!(Bucket::Closed.always_drawer());
+    assert!(!Bucket::Review.always_drawer());
+    assert!(!Bucket::InProgress.always_drawer());
+    assert!(!Bucket::Todo.always_drawer());
+    assert!(!Bucket::OneOff.always_drawer());
+
+    // In-progress work is never hidden behind a chevron, however much of it there is.
+    let mut app = App::new();
+    for index in 0..40 {
+        app.agents.push(test_agent_run(
+            &format!("run-{index}"),
+            &format!("live {index}"),
+        ));
+    }
+    assert!(!crate::render::bucket_is_drawer(
+        &app.agents,
+        Bucket::InProgress
+    ));
+    assert_eq!(app.visible_agent_indices().len(), 40);
+}
+
+#[test]
+fn review_stays_inline_until_it_stops_being_readable() {
+    // A handful of merge-ready rows belongs inline, where `m` is one keystroke away.
+    // A fleet that ends with 25 of them at four lines a row does not: the section the
+    // user MUST act on becomes the one whose shape they cannot see.
+    let mut app = App::new();
+    for index in 0..crate::render::REVIEW_INLINE_LIMIT {
+        let mut run = test_agent_run(&format!("run-{index}"), &format!("finished {index}"));
+        run.status = AgentStatus::Done;
+        app.agents.push(run);
+    }
+    assert!(
+        !crate::render::bucket_is_drawer(&app.agents, Bucket::Review),
+        "at the limit review is still inline"
+    );
+    assert_eq!(
+        app.visible_agent_indices().len(),
+        crate::render::REVIEW_INLINE_LIMIT
+    );
+
+    let mut one_more = test_agent_run("run-over", "one past the limit");
+    one_more.status = AgentStatus::Done;
+    app.agents.push(one_more);
+
+    assert!(
+        crate::render::bucket_is_drawer(&app.agents, Bucket::Review),
+        "one past the limit it collapses"
+    );
+    assert!(
+        app.visible_agent_indices().is_empty(),
+        "and its rows move into the drawer"
+    );
+    assert_eq!(app.drawer_rows(), vec![Bucket::Review]);
+}
+
+#[test]
+fn a_review_drawer_that_shrinks_back_under_the_limit_reopens_inline() {
+    // Merging rows out of a long review list drops it back under the limit. The drawer
+    // must not survive that: its rows are sidebar rows again, so a stale open drawer
+    // would show a list of things that are also drawn behind it.
+    let mut app = App::new();
+    for index in 0..(crate::render::REVIEW_INLINE_LIMIT + 2) {
+        let mut run = test_agent_run(&format!("run-{index}"), &format!("finished {index}"));
+        run.status = AgentStatus::Done;
+        app.agents.push(run);
+    }
+    app.drawer_cursor = Some(Bucket::Review);
+    app.open_drawer(Bucket::Review);
+    assert_eq!(app.drawer_open(), Some(Bucket::Review));
+
+    // Two rows merge away, leaving the section short enough to read inline again.
+    app.agents[0].status = AgentStatus::Merged;
+    app.agents[1].status = AgentStatus::Merged;
+    app.normalize_drawer_state();
+
+    assert_eq!(app.drawer_open(), None, "the review drawer closed itself");
+    assert_eq!(
+        app.drawer_cursor,
+        Some(Bucket::Done),
+        "cursor followed to the done drawer"
+    );
+    assert_eq!(
+        app.visible_agent_indices().len(),
+        crate::render::REVIEW_INLINE_LIMIT,
+        "the remaining review rows are sidebar rows again"
+    );
+}
+
+#[test]
+fn sidebar_navigation_walks_agents_then_each_drawer_header() {
+    let mut app = drawer_fleet();
+    app.selected_agent = 0;
+
+    // Two live rows, then the done header, then the closed header.
+    assert_eq!(app.visible_agent_indices(), vec![0, 1]);
+
+    app.select_next_agent();
+    assert_eq!((app.selected_agent, app.drawer_cursor), (1, None));
+    app.select_next_agent();
+    assert_eq!(app.drawer_cursor, Some(Bucket::Done));
+    app.select_next_agent();
+    assert_eq!(app.drawer_cursor, Some(Bucket::Closed));
+    // Saturates at the last row instead of wrapping to the top.
+    app.select_next_agent();
+    assert_eq!(app.drawer_cursor, Some(Bucket::Closed));
+
+    app.select_previous_agent();
+    assert_eq!(app.drawer_cursor, Some(Bucket::Done));
+    app.select_previous_agent();
+    assert_eq!((app.selected_agent, app.drawer_cursor), (1, None));
+}
+
+#[test]
+fn an_empty_bucket_draws_no_header_and_is_not_navigable() {
+    let mut app = App::new();
+    app.agents = vec![test_agent_run("run-live", "only live work")];
+    app.selected_agent = 0;
+
+    app.select_next_agent();
+    assert_eq!(
+        app.drawer_cursor, None,
+        "no merged or failed runs: no drawer rows to land on"
+    );
+    assert_eq!(app.selected_agent, 0);
+}
+
+#[test]
+fn enter_opens_the_drawer_and_esc_closes_it() {
+    let mut app = drawer_fleet();
+    app.focus = FocusPane::Agents;
+    app.drawer_cursor = Some(Bucket::Done);
+
+    app.handle_agents_key(KeyEvent::from(KeyCode::Enter));
+    assert_eq!(app.drawer_open(), Some(Bucket::Done));
+    assert_eq!(
+        app.selected_agent, 2,
+        "opening highlights the first member so m/d/b act on it"
+    );
+
+    // Enter again on the same header closes it (the chevron is a toggle).
+    app.handle_agents_key(KeyEvent::from(KeyCode::Enter));
+    assert_eq!(app.drawer_open(), None);
+
+    app.handle_agents_key(KeyEvent::from(KeyCode::Enter));
+    assert_eq!(app.drawer_open(), Some(Bucket::Done));
+    app.handle_agents_key(KeyEvent::from(KeyCode::Esc));
+    assert_eq!(app.drawer_open(), None);
+    assert_eq!(
+        app.drawer_cursor,
+        Some(Bucket::Done),
+        "esc backs out to the header, not out of the sidebar"
+    );
+}
+
+#[test]
+fn navigation_inside_an_open_drawer_moves_its_selection_not_the_sidebar() {
+    let mut app = drawer_fleet();
+    app.focus = FocusPane::Agents;
+    app.drawer_cursor = Some(Bucket::Done);
+    app.open_drawer(Bucket::Done);
+
+    assert_eq!((app.drawer_selection(), app.selected_agent), (0, 2));
+    app.select_next_agent();
+    assert_eq!((app.drawer_selection(), app.selected_agent), (1, 3));
+    app.select_next_agent();
+    assert_eq!((app.drawer_selection(), app.selected_agent), (2, 4));
+    // Clamped at the last member: j does not fall through to the closed drawer.
+    app.select_next_agent();
+    assert_eq!((app.drawer_selection(), app.selected_agent), (2, 4));
+    assert_eq!(app.drawer_cursor, Some(Bucket::Done));
+
+    app.select_previous_agent();
+    assert_eq!((app.drawer_selection(), app.selected_agent), (1, 3));
+}
+
+#[test]
+fn a_run_that_finishes_while_selected_moves_the_cursor_onto_its_drawer() {
+    // Without this the sidebar has NO marker at all: the selected row left the list
+    // for a drawer, and the user is looking at a pane whose row they cannot find.
+    let mut app = drawer_fleet();
+    app.selected_agent = 0;
+    app.drawer_cursor = None;
+
+    app.agents[0].status = AgentStatus::Merged;
+    app.normalize_drawer_state();
+
+    assert_eq!(app.drawer_cursor, Some(Bucket::Done));
+    assert_eq!(
+        app.selected_agent, 0,
+        "the worker pane keeps showing the run that just finished"
+    );
+}
+
+#[test]
+fn emptying_the_open_drawer_closes_it() {
+    let mut app = drawer_fleet();
+    app.open_drawer(Bucket::Closed);
+    assert_eq!(app.drawer_open(), Some(Bucket::Closed));
+
+    // `c` clears the failed row (or it is deleted): the drawer has nothing to show.
+    app.agents.retain(|run| run.status != AgentStatus::Failed);
+    app.normalize_drawer_state();
+
+    assert_eq!(app.drawer_open(), None);
+    assert_eq!(app.drawer_cursor, None);
+}
+
+#[test]
+fn drawer_selection_is_clamped_when_members_leave_underneath_it() {
+    let mut app = drawer_fleet();
+    app.open_drawer(Bucket::Done);
+    app.move_drawer_selection(2);
+    assert_eq!(app.drawer_selection(), 2);
+
+    app.agents.retain(|run| run.id != "run-m3");
+    app.normalize_drawer_state();
+
+    assert_eq!(
+        app.drawer_selection(),
+        1,
+        "clamped to the new last member rather than pointing past the end"
+    );
+}
+
+#[test]
+fn nest_view_still_lists_every_run_as_its_own_row() {
+    // Nest view (`g`) draws the global dependency tree with no status sections, so
+    // there are no drawers there and navigation must not skip finished runs.
+    let mut app = drawer_fleet();
+    app.nest_view = true;
+    let order = app.visible_agent_indices();
+    assert_eq!(
+        order.len(),
+        app.agents.len(),
+        "every run is navigable: {order:?}"
+    );
+}
+
+#[test]
+fn collapsed_drawer_header_renders_a_count_and_chevron() {
+    let mut app = drawer_fleet();
+    app.focus = FocusPane::Agents;
+    let area = Rect::new(0, 0, 34, 40);
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(34, 40)).expect("test backend");
+    terminal
+        .draw(|frame| render_agents(frame, area, &mut app))
+        .expect("draw agents pane");
+    let text: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+
+    assert!(
+        text.contains("done 3  \u{203a}"),
+        "collapsed done header: {text}"
+    );
+    assert!(
+        text.contains("closed 1  \u{203a}"),
+        "collapsed closed header: {text}"
+    );
+    assert!(
+        !text.contains("identity consolidation"),
+        "members stay inside the drawer: {text}"
+    );
+    assert!(
+        text.contains("wire up the escrow chips"),
+        "live rows still render: {text}"
+    );
+}
+
+#[test]
+fn open_drawer_header_flips_the_chevron() {
+    let mut app = drawer_fleet();
+    app.focus = FocusPane::Agents;
+    app.drawer_cursor = Some(Bucket::Done);
+    app.open_drawer(Bucket::Done);
+    let area = Rect::new(0, 0, 34, 40);
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(34, 40)).expect("test backend");
+    terminal
+        .draw(|frame| render_agents(frame, area, &mut app))
+        .expect("draw agents pane");
+    let text: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+
+    assert!(
+        text.contains("done 3  \u{2304}"),
+        "open done header: {text}"
+    );
+    assert!(
+        text.contains("\u{25b6} done"),
+        "the cursor marker sits on the header row: {text}"
+    );
+}
+
+#[test]
+fn drawer_list_shows_node_labels_and_marks_the_selection() {
+    let app = drawer_fleet();
+    let members = crate::render::drawer_members(&app.agents, Bucket::Done);
+    let lines = crate::render::drawer_list_lines(&app.agents, &members, 1, true, 30);
+    let text: Vec<String> = lines
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.to_string())
+                .collect::<String>()
+        })
+        .collect();
+
+    assert_eq!(text.len(), 3);
+    assert!(
+        text[0].starts_with("  \u{25cf} n2  "),
+        "unselected row: badge, then the node label: {:?}",
+        text[0]
+    );
+    assert!(
+        text[1].starts_with("\u{25b6} \u{25cf} n3  "),
+        "selected row carries the marker: {:?}",
+        text[1]
+    );
+    assert!(
+        text[2].starts_with("  \u{25cf} \u{b7}   "),
+        "a run with no node id still gets a label column: {:?}",
+        text[2]
+    );
+    for row in &text {
+        assert!(
+            row.ends_with("merged locally"),
+            "each row states the state it ended in: {row:?}"
+        );
+    }
+}
+
+#[test]
+fn open_drawer_takes_over_the_worker_pane() {
+    let mut app = drawer_fleet();
+    app.focus = FocusPane::Agents;
+    app.open_drawer(Bucket::Done);
+    let area = Rect::new(0, 0, 60, 30);
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 30)).expect("test backend");
+    terminal
+        .draw(|frame| render_worker(frame, area, &mut app))
+        .expect("draw worker pane");
+    let text: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+
+    assert!(
+        text.contains("done \u{b7} 3"),
+        "list pane titled by bucket: {text}"
+    );
+    assert!(
+        text.contains("identity consolidation"),
+        "the drawer lists its members: {text}"
+    );
+    assert!(
+        text.contains("one human, one account"),
+        "and shows the highlighted run's result below: {text}"
+    );
+}
+
+#[test]
+fn keys_in_an_open_drawer_never_reach_a_hidden_pty() {
+    // Focus can land on the worker pane while a drawer is open (Ctrl+W, a click).
+    // The pane is showing a list, so keys must drive the list — not type into the
+    // finished agent's session behind it.
+    let mut app = drawer_fleet();
+    app.open_drawer(Bucket::Done);
+    app.focus = FocusPane::Worker;
+
+    app.handle_worker_key(KeyEvent::from(KeyCode::Char('j')));
+    assert_eq!((app.drawer_selection(), app.selected_agent), (1, 3));
+    app.handle_worker_key(KeyEvent::from(KeyCode::Char('k')));
+    assert_eq!((app.drawer_selection(), app.selected_agent), (0, 2));
+
+    // Enter hands the pane back to the highlighted run's own session.
+    app.handle_worker_key(KeyEvent::from(KeyCode::Enter));
+    assert_eq!(app.drawer_open(), None);
+    assert_eq!(app.selected_agent, 2);
+}
+
+#[test]
+fn esc_in_an_open_drawer_returns_focus_to_the_sidebar() {
+    let mut app = drawer_fleet();
+    app.open_drawer(Bucket::Done);
+    app.focus = FocusPane::Worker;
+
+    app.handle_worker_key(KeyEvent::from(KeyCode::Esc));
+
+    assert_eq!(app.drawer_open(), None);
+    assert_eq!(app.focus, FocusPane::Agents);
+}
+
+#[test]
+fn esc_closes_the_drawer_through_the_top_level_key_path() {
+    // Routed through handle_key (not the pane handler) so the global Esc guards —
+    // notice dismissal, the Ctrl+W leader, nav mode — cannot swallow it.
+    let mut app = drawer_fleet();
+    app.focus = FocusPane::Agents;
+    app.drawer_cursor = Some(Bucket::Done);
+    app.notice = Some("Ctrl+W: Tab cycle".to_string());
+
+    app.handle_key(KeyEvent::from(KeyCode::Enter));
+    assert_eq!(app.drawer_open(), Some(Bucket::Done), "Enter opened it");
+
+    app.handle_key(KeyEvent::from(KeyCode::Esc));
+    assert_eq!(app.drawer_open(), None, "Esc closed it");
+}
+
+#[test]
+fn the_pane_scrolls_to_the_drawer_header_when_the_cursor_lands_on_it() {
+    // A long session pushes the drawer headers below the fold. The scroll follows
+    // the SELECTION, and the drawer cursor is a selection: without this the marker
+    // walks onto a header the viewport never reveals.
+    let mut app = App::new();
+    app.focus = FocusPane::Agents;
+    for index in 0..14 {
+        app.agents.push(test_agent_run(
+            &format!("run-{index}"),
+            &format!("live task {index}"),
+        ));
+    }
+    let mut merged = test_agent_run("run-merged", "identity consolidation");
+    merged.status = AgentStatus::Merged;
+    app.agents.push(merged);
+    app.drawer_cursor = Some(Bucket::Done);
+
+    let area = Rect::new(0, 0, 34, 24);
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(34, 24)).expect("test backend");
+    terminal
+        .draw(|frame| render_agents(frame, area, &mut app))
+        .expect("draw agents pane");
+    let text: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+
+    assert!(
+        text.contains("done 1"),
+        "the pane scrolled far enough to show the drawer header: {text}"
+    );
+    assert!(
+        text.contains("\u{25b6} done"),
+        "and the cursor marker is visible on it: {text}"
+    );
+}
+
+/// Build a colocated jj repo whose working copy is a REAL 2-sided merge conflict on
+/// package.json — the collision that blocked every remaining merge in a production
+/// fleet. Returns None when jj is absent: the authority here is the external binary,
+/// and faking it would test nothing.
+#[cfg(not(windows))]
+fn jj_repo_with_conflicted_package_json(repo: &Path) -> Option<()> {
+    let jj = |args: &[&str]| -> Option<String> {
+        let out = std::process::Command::new("jj")
+            .args(args)
+            .current_dir(repo)
+            .env("JJ_USER", "Rudder Test")
+            .env("JJ_EMAIL", "test@example.invalid")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+    jj(&["git", "init", "--colocate"])?;
+    fs::write(
+        repo.join("package.json"),
+        "{\n  \"scripts\": {\n    \"build\": \"tsc\"\n  }\n}\n",
+    )
+    .ok()?;
+    jj(&["describe", "-m", "base"])?;
+    let base = jj(&["log", "--no-graph", "-r", "@", "-T", "change_id.short()"])?;
+
+    jj(&["new", "-m", "side one"])?;
+    fs::write(
+        repo.join("package.json"),
+        "{\n  \"scripts\": {\n    \"build\": \"tsc\",\n    \"verify:one\": \"tsx one.ts\"\n  }\n}\n",
+    )
+    .ok()?;
+    let one = jj(&["log", "--no-graph", "-r", "@", "-T", "change_id.short()"])?;
+
+    jj(&["new", &base, "-m", "side two"])?;
+    fs::write(
+        repo.join("package.json"),
+        "{\n  \"scripts\": {\n    \"build\": \"tsc\",\n    \"verify:two\": \"tsx two.ts\"\n  }\n}\n",
+    )
+    .ok()?;
+    let two = jj(&["log", "--no-graph", "-r", "@", "-T", "change_id.short()"])?;
+
+    // The working copy IS the conflicted merge, exactly like an integration workspace
+    // left conflicted by an earlier merge.
+    jj(&["new", &one, &two, "-m", "conflicted integration"])?;
+    Some(())
+}
+
+#[cfg(not(windows))]
+#[test]
+fn a_stale_package_json_conflict_stops_blocking_every_later_merge() {
+    // PRODUCTION FAILURE this encodes: one unresolved package.json collision sat in the
+    // integration workspace, so `rudder merge` refused every subsequent run with
+    // "integration workspace already has unresolved conflicts". 20 finished nodes piled
+    // up in review and the conductor started hand-copying files out of workspaces.
+    // Mechanical conflicts must be cleared before that guard is allowed to strand a fleet.
+    let dir = std::env::temp_dir().join(format!("rudder-preflight-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("temp repo");
+    let Some(()) = jj_repo_with_conflicted_package_json(&dir) else {
+        eprintln!("skipping a_stale_package_json_conflict_stops_blocking_every_later_merge: no jj");
+        let _ = fs::remove_dir_all(&dir);
+        return;
+    };
+
+    let mut app = App::new();
+    app.cwd = dir.clone();
+    assert!(
+        !crate::gitio::jj_unresolved_conflicts(&dir).is_empty(),
+        "fixture really is conflicted before the pre-flight"
+    );
+
+    let remaining = app.clear_mechanical_integration_conflicts();
+
+    assert!(
+        remaining.is_empty(),
+        "the package.json collision is mechanical and must not block: {remaining:?}"
+    );
+    let merged = fs::read_to_string(dir.join("package.json")).expect("package.json");
+    assert!(
+        !merged.contains("<<<<<<<"),
+        "resolution never leaves conflict markers on disk: {merged}"
+    );
+    assert!(
+        merged.contains("verify:one") && merged.contains("verify:two"),
+        "both sides' scripts survive the union: {merged}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[cfg(not(windows))]
+#[test]
+fn the_pre_flight_keeps_its_hands_off_a_live_resolver() {
+    // A merge resolver is mid-edit on exactly these files. Rewriting them under it would
+    // bury its work, so a live resolver makes the pre-flight a no-op and the existing
+    // guard keeps its meaning.
+    let dir = std::env::temp_dir().join(format!("rudder-preflight-live-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("temp repo");
+    let Some(()) = jj_repo_with_conflicted_package_json(&dir) else {
+        eprintln!("skipping the_pre_flight_keeps_its_hands_off_a_live_resolver: no jj");
+        let _ = fs::remove_dir_all(&dir);
+        return;
+    };
+
+    let mut app = App::new();
+    app.cwd = dir.clone();
+    let mut resolver = test_agent_run("run-resolver", "resolve merge conflicts");
+    resolver.merge_resolver = true;
+    resolver.status = AgentStatus::Running;
+    app.agents.push(resolver);
+
+    let remaining = app.clear_mechanical_integration_conflicts();
+
+    assert!(remaining.is_empty(), "a no-op reports nothing to report");
+    assert!(
+        !crate::gitio::jj_unresolved_conflicts(&dir).is_empty(),
+        "the conflict is still there for the resolver to finish"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn nudge_targets_skip_finished_work_and_the_orchestrator() {
+    // A fleet nudge ("keep going, my connection dropped") must reach work still
+    // in flight and NOTHING else. Restarting a merged worker would redo landed
+    // work, and the orchestrator is the row issuing the nudge.
+    let mut app = App::new();
+
+    let mut orchestrator = test_agent_run("orch", "plan it");
+    orchestrator.mode = AgentMode::RudderPlan;
+    orchestrator.status = AgentStatus::Running;
+
+    let mut running = test_agent_run("running", "n0");
+    running.status = AgentStatus::Running;
+
+    let mut merged = test_agent_run("merged", "n1");
+    merged.status = AgentStatus::Merged;
+
+    let mut done = test_agent_run("done", "n2");
+    done.status = AgentStatus::Done;
+
+    let mut failed = test_agent_run("failed", "n3");
+    failed.status = AgentStatus::Failed;
+
+    app.agents = vec![orchestrator, running, merged, done, failed];
+
+    let targets = app.nudge_targets();
+    let ids: Vec<&str> = targets
+        .iter()
+        .map(|(index, _)| app.agents[*index].id.as_str())
+        .collect();
+    assert_eq!(ids, vec!["running", "failed"]);
+}
+
+#[test]
+fn nudge_resumes_workers_whose_process_died_and_injects_into_live_ones() {
+    // The connection-drop case: a row still marked Running whose PTY is gone
+    // cannot be typed into, so it has to be resumed in its own workspace. A row
+    // that still holds a terminal takes the message as a normal turn instead,
+    // which preserves its context.
+    let mut app = App::new();
+
+    let mut live = test_agent_run("live", "n0");
+    live.status = AgentStatus::Running;
+    live.terminal = Some(
+        TerminalPane::spawn_shell_or_command(
+            Some(TerminalCommand::with_args("/bin/sh", ["-c", "sleep 5"])),
+            TerminalPaneOptions {
+                size: TerminalSize { rows: 10, cols: 40 },
+                scrollback_lines: 50,
+                ..Default::default()
+            },
+        )
+        .expect("spawn nudge pty"),
+    );
+
+    let mut dead = test_agent_run("dead", "n1");
+    dead.status = AgentStatus::Running;
+    dead.terminal = None;
+
+    let mut stopped = test_agent_run("stopped", "n2");
+    stopped.status = AgentStatus::Stopped;
+
+    app.agents = vec![live, dead, stopped];
+
+    let targets = app.nudge_targets();
+    let by_id: Vec<(&str, NudgeDelivery)> = targets
+        .iter()
+        .map(|(index, delivery)| (app.agents[*index].id.as_str(), *delivery))
+        .collect();
+    assert_eq!(
+        by_id,
+        vec![
+            ("live", NudgeDelivery::Inject),
+            ("dead", NudgeDelivery::Resume),
+            ("stopped", NudgeDelivery::Resume),
+        ]
+    );
+}
+
+#[test]
+fn nudge_all_marker_requires_a_message() {
+    let mut app = App::new();
+    let mut running = test_agent_run("running", "n0");
+    running.status = AgentStatus::Running;
+    app.agents = vec![running];
+
+    app.handle_orchestrator_skill_marker("RUDDER_NUDGE_ALL");
+    assert_eq!(
+        app.notice.as_deref(),
+        Some("RUDDER_NUDGE_ALL requires a message")
+    );
+
+    app.notice = None;
+    app.handle_orchestrator_skill_marker("RUDDER_NUDGE_ALL    ");
+    assert_eq!(
+        app.notice.as_deref(),
+        Some("RUDDER_NUDGE_ALL requires a message")
+    );
+}
+
+#[test]
+fn nudge_all_is_recognized_as_an_orchestrator_marker() {
+    // RUDDER.md control lines are only consumed when they classify as orchestrator
+    // markers; without this the conductor's line is left in the file as prose.
+    assert!(is_orchestrator_skill_marker("RUDDER_NUDGE_ALL keep going"));
+    assert!(is_orchestrator_skill_marker("RUDDER_NUDGE_ALL"));
+}
+
+#[test]
+fn nudge_slash_command_runs_locally_without_the_orchestrator() {
+    // The whole point of /nudge is the dropped-connection case, which can have
+    // killed the orchestrator too. Rudder must handle it itself rather than
+    // forwarding the sentence to a conductor that may not be alive to read it.
+    let mut app = App::new();
+    let mut dead = test_agent_run("dead", "n0");
+    dead.status = AgentStatus::Running;
+    dead.terminal = None;
+    app.agents = vec![dead];
+
+    assert!(app.handle_command("/nudge"));
+    assert_eq!(
+        app.notice.as_deref(),
+        Some("usage: /nudge <message to every in-flight worker>")
+    );
+
+    app.notice = None;
+    app.agents.clear();
+    assert!(app.handle_command("/nudge keep going"));
+    assert_eq!(
+        app.notice.as_deref(),
+        Some("no in-flight workers to nudge"),
+        "an empty fleet reports rather than silently doing nothing"
+    );
+}
+
+#[test]
+fn consumed_markers_report_their_outcome_back_to_the_orchestrator() {
+    // Rudder strips each marker line as it runs it, so a failed marker vanishes
+    // from RUDDER.md exactly like a successful one. Without the outcome written
+    // back, the conductor cannot tell the two apart and reports a success that
+    // never happened.
+    let mut app = App::new();
+    app.record_control_result("RUDDER_INJECT n7 keep going", "RUDDER_INJECT target not found: n7");
+    app.record_control_result("RUDDER_NUDGE_ALL keep going", "nudged 3 workers");
+
+    let rendered: Vec<(String, String)> = app
+        .control_results
+        .iter()
+        .map(|entry| (entry.marker.clone(), entry.outcome.clone()))
+        .collect();
+
+    let mut body = String::new();
+    crate::gitio::append_control_results(&mut body, &rendered);
+    assert!(body.contains("RUDDER_INJECT target not found: n7"));
+    assert!(body.contains("nudged 3 workers"));
+    // Newest first, so the conductor reads its most recent action at the top.
+    let inject_at = body.find("RUDDER_INJECT n7").expect("inject entry");
+    let nudge_at = body.find("RUDDER_NUDGE_ALL").expect("nudge entry");
+    assert!(nudge_at < inject_at, "newest control result is listed first");
+}
+
+#[test]
+fn control_results_stay_bounded_and_empty_renders_nothing() {
+    let mut app = App::new();
+    let mut body = String::new();
+    crate::gitio::append_control_results(&mut body, &[]);
+    assert!(body.is_empty(), "no section until a marker has actually run");
+
+    for index in 0..40 {
+        app.record_control_result(&format!("RUDDER_MERGE n{index}"), "merged");
+    }
+    assert!(
+        app.control_results.len() <= 12,
+        "the feedback log is bounded so it never crowds out RUDDER.md"
+    );
+    assert_eq!(app.control_results.last().unwrap().marker, "RUDDER_MERGE n39");
+}
+
+#[test]
+fn a_rejected_marker_is_recorded_as_a_failure_not_silently_swallowed() {
+    // End to end through the real consume path: the conductor writes a marker
+    // aimed at a node that does not exist, Rudder strips the line, and the
+    // rejection has to survive as a control result. Otherwise the conductor sees
+    // only that its line is gone and reports the injection as done.
+    let repo = unique_test_repo("orch-marker-outcome");
+    fs::write(
+        repo.join("RUDDER.md"),
+        "notes\nRUDDER_INJECT n404 keep going\nRUDDER_NUDGE_ALL keep going\nmore notes\n",
+    )
+    .unwrap();
+
+    let mut app = App::new();
+    app.cwd = repo.clone();
+    app.interactive_orchestrator = true;
+    let mut orch = test_agent_run("orch-1", "plan it");
+    orch.cwd = repo.clone();
+    orch.mode = AgentMode::RudderPlan;
+    orch.autosteered = false;
+    orch.interactive_orchestrator = true;
+    orch.status = AgentStatus::Running;
+    app.agents.push(orch);
+
+    app.scan_orchestrator_skill_markers();
+
+    let outcomes: Vec<(&str, &str)> = app
+        .control_results
+        .iter()
+        .map(|entry| (entry.marker.as_str(), entry.outcome.as_str()))
+        .collect();
+    assert_eq!(
+        outcomes,
+        vec![
+            ("RUDDER_INJECT n404 keep going", "RUDDER_INJECT target not found: n404"),
+            // Only the orchestrator is present, and it is never a nudge target.
+            ("RUDDER_NUDGE_ALL keep going", "no in-flight workers to nudge"),
+        ],
+        "both rejections survive as outcomes the conductor can read"
+    );
+
+    let text = fs::read_to_string(repo.join("RUDDER.md")).unwrap();
+    assert!(!text.contains("RUDDER_INJECT"), "the marker line is still consumed");
+    assert!(text.contains("notes"), "surrounding prose is preserved");
+}
+
+#[test]
+fn a_merge_conflict_starts_a_resolver_instead_of_parking_on_a_prompt() {
+    // The field failure this exists for: five finished offstage nodes sat in
+    // review for hours behind an unanswered "press y" modal, and because n6 hard-
+    // depended on one of them the entire back half of the plan never launched.
+    // Integration is automatic, so its failure path must be automatic too.
+    let mut app = App::new();
+    let mut run = test_agent_run("worker", "n2");
+    run.node_id = Some("n2".to_string());
+    run.status = AgentStatus::Done;
+    run.merge_resolver = false;
+    app.agents = vec![run];
+
+    app.pending_jj_conflict = Some(vec![
+        "DECISIONS.md".to_string(),
+        "src/router/index.ts".to_string(),
+    ]);
+    app.handle_merge_error(
+        "n2 task".to_string(),
+        anyhow::anyhow!("merge produced conflicts"),
+        None,
+        None,
+        None,
+        Some("worker".to_string()),
+    );
+
+    assert!(
+        app.conflict_prompt.is_none(),
+        "a conflict on a real row never leaves a modal waiting for a keypress"
+    );
+    let notice = app.notice.clone().unwrap_or_default();
+    assert!(
+        notice.contains("resolver running"),
+        "the resolver takes over the pane and says so: {notice}"
+    );
+    assert!(
+        !notice.contains("press y"),
+        "the y/n gate is gone for rows that can host a resolver"
+    );
+}
+
+#[test]
+fn a_resolver_that_conflicts_again_asks_rather_than_respawning_forever() {
+    // Auto-resolution must not become an infinite loop: once the resolver itself
+    // has conflicted, escalate to the human instead of starting another one.
+    let mut app = App::new();
+    let mut run = test_agent_run("worker", "n2");
+    run.node_id = Some("n2".to_string());
+    run.status = AgentStatus::Done;
+    run.merge_resolver = true;
+    app.agents = vec![run];
+
+    app.pending_jj_conflict = Some(vec!["src/router/index.ts".to_string()]);
+    app.handle_merge_error(
+        "n2 task".to_string(),
+        anyhow::anyhow!("merge produced conflicts"),
+        None,
+        None,
+        None,
+        Some("worker".to_string()),
+    );
+
+    assert!(
+        app.conflict_prompt.is_some(),
+        "the second conflict escalates to a prompt"
+    );
+    assert!(app.notice.clone().unwrap_or_default().contains("press y"));
 }

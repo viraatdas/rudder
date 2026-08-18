@@ -243,10 +243,10 @@ export async function launchNode(
     targetBranch: baseChange,
     baseCommit: baseChange,
     vcs: "jj",
-    useWorktree: true,
-    worktreeWorkspaceName: workspace.workspaceName,
-    worktreeJjChangeId: jjChangeId,
-    worktreePath: workspace.path,
+    useWorkspace: true,
+    workspaceName: workspace.workspaceName,
+    workspaceChangeId: jjChangeId,
+    workspacePath: workspace.path,
   });
 
   // Flip status -> running in the same transaction so a concurrent tick cannot
@@ -258,7 +258,7 @@ export async function launchNode(
     }
     current.runId = run.id;
     current.status = "running";
-    current.worktree = { path: workspace.path, workspaceName: workspace.workspaceName };
+    current.workspace = { path: workspace.path, workspaceName: workspace.workspaceName };
     if (jjChangeId) {
       current.jjChangeId = jjChangeId;
     }
@@ -300,8 +300,8 @@ async function mergeNodeIntoIntegrationLocked(repoRoot: string, node: TaskNode, 
   // A change id can become divergent when jj snapshots a live workspace while
   // sibling workspaces are integrating. The workspace's immutable @ commit id
   // always identifies the exact finished revision, so prefer it at this seam.
-  const nodeRevision = node.worktree?.path
-    ? (await currentJjCommitId(node.worktree.path)) || node.jjChangeId || ""
+  const nodeRevision = node.workspace?.path
+    ? (await currentJjCommitId(node.workspace.path)) || node.jjChangeId || ""
     : node.jjChangeId || "";
   if (!nodeRevision) {
     bus.publish({
@@ -484,10 +484,10 @@ async function spawnResolver(
     baseCommit: input.mergeChangeId,
     vcs: "jj",
     resolverFor: node.id,
-    useWorktree: true,
-    worktreeWorkspaceName: workspace.workspaceName,
-    worktreeJjChangeId: input.mergeChangeId,
-    worktreePath: workspace.path,
+    useWorkspace: true,
+    workspaceName: workspace.workspaceName,
+    workspaceChangeId: input.mergeChangeId,
+    workspacePath: workspace.path,
   });
 
   // Persist the resolver context for the worker (and any UI). Best-effort.
@@ -574,7 +574,7 @@ export async function deliverSoftDiff(repoRoot: string, edge: GraphEdge, bus: Ru
   if (!parent || !child) {
     return;
   }
-  const parentWorkspace = parent.worktree?.path ?? repoRoot;
+  const parentWorkspace = parent.workspace?.path ?? repoRoot;
   const diff = await jjDiff(parentWorkspace).catch(() => "");
   const isJudge = edge.type === "judge";
 
@@ -922,10 +922,10 @@ async function onResolverTransition(
   resolverRun: RunRecord,
   bus: RudderBus,
 ): Promise<void> {
-  const workspacePath = resolverRun.worktree?.path || repoRoot;
+  const workspacePath = resolverRun.workspace?.path || repoRoot;
   const remaining = await listConflicts(workspacePath).catch(() => [] as string[]);
   const mergeChangeId =
-    resolverRun.worktree?.jjChangeId || (await currentJjChangeId(workspacePath).catch(() => "")) || "";
+    resolverRun.workspace?.jjChangeId || (await currentJjChangeId(workspacePath).catch(() => "")) || "";
 
   const graph = await readGraph(repoRoot);
   const node = graph.nodes[originalNodeId];

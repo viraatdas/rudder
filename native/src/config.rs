@@ -312,7 +312,7 @@ pub(crate) fn ensure_config_defaults(config: &mut serde_json::Value) {
     root.entry("runPolicy".to_string()).or_insert_with(|| {
         serde_json::json!({
             "sameCheckout": "single-active",
-            "concurrentPromptMode": "worktree"
+            "concurrentPromptMode": "workspace"
         })
     });
     root.entry("acpx".to_string())
@@ -329,7 +329,7 @@ pub(crate) fn default_config_value() -> serde_json::Value {
         "colorMode": "terminal",
         "runPolicy": {
             "sameCheckout": "single-active",
-            "concurrentPromptMode": "worktree"
+            "concurrentPromptMode": "workspace"
         },
         "acpx": { "install": "latest" },
         "backends": {

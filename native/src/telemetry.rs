@@ -34,7 +34,10 @@ pub(crate) fn emit_event(name: &str, properties: serde_json::Value) {
 /// Hand a feedback report to the CLI, which owns the local copy, the usage event,
 /// and the GitHub issue. The context is passed as a FILE so a long report never
 /// hits an argv limit and never lands in a process listing.
-pub(crate) fn submit_feedback(repo_root: &Path, context: serde_json::Value) -> std::io::Result<PathBuf> {
+pub(crate) fn submit_feedback(
+    repo_root: &Path,
+    context: serde_json::Value,
+) -> std::io::Result<PathBuf> {
     let dir = repo_root.join(".rudder").join("feedback");
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("pending-{}.json", std::process::id()));

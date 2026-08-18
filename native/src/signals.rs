@@ -384,10 +384,9 @@ pub(crate) fn augment_worker_command(
             if let Some(path) = signals.opencode_config {
                 // opencode reads its config from this env var; the config names the
                 // generated plugin that reports turn-end.
-                command.env.push((
-                    "OPENCODE_CONFIG".to_string(),
-                    path.display().to_string(),
-                ));
+                command
+                    .env
+                    .push(("OPENCODE_CONFIG".to_string(), path.display().to_string()));
             }
         }
     }

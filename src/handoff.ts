@@ -19,6 +19,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 
 import { findRepoRoot } from "./git.js";
+import { AGENT_WORKSPACES_DIR, LEGACY_AGENT_WORKSPACES_DIR } from "./state.js";
 import { encodeClaudeProjectsCwd } from "./migration.js";
 
 export type HandoffBackend = "claude" | "codex" | "opencode";
@@ -218,7 +219,7 @@ export function claudeProjectsDir(): string {
  * Recent Claude conversations recorded for `cwd` and its subdirectories, newest
  * first. Claude names each project folder after the directory the session ran in,
  * so a chat started in `src/` lives in a sibling folder — still this repo's.
- * Rudder's own agent sessions (under `.rudder-worktrees`) are not candidates.
+ * Rudder's own agent sessions (under `.rudder-workspaces`) are not candidates.
  */
 export function recentClaudeConversations(
   cwd: string,
@@ -236,7 +237,7 @@ export function recentClaudeConversations(
   const files: { file: string; modifiedMs: number }[] = [];
   for (const name of dirs) {
     const inRepo = name === encoded || name.startsWith(`${encoded}-`);
-    if (!inRepo || name.includes("-rudder-worktrees-")) {
+    if (!inRepo || name.includes("-rudder-workspaces-") || name.includes("-rudder-worktrees-")) {
       continue;
     }
     let sessions: string[];
@@ -526,9 +527,13 @@ function isRecordLike(value: unknown): value is Record<string, unknown> {
 /** `.rudder/` lives at the dashboard root, never inside an agent's workspace. */
 export function dashboardRoot(cwd = process.cwd()): string {
   const root = findRepoRoot(cwd);
-  const marker = `${path.sep}.rudder-worktrees${path.sep}`;
-  const index = root.indexOf(marker);
-  return index === -1 ? root : root.slice(0, index);
+  for (const dir of [AGENT_WORKSPACES_DIR, LEGACY_AGENT_WORKSPACES_DIR]) {
+    const index = root.indexOf(`${path.sep}${dir}${path.sep}`);
+    if (index !== -1) {
+      return root.slice(0, index);
+    }
+  }
+  return root;
 }
 
 export function handoffQueueDir(repoRoot: string): string {

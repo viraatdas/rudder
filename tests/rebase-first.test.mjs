@@ -39,9 +39,9 @@ test("activeRunsForCheckout matches filesystem aliases via realpath", async (t) 
     backend: "claude",
     targetBranch: "main",
     baseCommit: "HEAD",
-    useWorktree: true,
-    worktreeBranch: "run-active",
-    worktreePath: checkout,
+    useWorkspace: true,
+    workspaceBranch: "run-active",
+    workspacePath: checkout,
   });
   run.status = "running";
   run.process = { pid: process.pid, startedAt: new Date().toISOString() };
@@ -60,9 +60,9 @@ test("sync persists commit preparation failures before returning", async (t) => 
     backend: "claude",
     targetBranch: "main",
     baseCommit: git(repo, "rev-parse", "HEAD"),
-    useWorktree: true,
-    worktreeBranch: "run-sync-failure",
-    worktreePath: repo,
+    useWorkspace: true,
+    workspaceBranch: "run-sync-failure",
+    workspacePath: repo,
   });
   run.status = "completed";
   await makeRebaseInProgress(repo);
@@ -86,9 +86,9 @@ test("merge persists commit preparation failures before returning", async (t) =>
     backend: "claude",
     targetBranch: "main",
     baseCommit: git(repo, "rev-parse", "HEAD"),
-    useWorktree: true,
-    worktreeBranch: "run-merge-failure",
-    worktreePath: repo,
+    useWorkspace: true,
+    workspaceBranch: "run-merge-failure",
+    workspacePath: repo,
   });
   run.status = "completed";
   await makeRebaseInProgress(repo);

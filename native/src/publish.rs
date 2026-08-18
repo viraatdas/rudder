@@ -67,9 +67,7 @@ impl PublishBlocker {
     /// The notice text. Says the problem AND the fix, in that order.
     pub(crate) fn explain(&self) -> String {
         match self {
-            Self::NotGitHub => {
-                "no GitHub remote: publishing is off, m merges locally".to_string()
-            }
+            Self::NotGitHub => "no GitHub remote: publishing is off, m merges locally".to_string(),
             Self::GhMissing => {
                 "gh is not installed: publishing is off, m merges locally (install gh to open PRs)"
                     .to_string()
@@ -389,14 +387,22 @@ pub(crate) fn gh_stack_sync_argv() -> Vec<String> {
 /// detected). `--open` is omitted ON PURPOSE: without it new PRs are created as
 /// drafts, which is how decision 4 is satisfied for stacks.
 pub(crate) fn gh_stack_submit_argv() -> Vec<String> {
-    vec!["stack".to_string(), "submit".to_string(), "--auto".to_string()]
+    vec![
+        "stack".to_string(),
+        "submit".to_string(),
+        "--auto".to_string(),
+    ]
 }
 
 /// `gh stack view --json` — machine-readable stack state. The human output is a
 /// box-drawing table with status GLYPHS; scraping it would break on the next
 /// release of the extension.
 pub(crate) fn gh_stack_view_json_argv() -> Vec<String> {
-    vec!["stack".to_string(), "view".to_string(), "--json".to_string()]
+    vec![
+        "stack".to_string(),
+        "view".to_string(),
+        "--json".to_string(),
+    ]
 }
 
 /// `gh pr edit <n> --title ... --body ...`. Needed because `gh stack submit` in a
@@ -649,7 +655,12 @@ pub(crate) fn parse_stack_view_json(text: &str) -> Vec<StackBranchState> {
     } else {
         ["branches", "stack", "entries", "layers"]
             .iter()
-            .find_map(|key| value.get(*key).and_then(serde_json::Value::as_array).cloned())
+            .find_map(|key| {
+                value
+                    .get(*key)
+                    .and_then(serde_json::Value::as_array)
+                    .cloned()
+            })
             .unwrap_or_default()
     };
     array
@@ -664,11 +675,17 @@ pub(crate) fn parse_stack_view_json(text: &str) -> Vec<StackBranchState> {
             let number = ["number", "prNumber", "pr"]
                 .iter()
                 .find_map(|key| entry.get(*key).and_then(serde_json::Value::as_u64))
-                .or_else(|| pr.and_then(|pr| pr.get("number")).and_then(serde_json::Value::as_u64));
+                .or_else(|| {
+                    pr.and_then(|pr| pr.get("number"))
+                        .and_then(serde_json::Value::as_u64)
+                });
             let url = ["url", "prUrl"]
                 .iter()
                 .find_map(|key| entry.get(*key).and_then(serde_json::Value::as_str))
-                .or_else(|| pr.and_then(|pr| pr.get("url")).and_then(serde_json::Value::as_str))
+                .or_else(|| {
+                    pr.and_then(|pr| pr.get("url"))
+                        .and_then(serde_json::Value::as_str)
+                })
                 .map(ToOwned::to_owned);
             let needs_rebase = ["needsRebase", "needs_rebase", "requiresRebase"]
                 .iter()
@@ -1126,21 +1143,11 @@ pub(crate) fn publish_stack(
     }
     // sync, never push: push is documented as non-atomic and would leave a partly
     // updated stack behind on a rejection.
-    let sync = bounded_output(
-        "gh",
-        &gh_stack_sync_argv(),
-        cwd,
-        PUBLISH_STACK_TIMEOUT,
-    );
+    let sync = bounded_output("gh", &gh_stack_sync_argv(), cwd, PUBLISH_STACK_TIMEOUT);
     if !sync.ok {
         return Err(classify_stack_sync_failure(&sync.stderr));
     }
-    let submit = bounded_output(
-        "gh",
-        &gh_stack_submit_argv(),
-        cwd,
-        PUBLISH_STACK_TIMEOUT,
-    );
+    let submit = bounded_output("gh", &gh_stack_submit_argv(), cwd, PUBLISH_STACK_TIMEOUT);
     if !submit.ok {
         return Err(format!(
             "branches were pushed but gh stack submit failed: {}",
@@ -1330,7 +1337,8 @@ impl App {
             let (tx, rx) = mpsc::channel();
             self.publish_pr_state_rx = Some(rx);
             thread::spawn(move || {
-                let output = bounded_output("gh", &gh_pr_list_argv(), &cwd, PUBLISH_COMMAND_TIMEOUT);
+                let output =
+                    bounded_output("gh", &gh_pr_list_argv(), &cwd, PUBLISH_COMMAND_TIMEOUT);
                 let states = if output.ok {
                     parse_pr_states(&output.stdout)
                 } else {
@@ -1428,16 +1436,12 @@ impl App {
             return;
         };
         let Some(subject) = publish_subject_for(run, &capability.default_branch) else {
-            self.notice =
-                Some("this row has no jj change to publish; it predates the workspace model".to_string());
+            self.notice = Some(
+                "this row has no jj change to publish; it predates the workspace model".to_string(),
+            );
             return;
         };
-        match publish_one_pr(
-            &self.cwd,
-            capability,
-            &subject,
-            &capability.default_branch,
-        ) {
+        match publish_one_pr(&self.cwd, capability, &subject, &capability.default_branch) {
             Ok((number, url)) => {
                 self.record_publish_result(index, &subject.branch, Some(number), Some(url.clone()));
                 self.notice = Some(format!("PR #{number} opened as a draft · {url}"));
@@ -1504,9 +1508,8 @@ impl App {
                     match publish_stack(&self.cwd, capability, &flat) {
                         Ok(states) => {
                             for (index, subject) in &subjects {
-                                let state = states
-                                    .iter()
-                                    .find(|state| state.branch == subject.branch);
+                                let state =
+                                    states.iter().find(|state| state.branch == subject.branch);
                                 let number = state.and_then(|state| state.number);
                                 if number.is_some() {
                                     opened += 1;
@@ -1561,7 +1564,10 @@ impl App {
             if opened == 1 { "" } else { "s" }
         )];
         if stacks > 0 {
-            parts.push(format!("{stacks} stack{}", if stacks == 1 { "" } else { "s" }));
+            parts.push(format!(
+                "{stacks} stack{}",
+                if stacks == 1 { "" } else { "s" }
+            ));
         }
         if joins > 0 {
             parts.push(format!(

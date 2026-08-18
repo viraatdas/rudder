@@ -1,5 +1,5 @@
 #![allow(unused_imports)]
-//! Git, worktree, run-record persistence, and filesystem helpers.
+//! Git, workspace, run-record persistence, and filesystem helpers.
 use super::*;
 use std::cell::RefCell;
 
@@ -182,8 +182,8 @@ pub(crate) fn read_migration_manifest(repo_root: &Path) -> Vec<MigratedAgent> {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let worktree_path = agent
-            .get("worktreePath")
+        let workspace_path = agent
+            .get("workspacePath")
             .and_then(|v| v.as_str())
             .map(PathBuf::from)
             .unwrap_or_else(|| repo_root.to_path_buf());
@@ -198,7 +198,7 @@ pub(crate) fn read_migration_manifest(repo_root: &Path) -> Vec<MigratedAgent> {
         out.push(MigratedAgent {
             run_id,
             session_id,
-            worktree_path,
+            workspace_path,
             fresh_prompt,
         });
     }
@@ -237,8 +237,8 @@ pub(crate) fn create_main_agent(
         effort,
         status: AgentStatus::Stopped,
         cwd: repo_root.to_path_buf(),
-        worktree_branch: None,
-        worktree_path: None,
+        workspace_branch: None,
+        workspace_path: None,
         workspace_name: None,
         jj_change_id: None,
         integration: IntegrationEvidence::default(),
@@ -284,7 +284,7 @@ pub(crate) fn create_main_agent(
 }
 
 /// Build a ONE-OFF agent: a single conversational agent that runs in the MAIN checkout
-/// (no jj worktree, no DAG node) for a question or a small self-contained change. Mirrors
+/// (no jj workspace, no DAG node) for a question or a small self-contained change. Mirrors
 /// `create_main_agent` but with `AgentMode::OneOff` and the task seeded from the request.
 /// `status` starts Stopped/`terminal` None; `start_oneoff_task` spawns the PTY.
 pub(crate) fn create_oneoff_agent(
@@ -383,7 +383,7 @@ pub(crate) fn clear_stop_request(repo_root: &Path, run_id: &str) {
 }
 
 /// Recorded absolute paths survive a repo RENAME or MOVE; the repo does not.
-/// A run record's worktree and cwd live INSIDE the repo and moved with it, so
+/// A run record's workspace and cwd live INSIDE the repo and moved with it, so
 /// when the record's `repoRoot` disagrees with the root the record was read
 /// from, every stored path under the old root has an exact counterpart under
 /// the new one. Rewriting the prefix makes the record true again — without
@@ -401,9 +401,9 @@ pub(crate) fn heal_moved_repo_paths(record: &mut serde_json::Value, actual_root:
         .map(ToString::to_string);
     // Rule 2 exists because rule 1 is not enough: a later save can rewrite
     // repoRoot alone (observed in the field: repoRoot said the new name while
-    // worktree.path still said the old one), which makes the stored root
-    // USELESS as a key. Worktrees always live at
-    // <root>/.rudder-worktrees/..., so whatever precedes that marker in a
+    // workspace.path still said the old one), which makes the stored root
+    // USELESS as a key. Workspaces always live at
+    // <root>/.rudder-workspaces/..., so whatever precedes that marker in a
     // stored path is some spelling of the root — rebase it onto the real one.
     remap_strings(record, stored_root.as_deref(), &current);
     // Rule 3: a record inside <root>/.rudder/runs belongs to <root> by
@@ -415,7 +415,22 @@ pub(crate) fn heal_moved_repo_paths(record: &mut serde_json::Value, actual_root:
     }
 }
 
-const WORKTREES_MARKER: &str = "/.rudder-worktrees/";
+/// Directory inside the repo holding one jj workspace per agent.
+pub(crate) const AGENT_WORKSPACES_DIR: &str = ".rudder-workspaces";
+/// The pre-rename name for the same directory. Still recognized wherever a path
+/// is CLASSIFIED, because a jj workspace stays registered under the absolute
+/// path it was created at. Only NEW workspaces use AGENT_WORKSPACES_DIR.
+pub(crate) const LEGACY_AGENT_WORKSPACES_DIR: &str = ".rudder-worktrees";
+
+/// True when `path` sits inside either spelling of the agent-workspaces dir.
+pub(crate) fn is_under_agent_workspaces(path: &Path) -> bool {
+    path.components().any(|component| {
+        component.as_os_str() == AGENT_WORKSPACES_DIR
+            || component.as_os_str() == LEGACY_AGENT_WORKSPACES_DIR
+    })
+}
+
+const WORKSPACES_MARKERS: [&str; 2] = ["/.rudder-workspaces/", "/.rudder-worktrees/"];
 
 fn remap_strings(value: &mut serde_json::Value, old_root: Option<&str>, new_root: &str) {
     match value {
@@ -430,9 +445,12 @@ fn remap_strings(value: &mut serde_json::Value, old_root: Option<&str>, new_root
                     return;
                 }
             }
-            if let Some(index) = text.find(WORKTREES_MARKER) {
-                if !text.starts_with(new_root) {
-                    *text = format!("{new_root}{}", &text[index..]);
+            for marker in WORKSPACES_MARKERS {
+                if let Some(index) = text.find(marker) {
+                    if !text.starts_with(new_root) {
+                        *text = format!("{new_root}{}", &text[index..]);
+                    }
+                    break;
                 }
             }
         }
@@ -519,16 +537,18 @@ pub(crate) fn agent_from_run_record(
         .and_then(|value| value.as_str())
         .and_then(AgentMode::parse)
         .unwrap_or(AgentMode::Execute);
-    let worktree = record.get("worktree");
-    let worktree_enabled = worktree
+    // Records written before the worktree->workspace rename carry the isolation
+    // info under `worktree`. Read either; every write below emits `workspace`.
+    let workspace = record.get("workspace").or_else(|| record.get("worktree"));
+    let workspace_enabled = workspace
         .and_then(|value| value.get("enabled"))
         .and_then(|value| value.as_bool())
         .unwrap_or(false);
-    let cwd = worktree
+    let cwd = workspace
         .and_then(|value| value.get("path"))
         .and_then(|value| value.as_str())
         // An EMPTY string is not a usable cwd. Without this filter a record
-        // whose worktree.path is "" (corruption, a half-written record, an
+        // whose workspace.path is "" (corruption, a half-written record, an
         // interrupted rename) loads with an empty cwd, and every spawn against
         // that row fails silently — a row that is simply "not working" with no
         // error. Fall through to the repo root, the right home for a
@@ -536,18 +556,18 @@ pub(crate) fn agent_from_run_record(
         .filter(|value| !value.trim().is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| repo_root.to_path_buf());
-    let worktree_branch = worktree
+    let workspace_branch = workspace
         .and_then(|value| value.get("branch"))
         .and_then(|value| value.as_str())
         .filter(|value| !value.trim().is_empty())
         .map(ToOwned::to_owned);
-    let worktree_path = worktree_enabled.then_some(cwd.clone());
-    let workspace_name = worktree
+    let workspace_path = workspace_enabled.then_some(cwd.clone());
+    let workspace_name = workspace
         .and_then(|value| value.get("workspaceName"))
         .and_then(|value| value.as_str())
         .filter(|value| !value.trim().is_empty())
         .map(ToOwned::to_owned);
-    let jj_change_id = worktree
+    let jj_change_id = workspace
         .and_then(|value| value.get("jjChangeId"))
         .and_then(|value| value.as_str())
         .filter(|value| !value.trim().is_empty())
@@ -712,8 +732,8 @@ pub(crate) fn agent_from_run_record(
         effort,
         status,
         cwd,
-        worktree_branch,
-        worktree_path,
+        workspace_branch,
+        workspace_path,
         workspace_name,
         jj_change_id,
         integration,
@@ -943,23 +963,25 @@ pub(crate) fn save_native_run_record(repo_root: &Path, run: &AgentRun) -> Result
     // recognising its directory as owned — which is how a finished-but-unmerged
     // workspace disappeared from a live repo.
     let recorded_workspace_name = existing_record
-        .get("worktree")
+        .get("workspace")
+        .or_else(|| existing_record.get("worktree"))
         .and_then(|value| value.get("workspaceName"))
         .and_then(serde_json::Value::as_str)
         .map(ToOwned::to_owned);
     let recorded_change_id = existing_record
-        .get("worktree")
+        .get("workspace")
+        .or_else(|| existing_record.get("worktree"))
         .and_then(|value| value.get("jjChangeId"))
         .and_then(serde_json::Value::as_str)
         .map(ToOwned::to_owned);
     let workspace_name = run.workspace_name.clone().or(recorded_workspace_name);
     let jj_change_id = run.jj_change_id.clone().or(recorded_change_id);
     let is_jj_run = workspace_name.is_some() || jj_change_id.is_some();
-    let mut worktree = serde_json::json!({
-        "enabled": run.worktree_path.is_some(),
+    let mut workspace = serde_json::json!({
+        "enabled": run.workspace_path.is_some(),
         "path": run.cwd,
     });
-    if let Some(map) = worktree.as_object_mut() {
+    if let Some(map) = workspace.as_object_mut() {
         if is_jj_run {
             if let Some(name) = workspace_name.as_ref() {
                 map.insert("workspaceName".to_string(), serde_json::json!(name));
@@ -967,7 +989,7 @@ pub(crate) fn save_native_run_record(repo_root: &Path, run: &AgentRun) -> Result
             if let Some(change_id) = jj_change_id.as_ref() {
                 map.insert("jjChangeId".to_string(), serde_json::json!(change_id));
             }
-        } else if let Some(branch) = run.worktree_branch.as_ref() {
+        } else if let Some(branch) = run.workspace_branch.as_ref() {
             // Preserve the branch field only when rewriting an old record.
             map.insert("branch".to_string(), serde_json::json!(branch));
         }
@@ -999,7 +1021,7 @@ pub(crate) fn save_native_run_record(repo_root: &Path, run: &AgentRun) -> Result
         "repoRoot": repo_root,
         "targetBranch": target_branch,
         "baseCommit": base_commit,
-        "worktree": worktree,
+        "workspace": workspace,
         "currentPrompt": run.current_prompt,
         "turns": turns,
         "lastUserInputAt": run.last_user_input_at,
@@ -1338,11 +1360,11 @@ pub(crate) fn remove_native_run_record(repo_root: &Path, run_id: &str) -> Result
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct WorktreeInfo {
+pub(crate) struct WorkspaceInfo {
     pub(crate) id: String,
     pub(crate) path: PathBuf,
     pub(crate) branch: Option<String>,
-    pub(crate) path_is_worktree: bool,
+    pub(crate) path_is_workspace: bool,
     /// jj workspace name for the run (e.g. `rudder-<id>-<hash>`). Present for new
     /// runs isolated in a jj workspace; `None` for the dedicated main agent.
     pub(crate) workspace_name: Option<String>,
@@ -1350,13 +1372,13 @@ pub(crate) struct WorktreeInfo {
     pub(crate) jj_change_id: Option<String>,
 }
 
-impl WorktreeInfo {
+impl WorkspaceInfo {
     pub(crate) fn current(path: PathBuf) -> Self {
         Self {
             id: new_run_id("task"),
             path,
             branch: None,
-            path_is_worktree: false,
+            path_is_workspace: false,
             workspace_name: None,
             jj_change_id: None,
         }
@@ -1366,11 +1388,11 @@ impl WorktreeInfo {
 /// Isolate a worker in a jj workspace instead of a git worktree. Shells out to
 /// `rudder __launch-node` (the TS shim that owns the jj logic via src/jj.ts) so
 /// the worker runs against a per-node jj workspace whose change id is captured
-/// for merge/sync. The returned WorktreeInfo carries the workspace path, name,
+/// for merge/sync. The returned WorkspaceInfo carries the workspace path, name,
 /// and jj change id; `branch` stays empty for jj runs. New runs never silently
 /// fall back to git: if the shim is unavailable or fails, this surfaces a clear
 /// error to the caller.
-pub(crate) fn prepare_jj_workspace(cwd: &Path, task: &str) -> Result<WorktreeInfo> {
+pub(crate) fn prepare_jj_workspace(cwd: &Path, task: &str) -> Result<WorkspaceInfo> {
     prepare_jj_workspace_at(cwd, task, None)
 }
 
@@ -1412,10 +1434,10 @@ pub(crate) fn prepare_jj_workspace_at(
     cwd: &Path,
     task: &str,
     base_change: Option<&str>,
-) -> Result<WorktreeInfo> {
+) -> Result<WorkspaceInfo> {
     let repo = dashboard_root(cwd);
     if !is_git_repo(&repo) {
-        return Ok(WorktreeInfo::current(cwd.to_path_buf()));
+        return Ok(WorkspaceInfo::current(cwd.to_path_buf()));
     }
 
     let id = new_run_id(task);
@@ -1474,11 +1496,11 @@ pub(crate) fn prepare_jj_workspace_at(
         .filter(|value| !value.is_empty())
         .map(ToString::to_string);
 
-    Ok(WorktreeInfo {
+    Ok(WorkspaceInfo {
         id,
         path: PathBuf::from(path),
         branch: None,
-        path_is_worktree: true,
+        path_is_workspace: true,
         workspace_name,
         jj_change_id,
     })
@@ -1492,10 +1514,10 @@ pub(crate) fn repo_root(cwd: &Path) -> PathBuf {
 
 pub(crate) fn dashboard_root(cwd: &Path) -> PathBuf {
     let repo = repo_root(cwd);
-    main_worktree_root(&repo).unwrap_or(repo)
+    main_workspace_root(&repo).unwrap_or(repo)
 }
 
-pub(crate) fn main_worktree_root(repo: &Path) -> Option<PathBuf> {
+pub(crate) fn main_workspace_root(repo: &Path) -> Option<PathBuf> {
     let output = git_output_args(repo, &["worktree", "list", "--porcelain"]).ok()?;
     main_worktree_from_porcelain(&output)
 }
@@ -1740,7 +1762,7 @@ pub(crate) fn describe_workspace_status(run: &AgentRun, status: &str) {
 /// `dd` delete used to run `git worktree remove` here, which fails on a jj
 /// workspace and leaked both the directory and the registry entry.
 ///
-/// SAFETY: only ever removes a directory that sits under `.rudder-worktrees`.
+/// SAFETY: only ever removes a directory that sits under `.rudder-workspaces`.
 /// A record with a bad/empty path can never delete the main checkout or an
 /// unrelated tree — the function refuses and returns an error instead.
 pub(crate) fn forget_jj_workspace(
@@ -1748,12 +1770,9 @@ pub(crate) fn forget_jj_workspace(
     workspace_name: &str,
     path: &Path,
 ) -> Result<()> {
-    let under_rudder = path
-        .components()
-        .any(|component| component.as_os_str() == ".rudder-worktrees");
-    if !under_rudder {
+    if !is_under_agent_workspaces(path) {
         anyhow::bail!(
-            "refusing to remove a workspace outside .rudder-worktrees: {}",
+            "refusing to remove a workspace outside .rudder-workspaces: {}",
             path.display()
         );
     }
@@ -2066,7 +2085,7 @@ fn deep_merge_json(left: &serde_json::Value, right: &serde_json::Value) -> serde
 }
 
 pub(crate) fn diff_short_summary_at(cwd: &Path) -> Option<String> {
-    // Worker cwds are jj workspaces under .rudder-worktrees with no .git of
+    // Worker cwds are jj workspaces under .rudder-workspaces with no .git of
     // their own; git silently walks UP to the enclosing repo and reports the
     // MAIN checkout's diff on every worker row. Ask jj about jj workspaces.
     if cwd.join(".jj").is_dir() && !cwd.join(".git").exists() {
@@ -2158,6 +2177,21 @@ pub(crate) fn completion_sound_path() -> Option<PathBuf> {
     candidates.into_iter().find(|path| path.is_file())
 }
 
+/// What Rudder did with the control markers the orchestrator most recently wrote,
+/// newest first. Rudder strips marker lines from this file as it consumes them, so
+/// without this section the conductor cannot distinguish "acted" from "rejected":
+/// a marker aimed at a stale node id vanishes exactly like one that worked, and the
+/// conductor goes on to report a success that never happened.
+pub(crate) fn append_control_results(body: &mut String, control_results: &[(String, String)]) {
+    if control_results.is_empty() {
+        return;
+    }
+    body.push_str("\n## Your last control markers, and what they did (newest first)\n\nRudder removes each marker line from this file as it runs it, so a missing line only means it was CONSUMED, not that it succeeded. These are the actual outcomes. Check them before telling the user an action landed, and re-issue anything that reports a failure or a zero count.\n");
+    for (marker, outcome) in control_results.iter().rev().take(10) {
+        body.push_str(&format!("- `{marker}` -> {outcome}\n"));
+    }
+}
+
 /// `recent_instructions` is the tail of the user's task history (newest last):
 /// every agent workspace mirrors this file, so a freshly spawned `/run` worker
 /// opens with a one-page digest of the session — what the user has been asking
@@ -2165,16 +2199,18 @@ pub(crate) fn completion_sound_path() -> Option<PathBuf> {
 pub(crate) fn write_rudder_context_with_history(
     repo_root: &Path,
     agents: &[AgentRun],
-    pending: Option<&WorktreeInfo>,
+    pending: Option<&WorkspaceInfo>,
     recent_instructions: &[String],
     final_gates: &[(FinalGateStatus, Option<&str>)],
+    control_results: &[(String, String)],
 ) -> Result<()> {
     ensure_gitignore_contains(repo_root, "RUDDER.md")?;
     ensure_gitignore_contains(repo_root, RUDDER_SHARED_CONTEXT_FILE)?;
-    // Worktrees now live INSIDE the project at <repo>/.rudder-worktrees; ignore them in the
+    // Workspaces now live INSIDE the project at <repo>/.rudder-workspaces; ignore them in the
     // USER's repo (only Rudder's own repo previously listed it), or each worker's checkout
     // would show up as untracked files in the parent and could be committed/cleaned.
-    ensure_gitignore_contains(repo_root, ".rudder-worktrees/")?;
+    ensure_gitignore_contains(repo_root, &format!("{AGENT_WORKSPACES_DIR}/"))?;
+    ensure_gitignore_contains(repo_root, &format!("{LEGACY_AGENT_WORKSPACES_DIR}/"))?;
     let mut body = String::from("# Rudder-Specific Context\n\nThis file is generated by Rudder. It is not user-authored repo documentation. Use it to coordinate with other Rudder agents in this checkout.\n\n");
     append_global_job_snapshot(&mut body, agents, pending);
     append_ship_status(&mut body, repo_root, agents);
@@ -2202,7 +2238,7 @@ pub(crate) fn write_rudder_context_with_history(
     // edits that are not in its workspace, or tries to hand work over by writing a
     // file into a directory nothing else can see. Stated once here rather than per
     // row: RUDDER.md is re-read every turn, so the rows stay one line each.
-    body.push_str("\n## Where each agent works\n\nEvery row below carries `where=`. `where=workspace` means that agent has its OWN jj workspace — a private copy of the repo at `.rudder-worktrees/<name>` (its `cwd=`), isolated from the user's checkout and from every other agent; its work reaches the user only when Rudder integrates it. `where=main-checkout` means that agent edits the user's REAL files in place: several agents can share that tree, and they have nothing to merge.\n\nSo: a sibling's uncommitted edits are NOT in your tree and you cannot read them, waiting on a file a sibling is \"about to write\" will hang forever, and writing into another agent's workspace to hand work over does not work. Coordinate through this file, not the filesystem.\n");
+    body.push_str("\n## Where each agent works\n\nEvery row below carries `where=`. `where=workspace` means that agent has its OWN jj workspace — a private copy of the repo at `.rudder-workspaces/<name>` (its `cwd=`), isolated from the user's checkout and from every other agent; its work reaches the user only when Rudder integrates it. `where=main-checkout` means that agent edits the user's REAL files in place: several agents can share that tree, and they have nothing to merge.\n\nSo: a sibling's uncommitted edits are NOT in your tree and you cannot read them, waiting on a file a sibling is \"about to write\" will hang forever, and writing into another agent's workspace to hand work over does not work. Coordinate through this file, not the filesystem.\n");
     body.push_str("\n## Active local Rudder agents\n");
     let live_agents = agents
         .iter()
@@ -2214,16 +2250,16 @@ pub(crate) fn write_rudder_context_with_history(
     for agent in live_agents {
         append_agent_context_line(&mut body, agent);
     }
-    if let Some(worktree) = pending {
+    if let Some(workspace) = pending {
         body.push_str(&format!(
             "- starting node=- mode=execute status=starting backend=pending model=pending cwd={} where={} branch={}\n",
-            worktree.path.display(),
-            if worktree.path_is_worktree {
+            workspace.path.display(),
+            if workspace.path_is_workspace {
                 "workspace"
             } else {
                 "main-checkout"
             },
-            worktree.branch.as_deref().unwrap_or("current")
+            workspace.branch.as_deref().unwrap_or("current")
         ));
     }
     let ready_agents = agents
@@ -2261,6 +2297,7 @@ pub(crate) fn write_rudder_context_with_history(
             body.push_str(&format!("- {}\n", preview_text(instruction, 200)));
         }
     }
+    append_control_results(&mut body, control_results);
     body.push_str(
         "\nRead this file before making changes so you know what other Rudder agents are doing. If RUDDER_SHARED.md exists beside it, read that too; it is Rudder's gitignored file for user-shared credentials, API tokens, private URLs, and other local context that must survive model compaction.\n",
     );
@@ -2269,7 +2306,7 @@ pub(crate) fn write_rudder_context_with_history(
     );
     {
         // One lock per write batch at the repo root (the TS side locks the same
-        // way), covering the worktree copies too. Released on drop.
+        // way), covering the workspace copies too. Released on drop.
         let _lock = acquire_rudder_md_lock(repo_root);
         for workspace in rudder_context_workspaces(repo_root, agents, pending) {
             write_merged_rudder_md(&workspace.join("RUDDER.md"), &body)?;
@@ -2357,14 +2394,10 @@ fn append_agent_context_line(body: &mut String, agent: &AgentRun) {
 
 /// Which tree a row's files actually live in. Derived from the cwd rather than
 /// from mode/workspace_name because the path is ground truth: workspaces are
-/// always created under `<repo>/.rudder-worktrees`, so this cannot drift out of
+/// always created under `<repo>/.rudder-workspaces`, so this cannot drift out of
 /// sync with the spawn bookkeeping the way a mode lookup table would.
 fn agent_location_label(agent: &AgentRun) -> &'static str {
-    let under_rudder = agent
-        .cwd
-        .components()
-        .any(|component| component.as_os_str() == ".rudder-worktrees");
-    if under_rudder {
+    if is_under_agent_workspaces(&agent.cwd) {
         "workspace"
     } else {
         "main-checkout"
@@ -2397,14 +2430,14 @@ fn agent_awaits_action_for_context(agent: &AgentRun) -> bool {
 fn rudder_context_workspaces(
     repo_root: &Path,
     agents: &[AgentRun],
-    pending: Option<&WorktreeInfo>,
+    pending: Option<&WorkspaceInfo>,
 ) -> Vec<PathBuf> {
     let mut workspaces = agents
         .iter()
         .map(|agent| agent.cwd.clone())
         .collect::<Vec<_>>();
-    if let Some(worktree) = pending.filter(|worktree| worktree.path_is_worktree) {
-        workspaces.push(worktree.path.clone());
+    if let Some(workspace) = pending.filter(|workspace| workspace.path_is_workspace) {
+        workspaces.push(workspace.path.clone());
     }
     workspaces.push(repo_root.to_path_buf());
     workspaces.sort();
@@ -2521,7 +2554,7 @@ fn append_ship_status(body: &mut String, repo_root: &Path, agents: &[AgentRun]) 
 fn append_global_job_snapshot(
     body: &mut String,
     agents: &[AgentRun],
-    pending: Option<&WorktreeInfo>,
+    pending: Option<&WorkspaceInfo>,
 ) {
     let pending_count = usize::from(pending.is_some());
     let total = agents.len() + pending_count;
@@ -2622,7 +2655,7 @@ fn agent_is_mergeable_worker(agent: &AgentRun) -> bool {
 pub(crate) fn sync_shared_context_surfaces(
     repo_root: &Path,
     agents: &[AgentRun],
-    pending: Option<&WorktreeInfo>,
+    pending: Option<&WorkspaceInfo>,
 ) -> Result<()> {
     ensure_gitignore_contains(repo_root, RUDDER_SHARED_CONTEXT_FILE)?;
     let source = shared_context_path(repo_root);
@@ -2636,8 +2669,8 @@ pub(crate) fn sync_shared_context_surfaces(
         .iter()
         .map(|agent| agent.cwd.clone())
         .collect::<Vec<_>>();
-    if let Some(worktree) = pending.filter(|worktree| worktree.path_is_worktree) {
-        targets.push(worktree.path.clone());
+    if let Some(workspace) = pending.filter(|workspace| workspace.path_is_workspace) {
+        targets.push(workspace.path.clone());
     }
     targets.push(repo_root.to_path_buf());
     targets.sort();

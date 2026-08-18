@@ -13,8 +13,8 @@ test("writeAgentContext separates active, ready, completed, and merge-ready runs
     await fsp.rm(repo, { recursive: true, force: true });
   });
 
-  async function makeRun(id, status, { backend = "codex", worktree = true } = {}) {
-    const workspace = worktree ? path.join(repo, `${id}-workspace`) : repo;
+  async function makeRun(id, status, { backend = "codex", isolated = true } = {}) {
+    const workspace = isolated ? path.join(repo, `${id}-workspace`) : repo;
     await fsp.mkdir(workspace, { recursive: true });
     const run = await createRunRecord({
       id,
@@ -24,10 +24,10 @@ test("writeAgentContext separates active, ready, completed, and merge-ready runs
       targetBranch: "base",
       baseCommit: "base",
       vcs: "jj",
-      useWorktree: worktree,
-      worktreePath: workspace,
-      worktreeWorkspaceName: worktree ? `rudder-${id}` : undefined,
-      worktreeJjChangeId: worktree ? `${id}-change` : undefined,
+      useWorkspace: isolated,
+      workspacePath: workspace,
+      workspaceName: isolated ? `rudder-${id}` : undefined,
+      workspaceChangeId: isolated ? `${id}-change` : undefined,
     });
     run.status = status;
     run.taskSummaryLlm = true;
@@ -41,8 +41,8 @@ test("writeAgentContext separates active, ready, completed, and merge-ready runs
   await makeRun("created-run", "created", { backend: "claude" });
   await makeRun("running-run", "running");
   await makeRun("waiting-run", "steering");
-  await makeRun("ready-worktree", "completed");
-  await makeRun("ready-current", "completed", { worktree: false });
+  await makeRun("ready-workspace", "completed");
+  await makeRun("ready-current", "completed", { isolated: false });
   await makeRun("merged-run", "merged", { backend: "claude" });
 
   await writeAgentContext(repo);
@@ -62,18 +62,18 @@ test("writeAgentContext separates active, ready, completed, and merge-ready runs
   assert.match(active, /created-run/);
   assert.match(active, /running-run/);
   assert.match(active, /waiting-run/);
-  assert.doesNotMatch(active, /ready-worktree/);
+  assert.doesNotMatch(active, /ready-workspace/);
   assert.doesNotMatch(active, /merged-run/);
 
   const ready = text.split("## Ready local Rudder agents")[1].split("## Completed local Rudder agents")[0];
-  assert.match(ready, /ready-worktree/);
+  assert.match(ready, /ready-workspace/);
   assert.match(ready, /ready-current/);
   assert.doesNotMatch(ready, /merged-run/);
 
   const completed = text.split("## Completed local Rudder agents")[1];
   assert.match(completed, /merged-run/);
 
-  const workspaceCopy = await fsp.readFile(path.join(repo, "ready-worktree-workspace", "RUDDER.md"), "utf8");
+  const workspaceCopy = await fsp.readFile(path.join(repo, "ready-workspace-workspace", "RUDDER.md"), "utf8");
   assert.equal(workspaceCopy, text);
 });
 
@@ -88,8 +88,8 @@ test("legacy startedAt ownership cannot overwrite a newly redirected attempt", a
     targetBranch: "base",
     baseCommit: "base",
     vcs: "jj",
-    useWorktree: false,
-    worktreePath: repo,
+    useWorkspace: false,
+    workspacePath: repo,
   });
   const legacyStartedAt = "2026-01-01T00:00:00.000Z";
   run.status = "running";
