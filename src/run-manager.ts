@@ -27,6 +27,7 @@ import {
   stopRequestPath,
 } from "./state.js";
 import type { BackendId, EffortLevel, JsonValue, MergeStrategy, RunRecord, RudderEvent, VerificationResult } from "./types.js";
+import { updateGraph } from "./graph.js";
 import {
   appendEvent,
 } from "./state.js";
@@ -1050,9 +1051,15 @@ export async function mergeRun(runId: string, allowDirty = false, options?: { si
     throw new Error(`Run not found: ${runId}`);
   }
   if (run.status === "merged") {
+    // SELF-HEAL before refusing. A run can be merged while the graph node it owns
+    // still reads review — the run merged through a path that did not reconcile
+    // the DAG. Left alone the node is stranded forever: its work is integrated,
+    // but everything hard-depending on it stays unlaunchable. Reconcile, then
+    // report the refusal.
+    await markGraphNodeMerged(repoRoot, run);
     throw new Error(`Run ${runId} is already merged; re-running the merge would create a spurious second merge.`);
   }
-  if (isActiveStatus(run.status)) {
+  if (isActiveStatus(run.status) && !hasBlockedIntegration(run)) {
     throw new Error(`Run ${runId} is still active; stop it or wait for it to finish before merging.`);
   }
   const config = await loadConfig();
@@ -1068,6 +1075,12 @@ export async function mergeRun(runId: string, allowDirty = false, options?: { si
     if ((merged.vcs ?? "git") === "jj") {
       await exportToGit(repoRoot);
     }
+    // A merged RUN is not yet a merged NODE. Without this the DAG never learns
+    // its work landed: the node keeps its old status, everything hard-depending
+    // on it stays unlaunchable, and the plan stalls with finished, integrated
+    // work sitting in review. That is how a whole plan's back half went dark
+    // behind five already-merged nodes.
+    await markGraphNodeMerged(repoRoot, merged);
     await writeAgentContext(repoRoot);
     if (!options?.silent) {
       console.log(`Merged ${runId}`);
@@ -1484,6 +1497,36 @@ async function followFile(
     }
     await new Promise((resolve) => setTimeout(resolve, 350));
   }
+}
+
+/**
+ * A run whose merge already conflicted is FINISHED work whose integration
+ * failed — not a live agent. Its status can still read "running" (the native
+ * side leaves the row live while a conflict is pending), which made the active
+ * guard refuse the merge forever: the only way to retry integration was the very
+ * command the guard blocked. Observed in the field as finished nodes parked in
+ * review while every node hard-depending on them stayed unlaunchable.
+ */
+function hasBlockedIntegration(run: RunRecord): boolean {
+  return run.merge?.status === "conflict" || Boolean(run.hadMergeConflict && run.merge);
+}
+
+/**
+ * Flip the graph node this run owns to `merged` so the scheduler can see that
+ * its hard dependents are now free to launch. No-op when the run owns no node
+ * (an ad-hoc `rudder run`) or the node is already merged.
+ */
+async function markGraphNodeMerged(repoRoot: string, run: RunRecord): Promise<void> {
+  await updateGraph(repoRoot, (graph) => {
+    const node = Object.values(graph.nodes).find((candidate) => candidate.runId === run.id);
+    if (!node || node.status === "merged") {
+      return graph;
+    }
+    node.status = "merged";
+    node.merge = run.merge;
+    node.updatedAt = nowIso();
+    return graph;
+  }).catch(() => undefined);
 }
 
 function isActiveStatus(status: RunRecord["status"]): boolean {
