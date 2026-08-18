@@ -7414,23 +7414,6 @@ impl App {
             // The case this exists for is a dropped connection, which can have
             // killed the orchestrator too — asking a dead conductor to write
             // RUDDER_NUDGE_ALL would leave the fleet stalled with no way back.
-            // Hardening normally flushes itself at the phase boundary. This is the
-            // "do it now" lever for when you want the backlog cleared early.
-            Some("/harden") => {
-                if self.hardening.is_empty() {
-                    self.notice = Some("no hardening findings pending".to_string());
-                } else {
-                    let pending = self.hardening.len();
-                    let plan_index = self.active_plan_index();
-                    let added = self.flush_hardening_into_plan(plan_index);
-                    self.notice = Some(if added > 0 {
-                        format!("{pending} hardening finding(s) scheduled as {added} node(s)")
-                    } else {
-                        "hardening findings belong to another plan".to_string()
-                    });
-                }
-                true
-            }
             Some("/nudge") => {
                 let message = command_rest(input, "/nudge").trim().to_string();
                 if message.is_empty() {
@@ -8702,7 +8685,7 @@ impl App {
             return;
         }
         if marker == "RUDDER_HARDEN" {
-            self.handle_command("/harden");
+            self.flush_hardening_now();
             return;
         }
         if let Some(rest) = marker.strip_prefix("RUDDER_NUDGE_ALL ") {
@@ -10316,6 +10299,25 @@ Files involved: {}
             self.dirty = true;
         }
         added
+    }
+
+    /// Flush the hardening backlog ahead of the phase boundary. Reached through the
+    /// orchestrator marker, which is where fleet control belongs; it is deliberately
+    /// NOT a slash command, since hardening flushes itself and an extra verb in the
+    /// picker earns its place only if you would otherwise be stuck.
+    fn flush_hardening_now(&mut self) {
+        if self.hardening.is_empty() {
+            self.notice = Some("no hardening findings pending".to_string());
+            return;
+        }
+        let pending = self.hardening.len();
+        let plan_index = self.active_plan_index();
+        let added = self.flush_hardening_into_plan(plan_index);
+        self.notice = Some(if added > 0 {
+            format!("{pending} hardening finding(s) scheduled as {added} node(s)")
+        } else {
+            "hardening findings belong to another plan".to_string()
+        });
     }
 
     fn hardening_path(&self) -> PathBuf {
