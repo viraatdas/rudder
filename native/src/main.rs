@@ -14137,6 +14137,25 @@ What to do\n\
     fn verify_merged_rows(&mut self) {
         let cwd = self.cwd.clone();
         let mut drifted: Vec<(String, String)> = Vec::new();
+        // ONE jj call for every merged row. Asking per row spawned a process per
+        // row on the UI thread; jj's work is trivial next to process startup, so
+        // the cost scaled with merged-row count and showed up as a periodic hitch
+        // in repos with a long agent history.
+        let wanted: Vec<String> = self
+            .agents
+            .iter()
+            .filter(|run| run.status == AgentStatus::Merged)
+            .filter_map(|run| {
+                run.integration
+                    .merge_change_id
+                    .clone()
+                    .or_else(|| run.jj_change_id.clone())
+            })
+            .collect();
+        if wanted.is_empty() {
+            return;
+        }
+        let answers = jj_changes_in_trunk(&cwd, &wanted);
         for run in self.agents.iter_mut() {
             if run.status != AgentStatus::Merged {
                 continue;
@@ -14149,7 +14168,7 @@ What to do\n\
             else {
                 continue;
             };
-            let Some(in_trunk) = jj_change_in_trunk(&cwd, &change) else {
+            let Some(in_trunk) = answers.get(change.trim()).copied() else {
                 continue;
             };
             let was = run.integration.in_trunk;

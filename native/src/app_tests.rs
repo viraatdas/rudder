@@ -17602,3 +17602,21 @@ fn a_specific_failure_reason_is_not_overwritten_by_the_generic_exit_symptom() {
     let fresh_diagnosed = fresh.status == AgentStatus::Failed && fresh.last_error.is_some();
     assert!(!fresh_diagnosed, "an undiagnosed row still records the exit reason");
 }
+
+#[test]
+fn trunk_verification_asks_jj_once_for_every_merged_row() {
+    // The per-row version spawned a `jj log` for each merged row on the UI thread
+    // every reconcile. jj's work is trivial next to process startup, so the cost
+    // scaled with merged-row count: ~206ms for 16 rows versus ~10ms asking once.
+    // In a repo with a long agent history that is a visible periodic stall.
+    let repo = unique_test_repo("trunk-batch");
+
+    // Not a jj/git repo, so the batched call answers nothing rather than
+    // spawning anything -- the cheap path stays cheap.
+    let answers = jj_changes_in_trunk(&repo, &["abc".to_string(), "def".to_string()]);
+    assert!(answers.is_empty());
+
+    // An empty id list must never shell out at all.
+    assert!(jj_changes_in_trunk(&repo, &[]).is_empty());
+    assert!(jj_changes_in_trunk(&repo, &["   ".to_string()]).is_empty());
+}

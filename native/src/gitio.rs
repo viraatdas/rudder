@@ -1430,6 +1430,77 @@ pub(crate) fn jj_change_in_trunk(repo_root: &Path, change_id: &str) -> Option<bo
     Some(!String::from_utf8_lossy(&output.stdout).trim().is_empty())
 }
 
+/// Which of `change_ids` are still reachable from trunk, answered in ONE jj call.
+///
+/// The per-row version spawned a `jj log` for every merged row on every reconcile
+/// tick. jj's own work here is trivial; the cost is process startup, so it scaled
+/// with the number of merged rows and ran on the UI thread — measured at ~206ms
+/// for 16 rows versus ~10ms for the same question asked once. A repo with a long
+/// history of merged agents turned that into a visible periodic stall.
+///
+/// Ids absent from the answer are reported false. An id jj cannot resolve at all
+/// is simply absent, which is the same conclusion the per-row version reached.
+pub(crate) fn jj_changes_in_trunk(
+    repo_root: &Path,
+    change_ids: &[String],
+) -> HashMap<String, bool> {
+    let mut out = HashMap::new();
+    let ids: Vec<&str> = change_ids
+        .iter()
+        .map(|id| id.trim())
+        .filter(|id| !id.is_empty())
+        .collect();
+    if ids.is_empty() || !is_git_repo(repo_root) {
+        return out;
+    }
+    // Chunked so a repo with hundreds of merged rows cannot build a revset long
+    // enough to hit an argument-length limit.
+    const CHUNK: usize = 128;
+    for chunk in ids.chunks(CHUNK) {
+        let union = chunk.join("|");
+        let Ok(output) = Command::new("jj")
+            .args([
+                "log",
+                "--no-graph",
+                "--ignore-working-copy",
+                "-r",
+                &format!("({union}) & ::(trunk() | @)"),
+                "-T",
+                "change_id.short() ++ \"\\n\"",
+            ])
+            .current_dir(repo_root)
+            .stdin(Stdio::null())
+            .output()
+        else {
+            continue;
+        };
+        if !output.status.success() {
+            // A single unresolvable id fails the whole revset, so fall back to
+            // asking per id rather than silently reporting the batch as gone.
+            for id in chunk {
+                if let Some(answer) = jj_change_in_trunk(repo_root, id) {
+                    out.insert((*id).to_string(), answer);
+                }
+            }
+            continue;
+        }
+        let found: Vec<String> = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(|line| line.trim().to_string())
+            .filter(|line| !line.is_empty())
+            .collect();
+        for id in chunk {
+            // jj prints a SHORT change id; the stored one may be the full id, so
+            // match on whichever is the prefix of the other.
+            let present = found
+                .iter()
+                .any(|value| value.starts_with(*id) || id.starts_with(value.as_str()));
+            out.insert((*id).to_string(), present);
+        }
+    }
+    out
+}
+
 pub(crate) fn prepare_jj_workspace_at(
     cwd: &Path,
     task: &str,
