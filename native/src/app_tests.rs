@@ -5712,29 +5712,38 @@ fn auto_expand_grows_dag_from_in_scope_followups() {
         ]
     });
     let grew = app.apply_worker_followups("n0", &note);
-    assert!(grew, "an in-scope follow-up grows the DAG");
+    assert!(grew, "an in-scope follow-up is captured");
+    // It QUEUES rather than becoming a node. One node per finding gave each its own
+    // cold-start agent, workspace and merge, and because hardening findings land on
+    // the same files it manufactured the conflicts it then had to resolve.
     assert_eq!(
         app.plan().planned_nodes.len(),
-        1,
-        "only the in-scope follow-up is injected"
+        0,
+        "nothing is scheduled until the phase boundary"
     );
-    let added = &app.plan().planned_nodes[0];
-    assert_eq!(added.title, "add token refresh");
+    assert_eq!(app.hardening.len(), 1, "only the in-scope follow-up is queued");
+    assert_eq!(app.hardening[0].title, "add token refresh");
+    assert_eq!(app.hardening[0].origin_node, "n0");
     assert!(
-        added.soft_deps.contains(&"n0".to_string()),
-        "soft-linked to the finishing node (never deadlocks)"
-    );
-    assert!(
-        app.activity_log.iter().any(|l| l.contains("grew 1 node")),
-        "auto-expansion is surfaced in the activity log: {:?}",
+        app.activity_log
+            .iter()
+            .any(|l| l.contains("queued 1 hardening item")),
+        "queueing is surfaced in the activity log: {:?}",
         app.activity_log
     );
-    // A second identical note adds nothing (title dedupe).
+    // A second identical note adds nothing (title dedupe against the BACKLOG).
     assert!(
         !app.apply_worker_followups("n0", &note),
         "duplicate title is skipped"
     );
+    assert_eq!(app.hardening.len(), 1);
+
+    // Flushing turns the backlog into plan nodes.
+    let added = app.flush_hardening_into_plan(0);
+    assert_eq!(added, 1);
     assert_eq!(app.plan().planned_nodes.len(), 1);
+    assert_eq!(app.plan().planned_nodes[0].title, "add token refresh");
+    assert!(app.hardening.is_empty(), "the backlog is consumed by the flush");
 }
 
 #[test]
@@ -13409,10 +13418,13 @@ fn nest_view_selection_order_matches_nest_render_across_buckets() {
 }
 
 #[test]
-fn followup_unknown_explicit_dep_falls_back_to_soft() {
-    // A follow-up that names a hard dep NOT in the plan (e.g. a typo) must not install
-    // it as a hard dep: is_ready treats an out-of-plan dep as satisfied, so the node
-    // would launch immediately, silently losing the gate. It is soft-linked instead.
+fn a_hardening_clump_carries_no_deps_so_a_bad_dep_cannot_gate_it() {
+    // A follow-up naming a hard dep NOT in the plan (a typo) used to be a live trap:
+    // is_ready treats an out-of-plan dep as satisfied, so the node launched
+    // immediately and silently lost its gate; a dep resolving to a FAILED node
+    // deadlocked instead. Hardening now flushes at the phase boundary, when every
+    // launched node has already merged, so a clump has nothing left to depend on --
+    // the whole class of bad-dep failures is gone rather than mitigated.
     let mut app = App::new();
     app.cwd = std::env::temp_dir();
     let mut a = node_agent("n0", AgentStatus::Done);
@@ -13422,17 +13434,15 @@ fn followup_unknown_explicit_dep_falls_back_to_soft() {
         "followups": [{ "title": "wire it", "deps": ["ghost"], "scope": "in" }]
     });
     assert!(app.apply_worker_followups("n0", &note));
+    app.flush_hardening_into_plan(0);
     let node = app
         .plan()
         .planned_nodes
         .iter()
         .find(|n| n.title == "wire it")
-        .expect("follow-up added");
-    assert!(node.deps.is_empty(), "unknown hard dep is not installed");
-    assert!(
-        node.soft_deps.contains(&"n0".to_string()),
-        "soft-linked to the finishing node instead"
-    );
+        .expect("follow-up scheduled");
+    assert!(node.deps.is_empty(), "no hard dep to mis-resolve");
+    assert!(node.soft_deps.is_empty(), "and nothing left to wait on");
 }
 
 #[test]
@@ -14306,6 +14316,8 @@ fn auto_expand_recovers_followups_from_sidecar_file_without_a_pty() {
         .unwrap();
 
     app.maybe_ingest_worker_followups();
+    // Findings queue; the flush is what schedules them.
+    app.flush_hardening_into_plan(0);
 
     assert_eq!(
         app.plan().planned_nodes.len(),
@@ -14377,6 +14389,7 @@ fn backstop_result_grows_dag_via_poll() {
         app.followups_ingested.contains("n0"),
         "marked ingested (never re-summarized)"
     );
+    app.flush_hardening_into_plan(0);
     assert_eq!(
         app.plan().planned_nodes.len(),
         1,
@@ -14469,6 +14482,7 @@ fn ingest_failed_worker_reads_note_but_never_backstops() {
         )];
     let grew = app.ingest_worker_followups(0);
     assert!(grew, "a failed worker's filed follow-ups are still applied");
+    app.flush_hardening_into_plan(0);
     assert_eq!(app.plan().planned_nodes[0].title, "finish the refactor");
 
     // …but a FAILED worker with only freeform prose never triggers the diff-backstop
@@ -14544,6 +14558,7 @@ fn followup_scope_out_is_case_insensitive() {
     });
     let grew = app.apply_worker_followups("n0", &note);
     assert!(grew);
+    app.flush_hardening_into_plan(0);
     assert_eq!(
         app.plan().planned_nodes.len(),
         1,
@@ -17619,4 +17634,154 @@ fn trunk_verification_asks_jj_once_for_every_merged_row() {
     // An empty id list must never shell out at all.
     assert!(jj_changes_in_trunk(&repo, &[]).is_empty());
     assert!(jj_changes_in_trunk(&repo, &["   ".to_string()]).is_empty());
+}
+
+fn hardening_item(title: &str, files: &[&str]) -> crate::tasks::HardeningItem {
+    crate::tasks::HardeningItem {
+        title: title.to_string(),
+        prompt: title.to_string(),
+        origin_node: "n0".to_string(),
+        plan_id: "p1".to_string(),
+        files: files.iter().map(|f| (*f).to_string()).collect(),
+    }
+}
+
+#[test]
+fn hardening_findings_on_the_same_files_become_one_clump() {
+    // The offstage failure, exactly: two hardening follow-ups each independently
+    // created the same four src/router files, conflicted 3-sided, and froze
+    // integration for hours. As one clump they are edits in a single working copy
+    // and the conflict cannot exist.
+    let clusters = crate::tasks::cluster_hardening(vec![
+        hardening_item("--video routes to container", &["src/router/index.ts", "src/router/signals.ts"]),
+        hardening_item("webdriver tools route to container", &["src/router/index.ts", "src/router/inspect.ts"]),
+        hardening_item("cap retained output at 4MB", &["src/lanes/headless/parse.ts"]),
+    ]);
+
+    assert_eq!(clusters.len(), 2, "the two router findings clump, the lane one stands alone");
+    let router = clusters
+        .iter()
+        .find(|c| c.len() == 2)
+        .expect("router clump");
+    assert!(router.iter().any(|i| i.title.contains("--video")));
+    assert!(router.iter().any(|i| i.title.contains("webdriver")));
+}
+
+#[test]
+fn clumping_is_transitive_across_a_shared_file() {
+    // A touches x, B touches x+y, C touches y. All three belong together: an agent
+    // fixing y must see what A did to x, or it re-litigates the same file.
+    let clusters = crate::tasks::cluster_hardening(vec![
+        hardening_item("A", &["src/x.ts"]),
+        hardening_item("C", &["src/y.ts"]),
+        hardening_item("B", &["src/x.ts", "src/y.ts"]),
+    ]);
+    assert_eq!(clusters.len(), 1, "the bridging finding merges both clumps");
+    assert_eq!(clusters[0].len(), 3);
+}
+
+#[test]
+fn findings_with_no_identifiable_file_stay_separate() {
+    // Sweeping unattributable findings into an arbitrary clump would hand one agent
+    // two unrelated jobs, which is the failure mode clumping exists to avoid.
+    let clusters = crate::tasks::cluster_hardening(vec![
+        hardening_item("tighten the docs", &[]),
+        hardening_item("review error copy", &[]),
+        hardening_item("fix router", &["src/router/index.ts"]),
+    ]);
+    assert_eq!(clusters.len(), 3);
+}
+
+#[test]
+fn file_mentions_are_recovered_from_free_text() {
+    let files = crate::tasks::extract_file_mentions(
+        "constraintStatus() in scripts/migrate-comeback.ts must match pg_constraint; \
+         also update `tests/router.classify.test.ts` and the README.md note.",
+    );
+    assert!(files.contains(&"scripts/migrate-comeback.ts".to_string()), "{files:?}");
+    assert!(files.contains(&"tests/router.classify.test.ts".to_string()), "{files:?}");
+    assert!(files.contains(&"README.md".to_string()), "{files:?}");
+    // Prose is not a path.
+    assert!(!files.iter().any(|f| f == "constraintStatus()"), "{files:?}");
+}
+
+#[test]
+fn many_findings_on_one_area_become_one_node_not_many() {
+    // The whole point. Four findings across two areas used to be four nodes: four
+    // cold-start agents, four workspaces, four merges — and the two router findings
+    // would race to create the same files. They become two nodes.
+    let mut app = App::new();
+    app.cwd = std::env::temp_dir();
+    let mut a = test_agent_run("n0agent", "router");
+    a.node_id = Some("n0".to_string());
+    a.mode = AgentMode::Execute;
+    app.agents = vec![a];
+
+    let note = serde_json::json!({
+        "summary": "built the router",
+        "followups": [
+            { "title": "video routing needs src/router/index.ts guard", "scope": "in" },
+            { "title": "webdriver routing in src/router/index.ts is unhandled", "scope": "in" },
+            { "title": "cap output in src/lanes/headless/parse.ts", "scope": "in" },
+            { "title": "docs for src/lanes/headless/parse.ts limits", "scope": "in" }
+        ]
+    });
+    assert!(app.apply_worker_followups("n0", &note));
+    assert_eq!(app.hardening.len(), 4, "all four are captured");
+    assert_eq!(
+        app.plan().planned_nodes.len(),
+        0,
+        "and none of them is scheduled yet"
+    );
+
+    let added = app.flush_hardening_into_plan(0);
+    assert_eq!(added, 2, "four findings, two file-areas, two nodes");
+
+    let titles: Vec<&str> = app
+        .plan()
+        .planned_nodes
+        .iter()
+        .map(|n| n.title.as_str())
+        .collect();
+    assert!(
+        titles.iter().any(|t| t.contains("src/router")),
+        "a clump is named for its area: {titles:?}"
+    );
+
+    // Every finding in a clump reaches the agent in ONE prompt, so it fixes them
+    // together with full sight of the file instead of two agents half-fixing it.
+    let router = app
+        .plan()
+        .planned_nodes
+        .iter()
+        .find(|n| n.title.contains("src/router"))
+        .expect("router clump");
+    assert!(router.prompt.contains("video routing"));
+    assert!(router.prompt.contains("webdriver routing"));
+    assert!(router.prompt.contains("reported by n0"));
+}
+
+#[test]
+fn the_backlog_survives_a_restart() {
+    // A finding recorded and then lost is hardening the user was told would happen
+    // and never does.
+    let repo = unique_test_repo("hardening-persist");
+    let mut app = App::new();
+    app.cwd = repo.clone();
+    app.hardening = vec![crate::tasks::HardeningItem {
+        title: "cap the output".to_string(),
+        prompt: "cap it".to_string(),
+        origin_node: "n2".to_string(),
+        plan_id: "p1".to_string(),
+        files: vec!["src/lanes/headless/parse.ts".to_string()],
+    }];
+    app.persist_hardening();
+
+    let reloaded = load_hardening_backlog(&repo);
+    assert_eq!(reloaded, app.hardening);
+
+    // Draining it clears the file rather than leaving a stale backlog behind.
+    app.hardening.clear();
+    app.persist_hardening();
+    assert!(load_hardening_backlog(&repo).is_empty());
 }

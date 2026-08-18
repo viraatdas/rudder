@@ -532,6 +532,11 @@ pub(crate) fn command_suggestions() -> Vec<Suggestion> {
             action: SuggestionAction::RunCommand("/merge-all".to_string()),
         },
         Suggestion {
+            label: "/harden".to_string(),
+            detail: "schedule the pending hardening findings now, clumped by area".to_string(),
+            action: SuggestionAction::RunCommand("/harden".to_string()),
+        },
+        Suggestion {
             label: "/nudge <message>".to_string(),
             detail: "send one message to every in-flight worker (dead ones are resumed)"
                 .to_string(),

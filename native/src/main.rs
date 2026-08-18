@@ -819,6 +819,9 @@ struct App {
     /// Throttle for the web-board steer inbox poll (.rudder/steer/*.json): checked
     /// ~once/sec from poll_agents so a browser "steer" reaches the right agent's PTY.
     last_steer_poll: Instant,
+    /// Hardening findings reported by finished workers, held until the plan reaches
+    /// a phase boundary and then flushed as CLUMPS. See tasks::HardeningItem.
+    hardening: Vec<crate::tasks::HardeningItem>,
     /// Outcomes of the orchestrator's recent control markers, newest last. Bounded;
     /// rendered into RUDDER.md so the conductor can see what its own markers did.
     control_results: Vec<ControlResult>,
@@ -1635,6 +1638,12 @@ impl App {
         };
         // Restore the ingested-run ledger so a worker handled before the last exit is not
         // re-ingested (or re-summarized) when its Done record reloads. Empty in tests.
+        // Loaded before `cwd` moves into the struct below.
+        let hardening_backlog = if cfg!(test) {
+            Vec::new()
+        } else {
+            load_hardening_backlog(cwd.as_path())
+        };
         let followups_ingested = if cfg!(test) {
             HashSet::new()
         } else {
@@ -1778,6 +1787,7 @@ impl App {
             last_publish_pr_state: None,
             last_workspace_gc: Instant::now(),
             last_steer_poll: Instant::now(),
+            hardening: hardening_backlog,
             control_results: Vec::new(),
             last_heartbeat_emit: Instant::now(),
             cloud_workspace: None,
@@ -7404,6 +7414,23 @@ impl App {
             // The case this exists for is a dropped connection, which can have
             // killed the orchestrator too — asking a dead conductor to write
             // RUDDER_NUDGE_ALL would leave the fleet stalled with no way back.
+            // Hardening normally flushes itself at the phase boundary. This is the
+            // "do it now" lever for when you want the backlog cleared early.
+            Some("/harden") => {
+                if self.hardening.is_empty() {
+                    self.notice = Some("no hardening findings pending".to_string());
+                } else {
+                    let pending = self.hardening.len();
+                    let plan_index = self.active_plan_index();
+                    let added = self.flush_hardening_into_plan(plan_index);
+                    self.notice = Some(if added > 0 {
+                        format!("{pending} hardening finding(s) scheduled as {added} node(s)")
+                    } else {
+                        "hardening findings belong to another plan".to_string()
+                    });
+                }
+                true
+            }
             Some("/nudge") => {
                 let message = command_rest(input, "/nudge").trim().to_string();
                 if message.is_empty() {
@@ -8674,6 +8701,10 @@ impl App {
             self.notice = Some("RUDDER_INJECT requires <node-or-run-id> <message>".to_string());
             return;
         }
+        if marker == "RUDDER_HARDEN" {
+            self.handle_command("/harden");
+            return;
+        }
         if let Some(rest) = marker.strip_prefix("RUDDER_NUDGE_ALL ") {
             self.nudge_all_workers(rest.trim());
             return;
@@ -9912,6 +9943,10 @@ impl App {
             .planned_nodes
             .iter()
             .any(|n| norm(&n.title) == want)
+            // Findings now WAIT in the hardening backlog before becoming nodes, so
+            // dedupe has to see the backlog too — otherwise the same finding
+            // reported by two workers is queued twice and the clump does it twice.
+            || self.hardening.iter().any(|item| norm(&item.title) == want)
             || self.active_plan_agents().any(|r| {
                 r.node_id.is_some() && (norm(&r.task_summary) == want || norm(&r.task) == want)
             })
@@ -10188,6 +10223,122 @@ impl App {
     /// MAX_FOLLOWUP_DEPTH cap survives a restart. Without this, reopening Rudder mid-plan
     /// resets every node's depth to 0 and an auto-expansion chain could grow further than
     /// the cap intends (still bounded by MAX_PLAN_TASKS, but the depth guard would be lost).
+    /// Turn the pending hardening backlog for `plan_id` into plan nodes, ONE per
+    /// file-cluster. Returns how many nodes were added.
+    ///
+    /// Called at the phase boundary (every launched node merged, queue empty), so
+    /// hardening runs as its own phase instead of interleaving with feature work
+    /// and competing for the same files while those features are still landing.
+    fn flush_hardening_into_plan(&mut self, plan_index: usize) -> usize {
+        let plan_id = self.plans[plan_index].id.clone();
+        let (mine, rest): (Vec<_>, Vec<_>) = self
+            .hardening
+            .drain(..)
+            .partition(|item| item.plan_id == plan_id);
+        self.hardening = rest;
+        if mine.is_empty() {
+            return 0;
+        }
+        let clusters = crate::tasks::cluster_hardening(mine);
+        let mut added = 0usize;
+        for cluster in clusters {
+            if self.plan_node_count() >= MAX_PLAN_TASKS {
+                self.record_decision(
+                    &format!("Plan at {MAX_PLAN_TASKS}-node cap"),
+                    "Remaining hardening clumps were not scheduled: the plan hit its node cap.",
+                    Some("the plan-size cap prevents runaway auto-growth"),
+                );
+                break;
+            }
+            let files: Vec<String> = {
+                let mut all: Vec<String> = cluster
+                    .iter()
+                    .flat_map(|item| item.files.clone())
+                    .collect();
+                all.sort();
+                all.dedup();
+                all
+            };
+            let title = if cluster.len() == 1 {
+                cluster[0].title.clone()
+            } else if let Some(area) = common_area(&files) {
+                format!("Harden {area} ({} findings)", cluster.len())
+            } else {
+                format!("Hardening pass ({} findings)", cluster.len())
+            };
+            // ONE prompt carrying every finding in the clump, so the agent fixes
+            // them together with full sight of the file rather than N agents each
+            // half-fixing it.
+            let mut prompt = String::from(
+                "Hardening pass. Address ALL of the following findings together in one coherent change. They were reported by finished workers and touch overlapping files, so fix them as a set rather than one at a time.
+
+",
+            );
+            for (index, item) in cluster.iter().enumerate() {
+                prompt.push_str(&format!(
+                    "{}. {} (reported by {})
+   {}
+",
+                    index + 1,
+                    item.title,
+                    item.origin_node,
+                    item.prompt
+                ));
+            }
+            if !files.is_empty() {
+                prompt.push_str(&format!("
+Files involved: {}
+", files.join(", ")));
+            }
+            let node = PlannedNode {
+                id: self.uniquify_node_id("harden"),
+                plan_id: plan_id.clone(),
+                title,
+                prompt,
+                goal: Some("address every finding in this hardening clump".to_string()),
+                success: Some(
+                    "every listed finding is handled and the repo's own checks pass".to_string(),
+                ),
+                deps: Vec::new(),
+                soft_deps: Vec::new(),
+                backend: None,
+                model: None,
+                effort: None,
+            };
+            self.push_plan_node(plan_index, node);
+            added += 1;
+        }
+        if added > 0 {
+            self.plans[plan_index].final_gate_status = FinalGateStatus::Idle;
+            self.plans[plan_index].final_gate_summary = None;
+            self.push_activity(format!("hardening: {added} clumped node(s) scheduled"));
+            self.persist_hardening();
+            self.dirty = true;
+        }
+        added
+    }
+
+    fn hardening_path(&self) -> PathBuf {
+        self.cwd.join(".rudder").join("hardening.json")
+    }
+
+    /// The backlog must survive a restart: a finding recorded and then lost is
+    /// hardening the user was told would happen and never does.
+    fn persist_hardening(&self) {
+        let path = self.hardening_path();
+        if self.hardening.is_empty() {
+            let _ = std::fs::remove_file(&path);
+            return;
+        }
+        let Ok(json) = serde_json::to_string(&self.hardening) else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(path, json);
+    }
+
     fn persist_followup_gen(&self) {
         let Ok(json) = serde_json::to_string(&self.followup_gen) else {
             return;
@@ -10720,6 +10871,44 @@ impl App {
                 .filter(|s| !s.is_empty())
                 .unwrap_or(title)
                 .to_string();
+            // BACKLOG, not a node. One node per finding gave each a cold-start
+            // agent, a workspace and a merge — and because hardening findings
+            // land on the same files, it manufactured the conflicts it then had
+            // to resolve. These are clumped by file and flushed at the phase
+            // boundary instead (flush_hardening_into_plan).
+            {
+                let mut files: Vec<String> = f
+                    .get("files")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if files.is_empty() {
+                    files = crate::tasks::extract_file_mentions(&format!("{title} {prompt}"));
+                }
+                // The reporting node's own interfaces are the strongest clue about
+                // WHERE this finding lives when the finding text names no file.
+                if files.is_empty() {
+                    if let Some(interfaces) =
+                        note.get("interfaces").and_then(serde_json::Value::as_str)
+                    {
+                        files = crate::tasks::extract_file_mentions(interfaces);
+                    }
+                }
+                self.hardening.push(crate::tasks::HardeningItem {
+                    title: title.to_string(),
+                    prompt: prompt.clone(),
+                    origin_node: node_id.to_string(),
+                    plan_id: plan_id.clone(),
+                    files,
+                });
+                added += 1;
+                continue;
+            }
+            #[allow(unreachable_code)]
             let explicit: Vec<String> = f
                 .get("deps")
                 .and_then(serde_json::Value::as_array)
@@ -10791,7 +10980,13 @@ impl App {
             added += 1;
         }
         if added > 0 {
-            self.push_activity(format!("grew {added} node(s) from {node_id}'s completion"));
+            self.followup_gen.insert(node_id.to_string(), gen + 1);
+            self.persist_followup_gen();
+            self.persist_hardening();
+            self.push_activity(format!(
+                "queued {added} hardening item(s) from {node_id} ({} pending)",
+                self.hardening.len()
+            ));
         }
         added > 0
     }
@@ -15841,6 +16036,27 @@ fn clear_orchestrator_plan_markers(repo_root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The directory prefix every path shares, for naming a clump ("src/router").
+/// None when they share nothing meaningful.
+fn common_area(files: &[String]) -> Option<String> {
+    let dirs: Vec<&str> = files
+        .iter()
+        .filter_map(|f| f.rsplit_once('/').map(|(dir, _)| dir))
+        .collect();
+    if dirs.is_empty() {
+        return None;
+    }
+    let first = dirs[0];
+    dirs.iter().all(|d| *d == first).then(|| first.to_string())
+}
+
+fn load_hardening_backlog(cwd: &Path) -> Vec<crate::tasks::HardeningItem> {
+    std::fs::read_to_string(cwd.join(".rudder").join("hardening.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
 fn is_orchestrator_skill_marker(line: &str) -> bool {
     [
         "RUDDER_MODEL",
@@ -15859,6 +16075,7 @@ fn is_orchestrator_skill_marker(line: &str) -> bool {
         "RUDDER_REGOAL",
         "RUDDER_INJECT",
         "RUDDER_NUDGE_ALL",
+        "RUDDER_HARDEN",
         "RUDDER_ADD_TASK",
         "RUDDER_REPLAN",
         "RUDDER_PLAN",

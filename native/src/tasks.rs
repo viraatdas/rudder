@@ -161,7 +161,7 @@ fn orchestrator_system_prompt_for(
         "CONFLICT-SAFE DECOMPOSITION (every parallel worker merges back into ONE tree, so structure the DAG to minimize merge collisions): FOUNDATION FIRST — shared groundwork (scaffold, shared schema/data-access layer, shared config/types) goes in early node(s) that every feature HARD-depends on, so features branch from the same settled base. DISJOINT PATHS — scope each parallel feature to its OWN files/dirs; two soft-coupled siblings must not edit the same source file (merge them, or make one hard-depend on the other). SHARED MANIFESTS ARE OWNED — package.json, lock files, .gitignore, tsconfig and global config are established completely by the foundation node (including deps features will need), not edited by many parallel features. SUPERSEDE CLEANLY — if replacing draft/scaffold files, the foundation node deletes the superseded files authoritatively so later merges do not resurrect them. BROAD PASSES RUN LAST, ALONE — any whole-codebase pass (final polish, integration, cleanup, formatting) is a single terminal node that hard-depends on every feature it touches, never a concurrent sibling.".to_string(),
         "Rudder renders the DAG in the pane ABOVE this terminal and reloads it LIVE from RUDDER.md. The plan is a LIVING document: whenever the user asks to ADD, CHANGE, REMOVE, reorder, re-scope, or re-split tasks at ANY point before they approve, UPDATE the DAG by re-writing the FULL RUDDER_PLAN_TASKS block in RUDDER.md to match - keep stable `id`s for unchanged nodes, add new ones with fresh ids, drop removed ones, and fix up `deps` so the edges stay correct. Always keep the block in sync with what you and the user have agreed; never describe a plan change only in chat without also writing it to the file.".to_string(),
         "APPROVAL / LAUNCH: After - and ONLY after - the user has EXPLICITLY confirmed in the conversation that the plan is good to run (e.g. \"yes\", \"go\", \"approve\", \"launch it\"), signal Rudder to launch the workers by WRITING (Edit/Write) the line `RUDDER_APPROVE_PLAN` on its own line into RUDDER.md, keeping the RUDDER_PLAN_TASKS block in the file. Writing it into RUDDER.md (a structured Write) is the reliable channel; you MAY also print the same line in the chat as a fallback. Never write/print it preemptively, while you are still asking questions, or while you are revising the plan. When you merely need to REFER to the marker in prose, write it as RUDDER_APPROVE_PLAN_TEMPLATE so Rudder does not treat the mention as a launch trigger. Once you write RUDDER_APPROVE_PLAN, Rudder generates graph.json and launches the SEPARATE worker fleet, but this session stays alive as the high-level conductor. Keep talking with the user, explain status from RUDDER.md/graph state, and control workers only through RUDDER_* markers. Do not implement product code yourself.".to_string(),
-        "POST-APPROVAL CONDUCTOR ROLE: Messages the user types into YOUR pane reach you while workers run (the task pane no longer forwards to you: plain input there starts its own isolated worker, so anything you receive was aimed at this plan deliberately). For additive DAG work, write RUDDER_ADD_TASK <task>. For one isolated implementation worker that should be reviewed/merged but does not need a DAG, write RUDDER_RUN <task>. For direct work in the shared main checkout, write RUDDER_MAIN <prompt>. For structural pivots, write RUDDER_REPLAN <direction>. For specific workers, use RUDDER_STOP <node-or-run-id>, RUDDER_RESUME <node-or-run-id> <claude|codex> <model> [effort] [new direction], RUDDER_REGOAL <node-or-run-id> <new goal>, RUDDER_INJECT <node-or-run-id> <message>, or RUDDER_MERGE <node-or-run-id>. To send ONE message to the WHOLE fleet at once, write RUDDER_NUDGE_ALL <message>: it reaches every in-flight worker, typing the message into the ones still live and resuming the ones whose process died in their own workspace. Use it for fleet-wide nudges such as \"keep going\", \"carry on, my connection dropped\", \"status check\", or \"stick to the plan\" — do NOT emit one RUDDER_INJECT line per node for those; finished and merged workers are skipped automatically. Resolve natural-language references such as 'current tasks' from the live rows in RUDDER.md; for 'pause and resume on model X', write STOP then RESUME for each matching worker. When the user asks to take/move/run the current or active agent fleet on Rudder Cloud, write RUDDER_CLOUD_MIGRATE; never use the single-run onload action for a fleet. Planned DAG nodes integrate automatically; for broad actions use RUDDER_REVIEW_ALL and RUDDER_MERGE_ALL. For monitoring requests like \"wait for current Claude/Codex jobs, then review/fix/merge/push/deploy\", periodically re-read the generated global job snapshot, wait until the relevant jobs are no longer running or waiting, then trigger review/merge markers. If the user asks for repo-specific final steps such as pushing, publishing, or deploying, start a normal main-checkout worker with RUDDER_MAIN <prompt>; do not run those commands yourself from the orchestrator. AUTO-SHIP: if the ORIGINAL task goal includes deploying/publishing/shipping to a host (e.g. 'deploy to X', 'ship it', 'make it live'), treat shipping as the plan's final step — do NOT wait for the user to ask again. Once every implementation node has merged (merged count = launched, none running/waiting) and the Ship status shows unpushed work, automatically write RUDDER_MAIN <push the integrated result with `jj git push` (or `git push`), then deploy to the named target — or rely on the host auto-deploying from the push, e.g. Netlify/Vercel>. After it finishes, verify the live target before telling the user it is deployed; 'merged' is local git only and is never deployed until pushed. Rudder consumes marker lines from RUDDER.md and removes them after acting — a line disappearing means it was CONSUMED, not that it succeeded. RUDDER.md carries a \"Your last control markers, and what they did\" section with the real outcome of each one. Re-read it after you write markers, BEFORE you tell the user anything landed: if an entry reports a failure, a \"target not found\", or a zero count, fix the target (resolve ids from the live agent rows) and re-issue rather than reporting success.".to_string(),
+        "POST-APPROVAL CONDUCTOR ROLE: Messages the user types into YOUR pane reach you while workers run (the task pane no longer forwards to you: plain input there starts its own isolated worker, so anything you receive was aimed at this plan deliberately). For additive DAG work, write RUDDER_ADD_TASK <task>. For one isolated implementation worker that should be reviewed/merged but does not need a DAG, write RUDDER_RUN <task>. For direct work in the shared main checkout, write RUDDER_MAIN <prompt>. For structural pivots, write RUDDER_REPLAN <direction>. For specific workers, use RUDDER_STOP <node-or-run-id>, RUDDER_RESUME <node-or-run-id> <claude|codex> <model> [effort] [new direction], RUDDER_REGOAL <node-or-run-id> <new goal>, RUDDER_INJECT <node-or-run-id> <message>, or RUDDER_MERGE <node-or-run-id>. Hardening findings workers report are QUEUED, not scheduled immediately: Rudder flushes them clumped by file once the phase merges. Write RUDDER_HARDEN to flush that backlog early when the user asks to harden now. To send ONE message to the WHOLE fleet at once, write RUDDER_NUDGE_ALL <message>: it reaches every in-flight worker, typing the message into the ones still live and resuming the ones whose process died in their own workspace. Use it for fleet-wide nudges such as \"keep going\", \"carry on, my connection dropped\", \"status check\", or \"stick to the plan\" — do NOT emit one RUDDER_INJECT line per node for those; finished and merged workers are skipped automatically. Resolve natural-language references such as 'current tasks' from the live rows in RUDDER.md; for 'pause and resume on model X', write STOP then RESUME for each matching worker. When the user asks to take/move/run the current or active agent fleet on Rudder Cloud, write RUDDER_CLOUD_MIGRATE; never use the single-run onload action for a fleet. Planned DAG nodes integrate automatically; for broad actions use RUDDER_REVIEW_ALL and RUDDER_MERGE_ALL. For monitoring requests like \"wait for current Claude/Codex jobs, then review/fix/merge/push/deploy\", periodically re-read the generated global job snapshot, wait until the relevant jobs are no longer running or waiting, then trigger review/merge markers. If the user asks for repo-specific final steps such as pushing, publishing, or deploying, start a normal main-checkout worker with RUDDER_MAIN <prompt>; do not run those commands yourself from the orchestrator. AUTO-SHIP: if the ORIGINAL task goal includes deploying/publishing/shipping to a host (e.g. 'deploy to X', 'ship it', 'make it live'), treat shipping as the plan's final step — do NOT wait for the user to ask again. Once every implementation node has merged (merged count = launched, none running/waiting) and the Ship status shows unpushed work, automatically write RUDDER_MAIN <push the integrated result with `jj git push` (or `git push`), then deploy to the named target — or rely on the host auto-deploying from the push, e.g. Netlify/Vercel>. After it finishes, verify the live target before telling the user it is deployed; 'merged' is local git only and is never deployed until pushed. Rudder consumes marker lines from RUDDER.md and removes them after acting — a line disappearing means it was CONSUMED, not that it succeeded. RUDDER.md carries a \"Your last control markers, and what they did\" section with the real outcome of each one. Re-read it after you write markers, BEFORE you tell the user anything landed: if an entry reports a failure, a \"target not found\", or a zero count, fix the target (resolve ids from the live agent rows) and re-issue rather than reporting success.".to_string(),
         action_help.to_string(),
         format!("Only ever Edit/Write {writable_files}. Treat all other files as read-only."),
     ]
@@ -280,6 +280,92 @@ impl RudderPlanTask {
 /// drains these into live `AgentRun`s as their hard deps merge and parallelism
 /// slots free. Created one-per-task when a planner agent completes; rendered in
 /// the Todo section until launched.
+/// One hardening finding a worker reported on completion, held in a backlog
+/// instead of becoming its own node.
+///
+/// Every follow-up used to become a node: its own workspace, its own cold-start
+/// agent, its own merge. Hardening findings cluster on the same files BY NATURE —
+/// that is what hardening is — so one-node-per-finding manufactured the conflicts
+/// it then had to resolve. In a real plan two hardening nodes independently
+/// created the same four `src/router/*.ts` files and froze integration for hours.
+/// Clumped into one node per file-cluster, those become edits in a single working
+/// copy and the conflict cannot exist.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub(crate) struct HardeningItem {
+    pub(crate) title: String,
+    pub(crate) prompt: String,
+    /// The node whose completion reported this.
+    pub(crate) origin_node: String,
+    pub(crate) plan_id: String,
+    /// Repo-relative files this finding touches, used to cluster it.
+    #[serde(default)]
+    pub(crate) files: Vec<String>,
+}
+
+/// Repo-relative-looking file paths mentioned in `text`. Deliberately loose: this
+/// only decides CLUSTERING, so a miss costs an extra node rather than correctness.
+pub(crate) fn extract_file_mentions(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in text.split(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | '(' | ')' | '`' | '"' | '\'' | '<' | '>')) {
+        let token = raw.trim_matches(|c: char| matches!(c, '.' | ':' | '*' | '-' | '[' | ']'));
+        if token.len() < 3 || token.len() > 200 {
+            continue;
+        }
+        // A path-ish token: has a directory separator or a known source extension.
+        let has_dir = token.contains('/');
+        let has_ext = [
+            ".ts", ".tsx", ".js", ".jsx", ".mjs", ".rs", ".py", ".go", ".md", ".json", ".toml",
+            ".yaml", ".yml", ".css", ".sql", ".sh",
+        ]
+        .iter()
+        .any(|ext| token.ends_with(ext));
+        if !(has_dir && has_ext) && !has_ext {
+            continue;
+        }
+        let value = token.trim_start_matches("./").to_string();
+        if !out.contains(&value) {
+            out.push(value);
+        }
+    }
+    out
+}
+
+/// Group findings that share at least one file into the same clump, transitively.
+/// Findings with no identifiable file each stand alone rather than being swept into
+/// an unrelated clump — a wrong clump makes one agent do two unrelated jobs.
+pub(crate) fn cluster_hardening(items: Vec<HardeningItem>) -> Vec<Vec<HardeningItem>> {
+    let mut clusters: Vec<(Vec<String>, Vec<HardeningItem>)> = Vec::new();
+    for item in items {
+        if item.files.is_empty() {
+            clusters.push((Vec::new(), vec![item]));
+            continue;
+        }
+        // Every existing cluster sharing a file with this item merges together with
+        // it, so A-B and B-C findings land in one clump rather than two.
+        let mut hit: Vec<usize> = Vec::new();
+        for (index, (files, _)) in clusters.iter().enumerate() {
+            if files.iter().any(|f| item.files.contains(f)) {
+                hit.push(index);
+            }
+        }
+        if hit.is_empty() {
+            clusters.push((item.files.clone(), vec![item]));
+            continue;
+        }
+        let target = hit[0];
+        for index in hit.into_iter().skip(1).rev() {
+            let (files, members) = clusters.remove(index);
+            clusters[target].0.extend(files);
+            clusters[target].1.extend(members);
+        }
+        clusters[target].0.extend(item.files.clone());
+        clusters[target].0.sort();
+        clusters[target].0.dedup();
+        clusters[target].1.push(item);
+    }
+    clusters.into_iter().map(|(_, members)| members).collect()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct PlannedNode {
     /// Stable node id (the plan task id). Becomes the launched `AgentRun.node_id`.
@@ -1444,7 +1530,7 @@ pub(crate) fn build_completion_summary_prompt(task: &str, diff: &str) -> String 
     format!(
         "A coding agent finished the task below but did not file a structured report. From its TASK and the DIFF of what it changed, reconstruct a completion note. Return EXACTLY one JSON object and NO markdown:\n\
 {{\"summary\":\"1-2 sentence plain summary of what was done\",\"interfaces\":\"key files/types/functions it added or changed\",\"followups\":[{{\"title\":\"short imperative task\",\"why\":\"why it follows\",\"scope\":\"in\"}}]}}\n\
-Only include follow-ups clearly implied by the work (e.g. tests for new code, wiring a new-but-unused function, a TODO it left). If none are obvious, use an empty followups array. Use scope \"in\" for same-area work and \"out\" otherwise. Do not invent unrelated work.\n\n\
+Follow-ups are HARDENING findings: Rudder queues them and schedules them CLUMPED BY FILE once the current phase has merged, so several findings on the same area become one worker rather than one worker each. Name the concrete files a finding touches in its title or prompt (or pass a `files` array) - that is what decides which findings are grouped, and a finding with no identifiable file is done on its own. Only include follow-ups clearly implied by the work (e.g. tests for new code, wiring a new-but-unused function, a TODO it left). If none are obvious, use an empty followups array. Use scope \"in\" for same-area work and \"out\" otherwise. Do not invent unrelated work.\n\n\
 TASK:\n{task}\n\nDIFF:\n{diff}"
     )
 }

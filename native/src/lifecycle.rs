@@ -425,6 +425,14 @@ impl App {
         }) else {
             return;
         };
+        // PHASE BOUNDARY. Every launched node has merged and the queue is empty, so
+        // this is the moment hardening runs — as its own clumped phase, after the
+        // feature work it hardens has landed. Scheduling reopens the gate, so the
+        // final verification runs against the HARDENED result rather than the state
+        // before it.
+        if self.flush_hardening_into_plan(plan_index) > 0 {
+            return;
+        }
         let commands = verification_commands(&self.cwd);
         let cwd = self.cwd.clone();
         let tx = self.final_gate_tx.clone();
