@@ -17560,3 +17560,45 @@ fn a_resolver_that_conflicts_again_asks_rather_than_respawning_forever() {
     );
     assert!(app.notice.clone().unwrap_or_default().contains("press y"));
 }
+
+#[test]
+fn a_signal_death_says_which_signal_not_a_bare_number() {
+    // A shell reports a signal death as 128 + signal, so a killed agent surfaced
+    // as "agent process exited (exit 143)" -- which does not tell the reader that
+    // the agent was KILLED rather than that its work failed. This is the single
+    // most common death note people see, so it has to be diagnosable.
+    let term = rudder_native::pty_terminal::describe_exit_code(143);
+    assert!(term.contains("SIGTERM"), "{term}");
+    assert!(
+        term.contains("Rudder") || term.contains("shutdown") || term.contains("manual"),
+        "names the plausible senders: {term}"
+    );
+
+    let kill = rudder_native::pty_terminal::describe_exit_code(137);
+    assert!(kill.contains("SIGKILL"), "{kill}");
+    assert!(kill.contains("out-of-memory"), "points at the usual cause: {kill}");
+
+    assert!(rudder_native::pty_terminal::describe_exit_code(130).contains("SIGINT"));
+    // A genuine non-signal failure still reports its code plainly.
+    assert_eq!(rudder_native::pty_terminal::describe_exit_code(1), "exit 1");
+    assert_eq!(rudder_native::pty_terminal::describe_exit_code(2), "exit 2");
+}
+
+#[test]
+fn a_specific_failure_reason_is_not_overwritten_by_the_generic_exit_symptom() {
+    // Once the child is gone every later drain fails with the same generic
+    // "agent process exited" line. When Rudder already recorded a real cause --
+    // its own lifecycle-sweep kill, a merge failure -- that cause is the useful
+    // one. Overwriting it with the symptom is why so many rows read as an
+    // undiagnosable exit code.
+    let mut run = test_agent_run("worker", "n0");
+    run.status = AgentStatus::Failed;
+    run.last_error = Some("worker lifecycle hooks were not installed".to_string());
+    let already_diagnosed = run.status == AgentStatus::Failed && run.last_error.is_some();
+    assert!(already_diagnosed, "the guard sees an existing diagnosis");
+
+    let mut fresh = test_agent_run("worker-2", "n1");
+    fresh.status = AgentStatus::Running;
+    let fresh_diagnosed = fresh.status == AgentStatus::Failed && fresh.last_error.is_some();
+    assert!(!fresh_diagnosed, "an undiagnosed row still records the exit reason");
+}

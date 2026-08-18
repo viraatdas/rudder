@@ -438,7 +438,7 @@ impl TerminalPane {
                 if status.success() {
                     Some("exit 0".to_string())
                 } else {
-                    Some(format!("exit {code}"))
+                    Some(describe_exit_code(code))
                 }
             }
             _ => None,
@@ -969,6 +969,32 @@ impl Drop for TerminalPane {
         if let Some(handle) = self.reader_thread.take() {
             let _ = handle.join();
         }
+    }
+}
+
+/// A shell reports a signal death as 128 + signal number, so an agent killed by
+/// SIGTERM surfaces as the bare number 143 — which tells the reader nothing about
+/// what happened, and in particular does not say that the agent was KILLED rather
+/// than that its work failed. Name the signal so the death note is diagnosable.
+pub fn describe_exit_code(code: u32) -> String {
+    let signal = match code {
+        130 => Some("SIGINT"),
+        137 => Some("SIGKILL"),
+        139 => Some("SIGSEGV"),
+        143 => Some("SIGTERM"),
+        _ => None,
+    };
+    match signal {
+        // SIGKILL is overwhelmingly the OOM killer on a dev machine; SIGTERM is a
+        // deliberate stop, from Rudder's own teardown, a system shutdown/sleep, or
+        // a manual kill. Both mean the work was interrupted, not that it errored.
+        Some("SIGKILL") => "killed (SIGKILL) - usually the OS out-of-memory killer".to_string(),
+        Some("SIGTERM") => {
+            "terminated (SIGTERM) - stopped by Rudder, a system shutdown, or a manual kill"
+                .to_string()
+        }
+        Some(name) => format!("killed by {name}"),
+        None => format!("exit {code}"),
     }
 }
 

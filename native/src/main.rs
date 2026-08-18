@@ -30,6 +30,7 @@ use ratatui::{
     Frame, Terminal,
 };
 use rudder_native::pty_terminal::{
+    describe_exit_code,
     CellContents, PtyOutputWaker, StyledTerminalCell, TerminalCommand, TerminalCursor,
     TerminalPane, TerminalPaneOptions, TerminalSize,
 };
@@ -14516,6 +14517,18 @@ What to do\n\
                         } else {
                             run.status = AgentStatus::Failed;
                             run.completed_at = Some(Instant::now());
+                            // Record WHY. This branch used to set Failed and no
+                            // reason at all, so the row went red carrying only
+                            // whatever generic line a later drain failure left
+                            // behind — the most common death note in the app said
+                            // nothing about the death. A signal exit now names the
+                            // signal instead of surfacing a bare 143.
+                            if run.last_error.is_none() {
+                                run.last_error = Some(format!(
+                                    "agent process {}",
+                                    describe_exit_code(status.exit_code())
+                                ));
+                            }
                             run.needs_permission = false;
                             run.needs_user_input = false;
                             changed = true;
@@ -14571,9 +14584,20 @@ What to do\n\
                         }
                     }
                     Err(error) => {
+                        // A drain failure is a SYMPTOM: once the child is gone,
+                        // every later read/write fails with the same generic
+                        // "agent process exited" line. When we already recorded a
+                        // specific cause (the lifecycle sweep's own kill, a merge
+                        // failure), that cause is the useful one and must not be
+                        // overwritten by the symptom — losing it is why a row so
+                        // often reads as a bare, undiagnosable exit code.
+                        let already_diagnosed =
+                            run.status == AgentStatus::Failed && run.last_error.is_some();
                         run.status = AgentStatus::Failed;
                         run.completed_at = Some(Instant::now());
-                        run.last_error = Some(error.to_string());
+                        if !already_diagnosed {
+                            run.last_error = Some(error.to_string());
+                        }
                         run.needs_permission = false;
                         run.needs_user_input = false;
                         changed = true;
