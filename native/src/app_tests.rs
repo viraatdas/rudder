@@ -17846,3 +17846,74 @@ fn a_branch_switch_invalidates_the_cached_branch() {
     );
     clear_git_state_cache();
 }
+
+#[test]
+fn solo_hides_the_other_panes_and_toggles_back() {
+    let mut app = App::new();
+    assert!(!app.solo_pane, "the split is the default");
+
+    app.focus = FocusPane::Worker;
+    app.toggle_solo_pane();
+    assert!(app.solo_pane);
+    assert!(
+        app.notice.as_deref().unwrap_or_default().contains("⌥o"),
+        "the notice says how to get back: {:?}",
+        app.notice
+    );
+    // Solo never moves focus, so toggling twice returns you exactly where you were.
+    assert_eq!(app.focus, FocusPane::Worker);
+
+    app.toggle_solo_pane();
+    assert!(!app.solo_pane);
+    assert_eq!(app.focus, FocusPane::Worker);
+}
+
+#[test]
+fn solo_leaves_no_stale_rect_for_the_hidden_pane() {
+    // agents_area/worker_area are what mouse hit-testing and scroll routing read.
+    // A rect left behind for a pane that is no longer drawn would take clicks meant
+    // for the soloed pane.
+    let mut app = App::new();
+    app.solo_pane = true;
+    app.focus = FocusPane::Worker;
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).expect("terminal");
+    terminal
+        .draw(|frame| crate::render::render(frame, &mut app))
+        .expect("draw");
+    assert!(app.worker_area.is_some(), "the soloed pane owns a rect");
+    assert!(
+        app.agents_area.is_none(),
+        "the hidden pane owns none"
+    );
+    // The task line survives solo: it is where you type.
+    assert!(app.task_area.is_some());
+
+    app.focus = FocusPane::Agents;
+    terminal
+        .draw(|frame| crate::render::render(frame, &mut app))
+        .expect("draw");
+    assert!(app.agents_area.is_some());
+    assert!(app.worker_area.is_none());
+}
+
+#[test]
+fn alt_h_still_steps_agents_and_alt_o_is_the_solo_key() {
+    // Alt+h is the vim-grammar agent stepper (Alt+h/l are the horizontal moves that
+    // match Alt+j/k scrolling). Solo takes Alt+o instead — vim's `:only`.
+    let mut app = App::new();
+    app.agents = vec![
+        test_agent_run("a", "first"),
+        test_agent_run("b", "second"),
+    ];
+    app.focus = FocusPane::Agents;
+    app.selected_agent = 1;
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::ALT));
+    assert_eq!(app.selected_agent, 0, "Alt+h still steps agents");
+    assert!(!app.solo_pane, "and does not solo");
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::ALT));
+    assert!(app.solo_pane, "Alt+o solos");
+    assert_eq!(app.selected_agent, 0, "without moving the selection");
+}

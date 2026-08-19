@@ -171,6 +171,7 @@ const AGENT_PANE_HINTS: &[&str] = &[
     "j/k move",
     "⌥j/k scroll",
     "⌥h/l agents",
+    "⌥o solo pane",
     "Enter focus",
     "r rename",
     "v diff",
@@ -781,6 +782,9 @@ struct App {
     orch_follow_bottom: bool,
     agents_area: Option<Rect>,
     worker_area: Option<Rect>,
+    /// SOLO view: draw only the focused pane, full width. The task line stays --
+    /// hiding the place you type would strand you in a view you cannot act from.
+    solo_pane: bool,
     task_area: Option<Rect>,
     cloud_connected: bool,
     cloud_runtime: Option<String>,
@@ -1771,6 +1775,7 @@ impl App {
             orch_follow_bottom: true,
             agents_area: None,
             worker_area: None,
+            solo_pane: false,
             task_area: None,
             cloud_connected: cloud.connected,
             cloud_runtime: cloud.runtime,
@@ -2035,6 +2040,18 @@ impl App {
         self.diff_summary_cache
             .insert(id.to_string(), (now, value.clone()));
         value
+    }
+
+    /// Show only the focused pane, or restore the split. Solo never changes WHICH
+    /// pane is focused, so toggling twice returns you exactly where you were.
+    fn toggle_solo_pane(&mut self) {
+        self.solo_pane = !self.solo_pane;
+        self.notice = Some(if self.solo_pane {
+            "solo: showing this pane only · ⌥o restores the split".to_string()
+        } else {
+            "split restored".to_string()
+        });
+        self.dirty = true;
     }
 
     fn selected_is_main(&self) -> bool {
@@ -2348,6 +2365,19 @@ impl App {
             }
             KeyCode::Char('v') if alt_like => {
                 self.toggle_worker_view();
+                return false;
+            }
+            // Alt+o = vim's `:only` / Ctrl-w o: keep the focused pane, drop the
+            // rest. Alt+h is NOT free -- it is the vim-grammar agent stepper
+            // (Alt+h/l move left/right across agents, matching Alt+j/k scrolling).
+            KeyCode::Char('o') if alt_like => {
+                self.toggle_solo_pane();
+                return false;
+            }
+            // Terminals that swallow the Option modifier send the typographic
+            // character instead; Option+o is ø on a US layout.
+            KeyCode::Char('\u{00f8}') => {
+                self.toggle_solo_pane();
                 return false;
             }
             KeyCode::Char('\u{00a1}') => {
