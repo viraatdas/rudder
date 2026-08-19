@@ -1294,23 +1294,33 @@ pub(crate) fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         // Pinned planners (orchestrator + plan-mode front-end) run in the MAIN repo
         // and are rendered via push_orchestrator_row (no diff line), so a diff summary
         // there is both meaningless and never shown: skip it like main agents.
-        let keys: Vec<(String, PathBuf, bool)> = app
+        // Only rows that are actually DRAWN. Each summary costs two git subprocesses
+        // on a miss, and a row collapsed inside the done/closed/review drawer never
+        // shows one — so asking for every agent made startup O(all rows ever) in
+        // subprocess spawns. Measured at 200 seeded rows: ~2 git processes per row
+        // before the first frame.
+        let drawn: std::collections::HashSet<usize> =
+            sidebar_agent_indices(&app.agents).into_iter().collect();
+        let keys: Vec<(String, PathBuf, bool, bool)> = app
             .agents
             .iter()
-            .map(|a| {
+            .enumerate()
+            .map(|(index, a)| {
                 (
                     a.id.clone(),
                     a.cwd.clone(),
-                    a.is_main() || a.is_pinned_planner(),
+                    a.is_main() || a.is_pinned_planner() || !drawn.contains(&index),
+                    // Only a row whose workspace can still change needs re-asking.
+                    matches!(a.status, AgentStatus::Running | AgentStatus::Paused),
                 )
             })
             .collect();
         keys.iter()
-            .map(|(id, cwd, skip)| {
+            .map(|(id, cwd, skip, live)| {
                 if *skip {
                     None
                 } else {
-                    app.cached_diff_summary(id, cwd)
+                    app.cached_diff_summary(id, cwd, *live)
                 }
             })
             .collect()

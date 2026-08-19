@@ -2014,11 +2014,20 @@ impl App {
             })
     }
 
-    fn cached_diff_summary(&mut self, id: &str, cwd: &Path) -> Option<String> {
+    /// The "+12 -3" summary for one row. Costs TWO git subprocesses on a miss, and
+    /// the sidebar asks for every row on every render, so the miss policy is what
+    /// decides whether a long session stays usable.
+    ///
+    /// `live` means the row's workspace can still change. A settled row (merged,
+    /// failed, stopped, done) has a diff that is FINAL, so its first answer is kept
+    /// for the rest of the session; only live rows re-ask on the TTL. Before this,
+    /// every row re-spawned two git processes every 1.5s: measured at 200 rows, boot
+    /// took 61s and keystrokes 61ms, against 0.4s and 2.3ms on an empty repo.
+    fn cached_diff_summary(&mut self, id: &str, cwd: &Path, live: bool) -> Option<String> {
         const TTL: Duration = Duration::from_millis(1500);
         let now = Instant::now();
         if let Some((stamp, value)) = self.diff_summary_cache.get(id) {
-            if now.duration_since(*stamp) < TTL {
+            if !live || now.duration_since(*stamp) < TTL {
                 return value.clone();
             }
         }

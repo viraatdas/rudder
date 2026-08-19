@@ -17785,3 +17785,64 @@ fn the_backlog_survives_a_restart() {
     app.persist_hardening();
     assert!(load_hardening_backlog(&repo).is_empty());
 }
+
+#[test]
+fn git_state_is_recomputed_only_when_git_writes() {
+    // A TTL cache re-runs its subprocess on a clock; git state in a repo nobody is
+    // committing to is unchanged for hours, so that work is wasted. Stamp the files
+    // git itself writes and recompute only when one moves.
+    let repo = unique_test_repo("git-state-cache");
+    clear_git_state_cache();
+
+    // Not a repo: the answer is false, and asking again must not re-spawn.
+    assert!(!is_git_repo(&repo));
+    assert!(!is_git_repo(&repo));
+
+    std::process::Command::new("git")
+        .args(["init", "-q", "."])
+        .current_dir(&repo)
+        .status()
+        .expect("git init");
+
+    // The stamps moved (.git now exists), so the stale `false` must not survive.
+    assert!(
+        is_git_repo(&repo),
+        "creating the repo invalidates the cached answer"
+    );
+
+    // And a repeat call is served from cache: same answer, no new stamps.
+    assert!(is_git_repo(&repo));
+    clear_git_state_cache();
+}
+
+#[test]
+fn a_branch_switch_invalidates_the_cached_branch() {
+    let repo = unique_test_repo("git-branch-cache");
+    clear_git_state_cache();
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .status()
+            .expect("git");
+    };
+    git(&["init", "-q", "."]);
+    git(&["config", "user.email", "t@example.com"]);
+    git(&["config", "user.name", "T"]);
+    std::fs::write(repo.join("a.txt"), "hi").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "base"]);
+
+    let first = current_branch_at(&repo);
+    assert!(first.is_some(), "a branch is reported");
+    // Cached: same answer without git having moved.
+    assert_eq!(current_branch_at(&repo), first);
+
+    git(&["checkout", "-q", "-b", "feature-branch"]);
+    assert_eq!(
+        current_branch_at(&repo).as_deref(),
+        Some("feature-branch"),
+        "switching branches rewrites .git/HEAD, which invalidates the cache"
+    );
+    clear_git_state_cache();
+}

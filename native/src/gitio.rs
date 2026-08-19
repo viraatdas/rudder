@@ -3,7 +3,84 @@
 use super::*;
 use std::cell::RefCell;
 
+// ---------------------------------------------------------------------------
+// Git state cache — invalidated by WATCHED FILE MTIMES, not by a timer.
+//
+// A TTL cache re-runs its subprocess every N seconds whether or not anything
+// changed; git state in a repo nobody is committing to is unchanged for hours,
+// so that work is almost entirely wasted. Instead, stamp the files git itself
+// writes when the answer would change and recompute only when a stamp moves:
+//
+//   .git/HEAD   — branch switches, detached HEAD
+//   .git/config — remote URL changes
+//   .git/refs   — new commits move a loose ref inside this directory
+//
+// A stat is microseconds against a subprocess's ~10-25ms, so the steady state
+// costs effectively nothing. (This mirrors Claude Code's GitFileWatcher; its
+// Node `watchFile` is itself an interval stat-poller, so stamping is the same
+// mechanism without pulling in a filesystem-notification dependency.)
+// ---------------------------------------------------------------------------
+
+type GitStamps = [Option<std::time::SystemTime>; 3];
+
+fn git_state_stamps(repo_root: &Path) -> GitStamps {
+    let git_dir = repo_root.join(".git");
+    let stamp = |path: PathBuf| {
+        std::fs::metadata(path)
+            .ok()
+            .and_then(|meta| meta.modified().ok())
+    };
+    [
+        stamp(git_dir.join("HEAD")),
+        stamp(git_dir.join("config")),
+        stamp(git_dir.join("refs")),
+    ]
+}
+
+#[allow(clippy::type_complexity)]
+fn git_state_cache() -> &'static std::sync::Mutex<HashMap<(PathBuf, &'static str), (GitStamps, Option<String>)>>
+{
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<(PathBuf, &'static str), (GitStamps, Option<String>)>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Cached git value for `repo_root`, recomputed only when a watched file moved.
+fn cached_git_state(
+    repo_root: &Path,
+    key: &'static str,
+    compute: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    let stamps = git_state_stamps(repo_root);
+    let cache_key = (repo_root.to_path_buf(), key);
+    if let Ok(cache) = git_state_cache().lock() {
+        if let Some((seen, value)) = cache.get(&cache_key) {
+            if *seen == stamps {
+                return value.clone();
+            }
+        }
+    }
+    let value = compute();
+    if let Ok(mut cache) = git_state_cache().lock() {
+        cache.insert(cache_key, (stamps, value.clone()));
+    }
+    value
+}
+
+/// Drop every cached git answer. For tests, and for any path that knowingly
+/// rewrites git state behind the stamps.
+pub(crate) fn clear_git_state_cache() {
+    if let Ok(mut cache) = git_state_cache().lock() {
+        cache.clear();
+    }
+}
+
 pub(crate) fn current_branch_at(cwd: &Path) -> Option<String> {
+    cached_git_state(cwd, "branch", || current_branch_uncached(cwd))
+}
+
+fn current_branch_uncached(cwd: &Path) -> Option<String> {
     let output = Command::new("git")
         .args(["branch", "--show-current"])
         .current_dir(cwd)
@@ -1608,9 +1685,19 @@ pub(crate) fn main_worktree_from_porcelain(output: &str) -> Option<PathBuf> {
 }
 
 pub(crate) fn is_git_repo(cwd: &Path) -> bool {
-    git_output(cwd, ["rev-parse", "--is-inside-work-tree"])
-        .map(|value| value.trim() == "true")
-        .unwrap_or(false)
+    // Whether a path is inside a work tree changes only when a repo is created or
+    // removed under it, yet this was a subprocess on EVERY call — 68 of them in a
+    // single traced session. Same stamp-keyed cache as the other git answers.
+    cached_git_state(cwd, "is-work-tree", || {
+        Some(
+            git_output(cwd, ["rev-parse", "--is-inside-work-tree"])
+                .map(|value| value.trim() == "true")
+                .unwrap_or(false)
+                .to_string(),
+        )
+    })
+    .as_deref()
+        == Some("true")
 }
 
 pub(crate) fn git_output<const N: usize>(cwd: &Path, args: [&str; N]) -> Result<String> {
