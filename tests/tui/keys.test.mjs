@@ -65,15 +65,22 @@ test("j/k move the selection up and down the agents list", { timeout: 60_000 }, 
   await waitSelected(session, "beta worker");
 });
 
-test("Alt+h/l step across agents — vim-grammar aliases for the [/] stepper", { timeout: 60_000 }, async (t) => {
+test("Alt+p/l step across agents; Alt+h hides instead of stepping", { timeout: 60_000 }, async (t) => {
   const { session } = await twoWorkerDashboard(t, "rudder-tui-hlstep-");
-  // With Alt+j/k scrolling the pane vertically, Alt+h/l are the matching
-  // horizontal moves. A PTY wraps at the pane width, so there is no
-  // horizontal scrollback these could have meant instead.
+  // Alt+h used to step back. It now hides the panes, and Alt+[ cannot cover for
+  // it — ESC-[ is the CSI introducer, so terminals read that chord as the start
+  // of an escape sequence. Alt+p is the backward step that actually arrives.
   await waitSelected(session, "beta worker");
-  await session.press("Alt+h");
+  await session.press("Alt+p");
   await waitSelected(session, "alpha worker");
   await session.press("Alt+l");
+  await waitSelected(session, "beta worker");
+
+  // And Alt+h moves nothing: it toggles the hide.
+  await session.press("Alt+h");
+  await session.waitForText("showing this pane only", { timeout: 10_000 });
+  await session.press("Alt+h");
+  await session.waitForText("split restored", { timeout: 10_000 });
   await waitSelected(session, "beta worker");
 });
 

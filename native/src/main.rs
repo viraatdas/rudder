@@ -170,8 +170,8 @@ pub(crate) const SPINNER_FRAMES: [&str; 10] = [
 const AGENT_PANE_HINTS: &[&str] = &[
     "j/k move",
     "⌥j/k scroll",
-    "⌥h/l agents",
-    "⌥o solo pane",
+    "⌥h hide panes",
+    "⌥p/l agents",
     "Enter focus",
     "r rename",
     "v diff",
@@ -2105,7 +2105,7 @@ impl App {
     fn toggle_solo_pane(&mut self) {
         self.solo_pane = !self.solo_pane;
         self.notice = Some(if self.solo_pane {
-            "solo: showing this pane only · ⌥o restores the split".to_string()
+            "showing this pane only · ⌥h restores the split".to_string()
         } else {
             "split restored".to_string()
         });
@@ -2425,16 +2425,22 @@ impl App {
                 self.toggle_worker_view();
                 return false;
             }
-            // Alt+o = vim's `:only` / Ctrl-w o: keep the focused pane, drop the
-            // rest. Alt+h is NOT free -- it is the vim-grammar agent stepper
-            // (Alt+h/l move left/right across agents, matching Alt+j/k scrolling).
-            KeyCode::Char('o') if alt_like => {
+            // Alt+h HIDES the other panes. It previously stepped to the previous
+            // agent, but that was only an alias: the stepper's real binding is
+            // Alt+[ / Alt+], which still works. Hiding is the more valuable thing
+            // to reach with one hand on a key you can find by feel.
+            // Works from ANY pane, the task input included. Task is the focus you
+            // start in and the one you are in while typing, so a guard excluding it
+            // would block the key exactly when it is wanted. A real ALT modifier is
+            // unambiguous here — it cannot be confused with typing the letter.
+            KeyCode::Char('h') if alt_like => {
                 self.toggle_solo_pane();
                 return false;
             }
             // Terminals that swallow the Option modifier send the typographic
-            // character instead; Option+o is ø on a US layout.
-            KeyCode::Char('\u{00f8}') => {
+            // character instead; Option+h is ˙ on a US layout. That one IS just a
+            // character, so it must not hijack a task the user is composing.
+            KeyCode::Char('\u{02d9}') if self.focus != FocusPane::Task => {
                 self.toggle_solo_pane();
                 return false;
             }
@@ -2474,15 +2480,15 @@ impl App {
                 self.select_next_agent();
                 return false;
             }
-            // Vim-grammar aliases for the stepper: with Alt+j/k scrolling the
-            // pane vertically, Alt+h/l are the matching horizontal moves —
-            // left/right across agents. A PTY wraps at the pane width, so
-            // there is no horizontal scrollback for these to mean instead.
-            // Not while composing a task, same rule as every Option+letter.
-            KeyCode::Char('h') if stepper_like && self.focus != FocusPane::Task => {
+            // Alt+p steps BACK. Alt+h used to, but now hides the panes, and Alt+[
+            // cannot cover for it: ESC-[ is the CSI introducer, so a terminal parses
+            // that chord as the start of an escape sequence rather than Alt+[. Without
+            // this there would be no working backward step from the worker pane.
+            KeyCode::Char('p') if stepper_like && self.focus != FocusPane::Task => {
                 self.select_previous_agent();
                 return false;
             }
+            // Alt+l steps forward through agents.
             KeyCode::Char('l') if stepper_like && self.focus != FocusPane::Task => {
                 self.select_next_agent();
                 return false;

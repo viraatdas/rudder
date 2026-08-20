@@ -17856,7 +17856,7 @@ fn solo_hides_the_other_panes_and_toggles_back() {
     app.toggle_solo_pane();
     assert!(app.solo_pane);
     assert!(
-        app.notice.as_deref().unwrap_or_default().contains("⌥o"),
+        app.notice.as_deref().unwrap_or_default().contains("⌥h"),
         "the notice says how to get back: {:?}",
         app.notice
     );
@@ -17898,9 +17898,9 @@ fn solo_leaves_no_stale_rect_for_the_hidden_pane() {
 }
 
 #[test]
-fn alt_h_still_steps_agents_and_alt_o_is_the_solo_key() {
-    // Alt+h is the vim-grammar agent stepper (Alt+h/l are the horizontal moves that
-    // match Alt+j/k scrolling). Solo takes Alt+o instead — vim's `:only`.
+fn alt_h_hides_the_panes_and_the_stepper_keeps_its_real_binding() {
+    // Alt+h used to be an ALIAS for the agent stepper; the real binding is
+    // Alt+[ / Alt+], which is why spending the alias on hiding costs nothing.
     let mut app = App::new();
     app.agents = vec![
         test_agent_run("a", "first"),
@@ -17910,12 +17910,18 @@ fn alt_h_still_steps_agents_and_alt_o_is_the_solo_key() {
     app.selected_agent = 1;
 
     app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::ALT));
-    assert_eq!(app.selected_agent, 0, "Alt+h still steps agents");
-    assert!(!app.solo_pane, "and does not solo");
+    assert!(app.solo_pane, "Alt+h hides the other panes");
+    assert_eq!(app.selected_agent, 1, "and does not move the selection");
 
-    app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::ALT));
-    assert!(app.solo_pane, "Alt+o solos");
-    assert_eq!(app.selected_agent, 0, "without moving the selection");
+    app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::ALT));
+    assert!(!app.solo_pane, "Alt+h again restores the split");
+
+    // The stepper still works on its real binding, and on Alt+l.
+    app.handle_key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::ALT));
+    assert_eq!(app.selected_agent, 0, "Alt+[ steps back");
+    app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::ALT));
+    assert_eq!(app.selected_agent, 1, "Alt+l steps forward");
+    assert!(!app.solo_pane, "stepping never toggles the hide");
 }
 
 #[test]
