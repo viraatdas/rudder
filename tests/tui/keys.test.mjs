@@ -175,3 +175,4 @@ test("q quits the dashboard (double-press with live workers)", { timeout: 60_000
   await session.press("q");
   await session.waitForExit({ timeout: 20_000 });
 });
+

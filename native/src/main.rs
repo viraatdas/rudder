@@ -2480,10 +2480,15 @@ impl App {
                 self.select_next_agent();
                 return false;
             }
-            // Alt+p steps BACK. Alt+h used to, but now hides the panes, and Alt+[
-            // cannot cover for it: ESC-[ is the CSI introducer, so a terminal parses
-            // that chord as the start of an escape sequence rather than Alt+[. Without
-            // this there would be no working backward step from the worker pane.
+            // Alt+p steps BACK. Alt+h used to, before it became the hide key.
+            //
+            // Alt+[ does not reliably cover for it: ESC-[ is the CSI introducer, so a
+            // terminal WITHOUT the kitty keyboard protocol reads that chord as the
+            // start of an escape sequence and it never arrives (measured: neither
+            // Alt+[ nor Alt+] reaches the app in a plain PTY; ESC-] is likewise the
+            // OSC introducer). Rudder does request the protocol, so both work in a
+            // terminal that supports it — but the backward step should not depend on
+            // the terminal, so Alt+p is the one that always arrives.
             KeyCode::Char('p') if stepper_like && self.focus != FocusPane::Task => {
                 self.select_previous_agent();
                 return false;
