@@ -17917,3 +17917,65 @@ fn alt_h_still_steps_agents_and_alt_o_is_the_solo_key() {
     assert!(app.solo_pane, "Alt+o solos");
     assert_eq!(app.selected_agent, 0, "without moving the selection");
 }
+
+#[test]
+fn a_diff_summary_miss_never_blocks_the_frame() {
+    // `sample` of a live session found 984 of 1030 render frames parked in
+    // Command::output waiting for jj to answer this. Render runs on the main
+    // thread and every keystroke draws a frame, so that wait IS the typing lag.
+    // A miss must hand back whatever we have and compute off-thread.
+    let repo = unique_test_repo("diff-summary-async");
+    let mut app = App::new();
+    app.cwd = repo.clone();
+
+    let started = std::time::Instant::now();
+    let first = app.cached_diff_summary("row-1", &repo, true);
+    let elapsed = started.elapsed();
+    assert!(first.is_none(), "nothing cached yet, so nothing to show");
+    assert!(
+        elapsed < Duration::from_millis(50),
+        "the miss returned immediately instead of waiting on a subprocess: {elapsed:?}"
+    );
+    assert!(
+        app.diff_summary_inflight.contains("row-1"),
+        "the real work was handed to a background thread"
+    );
+
+    // A second ask while it is still running must NOT spawn another subprocess.
+    let _ = app.cached_diff_summary("row-1", &repo, true);
+    assert_eq!(app.diff_summary_inflight.len(), 1, "one row, one computation");
+
+    // Once the answer lands, draining installs it and marks the screen dirty.
+    for _ in 0..200 {
+        app.drain_diff_summaries();
+        if !app.diff_summary_inflight.contains("row-1") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !app.diff_summary_inflight.contains("row-1"),
+        "the background result was absorbed"
+    );
+    assert!(app.diff_summary_cache.contains_key("row-1"));
+}
+
+#[test]
+fn a_settled_row_is_answered_from_cache_without_recomputing() {
+    // A merged/failed row's diff is final. Re-asking spends two subprocesses for an
+    // answer that cannot have changed.
+    let repo = unique_test_repo("diff-summary-settled");
+    let mut app = App::new();
+    app.cwd = repo.clone();
+    app.diff_summary_cache.insert(
+        "settled".to_string(),
+        (Instant::now() - Duration::from_secs(3600), Some("+3 -1".to_string())),
+    );
+
+    let value = app.cached_diff_summary("settled", &repo, false);
+    assert_eq!(value.as_deref(), Some("+3 -1"), "an hour-old answer still serves");
+    assert!(
+        app.diff_summary_inflight.is_empty(),
+        "and nothing was recomputed for it"
+    );
+}

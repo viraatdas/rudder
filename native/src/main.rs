@@ -861,6 +861,12 @@ struct App {
     /// keeps the name and clears this, so editing-in-place still works.
     rename_prefilled: bool,
     diff_summary_cache: HashMap<String, (Instant, Option<String>)>,
+    /// Diff summaries still being computed off-thread, so N frames asking for the
+    /// same row spawn ONE subprocess rather than one each.
+    diff_summary_inflight: HashSet<String>,
+    /// Results from those background computations, drained on the next tick.
+    diff_summary_rx: Option<mpsc::Receiver<(String, Option<String>)>>,
+    diff_summary_tx: Option<mpsc::Sender<(String, Option<String>)>>,
     dirty: bool,
     last_tab_emoji: Option<char>,
     /// True when the user pressed Ctrl+C once but there are running agents we
@@ -1814,6 +1820,9 @@ impl App {
             rename_cursor: 0,
             rename_prefilled: false,
             diff_summary_cache: HashMap::new(),
+            diff_summary_inflight: HashSet::new(),
+            diff_summary_rx: None,
+            diff_summary_tx: None,
             dirty: true,
             last_tab_emoji: None,
             session_started_iso,
@@ -2036,10 +2045,59 @@ impl App {
                 return value.clone();
             }
         }
-        let value = diff_short_summary_at(cwd);
-        self.diff_summary_cache
-            .insert(id.to_string(), (now, value.clone()));
-        value
+        // MISS: compute off-thread and show the previous answer (or nothing) until it
+        // lands. This runs inside render, on the main thread, once per row — a
+        // `sample` of a live session found 984 of 1030 render frames parked in
+        // Command::output waiting for jj, which is felt directly as typing lag,
+        // because every keystroke draws a frame.
+        let stale = self
+            .diff_summary_cache
+            .get(id)
+            .map(|(_, value)| value.clone())
+            .unwrap_or(None);
+        if self.diff_summary_inflight.contains(id) {
+            return stale;
+        }
+        if self.diff_summary_tx.is_none() {
+            let (tx, rx) = mpsc::channel();
+            self.diff_summary_tx = Some(tx);
+            self.diff_summary_rx = Some(rx);
+        }
+        let Some(tx) = self.diff_summary_tx.clone() else {
+            return stale;
+        };
+        self.diff_summary_inflight.insert(id.to_string());
+        let key = id.to_string();
+        let path = cwd.to_path_buf();
+        std::thread::Builder::new()
+            .name("rudder-diff-summary".to_string())
+            .spawn(move || {
+                let value = diff_short_summary_at(&path);
+                let _ = tx.send((key, value));
+            })
+            .ok();
+        stale
+    }
+
+    /// Absorb finished background diff summaries. Called on the poll tick; a row
+    /// whose answer arrived redraws with it on the next frame.
+    fn drain_diff_summaries(&mut self) {
+        let Some(rx) = self.diff_summary_rx.as_ref() else {
+            return;
+        };
+        let mut received: Vec<(String, Option<String>)> = Vec::new();
+        while let Ok(item) = rx.try_recv() {
+            received.push(item);
+        }
+        if received.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        for (id, value) in received {
+            self.diff_summary_inflight.remove(&id);
+            self.diff_summary_cache.insert(id, (now, value));
+        }
+        self.dirty = true;
     }
 
     /// Show only the focused pane, or restore the split. Solo never changes WHICH
@@ -14524,6 +14582,7 @@ What to do\n\
         // loop (11-33ms tick) is never stalled by the readdir/fs work.
         if self.last_steer_poll.elapsed() >= Duration::from_secs(1) {
             self.last_steer_poll = Instant::now();
+            self.drain_diff_summaries();
             self.poll_steer_inbox();
             self.poll_handoff_inbox();
             self.reconcile_rows();
