@@ -8332,7 +8332,7 @@ fn main_agent_blocks_merge_but_renames() {
 }
 
 #[test]
-fn done_worker_card_shows_objective_and_summary() {
+fn drawer_result_lines_show_objective_and_summary() {
     let mut run = test_agent_run(
         "done-1",
         "Objective: ship the widget\nDone when: tests pass",
@@ -8371,7 +8371,7 @@ fn done_worker_card_shows_objective_and_summary() {
 }
 
 #[test]
-fn done_worker_card_is_active_only_for_finished_workers() {
+fn only_finished_workers_are_conversable_after_their_pty_exits() {
     let mut app = App::new();
     let mut done = test_agent_run("w-done", "task");
     done.status = AgentStatus::Done;
@@ -8386,23 +8386,23 @@ fn done_worker_card_is_active_only_for_finished_workers() {
 
     app.selected_agent = 0;
     assert!(
-        app.selected_done_worker_card_active(),
-        "done worker gets the card"
+        app.selected_finished_worker_conversable(),
+        "a finished worker stays conversable"
     );
     app.selected_agent = 1;
     assert!(
-        !app.selected_done_worker_card_active(),
-        "running worker keeps its PTY view"
+        !app.selected_finished_worker_conversable(),
+        "a running worker types straight into its live PTY"
     );
     app.selected_agent = 2;
     assert!(
-        !app.selected_done_worker_card_active(),
+        !app.selected_finished_worker_conversable(),
         "the orchestrator has its own view"
     );
     app.selected_agent = 0;
     app.worker_view = WorkerView::Diff;
     assert!(
-        !app.selected_done_worker_card_active(),
+        !app.selected_finished_worker_conversable(),
         "diff view is never hijacked"
     );
 }
@@ -17898,7 +17898,7 @@ fn solo_leaves_no_stale_rect_for_the_hidden_pane() {
 }
 
 #[test]
-fn alt_h_hides_the_panes_and_the_stepper_keeps_its_real_binding() {
+fn alt_h_hides_the_panes_and_stepping_is_brackets_only() {
     // Alt+h used to be an ALIAS for the agent stepper; the real binding is
     // Alt+[ / Alt+], which is why spending the alias on hiding costs nothing.
     let mut app = App::new();
@@ -17916,12 +17916,16 @@ fn alt_h_hides_the_panes_and_the_stepper_keeps_its_real_binding() {
     app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::ALT));
     assert!(!app.solo_pane, "Alt+h again restores the split");
 
-    // The stepper still works on its real binding, and on Alt+l.
+    // Stepping is Alt+[ / Alt+] only — the letter aliases are gone.
     app.handle_key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::ALT));
     assert_eq!(app.selected_agent, 0, "Alt+[ steps back");
-    app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::ALT));
-    assert_eq!(app.selected_agent, 1, "Alt+l steps forward");
+    app.handle_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::ALT));
+    assert_eq!(app.selected_agent, 1, "Alt+] steps forward");
     assert!(!app.solo_pane, "stepping never toggles the hide");
+
+    // Alt+l no longer steps: it is free again.
+    app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::ALT));
+    assert_eq!(app.selected_agent, 1, "Alt+l is no longer a stepper alias");
 }
 
 #[test]

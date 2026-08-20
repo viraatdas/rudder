@@ -65,18 +65,13 @@ test("j/k move the selection up and down the agents list", { timeout: 60_000 }, 
   await waitSelected(session, "beta worker");
 });
 
-test("Alt+p/l step across agents; Alt+h hides instead of stepping", { timeout: 60_000 }, async (t) => {
+test("Alt+h hides the panes and never moves the selection", { timeout: 60_000 }, async (t) => {
   const { session } = await twoWorkerDashboard(t, "rudder-tui-hlstep-");
-  // Alt+h used to step back. It now hides the panes, and Alt+[ cannot cover for
-  // it — ESC-[ is the CSI introducer, so terminals read that chord as the start
-  // of an escape sequence. Alt+p is the backward step that actually arrives.
+  // Stepping between agents is Alt+[ / Alt+] only. Those need the kitty keyboard
+  // protocol to arrive (ESC-[ is the CSI introducer), which this harness does not
+  // negotiate — so the steppers are asserted in the unit tests, and what matters
+  // on a real screen is that Alt+h hides without disturbing the selection.
   await waitSelected(session, "beta worker");
-  await session.press("Alt+p");
-  await waitSelected(session, "alpha worker");
-  await session.press("Alt+l");
-  await waitSelected(session, "beta worker");
-
-  // And Alt+h moves nothing: it toggles the hide.
   await session.press("Alt+h");
   await session.waitForText("showing this pane only", { timeout: 10_000 });
   await session.press("Alt+h");

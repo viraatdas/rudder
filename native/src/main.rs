@@ -171,7 +171,7 @@ const AGENT_PANE_HINTS: &[&str] = &[
     "j/k move",
     "⌥j/k scroll",
     "⌥h hide panes",
-    "⌥p/l agents",
+    "⌥[/] agents",
     "Enter focus",
     "r rename",
     "v diff",
@@ -2480,24 +2480,11 @@ impl App {
                 self.select_next_agent();
                 return false;
             }
-            // Alt+p steps BACK. Alt+h used to, before it became the hide key.
-            //
-            // Alt+[ does not reliably cover for it: ESC-[ is the CSI introducer, so a
-            // terminal WITHOUT the kitty keyboard protocol reads that chord as the
-            // start of an escape sequence and it never arrives (measured: neither
-            // Alt+[ nor Alt+] reaches the app in a plain PTY; ESC-] is likewise the
-            // OSC introducer). Rudder does request the protocol, so both work in a
-            // terminal that supports it — but the backward step should not depend on
-            // the terminal, so Alt+p is the one that always arrives.
-            KeyCode::Char('p') if stepper_like && self.focus != FocusPane::Task => {
-                self.select_previous_agent();
-                return false;
-            }
-            // Alt+l steps forward through agents.
-            KeyCode::Char('l') if stepper_like && self.focus != FocusPane::Task => {
-                self.select_next_agent();
-                return false;
-            }
+            // Stepping between agents is Alt+[ / Alt+] only; the letter aliases are
+            // gone. Those chords need the kitty keyboard protocol to arrive at all
+            // (ESC-[ is the CSI introducer and ESC-] the OSC introducer, so a plain
+            // PTY reads them as the start of an escape sequence). Rudder requests the
+            // protocol, so they work in a terminal that honours it.
             // Terminals that swallow the modifier send what Option+[ / Option+]
             // TYPE on a US layout instead. Not honored while composing a task,
             // where a curly quote is far more likely to be text than a shortcut.
@@ -2867,7 +2854,7 @@ impl App {
                 // A FINISHED worker whose PTY is gone (e.g. after a restart) stays
                 // conversable: keys type into the run's draft, and Enter resumes the
                 // same session with the new instruction via the regoal path.
-                if self.selected_done_worker_card_active() {
+                if self.selected_finished_worker_conversable() {
                     if let Some(prompt) = self.capture_selected_worker_key(key, true) {
                         let index = self.selected_agent;
                         self.regoal_agent_at(index, &prompt);
@@ -4073,7 +4060,7 @@ impl App {
                         None => {
                             // Finished worker without a PTY: paste lands in the
                             // resume draft (Enter sends it via the regoal path).
-                            if self.selected_done_worker_card_active() {
+                            if self.selected_finished_worker_conversable() {
                                 let prompts = self.capture_selected_worker_paste(&text, true);
                                 let joined = prompts.join("\n");
                                 if !joined.trim().is_empty() {
@@ -4253,7 +4240,12 @@ impl App {
     /// merged / stopped / failed worker (not main, not the orchestrator), so the
     /// worker pane renders objective + what-it-did above the conversation, and the
     /// session stays conversable.
-    pub(crate) fn selected_done_worker_card_active(&self) -> bool {
+    /// A finished worker row that stays CONVERSABLE: its PTY may be gone, so keys
+    /// type into a resume draft and Enter re-goals the same session. This used to
+    /// also gate a two-panel summary card in the worker pane; the card is gone (it
+    /// restated the transcript and cost half the pane) but talking to a finished
+    /// agent is still worth having.
+    pub(crate) fn selected_finished_worker_conversable(&self) -> bool {
         if self.worker_view != WorkerView::Terminal {
             return false;
         }
@@ -4311,9 +4303,6 @@ impl App {
                 self.task_selection = None;
                 let worker_inner = if self.selected_interactive_orchestrator_active() {
                     let (_, term_area) = interactive_orchestrator_areas(worker_area);
-                    block_inner(term_area)
-                } else if self.selected_done_worker_card_active() {
-                    let (_, term_area) = done_card_areas(worker_area);
                     block_inner(term_area)
                 } else {
                     block_inner(worker_area)
@@ -4397,22 +4386,6 @@ impl App {
             return false;
         }
 
-        // Finished-worker card view: the card is static text (no selection mapping
-        // to PTY rows), so mouse work targets only the conversation sub-pane.
-        if self.selected_done_worker_card_active() {
-            let (_, term_area) = done_card_areas(worker_area);
-            if rect_contains(term_area, mouse.column, mouse.row) {
-                let term_inner = block_inner(term_area);
-                if self.handle_worker_selection_mouse(mouse, term_inner) {
-                    return true;
-                }
-                if self.write_mouse_to_selected_worker(mouse, term_inner) {
-                    return true;
-                }
-            }
-            return false;
-        }
-
         if self.handle_worker_selection_mouse(mouse, inner) {
             return true;
         }
@@ -4475,9 +4448,6 @@ impl App {
                     self.scroll_plan_review(mouse, inner)
                 } else if self.selected_interactive_orchestrator_active() {
                     self.scroll_interactive_orchestrator(mouse, area)
-                } else if self.selected_done_worker_card_active() {
-                    let (_, term_area) = done_card_areas(area);
-                    self.scroll_selected_worker_or_forward(mouse, block_inner(term_area))
                 } else if self.selected_headless_orchestrator_rendered_view_active() {
                     self.scroll_orchestrator_dag(mouse, inner)
                 } else if self.worker_view == WorkerView::Diff {
@@ -4518,9 +4488,6 @@ impl App {
                 self.scroll_plan_review(mouse, inner)
             } else if self.selected_interactive_orchestrator_active() {
                 self.scroll_interactive_orchestrator(mouse, area)
-            } else if self.selected_done_worker_card_active() {
-                let (_, term_area) = done_card_areas(area);
-                self.scroll_selected_worker_or_forward(mouse, block_inner(term_area))
             } else if self.selected_headless_orchestrator_rendered_view_active() {
                 self.scroll_orchestrator_dag(mouse, inner)
             } else if self.worker_view == WorkerView::Diff {

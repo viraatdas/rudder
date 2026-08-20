@@ -3150,85 +3150,6 @@ pub(crate) fn done_worker_card_lines(run: &AgentRun, focused: bool) -> Vec<Line<
 /// the card on top (objective + what it did), the conversation below. The session
 /// stays conversable — typing below resumes it and the card refreshes when the
 /// resumed turn completes.
-pub(crate) fn render_done_worker_card(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
-    let focused = app.focus == FocusPane::Worker;
-    let (card_area, term_area) = done_card_areas(area);
-
-    let card_lines = app
-        .agents
-        .get(app.selected_agent)
-        .map(|run| done_worker_card_lines(run, focused))
-        .unwrap_or_default();
-    frame.render_widget(
-        Paragraph::new(card_lines)
-            .style(app_style())
-            .block(pane_block("result", focused, app.nav_mode))
-            .wrap(Wrap { trim: false }),
-        card_area,
-    );
-
-    let term_inner = block_inner(term_area);
-    let has_terminal = app
-        .agents
-        .get(app.selected_agent)
-        .is_some_and(|run| run.terminal.is_some());
-    if !has_terminal {
-        // PTY gone (restart): show the resume draft. Enter re-goals the same
-        // session with the typed instruction.
-        let draft = app
-            .agents
-            .get(app.selected_agent)
-            .map(|run| run.worker_input_draft.clone())
-            .unwrap_or_default();
-        let body = vec![
-            Line::from(""),
-            Line::from(Span::styled(
-                "Session paused. Type a new instruction and press Enter to continue it.",
-                muted_style(focused),
-            )),
-            Line::from(""),
-            Line::from(vec![
-                Span::styled("> ", muted_style(focused)),
-                Span::styled(draft, pane_text_style(focused)),
-            ]),
-        ];
-        frame.render_widget(
-            Paragraph::new(body)
-                .style(app_style())
-                .block(pane_block("continue · type + Enter", focused, app.nav_mode))
-                .wrap(Wrap { trim: false }),
-            term_area,
-        );
-        return;
-    }
-    if let Ok(size) = TerminalSize::new(term_inner.height.max(1), term_inner.width.max(1)) {
-        if let Some(run) = app.agents.get_mut(app.selected_agent) {
-            if run.terminal_size != Some(size) {
-                if let Some(terminal) = run.terminal.as_mut() {
-                    if terminal.resize(size).is_ok() {
-                        run.terminal_size = Some(size);
-                    }
-                }
-            }
-        }
-    }
-    let lines = worker_lines(app, term_inner.height as usize, term_inner.width as usize);
-    frame.render_widget(
-        Paragraph::new(lines)
-            .style(app_style())
-            .block(pane_block(
-                "conversation · type to continue",
-                focused,
-                app.nav_mode,
-            ))
-            .wrap(Wrap { trim: false }),
-        term_area,
-    );
-    if focused {
-        set_worker_cursor(frame, term_inner, app);
-    }
-}
-
 /// One line per finished run in a drawer: node label (or `·` when it has none), the
 /// task summary, and its diff size when the run recorded one. Pure so tests can
 /// assert the list without a terminal.
@@ -3400,12 +3321,10 @@ pub(crate) fn render_worker(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         return;
     }
 
-    // A FINISHED worker gets the two-panel card view: objective + what-it-did on
-    // top, the (still conversable) conversation below.
-    if app.selected_done_worker_card_active() {
-        render_done_worker_card(frame, area, app);
-        return;
-    }
+    // A finished worker renders as its plain conversation. It used to get a
+    // two-panel card (objective + what-it-did on top, conversation below), but the
+    // card restated what the transcript already said and took half the pane to do
+    // it. The same summary is still one keypress away in the done drawer.
 
     if let Some(size) = terminal_size {
         if let Some(run) = app.agents.get_mut(app.selected_agent) {
