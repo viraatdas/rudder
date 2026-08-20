@@ -17860,12 +17860,19 @@ fn solo_hides_the_other_panes_and_toggles_back() {
         "the notice says how to get back: {:?}",
         app.notice
     );
-    // Solo never moves focus, so toggling twice returns you exactly where you were.
     assert_eq!(app.focus, FocusPane::Worker);
 
     app.toggle_solo_pane();
     assert!(!app.solo_pane);
     assert_eq!(app.focus, FocusPane::Worker);
+
+    // From the TASK pane, focus has to move: the task line is not drawn in full
+    // screen, so keys typed at it would land in an input the user cannot see.
+    app.focus = FocusPane::Task;
+    app.toggle_solo_pane();
+    assert_eq!(app.focus, FocusPane::Worker, "focus leaves the hidden task line");
+    app.toggle_solo_pane();
+    assert_eq!(app.focus, FocusPane::Task, "and comes back when the panes do");
 }
 
 #[test]
@@ -17882,12 +17889,10 @@ fn solo_leaves_no_stale_rect_for_the_hidden_pane() {
         .draw(|frame| crate::render::render(frame, &mut app))
         .expect("draw");
     assert!(app.worker_area.is_some(), "the soloed pane owns a rect");
-    assert!(
-        app.agents_area.is_none(),
-        "the hidden pane owns none"
-    );
-    // The task line survives solo: it is where you type.
-    assert!(app.task_area.is_some());
+    assert!(app.agents_area.is_none(), "the hidden pane owns none");
+    // The task line is hidden too, so it must not keep a rect that would take
+    // clicks over the full-screen pane now drawn where it used to be.
+    assert!(app.task_area.is_none(), "the hidden task line owns none");
 
     app.focus = FocusPane::Agents;
     terminal

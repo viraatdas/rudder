@@ -16,33 +16,24 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
     // The task line stays regardless — it is where you type, and a mode that hid it
     // would strand you in a view you cannot act from.
     if app.solo_pane {
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Min(8),
-                Constraint::Length(1),
-                Constraint::Length(task_height),
-            ])
-            .split(area);
-        // Focus follows the pane you soloed; the task pane is composed, not soloed,
-        // so it falls back to the worker (what you are almost always watching).
+        // FULL SCREEN: the focused pane and nothing else -- no sidebar, no task
+        // line, no gutters. Soloing from the task pane moves focus to the worker
+        // (toggle_solo_pane does it) so keystrokes still land somewhere you can see;
+        // ⌥h restores both the split and the focus you had.
         let solo = match app.focus {
             FocusPane::Agents => FocusPane::Agents,
             _ => FocusPane::Worker,
         };
-        // Areas the hit-testing and scroll code read: the hidden pane gets none, so
-        // a stale rect cannot take a click meant for the soloed pane.
-        app.agents_area = (solo == FocusPane::Agents).then_some(rows[0]);
-        app.worker_area = (solo == FocusPane::Worker).then_some(rows[0]);
-        app.task_area = Some(rows[2]);
+        // Areas the hit-testing and scroll code read: a hidden pane gets NONE, so a
+        // stale rect cannot take a click meant for the pane that is actually drawn.
+        app.agents_area = (solo == FocusPane::Agents).then_some(area);
+        app.worker_area = (solo == FocusPane::Worker).then_some(area);
+        app.task_area = None;
         if solo == FocusPane::Agents {
-            render_agents(frame, rows[0], app);
+            render_agents(frame, area, app);
         } else {
-            render_worker(frame, rows[0], app);
+            render_worker(frame, area, app);
         }
-        render_gutter(frame, rows[1], Gutter::Horizontal);
-        render_task(frame, rows[2], app);
-        render_suggestions(frame, rows[2], app);
         render_cloud_prompt(frame, area, app);
         render_merge_prompt(frame, area, app);
         render_mouse_debug(frame, area, app);

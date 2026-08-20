@@ -72,10 +72,12 @@ test("Alt+h hides the panes and never moves the selection", { timeout: 60_000 },
   // negotiate — so the steppers are asserted in the unit tests, and what matters
   // on a real screen is that Alt+h hides without disturbing the selection.
   await waitSelected(session, "beta worker");
+  // Focus is the agents pane here, so full screen keeps THAT one and drops the
+  // worker pane and the task line with it.
   await session.press("Alt+h");
-  await session.waitForText("showing this pane only", { timeout: 10_000 });
+  await session.waitForGone("Type a task", { timeout: 10_000 });
   await session.press("Alt+h");
-  await session.waitForText("split restored", { timeout: 10_000 });
+  await session.waitForText("Type a task", { timeout: 10_000 });
   await waitSelected(session, "beta worker");
 });
 

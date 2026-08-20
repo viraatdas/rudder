@@ -782,9 +782,13 @@ struct App {
     orch_follow_bottom: bool,
     agents_area: Option<Rect>,
     worker_area: Option<Rect>,
-    /// SOLO view: draw only the focused pane, full width. The task line stays --
-    /// hiding the place you type would strand you in a view you cannot act from.
+    /// SOLO view: the focused pane full-screen, with the sidebar, task line and
+    /// gutters all hidden.
     solo_pane: bool,
+    /// Focus to put back when solo ends. Soloing from the task pane has to move
+    /// focus to the worker (the task line is not drawn, so keys typed at it would
+    /// go somewhere invisible); this remembers where to return.
+    solo_restore_focus: Option<FocusPane>,
     task_area: Option<Rect>,
     cloud_connected: bool,
     cloud_runtime: Option<String>,
@@ -1782,6 +1786,7 @@ impl App {
             agents_area: None,
             worker_area: None,
             solo_pane: false,
+            solo_restore_focus: None,
             task_area: None,
             cloud_connected: cloud.connected,
             cloud_runtime: cloud.runtime,
@@ -2100,14 +2105,26 @@ impl App {
         self.dirty = true;
     }
 
-    /// Show only the focused pane, or restore the split. Solo never changes WHICH
-    /// pane is focused, so toggling twice returns you exactly where you were.
+    /// Full-screen the focused pane, or restore the split. Toggling twice returns
+    /// you exactly where you were, focus included.
     fn toggle_solo_pane(&mut self) {
         self.solo_pane = !self.solo_pane;
+        if self.solo_pane {
+            // The task line is not drawn in solo, so focus cannot stay on it --
+            // keystrokes would land in an input the user cannot see.
+            if self.focus == FocusPane::Task {
+                self.solo_restore_focus = Some(FocusPane::Task);
+                self.focus = FocusPane::Worker;
+            } else {
+                self.solo_restore_focus = None;
+            }
+        } else if let Some(previous) = self.solo_restore_focus.take() {
+            self.focus = previous;
+        }
         self.notice = Some(if self.solo_pane {
-            "showing this pane only · ⌥h restores the split".to_string()
+            "full screen · ⌥h restores the panes".to_string()
         } else {
-            "split restored".to_string()
+            "panes restored".to_string()
         });
         self.dirty = true;
     }

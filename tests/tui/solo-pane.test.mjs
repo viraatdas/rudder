@@ -7,7 +7,7 @@ import { assertPrerequisites, fakeBackends, launchRudder, scratchRepo } from "./
 
 assertPrerequisites();
 
-test("Alt+h hides the other panes, Alt+h again restores the split", { timeout: 90_000 }, async (t) => {
+test("Alt+h full-screens the pane, hiding the sidebar and task line", { timeout: 90_000 }, async (t) => {
   const repo = await scratchRepo("rudder-solo-");
   const { claudeBin } = await fakeBackends(repo);
   const session = await launchRudder(t, { repo, claudeBin });
@@ -17,14 +17,17 @@ test("Alt+h hides the other panes, Alt+h again restores the split", { timeout: 9
   await session.waitForText("j/k move", { timeout: 10_000 });
 
   await session.press("Alt+h");
-  await session.waitForText("showing this pane only", { timeout: 10_000 });
+  // Full screen: the sidebar keymap AND the task prompt are both gone.
+  await session.waitForGone("j/k move", { timeout: 10_000 });
+  await session.waitForGone("Type a task", { timeout: 10_000 });
 
   await session.press("Alt+h");
-  const restored = await session.waitFor((s) => s.includes("split restored"), {
+  const restored = await session.waitFor((s) => s.includes("panes restored"), {
     timeout: 10_000,
-    label: "the split-restored notice",
+    label: "the panes-restored notice",
   });
-  assert.match(restored, /split restored/);
+  assert.match(restored, /panes restored/);
+  await session.waitForText("Type a task", { timeout: 10_000 });
   // The sidebar is back, which is what "restored" has to mean on screen.
   await session.waitForText("j/k move", { timeout: 10_000 });
 });
