@@ -17994,3 +17994,63 @@ fn a_settled_row_is_answered_from_cache_without_recomputing() {
         "and nothing was recomputed for it"
     );
 }
+
+#[test]
+fn the_tab_glyph_distinguishes_states_by_shape_not_colour() {
+    // A tab strip is read at a glance and at ~14px. The old set was four coloured
+    // circles, so a running session looked identical to a finished one until you
+    // focused on the hue. These differ in SHAPE.
+    let mut app = App::new();
+
+    // Nothing at all: an empty circle.
+    assert_eq!(app.tab_status_glyph(), '○');
+
+    let mut running = test_agent_run("r", "work");
+    running.status = AgentStatus::Running;
+    app.agents = vec![running];
+    assert!(
+        App::TAB_SPINNER.contains(&app.tab_status_glyph()),
+        "running turns"
+    );
+
+    // Every agent finished: a full circle.
+    app.agents[0].status = AgentStatus::Merged;
+    assert_eq!(app.tab_status_glyph(), '●');
+    app.agents[0].status = AgentStatus::Done;
+    assert_eq!(app.tab_status_glyph(), '●');
+
+    // A failure is neither circle nor square.
+    app.agents[0].status = AgentStatus::Failed;
+    assert_eq!(app.tab_status_glyph(), '⊗');
+
+    // Waiting on YOU outranks everything: it is the one state that will not
+    // resolve without you, so it must win over a sibling that is still running.
+    app.agents[0].status = AgentStatus::Running;
+    let mut waiting = test_agent_run("w", "asking");
+    waiting.status = AgentStatus::Running;
+    waiting.needs_user_input = true;
+    app.agents.push(waiting);
+    assert_eq!(app.tab_status_glyph(), '⬓', "square, bottom half filled");
+}
+
+#[test]
+fn the_tab_spinner_turns_on_a_clock_not_on_frames() {
+    // The draw loop runs at ~30fps. A glyph advancing per frame reads as flicker
+    // in the corner of the eye rather than as progress.
+    let mut app = App::new();
+    let mut running = test_agent_run("r", "work");
+    running.status = AgentStatus::Running;
+    app.agents = vec![running];
+
+    let first = app.tab_status_glyph();
+    // Several draws inside one interval must not move it.
+    for _ in 0..20 {
+        assert_eq!(app.tab_status_glyph(), first, "steady within the interval");
+    }
+
+    // Once the interval passes, it advances exactly one step.
+    app.tab_spinner_at = Instant::now() - TAB_SPINNER_INTERVAL - Duration::from_millis(10);
+    let second = app.tab_status_glyph();
+    assert_ne!(second, first, "and turns once the interval elapses");
+    assert!(App::TAB_SPINNER.contains(&second));
+}

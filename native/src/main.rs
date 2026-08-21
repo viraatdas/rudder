@@ -100,6 +100,10 @@ struct PendingEnter {
 /// Animation-only redraw cadence. Real PTY output wakes the loop immediately; this
 /// interval only advances the idle spinner.
 const SPINNER_FRAME_INTERVAL: Duration = Duration::from_millis(100);
+/// How fast the tab glyph turns while agents are running. Slower than the in-app
+/// spinner: a tab is glanced at, not watched, and a fast cycle there is noise in
+/// the corner of the eye.
+const TAB_SPINNER_INTERVAL: Duration = Duration::from_millis(400);
 const MAX_EVENTS_PER_FRAME: usize = 64;
 /// Trackpad wheel bursts can deliver many tiny scroll events. The handler itself
 /// is cheap; the expensive part is flushing a full terminal draw. Briefly defer
@@ -873,6 +877,9 @@ struct App {
     diff_summary_tx: Option<mpsc::Sender<(String, Option<String>)>>,
     dirty: bool,
     last_tab_emoji: Option<char>,
+    /// Frame of the rotating tab glyph, and when it last advanced.
+    tab_spinner: usize,
+    tab_spinner_at: Instant,
     /// True when the user pressed Ctrl+C once but there are running agents we
     /// want them to confirm pausing before we actually quit. Cleared by any
     /// other key.
@@ -1830,6 +1837,8 @@ impl App {
             diff_summary_tx: None,
             dirty: true,
             last_tab_emoji: None,
+            tab_spinner: 0,
+            tab_spinner_at: Instant::now(),
             session_started_iso,
             quit_confirm_pending: false,
             last_mirror_signature: None,
@@ -1840,28 +1849,59 @@ impl App {
         }
     }
 
-    fn tab_status_emoji(&self) -> char {
+    /// The glyph in the host terminal's tab, as ONE coherent shape language:
+    ///
+    ///   ◐ ◓ ◑ ◒   running   — rotates, so a glance tells you it is still alive
+    ///   ⬓         input     — a square, because it is categorically different
+    ///                         from "working"; you have to do something
+    ///   ⊗         failed    — the only glyph that is neither circle nor square
+    ///   ●         done      — a full circle: everything landed
+    ///   ○         idle      — an empty one: nothing to do
+    ///
+    /// Filled means finished, empty means nothing, turning means working. A tab
+    /// strip is read at a glance and at ~14px, so the states have to differ in
+    /// SHAPE, not just colour — the previous set was four coloured circles that
+    /// were hard to tell apart, and a running session looked identical to a
+    /// finished one until you focused on the hue.
+    const TAB_SPINNER: [char; 4] = ['\u{25d0}', '\u{25d3}', '\u{25d1}', '\u{25d2}'];
+
+    fn tab_status_glyph(&mut self) -> char {
         if self
             .agents
             .iter()
             .any(|a| a.needs_permission || a.needs_user_input)
         {
-            return '\u{1f7e1}'; // yellow circle - your attention needed
+            return '\u{2b13}'; // ⬓ square, bottom half filled - waiting on you
         }
         if self.agents.iter().any(|a| a.status == AgentStatus::Failed) {
-            return '\u{1f534}'; // red circle - failure
+            return '\u{2297}'; // ⊗ - something failed
         }
         if self.agents.iter().any(|a| a.status == AgentStatus::Running) {
-            return '\u{1f7e2}'; // green circle - actively running
+            // Advance on a wall clock rather than per frame: the draw loop runs at
+            // ~30fps and a glyph cycling that fast reads as flicker, not progress.
+            let now = Instant::now();
+            if now.duration_since(self.tab_spinner_at) >= TAB_SPINNER_INTERVAL {
+                self.tab_spinner_at = now;
+                self.tab_spinner = (self.tab_spinner + 1) % Self::TAB_SPINNER.len();
+            }
+            return Self::TAB_SPINNER[self.tab_spinner];
         }
-        '\u{26aa}' // white circle - idle / no work
+        if !self.agents.is_empty()
+            && self
+                .agents
+                .iter()
+                .all(|a| matches!(a.status, AgentStatus::Merged | AgentStatus::Done))
+        {
+            return '\u{25cf}'; // ● full circle - every agent finished
+        }
+        '\u{25cb}' // ○ empty circle - idle / nothing to do
     }
 
     /// Update the host terminal tab title to reflect current state. Cheap;
     /// only emits an OSC when the leading status emoji actually changed.
     fn refresh_tab_title(&mut self) {
-        let emoji = self.tab_status_emoji();
-        if self.last_tab_emoji == Some(emoji) {
+        let glyph = self.tab_status_glyph();
+        if self.last_tab_emoji == Some(glyph) {
             return;
         }
         let repo = self
@@ -1875,11 +1915,11 @@ impl App {
         } else {
             "Rudder"
         };
-        let title = format!("{emoji} {prefix}: {repo}");
+        let title = format!("{glyph} {prefix}: {repo}");
         let mut stdout = io::stdout();
         let _ = write!(stdout, "\x1b]0;{title}\x07");
         let _ = stdout.flush();
-        self.last_tab_emoji = Some(emoji);
+        self.last_tab_emoji = Some(glyph);
     }
 
     fn mark_dirty(&mut self) {
