@@ -74,14 +74,14 @@ task and a second one starts beside it, unable to see or overwrite the first.</p
         <div class="pane-label">agents</div>
         <div class="row-group">/main<span>1 agent</span></div>
         <div class="row"><span class="row-task">tag the release</span><span class="state state--running">running</span></div>
-        <div class="row-group">worktrees<span>3 agents</span></div>
+        <div class="row-group">workspaces<span>3 agents</span></div>
         <div class="row is-selected"><span class="row-task">rate-limit the public API</span><span class="state state--running">running</span></div>
         <div class="row"><span class="row-task">port the settings screen</span><span class="state state--review">done</span></div>
         <div class="row"><span class="row-task">drop the legacy session table</span><span class="state state--merged">merged</span></div>
       </div>
       <div class="pane pane-main">
         <div class="pane-label">rate-limit the public API</div>
-        <pre class="tty"><span class="dim">workspace</span> .rudder-worktrees/rate-limit
+        <pre class="tty"><span class="dim">workspace</span> .rudder-workspaces/rate-limit
 
 <span class="ok">●</span> Read src/server/middleware.ts
 <span class="ok">●</span> Edit src/server/rate-limit.ts <span class="add">+64</span>
@@ -228,14 +228,14 @@ inside, and adds a row to the agents list.</p>
         <div class="pane-label">agents</div>
         <div class="row-group">/main<span>1 agent</span></div>
         <div class="row"><span class="row-task">tag the release</span><span class="state state--running">running</span></div>
-        <div class="row-group">worktrees<span>3 agents</span></div>
+        <div class="row-group">workspaces<span>3 agents</span></div>
         <div class="row is-selected"><span class="row-task">rate-limit the public API</span><span class="state state--running">running</span></div>
         <div class="row"><span class="row-task">port the settings screen</span><span class="state state--review">done</span></div>
         <div class="row"><span class="row-task">drop the legacy session table</span><span class="state state--merged">merged</span></div>
       </div>
       <div class="pane pane-main">
         <div class="pane-label">rate-limit the public API</div>
-        <pre class="tty"><span class="dim">workspace</span> .rudder-worktrees/rate-limit
+        <pre class="tty"><span class="dim">workspace</span> .rudder-workspaces/rate-limit
 
 <span class="ok">●</span> Read src/server/middleware.ts
 <span class="ok">●</span> Edit src/server/rate-limit.ts <span class="add">+64</span>
@@ -298,7 +298,7 @@ each other.</p>
 
 <h2 id="where">Where they live</h2>
 <pre><code>your-repo/
-  .rudder-worktrees/
+  .rudder-workspaces/
     fix-login-redirect/
     port-settings-form/
     drop-sessions-table/</code></pre>
@@ -324,6 +324,13 @@ conflicted merge still completes; the conflict is then a thing you can see, reso
 or undo, instead of a wall you hit mid-operation.</p>
 <p>This is what lets Rudder integrate several overlapping agents without stopping the
 whole session on the first collision.</p>
+<p>Rudder settles the conflicts that need no judgment on its own: its own coordination
+files union their entries, <code>package.json</code> deep-merges its dependency maps,
+lock files take the most complete side. Source code is never merged mechanically -
+guessing at a real disagreement is worse than stopping. What is left starts a resolver
+agent in the row that already owns the work, rather than a prompt waiting for a
+keypress. An unanswered prompt used to park finished nodes in review and leave
+everything downstream of them unable to launch.</p>
 
 <h2 id="main">The main checkout</h2>
 <p>Some jobs are genuinely about your working tree: tagging a release, running a
@@ -339,6 +346,7 @@ sometimes what you want; managing what they do to each other is yours.</p>
     lede: "When a goal needs several steps in a particular order, /plan gives you an orchestrator: it proposes a task graph, you edit it, then it runs and merges the nodes as their dependencies land. Several plans can run at once, each in its own pane.",
     toc: [
       ["start", "Starting a plan"],
+      ["hardening", "Hardening"],
       ["edit", "Editing before it runs"],
       ["deps", "Hard and soft edges"],
       ["steer", "Steering a running plan"],
@@ -356,6 +364,17 @@ they touch the same files, that is an ordinary merge conflict, handled the same 
 as any other. A plan that is finished - nothing queued, nothing running, nothing at
 the gate - is reused rather than piling up, so repeatedly planning does not leave a
 row per past goal.</p>
+
+<h2 id="hardening">Hardening</h2>
+<p>Workers report follow-ups when they finish - a test worth adding, a rough edge
+worth smoothing. Rudder collects those into a backlog instead of scheduling each one
+as its own node, and runs them <strong>clumped by file</strong> once the current phase
+has merged.</p>
+<p>The reason is that hardening findings land on the same files by nature. One node
+per finding meant several agents racing to edit the same file and conflicting with
+each other - manufacturing the very conflicts they then had to resolve. As one clump
+they are edits in a single workspace, and one agent fixes them together with the whole
+file in view instead of several half-fixing it.</p>
 
 <h2 id="edit">Editing before it runs</h2>
 <p>The plan is a draft, not a verdict. Press <kbd>v</kbd> on the orchestrator to open
@@ -437,6 +456,7 @@ what is happening.</p>
     <tr><td>j / k</td><td>Move down and up the agents list.</td></tr>
     <tr><td>Enter</td><td>Focus the selected agent's pane.</td></tr>
     <tr><td>Option-[ / Option-]</td><td>Step to the previous or next agent from any pane.</td></tr>
+    <tr><td>Option-h</td><td>Full-screen the focused pane; press again to bring the others back.</td></tr>
     <tr><td>v</td><td>Live jj diff of the selected agent.</td></tr>
     <tr><td>m</td><td>Merge the selected agent.</td></tr>
     <tr><td>M</td><td>Merge everything ready.</td></tr>
@@ -455,6 +475,10 @@ what is happening.</p>
 <h2 id="panes">Panes</h2>
 <p><kbd>Option-1</kbd>, <kbd>Option-2</kbd> and <kbd>Option-3</kbd> always mean Agents,
 Worker and Task.</p>
+<p><kbd>Option-h</kbd> gives the focused pane the whole screen: no sidebar, no task
+line, no gutters. Press it again to bring them back. Reaching for it from the task
+line hands the screen to the worker, since the task input is no longer drawn, and
+you land back on the task line when the panes return.</p>
 <p>The worker pane belongs to the agent, so its keystrokes go to Claude or Codex, not
 to Rudder. To send a dashboard key from inside it, use the <kbd>Ctrl-W</kbd> leader:
 <kbd>Ctrl-W v</kbd> reviews, <kbd>Ctrl-W m</kbd> merges, <kbd>Ctrl-W 1/2/3</kbd>
@@ -476,7 +500,7 @@ switches panes.</p>
 <h2 id="git">Does this change my git repository?</h2>
 <p>jj is colocated with git in the same repository. Your git history, branches and
 remotes keep working exactly as they did. Rudder adds workspaces under
-<code>.rudder-worktrees/</code> and merges into your local branch; it does not rewrite
+<code>.rudder-workspaces/</code> and merges into your local branch; it does not rewrite
 your history behind you.</p>
 
 <h2 id="push">Does it push or deploy anything?</h2>

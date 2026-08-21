@@ -91,6 +91,7 @@
     <tr><td>j / k</td><td>Move down and up the agents list.</td></tr>
     <tr><td>Enter</td><td>Focus the selected agent's pane.</td></tr>
     <tr><td>Option-[ / Option-]</td><td>Step to the previous or next agent from any pane.</td></tr>
+    <tr><td>Option-h</td><td>Full-screen the focused pane; press again to bring the others back.</td></tr>
     <tr><td>v</td><td>Live jj diff of the selected agent.</td></tr>
     <tr><td>m</td><td>Merge the selected agent.</td></tr>
     <tr><td>M</td><td>Merge everything ready.</td></tr>
@@ -109,6 +110,10 @@
 <h2 id="panes">Panes</h2>
 <p><kbd>Option-1</kbd>, <kbd>Option-2</kbd> and <kbd>Option-3</kbd> always mean Agents,
 Worker and Task.</p>
+<p><kbd>Option-h</kbd> gives the focused pane the whole screen: no sidebar, no task
+line, no gutters. Press it again to bring them back. Reaching for it from the task
+line hands the screen to the worker, since the task input is no longer drawn, and
+you land back on the task line when the panes return.</p>
 <p>The worker pane belongs to the agent, so its keystrokes go to Claude or Codex, not
 to Rudder. To send a dashboard key from inside it, use the <kbd>Ctrl-W</kbd> leader:
 <kbd>Ctrl-W v</kbd> reviews, <kbd>Ctrl-W m</kbd> merges, <kbd>Ctrl-W 1/2/3</kbd>

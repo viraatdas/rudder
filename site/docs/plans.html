@@ -69,6 +69,17 @@ as any other. A plan that is finished - nothing queued, nothing running, nothing
 the gate - is reused rather than piling up, so repeatedly planning does not leave a
 row per past goal.</p>
 
+<h2 id="hardening">Hardening</h2>
+<p>Workers report follow-ups when they finish - a test worth adding, a rough edge
+worth smoothing. Rudder collects those into a backlog instead of scheduling each one
+as its own node, and runs them <strong>clumped by file</strong> once the current phase
+has merged.</p>
+<p>The reason is that hardening findings land on the same files by nature. One node
+per finding meant several agents racing to edit the same file and conflicting with
+each other - manufacturing the very conflicts they then had to resolve. As one clump
+they are edits in a single workspace, and one agent fixes them together with the whole
+file in view instead of several half-fixing it.</p>
+
 <h2 id="edit">Editing before it runs</h2>
 <p>The plan is a draft, not a verdict. Press <kbd>v</kbd> on the orchestrator to open
 plan review and edit any node in place: its title, goal, success criteria,
@@ -117,6 +128,7 @@ what is happening.</p>
         <h2>on this page</h2>
         <ul>
             <li><a href="#start">Starting a plan</a></li>
+            <li><a href="#hardening">Hardening</a></li>
             <li><a href="#edit">Editing before it runs</a></li>
             <li><a href="#deps">Hard and soft edges</a></li>
             <li><a href="#steer">Steering a running plan</a></li>

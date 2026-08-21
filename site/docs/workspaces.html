@@ -66,7 +66,7 @@ each other.</p>
 
 <h2 id="where">Where they live</h2>
 <pre><code>your-repo/
-  .rudder-worktrees/
+  .rudder-workspaces/
     fix-login-redirect/
     port-settings-form/
     drop-sessions-table/</code></pre>
@@ -92,6 +92,13 @@ conflicted merge still completes; the conflict is then a thing you can see, reso
 or undo, instead of a wall you hit mid-operation.</p>
 <p>This is what lets Rudder integrate several overlapping agents without stopping the
 whole session on the first collision.</p>
+<p>Rudder settles the conflicts that need no judgment on its own: its own coordination
+files union their entries, <code>package.json</code> deep-merges its dependency maps,
+lock files take the most complete side. Source code is never merged mechanically -
+guessing at a real disagreement is worse than stopping. What is left starts a resolver
+agent in the row that already owns the work, rather than a prompt waiting for a
+keypress. An unanswered prompt used to park finished nodes in review and leave
+everything downstream of them unable to launch.</p>
 
 <h2 id="main">The main checkout</h2>
 <p>Some jobs are genuinely about your working tree: tagging a release, running a

@@ -124,14 +124,14 @@
                   <div class="pane-label">agents</div>
                   <div class="row-group">/main<span>1 agent · shared checkout</span></div>
                   <div class="row"><span class="row-task">tag the release</span><span class="state state--running">running</span></div>
-                  <div class="row-group">worktrees<span>3 agents</span></div>
+                  <div class="row-group">workspaces<span>3 agents</span></div>
                   <div class="row is-selected"><span class="row-task">rate-limit the public API</span><span class="state state--running">running</span></div>
                   <div class="row"><span class="row-task">port the settings screen</span><span class="state state--review">done</span></div>
                   <div class="row"><span class="row-task">drop the legacy session table</span><span class="state state--merged">merged</span></div>
                 </div>
                 <div class="pane pane-main">
                   <div class="pane-label">rate-limit the public API</div>
-                  <pre class="tty"><span class="dim">workspace</span> .rudder-worktrees/rate-limit
+                  <pre class="tty"><span class="dim">workspace</span> .rudder-workspaces/rate-limit
 
 <span class="ok">●</span> Read src/server/middleware.ts
 <span class="ok">●</span> Edit src/server/rate-limit.ts <span class="add">+64</span>
@@ -145,7 +145,7 @@
               <div class="frame frame-talk">
                 <div class="pane pane-list">
                   <div class="pane-label">agents</div>
-                  <div class="row-group">worktrees<span>3 agents</span></div>
+                  <div class="row-group">workspaces<span>3 agents</span></div>
                   <div class="row is-selected"><span class="row-task">rate-limit the public API</span><span class="state state--running">running</span></div>
                   <div class="row"><span class="row-task">port the settings screen</span><span class="state state--review">done</span></div>
                   <div class="row"><span class="row-task">drop the legacy session table</span><span class="state state--merged">merged</span></div>
@@ -167,14 +167,14 @@
               <div class="frame frame-diff">
                 <div class="pane pane-list">
                   <div class="pane-label">agents</div>
-                  <div class="row-group">worktrees<span>3 agents</span></div>
+                  <div class="row-group">workspaces<span>3 agents</span></div>
                   <div class="row"><span class="row-task">rate-limit the public API</span><span class="state state--running">running</span></div>
                   <div class="row is-selected"><span class="row-task">port the settings screen</span><span class="state state--review">done</span></div>
                   <div class="row"><span class="row-task">drop the legacy session table</span><span class="state state--merged">merged</span></div>
                 </div>
                 <div class="pane pane-main">
                   <div class="pane-label">nothing here is yours yet</div>
-                  <pre class="tty"><span class="dim">jj diff · .rudder-worktrees/settings-form</span>
+                  <pre class="tty"><span class="dim">jj diff · .rudder-workspaces/settings-form</span>
 
 <span class="dim">src/settings/Form.tsx</span>
 <span class="del">- const [state, setState] = useState(initial)</span>
@@ -193,7 +193,7 @@
                   <div class="pane-label">agents</div>
                   <div class="row-group">orchestrator<span>ship billing v2</span></div>
                   <div class="row is-selected"><span class="row-task">plan · 4 nodes</span><span class="state state--running">running</span></div>
-                  <div class="row-group">worktrees<span>4 nodes</span></div>
+                  <div class="row-group">workspaces<span>4 nodes</span></div>
                   <div class="row"><span class="row-task">n0 schema</span><span class="state state--merged">merged</span></div>
                   <div class="row"><span class="row-task">n1 stripe client</span><span class="state state--running">running</span></div>
                   <div class="row"><span class="row-task">n2 webhook handler</span><span class="state state--idle">waiting on n1</span></div>
