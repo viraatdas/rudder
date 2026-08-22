@@ -4881,7 +4881,15 @@ impl App {
         let alternate = terminal.uses_alternate_screen_snapshot();
         let mut forwarded = false;
         let mut write_error = None;
-        terminal.scrollback_by(rows);
+        // An alternate-screen app that asked for SGR mouse tracking owns the wheel: it
+        // keeps its own scrollback (a chat log, a pager) and expects the events. Our
+        // `alternate_history` screenshot buffer must not intercept them -- it grows a
+        // frame on every repaint, so for a live TUI like opencode the offset always
+        // moves, `moved` is always true, and the child would never see a single scroll.
+        let child_owns_wheel = alternate && terminal.wants_sgr_mouse_events_snapshot();
+        if !child_owns_wheel {
+            terminal.scrollback_by(rows);
+        }
         let after = terminal.scrollback();
         let moved = after != before;
         let wants_mouse = if moved || rows == 0 {
@@ -4991,7 +4999,12 @@ impl App {
         };
         let before = review.scrollback();
         let alternate = review.uses_alternate_screen_snapshot();
-        review.scrollback_by(rows);
+        // Same precedence as the worker pane: a mouse-tracking alternate-screen app
+        // scrolls itself, so keep our snapshot history out of the way.
+        let child_owns_wheel = alternate && review.wants_sgr_mouse_events_snapshot();
+        if !child_owns_wheel {
+            review.scrollback_by(rows);
+        }
         let after = review.scrollback();
         let moved = after != before;
         let wants_mouse = if moved || rows == 0 {

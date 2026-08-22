@@ -2776,6 +2776,83 @@ fn worker_wheel_forwards_to_inner_tui_when_scrollback_cannot_move() {
 
 #[cfg(not(windows))]
 #[test]
+fn worker_wheel_reaches_a_repainting_tui_and_never_its_snapshot_history() {
+    // The sibling test above uses a child that paints once and then sits still, so
+    // `alternate_history` never grows and the wheel forwards by luck. Real TUIs --
+    // opencode, which sets ?1049h/?1000h/?1002h/?1003h/?1006h -- repaint constantly.
+    // Every repaint is a distinct snapshot, so the alternate history grows and its
+    // offset moves on each scroll. Before the fix that `moved` flag suppressed
+    // forwarding entirely and the wheel scrolled our screenshot buffer instead of the
+    // app's own conversation. Here the child keeps changing the screen between
+    // scrolls, so the forwarding path only survives if mouse tracking takes priority
+    // over the snapshot history.
+    let command = TerminalCommand::with_args(
+        "/bin/sh",
+        [
+            "-lc",
+            "stty raw -echo; printf '\\033[?1049h\\033[?1000h\\033[?1002h\\033[?1003h\\033[?1006h'; cat -v",
+        ],
+    );
+    let mut pane = TerminalPane::spawn_shell_or_command(
+        Some(command),
+        TerminalPaneOptions {
+            size: TerminalSize { rows: 5, cols: 40 },
+            scrollback_lines: 100,
+            ..Default::default()
+        },
+    )
+    .expect("spawn test pty");
+
+    for _ in 0..20 {
+        std::thread::sleep(Duration::from_millis(25));
+        pane.drain_output();
+        if pane.uses_alternate_screen() && pane.wants_sgr_mouse_events() {
+            break;
+        }
+    }
+    assert!(pane.uses_alternate_screen());
+    assert!(pane.wants_sgr_mouse_events());
+
+    let mut app = App::new();
+    app.worker_area = Some(Rect {
+        x: 0,
+        y: 0,
+        width: 40,
+        height: 7,
+    });
+    app.agents.push(test_agent_run_with_terminal(&app, pane));
+    app.selected_agent = 0;
+
+    // Three notches, with the screen repainting in between -- `cat -v` echoes each
+    // forwarded report, which is itself a repaint, exactly like a live TUI.
+    for _ in 0..3 {
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::empty(),
+        });
+        std::thread::sleep(Duration::from_millis(60));
+        if let Some(terminal) = app.selected_terminal_mut() {
+            terminal.drain_output();
+        }
+    }
+
+    std::thread::sleep(Duration::from_millis(60));
+    let output = app
+        .selected_terminal_mut()
+        .map(|terminal| terminal.visible_lines().join("\n"))
+        .unwrap_or_default();
+    let reports = output.matches("^[[<64;").count();
+    assert_eq!(reports, 3, "every notch must reach the app; output was {output:?}");
+    // And our own snapshot history must not have absorbed any of them.
+    assert!(app
+        .selected_terminal_mut()
+        .is_some_and(|terminal| terminal.scrollback() == 0));
+}
+
+#[cfg(not(windows))]
+#[test]
 fn codex_worker_wheel_at_edge_does_not_send_page_keys() {
     let command = TerminalCommand::with_args(
         "/bin/sh",
