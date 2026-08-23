@@ -17592,6 +17592,16 @@ fn a_merge_conflict_starts_a_resolver_instead_of_parking_on_a_prompt() {
     // review for hours behind an unanswered "press y" modal, and because n6 hard-
     // depended on one of them the entire back half of the plan never launched.
     // Integration is automatic, so its failure path must be automatic too.
+    //
+    // HERMETIC: the resolver spawns a real PTY, so without a stubbed backend
+    // this passed locally (claude installed) and failed every release run
+    // ("failed to spawn command in PTY") where no claude exists.
+    let _env = env_guard();
+    let dir = unique_test_repo("merge-resolver-hermetic");
+    let fake = dir.join("fake-claude.sh");
+    write_fake_bin(&fake, "#!/bin/sh\nsleep 30\n");
+    std::env::set_var("RUDDER_CLAUDE_BIN", &fake);
+
     let mut app = App::new();
     let mut run = test_agent_run("worker", "n2");
     run.node_id = Some("n2".to_string());
