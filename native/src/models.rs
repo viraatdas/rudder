@@ -61,6 +61,41 @@ pub(crate) fn provider_backend(provider: &str) -> Option<Backend> {
     }
 }
 
+/// Whether a bare token names a REAL model (alias or explicit id) across the
+/// known tables. Unlike `backend_for_model`, which guesses a default backend
+/// for anything, this refuses task words like "fix" or "refactor" so `/gam`
+/// never eats the first word of someone's ask as a model id.
+pub(crate) fn known_model_backend(model: &str) -> Option<Backend> {
+    let query = model.trim();
+    if query.is_empty() {
+        return None;
+    }
+    for (backend, candidate, _) in fallback_model_rows() {
+        if candidate.eq_ignore_ascii_case(query) {
+            return Some(backend);
+        }
+    }
+    maybe_refresh_models_dev_cache();
+    for (backend, candidate, _) in cached_models_dev_rows() {
+        if candidate.eq_ignore_ascii_case(query) {
+            return Some(backend);
+        }
+    }
+    for (backend, candidate, _) in cached_codex_local_rows() {
+        if candidate.eq_ignore_ascii_case(query) {
+            return Some(backend);
+        }
+    }
+    // Provider-qualified opencode ids ("anthropic/claude-sonnet-4-5"): a slash
+    // whose head is NOT one of our provider keywords.
+    if query.contains('/')
+        && provider_backend(query.split('/').next().unwrap_or_default()).is_none()
+    {
+        return Some(Backend::Opencode);
+    }
+    None
+}
+
 pub(crate) fn effort_options_for(backend: Backend, model: &str) -> Vec<Option<EffortLevel>> {
     if !model_supports_reasoning(backend, model) {
         return vec![None];
@@ -172,6 +207,33 @@ pub(crate) fn suggestions_for(app: &App) -> Vec<Suggestion> {
         return suggestions;
     }
 
+    if input.starts_with("/gam") {
+        // The gam drill-down picks the ADVERSARIAL reviewer's model. Same
+        // provider -> model flow as /model, but every choice INSERTS into the
+        // input instead of setting defaults, leaving the rest of the line free
+        // for the task text.
+        let rest = input.strip_prefix("/gam").unwrap_or_default();
+        maybe_refresh_models_dev_cache();
+        let rest = rest.trim_start();
+        if rest.is_empty() {
+            return gam_provider_suggestions("");
+        }
+        let trailing_space = rest.ends_with(char::is_whitespace);
+        let parts = rest.split_whitespace().collect::<Vec<_>>();
+        let Some(backend) = parts.first().and_then(|provider| provider_backend(provider)) else {
+            return gam_provider_suggestions(parts.first().copied().unwrap_or_default());
+        };
+        return match parts.as_slice() {
+            [_provider] => gam_model_suggestions(backend, ""),
+            // Still typing the model: keep filtering. Once the token is
+            // complete (trailing space) the rest of the line is task text and
+            // the palette gets out of the way.
+            [_provider, model] if !trailing_space => {
+                gam_model_suggestions(backend, model)
+            }
+            _ => Vec::new(),
+        };
+    }
     rank_suggestions(command_suggestions(), input.trim_start_matches('/'))
 }
 
@@ -485,6 +547,16 @@ pub(crate) fn command_suggestions() -> Vec<Suggestion> {
             action: SuggestionAction::Insert("/plan ".to_string()),
         },
         Suggestion {
+            label: "/gam <task>".to_string(),
+            detail: "generator + adversarial reviewer pair: reviewer questions every round, only the generator edits".to_string(),
+            action: SuggestionAction::Insert("/gam ".to_string()),
+        },
+        Suggestion {
+            label: "/gam <model> <task>".to_string(),
+            detail: "pick the adversarial reviewer's model inline (e.g. /gam codex gpt-5.5 fix auth)".to_string(),
+            action: SuggestionAction::Insert("/gam ".to_string()),
+        },
+        Suggestion {
             label: "/resume".to_string(),
             detail:
                 "pick a recent claude/codex/opencode chat and continue it as a worker, context intact"
@@ -675,6 +747,41 @@ pub(crate) fn provider_suggestions(query: &str) -> Vec<Suggestion> {
     })
     .collect();
     rank_suggestions(suggestions, query)
+}
+
+/// The `/gam` drill-down's provider rows. Selecting one inserts the provider
+/// into the input rather than changing dashboard defaults.
+pub(crate) fn gam_provider_suggestions(query: &str) -> Vec<Suggestion> {
+    let suggestions = [
+        (Backend::Claude, "adversarial reviewer: Claude Code models"),
+        (Backend::Codex, "adversarial reviewer: Codex models"),
+        (Backend::Opencode, "adversarial reviewer: opencode models"),
+    ]
+    .into_iter()
+    .map(|(backend, detail)| Suggestion {
+        label: backend.as_str().to_string(),
+        detail: format!("{detail} · then type the task"),
+        action: SuggestionAction::ChooseGamProvider(backend),
+    })
+    .collect();
+    rank_suggestions(suggestions, query)
+}
+
+/// The same model rows /model offers, rewritten to insert into a `/gam` line.
+/// Effort is intentionally not offered here: it is derived from the chosen
+/// model, and the rest of the line belongs to the task text.
+pub(crate) fn gam_model_suggestions(backend_filter: Backend, query: &str) -> Vec<Suggestion> {
+    model_suggestions_for(backend_filter, query)
+        .into_iter()
+        .map(|suggestion| match suggestion.action {
+            SuggestionAction::ChooseModel { backend, model } => Suggestion {
+                detail: format!("as the adversarial reviewer · {}", suggestion.detail),
+                action: SuggestionAction::ChooseGamModel { backend, model },
+                ..suggestion
+            },
+            _ => suggestion,
+        })
+        .collect()
 }
 
 pub(crate) fn model_suggestions_for(backend_filter: Backend, query: &str) -> Vec<Suggestion> {

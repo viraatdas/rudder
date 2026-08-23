@@ -6470,6 +6470,7 @@ fn test_agent_run(id: &str, task: &str) -> AgentRun {
         done_summary: None,
         tokens_in: 0,
         tokens_out: 0,
+        gam: None,
     }
 }
 
@@ -8303,6 +8304,7 @@ fn delete_agent_requires_second_d() {
         done_summary: None,
         tokens_in: 0,
         tokens_out: 0,
+        gam: None,
     });
 
     app.delete_selected_agent();
@@ -18131,3 +18133,514 @@ fn the_tab_spinner_turns_on_a_clock_not_on_frames() {
     assert_ne!(second, first, "and turns once the interval elapses");
     assert!(App::TAB_SPINNER.contains(&second));
 }
+
+// ---------------------------------------------------------------------------
+// /gam: generator + adversarial reviewer pair
+// ---------------------------------------------------------------------------
+
+#[test]
+fn gam_args_default_to_the_cross_picked_reviewer() {
+    let request = parse_gam_args("fix the auth bug", Backend::Claude, "sonnet")
+        .expect("plain task parses");
+    assert_eq!(request.task, "fix the auth bug");
+    assert_eq!(request.adversarial_backend, Backend::Codex);
+    assert_eq!(request.adversarial_model, "gpt-5.5");
+    assert!(!request.in_main);
+
+    let mirrored = parse_gam_args("fix the auth bug", Backend::Codex, "gpt-5.5").expect("parses");
+    assert_eq!(mirrored.adversarial_backend, Backend::Claude);
+}
+
+#[test]
+fn gam_args_honor_main_and_explicit_model_specs() {
+    let main = parse_gam_args("main refactor the parser", Backend::Claude, "sonnet").expect("main");
+    assert!(main.in_main);
+    assert_eq!(main.task, "refactor the parser");
+
+    let bare_model =
+        parse_gam_args("fable rewrite the docs", Backend::Codex, "gpt-5.5").expect("alias model");
+    assert_eq!(bare_model.adversarial_backend, Backend::Claude);
+    assert_eq!(bare_model.adversarial_model, "fable");
+    assert_eq!(bare_model.task, "rewrite the docs");
+
+    // Task words that merely look like verbs are never eaten as models.
+    let plain = parse_gam_args("high performance caching", Backend::Claude, "sonnet")
+        .expect("no model spec");
+    assert_eq!(plain.task, "high performance caching");
+    assert_eq!(plain.adversarial_backend, Backend::Codex);
+}
+
+#[test]
+fn gam_args_consume_one_effort_word_after_a_model_spec() {
+    let effort = parse_gam_args("claude opus high perf tuning", Backend::Codex, "gpt-5.5")
+        .expect("provider + model + effort");
+    assert_eq!(effort.adversarial_backend, Backend::Claude);
+    assert_eq!(effort.adversarial_model, "opus");
+    assert_eq!(effort.task, "perf tuning");
+    // Without a preceding model spec, "high" stays part of the ask.
+    let mid_task = parse_gam_args("keep the high latency path fast", Backend::Claude, "sonnet")
+        .expect("task keeps its words");
+    assert_eq!(mid_task.task, "keep the high latency path fast");
+}
+
+#[test]
+fn gam_args_require_a_task() {
+    assert!(parse_gam_args("", Backend::Claude, "sonnet").is_err());
+    assert!(parse_gam_args("main", Backend::Claude, "sonnet").is_err());
+    assert!(parse_gam_args("claude opus high", Backend::Codex, "gpt-5.5").is_err());
+}
+
+#[test]
+fn gam_verdict_block_parses_all_three_routes() {
+    let lines: Vec<String> = [
+        "Some review prose.",
+        GAM_VERDICT_START,
+        r#"{"verdict":"accept","message":"solid"}"#,
+        GAM_VERDICT_END,
+        "trailing",
+    ]
+    .iter()
+    .map(|line| line.to_string())
+    .collect();
+    assert_eq!(
+        parse_gam_verdict(&lines),
+        Some(GamVerdict::Accept("solid".to_string()))
+    );
+
+    let revise: Vec<String> = [
+        GAM_VERDICT_START,
+        r#"{"verdict":"revise","message":"the parser is untested"}"#,
+        GAM_VERDICT_END,
+    ]
+    .iter()
+    .map(|line| line.to_string())
+    .collect();
+    assert_eq!(
+        parse_gam_verdict(&revise),
+        Some(GamVerdict::Revise("the parser is untested".to_string()))
+    );
+
+    let escalate: Vec<String> = [GAM_VERDICT_START, r#"{"verdict":"escalate","message":"scope dispute"}"#, GAM_VERDICT_END]
+        .iter()
+        .map(|line| line.to_string())
+        .collect();
+    assert_eq!(
+        parse_gam_verdict(&escalate),
+        Some(GamVerdict::Escalate("scope dispute".to_string()))
+    );
+}
+
+#[test]
+fn gam_verdict_survives_markdown_fences_and_takes_the_last_block() {
+    let lines: Vec<String> = [
+        "RUDDER_GAM_REPLY_START",
+        "stale",
+        "RUDDER_GAM_REPLY_END",
+        GAM_VERDICT_START,
+        "```json",
+        r#"{"verdict":"revise","message":"check the null case"}"#,
+        "```",
+        GAM_VERDICT_END,
+    ]
+    .iter()
+    .map(|line| line.to_string())
+    .collect();
+    assert_eq!(
+        parse_gam_verdict(&lines),
+        Some(GamVerdict::Revise("check the null case".to_string()))
+    );
+}
+
+#[test]
+fn gam_verdict_missing_or_empty_escalates_via_none() {
+    let prose: Vec<String> = vec!["just talking, no block".to_string()];
+    assert_eq!(parse_gam_verdict(&prose), None);
+    let empty: Vec<String> = [GAM_VERDICT_START, GAM_VERDICT_END]
+        .iter()
+        .map(|line| line.to_string())
+        .collect();
+    assert_eq!(parse_gam_verdict(&empty), None);
+    // A malformed body still carries an objection: degrade to revise text.
+    let malformed: Vec<String> = [
+        GAM_VERDICT_START,
+        "the diff drops error handling in src/auth.rs",
+        GAM_VERDICT_END,
+    ]
+    .iter()
+    .map(|line| line.to_string())
+    .collect();
+    assert_eq!(
+        parse_gam_verdict(&malformed),
+        Some(GamVerdict::Revise(
+            "the diff drops error handling in src/auth.rs".to_string()
+        ))
+    );
+}
+
+#[test]
+fn lift_gam_reply_takes_the_last_reply_block_only() {
+    let lines: Vec<String> = [
+        "working...",
+        GAM_REPLY_START,
+        "first draft of my defense",
+        GAM_REPLY_END,
+        GAM_REPLY_START,
+        "final: the benchmark justifies it",
+        GAM_REPLY_END,
+    ]
+    .iter()
+    .map(|line| line.to_string())
+    .collect();
+    assert_eq!(
+        lift_gam_reply(&lines).as_deref(),
+        Some("final: the benchmark justifies it")
+    );
+    let silent: Vec<String> = vec!["no pushback here".to_string()];
+    assert_eq!(lift_gam_reply(&silent), None);
+}
+
+#[test]
+fn gam_packet_carries_task_round_and_visible_truncation() {
+    let mut gam = GamState {
+        role: GamRole::Generator,
+        peer_run_id: "peer".to_string(),
+        round: 2,
+        max_rounds: 4,
+        phase: GamPhase::AwaitingVerdict,
+        task: "refactor auth".to_string(),
+        last_message: "I disagree about the token shape".to_string(),
+        awaiting_since: None,
+    };
+    let packet = gam_review_packet(&gam, "- a.ts | 1 +");
+    assert!(packet.contains("refactor auth"));
+    assert!(packet.contains("Review round 3 of 4"));
+    // The generator's reply is relayed from the SECOND packet on (round > 0).
+    assert!(packet.contains("I disagree about the token shape"));
+
+    gam.round = 0;
+    let first = gam_review_packet(&gam, "");
+    // Round 1 has no reply to relay and names the empty diff honestly.
+    assert!(!first.contains("GENERATOR'S REPLY"));
+    assert!(first.contains("(empty"));
+
+    let oversized = "x".repeat(GAM_DIFF_BUDGET_CHARS + 10);
+    let truncated = gam_review_packet(&gam, &oversized);
+    assert!(truncated.contains("TRUNCATED"));
+}
+
+fn spawn_gam_fake(app: &App, dir: &std::path::Path, log_name: &str, output: &str) -> TerminalPane {
+    // The fake prints `output`, then reads its stdin FOREGROUND into
+    // `log_name` so injected packets land in the file. (A background `cat`
+    // gets SIGTTIN-stopped on the controlling terminal and silently never
+    // reads, which filled the PTY input queue and blocked master writes.)
+    // The foreground read keeps the PTY open until Rudder terminates it.
+    let script = format!(
+        "#!/bin/sh\nprintf '%s\\n' {out}\ncat >> {log}\n",
+        out = shell_single_quote(output),
+        log = shell_single_quote(&dir.join(log_name).to_string_lossy()),
+    );
+    let fake = dir.join(format!("fake-{log_name}.sh"));
+    write_fake_bin(&fake, &script);
+    TerminalPane::spawn_shell_or_command(
+        Some(TerminalCommand::with_args(
+            "/bin/sh",
+            [fake.to_string_lossy().to_string()],
+        )),
+        TerminalPaneOptions {
+            size: TerminalSize {
+                rows: 24,
+                cols: 80,
+            },
+            cwd: Some(app.cwd.clone()),
+            ..Default::default()
+        },
+    )
+    .expect("spawn gam fake pane")
+}
+
+fn gam_test_pair(
+    app: &mut App,
+    reviewer_output: &str,
+) -> (usize, usize) {
+    let generator = test_agent_run("gam-gen", "refactor auth");
+    app.agents.push(generator);
+    let reviewer_pane = spawn_gam_fake(app, &app.cwd.clone(), "reviewer.log", reviewer_output);
+    let mut reviewer = test_agent_run_with_terminal(app, reviewer_pane);
+    reviewer.id = "gam-adv".to_string();
+    reviewer.mode = AgentMode::GamAdversarial;
+    app.agents.push(reviewer);
+    let generator_pane = spawn_gam_fake(app, &app.cwd.clone(), "generator.log", "did work");
+    app.agents[0].terminal = Some(generator_pane);
+    // Both halves idle between turns (Done), which is when packets flow.
+    app.agents[0].status = AgentStatus::Done;
+    app.agents[1].status = AgentStatus::Done;
+    for (index, role, peer) in [
+        (0usize, GamRole::Generator, "gam-adv".to_string()),
+        (1usize, GamRole::Adversarial, "gam-gen".to_string()),
+    ] {
+        app.agents[index].gam = Some(GamState {
+            role,
+            peer_run_id: peer,
+            round: 0,
+            max_rounds: MAX_GAM_ROUNDS,
+            phase: GamPhase::GeneratorWorking,
+            task: "refactor auth".to_string(),
+            last_message: String::new(),
+            awaiting_since: None,
+        });
+    }
+    app.selected_agent = 0;
+    // Give both freshly spawned PTYs a beat to come up; an immediate write can
+    // race the child's setup.
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    (0, 1)
+}
+
+#[cfg(not(windows))]
+#[test]
+fn gam_delivers_packet_to_the_reviewer_once() {
+    let dir = unique_test_repo("gam-deliver");
+    let mut app = App::new();
+    app.cwd = dir.clone();
+    let (_gen, adv) = gam_test_pair(&mut app, "standing by");
+
+    app.poll_gam_pairs();
+
+    assert!(
+        matches!(
+            app.agents[0].gam.as_ref().unwrap().phase,
+            GamPhase::AwaitingVerdict
+        ),
+        "generator phase: {:?} · notice {:?} · err {:?}",
+        app.agents[0].gam.as_ref().unwrap().phase,
+        app.notice,
+        app.agents[0].last_error
+    );
+    // Exactly once: a second pass must not re-deliver (phase-gated).
+    app.poll_gam_pairs();
+    std::thread::sleep(std::time::Duration::from_millis(120));
+    let log = fs::read_to_string(dir.join("reviewer.log")).unwrap_or_default();
+    let packets = log.matches("Review round 1 of 4").count();
+    assert_eq!(packets, 1, "one packet delivered: {log:?}");
+    assert!(log.contains("refactor auth"), "packet carries the task");
+    assert!(
+        matches!(
+            app.agents[adv].gam.as_ref().unwrap().phase,
+            GamPhase::AwaitingVerdict
+        ),
+        "adversarial phase: {:?} · completed_at set: {}",
+        app.agents[adv].gam.as_ref().unwrap().phase,
+        app.agents[adv].completed_at.is_some()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn wait_for_log(dir: &std::path::Path, name: &str, needle: &str) -> String {
+    let log_path = dir.join(name);
+    for _ in 0..50 {
+        if let Ok(log) = fs::read_to_string(&log_path) {
+            if log.contains(needle) {
+                return log;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(40));
+    }
+    fs::read_to_string(&log_path).unwrap_or_default()
+}
+
+/// Drain a run's PTY until its visible lines contain `needle` (or give up),
+/// so tests that read the pane directly (verdict routing) see the fake's
+/// output. poll_agents is not running here, so nothing else drains it.
+fn drain_until(app: &mut App, index: usize, needle: &str) -> bool {
+    for _ in 0..60 {
+        if let Some(run) = app.agents.get_mut(index) {
+            if let Some(terminal) = run.terminal.as_mut() {
+                let _ = terminal.drain_output();
+                if terminal
+                    .visible_lines_snapshot()
+                    .iter()
+                    .any(|line| line.contains(needle))
+                {
+                    return true;
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(40));
+    }
+    false
+}
+
+#[cfg(not(windows))]
+#[test]
+fn gam_revise_verdict_reaches_the_generator_and_bumps_the_round() {
+    let dir = unique_test_repo("gam-revise");
+    let mut app = App::new();
+    app.cwd = dir.clone();
+    let (_gen, _adv) = gam_test_pair(
+        &mut app,
+        "objections follow\nRUDDER_GAM_VERDICT_START\n{\"verdict\":\"revise\",\"message\":\"add tests for the parser\"}\nRUDDER_GAM_VERDICT_END",
+    );
+    // The reviewer has already spoken; drain its pane so the routing pass can
+    // read the verdict off the buffer, then put the pair in the waiting state.
+    assert!(drain_until(&mut app, 1, GAM_VERDICT_END));
+    // Simulate the reviewer finishing its verdict turn AFTER the packet:
+    // delivery timestamp first, then a fresh completion on the reviewer row.
+    for index in [0usize, 1usize] {
+        if let Some(gam) = app.agents[index].gam.as_mut() {
+            gam.phase = GamPhase::AwaitingVerdict;
+            gam.awaiting_since = Some(Instant::now());
+        }
+    }
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    app.agents[1].status = AgentStatus::Done;
+    app.agents[1].completed_at = Some(Instant::now());
+
+    app.poll_gam_pairs();
+
+    assert_eq!(app.agents[0].gam.as_ref().unwrap().round, 1);
+    assert!(matches!(
+        app.agents[0].gam.as_ref().unwrap().phase,
+        GamPhase::GeneratorWorking
+    ));
+    let log = wait_for_log(&dir, "generator.log", "[gam reviewer");
+    assert!(log.contains("add tests for the parser"), "revision relayed");
+    assert!(log.contains("[gam reviewer · round 1]"));
+    // Phase-gated: a second pass must not re-read or re-inject.
+    app.poll_gam_pairs();
+    std::thread::sleep(std::time::Duration::from_millis(80));
+    let reread = fs::read_to_string(dir.join("generator.log")).unwrap_or_default();
+    assert_eq!(reread.matches("[gam reviewer").count(), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(not(windows))]
+#[test]
+fn gam_accept_settles_the_pair() {
+    let dir = unique_test_repo("gam-accept");
+    let mut app = App::new();
+    app.cwd = dir.clone();
+    let (_gen, _adv) = gam_test_pair(
+        &mut app,
+        "fine work\nRUDDER_GAM_VERDICT_START\n{\"verdict\":\"accept\",\"message\":\"done\"}\nRUDDER_GAM_VERDICT_END",
+    );
+    assert!(drain_until(&mut app, 1, GAM_VERDICT_END));
+    for index in [0usize, 1usize] {
+        if let Some(gam) = app.agents[index].gam.as_mut() {
+            gam.phase = GamPhase::AwaitingVerdict;
+            gam.awaiting_since = Some(Instant::now());
+        }
+    }
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    app.agents[1].status = AgentStatus::Done;
+    app.agents[1].completed_at = Some(Instant::now());
+
+    app.poll_gam_pairs();
+
+    for index in [0usize, 1usize] {
+        assert_eq!(
+            app.agents[index].gam.as_ref().unwrap().phase,
+            GamPhase::Settled(GamOutcome::Accepted)
+        );
+    }
+    assert!(
+        app.activity_log
+            .iter()
+            .any(|line| line.contains("accepted the work")),
+        "acceptance logged: {:?}",
+        app.activity_log
+    );
+}
+
+#[cfg(not(windows))]
+#[test]
+fn gam_round_cap_escalates_but_still_delivers_the_last_objection() {
+    let dir = unique_test_repo("gam-cap");
+    let mut app = App::new();
+    app.cwd = dir.clone();
+    let (_gen, _adv) = gam_test_pair(
+        &mut app,
+        "still no\nRUDDER_GAM_VERDICT_START\n{\"verdict\":\"revise\",\"message\":\"the cap test\"}\nRUDDER_GAM_VERDICT_END",
+    );
+    assert!(drain_until(&mut app, 1, GAM_VERDICT_END));
+    for index in [0usize, 1usize] {
+        if let Some(gam) = app.agents[index].gam.as_mut() {
+            gam.round = MAX_GAM_ROUNDS.saturating_sub(1);
+            gam.max_rounds = MAX_GAM_ROUNDS;
+            gam.phase = GamPhase::AwaitingVerdict;
+            gam.awaiting_since = Some(Instant::now());
+        }
+    }
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    app.agents[1].status = AgentStatus::Done;
+    app.agents[1].completed_at = Some(Instant::now());
+
+    app.poll_gam_pairs();
+
+    for index in [0usize, 1usize] {
+        assert_eq!(
+            app.agents[index].gam.as_ref().unwrap().phase,
+            GamPhase::Settled(GamOutcome::Escalated(
+                "round cap (4) reached without acceptance".to_string()
+            ))
+        );
+    }
+    // The final objection still reaches the generator so it can act manually.
+    let log = wait_for_log(&dir, "generator.log", "[gam reviewer");
+    assert!(log.contains("the cap test"), "cap objection relayed");
+    assert!(
+        app.notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("gam needs you")),
+    );
+}
+
+#[test]
+fn gam_suggestions_drill_down_like_the_model_picker() {
+    let mut app = App::new();
+    app.task_input = "/gam".to_string();
+    let providers = suggestions_for(&app);
+    assert!(
+        providers
+            .iter()
+            .any(|suggestion| matches!(suggestion.action, SuggestionAction::ChooseGamProvider(_))),
+        "providers offered first"
+    );
+
+    app.task_input = "/gam codex ".to_string();
+    let models = suggestions_for(&app);
+    assert!(
+        !models.is_empty(),
+        "codex models offered as adversarial candidates"
+    );
+    assert!(
+        models
+            .iter()
+            .all(|suggestion| matches!(suggestion.action, SuggestionAction::ChooseGamModel { .. })),
+        "every model row inserts into /gam, not defaults"
+    );
+
+    // Once a model is chosen the rest of the line is task text.
+    app.task_input = "/gam codex gpt-5.5 ".to_string();
+    assert!(suggestions_for(&app).is_empty());
+}
+
+#[cfg(not(windows))]
+#[test]
+fn gam_split_render_draws_both_halves_with_roles() {
+    let dir = unique_test_repo("gam-render");
+    let mut app = App::new();
+    app.cwd = dir.clone();
+    let (_gen, _adv) = gam_test_pair(&mut app, "reviewer online");
+    app.focus = FocusPane::Worker;
+    let screen = render_screen(&mut app, 100, 24);
+    assert!(screen.contains("gen ·"), "left half labeled: {screen}");
+    assert!(screen.contains("adv ·"), "right half labeled");
+    assert!(screen.contains("round 1/4"), "round badge shown");
+
+    // The leader 'a' chord swaps which half is selected.
+    app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+    app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+    assert_eq!(app.selected_agent, 1, "toggled to the adversarial half");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+

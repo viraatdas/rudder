@@ -345,7 +345,11 @@ impl AgentRun {
                 // completion path calls it "a task entering review"). The old
                 // "verifying" label read as active work when the agent had in
                 // fact finished and was awaiting review/merge.
-                AgentStatus::Done if self.is_main() || self.is_oneoff() => "completed",
+                AgentStatus::Done
+                    if self.is_main() || self.is_oneoff() || self.is_gam_adversary() =>
+                {
+                    "completed"
+                }
                 AgentStatus::Done => "review",
                 AgentStatus::Failed => "failed",
                 AgentStatus::Stopped => "cancelled",

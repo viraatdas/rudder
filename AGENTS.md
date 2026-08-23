@@ -1503,9 +1503,48 @@ plan): an explicit `OrchestratorMode` enum/header (behaviour already derives fro
 `refining`/`rebasing`/`awaiting_approval`), and the remaining DAG-edit steering (edge
 promote/demote, extract-shared, reorder).
 
+### 14.10.5 `/gam`: the generator/adversarial pair (2026-08)
+Two models argue about one piece of work: a GENERATOR implements (normal Execute
+worker, dashboard default model, isolated jj workspace unless the `main` keyword
+is given), and an ADVERSARIAL reviewer (the model named after `/gam`) questions
+it. Only the generator ever edits; the reviewer is read-only by construction —
+Claude via a tool ALLOWLIST (`GAM_ADVERSARIAL_CLAUDE_TOOLS`, no Bash because a
+Claude Bash call can write), Codex via `--sandbox read-only` (runtime-enforced).
+The pair renders as a SPLIT worker pane (generator left, adversarial right,
+`render_gam_split`); click a half or `^W` `a` to move between them; wheel routes
+to whichever half is under the pointer.
+
+- **Grammar**: `/gam [main] [<claude|codex|opencode> [model] [effort]] <task>`.
+  Bare model aliases (`/gam fable …`) resolve through `known_model_backend` —
+  NEVER `backend_for_model`, which guesses Claude for any word and would eat
+  task verbs. No spec at all cross-picks the OTHER backend's default model.
+- **Round loop** (`poll_gam_pairs`, runs every heartbeat after status updates):
+  generator turn Done → lift its optional `{GAM_REPLY_START..END}` reply note →
+  packet (original task + reply + `jj_diff_text` bounded at 16k with a VISIBLE
+  truncation marker) pasted into the reviewer pane → reviewer turn Done → parse
+  `{GAM_VERDICT_START..END}` JSON from its screen → route accept / revise
+  (becomes the generator's next user turn) / escalate. Cap `MAX_GAM_ROUNDS = 4`,
+  then settle Escalated but still deliver the final objection. Unparseable
+  verdicts escalate rather than guess. Both panes stay live after settling for
+  manual driving.
+- **Zero new filesystem state by design**: packets/replies cross through PTY
+  stdin + the terminal buffers Rudder already owns; the only durable state is
+  the `gam` object inside each run.json (role, peerId, round, maxRounds, phase,
+  task, lastMessage). Signals reuse `<rudder_home>/signals/<run_id>.json`.
+- **Freshness gate**: `GamState.awaiting_since` (transient, not serialized) is
+  stamped at delivery; routing requires the reviewer's `completed_at` AFTER it.
+  Without this, the reviewer's PREVIOUS Done satisfied the wait one frame after
+  delivery and routed its stale screen ("no verdict block" escalations on
+  delivery tick). Post-restart there is no timestamp; the PTYs are gone anyway
+  so routing escalates visibly.
+- **Testing hazard that cost an afternoon**: test fakes must read their PTY
+  stdin in the FOREGROUND. A background `cat >> log &` gets SIGTTIN-stopped on
+  the controlling terminal, silently never reads, the ~1KB kernel tty input
+  queue fills, and master writes BLOCK until child exit then fail EIO — which
+  looks exactly like an App bug. Foreground `cat >> log` drains correctly.
+
 ### 14.10 Product decisions (the durable "why")
-Recorded so future contributors do not relitigate them:
-- **Autonomy without a confirm gate.** The conductor acts unilaterally (auto-expand,
+Recorded so future contributors do not relitigate them:- **Autonomy without a confirm gate.** The conductor acts unilaterally (auto-expand,
   drift-fix, plan-rebase, merges). The bargain is VISIBLE (every action lands in
   `activity_log`) and UNDOABLE (jj op-log via `rudder undo`), not gated. The only
   explicit-intent action is reverting already-MERGED work (build-forward).

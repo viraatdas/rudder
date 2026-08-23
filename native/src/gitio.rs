@@ -357,6 +357,7 @@ pub(crate) fn create_main_agent(
         done_summary: None,
         tokens_in: 0,
         tokens_out: 0,
+        gam: None,
     }
 }
 
@@ -857,6 +858,7 @@ pub(crate) fn agent_from_run_record(
             .map(ToOwned::to_owned),
         tokens_in,
         tokens_out,
+        gam: gam_state_from_record(&record),
     };
     // A record persisted with the resolver labels ("Resolve merge conflicts: …")
     // and merged out of band (records written before the merge-time restore
@@ -934,8 +936,70 @@ pub(crate) fn agent_status_from_record(status: Option<&str>) -> AgentStatus {
     }
 }
 
-pub(crate) fn integration_evidence_from_record(record: &serde_json::Value) -> IntegrationEvidence {
-    let merge = record.get("merge");
+/// Read a persisted `/gam` pair link back off a run record. Old records (and
+/// every non-gam run) have no `gam` object and load as `None`.
+pub(crate) fn gam_state_from_record(record: &serde_json::Value) -> Option<crate::GamState> {
+    use crate::{GamOutcome, GamPhase, GamRole, GamState, MAX_GAM_ROUNDS};
+    let gam = record.get("gam")?;
+    let role = gam
+        .get("role")
+        .and_then(serde_json::Value::as_str)
+        .and_then(GamRole::parse)?;
+    let peer_run_id = gam
+        .get("peerId")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)?;
+    let task = gam
+        .get("task")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let phase = match gam.get("phase").and_then(serde_json::Value::as_str) {
+        Some("verdict") => GamPhase::AwaitingVerdict,
+        Some("accepted") => GamPhase::Settled(GamOutcome::Accepted),
+        // An escalation reason is not persisted (it lives in the activity log);
+        // a reloaded escalated pair still reads as ended-without-agreement.
+        Some("escalated") => GamPhase::Settled(GamOutcome::Escalated(String::new())),
+        _ => GamPhase::GeneratorWorking,
+    };
+    Some(GamState {
+        role,
+        peer_run_id,
+        round: gam.get("round").and_then(serde_json::Value::as_u64).unwrap_or(0) as u32,
+        max_rounds: gam
+            .get("maxRounds")
+            .and_then(serde_json::Value::as_u64)
+            .map(|value| value as u32)
+            .filter(|value| *value > 0)
+            .unwrap_or(MAX_GAM_ROUNDS),
+        phase,
+        task,
+        last_message: gam
+            .get("lastMessage")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        // Transient delivery timestamp: meaningless across a restart.
+        awaiting_since: None,
+    })
+}
+
+/// Mirror of `gam_state_from_record` for writes. Absent from the JSON entirely
+/// when the row is not part of a `/gam` pair, so old readers see nothing new.
+pub(crate) fn gam_state_to_json(gam: &crate::GamState) -> serde_json::Value {
+    serde_json::json!({
+        "role": gam.role.as_str(),
+        "peerId": gam.peer_run_id,
+        "round": gam.round,
+        "maxRounds": gam.max_rounds,
+        "phase": gam.phase.as_str(),
+        "task": gam.task,
+        "lastMessage": gam.last_message,
+    })
+}
+
+pub(crate) fn integration_evidence_from_record(record: &serde_json::Value) -> IntegrationEvidence {    let merge = record.get("merge");
     let text = |field: &str| {
         merge
             .and_then(|value| value.get(field))
@@ -1124,6 +1188,9 @@ pub(crate) fn save_native_run_record(repo_root: &Path, run: &AgentRun) -> Result
         "delivery": run.delivery.to_json(),
         "session": run.session_id.as_ref().map(|sid| serde_json::json!({ "nativeSessionId": sid })),
     });
+    if let Some(gam) = run.gam.as_ref() {
+        record["gam"] = gam_state_to_json(gam);
+    }
     // Native and TS commands share run.json. Preserve fields owned by the TS
     // merge/undo/verifier layers instead of replacing the document with the
     // native projection on every UI transition.

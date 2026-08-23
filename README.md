@@ -201,6 +201,7 @@ running, Rudder also exposes matching project skills; the orchestrator can write
 | `/model` | Pick provider, then model, then effort |
 | `/fast` | Fast mode for new agents: flagship model at low effort (Claude opus / Codex gpt-5.5); `/model` switches back |
 | `/plan <text>` | Start the orchestrator / DAG planner |
+| `/gam [main] [<model>] <task>` | Generator + adversarial reviewer pair: split panes, the reviewer questions every round and only the generator edits |
 | `/run <task>` | Start one isolated mergeable worker, with no DAG |
 | `/ask <text>` | Start a one-off conversational agent in the main checkout |
 | `/share <text>` | Save gitignored shared context for all agents in `RUDDER_SHARED.md` |

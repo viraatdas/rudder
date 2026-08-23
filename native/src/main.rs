@@ -469,6 +469,10 @@ enum AgentMode {
     /// about the user's real files. Structurally like Main (main checkout, no jj
     /// workspace, bypass-permissions tools), distinct in intent + its own list section.
     OneOff,
+    /// The adversarial half of a `/gam` pair: a READ-ONLY reviewer that questions
+    /// the generator's work and sends revision requests back through Rudder. It
+    /// never holds a jj workspace and never merges; its only output is talk.
+    GamAdversarial,
 }
 
 const MAIN_AGENT_ID: &str = "__main__";
@@ -488,6 +492,7 @@ impl AgentMode {
             Self::ReviewAll => "review-all",
             Self::Main => "main",
             Self::OneOff => "one-off",
+            Self::GamAdversarial => "gam-adversarial",
         }
     }
 
@@ -499,9 +504,376 @@ impl AgentMode {
             "review-all" | "review_all" | "reviewall" => Some(Self::ReviewAll),
             "main" => Some(Self::Main),
             "one-off" | "oneoff" | "ask" => Some(Self::OneOff),
+            "gam-adversarial" | "gam_adversarial" | "gam-adv" => Some(Self::GamAdversarial),
             _ => None,
         }
     }
+}
+
+/// Which half of a `/gam` pair this row is.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GamRole {
+    /// The implementing agent. Owns every edit; receives revision requests.
+    Generator,
+    /// The adversarial reviewer. Read-only; questions the generator's work.
+    Adversarial,
+}
+
+impl GamRole {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Generator => "generator",
+            Self::Adversarial => "adversarial",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "generator" => Some(Self::Generator),
+            "adversarial" => Some(Self::Adversarial),
+            _ => None,
+        }
+    }
+}
+
+/// Where the round loop stands for one `/gam` pair.
+#[derive(Clone, Debug, PartialEq)]
+enum GamPhase {
+    /// The generator is working on its current turn.
+    GeneratorWorking,
+    /// The review packet was delivered to the adversarial pane; waiting on its
+    /// verdict.
+    AwaitingVerdict,
+    /// The automatic loop ended. Both panes stay live; the user drives from here.
+    Settled(GamOutcome),
+}
+
+impl GamPhase {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::GeneratorWorking => "working",
+            Self::AwaitingVerdict => "verdict",
+            Self::Settled(GamOutcome::Accepted) => "accepted",
+            Self::Settled(GamOutcome::Escalated(_)) => "escalated",
+        }
+    }
+}
+
+/// How the loop ended when it settled.
+#[derive(Clone, Debug, PartialEq)]
+enum GamOutcome {
+    Accepted,
+    /// Cap reached, verdict unparseable, reviewer gone, or the adversarial model
+    /// explicitly asked for a human.
+    Escalated(String),
+}
+
+/// One generator/adversarial pair ("gam"). Mirrored on BOTH rows so either pane
+/// can find its peer and render the round badge; the ROUND LOOP itself runs only
+/// from the generator row (single-writer, like every other App mutation).
+#[derive(Clone, Debug)]
+struct GamState {
+    role: GamRole,
+    peer_run_id: String,
+    /// Reviews completed so far (the first packet is round 1's start).
+    round: u32,
+    max_rounds: u32,
+    phase: GamPhase,
+    /// The user's original ask, kept clean of the protocol preamble so every
+    /// packet anchors on the same request.
+    task: String,
+    /// The adversarial side's most recent message (objection text or the accept
+    /// note), carried into the next packet so the conversation accumulates
+    /// instead of restarting each round.
+    last_message: String,
+    /// When the latest packet was delivered. TRANSIENT (not persisted): the
+    /// verdict-routing gate compares the reviewer's `completed_at` against it,
+    /// so the reviewer's PREVIOUS turn's Done (e.g. its bootstrap ack) can never
+    /// satisfy the wait — only a completion that happened after we asked. This
+    /// closes the race where delivery and routing fired on consecutive frames.
+    awaiting_since: Option<Instant>,
+}
+
+const GAM_VERDICT_START: &str = "RUDDER_GAM_VERDICT_START";
+const GAM_VERDICT_END: &str = "RUDDER_GAM_VERDICT_END";
+/// Revisions before the loop escalates instead of looping forever. Four full
+/// reviews is already a long argument; beyond that a human should arbitrate.
+const MAX_GAM_ROUNDS: u32 = 4;
+/// Diff budget per packet, matching the haiku backstop's discipline: bounded,
+/// and truncated VISIBLY so the reviewer never objects to code it cannot see.
+const GAM_DIFF_BUDGET_CHARS: usize = 16_000;
+/// The generator talks back through this sentinel pair, lifted from its pane
+/// after each completed turn and relayed verbatim in the next review packet.
+/// Same trick as the orchestrator's approve marker: exact-line match against
+/// our own terminal buffer, immune to how backends render markdown.
+const GAM_REPLY_START: &str = "RUDDER_GAM_REPLY_START";
+const GAM_REPLY_END: &str = "RUDDER_GAM_REPLY_END";
+/// One relayed note (verdict message or generator reply) is capped before it is
+/// pasted into the peer's PTY. A reviewer essay longer than this has stopped
+/// reviewing and started writing its own implementation.
+const GAM_MESSAGE_BUDGET_CHARS: usize = 4_000;
+const GAM_USAGE: &str = "usage: /gam [main] [<claude|codex|opencode> [model]] <task> — start a generator + adversarial reviewer pair (reviewer model defaults to the other provider; 'main' runs in the shared checkout instead of an isolated workspace)";
+
+/// A parsed `/gam` invocation.
+#[derive(Clone, Debug)]
+struct GamRequest {
+    task: String,
+    adversarial_backend: Backend,
+    adversarial_model: String,
+    in_main: bool,
+}
+
+fn cross_gam_backend(default_backend: Backend) -> Backend {
+    match default_backend {
+        Backend::Claude => Backend::Codex,
+        // Both Codex and opencode generators pair with Claude by default: it is
+        // the only other backend with a guaranteed-configured CLI here.
+        _ => Backend::Claude,
+    }
+}
+
+/// Parse the argument tail of a `/gam` invocation.
+///
+/// Grammar: `[main] [<provider> [model] [effort]] | [<model> [effort]]] <task>`.
+///
+/// Deliberately greedy ONLY where the token vocabulary is closed: `main`, the
+/// three provider keywords, and effort words are consumed by exact match; a
+/// bare model name is taken from the first token only when the model tables
+/// recognize it (so "/gam fix the auth bug" keeps ALL its words as the task,
+/// while "/gam fable fix the auth bug" pairs sonnet-default claude with fable).
+/// An explicit provider consumes the next token as its model unconditionally —
+/// the picker inserts that form, so mis-typing shows up immediately in the
+/// launch notice naming the chosen reviewer model.
+fn parse_gam_args(
+    rest: &str,
+    default_backend: Backend,
+    default_model: &str,
+) -> Result<GamRequest, String> {
+    let mut tokens = rest.split_whitespace().peekable();
+    let mut in_main = false;
+    if tokens.peek().is_some_and(|token| *token == "main") {
+        in_main = true;
+        tokens.next();
+    }
+
+    let mut adversarial_backend: Option<Backend> = None;
+    let mut adversarial_model: Option<String> = None;
+
+    if let Some(provider) = tokens.peek().and_then(|token| provider_backend(token)) {
+        adversarial_backend = Some(provider);
+        tokens.next();
+        // An explicit provider consumes the next token as its model
+        // unconditionally: the picker inserts exactly this shape, and a mis-taken
+        // word shows up immediately in the launch notice naming the reviewer.
+        adversarial_model = tokens.next().map(str::to_string);
+    } else if let Some(first) = tokens.peek() {
+        // A bare model alias/id ("fable", "gpt-5.5", …): recognized through the
+        // same tables /model offers, and its backend comes with it. Task words
+        // ("fix", "refactor") are NOT model ids, so they stay in the ask.
+        let candidate = (*first).to_string();
+        if let Some(backend) = known_model_backend(&candidate) {
+            adversarial_backend = Some(backend);
+            adversarial_model = Some(candidate);
+            tokens.next();
+        }
+    }
+
+    let explicit_spec = adversarial_backend.is_some() || adversarial_model.is_some();
+    let adversarial_backend = adversarial_backend.unwrap_or_else(|| cross_gam_backend(default_backend));
+    let adversarial_model = adversarial_model
+        .map(|model| model.trim().to_string())
+        .filter(|model| !model.is_empty())
+        .unwrap_or_else(|| default_model_for(adversarial_backend).trim().to_string());
+    // A recognized model spec may be followed by ONE effort word. Never consumed
+    // mid-task: without a preceding model spec, "high" stays part of the ask.
+    if explicit_spec {
+        if let Some(effort_token) = tokens.peek() {
+            if parse_effort_arg(effort_token).is_some() || effort_token.eq_ignore_ascii_case("auto")
+            {
+                tokens.next();
+                // The effort itself is derived from the model below; the token is
+                // consumed only to keep it out of the task text.
+            }
+        }
+    }
+
+    let task = tokens.collect::<Vec<_>>().join(" ");
+    let task = task.trim().to_string();
+    if task.is_empty() {
+        return Err(GAM_USAGE.to_string());
+    }
+    Ok(GamRequest {
+        task,
+        adversarial_backend,
+        adversarial_model: if adversarial_model.is_empty() {
+            default_model.to_string()
+        } else {
+            adversarial_model
+        },
+        in_main,
+    })
+}
+
+/// Appended to the generator's launch prompt so it knows revisions will arrive
+/// under Rudder's signature and how to argue back when it disagrees.
+fn gam_generator_protocol_note() -> String {
+    format!(
+        "\n\nADVERSARIAL REVIEW PAIRING: You are the generator in a Rudder gam pair. \
+A separate read-only reviewer model audits your diff after each turn and may send \
+revision requests. They arrive as user messages beginning \"[gam reviewer\" — treat \
+them as review feedback from a colleague: address the substance directly. If you \
+disagree with an objection, do not silently comply; state your reasoning in one \
+short paragraph wrapped exactly in {start} and {end} lines, and keep implementing \
+unless the objection is clearly right. Your edits stay yours alone; the reviewer \
+cannot modify anything.",
+        start = GAM_REPLY_START,
+        end = GAM_REPLY_END,
+    )
+}
+
+/// The packet handed to the adversarial reviewer. Round 1 arrives right after
+/// the generator's first turn; later rounds carry the same anchors plus the
+/// generator's latest reply, because the reviewer RESUMES ITS OWN SESSION and
+/// must not re-pay context it already holds.
+fn gam_review_packet(gam: &GamState, diff: &str) -> String {
+    let round_label = format!("Review round {} of {}", gam.round + 1, gam.max_rounds);
+    let mut packet = String::new();
+    packet.push_str(&format!(
+        "[gam reviewer · {round_label}] You are the ADVERSARIAL REVIEWER half of a \
+Rudder gam pair. The generator implements; you question. You have read-only access: \
+you cannot edit any file, ever.\n\n\
+ORIGINAL TASK\n{task}\n\n",
+        task = gam.task,
+    ));
+    if gam.round > 0 && !gam.last_message.trim().is_empty() {
+        packet.push_str(&format!(
+            "GENERATOR'S REPLY TO YOUR LAST OBJECTION\n{}\n\n",
+            truncate_chars(gam.last_message.trim(), GAM_MESSAGE_BUDGET_CHARS)
+        ));
+    }
+    if diff.trim().is_empty() {
+        packet.push_str(
+            "DIFF\n(empty — the generator's working copy has no changes yet)\n\n",
+        );
+    } else if diff.chars().count() >= GAM_DIFF_BUDGET_CHARS {
+        packet.push_str(&format!(
+            "DIFF (TRUNCATED at {budget} chars — object to nothing outside what is shown; \
+say so in your verdict if the unseen remainder matters)\n{diff}\n\n",
+            budget = GAM_DIFF_BUDGET_CHARS,
+            diff = diff,
+        ));
+    } else {
+        packet.push_str(&format!("DIFF\n{diff}\n\n"));
+    }
+    packet.push_str(
+        "REVIEW CONTRACT\n\
+- Refute first: actively hunt for what is wrong, missing, oversimplified, or \
+untested. Question the generator's claims against the actual diff and files, not \
+its narrative.\n\
+- Accept ONLY when the work plainly satisfies the ORIGINAL TASK with no blocking \
+defects you can demonstrate.\n\
+- Revise means concrete, actionable objections (file, symptom, why it blocks the \
+task). Nitpicks belong in the message, not in blocking acceptance.\n\
+- Escalate when the disagreement needs a human: scope disputes, irreconcilable \
+approaches, or the generator repeatedly ignoring a correct objection.\n\n\
+OUTPUT CONTRACT — end your reply with EXACTLY this block:\n\
+```\n\
+RUDDER_GAM_VERDICT_START\n\
+{\"verdict\":\"accept\"|\"revise\"|\"escalate\",\"message\":\"<under 120 words>\"}\n\
+RUDDER_GAM_VERDICT_END\n\
+```\n\
+Rudder parses that block mechanically; a missing or malformed block stops the \
+pair and pages the human.",
+    );
+    packet
+}
+
+/// One lifted adversarial verdict.
+#[derive(Clone, Debug, PartialEq)]
+enum GamVerdict {
+    Accept(String),
+    Revise(String),
+    Escalate(String),
+}
+
+/// Strip markdown fences the model may wrap around the JSON payload.
+fn strip_code_fences(block: &str) -> String {
+    let trimmed = block.trim();
+    let without_leading = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```JSON"))
+        .or_else(|| trimmed.strip_prefix("```"))
+        .unwrap_or(trimmed);
+    without_leading
+        .strip_suffix("```")
+        .unwrap_or(without_leading)
+        .trim()
+        .to_string()
+}
+
+/// Parse the verdict out of the adversarial pane's visible lines.
+///
+/// Scans for the LAST complete sentinel block (the buffer restarts on every
+/// injection, so within one round there is exactly one candidate). A JSON body
+/// wins; a malformed body degrades to its raw text as a REVISE when anything
+/// readable remains — the objection content matters more than the envelope —
+/// and returns None (caller escalates) only when the block is absent or empty.
+fn parse_gam_verdict(lines: &[String]) -> Option<GamVerdict> {
+    let start_index = lines
+        .iter()
+        .rposition(|line| line.trim() == GAM_VERDICT_START)?;
+    let end_offset = lines[start_index + 1..]
+        .iter()
+        .position(|line| line.trim() == GAM_VERDICT_END);
+    let end_index = end_offset.map(|offset| start_index + 1 + offset);
+    let mut body = match end_index {
+        Some(end) => lines[start_index + 1..end].join("\n"),
+        None => lines[start_index + 1..].join("\n"),
+    };
+    if body.is_empty() {
+        return None;
+    }
+    body = strip_code_fences(&body);
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) {
+        let message = value
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        return match value.get("verdict").and_then(serde_json::Value::as_str) {
+            Some("accept") => Some(GamVerdict::Accept(message)),
+            Some("revise") => Some(GamVerdict::Revise(message)),
+            Some("escalate") => Some(GamVerdict::Escalate(message)),
+            _ if !message.is_empty() => Some(GamVerdict::Revise(message)),
+            _ => None,
+        };
+    }
+    let fallback: String = body.trim().to_string();
+    if fallback.is_empty() {
+        None
+    } else {
+        Some(GamVerdict::Revise(truncate_chars(
+            &fallback,
+            GAM_MESSAGE_BUDGET_CHARS,
+        )))
+    }
+}
+
+/// Lift the generator's latest `{GAM_REPLY_START}…{GAM_REPLY_END}` note from its
+/// pane. Takes the LAST block (a chatty generator may answer several objections
+/// in one turn); returns None when it stayed silent, which is legal — silence
+/// means "no pushback".
+fn lift_gam_reply(lines: &[String]) -> Option<String> {
+    let start_index = lines.iter().rposition(|line| line.trim() == GAM_REPLY_START)?;
+    let end_offset = lines[start_index + 1..]
+        .iter()
+        .position(|line| line.trim() == GAM_REPLY_END);
+    let end_index = end_offset.map(|offset| start_index + 1 + offset)?;
+    let reply = lines[start_index + 1..end_index].join("\n");
+    let reply = reply.trim().to_string();
+    (!reply.is_empty())
+        .then(|| truncate_chars(&reply, GAM_MESSAGE_BUDGET_CHARS))
 }
 
 /// Everything ONE `/plan` owns. Several orchestrators run at once, each driving its
@@ -1179,6 +1551,9 @@ struct AgentRun {
     /// cost accounting reads run.tokens, which the TS __worker path also writes).
     tokens_in: u64,
     tokens_out: u64,
+    /// This run's half of a `/gam` generator/adversarial pair. `Some` on both
+    /// sides of an active pair; the round loop reads it from the GENERATOR row.
+    gam: Option<GamState>,
 }
 
 #[derive(Debug)]
@@ -1212,6 +1587,11 @@ impl AgentRun {
     /// A one-off conversational agent (its own list section; not a DAG worker).
     pub(crate) fn is_oneoff(&self) -> bool {
         self.mode == AgentMode::OneOff
+    }
+
+    /// The read-only adversarial half of a `/gam` pair.
+    pub(crate) fn is_gam_adversary(&self) -> bool {
+        self.mode == AgentMode::GamAdversarial
     }
 
     /// Restore a resolver-relabeled run's original identity once its conflict
@@ -1324,6 +1704,13 @@ enum SuggestionAction {
         backend: Backend,
         model: String,
         effort: Option<EffortLevel>,
+    },
+    /// /gam drill-down: insert the provider/model into the input as the
+    /// ADVERSARIAL reviewer's spec, without touching dashboard defaults.
+    ChooseGamProvider(Backend),
+    ChooseGamModel {
+        backend: Backend,
+        model: String,
     },
     ShowHelp,
 }
@@ -2675,6 +3062,22 @@ impl App {
                 self.focus = FocusPane::Task;
             }
             KeyCode::Char('v') | KeyCode::Char('\u{221a}') => self.toggle_worker_view(),
+            // 'a' toggles between the two halves of a /gam pair (generator left,
+            // adversarial right) without leaving the worker pane.
+            KeyCode::Char('a') => {
+                if let Some((generator_index, adversarial_index)) =
+                    self.gam_pair_indices_for_selected()
+                {
+                    let target = if self.selected_agent == generator_index {
+                        adversarial_index
+                    } else {
+                        generator_index
+                    };
+                    self.selected_agent = target;
+                    self.focus = FocusPane::Worker;
+                    self.dirty = true;
+                }
+            }
             KeyCode::Char('r') => self.start_rename_selected_agent(),
             KeyCode::Char('b') => self.branch_selected_agent(),
             KeyCode::Char('u') => self.undo_selected_merge(),
@@ -4004,6 +4407,20 @@ impl App {
                 self.select_current_model_picker_choice();
                 self.notice = Some(format!("pick a {} model", backend.as_str()));
             }
+            SuggestionAction::ChooseGamProvider(backend) => {
+                self.replace_task_input(format!("/gam {} ", backend.as_str()));
+                self.notice = Some(format!(
+                    "pick the ADVERSARIAL {} reviewer, then type the task",
+                    backend.as_str()
+                ));
+            }
+            SuggestionAction::ChooseGamModel { backend, model } => {
+                self.replace_task_input(format!("/gam {} {} ", backend.as_str(), model));
+                self.notice = Some(format!(
+                    "adversarial: {} {model} — now type the task",
+                    backend.as_str()
+                ));
+            }
             SuggestionAction::ChooseModel { backend, model } => {
                 self.replace_task_input(format!("/model {} {} ", backend.as_str(), model));
                 self.select_current_model_picker_choice();
@@ -4423,6 +4840,37 @@ impl App {
             return true;
         }
 
+        // /gam split: the first click on a half selects that conversation so
+        // keys, selection, and later scrolls target it. A second click on the
+        // already-selected half falls through to the terminal below (some TUIs
+        // use clicks).
+        if self.worker_view == WorkerView::Terminal
+            && mouse.kind == MouseEventKind::Down(MouseButton::Left)
+            && self.gam_pair_indices_for_selected().is_some()
+        {
+            let Some((generator_index, adversarial_index)) =
+                self.gam_pair_indices_for_selected()
+            else {
+                return false;
+            };
+            let (left, right) = gam_split_halves(inner);
+            let target = if rect_contains(left, mouse.column, mouse.row) {
+                Some(generator_index)
+            } else if rect_contains(right, mouse.column, mouse.row) {
+                Some(adversarial_index)
+            } else {
+                None
+            };
+            if let Some(target) = target {
+                if target != self.selected_agent {
+                    self.selected_agent = target;
+                    self.worker_selection = None;
+                    self.dirty = true;
+                }
+                return true;
+            }
+        }
+
         if self.selected_interactive_orchestrator_active() {
             let (dag_area, term_area) = interactive_orchestrator_areas(worker_area);
             if rect_contains(dag_area, mouse.column, mouse.row) {
@@ -4509,6 +4957,8 @@ impl App {
                     self.scroll_orchestrator_dag(mouse, inner)
                 } else if self.worker_view == WorkerView::Diff {
                     self.scroll_selected_review_or_forward(mouse, inner)
+                } else if self.gam_pair_indices_for_selected().is_some() {
+                    self.scroll_gam_split(mouse, inner)
                 } else {
                     self.scroll_selected_worker_or_forward(mouse, inner)
                 };
@@ -4922,6 +5372,56 @@ impl App {
         if let Some(error) = write_error {
             self.set_selected_error(error);
             return true;
+        }
+        moved || forwarded
+    }
+
+    /// Wheel routing inside a `/gam` split: whichever half is under the pointer
+    /// scrolls, regardless of which half is selected. Mirrors
+    /// `scroll_selected_worker_or_forward` against an arbitrary index.
+    fn scroll_gam_split(&mut self, mouse: MouseEvent, area: Rect) -> bool {
+        let Some((generator_index, adversarial_index)) = self.gam_pair_indices_for_selected()
+        else {
+            return false;
+        };
+        let (left, right) = gam_split_halves(area);
+        let target = if rect_contains(left, mouse.column, mouse.row) {
+            generator_index
+        } else if rect_contains(right, mouse.column, mouse.row) {
+            adversarial_index
+        } else {
+            return false;
+        };
+        self.scroll_gam_half(mouse, area, target)
+    }
+
+    fn scroll_gam_half(&mut self, mouse: MouseEvent, area: Rect, index: usize) -> bool {
+        let rows = mouse_scrollback_delta(mouse, area.height);
+        let mouse_bytes = mouse_event_to_sgr(mouse, area);
+        let Some(terminal) = self.agents.get_mut(index).and_then(|run| run.terminal.as_mut())
+        else {
+            return false;
+        };
+        let before = terminal.scrollback();
+        let alternate = terminal.uses_alternate_screen_snapshot();
+        // Same ownership rule as the single-pane path: an alternate-screen app
+        // that asked for SGR mouse tracking owns its own wheel.
+        let child_owns_wheel = alternate && terminal.wants_sgr_mouse_events_snapshot();
+        if !child_owns_wheel {
+            terminal.scrollback_by(rows);
+        }
+        let after = terminal.scrollback();
+        let moved = after != before;
+        let wants_mouse = if moved || rows == 0 {
+            false
+        } else {
+            terminal.wants_sgr_mouse_events_snapshot()
+        };
+        let mut forwarded = false;
+        if !moved && rows != 0 && wants_mouse {
+            if let Some(bytes) = mouse_bytes {
+                forwarded = terminal.write_input(&bytes).is_ok();
+            }
         }
         moved || forwarded
     }
@@ -5545,6 +6045,7 @@ impl App {
             done_summary: None,
             tokens_in: 0,
             tokens_out: 0,
+            gam: None,
         };
 
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
@@ -5731,6 +6232,7 @@ impl App {
             done_summary: None,
             tokens_in: 0,
             tokens_out: 0,
+            gam: None,
         };
 
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
@@ -5765,6 +6267,639 @@ impl App {
             spawn_task_summary_worker(self.task_summary_tx.clone(), run_id, input.to_string());
         }
         let _ = self.write_rudder_context_timed(None);
+    }
+
+    /// Start a `/gam` pair: a GENERATOR (a normal isolated execute worker using
+    /// the dashboard's current default model) plus a READ-ONLY adversarial
+    /// reviewer (the requested model) in its own pane. Both PTYs stay live for
+    /// the whole conversation; the round loop in `poll_gam_pairs` relays packets
+    /// and verdicts between them.
+    ///
+    /// Filesystem cost is deliberately zero new files: state rides the existing
+    /// per-run `run.json` (`gam` object), signals reuse `<rudder_home>/signals/`,
+    /// and every packet/verdict/reply crosses through PTY stdin + the terminal
+    /// buffers we already own — nothing is written per round.
+    fn start_gam_task(&mut self, request: GamRequest) {
+        let GamRequest {
+            task,
+            adversarial_backend,
+            adversarial_model,
+            in_main,
+        } = request;
+        if adversarial_backend == Backend::Opencode {
+            self.notice = Some(
+                "gam adversarial supports claude and codex reviewers; opencode has no read-only sandbox yet"
+                    .to_string(),
+            );
+            return;
+        }
+        self.notice = None;
+
+        // ---- GENERATOR ------------------------------------------------------
+        let workspace_label = rudder_plan_worker_title_from_prompt(&task)
+            .unwrap_or_else(|| task.clone());
+        let task_summary = summarize_task(&task);
+        let workspace = if in_main {
+            WorkspaceInfo::current(self.cwd.clone())
+        } else {
+            match prepare_jj_workspace(&self.cwd, &workspace_label) {
+                Ok(workspace) => workspace,
+                Err(error) => {
+                    self.notice = Some(format!("jj workspace failed: {error}"));
+                    WorkspaceInfo::current(self.cwd.clone())
+                }
+            }
+        };
+        if let Err(error) = self.write_rudder_context_timed(Some(&workspace)) {
+            self.notice = Some(format!("context warning: {error}"));
+        }
+
+        // The generator uses the dashboard's CURRENT default model, whatever it is.
+        let backend = self.backend;
+        let model = self.model.clone();
+        let effort = self.effort;
+        let session_id = mint_session_id_for(backend);
+        let goal_prompt = manual_goal_prompt(&task);
+        let launch_prompt = format!("{}{}", goal_prompt, gam_generator_protocol_note());
+        let generator_id = workspace.id.clone();
+
+        // ---- ADVERSARIAL REVIEWER -------------------------------------------
+        // Spawned immediately so its pane is visible from t0; it opens with a
+        // bootstrap prompt and waits for Rudder to deliver the first packet.
+        let adversarial_effort = default_effort_for(adversarial_backend, &adversarial_model);
+        let adversarial_id = new_run_id("gam-review");
+        let adversarial_summary = format!(
+            "adv · {}{}",
+            adversarial_backend.as_str(),
+            if adversarial_model.trim().is_empty() {
+                String::new()
+            } else {
+                format!(" {}", truncate_chars(&adversarial_model, 24))
+            },
+        );
+        let adversarial_session = mint_session_id_for(adversarial_backend);
+        let adversarial_bootstrap = format!(
+            "[gam reviewer] You are the ADVERSARIAL REVIEWER half of a Rudder pair. \
+A generator agent implements the task; you question its work. You have READ-ONLY \
+access: never attempt to edit, create, or write any file. Rudder will deliver each \
+review packet as a user message ending with a verdict contract. Until the first \
+packet arrives, reply only: \"standing by\"."
+        );
+
+        // Build both commands before mutating the roster. The reviewer command
+        // comes from `agent_command`'s GamAdversarial arms: Claude gets a tool
+        // ALLOWLIST (reads only), Codex gets its filesystem sandbox in read-only
+        // mode — enforced by the runtime, not prompt discipline alone.
+        let mut generator_command = agent_command(
+            backend,
+            &model,
+            effort,
+            &launch_prompt,
+            AgentMode::Execute,
+            session_id.as_deref(),
+        );
+        signals::augment_worker_command(
+            &mut generator_command,
+            backend,
+            AgentMode::Execute,
+            &generator_id,
+        );
+        let mut adversarial_command = agent_command(
+            adversarial_backend,
+            &adversarial_model,
+            adversarial_effort,
+            &adversarial_bootstrap,
+            AgentMode::GamAdversarial,
+            adversarial_session.as_deref(),
+        );
+        signals::augment_worker_command(
+            &mut adversarial_command,
+            adversarial_backend,
+            AgentMode::GamAdversarial,
+            &adversarial_id,
+        );
+
+        let created_at = now_stamp();
+        let mut run = AgentRun {
+            id: generator_id.clone(),
+            created_at: created_at.clone(),
+            mode: AgentMode::Execute,
+            task: goal_prompt.clone(),
+            task_summary,
+            current_prompt: goal_prompt.clone(),
+            turns: vec![AgentTurn {
+                ts: created_at.clone(),
+                prompt: task.clone(),
+                source: "user".to_string(),
+            }],
+            last_user_input_at: created_at,
+            backend,
+            model,
+            effort,
+            status: AgentStatus::Running,
+            cwd: workspace.path.clone(),
+            workspace_branch: workspace.branch.clone(),
+            workspace_path: workspace
+                .path_is_workspace
+                .then_some(workspace.path.clone()),
+            workspace_name: workspace.workspace_name.clone(),
+            jj_change_id: workspace.jj_change_id.clone(),
+            integration: IntegrationEvidence::default(),
+            publish: PublishEvidence::default(),
+            delivery: DeliveryEvidence::for_task(&goal_prompt),
+            session_id,
+            terminal: None,
+            terminal_size: None,
+            review_terminal: None,
+            review_size: None,
+            review_error: None,
+            last_output_at: Instant::now(),
+            completed_at: None,
+            autosteered: false,
+            plain_process: false,
+            interactive_orchestrator: false,
+            needs_permission: false,
+            needs_user_input: false,
+            last_error: None,
+            worker_input_draft: String::new(),
+            worker_input_cursor: 0,
+            worker_input_is_prompt: false,
+            last_drain_at: None,
+            review_source_ids: Vec::new(),
+            deps: Vec::new(),
+            soft_deps: Vec::new(),
+            node_id: None,
+            plan_id: None,
+            reviewed_at: None,
+            reconcile_planner: false,
+            plan_stream: None,
+            plan_output_cache: None,
+            last_worker_input_at: None,
+            merge_resolver: false,
+            merge_conflict: false,
+            merge_conflict_operation: ConflictOperation::Merge,
+            merge_conflict_files: Vec::new(),
+            had_merge_conflict: false,
+            done_summary: None,
+            tokens_in: 0,
+            tokens_out: 0,
+            gam: Some(GamState {
+                role: GamRole::Generator,
+                peer_run_id: adversarial_id.clone(),
+                round: 0,
+                max_rounds: MAX_GAM_ROUNDS,
+                phase: GamPhase::GeneratorWorking,
+                task,
+                last_message: String::new(),
+                awaiting_since: None,
+            }),
+        };
+
+        let generator_options = TerminalPaneOptions {
+            size: TerminalSize::default(),
+            cwd: Some(workspace.path.clone()),
+            ..TerminalPaneOptions::default()
+        };
+        let mut spawned_generator = false;
+        match TerminalPane::spawn_shell_or_command(Some(generator_command), generator_options) {
+            Ok(mut terminal) => {
+                let _ = terminal.drain_output();
+                Self::attach_output_waker(&self.pty_output_waker, &terminal);
+                run.terminal = Some(terminal);
+                spawned_generator = true;
+            }
+            Err(error) => {
+                run.status = AgentStatus::Failed;
+                run.last_error = Some(error.to_string());
+                self.notice = Some(format!("failed to start {}: {error}", backend.as_str()));
+            }
+        }
+
+        // ---- ADVERSARIAL ROW -------------------------------------------------
+        // cwd = the generator's checkout: the reviewer must see exactly the files
+        // under discussion. It records no workspace identity of its own, so it can
+        // never be merged, synced, or mistaken for mergeable work.
+        let mut adversarial_run = AgentRun {
+            id: adversarial_id.clone(),
+            created_at: now_stamp(),
+            mode: AgentMode::GamAdversarial,
+            task: adversarial_bootstrap.clone(),
+            task_summary: adversarial_summary,
+            current_prompt: adversarial_bootstrap,
+            turns: Vec::new(),
+            last_user_input_at: now_stamp(),
+            backend: adversarial_backend,
+            model: adversarial_model.clone(),
+            effort: adversarial_effort,
+            status: if spawned_generator {
+                AgentStatus::Running
+            } else {
+                AgentStatus::Stopped
+            },
+            cwd: workspace.path.clone(),
+            workspace_branch: None,
+            workspace_path: None,
+            workspace_name: None,
+            jj_change_id: None,
+            integration: IntegrationEvidence::default(),
+            publish: PublishEvidence::default(),
+            delivery: DeliveryEvidence::default(),
+            session_id: adversarial_session,
+            terminal: None,
+            terminal_size: None,
+            review_terminal: None,
+            review_size: None,
+            review_error: None,
+            last_output_at: Instant::now(),
+            completed_at: None,
+            autosteered: false,
+            plain_process: false,
+            interactive_orchestrator: false,
+            needs_permission: false,
+            needs_user_input: false,
+            last_error: None,
+            worker_input_draft: String::new(),
+            worker_input_cursor: 0,
+            worker_input_is_prompt: false,
+            last_drain_at: None,
+            review_source_ids: Vec::new(),
+            deps: Vec::new(),
+            soft_deps: Vec::new(),
+            node_id: None,
+            plan_id: None,
+            reviewed_at: None,
+            reconcile_planner: false,
+            plan_stream: None,
+            plan_output_cache: None,
+            last_worker_input_at: None,
+            merge_resolver: false,
+            merge_conflict: false,
+            merge_conflict_operation: ConflictOperation::Merge,
+            merge_conflict_files: Vec::new(),
+            had_merge_conflict: false,
+            done_summary: None,
+            tokens_in: 0,
+            tokens_out: 0,
+            gam: Some(GamState {
+                role: GamRole::Adversarial,
+                peer_run_id: generator_id,
+                round: 0,
+                max_rounds: MAX_GAM_ROUNDS,
+                phase: GamPhase::GeneratorWorking,
+                task: run.task_summary.clone(),
+                last_message: String::new(),
+                awaiting_since: None,
+            }),
+        };
+        let adversarial_options = TerminalPaneOptions {
+            size: TerminalSize::default(),
+            cwd: Some(workspace.path.clone()),
+            ..TerminalPaneOptions::default()
+        };
+        if spawned_generator {
+            match TerminalPane::spawn_shell_or_command(
+                Some(adversarial_command),
+                adversarial_options,
+            ) {
+                Ok(mut terminal) => {
+                    let _ = terminal.drain_output();
+                    Self::attach_output_waker(&self.pty_output_waker, &terminal);
+                    adversarial_run.terminal = Some(terminal);
+                }
+                Err(error) => {
+                    adversarial_run.status = AgentStatus::Failed;
+                    adversarial_run.last_error = Some(error.to_string());
+                    self.notice =
+                        Some(format!("failed to start reviewer: {error}"));
+                }
+            }
+        }
+
+        self.agents.push(run);
+        self.agents.push(adversarial_run);
+        self.selected_agent = self.agents.len().saturating_sub(2);
+        self.delete_pending = None;
+        self.focus = FocusPane::Worker;
+        for saved in [self.agents.len() - 2, self.agents.len() - 1] {
+            if let Some(recorded) = self.agents.get(saved) {
+                let _ = save_native_run_record(&self.cwd, recorded);
+            }
+        }
+        spawn_task_summary_worker(
+            self.task_summary_tx.clone(),
+            self.agents[self.agents.len() - 2].id.clone(),
+            self.agents[self.agents.len() - 2].task.clone(),
+        );
+        self.record_activity(format!(
+            "gam: paired {} generator with {} adversarial reviewer ({})",
+            backend.as_str(),
+            adversarial_backend.as_str(),
+            truncate_chars(&self.agents[self.agents.len() - 2].task_summary, 48),
+        ));
+        let _ = self.write_rudder_context_timed(None);
+    }
+
+    fn gam_peer_index_of(&self, index: usize) -> Option<usize> {
+        let peer_id = self.agents.get(index)?.gam.as_ref()?.peer_run_id.clone();
+        self.agents.iter().position(|run| run.id == peer_id)
+    }
+
+    /// The selected row's `/gam` pair as (generator, adversarial) indices, so
+    /// rendering and mouse routing can address both halves.
+    pub(crate) fn gam_pair_indices_for_selected(&self) -> Option<(usize, usize)> {
+        let index = self.selected_agent;
+        let role = self.agents.get(index)?.gam.as_ref()?.role;
+        let peer_index = self.gam_peer_index_of(index)?;
+        Some(match role {
+            GamRole::Generator => (index, peer_index),
+            GamRole::Adversarial => (peer_index, index),
+        })
+    }
+
+    /// The `/gam` round loop, run once per heartbeat after status updates.
+    ///
+    /// Transitions are collected in an immutable pass and applied afterwards,
+    /// matching the loop's single-writer discipline. Every action is phase-gated
+    /// so it fires exactly once per transition: a packet is delivered only while
+    /// the pair sits in GeneratorWorking, a verdict is read only while it sits
+    /// in AwaitingVerdict.
+    fn poll_gam_pairs(&mut self) {
+        #[derive(Clone, Copy)]
+        enum GamAction {
+            /// The generator's turn ended: hand its diff to the reviewer.
+            DeliverPacket(usize),
+            /// The reviewer's verdict turn ended: parse it and route.
+            ReadVerdict(usize),
+        }
+        let mut actions: Vec<GamAction> = Vec::new();
+        for index in 0..self.agents.len() {
+            let Some(gam) = self.agents[index].gam.clone() else {
+                continue;
+            };
+            // The loop runs from the GENERATOR row only; the mirrored state on
+            // the adversarial row exists for rendering and restart durability.
+            if gam.role != GamRole::Generator {
+                continue;
+            }
+            match gam.phase {
+                GamPhase::GeneratorWorking => {
+                    if self.agents[index].status == AgentStatus::Done
+                        && self.gam_peer_index_of(index).is_some()
+                    {
+                        actions.push(GamAction::DeliverPacket(index));
+                    }
+                }
+                GamPhase::AwaitingVerdict => {
+                    let Some(peer) = self.gam_peer_index_of(index) else {
+                        // The reviewer row vanished entirely (deleted): escalate.
+                        actions.push(GamAction::ReadVerdict(index));
+                        continue;
+                    };
+                    if !matches!(
+                        self.agents[peer].status,
+                        AgentStatus::Done | AgentStatus::Failed | AgentStatus::Stopped
+                    ) {
+                        continue;
+                    }
+                    // FRESHNESS GATE: only a completion AFTER the packet was
+                    // delivered counts. The reviewer's previous turn's Done
+                    // (its bootstrap ack, or last round's verdict) must never
+                    // satisfy this wait — that race would route a stale screen.
+                    let fresh_completion = match self.agents[index]
+                        .gam
+                        .as_ref()
+                        .and_then(|gam| gam.awaiting_since)
+                    {
+                        Some(awaiting_since) => self.agents[peer]
+                            .completed_at
+                            .is_some_and(|at| at > awaiting_since),
+                        // Post-restart there is no delivery timestamp; the
+                        // reviewer's PTY is gone anyway, so routing escalates.
+                        None => true,
+                    };
+                    if fresh_completion {
+                        actions.push(GamAction::ReadVerdict(index));
+                    }
+                }
+                GamPhase::Settled(_) => {}
+            }
+        }
+        for action in actions {
+            match action {
+                GamAction::DeliverPacket(index) => self.deliver_gam_packet(index),
+                GamAction::ReadVerdict(index) => self.route_gam_verdict(index),
+            }
+        }
+    }
+
+    /// Round step 1: the generator finished a turn. Lift its optional reply
+    /// note, assemble the packet (original task + reply + bounded diff), and
+    /// paste it into the reviewer's pane.
+    fn deliver_gam_packet(&mut self, generator_index: usize) {
+        let Some(peer_index) = self.gam_peer_index_of(generator_index) else {
+            return;
+        };
+        // Never inject into a reviewer that is still mid-turn or dead: a queued
+        // packet would collide with live output, and a failed one cannot answer.
+        let reviewer_ready = !matches!(
+            self.agents[peer_index].status,
+            AgentStatus::Failed | AgentStatus::Stopped
+        ) && self.agents[peer_index].terminal.is_some()
+            && self.agents[peer_index].status != AgentStatus::Running;
+        if !reviewer_ready {
+            return;
+        }
+        // Lift the generator's pushback FIRST — nothing has reset its buffer
+        // since the turn that just completed, so this sees exactly what it said.
+        let reply = self.agents[generator_index]
+            .terminal
+            .as_ref()
+            .and_then(|terminal| lift_gam_reply(&terminal.visible_lines_snapshot()));
+        let mut gam = match self.agents[generator_index].gam.as_ref() {
+            Some(gam) => gam.clone(),
+            None => return,
+        };
+        if let Some(reply) = reply {
+            gam.last_message = reply;
+        }
+        let diff = jj_diff_text(&self.agents[generator_index].cwd, GAM_DIFF_BUDGET_CHARS);
+        let packet = gam_review_packet(&gam, &diff);
+        if !self.live_inject_at(peer_index, &packet) {
+            self.settle_gam_pair(generator_index, GamOutcome::Escalated(
+                "could not reach the reviewer pane".to_string(),
+            ));
+            return;
+        }
+        gam.phase = GamPhase::AwaitingVerdict;
+        gam.awaiting_since = Some(Instant::now());
+        let round = gam.round;
+        let reviewer_model = self.agents[peer_index].model.clone();
+        for side in [generator_index, peer_index] {
+            if let Some(recorded) = self.agents[side].gam.as_mut() {
+                recorded.phase = GamPhase::AwaitingVerdict;
+                recorded.round = gam.round;
+                recorded.last_message = gam.last_message.clone();
+                recorded.awaiting_since = gam.awaiting_since;
+            }
+        }
+        if let Some(run) = self.agents.get_mut(generator_index) {
+            let _ = save_native_run_record(&self.cwd, run);
+        }
+        if let Some(run) = self.agents.get_mut(peer_index) {
+            let _ = save_native_run_record(&self.cwd, run);
+        }
+        self.record_activity(format!(
+            "gam round {}: sent the diff to {} for review",
+            round + 1,
+            truncate_chars(reviewer_model.trim(), 24),
+        ));
+        self.dirty = true;
+    }
+
+    /// Round step 2: the reviewer finished. Parse its verdict block and route:
+    /// accept settles the pair; a revise becomes the generator's next user turn
+    /// (until the cap); an unparseable or explicit escalation pages the human.
+    fn route_gam_verdict(&mut self, generator_index: usize) {
+        let Some(peer_index) = self.gam_peer_index_of(generator_index) else {
+            return;
+        };
+        let lines = self.agents[peer_index]
+            .terminal
+            .as_ref()
+            .map(|terminal| terminal.visible_lines_snapshot())
+            .unwrap_or_default();
+        let verdict = parse_gam_verdict(&lines);
+        let reviewer_model = self.agents[peer_index].model.clone();
+        let round = self.agents[generator_index]
+            .gam
+            .as_ref()
+            .map(|gam| gam.round)
+            .unwrap_or(0);
+        let max_rounds = self.agents[generator_index]
+            .gam
+            .as_ref()
+            .map(|gam| gam.max_rounds)
+            .unwrap_or(MAX_GAM_ROUNDS);
+        let escalated_by_reviewer = matches!(verdict, Some(GamVerdict::Escalate(_)));
+        match verdict {
+            Some(GamVerdict::Accept(message)) => {
+                self.record_activity(format!(
+                    "gam: {} accepted the work after {} review round(s){}",
+                    truncate_chars(reviewer_model.trim(), 20),
+                    round + 1,
+                    if message.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" — {}", truncate_chars(&message, 120))
+                    },
+                ));
+                self.notice =
+                    Some("gam: adversarial reviewer accepted the work".to_string());
+                self.settle_gam_pair(generator_index, GamOutcome::Accepted);
+            }
+            Some(GamVerdict::Revise(message)) | Some(GamVerdict::Escalate(message)) => {
+                let revise_message = if message.trim().is_empty() {
+                    "(the reviewer gave no detail — see its pane)".to_string()
+                } else {
+                    message.trim().to_string()
+                };
+                let next_round = round + 1;
+                let capped = next_round >= max_rounds;
+                let injection = format!(
+                    "[gam reviewer · round {next_round}] {revise_message}\n\
+Address the objection directly. If you disagree, say why inside \
+{start} / {end} lines.",
+                    start = GAM_REPLY_START,
+                    end = GAM_REPLY_END,
+                );
+                let injected = self.live_inject_at(generator_index, &injection);
+                let reason = if capped {
+                    format!("round cap ({max_rounds}) reached without acceptance")
+                } else if escalated_by_reviewer {
+                    format!(
+                        "the reviewer asked for a human: {}",
+                        truncate_chars(&revise_message, 120)
+                    )
+                } else if !injected {
+                    "could not deliver the revision to the generator".to_string()
+                } else {
+                    // Not an escalation at all: keep arguing.
+                    self.apply_gam_revision(generator_index, peer_index, next_round, revise_message);
+                    return;
+                };
+                self.record_activity(format!(
+                    "gam: stopped after {next_round} round(s) — {reason}"
+                ));
+                self.notice =
+                    Some(format!("gam needs you: {reason}. Both panes stay live."));
+                self.settle_gam_pair(generator_index, GamOutcome::Escalated(reason));
+            }
+            None => {
+                // No parseable verdict block. Fail visibly instead of guessing:
+                // the pair stops and the human reads both panes.
+                self.record_activity(format!(
+                    "gam: no verdict block from {} — escalating to you",
+                    truncate_chars(reviewer_model.trim(), 20),
+                ));
+                self.notice =
+                    Some("gam: the reviewer produced no verdict block; panes left open".to_string());
+                self.settle_gam_pair(
+                    generator_index,
+                    GamOutcome::Escalated("no verdict block".to_string()),
+                );
+            }
+        }
+    }
+
+    /// Continue the loop after a revising verdict: bump the round counter and
+    /// flip both sides back to GeneratorWorking so the generator's next Done
+    /// delivers a fresh packet.
+    fn apply_gam_revision(
+        &mut self,
+        generator_index: usize,
+        peer_index: usize,
+        next_round: u32,
+        message: String,
+    ) {
+        for side in [generator_index, peer_index] {
+            if let Some(recorded) = self.agents[side].gam.as_mut() {
+                recorded.round = next_round;
+                recorded.phase = GamPhase::GeneratorWorking;
+                recorded.last_message = message.clone();
+            }
+        }
+        if let Some(run) = self.agents.get_mut(generator_index) {
+            run.current_prompt = format!("[gam reviewer] {message}");
+            let _ = save_native_run_record(&self.cwd, run);
+        }
+        if let Some(run) = self.agents.get_mut(peer_index) {
+            let _ = save_native_run_record(&self.cwd, run);
+        }
+        self.record_activity(format!(
+            "gam round {}: revision sent to the generator",
+            next_round,
+        ));
+        self.dirty = true;
+    }
+
+    /// End the automatic loop on BOTH rows. Both panes stay live; the user can
+    /// keep driving either conversation by hand.
+    fn settle_gam_pair(&mut self, generator_index: usize, outcome: GamOutcome) {
+        let Some(peer_index) = self.gam_peer_index_of(generator_index) else {
+            return;
+        };
+        for side in [generator_index, peer_index] {
+            if let Some(recorded) = self.agents[side].gam.as_mut() {
+                recorded.phase = GamPhase::Settled(outcome.clone());
+            }
+        }
+        if let Some(run) = self.agents.get_mut(generator_index) {
+            let _ = save_native_run_record(&self.cwd, run);
+        }
+        if let Some(run) = self.agents.get_mut(peer_index) {
+            let _ = save_native_run_record(&self.cwd, run);
+        }
+        self.dirty = true;
     }
 
     fn start_rudder_plan_task(&mut self, input: &str) {
@@ -5901,6 +7036,7 @@ impl App {
             done_summary: None,
             tokens_in: 0,
             tokens_out: 0,
+            gam: None,
         };
 
         // INTERACTIVE orchestrator: it never exits and presents its DAG via RUDDER.md, so
@@ -7345,6 +8481,28 @@ impl App {
                 }
                 true
             }
+            Some("/gam") => {
+                // Generator + adversarial reviewer pair: one implements in an
+                // isolated workspace (or `main`), the other read-only questions it.
+                let rest = command_rest(input, "/gam").trim();
+                match parse_gam_args(rest, self.backend, &self.model) {
+                    Ok(request) => {
+                        self.notice = Some(format!(
+                            "gam pair starting · adversarial: {} {} · generator: {} {}{}",
+                            request.adversarial_backend.as_str(),
+                            truncate_chars(&request.adversarial_model, 28),
+                            self.backend.as_str(),
+                            truncate_chars(&self.model, 28),
+                            if request.in_main { " · main checkout" } else { "" },
+                        ));
+                        self.start_gam_task(request);
+                    }
+                    Err(usage) => {
+                        self.notice = Some(usage);
+                    }
+                }
+                true
+            }
             Some("/restore") => {
                 // Reopen an existing claude/codex CLI conversation in a new agent
                 // pane, continuing the SAME session with all permissions bypassed.
@@ -7498,7 +8656,7 @@ impl App {
             }
             Some("/help") => {
                 self.notice = Some(
-                    "plain input -> one isolated mergeable worker in its own jj workspace · /plan <task> -> an orchestrator that plans and runs a DAG · /main|/m <task> -> another agent in this shared checkout · panes: Option-1/2/3 or ^W · keys: j/k select · Option-[ / Option-] step agents from any pane · Enter focus · v diff · m merge · u undo a merge · M merge all · R review all · g nest · o web ui · x stop · b branch chat · dd delete · cc clear merged · P model; commands: /model /fast /sound /color /main /plan /resume /restore /share /usage /goal /cloud /web /feedback"
+                    "plain input -> one isolated mergeable worker in its own jj workspace · /plan <task> -> an orchestrator that plans and runs a DAG · /gam [model] <task> -> generator + adversarial reviewer pair (split panes, ^W a toggles sides) · /main|/m <task> -> another agent in this shared checkout · panes: Option-1/2/3 or ^W · keys: j/k select · Option-[ / Option-] step agents from any pane · Enter focus · v diff · m merge · u undo a merge · M merge all · R review all · g nest · o web ui · x stop · b branch chat · dd delete · cc clear merged · P model; commands: /model /fast /sound /color /main /plan /gam /resume /restore /share /usage /goal /cloud /web /feedback"
                         .to_string(),
                 );
                 true
@@ -8223,6 +9381,7 @@ impl App {
             done_summary: None,
             tokens_in: 0,
             tokens_out: 0,
+            gam: None,
         };
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
             Ok(mut terminal) => {
@@ -12813,6 +13972,7 @@ Files involved: {}
             done_summary: None,
             tokens_in: 0,
             tokens_out: 0,
+            gam: None,
         };
 
         let mut outcome = ForkOutcome::Started;
@@ -14967,6 +16127,9 @@ What to do\n\
         self.scan_orchestrator_markers();
         self.scan_orchestrator_skill_markers();
         self.ingest_direct_completion_notes();
+        // /gam pairs: relay packets + verdicts between generator and reviewer.
+        // Phase-gated so each transition fires exactly once; cheap when idle.
+        self.poll_gam_pairs();
 
         // Drain the planned-node queue on a coarse cadence: as plan-launched
         // agents reach Merged their node ids satisfy dependents' hard deps, so a

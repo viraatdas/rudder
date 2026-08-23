@@ -13,6 +13,11 @@ const CLAUDE_DECOMPOSER_DISALLOWED: &str = "Edit,Write,MultiEdit,NotebookEdit,Ba
 // The standalone /plan FRONT-END pre-approves the read tools PLUS Bash so it can investigate
 // without prompts; --permission-mode plan still blocks edits.
 const CLAUDE_PLAN_FRONTEND_TOOLS: &str = "Read,Grep,Glob,LS,WebSearch,WebFetch,Bash";
+// The gam adversarial reviewer gets the read tools ONLY. No Bash: unlike Codex's
+// sandbox (which refuses writes while allowing command exec), a Claude Bash call
+// can write any file it likes, so an allowlist that included Bash would not be
+// read-only at all.
+const GAM_ADVERSARIAL_CLAUDE_TOOLS: &str = "Read,Grep,Glob,LS";
 const ORCHESTRATOR_SKILLS_DIR: &str = ".claude/skills";
 
 pub(crate) fn mint_session_id_for(backend: Backend) -> Option<String> {
@@ -225,7 +230,9 @@ pub(crate) fn codex_resume_command(run: &AgentRun, session_id: &str) -> Terminal
             // The prompt contract forbids product-file edits.
             push_codex_interactive_orchestrator_args(&mut args, run.effort);
         }
-        AgentMode::Plan | AgentMode::RudderPlan => {
+        // The gam reviewer resumes exactly as it launched: read-only, no
+        // approvals, so a resumed pane cannot quietly gain write access.
+        AgentMode::GamAdversarial | AgentMode::Plan | AgentMode::RudderPlan => {
             args.push("--no-alt-screen".to_string());
             args.push("--enable".to_string());
             args.push("goals".to_string());
@@ -373,6 +380,8 @@ pub(crate) fn agent_command_with_orchestrator_mode(
             }
         }
         AgentMode::OneOff => Some(oneoff_prompt(task)),
+        // For the gam reviewer the "task" IS the review packet Rudder assembled.
+        AgentMode::GamAdversarial => Some(task.to_string()),
     };
     match backend {
         Backend::Claude => {
@@ -436,6 +445,15 @@ pub(crate) fn agent_command_with_orchestrator_mode(
                     CLAUDE_PLAN_FRONTEND_TOOLS.to_string(),
                     "--name".to_string(),
                     format!("plan:{}", short_task(task)),
+                ],
+                // The gam adversarial reviewer: read-only by TOOL ALLOWLIST (no
+                // Edit/Write/Bash), permission-mode default so reads auto-run.
+                // It questions the diff and talks; it cannot touch a file.
+                AgentMode::GamAdversarial => vec![
+                    "--permission-mode".to_string(),
+                    "default".to_string(),
+                    "--allowedTools".to_string(),
+                    GAM_ADVERSARIAL_CLAUDE_TOOLS.to_string(),
                 ],
             };
             if !model.trim().is_empty() {
@@ -504,6 +522,15 @@ pub(crate) fn agent_command_with_orchestrator_mode(
                 AgentMode::Execute | AgentMode::ReviewAll | AgentMode::Main | AgentMode::OneOff => {
                     args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
                 }
+                // The reviewer runs under Codex's own filesystem sandbox: it may
+                // run commands and read anything, but writes are refused by the
+                // runtime, not by prompt discipline alone.
+                AgentMode::GamAdversarial => {
+                    args.push("--sandbox".to_string());
+                    args.push("read-only".to_string());
+                    args.push("--ask-for-approval".to_string());
+                    args.push("never".to_string());
+                }
                 AgentMode::Plan | AgentMode::RudderPlan => {
                     args.push("--sandbox".to_string());
                     args.push("read-only".to_string());
@@ -516,7 +543,7 @@ pub(crate) fn agent_command_with_orchestrator_mode(
                 AgentMode::Execute | AgentMode::ReviewAll | AgentMode::Main | AgentMode::OneOff => {
                     push_codex_worker_config_overrides(&mut args, effort);
                 }
-                AgentMode::Plan | AgentMode::RudderPlan => {
+                AgentMode::GamAdversarial | AgentMode::Plan | AgentMode::RudderPlan => {
                     push_codex_planner_config_overrides(&mut args, effort);
                 }
             }
@@ -867,6 +894,7 @@ pub(crate) fn review_all_run(
         done_summary: None,
         tokens_in: 0,
         tokens_out: 0,
+        gam: None,
     }
 }
 

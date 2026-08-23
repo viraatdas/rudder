@@ -3317,6 +3317,13 @@ pub(crate) fn render_worker(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     // card restated what the transcript already said and took half the pane to do
     // it. The same summary is still one keypress away in the done drawer.
 
+    // The /gam split: a paired generator + adversarial reviewer render as two
+    // live terminals side by side (generator left, reviewer right).
+    if app.worker_view == WorkerView::Terminal && app.gam_pair_indices_for_selected().is_some() {
+        render_gam_split(frame, area, app);
+        return;
+    }
+
     if let Some(size) = terminal_size {
         if let Some(run) = app.agents.get_mut(app.selected_agent) {
             if app.worker_view == WorkerView::Terminal && run.terminal_size != Some(size) {
@@ -3655,6 +3662,154 @@ pub(crate) fn set_worker_cursor(frame: &mut Frame<'_>, inner: Rect, app: &App) {
         return;
     }
     frame.set_cursor_position((inner.x + cursor.col, inner.y + cursor.row));
+}
+
+/// The selected run's `/gam` peer pair, ordered (generator, adversarial).
+/// `None` unless the selected row participates in a pair AND its peer still
+/// exists in the roster.
+pub(crate) fn gam_split_halves(inner: Rect) -> (Rect, Rect) {
+    let columns = ratatui::layout::Layout::horizontal([
+        ratatui::layout::Constraint::Percentage(50),
+        ratatui::layout::Constraint::Percentage(50),
+    ])
+    .split(inner);
+    (columns[0], columns[1])
+}
+
+/// Terminal lines for ANY agent's pane — `worker_lines` parameterized by
+/// index so the gam split can draw both conversations side by side. The
+/// unfocused half gets no text selection or cursor.
+fn worker_lines_at(app: &mut App, index: usize, height: usize, width: usize) -> Vec<Line<'static>> {
+    let focused = app.focus == FocusPane::Worker && app.selected_agent == index;
+    let Some(run) = app.agents.get_mut(index) else {
+        return vec![Line::from("")];
+    };
+    let Some(terminal) = run.terminal.as_mut() else {
+        // No live PTY (finished/reloaded): show the static conversation card,
+        // same as the single-pane path does for a pane-less run.
+        let mut lines = vec![
+            Line::from(Span::styled(
+                format!("{}  {}", run.status.as_str(), run.task_summary),
+                pane_text_style(true),
+            )),
+            Line::from(""),
+        ];
+        for text_line in run.task.lines() {
+            lines.push(Line::from(Span::styled(
+                text_line.to_string(),
+                pane_text_style(true),
+            )));
+        }
+        lines.push(Line::from(Span::styled(
+            "This agent is not running.",
+            muted_style(true),
+        )));
+        return lines;
+    };
+    let selection = app
+        .worker_selection
+        .filter(|_| focused)
+        .map(normalize_selection)
+        .filter(|selection| !selection_is_empty(*selection));
+    let (start_row, styled_rows) = terminal.styled_line_window_snapshot(height);
+    let cursor = worker_render_cursor(run.backend, terminal, focused, height, width, start_row);
+    let lines = styled_rows
+        .into_iter()
+        .enumerate()
+        .map(|(offset, cells)| {
+            let row = start_row + offset;
+            styled_terminal_line(
+                cells,
+                selection_for_row(selection, row),
+                cursor
+                    .filter(|cursor| cursor.row as usize == row)
+                    .map(|cursor| cursor.col as usize),
+            )
+        })
+        .collect::<Vec<_>>();
+    lines
+}
+
+/// The `/gam` split: generator on the left, adversarial reviewer on the right,
+/// each half a live terminal of one conversation in the pair.
+pub(crate) fn render_gam_split(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    let Some((generator_index, adversarial_index)) = app.gam_pair_indices_for_selected() else {
+        return;
+    };
+    let (left, right) = gam_split_halves(area);
+    for (half, index, role_label) in [
+        (left, generator_index, "gen"),
+        (right, adversarial_index, "adv"),
+    ] {
+        let size = TerminalSize::new(half.height.max(1), half.width.max(1)).ok();
+        if let Some(size) = size {
+            if let Some(run) = app.agents.get_mut(index) {
+                if run.terminal_size != Some(size) {
+                    if let Some(terminal) = run.terminal.as_mut() {
+                        if terminal.resize(size).is_ok() {
+                            run.terminal_size = Some(size);
+                        }
+                    }
+                }
+            }
+        }
+        let focused_half = app.focus == FocusPane::Worker && app.selected_agent == index;
+        let round_badge = app
+            .agents
+            .get(index)
+            .and_then(|run| run.gam.as_ref())
+            .map(|gam| match &gam.phase {
+                crate::GamPhase::GeneratorWorking => {
+                    format!("round {}/{}", gam.round + 1, gam.max_rounds)
+                }
+                crate::GamPhase::AwaitingVerdict => {
+                    format!("review {}/{} · judging", gam.round + 1, gam.max_rounds)
+                }
+                crate::GamPhase::Settled(crate::GamOutcome::Accepted) => "accepted".to_string(),
+                crate::GamPhase::Settled(crate::GamOutcome::Escalated(_)) => "needs you".to_string(),
+            })
+            .unwrap_or_default();
+
+        let identity = app
+            .agents
+            .get(index)
+            .map(|run| {
+                let label = if run.task_summary.trim().is_empty() {
+                    summarize_task(&run.task)
+                } else {
+                    run.task_summary.clone()
+                };
+                format!("{} · {}", truncate_chars(&label, 30), round_badge)
+            })
+            .unwrap_or_default();
+        let title = format!("{role_label} · {identity}");
+        let lines = worker_lines_at(app, index, half.height as usize, half.width as usize);
+        let paragraph = Paragraph::new(lines)
+            .style(app_style())
+            .block(pane_block(&title, focused_half, app.nav_mode))
+            .wrap(Wrap { trim: false });
+        frame.render_widget(paragraph, half);
+        if focused_half {
+            let half_inner = block_inner(half);
+            let Some(run) = app.agents.get(index) else {
+                continue;
+            };
+            let Some(terminal) = run.terminal.as_ref() else {
+                continue;
+            };
+            if terminal.scrollback() > 0 {
+                continue;
+            }
+            let cursor = terminal.cursor();
+            if cursor.row >= half_inner.height || cursor.col >= half_inner.width {
+                continue;
+            }
+            if !cursor.visible && !force_worker_cursor(run.backend) {
+                continue;
+            }
+            frame.set_cursor_position((half_inner.x + cursor.col, half_inner.y + cursor.row));
+        }
+    }
 }
 
 pub(crate) fn set_review_cursor(frame: &mut Frame<'_>, inner: Rect, app: &App) {
