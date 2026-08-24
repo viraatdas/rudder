@@ -3759,6 +3759,14 @@ pub(crate) fn render_gam_split(frame: &mut Frame<'_>, area: Rect, app: &mut App)
             .get(index)
             .and_then(|run| run.gam.as_ref())
             .map(|gam| match &gam.phase {
+                // Before the first packet the reviewer has not been given
+                // anything to review, so "round 1/4" on its half described work
+                // that had not started. It literally answers "standing by".
+                crate::GamPhase::GeneratorWorking
+                    if gam.role == crate::GamRole::Adversarial && gam.round == 0 =>
+                {
+                    "standing by".to_string()
+                }
                 crate::GamPhase::GeneratorWorking => {
                     format!("round {}/{}", gam.round + 1, gam.max_rounds)
                 }
@@ -3774,7 +3782,18 @@ pub(crate) fn render_gam_split(frame: &mut Frame<'_>, area: Rect, app: &mut App)
             .agents
             .get(index)
             .map(|run| {
-                let label = if run.task_summary.trim().is_empty() {
+                // The reviewer is identified by WHO is arguing, not by the task
+                // it shares with the generator. Its task_summary already carries
+                // an "adv · " label for the agents list, and this line adds the
+                // role prefix itself, so reusing it rendered "adv · adv · codex".
+                let label = if run.is_gam_adversary() {
+                    let model = run.model.trim();
+                    if model.is_empty() {
+                        run.backend.as_str().to_string()
+                    } else {
+                        format!("{} {}", run.backend.as_str(), model)
+                    }
+                } else if run.task_summary.trim().is_empty() {
                     summarize_task(&run.task)
                 } else {
                     run.task_summary.clone()

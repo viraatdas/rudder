@@ -269,7 +269,18 @@ pub(crate) fn worker_wants_signals(backend: Backend, mode: AgentMode) -> bool {
     let _ = backend;
     matches!(
         mode,
-        AgentMode::Execute | AgentMode::Main | AgentMode::ReviewAll | AgentMode::OneOff
+        AgentMode::Execute
+            | AgentMode::Main
+            | AgentMode::ReviewAll
+            | AgentMode::OneOff
+            // The gam reviewer needs hooks for BOTH reasons a worker ever does.
+            // Its turn end is what poll_gam_pairs waits on (it routes on the
+            // peer reaching AgentStatus::Done, which only a completion signal
+            // sets), and the lifecycle sweep kills any non-orchestrator pane
+            // that has no config installed. Leaving this mode out did not
+            // degrade the reviewer, it killed it within a tick of spawning --
+            // silently, in every pair, since the feature shipped.
+            | AgentMode::GamAdversarial
     )
 }
 

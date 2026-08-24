@@ -18670,15 +18670,74 @@ fn gam_split_render_draws_both_halves_with_roles() {
     app.cwd = dir.clone();
     let (_gen, _adv) = gam_test_pair(&mut app, "reviewer online");
     app.focus = FocusPane::Worker;
-    let screen = render_screen(&mut app, 100, 24);
+    // Wide enough that neither half's title is truncated: at 100 columns the
+    // agents sidebar clipped the badge to "round 1/".
+    let screen = render_screen(&mut app, 140, 24);
     assert!(screen.contains("gen ·"), "left half labeled: {screen}");
     assert!(screen.contains("adv ·"), "right half labeled");
-    assert!(screen.contains("round 1/4"), "round badge shown");
+    // The GENERATOR carries the round badge. The reviewer half reads
+    // "standing by" until a packet reaches it, so it is not the one to assert
+    // a round on.
+    assert!(
+        screen.contains("round 1/4"),
+        "generator round badge shown: {screen}"
+    );
 
     // The leader 'a' chord swaps which half is selected.
     app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
     app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
     assert_eq!(app.selected_agent, 1, "toggled to the adversarial half");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The reviewer must be wired for completion signals like any other worker.
+///
+/// This is the whole feature's load-bearing line. `poll_gam_pairs` routes on the
+/// reviewer reaching `AgentStatus::Done`, which ONLY a completion signal sets,
+/// and the lifecycle sweep terminates any non-orchestrator pane with no config
+/// installed. With GamAdversarial missing from this list the reviewer was killed
+/// within a tick of spawning, in every pair, with an empty transcript -- and the
+/// rest of the gam suite still passed, because it drives the pipeline above the
+/// layer that does the killing.
+#[test]
+fn gam_reviewer_is_wired_for_completion_signals() {
+    for backend in [Backend::Claude, Backend::Codex, Backend::Opencode] {
+        assert!(
+            signals::worker_wants_signals(backend, AgentMode::GamAdversarial),
+            "{backend:?} reviewer gets no lifecycle hooks, so the sweep kills it"
+        );
+    }
+}
+
+/// The split renders the role prefix itself, so an identity that already says
+/// "adv" produced "adv · adv · codex gpt-5.6-sol".
+#[cfg(not(windows))]
+#[test]
+fn gam_reviewer_half_names_the_model_without_repeating_its_role() {
+    let dir = unique_test_repo("gam-adv-title");
+    let mut app = App::new();
+    app.cwd = dir.clone();
+    let (_gen, adv) = gam_test_pair(&mut app, "standing by");
+    // Exactly what start_gam_pair stores on the reviewer row.
+    app.agents[adv].task_summary = "adv · codex gpt-5.6-sol".to_string();
+    app.agents[adv].backend = Backend::Codex;
+    app.agents[adv].model = "gpt-5.6-sol".to_string();
+    app.focus = FocusPane::Worker;
+
+    let screen = render_screen(&mut app, 120, 24);
+    assert!(
+        !screen.contains("adv · adv"),
+        "the role is prefixed twice: {screen}"
+    );
+    assert!(
+        screen.contains("adv · codex gpt-5.6-sol"),
+        "the reviewer half names who is reviewing: {screen}"
+    );
+    // Nothing has been handed to it yet, so it is not on a review round.
+    assert!(
+        screen.contains("standing by"),
+        "an unengaged reviewer must not claim a round: {screen}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
