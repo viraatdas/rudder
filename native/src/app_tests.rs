@@ -18624,59 +18624,26 @@ fn gam_suggestions_drill_down_like_the_model_picker() {
         bare.first().is_some_and(|s| s.detail.contains("reviews it by default")),
         "the default row must name who reviews when you skip the picker"
     );
-    // The rows are MODELS: picking who argues is the decision /gam exists to
-    // offer, and burying it behind a provider step hid it.
-    assert!(
-        bare.len() > 1 && bare[1..].iter().all(|s| matches!(
-            s.action,
-            SuggestionAction::ChooseGamModel { .. }
-        )),
-        "bare /gam lists candidate reviewer models: {:?}",
-        bare.iter().map(|s| s.label.clone()).collect::<Vec<_>>()
-    );
-    // Rows read like the /model picker's: the model and what it is good for.
-    // The popup TITLE is what frames them as reviewer candidates, so the rows
-    // must not repeat it.
-    assert!(
-        bare[1..]
-            .iter()
-            .all(|s| !s.detail.contains("adversarial")),
-        "the title says it; the rows should not repeat it: {:?}",
-        bare[1..].iter().map(|s| s.detail.clone()).collect::<Vec<_>>()
-    );
+    // Three providers, not the flattened catalogue: 19 rows mixing three
+    // vendors' naming schemes into one column is not a legible choice.
     assert_eq!(
+        bare[1..].iter().map(|s| s.label.clone()).collect::<Vec<_>>(),
+        vec![
+            "claude".to_string(),
+            "codex".to_string(),
+            "opencode".to_string()
+        ],
+        "bare /gam offers the three providers"
+    );
+    assert!(
         bare[1..]
             .iter()
-            .map(|s| s.detail.clone())
-            .collect::<Vec<_>>(),
-        {
-            let auto = cross_gam_backend(App::new().backend);
-            let mut providers = vec![auto];
-            for backend in [Backend::Claude, Backend::Codex, Backend::Opencode] {
-                if backend != auto {
-                    providers.push(backend);
-                }
-            }
-            providers
-                .into_iter()
-                .flat_map(|b| {
-                    model_suggestions_for(b, "")
-                        .into_iter()
-                        .take(6)
-                        .map(|s| s.detail)
-                })
-                .collect::<Vec<_>>()
-        },
-        "the rows carry the same descriptions /model shows"
+            .all(|s| matches!(s.action, SuggestionAction::ChooseGamProvider(_))),
+        "each row picks a reviewer provider"
     );
-    // The default reviewer's provider leads the list.
-    let auto = cross_gam_backend(App::new().backend);
     assert!(
-        matches!(
-            bare[1].action,
-            SuggestionAction::ChooseGamModel { backend, .. } if backend == auto
-        ),
-        "the default reviewer's provider is listed first"
+        bare[1..].iter().all(|s| s.detail.starts_with("review with")),
+        "every provider row says what the choice is for"
     );
     // And the popup says what it is, so a list of model names cannot read as
     // "/gam is about to change my model".
@@ -19179,4 +19146,257 @@ fn the_gam_split_shows_how_to_reach_the_other_half() {
         "the focused half should not carry it: {hinted_line}"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The task box already had up/down history; it just never outlived the
+/// process, so quitting rudder threw away everything you had asked it to do.
+#[test]
+fn task_history_survives_a_restart() {
+    let dir = unique_test_repo("task-history");
+    save_task_history(&dir, &[
+        "fix the login redirect".to_string(),
+        "port the settings screen".to_string(),
+    ]);
+
+    let restored = load_task_history(&dir);
+    assert_eq!(
+        restored,
+        vec![
+            "fix the login redirect".to_string(),
+            "port the settings screen".to_string()
+        ],
+        "history is what you arrow back through after a restart"
+    );
+
+    // Up-arrow walks it newest-first, from a real App holding that history.
+    let mut app = App::new();
+    app.cwd = dir.clone();
+    app.task_history = restored;
+    app.focus = FocusPane::Task;
+    app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+    assert_eq!(app.task_input, "port the settings screen", "newest first");
+    app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+    assert_eq!(app.task_input, "fix the login redirect", "then the one before");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn task_history_tolerates_a_missing_or_corrupt_file() {
+    let dir = unique_test_repo("task-history-bad");
+    // Never written: an empty history, not a startup failure.
+    assert!(load_task_history(&dir).is_empty());
+
+    std::fs::create_dir_all(dir.join(".rudder")).expect("mkdir");
+    std::fs::write(task_history_path(&dir), "{not json").expect("write");
+    assert!(
+        load_task_history(&dir).is_empty(),
+        "a hand-edited file must not stop rudder starting"
+    );
+
+    // Blank entries would be dead up-arrow presses.
+    std::fs::write(task_history_path(&dir), "[\"real\",\"\",\"  \"]").expect("write");
+    assert_eq!(load_task_history(&dir), vec!["real".to_string()]);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn repeating_a_task_does_not_double_up_the_history() {
+    let mut app = App::new();
+    app.cwd = std::env::temp_dir().join("rudder-history-noop");
+    app.remember_task_history("same task");
+    app.remember_task_history("same task");
+    app.remember_task_history("other");
+    assert_eq!(
+        app.task_history,
+        vec!["same task".to_string(), "other".to_string()],
+        "consecutive duplicates cost an extra press for nothing"
+    );
+    let _ = std::fs::remove_dir_all(&app.cwd);
+}
+
+/// END TO END through the REAL launcher.
+///
+/// Every other gam test builds panes by hand and sets statuses directly, which
+/// is exactly how a reviewer that died a tick after every launch went unnoticed
+/// while eighteen tests passed. This one calls `start_gam_task`, lets the real
+/// poll loop run, and requires the pair to reach a verdict on its own.
+///
+/// Only the MODEL is faked: RUDDER_CLAUDE_BIN / RUDDER_CODEX_BIN (which exist
+/// for exactly this) point at scripts that behave like the CLIs -- they fire the
+/// completion hook Rudder wired into their own argv, and the reviewer answers a
+/// delivered packet with a verdict block.
+#[cfg(not(windows))]
+#[test]
+fn gam_pair_reaches_a_verdict_end_to_end() {
+    let _env = env_guard();
+    let dir = unique_test_repo("gam-e2e");
+    fs::create_dir_all(&dir).expect("repo dir");
+
+    // Fake generator (claude): fires the Stop hook Rudder passed via --settings,
+    // then holds the PTY open reading stdin like a real interactive agent.
+    let gen_log = dir.join("gen.log");
+    let fake_claude = dir.join("fake-claude.sh");
+    write_fake_bin(
+        &fake_claude,
+        &format!(
+            r#"#!/bin/sh
+settings=""
+prev=""
+for a in "$@"; do
+  [ "$prev" = "--settings" ] && settings="$a"
+  prev="$a"
+done
+printf 'generator: implementing\n'
+# Settle before reporting turn-end: output arriving AFTER a done signal is how
+# a real agent looks when it starts a new turn, and Rudder reopens the row.
+sleep 1
+if [ -n "$settings" ]; then
+  sig=$(grep -o "/[^']*/signals/[^']*\.json" "$settings" | head -1)
+  if [ -n "$sig" ]; then
+    mkdir -p "$(dirname "$sig")"
+    printf '{{"state":"done"}}' > "$sig"
+  fi
+fi
+cat >> {log}
+"#,
+            log = shell_single_quote(&gen_log.to_string_lossy()),
+        ),
+    );
+
+    // Fake reviewer (codex): runs the notify script Rudder wired into its argv
+    // to report turn-end, then answers a delivered packet with a real verdict.
+    let adv_log = dir.join("adv.log");
+    let fake_codex = dir.join("fake-codex.sh");
+    write_fake_bin(
+        &fake_codex,
+        &format!(
+            r#"#!/bin/sh
+notify=""
+for a in "$@"; do
+  case "$a" in
+    notify=*) notify=$(printf '%s' "$a" | sed 's/^notify=\["//; s/"\]$//') ;;
+  esac
+done
+fire() {{ [ -n "$notify" ] && sh "$notify" '{{"type":"agent-turn-complete"}}' >/dev/null 2>&1; }}
+printf 'standing by\n'
+fire
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> {log}
+  case "$line" in
+    *"gam reviewer"*)
+      sleep 1
+      printf 'RUDDER_GAM_VERDICT_START\n'
+      printf '{{"verdict":"accept","message":"satisfies the task"}}\n'
+      printf 'RUDDER_GAM_VERDICT_END\n'
+      fire
+      ;;
+  esac
+done
+"#,
+            log = shell_single_quote(&adv_log.to_string_lossy()),
+        ),
+    );
+
+    std::env::set_var("RUDDER_CLAUDE_BIN", &fake_claude);
+    std::env::set_var("RUDDER_CODEX_BIN", &fake_codex);
+
+    let mut app = App::new();
+    app.cwd = dir.clone();
+    app.backend = Backend::Claude;
+    app.model = "sonnet".to_string();
+
+    app.start_gam_task(GamRequest {
+        task: "rewrite the retry logic".to_string(),
+        adversarial_backend: Backend::Codex,
+        adversarial_model: "gpt-5.5".to_string(),
+        in_main: true,
+    });
+
+    assert_eq!(app.agents.len(), 2, "a pair is two rows");
+    let generator = app.agents.len() - 2;
+    let adversarial = app.agents.len() - 1;
+    assert!(
+        app.agents[adversarial].terminal.is_some(),
+        "the reviewer must actually launch"
+    );
+
+    // Drive the real loops until the pair settles.
+    let mut settled = None;
+    for _ in 0..200 {
+        app.poll_agents();
+        app.poll_gam_pairs();
+        if let Some(gam) = app.agents[generator].gam.as_ref() {
+            if let GamPhase::Settled(outcome) = &gam.phase {
+                settled = Some(outcome.clone());
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    assert_ne!(
+        app.agents[adversarial].status,
+        AgentStatus::Failed,
+        "the reviewer died: {:?}",
+        app.agents[adversarial].last_error
+    );
+    let packet = fs::read_to_string(&adv_log).unwrap_or_default();
+    assert!(
+        packet.contains("gam reviewer"),
+        "no review packet ever reached the reviewer; log={packet:?}"
+    );
+    assert!(
+        packet.contains("rewrite the retry logic"),
+        "the packet must carry the ORIGINAL task; log={packet:?}"
+    );
+    assert!(
+        matches!(settled, Some(GamOutcome::Accepted)),
+        "the pair never reached a verdict; phase={:?} reviewer={:?}",
+        app.agents[generator].gam.as_ref().map(|g| g.phase.clone()),
+        app.agents[adversarial].status
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+
+#[test]
+fn tmp_dump_settings() {
+    let p = std::path::Path::new("/tmp/sig/run-x.json");
+    eprintln!("SET|{}", crate::signals::claude_settings_json(p, false));
+}
+
+/// The packet Rudder injects CONTAINS the output contract, sentinels and all,
+/// and the reviewer's PTY echoes it straight back into the pane. Parsed
+/// naively, that echo is a verdict: its body is the `"accept"|"revise"` template
+/// rather than JSON, so the tolerant fallback read it as a REVISE whose
+/// objection text was the contract itself. Found by the end-to-end test, which
+/// settled on revise when its reviewer had plainly answered accept.
+#[test]
+fn the_echoed_output_contract_is_not_mistaken_for_a_verdict() {
+    let contract: Vec<String> = vec![
+        "OUTPUT CONTRACT - end your reply with EXACTLY this block:".to_string(),
+        "RUDDER_GAM_VERDICT_START".to_string(),
+        r#"{"verdict":"accept"|"revise"|"escalate","message":"<under 120 words>"}"#.to_string(),
+        "RUDDER_GAM_VERDICT_END".to_string(),
+    ];
+    assert_eq!(
+        parse_gam_verdict(&contract),
+        None,
+        "the template is an instruction, not an answer"
+    );
+
+    // A real answer AFTER the echoed contract still wins.
+    let mut answered = contract.clone();
+    answered.extend([
+        "RUDDER_GAM_VERDICT_START".to_string(),
+        r#"{"verdict":"accept","message":"satisfies the task"}"#.to_string(),
+        "RUDDER_GAM_VERDICT_END".to_string(),
+    ]);
+    assert_eq!(
+        parse_gam_verdict(&answered),
+        Some(GamVerdict::Accept("satisfies the task".to_string()))
+    );
 }

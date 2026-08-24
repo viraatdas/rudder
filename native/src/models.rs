@@ -779,14 +779,16 @@ fn gam_provider_rows() -> impl Iterator<Item = Suggestion> {
     })
 }
 
-/// What bare `/gam` shows: the models that could argue with the generator,
-/// across every provider, with the default reviewer's provider listed first.
+/// What bare `/gam` shows: the three providers a reviewer can run on, then its
+/// models once one is named.
 ///
-/// Models rather than providers, because picking the adversary IS the decision
-/// this command exists to offer, and making it a two-step drill-down hid it.
-/// This list appears ONLY on the bare command: the moment a character follows
-/// `/gam `, the strict rules take over, so a task word can never pull a model
-/// row back up mid-sentence (typing "fix" would otherwise match "fable").
+/// Providers rather than every model at once. Flattening the catalogue put 19
+/// rows on screen and mixed three vendors' naming schemes into one column; the
+/// two-step read is what makes the choice legible.
+///
+/// This appears ONLY on the bare command. The moment a character follows
+/// `/gam `, the strict rules take over, so a task word can never pull the picker
+/// back up mid-sentence.
 ///
 /// The FIRST row is the do-nothing path, so the default selection under the
 /// cursor keeps whatever the user is typing rather than rewriting the line.
@@ -800,31 +802,9 @@ pub(crate) fn gam_reviewer_suggestions(default_backend: Backend) -> Vec<Suggesti
         ),
         action: SuggestionAction::Insert("/gam ".to_string()),
     }];
-    // Default reviewer's provider first, then the rest in their usual order.
-    let mut providers = vec![auto];
-    for backend in [Backend::Claude, Backend::Codex, Backend::Opencode] {
-        if backend != auto {
-            providers.push(backend);
-        }
-    }
-    for backend in providers {
-        rows.extend(
-            gam_model_suggestions(backend, "")
-                .into_iter()
-                .take(GAM_MODELS_PER_PROVIDER),
-        );
-    }
+    rows.extend(gam_provider_rows());
     rows
 }
-
-/// How many models each provider contributes to the bare `/gam` list.
-///
-/// The full catalogue is over a hundred rows across three providers, which is a
-/// wall to scroll rather than a choice to make. `model_suggestions_for` leads
-/// with the friendly aliases that track each family's newest release, so the
-/// first few are the ones worth offering; naming a provider still opens its
-/// complete list.
-const GAM_MODELS_PER_PROVIDER: usize = 6;
 
 /// Palette title for the `/gam` picker. The rows are model names, which on
 /// their own look exactly like the `/model` picker and read as "this is about

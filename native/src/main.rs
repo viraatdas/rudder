@@ -115,6 +115,40 @@ const READY_EVAL_LULL: Duration = Duration::from_millis(900);
 // re-exported above so call sites are unchanged.
 const DEFAULT_WHEEL_SCROLL_ROWS: u16 = 3;
 const TASK_HISTORY_LIMIT: usize = 100;
+
+/// Where the task box's up-arrow history lives. Per PROJECT, not per machine:
+/// the useful thing to arrow back to is what you asked THIS repo to do.
+fn task_history_path(cwd: &Path) -> PathBuf {
+    cwd.join(".rudder").join("task-history.json")
+}
+
+/// Best effort in both directions. History is a convenience, so a failure to
+/// write must never interrupt launching a task, and unreadable or hand-edited
+/// contents load as empty rather than refusing to start.
+fn save_task_history(cwd: &Path, history: &[String]) {
+    let path = task_history_path(cwd);
+    if let Some(parent) = path.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    if let Ok(json) = serde_json::to_string(&history) {
+        let _ = std::fs::write(path, json);
+    }
+}
+
+fn load_task_history(cwd: &Path) -> Vec<String> {
+    let Ok(raw) = std::fs::read_to_string(task_history_path(cwd)) else {
+        return Vec::new();
+    };
+    let mut history: Vec<String> = serde_json::from_str(&raw).unwrap_or_default();
+    history.retain(|entry| !entry.trim().is_empty());
+    if history.len() > TASK_HISTORY_LIMIT {
+        let overflow = history.len() - TASK_HISTORY_LIMIT;
+        history.drain(0..overflow);
+    }
+    history
+}
 /// How many recent conversations the `/handoff` palette offers. Each one costs a
 /// transcript head read, and a list longer than the popup is not a list.
 const HANDOFF_PICKER_LIMIT: usize = 8;
@@ -834,6 +868,14 @@ fn parse_gam_verdict(lines: &[String]) -> Option<GamVerdict> {
         return None;
     }
     body = strip_code_fences(&body);
+    // The packet we injected CONTAINS the output contract, sentinels and all,
+    // and the reviewer's PTY echoes it back into the pane. That echoed template
+    // is not an answer: its body is the literal `"accept"|"revise"|"escalate"`
+    // alternation, which is not valid JSON, so the tolerant fallback below would
+    // read it as a REVISE carrying the contract text as its objection.
+    if body.contains("\"accept\"|\"revise\"") || body.contains("<under 120 words>") {
+        return None;
+    }
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) {
         let message = value
             .get("message")
@@ -2060,6 +2102,13 @@ impl App {
         } else {
             load_ingested_runs(&cwd)
         };
+        // Same short-circuit as the restores above: every App::new() in the
+        // suite would otherwise read the developer's own .rudder/.
+        let restored_task_history = if cfg!(test) {
+            Vec::new()
+        } else {
+            load_task_history(&cwd)
+        };
         // Restore the auto-expansion depth map so MAX_FOLLOWUP_DEPTH survives a restart.
         let followup_gen = if cfg!(test) {
             HashMap::new()
@@ -2098,7 +2147,7 @@ impl App {
             task_input,
             task_cursor,
             pasted_chunks: Vec::new(),
-            task_history: Vec::new(),
+            task_history: restored_task_history,
             task_history_index: None,
             task_history_draft: String::new(),
             agents,
@@ -4336,12 +4385,17 @@ impl App {
         if input.trim().is_empty() {
             return;
         }
-        self.task_history.push(input.to_string());
+        // Consecutive duplicates are noise when arrowing back: re-running the
+        // same task twice should not cost two presses to step past.
+        if self.task_history.last().map(String::as_str) != Some(input) {
+            self.task_history.push(input.to_string());
+        }
         if self.task_history.len() > TASK_HISTORY_LIMIT {
             let overflow = self.task_history.len() - TASK_HISTORY_LIMIT;
             self.task_history.drain(0..overflow);
         }
         self.reset_task_history_navigation();
+        save_task_history(&self.cwd, &self.task_history);
     }
 
     fn handle_picker_key(&mut self, key: KeyEvent) -> bool {
