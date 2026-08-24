@@ -30,7 +30,7 @@ const NAV = [
     items: [
       ["workspaces", "Workspaces"],
       ["plans", "Plans and the DAG"],
-      ["gam", "Adversarial pairs (GAM)"],
+      ["gam", "Generative Adversarial Model (GAM)"],
     ],
   },
   {
@@ -418,6 +418,7 @@ what is happening.</p>
     toc: [
       ["start", "Starting a pair"],
       ["steering", "How the reviewer steers the work"],
+      ["pipeline", "How the two halves talk"],
       ["why", "Why two models"],
       ["round", "What a round is"],
       ["verdicts", "The three verdicts"],
@@ -510,6 +511,50 @@ specific correction at the moment it can still act on it cheaply. That is the wh
 mechanism: steering while the work is happening, rather than judging it once it is
 finished.</p>
 
+<h2 id="pipeline">How the two halves talk</h2>
+<p><strong>The reviewer is not a subagent.</strong> Neither model calls the other,
+and neither can see the other's conversation. They are two ordinary CLI processes in
+two panes, each holding its own session, exactly like any other agent Rudder runs.
+Rudder is the pipe between them.</p>
+<p>There is no live connection either. The exchange happens at turn boundaries, and
+Rudder moves it by typing into panes and reading them back:</p>
+<pre><code>GENERATOR  your model, writes, its own session
+REVIEWER   other provider, read-only, its own session
+
+  generator's turn ends
+    │   it says so itself, through its own Stop hook
+    │   or notify program. Rudder never guesses from
+    ▼   the screen, so a half still thinking is safe.
+  rudder reads the workspace diff
+  rudder builds the packet
+    ·  your ORIGINAL task, every round
+    ·  the current diff
+    ·  the generator's last rebuttal, if it made one
+    │
+    ▼   typed into the reviewer's pane, then Enter
+  REVIEWER reads it, runs its own checks, answers
+  reviewer's turn ends
+    │
+    ▼   rudder reads the verdict off its visible screen
+  accept  →  the pair settles
+  revise  →  the objection is typed into the generator
+    │
+    ▼
+  generator's next turn: same session, context intact</code></pre>
+<p>Three details are worth knowing, because they are what make the loop reliable:</p>
+<table class="docs-table">
+  <thead><tr><th>step</th><th>how it actually works</th></tr></thead>
+  <tbody>
+    <tr><td>Whose turn it is</td><td>Rudder does not guess from the screen. Each CLI reports its own turn-end through its native hook, Claude's <code>Stop</code> hook or Codex's <code>notify</code> program, which writes a signal file Rudder watches. A half that is still thinking is never interrupted.</td></tr>
+    <tr><td>Delivering a message</td><td>Rudder types it into the receiving pane as a bracketed paste and presses Enter, exactly as if you had typed it yourself. This is why the generator keeps its context: it is mid-conversation, not restarted with a new brief.</td></tr>
+    <tr><td>Reading the answer</td><td>The verdict is read off the reviewer's visible screen, which is why it must arrive wrapped in sentinel lines. No parseable block means Rudder stops and asks you rather than guessing what the reviewer meant.</td></tr>
+  </tbody>
+</table>
+<p>Because each half is its own session, nothing leaks between them but the messages
+above. The reviewer never sees the generator's reasoning, and the generator never sees
+the reviewer's. That separation is not a policy Rudder asks them to respect; it is a
+property of running them as two processes that were never introduced.</p>
+
 <h2 id="why">Why two models</h2>
 <p>A model reviewing its own work agrees with itself. It has already decided the
 approach was reasonable, and asking it to check that decision gets you a summary of
@@ -566,9 +611,23 @@ keeps the pair converging instead of wandering.</p>
 </div>
 
 <h2 id="stops">When it stops</h2>
-<p>A pair runs at most <strong>four rounds</strong>. It ends early when the reviewer
-accepts. It stops and asks for you when the reviewer escalates, when four rounds pass
-without acceptance, or when the reviewer produces no readable verdict at all.</p>
+<p><strong>There is no round limit.</strong> A pair keeps going for as long as the
+argument is getting somewhere, because a fixed count would end a productive exchange
+mid-sentence and let an unproductive one run to the same number anyway.</p>
+<p>What ends it is one of these:</p>
+<table class="docs-table">
+  <thead><tr><th>ending</th><th>what happened</th></tr></thead>
+  <tbody>
+    <tr><td>accepted</td><td>The reviewer could not find a blocking defect to demonstrate.</td></tr>
+    <tr><td>escalated</td><td>The reviewer asked for you: a scope dispute, two irreconcilable approaches, or a correct objection the generator keeps ignoring.</td></tr>
+    <tr><td>stalled</td><td>The generator handed back the same diff AND the same rebuttal as the round before. It did nothing with the objection, so another round would ask the identical question and get the identical answer. A NEW argument counts as progress even with no code change: refusing to edit while explaining why is a legitimate move.</td></tr>
+    <tr><td>no verdict</td><td>The reviewer produced no readable verdict block at all.</td></tr>
+  </tbody>
+</table>
+<p>The stall check is what makes an unbounded loop safe to run: it ends on lack of
+progress rather than on a count. There is a runaway guard far above any argument that
+is still moving, but reaching it means something went wrong that the stall check
+did not catch.</p>
 <p>In every one of those cases <strong>both panes stay live</strong> and Rudder names
 the reason. Nothing is discarded and nothing is merged behind your back: the
 generator's work sits in its workspace exactly like any other agent's, and it lands
@@ -576,10 +635,11 @@ when you press <kbd>m</kbd>.</p>
 
 <div class="note">
   <span class="field-label">cost</span>
-  <p>A pair spends roughly twice what the same task costs alone, and takes longer in
-  wall-clock time, because the reviewer reads a finished diff and the two halves
-  cannot run at the same time. It earns that on work where being wrong is expensive,
-  not on a rename.</p>
+  <p>A pair spends roughly twice what the same task costs alone per round, and takes
+  longer in wall-clock time, because the reviewer reads a finished diff and the two
+  halves cannot run at the same time. With no round limit that cost is bounded by
+  convergence rather than by a number, so it earns its keep on work where being wrong
+  is expensive, not on a rename.</p>
 </div>
 
 <h2 id="why-it-matters">Why this is worth the second model</h2>

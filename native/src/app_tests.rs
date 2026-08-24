@@ -18315,7 +18315,8 @@ fn gam_packet_carries_task_round_and_visible_truncation() {
         role: GamRole::Generator,
         peer_run_id: "peer".to_string(),
         round: 2,
-        max_rounds: 4,
+        runaway_rounds: GAM_RUNAWAY_ROUNDS,
+        last_progress: None,
         phase: GamPhase::AwaitingVerdict,
         task: "refactor auth".to_string(),
         last_message: "I disagree about the token shape".to_string(),
@@ -18323,7 +18324,11 @@ fn gam_packet_carries_task_round_and_visible_truncation() {
     };
     let packet = gam_review_packet(&gam, "- a.ts | 1 +");
     assert!(packet.contains("refactor auth"));
-    assert!(packet.contains("Review round 3 of 4"));
+    assert!(packet.contains("Review round 3"));
+    assert!(
+        !packet.contains("Review round 3 of"),
+        "no denominator on the round: the pair runs until it converges, not to a deadline"
+    );
     // The generator's reply is relayed from the SECOND packet on (round > 0).
     assert!(packet.contains("I disagree about the token shape"));
 
@@ -18392,7 +18397,8 @@ fn gam_test_pair(
             role,
             peer_run_id: peer,
             round: 0,
-            max_rounds: MAX_GAM_ROUNDS,
+            runaway_rounds: GAM_RUNAWAY_ROUNDS,
+            last_progress: None,
             phase: GamPhase::GeneratorWorking,
             task: "refactor auth".to_string(),
             last_message: String::new(),
@@ -18430,7 +18436,7 @@ fn gam_delivers_packet_to_the_reviewer_once() {
     app.poll_gam_pairs();
     std::thread::sleep(std::time::Duration::from_millis(120));
     let log = fs::read_to_string(dir.join("reviewer.log")).unwrap_or_default();
-    let packets = log.matches("Review round 1 of 4").count();
+    let packets = log.matches("Review round 1").count();
     assert_eq!(packets, 1, "one packet delivered: {log:?}");
     assert!(log.contains("refactor auth"), "packet carries the task");
     assert!(
@@ -18563,7 +18569,7 @@ fn gam_accept_settles_the_pair() {
 
 #[cfg(not(windows))]
 #[test]
-fn gam_round_cap_escalates_but_still_delivers_the_last_objection() {
+fn gam_runaway_guard_escalates_but_still_delivers_the_last_objection() {
     let dir = unique_test_repo("gam-cap");
     let mut app = App::new();
     app.cwd = dir.clone();
@@ -18574,8 +18580,8 @@ fn gam_round_cap_escalates_but_still_delivers_the_last_objection() {
     assert!(drain_until(&mut app, 1, GAM_VERDICT_END));
     for index in [0usize, 1usize] {
         if let Some(gam) = app.agents[index].gam.as_mut() {
-            gam.round = MAX_GAM_ROUNDS.saturating_sub(1);
-            gam.max_rounds = MAX_GAM_ROUNDS;
+            gam.round = GAM_RUNAWAY_ROUNDS.saturating_sub(1);
+            gam.runaway_rounds = GAM_RUNAWAY_ROUNDS;
             gam.phase = GamPhase::AwaitingVerdict;
             gam.awaiting_since = Some(Instant::now());
         }
@@ -18589,9 +18595,9 @@ fn gam_round_cap_escalates_but_still_delivers_the_last_objection() {
     for index in [0usize, 1usize] {
         assert_eq!(
             app.agents[index].gam.as_ref().unwrap().phase,
-            GamPhase::Settled(GamOutcome::Escalated(
-                "round cap (4) reached without acceptance".to_string()
-            ))
+            GamPhase::Settled(GamOutcome::Escalated(format!(
+                "{GAM_RUNAWAY_ROUNDS} rounds without converging; stopping so it cannot loop"
+            )))
         );
     }
     // The final objection still reaches the generator so it can act manually.
@@ -19415,8 +19421,8 @@ fn the_gam_badge_describes_the_stage_not_a_counter() {
         (0, GamPhase::GeneratorWorking, "writing", "standing by"),
         (0, GamPhase::AwaitingVerdict, "under review", "reviewing"),
         // Now the count means something: attempts left before it asks you.
-        (1, GamPhase::GeneratorWorking, "revision 1 of 3", "objected"),
-        (3, GamPhase::GeneratorWorking, "revision 3 of 3", "objected"),
+        (1, GamPhase::GeneratorWorking, "revision 1", "objected"),
+        (9, GamPhase::GeneratorWorking, "revision 9", "objected"),
         (0, GamPhase::Settled(GamOutcome::Accepted), "accepted", "accepted"),
     ];
     for (round, phase, expect_gen, expect_adv) in cases {
@@ -19445,5 +19451,101 @@ fn the_gam_badge_describes_the_stage_not_a_counter() {
             "the raw counter must not surface: {header}"
         );
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// With the round cap gone, what ends a pair is the argument going somewhere.
+/// If the generator hands back the same diff AND the same rebuttal as the round
+/// before, it did nothing with the objection: re-reviewing asks the identical
+/// question and gets the identical answer, forever.
+#[cfg(not(windows))]
+#[test]
+fn a_generator_that_stops_making_progress_ends_the_pair() {
+    let dir = unique_test_repo("gam-stall");
+    let mut app = App::new();
+    app.cwd = dir.clone();
+    let (generator, adversarial) = gam_test_pair(&mut app, "standing by");
+
+    // Mid-argument, and the previous round's diff+reply already fingerprinted.
+    // gam_test_pair's workspace has no changes, so the diff is stable "" and the
+    // reply is unchanged: exactly the shape of a generator that did nothing.
+    let stalled = {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        String::new().hash(&mut hasher);
+        String::new().hash(&mut hasher);
+        hasher.finish()
+    };
+    for side in [generator, adversarial] {
+        if let Some(gam) = app.agents[side].gam.as_mut() {
+            gam.round = 2;
+            gam.phase = GamPhase::GeneratorWorking;
+            gam.last_message = String::new();
+            gam.last_progress = Some(stalled);
+        }
+    }
+    app.agents[generator].status = AgentStatus::Done;
+    app.agents[adversarial].status = AgentStatus::Done;
+
+    app.poll_gam_pairs();
+
+    let phase = app.agents[generator].gam.as_ref().unwrap().phase.clone();
+    match phase {
+        GamPhase::Settled(GamOutcome::Escalated(reason)) => assert!(
+            reason.contains("stopped making progress"),
+            "the reason must name the stall: {reason}"
+        ),
+        other => panic!("a stalled pair must stop, got {other:?}"),
+    }
+    assert!(
+        app.notice
+            .as_deref()
+            .is_some_and(|n| n.contains("gam needs you")),
+        "and it must ask the human: {:?}",
+        app.notice
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A rebuttal is progress. Refusing to change the code while explaining why is
+/// a legitimate move the generator is explicitly told it may make, so only
+/// repeating yourself counts as a stall.
+#[cfg(not(windows))]
+#[test]
+fn a_new_rebuttal_counts_as_progress_even_with_no_code_change() {
+    let dir = unique_test_repo("gam-rebuttal");
+    let mut app = App::new();
+    app.cwd = dir.clone();
+    let (generator, adversarial) = gam_test_pair(&mut app, "standing by");
+
+    let previous = {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        String::new().hash(&mut hasher);
+        "my earlier reasoning".to_string().hash(&mut hasher);
+        hasher.finish()
+    };
+    for side in [generator, adversarial] {
+        if let Some(gam) = app.agents[side].gam.as_mut() {
+            gam.round = 2;
+            gam.phase = GamPhase::GeneratorWorking;
+            // Same (empty) diff, but a DIFFERENT argument than last round.
+            gam.last_message = "a different reason this time".to_string();
+            gam.last_progress = Some(previous);
+        }
+    }
+    app.agents[generator].status = AgentStatus::Done;
+    app.agents[adversarial].status = AgentStatus::Done;
+
+    app.poll_gam_pairs();
+
+    assert!(
+        matches!(
+            app.agents[generator].gam.as_ref().unwrap().phase,
+            GamPhase::AwaitingVerdict
+        ),
+        "a fresh argument keeps the pair going: {:?}",
+        app.agents[generator].gam.as_ref().unwrap().phase
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -3769,7 +3769,6 @@ pub(crate) fn render_gam_split(frame: &mut Frame<'_>, area: Rect, app: &mut App)
             // them, which is max_rounds - 1 revisions after the first draft.
             .map(|gam| {
                 let adversarial = gam.role == crate::GamRole::Adversarial;
-                let revisions_allowed = gam.max_rounds.saturating_sub(1);
                 match &gam.phase {
                     crate::GamPhase::GeneratorWorking if gam.round == 0 => {
                         if adversarial {
@@ -3782,7 +3781,9 @@ pub(crate) fn render_gam_split(frame: &mut Frame<'_>, area: Rect, app: &mut App)
                         if adversarial {
                             "objected · waiting".to_string()
                         } else {
-                            format!("revision {} of {}", gam.round, revisions_allowed)
+                            // No total: the pair runs until it converges, so
+                            // a denominator here would be inventing a deadline.
+                            format!("revision {}", gam.round)
                         }
                     }
                     // The two halves are doing different things here: one is

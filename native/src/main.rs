@@ -611,7 +611,16 @@ struct GamState {
     peer_run_id: String,
     /// Reviews completed so far (the first packet is round 1's start).
     round: u32,
-    max_rounds: u32,
+    /// Pure runaway guard, NOT the design. A pair ends when the reviewer
+    /// accepts, when it escalates, or when the generator stops making progress;
+    /// this only catches a loop that would otherwise never stop at all.
+    runaway_rounds: u32,
+    /// Fingerprint of the generator's last (diff, rebuttal) pair. Two identical
+    /// rounds in a row mean it produced nothing new -- no edit and no new
+    /// argument -- so another review would ask the same question and get the
+    /// same answer. That is a stall, and it is what makes an unbounded loop
+    /// safe to run: it ends on lack of progress rather than on a count.
+    last_progress: Option<u64>,
     phase: GamPhase,
     /// The user's original ask, kept clean of the protocol preamble so every
     /// packet anchors on the same request.
@@ -630,9 +639,10 @@ struct GamState {
 
 const GAM_VERDICT_START: &str = "RUDDER_GAM_VERDICT_START";
 const GAM_VERDICT_END: &str = "RUDDER_GAM_VERDICT_END";
-/// Revisions before the loop escalates instead of looping forever. Four full
-/// reviews is already a long argument; beyond that a human should arbitrate.
-const MAX_GAM_ROUNDS: u32 = 4;
+/// Runaway guard only. A pair is meant to run until it settles, so this is set
+/// far above any argument that is still making progress; a pair that reaches it
+/// has failed to converge in a way the stall check did not catch.
+const GAM_RUNAWAY_ROUNDS: u32 = 40;
 /// Diff budget per packet, matching the haiku backstop's discipline: bounded,
 /// and truncated VISIBLY so the reviewer never objects to code it cannot see.
 const GAM_DIFF_BUDGET_CHARS: usize = 16_000;
@@ -770,7 +780,7 @@ cannot modify anything.",
 /// generator's latest reply, because the reviewer RESUMES ITS OWN SESSION and
 /// must not re-pay context it already holds.
 fn gam_review_packet(gam: &GamState, diff: &str) -> String {
-    let round_label = format!("Review round {} of {}", gam.round + 1, gam.max_rounds);
+    let round_label = format!("Review round {}", gam.round + 1);
     let mut packet = String::new();
     packet.push_str(&format!(
         "[gam reviewer · {round_label}] You are the ADVERSARIAL REVIEWER half of a \
@@ -6533,7 +6543,8 @@ packet arrives, reply only: \"standing by\"."
                 role: GamRole::Generator,
                 peer_run_id: adversarial_id.clone(),
                 round: 0,
-                max_rounds: MAX_GAM_ROUNDS,
+                runaway_rounds: GAM_RUNAWAY_ROUNDS,
+                last_progress: None,
                 phase: GamPhase::GeneratorWorking,
                 task,
                 last_message: String::new(),
@@ -6630,7 +6641,8 @@ packet arrives, reply only: \"standing by\"."
                 role: GamRole::Adversarial,
                 peer_run_id: generator_id,
                 round: 0,
-                max_rounds: MAX_GAM_ROUNDS,
+                runaway_rounds: GAM_RUNAWAY_ROUNDS,
+                last_progress: None,
                 phase: GamPhase::GeneratorWorking,
                 task: run.task_summary.clone(),
                 last_message: String::new(),
@@ -6809,6 +6821,31 @@ packet arrives, reply only: \"standing by\"."
             gam.last_message = reply;
         }
         let diff = jj_diff_text(&self.agents[generator_index].cwd, GAM_DIFF_BUDGET_CHARS);
+        // PROGRESS GATE. The pair has no round limit, so what ends it is the
+        // argument going somewhere. If the generator produced the same diff AND
+        // the same rebuttal as last round, it did nothing with the objection:
+        // re-reviewing would ask the identical question and get the identical
+        // answer, forever. Note this deliberately counts a NEW rebuttal as
+        // progress -- refusing to change the code while explaining why is a
+        // legitimate move, and only repeating yourself is a stall.
+        let progress = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            diff.hash(&mut hasher);
+            gam.last_message.hash(&mut hasher);
+            hasher.finish()
+        };
+        if gam.round > 0 && gam.last_progress == Some(progress) {
+            let reason =
+                "the generator stopped making progress: same diff and same reply as the last round";
+            self.record_activity(format!("gam: stopped after {} round(s) — {reason}", gam.round));
+            // Every other ending tells the user; this one settled silently, so a
+            // stalled pair just went quiet with both panes still open.
+            self.notice = Some(format!("gam needs you: {reason}. Both panes stay live."));
+            self.settle_gam_pair(generator_index, GamOutcome::Escalated(reason.to_string()));
+            return;
+        }
+        gam.last_progress = Some(progress);
         let packet = gam_review_packet(&gam, &diff);
         if !self.live_inject_at(peer_index, &packet) {
             self.settle_gam_pair(generator_index, GamOutcome::Escalated(
@@ -6861,11 +6898,11 @@ packet arrives, reply only: \"standing by\"."
             .as_ref()
             .map(|gam| gam.round)
             .unwrap_or(0);
-        let max_rounds = self.agents[generator_index]
+        let runaway_rounds = self.agents[generator_index]
             .gam
             .as_ref()
-            .map(|gam| gam.max_rounds)
-            .unwrap_or(MAX_GAM_ROUNDS);
+            .map(|gam| gam.runaway_rounds)
+            .unwrap_or(GAM_RUNAWAY_ROUNDS);
         let escalated_by_reviewer = matches!(verdict, Some(GamVerdict::Escalate(_)));
         match verdict {
             Some(GamVerdict::Accept(message)) => {
@@ -6890,7 +6927,7 @@ packet arrives, reply only: \"standing by\"."
                     message.trim().to_string()
                 };
                 let next_round = round + 1;
-                let capped = next_round >= max_rounds;
+                let capped = next_round >= runaway_rounds;
                 let injection = format!(
                     "[gam reviewer · round {next_round}] {revise_message}\n\
 Address the objection directly. If you disagree, say why inside \
@@ -6900,7 +6937,9 @@ Address the objection directly. If you disagree, say why inside \
                 );
                 let injected = self.live_inject_at(generator_index, &injection);
                 let reason = if capped {
-                    format!("round cap ({max_rounds}) reached without acceptance")
+                    format!(
+                        "{runaway_rounds} rounds without converging; stopping so it cannot loop"
+                    )
                 } else if escalated_by_reviewer {
                     format!(
                         "the reviewer asked for a human: {}",

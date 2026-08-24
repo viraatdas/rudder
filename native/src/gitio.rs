@@ -939,7 +939,7 @@ pub(crate) fn agent_status_from_record(status: Option<&str>) -> AgentStatus {
 /// Read a persisted `/gam` pair link back off a run record. Old records (and
 /// every non-gam run) have no `gam` object and load as `None`.
 pub(crate) fn gam_state_from_record(record: &serde_json::Value) -> Option<crate::GamState> {
-    use crate::{GamOutcome, GamPhase, GamRole, GamState, MAX_GAM_ROUNDS};
+    use crate::{GamOutcome, GamPhase, GamRole, GamState, GAM_RUNAWAY_ROUNDS};
     let gam = record.get("gam")?;
     let role = gam
         .get("role")
@@ -967,12 +967,20 @@ pub(crate) fn gam_state_from_record(record: &serde_json::Value) -> Option<crate:
         role,
         peer_run_id,
         round: gam.get("round").and_then(serde_json::Value::as_u64).unwrap_or(0) as u32,
-        max_rounds: gam
-            .get("maxRounds")
+        runaway_rounds: gam
+            .get("runawayRounds")
+            // Records written before the round cap became a runaway guard carry
+            // "maxRounds": 4. Reading that as the new guard would stop a
+            // reloaded pair after four rounds, which is the behaviour being
+            // removed, so old values are ignored rather than honoured.
             .and_then(serde_json::Value::as_u64)
             .map(|value| value as u32)
             .filter(|value| *value > 0)
-            .unwrap_or(MAX_GAM_ROUNDS),
+            .unwrap_or(GAM_RUNAWAY_ROUNDS),
+        // Progress is compared against the round BEFORE it, which a restart has
+        // no memory of; starting empty just means the first round after a
+        // reload cannot be judged a stall.
+        last_progress: None,
         phase,
         task,
         last_message: gam
@@ -992,7 +1000,7 @@ pub(crate) fn gam_state_to_json(gam: &crate::GamState) -> serde_json::Value {
         "role": gam.role.as_str(),
         "peerId": gam.peer_run_id,
         "round": gam.round,
-        "maxRounds": gam.max_rounds,
+        "runawayRounds": gam.runaway_rounds,
         "phase": gam.phase.as_str(),
         "task": gam.task,
         "lastMessage": gam.last_message,
