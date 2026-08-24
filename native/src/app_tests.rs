@@ -18701,12 +18701,12 @@ fn gam_split_render_draws_both_halves_with_roles() {
     let screen = render_screen(&mut app, 140, 24);
     assert!(screen.contains("gen ·"), "left half labeled: {screen}");
     assert!(screen.contains("adv ·"), "right half labeled");
-    // The GENERATOR carries the round badge. The reviewer half reads
-    // "standing by" until a packet reaches it, so it is not the one to assert
-    // a round on.
+    // Each half says what it is doing. Before anything has been reviewed that
+    // is "writing" and "standing by" -- see
+    // the_gam_badge_describes_the_stage_not_a_counter for the full progression.
     assert!(
-        screen.contains("round 1/4"),
-        "generator round badge shown: {screen}"
+        screen.contains("writing") && screen.contains("standing by"),
+        "each half states its stage: {screen}"
     );
 
     // The leader 'a' chord swaps which half is selected.
@@ -19399,4 +19399,51 @@ fn the_echoed_output_contract_is_not_mistaken_for_a_verdict() {
         parse_gam_verdict(&answered),
         Some(GamVerdict::Accept("satisfies the task".to_string()))
     );
+}
+
+
+/// The badge should say what is HAPPENING, not which iteration of an internal
+/// counter this is. "round 1/4" showed before a single line had been reviewed,
+/// so it read as a countdown that had already started, and it never said what
+/// reaching 4 would do.
+#[cfg(not(windows))]
+#[test]
+fn the_gam_badge_describes_the_stage_not_a_counter() {
+    let dir = unique_test_repo("gam-badge-words");
+    let cases: Vec<(u32, GamPhase, &str, &str)> = vec![
+        // Nothing reviewed yet: there is no round to be on.
+        (0, GamPhase::GeneratorWorking, "writing", "standing by"),
+        (0, GamPhase::AwaitingVerdict, "under review", "reviewing"),
+        // Now the count means something: attempts left before it asks you.
+        (1, GamPhase::GeneratorWorking, "revision 1 of 3", "objected"),
+        (3, GamPhase::GeneratorWorking, "revision 3 of 3", "objected"),
+        (0, GamPhase::Settled(GamOutcome::Accepted), "accepted", "accepted"),
+    ];
+    for (round, phase, expect_gen, expect_adv) in cases {
+        let mut app = App::new();
+        app.cwd = dir.clone();
+        let _ = gam_test_pair(&mut app, "x");
+        for side in [0usize, 1] {
+            if let Some(gam) = app.agents[side].gam.as_mut() {
+                gam.round = round;
+                gam.phase = phase.clone();
+            }
+        }
+        app.focus = FocusPane::Worker;
+        let screen = render_screen(&mut app, 140, 12);
+        let header = screen.lines().next().unwrap_or_default().to_string();
+        assert!(
+            header.contains(expect_gen),
+            "generator half should read {expect_gen:?}: {header}"
+        );
+        assert!(
+            header.contains(expect_adv),
+            "reviewer half should read {expect_adv:?}: {header}"
+        );
+        assert!(
+            !header.contains("round "),
+            "the raw counter must not surface: {header}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }

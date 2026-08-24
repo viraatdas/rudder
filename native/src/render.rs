@@ -3758,23 +3758,47 @@ pub(crate) fn render_gam_split(frame: &mut Frame<'_>, area: Rect, app: &mut App)
             .agents
             .get(index)
             .and_then(|run| run.gam.as_ref())
-            .map(|gam| match &gam.phase {
-                // Before the first packet the reviewer has not been given
-                // anything to review, so "round 1/4" on its half described work
-                // that had not started. It literally answers "standing by".
-                crate::GamPhase::GeneratorWorking
-                    if gam.role == crate::GamRole::Adversarial && gam.round == 0 =>
-                {
-                    "standing by".to_string()
+            // Say what is HAPPENING, not which iteration of an internal counter
+            // this is. "round 1/4" appeared before a single line had been
+            // reviewed, so it read as a countdown that had already started, and
+            // it never said what reaching 4 would do.
+            //
+            // `round` counts completed review cycles, so the number is only
+            // meaningful once one has happened: at that point what the reader
+            // wants is how many attempts are left before the pair stops and asks
+            // them, which is max_rounds - 1 revisions after the first draft.
+            .map(|gam| {
+                let adversarial = gam.role == crate::GamRole::Adversarial;
+                let revisions_allowed = gam.max_rounds.saturating_sub(1);
+                match &gam.phase {
+                    crate::GamPhase::GeneratorWorking if gam.round == 0 => {
+                        if adversarial {
+                            "standing by".to_string()
+                        } else {
+                            "writing".to_string()
+                        }
+                    }
+                    crate::GamPhase::GeneratorWorking => {
+                        if adversarial {
+                            "objected · waiting".to_string()
+                        } else {
+                            format!("revision {} of {}", gam.round, revisions_allowed)
+                        }
+                    }
+                    // The two halves are doing different things here: one is
+                    // being judged, the other is judging.
+                    crate::GamPhase::AwaitingVerdict => if adversarial {
+                        "reviewing".to_string()
+                    } else {
+                        "under review".to_string()
+                    },
+                    crate::GamPhase::Settled(crate::GamOutcome::Accepted) => {
+                        "accepted".to_string()
+                    }
+                    crate::GamPhase::Settled(crate::GamOutcome::Escalated(_)) => {
+                        "needs you".to_string()
+                    }
                 }
-                crate::GamPhase::GeneratorWorking => {
-                    format!("round {}/{}", gam.round + 1, gam.max_rounds)
-                }
-                crate::GamPhase::AwaitingVerdict => {
-                    format!("review {}/{} · judging", gam.round + 1, gam.max_rounds)
-                }
-                crate::GamPhase::Settled(crate::GamOutcome::Accepted) => "accepted".to_string(),
-                crate::GamPhase::Settled(crate::GamOutcome::Escalated(_)) => "needs you".to_string(),
             })
             .unwrap_or_default();
 

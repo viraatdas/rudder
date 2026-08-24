@@ -70,7 +70,7 @@ pairs with Claude.</p>
     <div class="screen-chrome"><span class="mono">rudder</span><span class="mono">~/code/api</span></div>
     <div class="frame frame-gam frame-static">
       <div class="pane pane-gen">
-        <div class="pane-label">gen &middot; claude sonnet</div>
+        <div class="pane-label">gen &middot; claude sonnet &middot; revision 1 of 3</div>
         <pre class="tty"><span class="dim">workspace</span> .rudder-workspaces/retry
 
 <span class="ok">&#9679;</span> Edit src/net/retry.ts <span class="add">+58</span>
@@ -79,7 +79,7 @@ pairs with Claude.</p>
 <span class="run">&#9612;</span> writing the jitter test&hellip;</pre>
       </div>
       <div class="pane pane-adv">
-        <div class="pane-label">adv &middot; codex gpt-5.5 &middot; round 2/4</div>
+        <div class="pane-label">adv &middot; codex gpt-5.5 &middot; objected &middot; waiting</div>
         <pre class="tty"><span class="dim">read-only &middot; cannot edit any file</span>
 
 <span class="ok">&#9679;</span> Read src/net/retry.ts
@@ -112,24 +112,34 @@ real checkout rather than an isolated workspace:</p>
 bug</code> keeps every one of those words as the task, because <code>fix</code> is
 not a model name.</p>
 
-<h2 id="name">Where the name comes from</h2>
-<p><strong>GAM</strong> is a <strong>Generative Adversarial Model</strong>: one model
-generates, a second one is adversarial to it, and the pressure between them is the
-point. The name is borrowed, deliberately and only halfway.</p>
-<p>A generative adversarial network trains two models against each other. The
-generator produces candidates; the discriminator tries to tell the real ones from
-the manufactured ones. Neither improves in isolation. The pressure between them is
-the training signal, and the generator gets good precisely because something
-competent is trying to catch it out.</p>
-<p><code>/gam</code> takes the arrangement and leaves the mathematics. Nothing here
-is trained and no weights move. The generator writes code, the reviewer tries to
-refute it, and what travels back is an argument in English rather than a gradient.</p>
-<p>What survives the translation is the useful half: a critic that is structurally
-separate from the thing it is judging, and that gains nothing by agreeing. What does
-not survive is convergence for free. A GAN runs to equilibrium over many epochs; a
-pair here gets four rounds and then hands you the disagreement. It settles because
-objections have to be demonstrable and the generator is allowed to refute them, not
-because anything is optimising.</p>
+<h2 id="steering">How the reviewer steers the work</h2>
+<p>The reviewer is not a gate at the end. It reads the diff after every turn the
+generator takes, while the work is still in motion, and what it sends back becomes the
+generator's next instruction. A pair is a correction loop, not an inspection.</p>
+<p>That is what the second model is for. Left alone, a coding agent drifts in ways it
+cannot see from the inside: it settles on the first approach that compiles, treats the
+happy path as the whole problem, marks a task done because the code it wrote runs, and
+never revisits the framing it chose in its first thirty seconds. None of that shows up
+as an error. It shows up as a confident summary.</p>
+<p>So the reviewer is prompted to do the opposite of agreeing. Its instructions tell it
+to refute first: to hunt for what is wrong, missing, oversimplified or untested, and to
+check the generator's claims against the actual files rather than against its
+narrative. Concretely, each round it is asked to establish</p>
+<table class="docs-table">
+  <thead><tr><th>what it checks</th><th>the failure it is looking for</th></tr></thead>
+  <tbody>
+    <tr><td>Does this do what was asked?</td><td>A subset delivered as the whole thing. It is handed your ORIGINAL task every round, so this is measured against what you wanted, not against what the last message was about.</td></tr>
+    <tr><td>Was it actually verified?</td><td>A check described as run. The reviewer runs the tests itself rather than believing the transcript.</td></tr>
+    <tr><td>What was not considered?</td><td>The edge the generator never looked at: the error path, the empty case, the concurrent one, the migration that has to happen first.</td></tr>
+    <tr><td>Is the approach right?</td><td>A solution that works and should not survive. Cheaper to say in round one than after the diff has grown around it.</td></tr>
+  </tbody>
+</table>
+<p>Objections come back as concrete, actionable requests naming a file and a symptom,
+and they arrive as the generator's next prompt. The generator does not have to be
+started over or re-briefed; it is mid-task, holding all its context, and it gets a
+specific correction at the moment it can still act on it cheaply. That is the whole
+mechanism: steering while the work is happening, rather than judging it once it is
+finished.</p>
 
 <h2 id="why">Why two models</h2>
 <p>A model reviewing its own work agrees with itself. It has already decided the
@@ -237,7 +247,7 @@ a reviewer's objection and a generator's answer attached.</p>
         <h2>on this page</h2>
         <ul>
             <li><a href="#start">Starting a pair</a></li>
-            <li><a href="#name">Where the name comes from</a></li>
+            <li><a href="#steering">How the reviewer steers the work</a></li>
             <li><a href="#why">Why two models</a></li>
             <li><a href="#round">What a round is</a></li>
             <li><a href="#verdicts">The three verdicts</a></li>
