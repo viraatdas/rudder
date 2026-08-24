@@ -3801,7 +3801,14 @@ pub(crate) fn render_gam_split(frame: &mut Frame<'_>, area: Rect, app: &mut App)
                 format!("{} · {}", truncate_chars(&label, 30), round_badge)
             })
             .unwrap_or_default();
-        let title = format!("{role_label} · {identity}");
+        // The split is the only place two agent panes share the screen, and
+        // nothing on it said the halves were reachable. Put the chord on the
+        // half you are NOT in, which is the one you would want to move to.
+        let title = if app.focus == FocusPane::Worker && !focused_half {
+            format!("{role_label} · {identity} · ^w a")
+        } else {
+            format!("{role_label} · {identity}")
+        };
         let lines = worker_lines_at(app, index, half.height as usize, half.width as usize);
         let paragraph = Paragraph::new(lines)
             .style(app_style())

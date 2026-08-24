@@ -18606,6 +18606,10 @@ fn gam_round_cap_escalates_but_still_delivers_the_last_objection() {
 
 #[test]
 fn gam_suggestions_drill_down_like_the_model_picker() {
+    // The model rows come from the models.dev cache under RUDDER_HOME, so this
+    // reads process-global state too: repointed mid-test, the list changes out
+    // from under the row-by-row comparison below.
+    let _env = env_guard();
     let mut app = App::new();
     // Bare "/gam" offers the reviewer picker, but the FIRST row is the
     // do-nothing path so the default selection never rewrites the line.
@@ -18773,6 +18777,11 @@ fn gam_reviewer_is_wired_for_completion_signals() {
 #[cfg(not(windows))]
 #[test]
 fn gam_reviewer_launch_wiring_puts_a_config_where_the_sweep_looks() {
+    // signals_dir() resolves through the process-global RUDDER_HOME. Without
+    // this guard a concurrent test can repoint it at its own temp dir and then
+    // delete that dir, and this test's config vanishes between the write and
+    // the read.
+    let _env = env_guard();
     for (backend, program) in [
         (Backend::Claude, "claude"),
         (Backend::Codex, "codex"),
@@ -18812,6 +18821,8 @@ fn gam_reviewer_launch_wiring_puts_a_config_where_the_sweep_looks() {
 #[cfg(not(windows))]
 #[test]
 fn a_live_gam_reviewer_survives_the_lifecycle_sweep() {
+    // Same shared-RUDDER_HOME race as the wiring test above.
+    let _env = env_guard();
     let run_id = "gam-sweep-itest";
     let Some(sig) = crate::signals::signal_path(run_id) else {
         return; // no HOME in this env
@@ -19092,4 +19103,80 @@ fn a_run_with_no_session_is_not_reopened() {
         !app.reopen_conversation_at(0),
         "nothing to resume without a session id"
     );
+}
+
+/// Typing must reach the half you are looking at, and only that half.
+#[cfg(not(windows))]
+#[test]
+fn typing_in_the_gam_split_reaches_the_selected_half() {
+    let dir = unique_test_repo("gam-typing");
+    let mut app = App::new();
+    app.cwd = dir.clone();
+    let (generator, adversarial) = gam_test_pair(&mut app, "standing by");
+    app.focus = FocusPane::Worker;
+
+    // Generator half is selected: type into it.
+    app.selected_agent = generator;
+    for ch in "hello gen".chars() {
+        app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+    }
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    // Swap halves and type into the reviewer.
+    app.selected_agent = adversarial;
+    for ch in "hello adv".chars() {
+        app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+    }
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    let gen_log = std::fs::read_to_string(dir.join("generator.log")).unwrap_or_default();
+    let adv_log = std::fs::read_to_string(dir.join("reviewer.log")).unwrap_or_default();
+
+    assert!(
+        gen_log.contains("hello gen"),
+        "generator half got nothing; log={gen_log:?}"
+    );
+    assert!(
+        adv_log.contains("hello adv"),
+        "reviewer half got nothing; log={adv_log:?}"
+    );
+    assert!(
+        !gen_log.contains("hello adv") && !adv_log.contains("hello gen"),
+        "keystrokes crossed halves; gen={gen_log:?} adv={adv_log:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+
+/// The split is two panes with no visible way to get between them.
+#[cfg(not(windows))]
+#[test]
+fn the_gam_split_shows_how_to_reach_the_other_half() {
+    let dir = unique_test_repo("gam-hint");
+    let mut app = App::new();
+    app.cwd = dir.clone();
+    let (generator, _adv) = gam_test_pair(&mut app, "standing by");
+    app.focus = FocusPane::Worker;
+    app.selected_agent = generator;
+
+    let screen = render_screen(&mut app, 130, 20);
+    assert!(
+        screen.contains("^w a"),
+        "no way to discover the other half: {screen}"
+    );
+    // On the half you are NOT in: that is the one the chord takes you to.
+    let hinted_line = screen
+        .lines()
+        .find(|line| line.contains("^w a"))
+        .unwrap_or_default();
+    assert!(
+        hinted_line.contains("adv ·"),
+        "the hint belongs on the unfocused half: {hinted_line}"
+    );
+    assert!(
+        !hinted_line.split("adv ·").next().unwrap_or_default().contains("^w a"),
+        "the focused half should not carry it: {hinted_line}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
