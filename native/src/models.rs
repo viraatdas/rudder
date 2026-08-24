@@ -208,31 +208,41 @@ pub(crate) fn suggestions_for(app: &App) -> Vec<Suggestion> {
     }
 
     if input.starts_with("/gam") {
-        // The gam drill-down picks the ADVERSARIAL reviewer's model. Same
-        // provider -> model flow as /model, but every choice INSERTS into the
-        // input instead of setting defaults, leaving the rest of the line free
-        // for the task text.
-        let rest = input.strip_prefix("/gam").unwrap_or_default();
-        maybe_refresh_models_dev_cache();
-        let rest = rest.trim_start();
-        if rest.is_empty() {
-            return gam_provider_suggestions("");
+        // /gam is a TASK command first. The reviewer's model is optional and
+        // defaults to the other provider, so the drill-down has to be opt-in:
+        // it opens only while the first word after /gam is still a partial
+        // PROVIDER name. Offering providers on the bare "/gam" made the palette
+        // flip the instant the "m" landed, and Enter then inserted a provider
+        // instead of submitting the line the user was about to type.
+        let rest = input.strip_prefix("/gam").unwrap_or_default().trim_start();
+        if !rest.is_empty() {
+            maybe_refresh_models_dev_cache();
+            let trailing_space = rest.ends_with(char::is_whitespace);
+            let parts = rest.split_whitespace().collect::<Vec<_>>();
+            return match parts.first().and_then(|provider| provider_backend(provider)) {
+                // A named provider: offer its models, still filtering while the
+                // model token is being typed. A trailing space after the model
+                // means the rest of the line is task text, so the palette goes
+                // away.
+                Some(backend) => match parts.as_slice() {
+                    [_provider] => gam_model_suggestions(backend, ""),
+                    [_provider, model] if !trailing_space => {
+                        gam_model_suggestions(backend, model)
+                    }
+                    _ => Vec::new(),
+                },
+                // Not a provider. Only a lone, still-being-typed first word can
+                // be a provider the user has not finished spelling; a second
+                // word proves the line is task text ("/gam clean up auth").
+                None => match parts.as_slice() {
+                    [candidate] if !trailing_space => gam_provider_prefix_suggestions(candidate),
+                    _ => Vec::new(),
+                },
+            };
         }
-        let trailing_space = rest.ends_with(char::is_whitespace);
-        let parts = rest.split_whitespace().collect::<Vec<_>>();
-        let Some(backend) = parts.first().and_then(|provider| provider_backend(provider)) else {
-            return gam_provider_suggestions(parts.first().copied().unwrap_or_default());
-        };
-        return match parts.as_slice() {
-            [_provider] => gam_model_suggestions(backend, ""),
-            // Still typing the model: keep filtering. Once the token is
-            // complete (trailing space) the rest of the line is task text and
-            // the palette gets out of the way.
-            [_provider, model] if !trailing_space => {
-                gam_model_suggestions(backend, model)
-            }
-            _ => Vec::new(),
-        };
+        // Bare "/gam": fall through to the command palette, which carries the
+        // "/gam <task>" and "/gam <model> <task>" rows. Both only insert
+        // "/gam ", so Enter here keeps the line instead of choosing a model.
     }
     rank_suggestions(command_suggestions(), input.trim_start_matches('/'))
 }
@@ -751,20 +761,30 @@ pub(crate) fn provider_suggestions(query: &str) -> Vec<Suggestion> {
 
 /// The `/gam` drill-down's provider rows. Selecting one inserts the provider
 /// into the input rather than changing dashboard defaults.
-pub(crate) fn gam_provider_suggestions(query: &str) -> Vec<Suggestion> {
-    let suggestions = [
+///
+/// STRICT prefix match, deliberately not the fuzzy ranker every other palette
+/// uses. Fuzzy matching surfaced "codex" for "code" and a provider row for any
+/// task word that happened to share letters, which turned the opening word of
+/// an ordinary ask into a model picker. Here a row appears only when the user
+/// is genuinely part-way through spelling that provider's name.
+pub(crate) fn gam_provider_prefix_suggestions(query: &str) -> Vec<Suggestion> {
+    let query = query.trim().to_ascii_lowercase();
+    if query.is_empty() {
+        return Vec::new();
+    }
+    [
         (Backend::Claude, "adversarial reviewer: Claude Code models"),
         (Backend::Codex, "adversarial reviewer: Codex models"),
         (Backend::Opencode, "adversarial reviewer: opencode models"),
     ]
     .into_iter()
+    .filter(|(backend, _)| backend.as_str().starts_with(&query))
     .map(|(backend, detail)| Suggestion {
         label: backend.as_str().to_string(),
         detail: format!("{detail} · then type the task"),
         action: SuggestionAction::ChooseGamProvider(backend),
     })
-    .collect();
-    rank_suggestions(suggestions, query)
+    .collect()
 }
 
 /// The same model rows /model offers, rewritten to insert into a `/gam` line.

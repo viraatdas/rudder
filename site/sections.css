@@ -257,6 +257,24 @@
   font-size: 1.02rem;
 }
 
+/* Body copy standing on its own inside a section, above or below a table.
+ * Held to the same measure as the section head so the column edge is one
+ * line down the page rather than two. */
+.prose {
+  max-width: var(--measure);
+  color: var(--ink-2);
+  margin-bottom: clamp(22px, 3vw, 32px);
+}
+
+.prose + .table-wrap {
+  margin-top: 0;
+}
+
+.table-wrap + .prose {
+  margin-top: clamp(22px, 3vw, 32px);
+  margin-bottom: 0;
+}
+
 /* ---------- movements ---------- */
 
 /* Ruled rows, not an n-up grid.
@@ -354,6 +372,14 @@
   color: var(--ink-2);
 }
 
+/* In the roles table the permission column IS the argument: one half writes,
+ * the other cannot. Leaving it at secondary weight buried the one fact the
+ * section exists to make. */
+.commands--roles .c-where {
+  color: var(--ink);
+  font-weight: 500;
+}
+
 /* ---------- the dashboard, shown rather than described ----------
  *
  * The page's own world is a printed form, but a form cannot show a terminal
@@ -419,7 +445,8 @@
 #mode-run:checked ~ .modes li:nth-child(1) label,
 #mode-talk:checked ~ .modes li:nth-child(2) label,
 #mode-diff:checked ~ .modes li:nth-child(3) label,
-#mode-plan:checked ~ .modes li:nth-child(4) label {
+#mode-plan:checked ~ .modes li:nth-child(4) label,
+#mode-gam:checked ~ .modes li:nth-child(5) label {
   box-shadow: inset 2px 0 0 var(--work);
   padding-left: 12px;
 }
@@ -427,7 +454,8 @@
 #mode-run:checked ~ .modes li:nth-child(1) label span,
 #mode-talk:checked ~ .modes li:nth-child(2) label span,
 #mode-diff:checked ~ .modes li:nth-child(3) label span,
-#mode-plan:checked ~ .modes li:nth-child(4) label span {
+#mode-plan:checked ~ .modes li:nth-child(4) label span,
+#mode-gam:checked ~ .modes li:nth-child(5) label span {
   color: var(--ink);
 }
 
@@ -437,7 +465,8 @@
 #mode-run:focus-visible ~ .modes li:nth-child(1) label,
 #mode-talk:focus-visible ~ .modes li:nth-child(2) label,
 #mode-diff:focus-visible ~ .modes li:nth-child(3) label,
-#mode-plan:focus-visible ~ .modes li:nth-child(4) label {
+#mode-plan:focus-visible ~ .modes li:nth-child(4) label,
+#mode-gam:focus-visible ~ .modes li:nth-child(5) label {
   outline: 2px solid var(--work);
   outline-offset: 2px;
 }
@@ -475,8 +504,20 @@
 #mode-run:checked ~ .screen .frame-run,
 #mode-talk:checked ~ .screen .frame-talk,
 #mode-diff:checked ~ .screen .frame-diff,
-#mode-plan:checked ~ .screen .frame-plan {
+#mode-plan:checked ~ .screen .frame-plan,
+#mode-gam:checked ~ .screen .frame-gam {
   display: grid;
+}
+
+/* A gam pane is genuinely split down the middle rather than list-plus-worker,
+ * so the frame is too. The halves are equal because neither model outranks the
+ * other; only their permissions differ. */
+.frame-gam {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+}
+
+.pane-gen {
+  border-right: var(--hair) solid var(--rule);
 }
 
 .pane {
@@ -638,7 +679,8 @@
     grid-template-columns: minmax(0, 1fr);
     min-height: 0;
   }
-  .pane-list {
+  .pane-list,
+  .pane-gen {
     border-right: 0;
     border-bottom: var(--hair) solid var(--rule);
   }

@@ -104,12 +104,14 @@
             <input class="mode-input" type="radio" name="mode" id="mode-talk" />
             <input class="mode-input" type="radio" name="mode" id="mode-diff" />
             <input class="mode-input" type="radio" name="mode" id="mode-plan" />
+            <input class="mode-input" type="radio" name="mode" id="mode-gam" />
 
             <ul class="modes">
               <li><label for="mode-run"><span>Run several at once</span><em>never colliding</em></label></li>
               <li><label for="mode-talk"><span>Talk to one directly</span><em>its own terminal</em></label></li>
               <li><label for="mode-diff"><span>Read what changed</span><em>before it is yours</em></label></li>
               <li><label for="mode-plan"><span>Plan a graph</span><em>for bigger goals</em></label></li>
+              <li><label for="mode-gam"><span>Make two models argue</span><em>one writes, one attacks</em></label></li>
             </ul>
 
             <div class="screen" aria-live="polite">
@@ -215,12 +217,48 @@
                   <div class="tty-input"><span class="dim">type here to change the plan · v to edit a node</span></div>
                 </div>
               </div>
+
+              <!-- 5. adversarial pair. Deliberately NOT the list+worker layout of
+                   the other four: a gam pane really is split in half, and the
+                   arrangement is the point. -->
+              <div class="frame frame-gam">
+                <div class="pane pane-gen">
+                  <div class="pane-label">gen · claude sonnet</div>
+                  <pre class="tty"><span class="dim">workspace</span> .rudder-workspaces/rate-limit
+
+<span class="ok">●</span> Edit src/server/rate-limit.ts <span class="add">+64</span>
+<span class="ok">●</span> Bash npm test <span class="dim">· 41 passed</span>
+
+<span class="dim">RUDDER_GAM_REPLY_START</span>
+<span class="dim">The bucket is keyed per API key by design.</span>
+<span class="dim">You are right that nothing covers the burst</span>
+<span class="dim">window. Writing that test now.</span>
+<span class="dim">RUDDER_GAM_REPLY_END</span>
+
+<span class="run">▌</span> writing the burst-window test…</pre>
+                </div>
+                <div class="pane pane-adv">
+                  <div class="pane-label">adv · codex gpt-5.5 · round 2/4</div>
+                  <pre class="tty"><span class="dim">read-only · cannot edit any file</span>
+
+<span class="ok">●</span> Read src/server/rate-limit.ts
+<span class="ok">●</span> Bash npm test -- burst <span class="dim">· 0 matched</span>
+
+<span class="dim">41 passing tests do not touch the branch this</span>
+<span class="dim">task exists for. No test drives the window to</span>
+<span class="dim">its edge.</span>
+
+<span class="dim">RUDDER_GAM_VERDICT_START</span>
+<span class="dim">{"verdict":"revise", "message":"…"}</span>
+<span class="dim">RUDDER_GAM_VERDICT_END</span></pre>
+                </div>
+              </div>
             </div>
           </div>
         </section>
         <section class="section" aria-labelledby="type-title">
           <div class="section-head">
-            <h2 id="type-title">Three things you can type.</h2>
+            <h2 id="type-title">Four things you can type.</h2>
             <p>What you type decides where the work lands.</p>
           </div>
           <div class="table-wrap">
@@ -255,6 +293,17 @@
                   <td class="c-where" data-label="where it works">one workspace per node</td>
                 </tr>
                 <tr>
+                  <td class="c-in" data-label="you type">/gam rewrite the retry logic</td>
+                  <td class="c-what" data-label="what happens">
+                    Two models arguing
+                    <span
+                      >One implements. A second one, from the other provider,
+                      reviews it and cannot edit anything.</span
+                    >
+                  </td>
+                  <td class="c-where" data-label="where it works">one workspace, split pane</td>
+                </tr>
+                <tr>
                   <td class="c-in" data-label="you type">/main tag the release</td>
                   <td class="c-what" data-label="what happens">
                     An agent in your checkout
@@ -269,6 +318,68 @@
           </div>
         </section>
 
+
+        <section class="section" aria-labelledby="argue-title">
+          <div class="section-head">
+            <h2 id="argue-title">A model reviewing its own work agrees with itself.</h2>
+            <p>
+              So <code class="mono">/gam</code> runs two of them, and only one
+              is allowed to type.
+            </p>
+          </div>
+          <p class="prose">
+            The reviewer comes from the other provider by default, so it has
+            nothing to be loyal to. The two never share a conversation. The
+            reviewer is handed the original task, the diff, and whatever the
+            generator wrote back to it, and never the reasoning that produced
+            any of it, because a model that has read its own argument is no
+            longer a second opinion.
+          </p>
+          <div class="table-wrap">
+            <table class="commands commands--roles">
+              <thead>
+                <tr>
+                  <th scope="col">half</th>
+                  <th scope="col">what it does</th>
+                  <th scope="col">permission</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td class="c-in" data-label="half">generator</td>
+                  <td class="c-what" data-label="what it does">
+                    Implements the task
+                    <span
+                      >Your model and provider. It answers each objection
+                      directly, and is told to say why it disagrees rather than
+                      silently comply.</span
+                    >
+                  </td>
+                  <td class="c-where" data-label="permission">writes the code</td>
+                </tr>
+                <tr>
+                  <td class="c-in" data-label="half">adversarial reviewer</td>
+                  <td class="c-what" data-label="what it does">
+                    Tries to refute it
+                    <span
+                      >Reads the diff, runs the checks itself rather than
+                      trusting the transcript, and returns accept, revise or
+                      escalate.</span
+                    >
+                  </td>
+                  <td class="c-where" data-label="permission">cannot edit a file</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="prose">
+            Every round is anchored on the task you typed, never on the last
+            thing the reviewer happened to ask for, so a long argument cannot
+            drift away from what you wanted. Four rounds. If the reviewer still
+            will not accept, or asks for a human, both panes stay open and
+            Rudder tells you which one it was.
+          </p>
+        </section>
 
         <section class="section" aria-labelledby="options-title">
           <div class="section-head">

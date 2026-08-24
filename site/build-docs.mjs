@@ -30,6 +30,7 @@ const NAV = [
     items: [
       ["workspaces", "Workspaces"],
       ["plans", "Plans and the DAG"],
+      ["gam", "Adversarial pairs"],
     ],
   },
   {
@@ -411,6 +412,147 @@ what is happening.</p>
 `,
   },
 
+  gam: {
+    title: "Adversarial pairs",
+    lede: "/gam puts two models on one task: a generator that writes the code, and a reviewer from a different provider that can only argue with it. The reviewer cannot edit a single file.",
+    toc: [
+      ["start", "Starting a pair"],
+      ["why", "Why two models"],
+      ["round", "What a round is"],
+      ["verdicts", "The three verdicts"],
+      ["disagree", "When the generator disagrees"],
+      ["stops", "When it stops"],
+    ],
+    body: `
+<h2 id="start">Starting a pair</h2>
+<pre><code>/gam rewrite the retry logic to use exponential backoff</code></pre>
+<p>Two panes open side by side. The left half is the generator, running your current
+model. The right half is the adversarial reviewer, which defaults to a
+<strong>different provider</strong> so it is not the same model marking its own
+homework: a Claude generator pairs with Codex, and a Codex or opencode generator
+pairs with Claude.</p>
+
+<figure class="docs-shot">
+  <div class="screen">
+    <div class="screen-chrome"><span class="mono">rudder</span><span class="mono">~/code/api</span></div>
+    <div class="frame frame-gam frame-static">
+      <div class="pane pane-gen">
+        <div class="pane-label">gen &middot; claude sonnet</div>
+        <pre class="tty"><span class="dim">workspace</span> .rudder-workspaces/retry
+
+<span class="ok">&#9679;</span> Edit src/net/retry.ts <span class="add">+58</span>
+<span class="ok">&#9679;</span> Bash npm test <span class="dim">&middot; 41 passed</span>
+
+<span class="run">&#9612;</span> writing the jitter test&hellip;</pre>
+      </div>
+      <div class="pane pane-adv">
+        <div class="pane-label">adv &middot; codex gpt-5.5 &middot; round 2/4</div>
+        <pre class="tty"><span class="dim">read-only &middot; cannot edit any file</span>
+
+<span class="ok">&#9679;</span> Read src/net/retry.ts
+<span class="ok">&#9679;</span> Bash npm test -- jitter <span class="dim">&middot; 0 matched</span>
+
+<span class="dim">41 passing tests do not touch the branch this</span>
+<span class="dim">task exists for.</span></pre>
+      </div>
+    </div>
+  </div>
+  <figcaption>
+    The generator on the left writes. The reviewer on the right reads, runs its own
+    checks, and objects.
+  </figcaption>
+</figure>
+
+<p>You can name the reviewer instead of taking the default, and run the pair in your
+real checkout rather than an isolated workspace:</p>
+<table class="docs-table">
+  <thead><tr><th>you type</th><th>what you get</th></tr></thead>
+  <tbody>
+    <tr><td>/gam &lt;task&gt;</td><td>Reviewer picked for you, from the other provider.</td></tr>
+    <tr><td>/gam codex &lt;task&gt;</td><td>Codex reviews, on its default model.</td></tr>
+    <tr><td>/gam codex gpt-5.5 &lt;task&gt;</td><td>A named provider and model.</td></tr>
+    <tr><td>/gam fable &lt;task&gt;</td><td>A bare model name works when Rudder recognises it.</td></tr>
+    <tr><td>/gam main &lt;task&gt;</td><td>The pair runs in your checkout instead of a workspace.</td></tr>
+  </tbody>
+</table>
+<p>Ordinary task words are never mistaken for a model. <code>/gam fix the auth
+bug</code> keeps every one of those words as the task, because <code>fix</code> is
+not a model name.</p>
+
+<h2 id="why">Why two models</h2>
+<p>A model reviewing its own work agrees with itself. It has already decided the
+approach was reasonable, and asking it to check that decision gets you a summary of
+the decision rather than a test of it.</p>
+<p>So the two halves never share a conversation. Each keeps its own session, and the
+only things that cross between them are the original task, the diff, the reviewer's
+objections, and the generator's replies. The reviewer never sees the reasoning that
+produced the code, because a reviewer that has read the argument for a change is no
+longer independent of it.</p>
+<p>The asymmetry is the other half of the idea. The reviewer has no write access at
+all, which means it cannot quietly fix what it dislikes and call the disagreement
+settled. It has to make its case in words, and the generator has to be persuaded.</p>
+
+<h2 id="round">What a round is</h2>
+<p>A round begins when the generator finishes a turn. Rudder then hands the reviewer
+a packet containing:</p>
+<table class="docs-table">
+  <thead><tr><th>what is in the packet</th><th>why</th></tr></thead>
+  <tbody>
+    <tr><td>the original task</td><td>Every round is anchored on what <em>you</em> typed, never on the last thing the reviewer asked for, so a long argument cannot drift off the ask.</td></tr>
+    <tr><td>the current diff</td><td>The reviewer judges the code, not the generator's account of it. Very large diffs are truncated with a visible marker, and the reviewer is told not to object to what it cannot see.</td></tr>
+    <tr><td>the generator's last reply</td><td>Only when the generator pushed back, so the argument carries forward.</td></tr>
+  </tbody>
+</table>
+<p>The reviewer is told to refute first: to hunt for what is wrong, missing,
+oversimplified or untested, and to check claims against the actual files rather than
+the transcript. It ends its turn with a verdict.</p>
+
+<h2 id="verdicts">The three verdicts</h2>
+<table class="docs-table">
+  <thead><tr><th>verdict</th><th>what happens next</th></tr></thead>
+  <tbody>
+    <tr><td>accept</td><td>The pair settles. Reserved for work that plainly satisfies the original task with no blocking defect the reviewer can demonstrate.</td></tr>
+    <tr><td>revise</td><td>The objection is delivered to the generator as a message and a new round starts.</td></tr>
+    <tr><td>escalate</td><td>The disagreement needs you: a scope dispute, two irreconcilable approaches, or a correct objection the generator keeps ignoring.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="disagree">When the generator disagrees</h2>
+<p>The generator is not required to obey. It is told explicitly not to comply
+silently with an objection it thinks is wrong, but to state why in one short
+paragraph and keep implementing. Rudder lifts that reply out and puts it in front of
+the reviewer on the next round.</p>
+<p>This matters more than it sounds. A reviewer that gets its way automatically turns
+every weak objection into a code change, and the work drifts toward whatever the
+reviewer happened to notice. Giving the generator a way to win the argument is what
+keeps the pair converging instead of wandering.</p>
+
+<div class="note">
+  <span class="field-label">a use worth knowing</span>
+  <p>When one model refuses a task or quietly does a subset of it, the other one
+  often does not. The reviewer is reading the diff against the original ask, so it
+  is well placed to notice a job reported as done that was not, and to say so.</p>
+</div>
+
+<h2 id="stops">When it stops</h2>
+<p>A pair runs at most <strong>four rounds</strong>. It ends early when the reviewer
+accepts. It stops and asks for you when the reviewer escalates, when four rounds pass
+without acceptance, or when the reviewer produces no readable verdict at all.</p>
+<p>In every one of those cases <strong>both panes stay live</strong> and Rudder names
+the reason. Nothing is discarded and nothing is merged behind your back: the
+generator's work sits in its workspace exactly like any other agent's, and it lands
+when you press <kbd>m</kbd>.</p>
+
+<div class="note">
+  <span class="field-label">cost</span>
+  <p>A pair spends roughly twice what the same task costs alone, and takes longer in
+  wall-clock time, because the reviewer reads a finished diff and the two halves
+  cannot run at the same time. It earns that on work where being wrong is expensive,
+  not on a rename.</p>
+</div>
+`,
+  },
+
   commands: {
     title: "Commands and keys",
     lede: "Everything you can type into the task box, and every key the dashboard listens for.",
@@ -427,6 +569,7 @@ what is happening.</p>
   <tbody>
     <tr><td>plain text</td><td>One isolated agent in its own workspace. The default, and the only thing that cannot touch your checkout.</td></tr>
     <tr><td>/plan &lt;goal&gt;</td><td>An orchestrator that plans a task graph, then runs and merges it. Several can run at once, each in its own pane.</td></tr>
+    <tr><td>/gam &lt;task&gt;</td><td>Two models on one task: a generator that writes, and a read-only adversarial reviewer that argues with it. See <a href="/docs/gam">Adversarial pairs</a>.</td></tr>
     <tr><td>/main &lt;task&gt;</td><td>An agent in your real checkout. Nothing to merge. <code>/m</code> is the same thing.</td></tr>
   </tbody>
 </table>
@@ -437,6 +580,7 @@ what is happening.</p>
   <tbody>
     <tr><td>/model</td><td>Set the backend, model and reasoning effort for the next agent. Effort runs low, medium, high, xhigh, max; xhigh is the default where a model offers it, and opencode takes none. A running agent keeps what it launched with.</td></tr>
     <tr><td>/fast</td><td>Toggle faster output on supported models.</td></tr>
+    <tr><td>/gam</td><td>Start a generator plus adversarial reviewer pair. The reviewer defaults to the other provider; name one with <code>/gam codex gpt-5.5 &lt;task&gt;</code>, or add <code>main</code> to run the pair in your checkout.</td></tr>
     <tr><td>/resume</td><td>Continue an existing Claude, Codex or opencode chat as an agent. The picker lists this repo's recent chats and says which directory each one ran in. It lands in an isolated workspace like plain text does; add <code>--here</code> to continue it in your real checkout instead.</td></tr>
     <tr><td>/restore</td><td>Reopen a specific session id in a new pane.</td></tr>
     <tr><td>/share</td><td>Durable local context every agent reads. For tokens, URLs, env details.</td></tr>

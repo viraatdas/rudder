@@ -13,3 +13,4 @@ DECISIONS.md
 *.tgz
 tui-report.html
 .tui-report/
+.rudder-workspaces/

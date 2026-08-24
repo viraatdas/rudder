@@ -264,6 +264,17 @@
   background: var(--stock-band);
 }
 
+/* A gam figure is a split pane, not list-plus-worker: two equal halves, because
+ * neither model outranks the other. Must follow .frame-static, which sets the
+ * list-plus-worker track sizes at the same specificity. */
+.docs-shot .frame-gam {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+}
+
+.docs-shot .pane-gen {
+  border-right: var(--hair) solid var(--rule);
+}
+
 .docs-shot .pane-label {
   font-family: var(--font-mono);
   font-size: 0.62rem;
@@ -338,8 +349,13 @@
 .docs-shot .tty .add { color: var(--st-merged); }
 
 @media (max-width: 700px) {
-  .docs-shot .frame-static {
+  .docs-shot .frame-static,
+  .docs-shot .frame-gam {
     grid-template-columns: minmax(0, 1fr);
+  }
+  .docs-shot .pane-gen {
+    border-right: 0;
+    border-bottom: var(--hair) solid var(--rule);
   }
   /* Same reason as the landing page mockup: this is readable text, not texture. */
   .docs-shot .pane-label {

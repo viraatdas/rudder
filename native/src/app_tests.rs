@@ -18607,13 +18607,27 @@ fn gam_round_cap_escalates_but_still_delivers_the_last_objection() {
 #[test]
 fn gam_suggestions_drill_down_like_the_model_picker() {
     let mut app = App::new();
+    // Bare "/gam" is an ordinary command row, NOT a provider picker: the tail
+    // is usually a task, and grabbing the palette here stole the Enter key.
     app.task_input = "/gam".to_string();
+    let bare = suggestions_for(&app);
+    assert!(
+        bare.iter().all(|suggestion| !matches!(
+            suggestion.action,
+            SuggestionAction::ChooseGamProvider(_) | SuggestionAction::ChooseGamModel { .. }
+        )),
+        "bare /gam must not open the reviewer picker: {:?}",
+        bare.iter().map(|s| s.label.clone()).collect::<Vec<_>>()
+    );
+
+    // A partial provider name IS the opt-in drill-down.
+    app.task_input = "/gam cod".to_string();
     let providers = suggestions_for(&app);
     assert!(
         providers
             .iter()
             .any(|suggestion| matches!(suggestion.action, SuggestionAction::ChooseGamProvider(_))),
-        "providers offered first"
+        "a partial provider name offers providers"
     );
 
     app.task_input = "/gam codex ".to_string();
@@ -18664,16 +18678,16 @@ fn gam_enter_captures_only_inside_the_picker_window() {
     use crossterm::event::{KeyCode, KeyModifiers};
     let enter = || KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
 
-    // Provider step: Enter selects a reviewer backend.
+    // Provider step: Enter selects a reviewer backend, but only once the user
+    // has started spelling one. Bare "/gam" just completes the command name.
     let mut app = App::new();
-    app.task_input = "/gam".to_string();
+    app.task_input = "/gam cod".to_string();
     assert!(suggestions_for(&app).iter().any(|s| {
         matches!(s.action, SuggestionAction::ChooseGamProvider(_))
     }));
     let _captured = app.handle_task_key(enter());
     assert!(
-        app.task_input.starts_with("/gam ")
-            && app.task_input != "/gam",
+        app.task_input.starts_with("/gam codex"),
         "Enter applied a provider pick, input now {:?}",
         app.task_input
     );
@@ -18703,30 +18717,62 @@ fn gam_enter_captures_only_inside_the_picker_window() {
 fn gam_enter_with_task_words_submits_instead_of_picking() {
     use crossterm::event::{KeyCode, KeyModifiers};
     let mut app = App::new();
-    // "c" fuzzy-matches provider rows, so the palette IS visible here —
-    // but real task words follow, so Enter must fall through (return false
+    // A word that merely starts like a provider must not drag the picker along
+    // once real task words follow: Enter has to fall through (return false
     // means "submit the line").
     app.task_input = "/gam c fix the auth bug".to_string();
     let visible = suggestions_for(&app);
     assert!(
-        visible
-            .iter()
-            .any(|s| matches!(s.action, SuggestionAction::ChooseGamProvider(_))),
-        "precondition: provider rows visible"
+        visible.is_empty(),
+        "task words hide the picker entirely: {:?}",
+        visible.iter().map(|s| s.label.clone()).collect::<Vec<_>>()
     );
-    // Directly probe the gate: with task words present the picker must NOT
-    // claim the Enter key.
-    let trimmed = app.task_input.trim();
-    let gam_tokens = trimmed.split_whitespace().count();
-    let showing_providers = visible
-        .first()
-        .is_some_and(|s| matches!(s.action, SuggestionAction::ChooseGamProvider(_)));
-    let showing_models = visible
-        .first()
-        .is_some_and(|s| matches!(s.action, SuggestionAction::ChooseGamModel { .. }));
-    let captured = trimmed.starts_with("/gam")
-        && ((gam_tokens <= 1 && (showing_providers || showing_models))
-            || (gam_tokens == 2 && (showing_models || showing_providers))
-            || (gam_tokens == 3 && showing_models));
+    // Drive the REAL gate rather than restating its expression here: a probe
+    // copied out of main.rs passes happily while the shipped gate is broken.
+    let before = app.task_input.clone();
+    let captured = app.handle_picker_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     assert!(!captured, "task words must own Enter");
+    assert_eq!(app.task_input, before, "the line survived Enter untouched");
+}
+
+/// The reported bug, end to end: typing an ordinary task must never turn the
+/// palette into a model picker, and Enter must submit rather than rewrite the
+/// line. "/gam" used to swap the palette the instant its "m" arrived.
+#[test]
+fn gam_task_text_never_becomes_a_model_picker() {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    let mut app = App::new();
+
+    // Every keystroke of "/gam " on the way in, then a plain task.
+    for input in [
+        "/g", "/ga", "/gam", "/gam ", "/gam f", "/gam fix", "/gam fix the", "/gam fix the scroll",
+    ] {
+        app.task_input = input.to_string();
+        let rows = suggestions_for(&app);
+        assert!(
+            rows.iter().all(|s| !matches!(
+                s.action,
+                SuggestionAction::ChooseGamProvider(_) | SuggestionAction::ChooseGamModel { .. }
+            )),
+            "{input:?} opened the reviewer picker: {:?}",
+            rows.iter().map(|s| s.label.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    // Task words that merely LOOK like a provider prefix ("code" prefixes
+    // "codex", "cl" prefixes "claude") are still task words once a second
+    // word follows.
+    for input in ["/gam code cleanup", "/gam clean up auth", "/gam optimize the parser"] {
+        app.task_input = input.to_string();
+        assert!(
+            suggestions_for(&app).is_empty(),
+            "{input:?} should leave the palette closed"
+        );
+    }
+
+    // And Enter on a finished task line submits it verbatim.
+    app.task_input = "/gam make scrolling smooth".to_string();
+    let before = app.task_input.clone();
+    assert!(!app.handle_picker_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+    assert_eq!(app.task_input, before);
 }
