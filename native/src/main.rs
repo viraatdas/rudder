@@ -4367,8 +4367,30 @@ impl App {
                 // chosen from the list, not typed, so Enter keeps selecting. Both
                 // hide the palette once a concrete argument is present, which is
                 // what lets a second Enter submit.
+                //
+                // /gam is a drill-down TOO, but its tail becomes free task text,
+                // so the capture window is narrower: only while the visible rows
+                // are the gam provider/model chooser AND no task words exist yet
+                // (past provider + the model token being picked). Otherwise
+                // typing "/gam c fix the bug" and hitting Enter would wipe the
+                // task and insert a provider name instead of submitting.
+                let gam_tokens = trimmed.split_whitespace().count();
+                let showing = |variant: fn(&SuggestionAction) -> bool| {
+                    suggestions
+                        .first()
+                        .is_some_and(|s| variant(&s.action))
+                };
+                let showing_providers =
+                    showing(|action| matches!(action, SuggestionAction::ChooseGamProvider(_)));
+                let showing_models =
+                    showing(|action| matches!(action, SuggestionAction::ChooseGamModel { .. }));
+                let gam_drilldown = trimmed.starts_with("/gam")
+                    && ((gam_tokens <= 1 && (showing_providers || showing_models))
+                        || (gam_tokens == 2 && (showing_models || showing_providers))
+                        || (gam_tokens == 3 && showing_models));
                 if !(typing_command_name
                     || trimmed.starts_with("/model")
+                    || gam_drilldown
                     || resume_command_rest(trimmed).is_some())
                 {
                     return false;

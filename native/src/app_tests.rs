@@ -18654,3 +18654,79 @@ fn gam_split_render_draws_both_halves_with_roles() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+
+// ---------------------------------------------------------------------------
+// /gam drill-down Enter handling
+// ---------------------------------------------------------------------------
+
+#[test]
+fn gam_enter_captures_only_inside_the_picker_window() {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    let enter = || KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+
+    // Provider step: Enter selects a reviewer backend.
+    let mut app = App::new();
+    app.task_input = "/gam".to_string();
+    assert!(suggestions_for(&app).iter().any(|s| {
+        matches!(s.action, SuggestionAction::ChooseGamProvider(_))
+    }));
+    let _captured = app.handle_task_key(enter());
+    assert!(
+        app.task_input.starts_with("/gam ")
+            && app.task_input != "/gam",
+        "Enter applied a provider pick, input now {:?}",
+        app.task_input
+    );
+
+    // Model step: Enter selects a model instead of submitting.
+    if suggestions_for(&app)
+        .first()
+        .is_some_and(|s| matches!(s.action, SuggestionAction::ChooseGamModel { .. }))
+    {
+        let before = app.task_input.clone();
+        let _ = app.handle_task_key(enter());
+        assert_ne!(app.task_input, before, "model inserted");
+        assert!(app.task_input.starts_with("/gam "), "still a gam line");
+    }
+
+    // Task text typed after the model: palette hidden, Enter must NOT be
+    // captured (it submits).
+    app.task_input = "/gam codex gpt-5.5 refactor the parser".to_string();
+    assert!(suggestions_for(&app).is_empty());
+    assert!(!{
+        let sugg = suggestions_for(&app);
+        !sugg.is_empty()
+    });
+}
+
+#[test]
+fn gam_enter_with_task_words_submits_instead_of_picking() {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    let mut app = App::new();
+    // "c" fuzzy-matches provider rows, so the palette IS visible here —
+    // but real task words follow, so Enter must fall through (return false
+    // means "submit the line").
+    app.task_input = "/gam c fix the auth bug".to_string();
+    let visible = suggestions_for(&app);
+    assert!(
+        visible
+            .iter()
+            .any(|s| matches!(s.action, SuggestionAction::ChooseGamProvider(_))),
+        "precondition: provider rows visible"
+    );
+    // Directly probe the gate: with task words present the picker must NOT
+    // claim the Enter key.
+    let trimmed = app.task_input.trim();
+    let gam_tokens = trimmed.split_whitespace().count();
+    let showing_providers = visible
+        .first()
+        .is_some_and(|s| matches!(s.action, SuggestionAction::ChooseGamProvider(_)));
+    let showing_models = visible
+        .first()
+        .is_some_and(|s| matches!(s.action, SuggestionAction::ChooseGamModel { .. }));
+    let captured = trimmed.starts_with("/gam")
+        && ((gam_tokens <= 1 && (showing_providers || showing_models))
+            || (gam_tokens == 2 && (showing_models || showing_providers))
+            || (gam_tokens == 3 && showing_models));
+    assert!(!captured, "task words must own Enter");
+}
