@@ -19024,3 +19024,72 @@ fn gam_task_text_never_becomes_a_model_picker() {
 
 
 
+
+/// Quitting rudder kills every PTY and rudder persists no transcript, so a
+/// reloaded row renders a static card. Startup restore only covers agents that
+/// were RUNNING; an agent that had finished its turn -- the usual state when you
+/// step away -- had no path back to its conversation at all.
+#[cfg(not(windows))]
+#[test]
+fn focusing_a_reloaded_agent_reopens_its_conversation() {
+    // Resuming spawns the real backend CLI. Where it is not installed (the
+    // release gate), skip rather than fail -- same reason the resolver test
+    // stubs its backend.
+    if std::env::var_os("PATH")
+        .map(|path| {
+            !std::env::split_paths(&path).any(|dir| dir.join("claude").exists())
+        })
+        .unwrap_or(true)
+    {
+        return;
+    }
+    let mut app = App::new();
+    app.cwd = std::env::temp_dir();
+    let mut run = test_agent_run("reopen-itest", "port the settings screen");
+    run.terminal = None;
+    run.status = AgentStatus::Done;
+    run.completed_at = Some(Instant::now());
+    run.session_id = Some("11111111-2222-3333-4444-555555555555".to_string());
+    run.backend = Backend::Claude;
+    app.agents.push(run);
+    app.selected_agent = 0;
+
+    assert!(
+        app.reopen_conversation_at(0),
+        "a finished, resumable row must reopen"
+    );
+    assert!(
+        app.agents[0].terminal.is_some(),
+        "a live pane is what carries the conversation back"
+    );
+    // Reopening to READ is not going back to work: a resumed session runs no
+    // turn, fires no completion signal, and would sit "running" forever while
+    // dropping out of the merge gate.
+    assert_eq!(
+        app.agents[0].status,
+        AgentStatus::Done,
+        "a finished agent stays finished when you look at it"
+    );
+    assert!(app.agents[0].completed_at.is_some(), "still merge-eligible");
+
+    // One attempt per run: a failed spawn must not respawn on every Enter.
+    assert!(
+        !app.reopen_conversation_at(0),
+        "already has a pane, and the attempt is recorded"
+    );
+}
+
+#[test]
+fn a_run_with_no_session_is_not_reopened() {
+    let mut app = App::new();
+    app.cwd = std::env::temp_dir();
+    let mut run = test_agent_run("reopen-nosession", "whatever");
+    run.terminal = None;
+    run.status = AgentStatus::Done;
+    run.session_id = None;
+    app.agents.push(run);
+    assert!(
+        !app.reopen_conversation_at(0),
+        "nothing to resume without a session id"
+    );
+}

@@ -1233,6 +1233,9 @@ struct App {
     mouse_debug_last: Option<String>,
     pending_migration_resumes: Vec<MigratedAgent>,
     migration_resumes_attempted: bool,
+    /// Runs we already tried to reopen when their pane was focused. One attempt
+    /// each: a resume that fails must not respawn on every Enter.
+    focus_resume_attempted: HashSet<String>,
     rename_input: Option<String>,
     rename_cursor: usize,
     /// True while the rename box still holds the untouched current name as a
@@ -2215,6 +2218,7 @@ impl App {
             mouse_debug_last: None,
             pending_migration_resumes,
             migration_resumes_attempted: false,
+            focus_resume_attempted: HashSet::new(),
             rename_input: None,
             rename_cursor: 0,
             rename_prefilled: false,
@@ -3141,6 +3145,8 @@ impl App {
                         }
                         self.focus = FocusPane::Worker;
                     } else {
+                        let index = self.selected_agent;
+                        self.reopen_conversation_at(index);
                         self.focus = FocusPane::Worker;
                     }
                 }
@@ -7535,6 +7541,60 @@ Address the objection directly. If you disagree, say why inside \
                 "{prefix}{needs_manual} agent(s) could not be resumed"
             ));
         }
+    }
+
+    /// Reopen a restored row's ACTUAL conversation when its pane is focused.
+    ///
+    /// Quitting rudder kills every PTY, and rudder keeps no transcript of its
+    /// own -- only `run.json` survives, so a reloaded row renders a static card
+    /// listing the task. The conversation lives in the backend CLI's own session
+    /// store, which means resuming that session is the only way to show it.
+    ///
+    /// Startup restore covers agents that were RUNNING when you quit. An agent
+    /// that had finished its turn -- the usual state when you step away -- was
+    /// left with no path back to its history at all.
+    fn reopen_conversation_at(&mut self, index: usize) -> bool {
+        let Some(run) = self.agents.get(index) else {
+            return false;
+        };
+        if run.terminal.is_some()
+            || run.plain_process
+            || run.is_orchestrator()
+            || !can_resume_agent(run)
+        {
+            return false;
+        }
+        if !self.focus_resume_attempted.insert(run.id.clone()) {
+            return false;
+        }
+        let previous_status = run.status;
+        let previous_completed_at = run.completed_at;
+        let entry = MigratedAgent {
+            run_id: run.id.clone(),
+            session_id: run.session_id.clone().unwrap_or_default(),
+            workspace_path: run
+                .workspace_path
+                .clone()
+                .unwrap_or_else(|| run.cwd.clone()),
+            fresh_prompt: None,
+        };
+        if !self.spawn_claude_resume_for(index, &entry) {
+            return false;
+        }
+        // spawn_claude_resume_for marks the run Running, which is right for an
+        // agent that was interrupted mid-task. A FINISHED agent is not working
+        // again just because you opened it: `--resume` runs no turn, so no
+        // completion signal ever fires, and the row would sit "running" forever
+        // and drop out of the merge gate.
+        if previous_status != AgentStatus::Running {
+            if let Some(run) = self.agents.get_mut(index) {
+                run.status = previous_status;
+                run.completed_at = previous_completed_at;
+                let _ = save_native_run_record(&self.cwd, run);
+            }
+        }
+        self.notice = Some("reopened the previous conversation".to_string());
+        true
     }
 
     fn resume_migrated_agents(&mut self) {
