@@ -3,8 +3,8 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Adversarial pairs · Rudder docs</title>
-    <meta name="description" content="/gam puts two models on one task: a generator that writes the code, and a reviewer from a different provider that can only argue with it. The reviewer cannot edit a single file." />
+    <title>Generative Adversarial Model (GAM) · Rudder docs</title>
+    <meta name="description" content="GAM puts two models on one task: a generator that writes the code, and an adversarial reviewer from a different provider that can only argue with it. The reviewer cannot edit a single file. You start one with /gam." />
     <link rel="canonical" href="https://rudder.viraat.dev/docs/gam" />
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <meta name="theme-color" content="#ffffff" />
@@ -45,7 +45,7 @@
         <ul>
           <li><a href="/docs/workspaces">Workspaces</a></li>
           <li><a href="/docs/plans">Plans and the DAG</a></li>
-          <li><a href="/docs/gam" aria-current="page">Adversarial pairs</a></li>
+          <li><a href="/docs/gam" aria-current="page">Adversarial pairs (GAM)</a></li>
         </ul>
         <h2>reference</h2>
         <ul>
@@ -55,8 +55,8 @@
       </nav>
 
       <main class="docs-main" id="main">
-        <h1>Adversarial pairs</h1>
-        <p class="docs-lede">/gam puts two models on one task: a generator that writes the code, and a reviewer from a different provider that can only argue with it. The reviewer cannot edit a single file.</p>
+        <h1>Generative Adversarial Model (GAM)</h1>
+        <p class="docs-lede">GAM puts two models on one task: a generator that writes the code, and an adversarial reviewer from a different provider that can only argue with it. The reviewer cannot edit a single file. You start one with /gam.</p>
 <h2 id="start">Starting a pair</h2>
 <pre><code>/gam rewrite the retry logic to use exponential backoff</code></pre>
 <p>Two panes open side by side. The left half is the generator, running your current
@@ -113,6 +113,9 @@ bug</code> keeps every one of those words as the task, because <code>fix</code> 
 not a model name.</p>
 
 <h2 id="name">Where the name comes from</h2>
+<p><strong>GAM</strong> is a <strong>Generative Adversarial Model</strong>: one model
+generates, a second one is adversarial to it, and the pressure between them is the
+point. The name is borrowed, deliberately and only halfway.</p>
 <p>A generative adversarial network trains two models against each other. The
 generator produces candidates; the discriminator tries to tell the real ones from
 the manufactured ones. Neither improves in isolation. The pressure between them is

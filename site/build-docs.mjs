@@ -30,7 +30,7 @@ const NAV = [
     items: [
       ["workspaces", "Workspaces"],
       ["plans", "Plans and the DAG"],
-      ["gam", "Adversarial pairs"],
+      ["gam", "Adversarial pairs (GAM)"],
     ],
   },
   {
@@ -413,8 +413,8 @@ what is happening.</p>
   },
 
   gam: {
-    title: "Adversarial pairs",
-    lede: "/gam puts two models on one task: a generator that writes the code, and a reviewer from a different provider that can only argue with it. The reviewer cannot edit a single file.",
+    title: "Generative Adversarial Model (GAM)",
+    lede: "GAM puts two models on one task: a generator that writes the code, and an adversarial reviewer from a different provider that can only argue with it. The reviewer cannot edit a single file. You start one with /gam.",
     toc: [
       ["start", "Starting a pair"],
       ["name", "Where the name comes from"],
@@ -482,6 +482,9 @@ bug</code> keeps every one of those words as the task, because <code>fix</code> 
 not a model name.</p>
 
 <h2 id="name">Where the name comes from</h2>
+<p><strong>GAM</strong> is a <strong>Generative Adversarial Model</strong>: one model
+generates, a second one is adversarial to it, and the pressure between them is the
+point. The name is borrowed, deliberately and only halfway.</p>
 <p>A generative adversarial network trains two models against each other. The
 generator produces candidates; the discriminator tries to tell the real ones from
 the manufactured ones. Neither improves in isolation. The pressure between them is
@@ -606,7 +609,7 @@ a reviewer's objection and a generator's answer attached.</p>
   <tbody>
     <tr><td>plain text</td><td>One isolated agent in its own workspace. The default, and the only thing that cannot touch your checkout.</td></tr>
     <tr><td>/plan &lt;goal&gt;</td><td>An orchestrator that plans a task graph, then runs and merges it. Several can run at once, each in its own pane.</td></tr>
-    <tr><td>/gam &lt;task&gt;</td><td>Two models on one task: a generator that writes, and a read-only adversarial reviewer that argues with it. See <a href="/docs/gam">Adversarial pairs</a>.</td></tr>
+    <tr><td>/gam &lt;task&gt;</td><td>A Generative Adversarial Model pair: a generator that writes, and a read-only adversarial reviewer that argues with it. See <a href="/docs/gam">GAM</a>.</td></tr>
     <tr><td>/main &lt;task&gt;</td><td>An agent in your real checkout. Nothing to merge. <code>/m</code> is the same thing.</td></tr>
   </tbody>
 </table>
@@ -617,7 +620,7 @@ a reviewer's objection and a generator's answer attached.</p>
   <tbody>
     <tr><td>/model</td><td>Set the backend, model and reasoning effort for the next agent. Effort runs low, medium, high, xhigh, max; xhigh is the default where a model offers it, and opencode takes none. A running agent keeps what it launched with.</td></tr>
     <tr><td>/fast</td><td>Toggle faster output on supported models.</td></tr>
-    <tr><td>/gam</td><td>Start a generator plus adversarial reviewer pair. The reviewer defaults to the other provider; name one with <code>/gam codex gpt-5.5 &lt;task&gt;</code>, or add <code>main</code> to run the pair in your checkout.</td></tr>
+    <tr><td>/gam</td><td>Start a Generative Adversarial Model (GAM) pair: a generator plus an adversarial reviewer. The reviewer defaults to the other provider; name one with <code>/gam codex gpt-5.5 &lt;task&gt;</code>, or add <code>main</code> to run the pair in your checkout.</td></tr>
     <tr><td>/resume</td><td>Continue an existing Claude, Codex or opencode chat as an agent. The picker lists this repo's recent chats and says which directory each one ran in. It lands in an isolated workspace like plain text does; add <code>--here</code> to continue it in your real checkout instead.</td></tr>
     <tr><td>/restore</td><td>Reopen a specific session id in a new pane.</td></tr>
     <tr><td>/share</td><td>Durable local context every agent reads. For tokens, URLs, env details.</td></tr>
