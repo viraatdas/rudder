@@ -18630,11 +18630,40 @@ fn gam_suggestions_drill_down_like_the_model_picker() {
         "bare /gam lists candidate reviewer models: {:?}",
         bare.iter().map(|s| s.label.clone()).collect::<Vec<_>>()
     );
+    // Rows read like the /model picker's: the model and what it is good for.
+    // The popup TITLE is what frames them as reviewer candidates, so the rows
+    // must not repeat it.
     assert!(
         bare[1..]
             .iter()
-            .all(|s| s.detail.starts_with("as the adversarial reviewer")),
-        "every model row says whose model it is"
+            .all(|s| !s.detail.contains("adversarial")),
+        "the title says it; the rows should not repeat it: {:?}",
+        bare[1..].iter().map(|s| s.detail.clone()).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        bare[1..]
+            .iter()
+            .map(|s| s.detail.clone())
+            .collect::<Vec<_>>(),
+        {
+            let auto = cross_gam_backend(App::new().backend);
+            let mut providers = vec![auto];
+            for backend in [Backend::Claude, Backend::Codex, Backend::Opencode] {
+                if backend != auto {
+                    providers.push(backend);
+                }
+            }
+            providers
+                .into_iter()
+                .flat_map(|b| {
+                    model_suggestions_for(b, "")
+                        .into_iter()
+                        .take(6)
+                        .map(|s| s.detail)
+                })
+                .collect::<Vec<_>>()
+        },
+        "the rows carry the same descriptions /model shows"
     );
     // The default reviewer's provider leads the list.
     let auto = cross_gam_backend(App::new().backend);
@@ -18992,5 +19021,6 @@ fn gam_task_text_never_becomes_a_model_picker() {
     assert!(!app.handle_picker_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
     assert_eq!(app.task_input, before);
 }
+
 
 

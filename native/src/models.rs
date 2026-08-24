@@ -863,6 +863,13 @@ pub(crate) fn gam_provider_prefix_suggestions(query: &str) -> Vec<Suggestion> {
 }
 
 /// The same model rows /model offers, rewritten to insert into a `/gam` line.
+///
+/// The rows read EXACTLY like the /model picker's: label plus the model's own
+/// description. The popup's title is what says these are reviewer candidates
+/// (see `gam_picker_title`); stamping "as the adversarial reviewer" onto all
+/// nineteen rows repeated what the title already said and pushed the actual
+/// model description off the end of the line.
+///
 /// Effort is intentionally not offered here: it is derived from the chosen
 /// model, and the rest of the line belongs to the task text.
 pub(crate) fn gam_model_suggestions(backend_filter: Backend, query: &str) -> Vec<Suggestion> {
@@ -870,7 +877,6 @@ pub(crate) fn gam_model_suggestions(backend_filter: Backend, query: &str) -> Vec
         .into_iter()
         .map(|suggestion| match suggestion.action {
             SuggestionAction::ChooseModel { backend, model } => Suggestion {
-                detail: format!("as the adversarial reviewer · {}", suggestion.detail),
                 action: SuggestionAction::ChooseGamModel { backend, model },
                 ..suggestion
             },
