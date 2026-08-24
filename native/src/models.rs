@@ -208,15 +208,21 @@ pub(crate) fn suggestions_for(app: &App) -> Vec<Suggestion> {
     }
 
     if input.starts_with("/gam") {
-        // /gam is a TASK command first. The reviewer's model is optional and
-        // defaults to the other provider, so the drill-down has to be opt-in:
-        // it opens only while the first word after /gam is still a partial
-        // PROVIDER name. Offering providers on the bare "/gam" made the palette
-        // flip the instant the "m" landed, and Enter then inserted a provider
-        // instead of submitting the line the user was about to type.
+        // Bare "/gam" opens the reviewer picker, because choosing who argues
+        // with the generator is the interesting decision here. What it must NOT
+        // do is take the Enter key by surprise: the first row is "just type the
+        // task", so the default selection keeps the line and naming a provider
+        // is a deliberate arrow-down.
+        //
+        // Past that, /gam is a task command. The picker stays open only while
+        // the first word is still a partial PROVIDER name, matched by strict
+        // prefix, so an ordinary ask never turns back into a model chooser.
         let rest = input.strip_prefix("/gam").unwrap_or_default().trim_start();
-        if !rest.is_empty() {
-            maybe_refresh_models_dev_cache();
+        maybe_refresh_models_dev_cache();
+        if rest.is_empty() {
+            return gam_reviewer_suggestions(app.backend);
+        }
+        {
             let trailing_space = rest.ends_with(char::is_whitespace);
             let parts = rest.split_whitespace().collect::<Vec<_>>();
             return match parts.first().and_then(|provider| provider_backend(provider)) {
@@ -240,9 +246,6 @@ pub(crate) fn suggestions_for(app: &App) -> Vec<Suggestion> {
                 },
             };
         }
-        // Bare "/gam": fall through to the command palette, which carries the
-        // "/gam <task>" and "/gam <model> <task>" rows. Both only insert
-        // "/gam ", so Enter here keeps the line instead of choosing a model.
     }
     rank_suggestions(command_suggestions(), input.trim_start_matches('/'))
 }
@@ -759,8 +762,43 @@ pub(crate) fn provider_suggestions(query: &str) -> Vec<Suggestion> {
     rank_suggestions(suggestions, query)
 }
 
-/// The `/gam` drill-down's provider rows. Selecting one inserts the provider
-/// into the input rather than changing dashboard defaults.
+/// The three provider rows of the `/gam` picker. Every label says what the
+/// choice is FOR: this picks the model that argues with the generator, it does
+/// not touch the dashboard's own backend or model.
+fn gam_provider_rows() -> impl Iterator<Item = Suggestion> {
+    [
+        (Backend::Claude, "Claude Code"),
+        (Backend::Codex, "Codex"),
+        (Backend::Opencode, "opencode"),
+    ]
+    .into_iter()
+    .map(|(backend, name)| Suggestion {
+        label: backend.as_str().to_string(),
+        detail: format!("review with {name} · pick its model next"),
+        action: SuggestionAction::ChooseGamProvider(backend),
+    })
+}
+
+/// What bare `/gam` shows: who is going to argue with the generator.
+///
+/// The FIRST row is the do-nothing path, so the default selection under the
+/// cursor keeps whatever the user is typing. Enter used to land on a provider
+/// here, which read as `/gam` silently changing models.
+pub(crate) fn gam_reviewer_suggestions(default_backend: Backend) -> Vec<Suggestion> {
+    let auto = cross_gam_backend(default_backend);
+    let mut rows = vec![Suggestion {
+        label: "/gam <task>".to_string(),
+        detail: format!(
+            "just type the task · {} reviews it by default",
+            auto.as_str()
+        ),
+        action: SuggestionAction::Insert("/gam ".to_string()),
+    }];
+    rows.extend(gam_provider_rows());
+    rows
+}
+
+/// Provider rows filtered by what has been typed so far.
 ///
 /// STRICT prefix match, deliberately not the fuzzy ranker every other palette
 /// uses. Fuzzy matching surfaced "codex" for "code" and a provider row for any
@@ -772,19 +810,9 @@ pub(crate) fn gam_provider_prefix_suggestions(query: &str) -> Vec<Suggestion> {
     if query.is_empty() {
         return Vec::new();
     }
-    [
-        (Backend::Claude, "adversarial reviewer: Claude Code models"),
-        (Backend::Codex, "adversarial reviewer: Codex models"),
-        (Backend::Opencode, "adversarial reviewer: opencode models"),
-    ]
-    .into_iter()
-    .filter(|(backend, _)| backend.as_str().starts_with(&query))
-    .map(|(backend, detail)| Suggestion {
-        label: backend.as_str().to_string(),
-        detail: format!("{detail} · then type the task"),
-        action: SuggestionAction::ChooseGamProvider(backend),
-    })
-    .collect()
+    gam_provider_rows()
+        .filter(|suggestion| suggestion.label.starts_with(&query))
+        .collect()
 }
 
 /// The same model rows /model offers, rewritten to insert into a `/gam` line.

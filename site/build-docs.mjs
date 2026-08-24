@@ -417,6 +417,7 @@ what is happening.</p>
     lede: "/gam puts two models on one task: a generator that writes the code, and a reviewer from a different provider that can only argue with it. The reviewer cannot edit a single file.",
     toc: [
       ["start", "Starting a pair"],
+      ["name", "Where the name comes from"],
       ["why", "Why two models"],
       ["round", "What a round is"],
       ["verdicts", "The three verdicts"],
@@ -478,6 +479,22 @@ real checkout rather than an isolated workspace:</p>
 <p>Ordinary task words are never mistaken for a model. <code>/gam fix the auth
 bug</code> keeps every one of those words as the task, because <code>fix</code> is
 not a model name.</p>
+
+<h2 id="name">Where the name comes from</h2>
+<p>A generative adversarial network trains two models against each other. The
+generator produces candidates; the discriminator tries to tell the real ones from
+the manufactured ones. Neither improves in isolation. The pressure between them is
+the training signal, and the generator gets good precisely because something
+competent is trying to catch it out.</p>
+<p><code>/gam</code> takes the arrangement and leaves the mathematics. Nothing here
+is trained and no weights move. The generator writes code, the reviewer tries to
+refute it, and what travels back is an argument in English rather than a gradient.</p>
+<p>What survives the translation is the useful half: a critic that is structurally
+separate from the thing it is judging, and that gains nothing by agreeing. What does
+not survive is convergence for free. A GAN runs to equilibrium over many epochs; a
+pair here gets four rounds and then hands you the disagreement. It settles because
+objections have to be demonstrable and the generator is allowed to refute them, not
+because anything is optimising.</p>
 
 <h2 id="why">Why two models</h2>
 <p>A model reviewing its own work agrees with itself. It has already decided the

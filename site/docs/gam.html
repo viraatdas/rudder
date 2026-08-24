@@ -112,6 +112,22 @@ real checkout rather than an isolated workspace:</p>
 bug</code> keeps every one of those words as the task, because <code>fix</code> is
 not a model name.</p>
 
+<h2 id="name">Where the name comes from</h2>
+<p>A generative adversarial network trains two models against each other. The
+generator produces candidates; the discriminator tries to tell the real ones from
+the manufactured ones. Neither improves in isolation. The pressure between them is
+the training signal, and the generator gets good precisely because something
+competent is trying to catch it out.</p>
+<p><code>/gam</code> takes the arrangement and leaves the mathematics. Nothing here
+is trained and no weights move. The generator writes code, the reviewer tries to
+refute it, and what travels back is an argument in English rather than a gradient.</p>
+<p>What survives the translation is the useful half: a critic that is structurally
+separate from the thing it is judging, and that gains nothing by agreeing. What does
+not survive is convergence for free. A GAN runs to equilibrium over many epochs; a
+pair here gets four rounds and then hands you the disagreement. It settles because
+objections have to be demonstrable and the generator is allowed to refute them, not
+because anything is optimising.</p>
+
 <h2 id="why">Why two models</h2>
 <p>A model reviewing its own work agrees with itself. It has already decided the
 approach was reasonable, and asking it to check that decision gets you a summary of
@@ -199,6 +215,7 @@ when you press <kbd>m</kbd>.</p>
         <h2>on this page</h2>
         <ul>
             <li><a href="#start">Starting a pair</a></li>
+            <li><a href="#name">Where the name comes from</a></li>
             <li><a href="#why">Why two models</a></li>
             <li><a href="#round">What a round is</a></li>
             <li><a href="#verdicts">The three verdicts</a></li>

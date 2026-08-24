@@ -18607,17 +18607,31 @@ fn gam_round_cap_escalates_but_still_delivers_the_last_objection() {
 #[test]
 fn gam_suggestions_drill_down_like_the_model_picker() {
     let mut app = App::new();
-    // Bare "/gam" is an ordinary command row, NOT a provider picker: the tail
-    // is usually a task, and grabbing the palette here stole the Enter key.
+    // Bare "/gam" offers the reviewer picker, but the FIRST row is the
+    // do-nothing path so the default selection never rewrites the line.
     app.task_input = "/gam".to_string();
     let bare = suggestions_for(&app);
     assert!(
-        bare.iter().all(|suggestion| !matches!(
-            suggestion.action,
-            SuggestionAction::ChooseGamProvider(_) | SuggestionAction::ChooseGamModel { .. }
-        )),
-        "bare /gam must not open the reviewer picker: {:?}",
-        bare.iter().map(|s| s.label.clone()).collect::<Vec<_>>()
+        matches!(bare.first().map(|s| &s.action), Some(SuggestionAction::Insert(text)) if text == "/gam "),
+        "the default row must keep the line, got {:?}",
+        bare.first().map(|s| s.label.clone())
+    );
+    assert!(
+        bare.first().is_some_and(|s| s.detail.contains("reviews it by default")),
+        "the default row must name who reviews when you skip the picker"
+    );
+    assert_eq!(
+        bare.iter()
+            .filter(|s| matches!(s.action, SuggestionAction::ChooseGamProvider(_)))
+            .count(),
+        3,
+        "all three providers offered as reviewers"
+    );
+    assert!(
+        bare.iter()
+            .filter(|s| matches!(s.action, SuggestionAction::ChooseGamProvider(_)))
+            .all(|s| s.detail.starts_with("review with")),
+        "every provider row says what the choice is for"
     );
 
     // A partial provider name IS the opt-in drill-down.
@@ -18678,8 +18692,18 @@ fn gam_enter_captures_only_inside_the_picker_window() {
     use crossterm::event::{KeyCode, KeyModifiers};
     let enter = || KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
 
-    // Provider step: Enter selects a reviewer backend, but only once the user
-    // has started spelling one. Bare "/gam" just completes the command name.
+    // Bare "/gam": the picker is open, but the row under the cursor is the
+    // do-nothing default, so Enter keeps the line rather than naming a model.
+    let mut app = App::new();
+    app.task_input = "/gam".to_string();
+    let _ = app.handle_task_key(enter());
+    assert_eq!(
+        app.task_input, "/gam ",
+        "Enter on the default row must not choose a provider"
+    );
+
+    // Provider step: Enter selects a reviewer backend once the user has
+    // started spelling one.
     let mut app = App::new();
     app.task_input = "/gam cod".to_string();
     assert!(suggestions_for(&app).iter().any(|s| {
@@ -18743,9 +18767,11 @@ fn gam_task_text_never_becomes_a_model_picker() {
     use crossterm::event::{KeyCode, KeyModifiers};
     let mut app = App::new();
 
-    // Every keystroke of "/gam " on the way in, then a plain task.
+    // Every keystroke from the moment a task word starts. Bare "/gam" and
+    // "/gam " deliberately DO show the reviewer picker; the invariant is that
+    // typing an actual task closes it again.
     for input in [
-        "/g", "/ga", "/gam", "/gam ", "/gam f", "/gam fix", "/gam fix the", "/gam fix the scroll",
+        "/g", "/ga", "/gam f", "/gam fix", "/gam fix the", "/gam fix the scroll",
     ] {
         app.task_input = input.to_string();
         let rows = suggestions_for(&app);
