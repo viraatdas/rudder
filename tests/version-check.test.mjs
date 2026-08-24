@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { compareSemver, shouldAutoUpdateFromPackageRoot } from "../dist/version-check.js";
+import { compareSemver, isUnpublishedYet, shouldAutoUpdateFromPackageRoot } from "../dist/version-check.js";
 
 test("compareSemver orders patch/minor/major versions", () => {
   assert.equal(compareSemver("2.2.4", "2.2.5"), -1);
@@ -42,3 +42,20 @@ function restoreEnv(key, value) {
     process.env[key] = value;
   }
 }
+
+test("a publish that has not propagated is named, not dumped as an npm failure", () => {
+  // What the registry actually returns in the window between a version being
+  // readable in the packument and every replica being able to resolve it. The
+  // updater used to inherit npm's stdio, so this arrived as a five-line error
+  // block that reads like rudder itself is broken.
+  const etarget = [
+    "npm error code ETARGET",
+    "npm error notarget No matching version found for @viraatdas/rudder@2.14.36.",
+    "npm error notarget In most cases you or one of your dependencies are requesting",
+  ].join("\n");
+  assert.equal(isUnpublishedYet(etarget), true);
+
+  // A genuine failure must NOT be swallowed by that branch.
+  assert.equal(isUnpublishedYet("npm error code EACCES\nnpm error syscall mkdir"), false);
+  assert.equal(isUnpublishedYet(""), false);
+});

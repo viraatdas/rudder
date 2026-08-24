@@ -158,8 +158,23 @@ export async function autoUpdateAndRerunIfNeeded(argv: string[]): Promise<boolea
 
   console.error(`rudder: updating ${info.version} -> ${latest}...`);
   const installed = await installLatest(latest);
-  if (!installed) {
-    console.error(`rudder: auto-update failed; continuing with ${info.version}`);
+  if (!installed.ok) {
+    // A version can be readable in the registry's packument seconds before every
+    // replica can resolve it for install. The updater sees the new number, npm
+    // says ETARGET, and the user gets a five-line npm error block for what is a
+    // publish that has not finished propagating. Name it and move on; nothing is
+    // cached on failure, so the next launch retries.
+    if (isUnpublishedYet(installed.output)) {
+      console.error(
+        `rudder: ${latest} is not resolvable from the registry yet; staying on ${info.version}`,
+      );
+    } else {
+      console.error(`rudder: auto-update failed; continuing with ${info.version}`);
+      const detail = installed.output.trim();
+      if (detail) {
+        console.error(detail);
+      }
+    }
     return false;
   }
   await writeCache(latest);
@@ -168,11 +183,18 @@ export async function autoUpdateAndRerunIfNeeded(argv: string[]): Promise<boolea
   return true;
 }
 
-async function installLatest(version: string): Promise<boolean> {
-  const code = await spawnExitCode("npm", ["install", "-g", `@viraatdas/rudder@${version}`], {
+type InstallResult = { ok: boolean; output: string };
+
+async function installLatest(version: string): Promise<InstallResult> {
+  const result = await spawnCaptured("npm", ["install", "-g", `@viraatdas/rudder@${version}`], {
     RUDDER_SKIP_AUTO_UPDATE: "1",
   });
-  return code === 0;
+  return { ok: result.code === 0, output: result.output };
+}
+
+/** npm's shape for "that version exists in the index but I cannot resolve it". */
+export function isUnpublishedYet(npmOutput: string): boolean {
+  return /\bETARGET\b/.test(npmOutput) || /\bnotarget\b/.test(npmOutput);
 }
 
 async function rerunCurrentCommand(argv: string[]): Promise<number> {
@@ -188,6 +210,11 @@ async function rerunCurrentCommand(argv: string[]): Promise<number> {
   return await spawnExitCode("rudder", argv, { RUDDER_SKIP_AUTO_UPDATE: "1" });
 }
 
+/**
+ * Inherited stdio. The re-run path hands the terminal to the real dashboard,
+ * so this MUST NOT be swapped for the capturing variant: a captured TUI has no
+ * terminal to draw on.
+ */
 async function spawnExitCode(
   command: string,
   args: string[],
@@ -200,5 +227,32 @@ async function spawnExitCode(
     });
     child.on("error", () => resolve(127));
     child.on("close", (code) => resolve(code ?? 1));
+  });
+}
+
+/**
+ * Run a command with its output CAPTURED rather than inherited, so the caller
+ * decides what the user sees. The updater runs before the TUI paints, and an
+ * inherited npm error block is indistinguishable from rudder itself failing.
+ */
+async function spawnCaptured(
+  command: string,
+  args: string[],
+  envPatch: NodeJS.ProcessEnv,
+): Promise<{ code: number; output: string }> {
+  return await new Promise((resolve) => {
+    let output = "";
+    const child = spawn(command, args, {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, ...envPatch },
+    });
+    child.stdout?.on("data", (chunk) => {
+      output += String(chunk);
+    });
+    child.stderr?.on("data", (chunk) => {
+      output += String(chunk);
+    });
+    child.on("error", () => resolve({ code: 127, output }));
+    child.on("close", (code) => resolve({ code: code ?? 1, output }));
   });
 }
