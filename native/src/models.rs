@@ -779,11 +779,17 @@ fn gam_provider_rows() -> impl Iterator<Item = Suggestion> {
     })
 }
 
-/// What bare `/gam` shows: who is going to argue with the generator.
+/// What bare `/gam` shows: the models that could argue with the generator,
+/// across every provider, with the default reviewer's provider listed first.
+///
+/// Models rather than providers, because picking the adversary IS the decision
+/// this command exists to offer, and making it a two-step drill-down hid it.
+/// This list appears ONLY on the bare command: the moment a character follows
+/// `/gam `, the strict rules take over, so a task word can never pull a model
+/// row back up mid-sentence (typing "fix" would otherwise match "fable").
 ///
 /// The FIRST row is the do-nothing path, so the default selection under the
-/// cursor keeps whatever the user is typing. Enter used to land on a provider
-/// here, which read as `/gam` silently changing models.
+/// cursor keeps whatever the user is typing rather than rewriting the line.
 pub(crate) fn gam_reviewer_suggestions(default_backend: Backend) -> Vec<Suggestion> {
     let auto = cross_gam_backend(default_backend);
     let mut rows = vec![Suggestion {
@@ -794,8 +800,49 @@ pub(crate) fn gam_reviewer_suggestions(default_backend: Backend) -> Vec<Suggesti
         ),
         action: SuggestionAction::Insert("/gam ".to_string()),
     }];
-    rows.extend(gam_provider_rows());
+    // Default reviewer's provider first, then the rest in their usual order.
+    let mut providers = vec![auto];
+    for backend in [Backend::Claude, Backend::Codex, Backend::Opencode] {
+        if backend != auto {
+            providers.push(backend);
+        }
+    }
+    for backend in providers {
+        rows.extend(
+            gam_model_suggestions(backend, "")
+                .into_iter()
+                .take(GAM_MODELS_PER_PROVIDER),
+        );
+    }
     rows
+}
+
+/// How many models each provider contributes to the bare `/gam` list.
+///
+/// The full catalogue is over a hundred rows across three providers, which is a
+/// wall to scroll rather than a choice to make. `model_suggestions_for` leads
+/// with the friendly aliases that track each family's newest release, so the
+/// first few are the ones worth offering; naming a provider still opens its
+/// complete list.
+const GAM_MODELS_PER_PROVIDER: usize = 6;
+
+/// Palette title for the `/gam` picker. The rows are model names, which on
+/// their own look exactly like the `/model` picker and read as "this is about
+/// to change my model" — the title is what says whose model it is.
+pub(crate) fn gam_picker_title(input: &str, selected: usize, total: usize) -> String {
+    let rest = input
+        .trim_start()
+        .strip_prefix("/gam")
+        .unwrap_or_default()
+        .trim();
+    let step = match rest.split_whitespace().next() {
+        Some(provider) if provider_backend(provider).is_some() => {
+            format!("pick the adversarial model · {provider}")
+        }
+        Some(_) => "pick the adversarial reviewer".to_string(),
+        None => "pick the adversarial model".to_string(),
+    };
+    format!(" {step} · {selected}/{total} ")
 }
 
 /// Provider rows filtered by what has been typed so far.

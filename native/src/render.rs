@@ -4276,6 +4276,12 @@ pub(crate) fn render_suggestions(frame: &mut Frame<'_>, task_area: Rect, app: &A
             selected_index.saturating_add(1),
             suggestions.len(),
         )
+    } else if app.task_input.trim_start().starts_with("/gam") {
+        gam_picker_title(
+            &app.task_input,
+            selected_index.saturating_add(1),
+            suggestions.len(),
+        )
     } else {
         format!(
             " commands · {}/{} ",

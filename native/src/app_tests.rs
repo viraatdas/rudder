@@ -18620,18 +18620,44 @@ fn gam_suggestions_drill_down_like_the_model_picker() {
         bare.first().is_some_and(|s| s.detail.contains("reviews it by default")),
         "the default row must name who reviews when you skip the picker"
     );
-    assert_eq!(
-        bare.iter()
-            .filter(|s| matches!(s.action, SuggestionAction::ChooseGamProvider(_)))
-            .count(),
-        3,
-        "all three providers offered as reviewers"
+    // The rows are MODELS: picking who argues is the decision /gam exists to
+    // offer, and burying it behind a provider step hid it.
+    assert!(
+        bare.len() > 1 && bare[1..].iter().all(|s| matches!(
+            s.action,
+            SuggestionAction::ChooseGamModel { .. }
+        )),
+        "bare /gam lists candidate reviewer models: {:?}",
+        bare.iter().map(|s| s.label.clone()).collect::<Vec<_>>()
     );
     assert!(
-        bare.iter()
-            .filter(|s| matches!(s.action, SuggestionAction::ChooseGamProvider(_)))
-            .all(|s| s.detail.starts_with("review with")),
-        "every provider row says what the choice is for"
+        bare[1..]
+            .iter()
+            .all(|s| s.detail.starts_with("as the adversarial reviewer")),
+        "every model row says whose model it is"
+    );
+    // The default reviewer's provider leads the list.
+    let auto = cross_gam_backend(App::new().backend);
+    assert!(
+        matches!(
+            bare[1].action,
+            SuggestionAction::ChooseGamModel { backend, .. } if backend == auto
+        ),
+        "the default reviewer's provider is listed first"
+    );
+    // And the popup says what it is, so a list of model names cannot read as
+    // "/gam is about to change my model".
+    assert_eq!(
+        gam_picker_title("/gam", 1, bare.len()),
+        format!(" pick the adversarial model · 1/{} ", bare.len())
+    );
+    assert!(gam_picker_title("/gam codex", 1, 9).contains("pick the adversarial model · codex"));
+    // A choice, not a catalogue. Unbounded this is 100+ rows across three
+    // providers, which is a wall to scroll rather than a list to pick from.
+    assert!(
+        bare.len() <= 24,
+        "bare /gam offers {} rows; cap the per-provider slice",
+        bare.len()
     );
 
     // A partial provider name IS the opt-in drill-down.
@@ -18966,3 +18992,5 @@ fn gam_task_text_never_becomes_a_model_picker() {
     assert!(!app.handle_picker_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
     assert_eq!(app.task_input, before);
 }
+
+
