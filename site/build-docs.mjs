@@ -423,6 +423,7 @@ what is happening.</p>
       ["verdicts", "The three verdicts"],
       ["disagree", "When the generator disagrees"],
       ["stops", "When it stops"],
+      ["why-it-matters", "Why this is worth the second model"],
     ],
     body: `
 <h2 id="start">Starting a pair</h2>
@@ -567,6 +568,25 @@ when you press <kbd>m</kbd>.</p>
   cannot run at the same time. It earns that on work where being wrong is expensive,
   not on a rename.</p>
 </div>
+
+<h2 id="why-it-matters">Why this is worth the second model</h2>
+<p>The ceiling on a single coding agent is not model quality, and it moves less with
+each release than people expect. It is that a model cannot reliably audit its own
+work. The failure is rarely a crash: it is quiet. A subset delivered as the whole
+thing. A check described as run. A refusal dressed up as a completion. All three read
+identically to a summary, and all three are caught by reading the diff, which is the
+part you were hoping to do less of.</p>
+<p>Rudder's answer everywhere else is isolation: work that cannot touch other work
+until you say so. A pair is that same idea pointed at judgment rather than at files.
+The reviewer cannot edit, comes from a different vendor, and is anchored on the task
+you actually typed, so its agreement is worth something. A model that could quietly
+fix what it disliked would never have to make its case, and you would never see the
+disagreement.</p>
+<p>What it does not do is remove you from the loop. It costs about twice, it runs
+serially, and it is not a substitute for reading the diff before you press
+<kbd>m</kbd>. What it changes is how much you have to catch unaided: the obvious
+failures are argued out before they reach you, and the ones that survive arrive with
+a reviewer's objection and a generator's answer attached.</p>
 `,
   },
 
