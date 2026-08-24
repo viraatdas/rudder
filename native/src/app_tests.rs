@@ -18709,6 +18709,111 @@ fn gam_reviewer_is_wired_for_completion_signals() {
     }
 }
 
+/// The predicate the sweep actually evaluates.
+///
+/// `worker_wants_signals` returning true is one step removed from the condition
+/// that killed the reviewer: the sweep asks `worker_has_config`, which needs a
+/// file to exist on disk. Drive the real launch wiring and assert the file lands
+/// for every backend a reviewer can run on.
+#[cfg(not(windows))]
+#[test]
+fn gam_reviewer_launch_wiring_puts_a_config_where_the_sweep_looks() {
+    for (backend, program) in [
+        (Backend::Claude, "claude"),
+        (Backend::Codex, "codex"),
+        (Backend::Opencode, "opencode"),
+    ] {
+        let run_id = format!("gam-wiring-itest-{}", backend.as_str());
+        signals::cleanup_run_signals(&run_id);
+        assert!(
+            !signals::worker_has_config(&run_id, backend),
+            "precondition: {backend:?} starts unwired"
+        );
+
+        let mut command = TerminalCommand::with_args(program, ["--no-alt-screen"]);
+        // Codex's reviewer profile bakes in `notify=[]` for augment to replace.
+        if backend == Backend::Codex {
+            command.args.push("-c".to_string());
+            command.args.push("notify=[]".to_string());
+        }
+        signals::augment_worker_command(
+            &mut command,
+            backend,
+            AgentMode::GamAdversarial,
+            &run_id,
+        );
+
+        assert!(
+            signals::worker_has_config(&run_id, backend),
+            "{backend:?} reviewer left no config on disk; the sweep kills it a tick after launch"
+        );
+        signals::cleanup_run_signals(&run_id);
+    }
+}
+
+/// End to end on the exact death: a LIVE reviewer pane must survive the poll
+/// tick. Before the fix this pane was terminated within one tick of spawning,
+/// every single time, and the pair sat at round 1/4 forever.
+#[cfg(not(windows))]
+#[test]
+fn a_live_gam_reviewer_survives_the_lifecycle_sweep() {
+    let run_id = "gam-sweep-itest";
+    let Some(sig) = crate::signals::signal_path(run_id) else {
+        return; // no HOME in this env
+    };
+    signals::cleanup_run_signals(run_id);
+    let _ = std::fs::remove_file(&sig);
+
+    // Launch wiring, exactly as start_gam_pair performs it.
+    let mut command = TerminalCommand::with_args("claude", ["--no-alt-screen"]);
+    signals::augment_worker_command(
+        &mut command,
+        Backend::Claude,
+        AgentMode::GamAdversarial,
+        run_id,
+    );
+
+    let mut app = App::new();
+    app.cwd = std::env::temp_dir();
+    // A `sleep` PTY stands in for the reviewer standing by: alive, quiet, and
+    // with no idle chrome for any fallback scrape to latch onto.
+    let pane = TerminalPane::spawn_shell_or_command(
+        Some(TerminalCommand::with_args("/bin/sh", ["-lc", "sleep 30"])),
+        TerminalPaneOptions {
+            size: TerminalSize { rows: 10, cols: 80 },
+            scrollback_lines: 100,
+            ..Default::default()
+        },
+    )
+    .expect("spawn reviewer pty");
+    let mut run = test_agent_run(run_id, "review the diff");
+    run.cwd = app.cwd.clone();
+    run.mode = AgentMode::GamAdversarial;
+    run.terminal = Some(pane);
+    app.agents.push(run);
+    app.selected_agent = 0;
+
+    app.poll_agents();
+    assert_eq!(
+        app.agents[0].status,
+        AgentStatus::Running,
+        "the reviewer was killed by the sweep: {:?}",
+        app.agents[0].last_error
+    );
+
+    // And its turn end is readable, which is what poll_gam_pairs routes on.
+    std::fs::write(&sig, "{\"state\":\"done\"}").expect("write signal");
+    app.poll_agents();
+    assert_eq!(
+        app.agents[0].status,
+        AgentStatus::Done,
+        "a finished reviewer must reach Done or no verdict is ever read"
+    );
+
+    let _ = std::fs::remove_file(&sig);
+    signals::cleanup_run_signals(run_id);
+}
+
 /// The split renders the role prefix itself, so an identity that already says
 /// "adv" produced "adv · adv · codex gpt-5.6-sol".
 #[cfg(not(windows))]
