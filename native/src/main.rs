@@ -6778,9 +6778,12 @@ packet arrives, reply only: \"standing by\"."
             }
             match gam.phase {
                 GamPhase::GeneratorWorking => {
-                    if self.agents[index].status == AgentStatus::Done
-                        && self.gam_peer_index_of(index).is_some()
-                    {
+                    // Deliberately NOT gated on the peer existing. A deleted
+                    // reviewer used to mean this arm simply never fired: the
+                    // generator sat Done forever, the poll retried every tick,
+                    // and nothing told the user. deliver_gam_packet ends the
+                    // pair with a reason instead.
+                    if self.agents[index].status == AgentStatus::Done {
                         actions.push(GamAction::DeliverPacket(index));
                     }
                 }
@@ -6830,18 +6833,47 @@ packet arrives, reply only: \"standing by\"."
     /// Round step 1: the generator finished a turn. Lift its optional reply
     /// note, assemble the packet (original task + reply + bounded diff), and
     /// paste it into the reviewer's pane.
+    /// End a pair for a reason the user needs to see. Every silent `return` in
+    /// the delivery path was a pair that stopped working with no explanation,
+    /// which is indistinguishable from Rudder having forgotten about it.
+    fn settle_gam_pair_with_notice(&mut self, generator_index: usize, reason: &str) {
+        self.record_activity(format!("gam: stopped — {reason}"));
+        self.notice = Some(format!("gam needs you: {reason}. Both panes stay live."));
+        self.settle_gam_pair(generator_index, GamOutcome::Escalated(reason.to_string()));
+    }
+
     fn deliver_gam_packet(&mut self, generator_index: usize) {
         let Some(peer_index) = self.gam_peer_index_of(generator_index) else {
+            self.settle_gam_pair_with_notice(
+                generator_index,
+                "the reviewer row is gone, so nothing can review this turn",
+            );
             return;
         };
-        // Never inject into a reviewer that is still mid-turn or dead: a queued
-        // packet would collide with live output, and a failed one cannot answer.
-        let reviewer_ready = !matches!(
-            self.agents[peer_index].status,
-            AgentStatus::Failed | AgentStatus::Stopped
-        ) && self.agents[peer_index].terminal.is_some()
-            && self.agents[peer_index].status != AgentStatus::Running;
-        if !reviewer_ready {
+        // A reviewer that is mid-turn will be ready shortly, so that case waits
+        // and retries. Every OTHER not-ready reason is permanent, and used to
+        // return here exactly the same way: the pair then span silently forever
+        // with the generator parked at Done and no notice of any kind. That is
+        // the "gam just stopped doing anything" shape.
+        match self.agents[peer_index].status {
+            // Still answering; try again next tick.
+            AgentStatus::Running => return,
+            AgentStatus::Failed | AgentStatus::Stopped => {
+                self.settle_gam_pair_with_notice(
+                    generator_index,
+                    "the reviewer is no longer running, so this turn cannot be reviewed",
+                );
+                return;
+            }
+            _ => {}
+        }
+        if self.agents[peer_index].terminal.is_none() {
+            // Typically a restart: panes do not survive it, and only a RUNNING
+            // row is auto-resumed, so an idle reviewer comes back pane-less.
+            self.settle_gam_pair_with_notice(
+                generator_index,
+                "the reviewer's pane is gone (a restart ends a pair; start a new one)",
+            );
             return;
         }
         // Lift the generator's pushback FIRST — nothing has reset its buffer
@@ -6871,13 +6903,10 @@ packet arrives, reply only: \"standing by\"."
             hasher.finish()
         };
         if gam.round > 0 && gam.last_progress == Some(progress) {
-            let reason =
-                "the generator stopped making progress: same diff and same reply as the last round";
-            self.record_activity(format!("gam: stopped after {} round(s) — {reason}", gam.round));
-            // Every other ending tells the user; this one settled silently, so a
-            // stalled pair just went quiet with both panes still open.
-            self.notice = Some(format!("gam needs you: {reason}. Both panes stay live."));
-            self.settle_gam_pair(generator_index, GamOutcome::Escalated(reason.to_string()));
+            self.settle_gam_pair_with_notice(
+                generator_index,
+                "the generator stopped making progress: same diff and same reply as the last round",
+            );
             return;
         }
         gam.last_progress = Some(progress);
@@ -6920,6 +6949,13 @@ packet arrives, reply only: \"standing by\"."
     /// (until the cap); an unparseable or explicit escalation pages the human.
     fn route_gam_verdict(&mut self, generator_index: usize) {
         let Some(peer_index) = self.gam_peer_index_of(generator_index) else {
+            // poll_gam_pairs routes a vanished reviewer HERE precisely so it can
+            // be escalated; returning silently defeated that and left the
+            // generator waiting on a verdict nobody was ever going to give.
+            self.settle_gam_pair_with_notice(
+                generator_index,
+                "the reviewer row is gone, so its verdict can never arrive",
+            );
             return;
         };
         let lines = self.agents[peer_index]
@@ -7047,19 +7083,18 @@ Address the objection directly. If you disagree, say why inside \
     /// End the automatic loop on BOTH rows. Both panes stay live; the user can
     /// keep driving either conversation by hand.
     fn settle_gam_pair(&mut self, generator_index: usize, outcome: GamOutcome) {
-        let Some(peer_index) = self.gam_peer_index_of(generator_index) else {
-            return;
-        };
-        for side in [generator_index, peer_index] {
+        // The generator is settled whether or not its peer still exists. Bailing
+        // out on a missing peer meant the endings that exist BECAUSE the peer is
+        // gone could never be recorded: the pair stayed unsettled and the poll
+        // loop kept retrying it forever.
+        let peer_index = self.gam_peer_index_of(generator_index);
+        for side in [Some(generator_index), peer_index].into_iter().flatten() {
             if let Some(recorded) = self.agents[side].gam.as_mut() {
                 recorded.phase = GamPhase::Settled(outcome.clone());
             }
-        }
-        if let Some(run) = self.agents.get_mut(generator_index) {
-            let _ = save_native_run_record(&self.cwd, run);
-        }
-        if let Some(run) = self.agents.get_mut(peer_index) {
-            let _ = save_native_run_record(&self.cwd, run);
+            if let Some(run) = self.agents.get_mut(side) {
+                let _ = save_native_run_record(&self.cwd, run);
+            }
         }
         self.dirty = true;
     }

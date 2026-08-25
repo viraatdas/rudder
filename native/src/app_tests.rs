@@ -19677,3 +19677,72 @@ fn a_gam_pair_stays_together_in_the_sidebar() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A pair must never go quiet without saying why.
+///
+/// Every not-ready reason in the delivery path used to `return` the same way.
+/// "Still mid-turn" is transient and should retry, but a reviewer that has
+/// failed, been stopped, lost its pane, or been deleted is never coming back:
+/// those spun forever with the generator parked at Done and no notice of any
+/// kind, which is indistinguishable from Rudder having forgotten the pair.
+#[cfg(not(windows))]
+#[test]
+fn a_pair_that_cannot_continue_says_so_instead_of_spinning() {
+    let wrecks: Vec<(&str, Box<dyn Fn(&mut App)>)> = vec![
+        ("reviewer stopped", Box::new(|app: &mut App| app.agents[1].status = AgentStatus::Stopped)),
+        ("reviewer failed", Box::new(|app: &mut App| app.agents[1].status = AgentStatus::Failed)),
+        ("reviewer pane gone", Box::new(|app: &mut App| app.agents[1].terminal = None)),
+        ("reviewer row deleted", Box::new(|app: &mut App| { app.agents.remove(1); })),
+    ];
+    for (label, wreck) in wrecks {
+        let dir = unique_test_repo("gam-hang");
+        let mut app = App::new();
+        app.cwd = dir.clone();
+        let (generator, _adv) = gam_test_pair(&mut app, "standing by");
+        app.agents[generator].status = AgentStatus::Done;
+        wreck(&mut app);
+
+        app.poll_gam_pairs();
+
+        let phase = app.agents[generator].gam.as_ref().unwrap().phase.clone();
+        assert!(
+            matches!(phase, GamPhase::Settled(GamOutcome::Escalated(_))),
+            "[{label}] the pair must end, got {phase:?}"
+        );
+        assert!(
+            app.notice.as_deref().is_some_and(|n| n.contains("gam needs you")),
+            "[{label}] and it must say why: {:?}",
+            app.notice
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The one not-ready reason that IS transient: a reviewer still answering must
+/// be waited for, not treated as a dead pair.
+#[cfg(not(windows))]
+#[test]
+fn a_reviewer_still_mid_turn_is_waited_for() {
+    let dir = unique_test_repo("gam-midturn");
+    let mut app = App::new();
+    app.cwd = dir.clone();
+    let (generator, adversarial) = gam_test_pair(&mut app, "standing by");
+    app.agents[generator].status = AgentStatus::Done;
+    app.agents[adversarial].status = AgentStatus::Running;
+
+    app.poll_gam_pairs();
+
+    assert!(
+        matches!(
+            app.agents[generator].gam.as_ref().unwrap().phase,
+            GamPhase::GeneratorWorking
+        ),
+        "a busy reviewer keeps the pair waiting, it does not end it"
+    );
+    assert!(
+        app.notice.is_none(),
+        "and it is not an event worth interrupting the user for: {:?}",
+        app.notice
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

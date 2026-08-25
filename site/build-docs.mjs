@@ -652,8 +652,17 @@ mid-sentence and let an unproductive one run to the same number anyway.</p>
     <tr><td>escalated</td><td>The reviewer asked for you: a scope dispute, two irreconcilable approaches, or a correct objection the generator keeps ignoring.</td></tr>
     <tr><td>stalled</td><td>The generator handed back the same diff AND the same rebuttal as the round before. It did nothing with the objection, so another round would ask the identical question and get the identical answer. A NEW argument counts as progress even with no code change: refusing to edit while explaining why is a legitimate move.</td></tr>
     <tr><td>no verdict</td><td>The reviewer produced no readable verdict block at all.</td></tr>
+    <tr><td>the reviewer can no longer answer</td><td>It failed, you stopped it, you deleted its row, or its pane is gone. Each of these used to leave the pair spinning in silence with the generator parked and nothing on screen to explain it; the pair now ends and names the reason.</td></tr>
   </tbody>
 </table>
+<div class="note">
+  <span class="field-label">a restart ends a pair</span>
+  <p>Quitting Rudder kills both panes. Only a RUNNING agent is resumed on the way back
+  in, so a reviewer that was idle between rounds returns without a pane and the pair
+  cannot continue. It ends and says so rather than looking alive and doing nothing.
+  The generator's work is untouched in its workspace either way; start a new pair if
+  you want the argument to carry on.</p>
+</div>
 <p>The stall check is what makes an unbounded loop safe to run: it ends on lack of
 progress rather than on a count. There is a runaway guard far above any argument that
 is still moving, but reaching it means something went wrong that the stall check
