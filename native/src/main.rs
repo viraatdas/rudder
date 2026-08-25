@@ -3757,7 +3757,7 @@ impl App {
         if self.drawer_cursor.is_none() {
             let landed_in = self.agents.get(self.selected_agent).and_then(|run| {
                 crate::render::in_drawer(&self.agents, run)
-                    .then(|| crate::render::status_bucket(run))
+                    .then(|| crate::render::status_bucket_in(&self.agents, run))
             });
             if let Some(bucket) = landed_in {
                 self.drawer_cursor = Some(bucket);
@@ -8702,6 +8702,21 @@ Address the objection directly. If you disagree, say why inside \
                             truncate_chars(&self.model, 28),
                             if request.in_main { " · main checkout" } else { "" },
                         ));
+                        // The whole premise is that the critic is not the thing
+                        // it is criticising. Same provider AND same model is the
+                        // degenerate pair: it has already decided the approach
+                        // was reasonable, so it reviews its own judgement and
+                        // agrees. Say so rather than letting it look normal.
+                        if request.adversarial_backend == self.backend
+                            && request.adversarial_model.trim() == self.model.trim()
+                        {
+                            self.notice = Some(format!(
+                                "gam: reviewer is the SAME model as the generator ({} {}). \
+It will tend to agree with itself — name another with /gam <provider> <model> <task>.",
+                                self.backend.as_str(),
+                                truncate_chars(&self.model, 24),
+                            ));
+                        }
                         self.start_gam_task(request);
                     }
                     Err(usage) => {

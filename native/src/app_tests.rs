@@ -19615,3 +19615,50 @@ fn a_silent_generator_is_reported_as_silent_not_as_agreeing() {
     assert!(!packet.contains("YOUR LAST OBJECTION"));
     assert!(!packet.contains("GENERATOR'S REPLY"));
 }
+
+/// The two halves of a pair are one piece of work and must sit together in the
+/// sidebar. Bucketing each by its OWN status split them: the generator under
+/// "in progress" while the reviewer, idle between rounds, sat under "review" --
+/// which also reads as finished work awaiting a merge it can never have.
+#[cfg(not(windows))]
+#[test]
+fn a_gam_pair_stays_together_in_the_sidebar() {
+    let dir = unique_test_repo("gam-bucket");
+    let mut app = App::new();
+    app.cwd = dir.clone();
+    let (generator, adversarial) = gam_test_pair(&mut app, "standing by");
+
+    // Exactly the live shape: generator working, reviewer standing by.
+    app.agents[generator].status = AgentStatus::Running;
+    app.agents[adversarial].status = AgentStatus::Done;
+
+    assert_eq!(
+        crate::render::status_bucket(&app.agents[adversarial]),
+        crate::render::Bucket::Review,
+        "precondition: on its own status the reviewer reads as finished work"
+    );
+    assert_eq!(
+        crate::render::status_bucket_in(&app.agents, &app.agents[adversarial]),
+        crate::render::status_bucket_in(&app.agents, &app.agents[generator]),
+        "the reviewer follows its generator"
+    );
+
+    // And it follows wherever the generator goes, not just to In Progress.
+    app.agents[generator].status = AgentStatus::Done;
+    app.agents[adversarial].status = AgentStatus::Running;
+    assert_eq!(
+        crate::render::status_bucket_in(&app.agents, &app.agents[adversarial]),
+        crate::render::Bucket::Review,
+        "still together when the roles invert mid-round"
+    );
+
+    // A row with no peer in the roster falls back to its own status rather than
+    // vanishing from every bucket.
+    app.agents.remove(generator);
+    assert_eq!(
+        crate::render::status_bucket_in(&app.agents, &app.agents[0]),
+        crate::render::status_bucket(&app.agents[0]),
+        "an orphaned reviewer still belongs somewhere"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

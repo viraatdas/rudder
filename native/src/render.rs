@@ -485,7 +485,9 @@ pub(crate) fn drawer_members(agents: &[AgentRun], bucket: Bucket) -> Vec<usize> 
 
 /// Is this run tucked inside a collapsed drawer (and so not its own sidebar row)?
 pub(crate) fn in_drawer(agents: &[AgentRun], agent: &AgentRun) -> bool {
-    !agent.is_main() && !agent.is_pinned_planner() && bucket_is_drawer(agents, status_bucket(agent))
+    !agent.is_main()
+        && !agent.is_pinned_planner()
+        && bucket_is_drawer(agents, status_bucket_in(agents, agent))
 }
 
 /// Map an agent to its status section.
@@ -499,6 +501,26 @@ pub(crate) fn in_drawer(agents: &[AgentRun], agent: &AgentRun) -> bool {
 ///
 /// Main agents are rendered in their own leading section and are not bucketed.
 /// Agents never land in Todo: that section now holds planned nodes only.
+/// Bucket for a row IN THE CONTEXT of the fleet.
+///
+/// A `/gam` reviewer follows its generator. The two halves are one piece of
+/// work, and bucketing each by its own status split them across the sidebar:
+/// the generator under "in progress" while the reviewer, idle between rounds,
+/// sat under "review" -- which also reads as finished work awaiting a merge it
+/// can never have, since the reviewer holds no change of its own.
+pub(crate) fn status_bucket_in(agents: &[AgentRun], agent: &AgentRun) -> Bucket {
+    if agent.is_gam_adversary() {
+        if let Some(generator) = agent
+            .gam
+            .as_ref()
+            .and_then(|gam| agents.iter().find(|run| run.id == gam.peer_run_id))
+        {
+            return status_bucket(generator);
+        }
+    }
+    status_bucket(agent)
+}
+
 pub(crate) fn status_bucket(agent: &AgentRun) -> Bucket {
     // Bucket strictly by run status. A RUNNING agent stays "in progress" even when it is
     // waiting on a permission prompt or a question: it is still an active session, not
@@ -654,7 +676,9 @@ fn bucket_members(agents: &[AgentRun], bucket: Bucket) -> Vec<usize> {
         .iter()
         .enumerate()
         .filter(|(_, agent)| {
-            !agent.is_main() && !agent.is_pinned_planner() && status_bucket(agent) == bucket
+            !agent.is_main()
+                && !agent.is_pinned_planner()
+                && status_bucket_in(agents, agent) == bucket
         })
         .map(|(index, _)| index)
         .collect()
