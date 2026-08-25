@@ -625,10 +625,15 @@ struct GamState {
     /// The user's original ask, kept clean of the protocol preamble so every
     /// packet anchors on the same request.
     task: String,
-    /// The adversarial side's most recent message (objection text or the accept
-    /// note), carried into the next packet so the conversation accumulates
-    /// instead of restarting each round.
-    last_message: String,
+    /// The reviewer's most recent objection, quoted back to it next round so
+    /// checking whether the generator complied does not depend on its session
+    /// memory being intact.
+    last_objection: String,
+    /// The generator's most recent rebuttal, or empty when it said nothing.
+    /// Kept SEPARATE from the objection: one field served as both, so a
+    /// generator that complied silently left the reviewer's own words in place
+    /// and the packet handed them back under "GENERATOR'S REPLY".
+    last_reply: String,
     /// When the latest packet was delivered. TRANSIENT (not persisted): the
     /// verdict-routing gate compares the reviewer's `completed_at` against it,
     /// so the reviewer's PREVIOUS turn's Done (e.g. its bootstrap ack) can never
@@ -789,11 +794,29 @@ you cannot edit any file, ever.\n\n\
 ORIGINAL TASK\n{task}\n\n",
         task = gam.task,
     ));
-    if gam.round > 0 && !gam.last_message.trim().is_empty() {
-        packet.push_str(&format!(
-            "GENERATOR'S REPLY TO YOUR LAST OBJECTION\n{}\n\n",
-            truncate_chars(gam.last_message.trim(), GAM_MESSAGE_BUDGET_CHARS)
-        ));
+    if gam.round > 0 {
+        if !gam.last_objection.trim().is_empty() {
+            packet.push_str(&format!(
+                "YOUR LAST OBJECTION (round {})\n{}\n\n",
+                gam.round,
+                truncate_chars(gam.last_objection.trim(), GAM_MESSAGE_BUDGET_CHARS)
+            ));
+        }
+        // Silence is the COMMON case -- rebutting is the exception -- so it has
+        // to be stated. Leaving the section out entirely reads as "nothing
+        // happened"; the old code left the reviewer's own objection in place
+        // and labelled it as the generator's answer.
+        if gam.last_reply.trim().is_empty() {
+            packet.push_str(
+                "GENERATOR'S REPLY\n(none: it did not argue back. Judge from the diff whether \
+your objection was addressed.)\n\n",
+            );
+        } else {
+            packet.push_str(&format!(
+                "GENERATOR'S REPLY TO YOUR LAST OBJECTION\n{}\n\n",
+                truncate_chars(gam.last_reply.trim(), GAM_MESSAGE_BUDGET_CHARS)
+            ));
+        }
     }
     if diff.trim().is_empty() {
         packet.push_str(
@@ -811,6 +834,9 @@ say so in your verdict if the unseen remainder matters)\n{diff}\n\n",
     }
     packet.push_str(
         "REVIEW CONTRACT\n\
+- If you objected last round, open by saying whether that objection was \
+ADDRESSED, PARTLY addressed, or IGNORED, and cite the diff for it. An objection \
+ignored twice is grounds to escalate.\n\
 - Refute first: actively hunt for what is wrong, missing, oversimplified, or \
 untested. Question the generator's claims against the actual diff and files, not \
 its narrative.\n\
@@ -6547,7 +6573,8 @@ packet arrives, reply only: \"standing by\"."
                 last_progress: None,
                 phase: GamPhase::GeneratorWorking,
                 task,
-                last_message: String::new(),
+                last_objection: String::new(),
+                last_reply: String::new(),
                 awaiting_since: None,
             }),
         };
@@ -6645,7 +6672,8 @@ packet arrives, reply only: \"standing by\"."
                 last_progress: None,
                 phase: GamPhase::GeneratorWorking,
                 task: run.task_summary.clone(),
-                last_message: String::new(),
+                last_objection: String::new(),
+                last_reply: String::new(),
                 awaiting_since: None,
             }),
         };
@@ -6817,9 +6845,7 @@ packet arrives, reply only: \"standing by\"."
             Some(gam) => gam.clone(),
             None => return,
         };
-        if let Some(reply) = reply {
-            gam.last_message = reply;
-        }
+        gam.last_reply = reply.unwrap_or_default();
         let diff = jj_diff_text(&self.agents[generator_index].cwd, GAM_DIFF_BUDGET_CHARS);
         // PROGRESS GATE. The pair has no round limit, so what ends it is the
         // argument going somewhere. If the generator produced the same diff AND
@@ -6832,7 +6858,7 @@ packet arrives, reply only: \"standing by\"."
             use std::hash::{Hash, Hasher};
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             diff.hash(&mut hasher);
-            gam.last_message.hash(&mut hasher);
+            gam.last_reply.hash(&mut hasher);
             hasher.finish()
         };
         if gam.round > 0 && gam.last_progress == Some(progress) {
@@ -6861,7 +6887,8 @@ packet arrives, reply only: \"standing by\"."
             if let Some(recorded) = self.agents[side].gam.as_mut() {
                 recorded.phase = GamPhase::AwaitingVerdict;
                 recorded.round = gam.round;
-                recorded.last_message = gam.last_message.clone();
+                recorded.last_objection = gam.last_objection.clone();
+                recorded.last_reply = gam.last_reply.clone();
                 recorded.awaiting_since = gam.awaiting_since;
             }
         }
@@ -6990,7 +7017,8 @@ Address the objection directly. If you disagree, say why inside \
             if let Some(recorded) = self.agents[side].gam.as_mut() {
                 recorded.round = next_round;
                 recorded.phase = GamPhase::GeneratorWorking;
-                recorded.last_message = message.clone();
+                recorded.last_objection = message.clone();
+                recorded.last_reply = String::new();
             }
         }
         if let Some(run) = self.agents.get_mut(generator_index) {

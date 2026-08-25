@@ -18319,7 +18319,8 @@ fn gam_packet_carries_task_round_and_visible_truncation() {
         last_progress: None,
         phase: GamPhase::AwaitingVerdict,
         task: "refactor auth".to_string(),
-        last_message: "I disagree about the token shape".to_string(),
+        last_objection: "the burst window has no test".to_string(),
+        last_reply: "I disagree about the token shape".to_string(),
         awaiting_since: None,
     };
     let packet = gam_review_packet(&gam, "- a.ts | 1 +");
@@ -18401,7 +18402,8 @@ fn gam_test_pair(
             last_progress: None,
             phase: GamPhase::GeneratorWorking,
             task: "refactor auth".to_string(),
-            last_message: String::new(),
+            last_objection: String::new(),
+            last_reply: String::new(),
             awaiting_since: None,
         });
     }
@@ -19291,7 +19293,7 @@ fire
 while IFS= read -r line; do
   printf '%s\n' "$line" >> {log}
   case "$line" in
-    *"gam reviewer"*)
+    *"pages the human"*)
       sleep 1
       printf 'RUDDER_GAM_VERDICT_START\n'
       printf '{{"verdict":"accept","message":"satisfies the task"}}\n'
@@ -19421,8 +19423,8 @@ fn the_gam_badge_describes_the_stage_not_a_counter() {
         (0, GamPhase::GeneratorWorking, "writing", "standing by"),
         (0, GamPhase::AwaitingVerdict, "under review", "reviewing"),
         // Now the count means something: attempts left before it asks you.
-        (1, GamPhase::GeneratorWorking, "revision 1", "objected"),
-        (9, GamPhase::GeneratorWorking, "revision 9", "objected"),
+        (1, GamPhase::GeneratorWorking, "revision 1", "objected · 1 review"),
+        (9, GamPhase::GeneratorWorking, "revision 9", "objected · 9 reviews"),
         (0, GamPhase::Settled(GamOutcome::Accepted), "accepted", "accepted"),
     ];
     for (round, phase, expect_gen, expect_adv) in cases {
@@ -19480,7 +19482,7 @@ fn a_generator_that_stops_making_progress_ends_the_pair() {
         if let Some(gam) = app.agents[side].gam.as_mut() {
             gam.round = 2;
             gam.phase = GamPhase::GeneratorWorking;
-            gam.last_message = String::new();
+            gam.last_reply = String::new();
             gam.last_progress = Some(stalled);
         }
     }
@@ -19530,7 +19532,7 @@ fn a_new_rebuttal_counts_as_progress_even_with_no_code_change() {
             gam.round = 2;
             gam.phase = GamPhase::GeneratorWorking;
             // Same (empty) diff, but a DIFFERENT argument than last round.
-            gam.last_message = "a different reason this time".to_string();
+            gam.last_reply = "a different reason this time".to_string();
             gam.last_progress = Some(previous);
         }
     }
@@ -19548,4 +19550,68 @@ fn a_new_rebuttal_counts_as_progress_even_with_no_code_change() {
         app.agents[generator].gam.as_ref().unwrap().phase
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+
+/// The reviewer can only check compliance if it is told the truth about what
+/// the generator said. One field served as both "the reviewer's objection" and
+/// "the generator's reply", so a generator that complied SILENTLY -- the common
+/// case, since rebutting is the exception -- left the reviewer's own words in
+/// place, and the packet handed them straight back under "GENERATOR'S REPLY".
+/// On the round where it should be checking "did they fix it?", it was reading
+/// itself agreeing with itself.
+#[test]
+fn a_silent_generator_is_reported_as_silent_not_as_agreeing() {
+    let objection = "the burst window has no test".to_string();
+    let base = GamState {
+        role: GamRole::Generator,
+        peer_run_id: "peer".to_string(),
+        round: 1,
+        runaway_rounds: GAM_RUNAWAY_ROUNDS,
+        last_progress: None,
+        phase: GamPhase::GeneratorWorking,
+        task: "add retry backoff".to_string(),
+        last_objection: objection.clone(),
+        last_reply: String::new(),
+        awaiting_since: None,
+    };
+
+    // Silent compliance.
+    let packet = gam_review_packet(&base, "some diff");
+    assert!(
+        packet.contains("GENERATOR'S REPLY\n(none: it did not argue back"),
+        "silence must be stated: {packet}"
+    );
+    assert!(
+        !packet.contains(&format!("GENERATOR'S REPLY TO YOUR LAST OBJECTION\n{objection}")),
+        "the reviewer's own objection must never be labelled as the reply"
+    );
+    // And it gets its own objection back, correctly attributed, so checking
+    // compliance does not rely on its session memory surviving intact.
+    assert!(
+        packet.contains(&format!("YOUR LAST OBJECTION (round 1)\n{objection}")),
+        "the objection is quoted back as the reviewer's own: {packet}"
+    );
+    // The contract has to ASK for the check, or nothing makes it happen.
+    assert!(
+        packet.contains("ADDRESSED, PARTLY addressed, or IGNORED"),
+        "the compliance check must be requested: {packet}"
+    );
+
+    // An actual rebuttal is attributed to the generator.
+    let rebutted = GamState {
+        last_reply: "the window is per-key by design".to_string(),
+        ..base.clone()
+    };
+    let packet = gam_review_packet(&rebutted, "some diff");
+    assert!(packet.contains(
+        "GENERATOR'S REPLY TO YOUR LAST OBJECTION\nthe window is per-key by design"
+    ));
+    assert!(!packet.contains("(none: it did not argue back"));
+
+    // Round 0 has nothing to report either way.
+    let first = GamState { round: 0, ..base };
+    let packet = gam_review_packet(&first, "");
+    assert!(!packet.contains("YOUR LAST OBJECTION"));
+    assert!(!packet.contains("GENERATOR'S REPLY"));
 }

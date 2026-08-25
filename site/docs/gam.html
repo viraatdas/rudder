@@ -79,7 +79,7 @@ pairs with Claude.</p>
 <span class="run">&#9612;</span> writing the jitter test&hellip;</pre>
       </div>
       <div class="pane pane-adv">
-        <div class="pane-label">adv &middot; codex gpt-5.5 &middot; objected &middot; waiting</div>
+        <div class="pane-label">adv &middot; codex gpt-5.5 &middot; objected &middot; 1 review</div>
         <pre class="tty"><span class="dim">read-only &middot; cannot edit any file</span>
 
 <span class="ok">&#9679;</span> Read src/net/retry.ts
@@ -129,7 +129,7 @@ narrative. Concretely, each round it is asked to establish</p>
   <thead><tr><th>what it checks</th><th>the failure it is looking for</th></tr></thead>
   <tbody>
     <tr><td>Does this do what was asked?</td><td>A subset delivered as the whole thing. It is handed your ORIGINAL task every round, so this is measured against what you wanted, not against what the last message was about.</td></tr>
-    <tr><td>Was it actually verified?</td><td>A check described as run. The reviewer runs the tests itself rather than believing the transcript.</td></tr>
+    <tr><td>Was it actually verified?</td><td>A check described as run. A Codex reviewer runs the tests itself rather than believing the transcript; a Claude reviewer reads the code and the test files instead (see <a href="#powers">what each reviewer can do</a>).</td></tr>
     <tr><td>What was not considered?</td><td>The edge the generator never looked at: the error path, the empty case, the concurrent one, the migration that has to happen first.</td></tr>
     <tr><td>Is the approach right?</td><td>A solution that works and should not survive. Cheaper to say in round one than after the diff has grown around it.</td></tr>
   </tbody>
@@ -184,6 +184,35 @@ REVIEWER   other provider, read-only, its own session
 above. The reviewer never sees the generator's reasoning, and the generator never sees
 the reviewer's. That separation is not a policy Rudder asks them to respect; it is a
 property of running them as two processes that were never introduced.</p>
+
+<h2 id="compliance">Checking the generator complied</h2>
+<p>An objection is a message, not a command. The generator can read it, say
+something agreeable, and change nothing. So each round the reviewer is handed three
+things to judge that with: <strong>its own previous objection</strong>, quoted back
+verbatim; <strong>whether the generator argued back</strong>, and what it said; and
+the <strong>current diff</strong>. The contract then asks it, before anything else,
+to state whether that objection was <code>ADDRESSED</code>, <code>PARTLY</code>
+addressed, or <code>IGNORED</code>, citing the diff. An objection ignored twice is
+grounds to escalate.</p>
+<p>Silence is reported as silence. Most of the time the generator just complies
+without arguing, and the packet says so in as many words rather than leaving the
+section out, because an absent section reads as "nothing happened" when what actually
+happened is "it did not defend itself, so judge the code".</p>
+
+<h2 id="powers">What each reviewer can actually do</h2>
+<p>The reviewer is read-only in all three cases, but they are not read-only in the
+same way, and only some of them can run your tests:</p>
+<table class="docs-table">
+  <thead><tr><th>reviewer</th><th>can run checks</th><th>how writes are prevented</th></tr></thead>
+  <tbody>
+    <tr><td>Codex</td><td>Yes. It runs commands inside a read-only filesystem sandbox.</td><td>Refused by the runtime.</td></tr>
+    <tr><td>Claude</td><td>No. Its tools are Read, Grep, Glob and LS, so it reviews by reading the code and the tests rather than executing them.</td><td>No writing tool exists in its allowlist.</td></tr>
+    <tr><td>opencode</td><td>Yes.</td><td>By prompt and an approval gate, not by a sandbox. This is the weakest of the three.</td></tr>
+  </tbody>
+</table>
+<p>The default pairing is the strongest one: a Claude generator crosses to a Codex
+reviewer, which can run your checks and genuinely cannot write. Naming the reviewer
+yourself is how you choose otherwise, and worth knowing about before you do.</p>
 
 <h2 id="why">Why two models</h2>
 <p>A model reviewing its own work agrees with itself. It has already decided the
@@ -308,6 +337,7 @@ a reviewer's objection and a generator's answer attached.</p>
             <li><a href="#start">Starting a pair</a></li>
             <li><a href="#steering">How the reviewer steers the work</a></li>
             <li><a href="#pipeline">How the two halves talk</a></li>
+            <li><a href="#compliance">Checking the generator complied</a></li>
             <li><a href="#why">Why two models</a></li>
             <li><a href="#round">What a round is</a></li>
             <li><a href="#verdicts">The three verdicts</a></li>

@@ -3779,7 +3779,11 @@ pub(crate) fn render_gam_split(frame: &mut Frame<'_>, area: Rect, app: &mut App)
                     }
                     crate::GamPhase::GeneratorWorking => {
                         if adversarial {
-                            "objected · waiting".to_string()
+                            format!(
+                                "objected · {} review{}",
+                                gam.round,
+                                if gam.round == 1 { "" } else { "s" }
+                            )
                         } else {
                             // No total: the pair runs until it converges, so
                             // a denominator here would be inventing a deadline.
@@ -3789,7 +3793,7 @@ pub(crate) fn render_gam_split(frame: &mut Frame<'_>, area: Rect, app: &mut App)
                     // The two halves are doing different things here: one is
                     // being judged, the other is judging.
                     crate::GamPhase::AwaitingVerdict => if adversarial {
-                        "reviewing".to_string()
+                        format!("reviewing · #{}", gam.round + 1)
                     } else {
                         "under review".to_string()
                     },

@@ -983,8 +983,13 @@ pub(crate) fn gam_state_from_record(record: &serde_json::Value) -> Option<crate:
         last_progress: None,
         phase,
         task,
-        last_message: gam
-            .get("lastMessage")
+        last_objection: gam
+            .get("lastObjection")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        last_reply: gam
+            .get("lastReply")
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default()
             .to_string(),
@@ -1003,7 +1008,8 @@ pub(crate) fn gam_state_to_json(gam: &crate::GamState) -> serde_json::Value {
         "runawayRounds": gam.runaway_rounds,
         "phase": gam.phase.as_str(),
         "task": gam.task,
-        "lastMessage": gam.last_message,
+        "lastObjection": gam.last_objection,
+        "lastReply": gam.last_reply,
     })
 }
 
