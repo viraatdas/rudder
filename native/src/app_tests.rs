@@ -18321,6 +18321,7 @@ fn gam_packet_carries_task_round_and_visible_truncation() {
         task: "refactor auth".to_string(),
         last_objection: "the burst window has no test".to_string(),
         last_reply: "I disagree about the token shape".to_string(),
+        phase_since: None,
         awaiting_since: None,
     };
     let packet = gam_review_packet(&gam, "- a.ts | 1 +");
@@ -18404,6 +18405,7 @@ fn gam_test_pair(
             task: "refactor auth".to_string(),
             last_objection: String::new(),
             last_reply: String::new(),
+            phase_since: None,
             awaiting_since: None,
         });
     }
@@ -19588,6 +19590,7 @@ fn a_silent_generator_is_reported_as_silent_not_as_agreeing() {
         task: "add retry backoff".to_string(),
         last_objection: objection.clone(),
         last_reply: String::new(),
+        phase_since: None,
         awaiting_since: None,
     };
 
@@ -19743,6 +19746,55 @@ fn a_reviewer_still_mid_turn_is_waited_for() {
         app.notice.is_none(),
         "and it is not an event worth interrupting the user for: {:?}",
         app.notice
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// "standing by" for eighteen minutes and "standing by" for eight seconds are
+/// the same three words, and only one of them means something is wrong. The
+/// badge carries a clock once a phase has lasted past a minute, so a long first
+/// turn is distinguishable from a pair that has quietly died.
+#[cfg(not(windows))]
+#[test]
+fn the_gam_badge_shows_how_long_the_pair_has_waited() {
+    let dir = unique_test_repo("gam-elapsed");
+    let mut app = App::new();
+    app.cwd = dir.clone();
+    let (generator, adversarial) = gam_test_pair(&mut app, "standing by");
+    app.focus = FocusPane::Worker;
+
+    // Fresh: no clock, because seconds are noise.
+    for side in [generator, adversarial] {
+        if let Some(gam) = app.agents[side].gam.as_mut() {
+            gam.phase_since = Some(Instant::now());
+        }
+    }
+    let screen = render_screen(&mut app, 140, 12);
+    let header = screen.lines().next().unwrap_or_default().to_string();
+    assert!(
+        header.contains("writing") && header.contains("standing by"),
+        "stage still shown: {header}"
+    );
+    assert!(
+        !header.contains("· 0m"),
+        "a just-started phase must not wear a clock: {header}"
+    );
+
+    // Eighteen minutes in, which is the case that prompted this.
+    for side in [generator, adversarial] {
+        if let Some(gam) = app.agents[side].gam.as_mut() {
+            gam.phase_since = Instant::now().checked_sub(Duration::from_secs(18 * 60));
+        }
+    }
+    let screen = render_screen(&mut app, 140, 12);
+    let header = screen.lines().next().unwrap_or_default().to_string();
+    assert!(
+        header.contains("writing · 18m"),
+        "the generator's turn length is the answer to 'what is happening': {header}"
+    );
+    assert!(
+        header.contains("standing by · 18m"),
+        "and the reviewer says how long it has had nothing to do: {header}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

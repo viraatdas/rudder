@@ -993,7 +993,8 @@ pub(crate) fn gam_state_from_record(record: &serde_json::Value) -> Option<crate:
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default()
             .to_string(),
-        // Transient delivery timestamp: meaningless across a restart.
+        // Transient timestamps: meaningless across a restart.
+        phase_since: None,
         awaiting_since: None,
     })
 }

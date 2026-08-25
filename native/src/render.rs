@@ -3793,12 +3793,21 @@ pub(crate) fn render_gam_split(frame: &mut Frame<'_>, area: Rect, app: &mut App)
             // them, which is max_rounds - 1 revisions after the first draft.
             .map(|gam| {
                 let adversarial = gam.role == crate::GamRole::Adversarial;
+                // Anything past a minute gets a clock. "standing by" for eighteen
+                // minutes and "standing by" for eight seconds are the same three
+                // words, and only one of them means something is wrong.
+                let waited = gam
+                    .phase_since
+                    .map(|since| since.elapsed())
+                    .filter(|elapsed| elapsed.as_secs() >= 60)
+                    .map(|elapsed| format!(" · {}", humanize_quiet(elapsed)))
+                    .unwrap_or_default();
                 match &gam.phase {
                     crate::GamPhase::GeneratorWorking if gam.round == 0 => {
                         if adversarial {
-                            "standing by".to_string()
+                            format!("standing by{waited}")
                         } else {
-                            "writing".to_string()
+                            format!("writing{waited}")
                         }
                     }
                     crate::GamPhase::GeneratorWorking => {
@@ -3811,15 +3820,15 @@ pub(crate) fn render_gam_split(frame: &mut Frame<'_>, area: Rect, app: &mut App)
                         } else {
                             // No total: the pair runs until it converges, so
                             // a denominator here would be inventing a deadline.
-                            format!("revision {}", gam.round)
+                            format!("revision {}{waited}", gam.round)
                         }
                     }
                     // The two halves are doing different things here: one is
                     // being judged, the other is judging.
                     crate::GamPhase::AwaitingVerdict => if adversarial {
-                        format!("reviewing · #{}", gam.round + 1)
+                        format!("reviewing · #{}{waited}", gam.round + 1)
                     } else {
-                        "under review".to_string()
+                        format!("under review{waited}")
                     },
                     crate::GamPhase::Settled(crate::GamOutcome::Accepted) => {
                         "accepted".to_string()

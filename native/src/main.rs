@@ -634,6 +634,12 @@ struct GamState {
     /// generator that complied silently left the reviewer's own words in place
     /// and the packet handed them back under "GENERATOR'S REPLY".
     last_reply: String,
+    /// When the current phase began. TRANSIENT, like `awaiting_since`. Exists so
+    /// the badge can say how long the pair has been where it is: a generator on
+    /// a long first turn and a pair that has quietly died look identical without
+    /// it, and the honest answer to "what is happening" is usually "this turn
+    /// has been running for eighteen minutes".
+    phase_since: Option<Instant>,
     /// When the latest packet was delivered. TRANSIENT (not persisted): the
     /// verdict-routing gate compares the reviewer's `completed_at` against it,
     /// so the reviewer's PREVIOUS turn's Done (e.g. its bootstrap ack) can never
@@ -6584,6 +6590,7 @@ packet arrives, reply only: \"standing by\"."
                 task,
                 last_objection: String::new(),
                 last_reply: String::new(),
+                phase_since: Some(Instant::now()),
                 awaiting_since: None,
             }),
         };
@@ -6683,6 +6690,7 @@ packet arrives, reply only: \"standing by\"."
                 task: run.task_summary.clone(),
                 last_objection: String::new(),
                 last_reply: String::new(),
+                phase_since: Some(Instant::now()),
                 awaiting_since: None,
             }),
         };
@@ -6919,11 +6927,13 @@ packet arrives, reply only: \"standing by\"."
         }
         gam.phase = GamPhase::AwaitingVerdict;
         gam.awaiting_since = Some(Instant::now());
+        gam.phase_since = gam.awaiting_since;
         let round = gam.round;
         let reviewer_model = self.agents[peer_index].model.clone();
         for side in [generator_index, peer_index] {
             if let Some(recorded) = self.agents[side].gam.as_mut() {
                 recorded.phase = GamPhase::AwaitingVerdict;
+                recorded.phase_since = gam.phase_since;
                 recorded.round = gam.round;
                 recorded.last_objection = gam.last_objection.clone();
                 recorded.last_reply = gam.last_reply.clone();
@@ -7062,6 +7072,7 @@ Address the objection directly. If you disagree, say why inside \
             if let Some(recorded) = self.agents[side].gam.as_mut() {
                 recorded.round = next_round;
                 recorded.phase = GamPhase::GeneratorWorking;
+                recorded.phase_since = Some(Instant::now());
                 recorded.last_objection = message.clone();
                 recorded.last_reply = String::new();
             }
@@ -7091,6 +7102,7 @@ Address the objection directly. If you disagree, say why inside \
         for side in [Some(generator_index), peer_index].into_iter().flatten() {
             if let Some(recorded) = self.agents[side].gam.as_mut() {
                 recorded.phase = GamPhase::Settled(outcome.clone());
+                recorded.phase_since = Some(Instant::now());
             }
             if let Some(run) = self.agents.get_mut(side) {
                 let _ = save_native_run_record(&self.cwd, run);
