@@ -9675,6 +9675,10 @@ fn poll_loop_consumes_the_official_done_signal_for_a_live_worker() {
     // LIVE interactive worker (a `sleep` PTY so try_wait == Ok(None)) is flipped to
     // Done ONLY when the official signal file appears — proving the signal, not the
     // PTY-scrape, drives it (`sleep` has no idle chrome for the fallback to match).
+    // Writes into the shared signals dir, which resolves through the
+    // process-global RUDDER_HOME. Without the lock this can drop files into
+    // another test's temp home and break ITS count.
+    let _env = env_guard();
     let Some(sig) = crate::signals::signal_path("sig-worker-itest") else {
         return; // no HOME in this env; signal path is unavailable
     };
@@ -19912,4 +19916,48 @@ fn a_generator_waiting_on_you_says_so_on_the_badge() {
         "a permission prompt blocks the pair too"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The reviewer is unattended, so it must never be able to raise a prompt.
+///
+/// It ran under `--permission-mode default`, which asks for approval on
+/// anything outside its allowlist. Nobody is there to answer. Observed live in
+/// the libra session: the reviewer took a review packet, reached for a tool it
+/// did not have, and stopped dead on an invisible permission prompt -- 27
+/// minutes, no output, no tool calls, 0% CPU, with the row still reading
+/// "running" and the pair waiting on a verdict that could never come.
+#[test]
+fn the_gam_reviewer_can_never_raise_a_permission_prompt() {
+    let command = agent_command(
+        Backend::Claude,
+        "opus",
+        None,
+        "review this",
+        AgentMode::GamAdversarial,
+        None,
+    );
+    let args = command.args.join(" ");
+    assert!(
+        args.contains("--permission-mode bypassPermissions"),
+        "an unattended reviewer must not stop to ask: {args}"
+    );
+    assert!(
+        !args.contains("--permission-mode default"),
+        "`default` is the mode that deadlocked it: {args}"
+    );
+
+    // With prompting gone, the read-only guarantee rests entirely on the tool
+    // policy, so it is stated both ways.
+    assert!(args.contains("--allowedTools Read,Grep,Glob,LS"), "{args}");
+    for denied in ["Edit", "Write", "NotebookEdit", "Bash"] {
+        assert!(
+            args.contains("--disallowedTools")
+                && args.split("--disallowedTools").nth(1).unwrap_or_default().contains(denied),
+            "{denied} must be named as forbidden, not merely left off the allowlist: {args}"
+        );
+    }
+
+    // The generator is unchanged: it writes, so it bypasses by design.
+    let gen = agent_command(Backend::Claude, "opus", None, "do it", AgentMode::Execute, None);
+    assert!(gen.args.join(" ").contains("bypassPermissions"));
 }

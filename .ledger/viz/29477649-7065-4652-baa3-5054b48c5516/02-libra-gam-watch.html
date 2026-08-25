@@ -46,7 +46,11 @@
   <div class="row"><div class="k">verdict</div><div class="v">read back off the reviewer's visible screen. accept settles; revise goes to the generator as its next prompt.</div></div>
 
   <div class="warn">
-    <strong>The risk while you are away.</strong> Both halves are <span class="m">claude opus</span> — a model reviewing its own judgement, which tends to agree. And on this older binary a reviewer that dies, is stopped, or loses its pane leaves the pair spinning with <em>no notice</em>. Current state: <span class="state" id="live">generator running · round 0 · reviewer standing by 42m</span>
+    <strong>Live state.</strong> <span class="state">generator running &middot; round 0 &middot; reviewer standing by 47m</span> &mdash; the generator is genuinely working (transcript entries seconds old), 47 minutes into a large investigation. A watcher wakes me the moment any of status / phase / round moves.
+  </div>
+  <div class="warn">
+    <strong>What watching it caught.</strong> A generator that stops to ask a question <em>halts the whole pair</em>: an <span class="m">input</span> signal never marks the run Done, and a packet is only built for a Done generator, so the reviewer waits forever. The badge said <span class="m">writing</span> the entire time. It now says <span class="m">needs you &middot; 40m</span> instead &mdash; the clock says how long, this says what for.
+    <br><br>Two standing risks here: both halves are <span class="m">claude opus</span>, a model reviewing its own judgement, which tends to agree. And this session predates the silent-hang fixes, so a reviewer that dies or loses its pane still leaves the pair spinning with no notice.
   </div>
 </div>
 <script>
@@ -61,7 +65,9 @@
     {t:1700,f:function(){advl.textContent='adv · claude opus · reviewing · #1';advb.textContent='reading the diff, running checks…';hub.textContent='waiting for the verdict';}},
     {t:1500,f:function(){hub.textContent='reading the verdict';fly(-1);}},
     {t:1500,f:function(){advl.textContent='adv · claude opus · objected · 1 review';advb.textContent='revise: no test covers the new path';
-      genl.textContent='gen · claude opus · revision 1';genb.textContent='addressing the objection…';hub.textContent='objection delivered';}}
+      genl.textContent='gen · claude opus · revision 1';genb.textContent='addressing the objection…';hub.textContent='objection delivered';}},
+    {t:2100,f:function(){genl.textContent='gen · claude opus · needs you · 40m';genb.textContent='asked a question and stopped';
+      advl.textContent='adv · claude opus · standing by · 40m';advb.textContent='still nothing to review';hub.textContent='pair halted — no Done, no packet';}}
   ];
   function fly(dir){
     var from=dir>0?262:638, to=dir>0?638:262;

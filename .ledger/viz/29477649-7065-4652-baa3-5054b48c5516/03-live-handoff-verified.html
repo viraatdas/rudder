@@ -1,0 +1,67 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Live /gam handoff, verified against real models</title>
+<style>
+  body{margin:0;background:#fff;color:#16181d;font:14px/1.55 ui-sans-serif,-apple-system,"Segoe UI",Roboto,sans-serif}
+  .wrap{max-width:900px;margin:0 auto;padding:26px 24px 44px}
+  h1{font-size:17px;margin:0 0 4px;font-weight:600}
+  .sub{color:#5b636d;font-size:12.5px;margin:0 0 20px}
+  .m{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  h2{font-size:13px;font-weight:600;margin:26px 0 8px;padding-bottom:5px;border-bottom:1px solid #16181d}
+  ol.steps{list-style:none;margin:0;padding:0}
+  ol.steps li{display:flex;gap:12px;align-items:flex-start;padding:9px 10px;border-left:2px solid #e3e7eb;margin:0 0 2px;
+    opacity:.32;transition:opacity .45s,border-color .45s,background .45s}
+  ol.steps li.on{opacity:1;border-left-color:#0c6a72;background:#f4f8f8}
+  ol.steps li.pend{opacity:.5;border-left-color:#c9a227;background:#fdfaf0}
+  .when{flex:0 0 74px;font:11px ui-monospace,Menlo,monospace;color:#0c6a72;padding-top:2px}
+  .what{flex:1}
+  .what b{font-weight:600}
+  .what span{display:block;font-size:12px;color:#5b636d;margin-top:2px}
+  .mark{flex:0 0 18px;font:13px ui-monospace,Menlo,monospace;color:#0c6a72;padding-top:1px}
+  .bar{height:5px;background:#eef1f4;border-radius:3px;overflow:hidden;margin:16px 0 2px}
+  .fill{height:100%;width:0;background:#0c6a72;transition:width .5s linear}
+  .cap{font-size:11.5px;color:#5b636d}
+  .note{border:1px solid #16181d;border-radius:2px;padding:11px 13px;margin-top:18px;background:#f4f6f8;font-size:13px}
+</style>
+<div class="wrap">
+  <h1>The <span class="m">/gam</span> pipeline, verified step by step against real models &mdash; libra, 2026-08-25</h1>
+  <p class="sub">Every step below was observed on a live pair, not in a test with fakes. The last one is still open: it is the only leg nobody has watched a real model perform.</p>
+
+  <ol class="steps" id="steps">
+    <li><div class="mark">&#10003;</div><div class="when">02:49</div><div class="what"><b>Pair launched</b><span>generator claude opus in an isolated workspace; reviewer claude opus, read-only, standing by</span></div></li>
+    <li><div class="mark">&#10003;</div><div class="when">02:49&ndash;03:01</div><div class="what"><b>Generator works its first turn</b><span>47 minutes. The badge said "writing" the whole time, which is why the clock was added.</span></div></li>
+    <li><div class="mark">&#10003;</div><div class="when">03:01:3x</div><div class="what"><b>Turn ends &mdash; reported by the agent itself</b><span>Claude's Stop hook writes the signal file. Rudder never guesses this from the screen.</span></div></li>
+    <li><div class="mark">&#10003;</div><div class="when">03:01:3x</div><div class="what"><b>Rudder reads the workspace diff and builds the packet</b><span>ORIGINAL TASK + current diff + last rebuttal. Confirmed present in the reviewer's transcript.</span></div></li>
+    <li><div class="mark">&#10003;</div><div class="when">03:01:35</div><div class="what"><b>Packet typed into the reviewer's pane</b><span>bracketed paste + Enter, exactly as if a human typed it. Reviewer flipped to running.</span></div></li>
+    <li id="open"><div class="mark">?</div><div class="when">pending</div><div class="what"><b>Reviewer emits a parseable verdict, rudder routes it</b><span>The open question: will a real model reliably wrap its answer in the sentinel block? accept settles the pair; revise becomes the generator's next prompt.</span></div></li>
+  </ol>
+
+  <div class="bar"><div class="fill" id="fill"></div></div>
+  <div class="cap" id="cap">replaying…</div>
+
+  <div class="note">
+    <b>Why this matters.</b> Until tonight every green test used fake CLIs standing in for the models. That proved the plumbing and nothing about whether real agents honour the contract. Five of the six steps are now confirmed in the wild; a watcher is armed on the sixth and will wake me the moment the pair moves off <span class="m">verdict / round 0</span>.
+  </div>
+</div>
+<script>
+(function(){
+  var items=[].slice.call(document.querySelectorAll('#steps li')),
+      fill=document.getElementById('fill'), cap=document.getElementById('cap'),
+      caps=['pair launched','generator working — 47 minutes','turn end reported by the agent',
+            'diff read, packet built','packet delivered to the reviewer','waiting on the verdict — armed'];
+  var i=0;
+  function tick(){
+    items.forEach(function(el,n){
+      el.classList.remove('on','pend');
+      if(n<i) el.classList.add('on');
+    });
+    if(i>0){ var cur=items[i-1]; cur.classList.add(i===items.length?'pend':'on'); }
+    fill.style.width=Math.round((i/items.length)*100)+'%';
+    cap.textContent=i?caps[i-1]:'replaying…';
+    i++;
+    if(i>items.length){ setTimeout(function(){ i=0; tick(); }, 2400); return; }
+    setTimeout(tick, i===items.length?2000:1150);
+  }
+  tick();
+})();
+</script>

@@ -18,6 +18,11 @@ const CLAUDE_PLAN_FRONTEND_TOOLS: &str = "Read,Grep,Glob,LS,WebSearch,WebFetch,B
 // can write any file it likes, so an allowlist that included Bash would not be
 // read-only at all.
 const GAM_ADVERSARIAL_CLAUDE_TOOLS: &str = "Read,Grep,Glob,LS";
+/// Named explicitly as well as omitted from the allowlist. The reviewer runs
+/// with prompts disabled, so "not on the allowlist" is the only thing standing
+/// between it and a write; saying which tools are forbidden means a future
+/// widening of the allowlist cannot silently hand it a pen.
+const GAM_ADVERSARIAL_CLAUDE_DENIED: &str = "Edit,Write,NotebookEdit,Bash,Task";
 const ORCHESTRATOR_SKILLS_DIR: &str = ".claude/skills";
 
 pub(crate) fn mint_session_id_for(backend: Backend) -> Option<String> {
@@ -446,14 +451,28 @@ pub(crate) fn agent_command_with_orchestrator_mode(
                     "--name".to_string(),
                     format!("plan:{}", short_task(task)),
                 ],
-                // The gam adversarial reviewer: read-only by TOOL ALLOWLIST (no
-                // Edit/Write/Bash), permission-mode default so reads auto-run.
-                // It questions the diff and talks; it cannot touch a file.
+                // The gam adversarial reviewer: read-only by TOOL POLICY, and
+                // it must NEVER be able to raise a prompt.
+                //
+                // This ran under `--permission-mode default`, which asks for
+                // approval on anything outside the allowlist. Nobody is there to
+                // answer: the reviewer is a background half of a pair, so the
+                // first time it reached for a tool it did not have -- Bash to
+                // check a claim, or any of the MCP tools its own context gets
+                // handed -- it stopped dead on an invisible prompt and the pair
+                // hung forever with the row still reading "running". Observed
+                // live: 27 minutes, no output, no tool calls, 0% CPU.
+                //
+                // bypassPermissions removes the prompt; the read-only guarantee
+                // moves entirely onto the tool policy, which is named twice so a
+                // permissive allowlist can never quietly re-admit a writer.
                 AgentMode::GamAdversarial => vec![
                     "--permission-mode".to_string(),
-                    "default".to_string(),
+                    "bypassPermissions".to_string(),
                     "--allowedTools".to_string(),
                     GAM_ADVERSARIAL_CLAUDE_TOOLS.to_string(),
+                    "--disallowedTools".to_string(),
+                    GAM_ADVERSARIAL_CLAUDE_DENIED.to_string(),
                 ],
             };
             if !model.trim().is_empty() {
