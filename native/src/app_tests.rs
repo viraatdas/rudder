@@ -19798,3 +19798,71 @@ fn the_gam_badge_shows_how_long_the_pair_has_waited() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `main` is accepted on EITHER side of the model spec.
+///
+/// The picker inserts "/gam claude opus " and leaves the cursor past it, so the
+/// natural place to type `main` is exactly where the leading-only grammar used
+/// to swallow it into the task.
+#[test]
+fn gam_main_is_accepted_after_the_model_spec() {
+    let cases = [
+        "main claude opus fix the auth bug",
+        "claude opus main fix the auth bug",
+        "claude opus high main fix the auth bug",
+        "main fix the auth bug",
+    ];
+    for rest in cases {
+        let request = parse_gam_args(rest, Backend::Codex, "gpt-5.5").expect("parses");
+        assert!(request.in_main, "[{rest}] should run in the main checkout");
+        assert_eq!(
+            request.task, "fix the auth bug",
+            "[{rest}] main must not survive into the task"
+        );
+    }
+
+    // Not in main, and "main" as an ordinary task word is left alone.
+    let plain = parse_gam_args("claude opus fix the auth bug", Backend::Codex, "gpt-5.5").unwrap();
+    assert!(!plain.in_main);
+    let filename = parse_gam_args("claude opus main.ts is broken", Backend::Codex, "gpt-5.5").unwrap();
+    assert!(!filename.in_main, "main.ts is a path, not the keyword");
+    assert_eq!(filename.task, "main.ts is broken");
+}
+
+/// Two rows, one pair. The reviewer is pulled directly under its generator and
+/// hooked to it, because roster order put them together at launch but nothing
+/// kept them there.
+#[cfg(not(windows))]
+#[test]
+fn a_gam_reviewer_sits_directly_under_its_generator() {
+    let dir = unique_test_repo("gam-adjacent");
+    let mut app = App::new();
+    app.cwd = dir.clone();
+    let (generator, adversarial) = gam_test_pair(&mut app, "standing by");
+    app.agents[generator].status = AgentStatus::Running;
+    app.agents[adversarial].status = AgentStatus::Running;
+
+    // Something else lands between the two halves.
+    let mut intruder = test_agent_run("intruder", "unrelated work");
+    intruder.status = AgentStatus::Running;
+    app.agents.insert(adversarial, intruder);
+
+    let members = crate::render::bucket_members_for_test(&app.agents, crate::render::Bucket::InProgress);
+    let gen_pos = members.iter().position(|&i| app.agents[i].id == "gam-gen").unwrap();
+    let adv_pos = members.iter().position(|&i| app.agents[i].id == "gam-adv").unwrap();
+    assert_eq!(
+        adv_pos,
+        gen_pos + 1,
+        "the reviewer follows its generator even with a row wedged between them"
+    );
+
+    app.focus = FocusPane::Agents;
+    // Three lines per sidebar row, so the pane has to be tall enough to reach
+    // the second half of the pair.
+    let screen = render_screen(&mut app, 140, 34);
+    assert!(
+        screen.contains("↳ "),
+        "the reviewer row is hooked to the one above it: {screen}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

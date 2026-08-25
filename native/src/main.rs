@@ -689,7 +689,13 @@ fn cross_gam_backend(default_backend: Backend) -> Backend {
 
 /// Parse the argument tail of a `/gam` invocation.
 ///
-/// Grammar: `[main] [<provider> [model] [effort]] | [<model> [effort]]] <task>`.
+/// Grammar: `[main] [<provider> [model] [effort]] [main] <task>`, or the same
+/// with a bare `[<model> [effort]]` in place of the provider pair.
+///
+/// `main` is accepted on EITHER side of the model spec. The picker inserts
+/// "/gam claude opus " and leaves the cursor after it, so the natural place to
+/// type `main` is exactly where the leading-only form used to swallow it into
+/// the task.
 ///
 /// Deliberately greedy ONLY where the token vocabulary is closed: `main`, the
 /// three provider keywords, and effort words are consumed by exact match; a
@@ -750,6 +756,15 @@ fn parse_gam_args(
                 // consumed only to keep it out of the task text.
             }
         }
+    }
+
+    // Second chance at `main`, AFTER the whole model spec including effort. The
+    // picker inserts "/gam claude opus " and leaves the cursor past it, so the
+    // natural place to type `main` is exactly where the leading-only form used
+    // to swallow it into the task.
+    if !in_main && tokens.peek().is_some_and(|token| *token == "main") {
+        in_main = true;
+        tokens.next();
     }
 
     let task = tokens.collect::<Vec<_>>().join(" ");

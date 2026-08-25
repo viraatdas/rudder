@@ -430,6 +430,9 @@ what is happening.</p>
     body: `
 <h2 id="start">Starting a pair</h2>
 <pre><code>/gam rewrite the retry logic to use exponential backoff</code></pre>
+<p>The pair is one piece of work in two panes. In the agents list the reviewer sits
+directly beneath its generator, hooked to it with a <code>&#8627;</code>, and the two
+move between sections together rather than drifting apart as their statuses diverge.</p>
 <p>Two panes open side by side. The left half is the generator, running your current
 model. The right half is the adversarial reviewer, which defaults to a
 <strong>different provider</strong> so it is not the same model marking its own
@@ -477,6 +480,7 @@ real checkout rather than an isolated workspace:</p>
     <tr><td>/gam codex gpt-5.5 &lt;task&gt;</td><td>A named provider and model.</td></tr>
     <tr><td>/gam fable &lt;task&gt;</td><td>A bare model name works when Rudder recognises it.</td></tr>
     <tr><td>/gam main &lt;task&gt;</td><td>The pair runs in your checkout instead of a workspace.</td></tr>
+    <tr><td>/gam codex gpt-5.5 main &lt;task&gt;</td><td><code>main</code> works on either side of the model. The picker leaves your cursor after the model it inserted, which is where you would naturally type it.</td></tr>
   </tbody>
 </table>
 <p>Ordinary task words are never mistaken for a model. <code>/gam fix the auth

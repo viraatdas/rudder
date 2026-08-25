@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 640" width="900" height="640" font-family="ui-sans-serif,-apple-system,Segoe UI,Roboto,sans-serif">
+  <style>
+    .t{fill:#16181d}.m{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+    .box{fill:#fff;stroke:#16181d;stroke-width:1.5}
+    .soft{fill:#f4f6f8;stroke:#9aa4b2;stroke-width:1}
+    .end{fill:#fff;stroke:#16181d;stroke-width:1.5;stroke-dasharray:0}
+    .fix{fill:#0c6a72}
+    .lbl{font-size:12px;fill:#41474f}
+    .h{font-size:13px;font-weight:600}
+    .ttl{font-size:16px;font-weight:600}
+    .sub{font-size:12px;fill:#5b636d}
+    .ar{stroke:#16181d;stroke-width:1.4;fill:none;marker-end:url(#a)}
+    .ar2{stroke:#0c6a72;stroke-width:1.4;fill:none;marker-end:url(#b);stroke-dasharray:4 3}
+  </style>
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#16181d"/></marker>
+    <marker id="b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#0c6a72"/></marker>
+  </defs>
+
+  <text x="24" y="30" class="t ttl">GAM round loop — one generator, one read-only reviewer</text>
+  <text x="24" y="50" class="sub">Rudder is the only link: it types packets into panes and reads verdicts off the screen. No subagent, no socket.</text>
+
+  <!-- main loop -->
+  <rect x="40" y="82" width="180" height="62" rx="3" class="box"/>
+  <text x="130" y="107" text-anchor="middle" class="t h">GeneratorWorking</text>
+  <text x="130" y="126" text-anchor="middle" class="lbl m">writing · 23m</text>
+
+  <rect x="360" y="82" width="180" height="62" rx="3" class="box"/>
+  <text x="450" y="107" text-anchor="middle" class="t h">AwaitingVerdict</text>
+  <text x="450" y="126" text-anchor="middle" class="lbl m">reviewing · #1 · 2m</text>
+
+  <path d="M220,101 L356,101" class="ar"/>
+  <text x="288" y="94" text-anchor="middle" class="lbl">turn ends</text>
+  <text x="288" y="118" text-anchor="middle" class="lbl m" font-size="11">Stop hook / notify</text>
+
+  <path d="M450,148 L450,196 L130,196 L130,148" class="ar"/>
+  <text x="290" y="212" text-anchor="middle" class="lbl">revise → objection typed into the generator, same session</text>
+
+  <!-- endings -->
+  <text x="24" y="268" class="t h">Endings — every one now names its reason</text>
+  <line x1="24" y1="278" x2="876" y2="278" stroke="#16181d" stroke-width="1"/>
+
+  <rect x="24" y="292" width="196" height="54" rx="3" class="end"/>
+  <text x="122" y="313" text-anchor="middle" class="t h">accepted</text>
+  <text x="122" y="331" text-anchor="middle" class="lbl">no blocking defect found</text>
+
+  <rect x="240" y="292" width="196" height="54" rx="3" class="end"/>
+  <text x="338" y="313" text-anchor="middle" class="t h">escalated</text>
+  <text x="338" y="331" text-anchor="middle" class="lbl">reviewer asked for you</text>
+
+  <rect x="456" y="292" width="196" height="54" rx="3" class="end"/>
+  <text x="554" y="313" text-anchor="middle" class="t h">stalled</text>
+  <text x="554" y="331" text-anchor="middle" class="lbl">same diff AND same reply</text>
+
+  <rect x="672" y="292" width="204" height="54" rx="3" class="end"/>
+  <text x="774" y="313" text-anchor="middle" class="t h">no verdict</text>
+  <text x="774" y="331" text-anchor="middle" class="lbl">nothing parseable on screen</text>
+
+  <rect x="24" y="358" width="852" height="54" rx="3" class="soft"/>
+  <text x="40" y="379" class="t h">the reviewer can no longer answer</text>
+  <text x="40" y="398" class="lbl">failed · stopped · pane gone (a restart leaves this) · row deleted — all four used to spin forever in silence</text>
+
+  <!-- what changed -->
+  <text x="24" y="452" class="t h">Fixed this session</text>
+  <line x1="24" y1="462" x2="876" y2="462" stroke="#16181d" stroke-width="1"/>
+  <text x="24" y="484" class="lbl"><tspan class="fix" font-weight="600">reviewer was killed a tick after every launch</tspan> — GamAdversarial missing from worker_wants_signals, so no hook config, so the lifecycle sweep terminated it</text>
+  <text x="24" y="504" class="lbl"><tspan class="fix" font-weight="600">settle_gam_pair bailed on a missing peer</tspan> — every ending that exists BECAUSE the peer is gone could not be recorded; made the four fixes above inert</text>
+  <text x="24" y="524" class="lbl"><tspan class="fix" font-weight="600">echoed contract was fatal</tspan> — the parser took only the last sentinel block; it now walks backwards and skips our own instructions</text>
+  <text x="24" y="544" class="lbl"><tspan class="fix" font-weight="600">reviewer read its own objection as the generator's reply</tspan> — one field served as both; silent compliance is now reported as silence</text>
+  <text x="24" y="564" class="lbl"><tspan class="fix" font-weight="600">no round cap</tspan> — ends on lack of progress, not on a count · <tspan class="fix" font-weight="600">clock on the badge</tspan> — a long turn no longer looks like a dead pair</text>
+  <text x="24" y="584" class="lbl"><tspan class="fix" font-weight="600">one pair, two rows</tspan> — the reviewer is pulled directly under its generator and hooked with &#8627;; both move between sections together</text>
+  <text x="24" y="606" class="sub">Live 2026-08-24: first real handoff observed (turn end → packet → reviewing). The verdict → revision leg is still unwatched with real models.</text>
+</svg>

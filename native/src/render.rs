@@ -272,6 +272,15 @@ pub(crate) fn push_agent_row_with_trailing<'a>(
     } else {
         agent.task_summary.clone()
     };
+    // The reviewer half is not its own piece of work. bucket_members guarantees
+    // it sits directly under its generator, and the hook says so: two rows for
+    // one pair otherwise read as two unrelated agents that happen to be next to
+    // each other.
+    let task_label = if agent.is_gam_adversary() {
+        format!("↳ {task_label}")
+    } else {
+        task_label
+    };
 
     let mut first = prefix.to_vec();
     first.extend([
@@ -671,8 +680,13 @@ fn section_order(agents: &[AgentRun], members: &[usize]) -> Vec<usize> {
 
 /// Indices that belong to `bucket`, in display (insertion) order, excluding main
 /// and pinned orchestrators (which render above all sections).
+#[cfg(test)]
+pub(crate) fn bucket_members_for_test(agents: &[AgentRun], bucket: Bucket) -> Vec<usize> {
+    bucket_members(agents, bucket)
+}
+
 fn bucket_members(agents: &[AgentRun], bucket: Bucket) -> Vec<usize> {
-    agents
+    let mut members: Vec<usize> = agents
         .iter()
         .enumerate()
         .filter(|(_, agent)| {
@@ -681,7 +695,41 @@ fn bucket_members(agents: &[AgentRun], bucket: Bucket) -> Vec<usize> {
                 && status_bucket_in(agents, agent) == bucket
         })
         .map(|(index, _)| index)
-        .collect()
+        .collect();
+
+    // A `/gam` reviewer is pulled to sit directly under its generator. Roster
+    // order puts them together at launch, but nothing KEPT them together: a
+    // deletion, a reordering, or another agent landing between them split one
+    // pair into two rows with no visible relationship. The "↳" hook on the
+    // reviewer row promises adjacency, so it has to be guaranteed here.
+    let mut ordered: Vec<usize> = Vec::with_capacity(members.len());
+    let reviewers: Vec<usize> = members
+        .iter()
+        .copied()
+        .filter(|&index| agents[index].is_gam_adversary())
+        .collect();
+    members.retain(|&index| !agents[index].is_gam_adversary());
+    for index in members {
+        ordered.push(index);
+        let id = &agents[index].id;
+        for &reviewer in &reviewers {
+            let follows = agents[reviewer]
+                .gam
+                .as_ref()
+                .is_some_and(|gam| &gam.peer_run_id == id);
+            if follows {
+                ordered.push(reviewer);
+            }
+        }
+    }
+    // A reviewer whose generator is not in this bucket (or is gone) still has to
+    // appear somewhere rather than being dropped off the list entirely.
+    for reviewer in reviewers {
+        if !ordered.contains(&reviewer) {
+            ordered.push(reviewer);
+        }
+    }
+    ordered
 }
 
 /// Canonical agents-pane order used by BOTH the renderer and navigation so the
