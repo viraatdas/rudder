@@ -3826,6 +3826,15 @@ pub(crate) fn render_gam_split(frame: &mut Frame<'_>, area: Rect, app: &mut App)
             }
         }
         let focused_half = app.focus == FocusPane::Worker && app.selected_agent == index;
+        // A generator waiting on a question HALTS the whole pair: an "input"
+        // signal never marks the run Done, and a packet is only built for a Done
+        // generator, so the reviewer stands by forever with nothing to review.
+        // Observed live in the libra session, where the badge said "writing" for
+        // forty minutes while the answer was the thing everyone was waiting on.
+        let blocked = app
+            .agents
+            .get(index)
+            .is_some_and(|run| run.needs_user_input || run.needs_permission);
         let round_badge = app
             .agents
             .get(index)
@@ -3851,6 +3860,9 @@ pub(crate) fn render_gam_split(frame: &mut Frame<'_>, area: Rect, app: &mut App)
                     .map(|elapsed| format!(" · {}", humanize_quiet(elapsed)))
                     .unwrap_or_default();
                 match &gam.phase {
+                    // A blocked half is the whole pair's state, so it outranks
+                    // whatever stage it would otherwise report.
+                    _ if blocked && !adversarial => format!("needs you{waited}"),
                     crate::GamPhase::GeneratorWorking if gam.round == 0 => {
                         if adversarial {
                             format!("standing by{waited}")

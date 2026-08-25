@@ -19866,3 +19866,50 @@ fn a_gam_reviewer_sits_directly_under_its_generator() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A generator waiting on a question halts the entire pair, and the badge used
+/// to keep saying "writing".
+///
+/// An "input" signal never marks a run Done, and a review packet is only built
+/// for a DONE generator, so the reviewer stands by forever with nothing to
+/// review. Observed live: a pair sat forty minutes while the badge claimed the
+/// generator was writing and the actual blocker was an unanswered question.
+#[cfg(not(windows))]
+#[test]
+fn a_generator_waiting_on_you_says_so_on_the_badge() {
+    let dir = unique_test_repo("gam-blocked");
+    let mut app = App::new();
+    app.cwd = dir.clone();
+    let (generator, _adv) = gam_test_pair(&mut app, "standing by");
+    app.focus = FocusPane::Worker;
+
+    // Working normally.
+    let screen = render_screen(&mut app, 140, 12);
+    let header = screen.lines().next().unwrap_or_default().to_string();
+    assert!(header.contains("writing"), "baseline: {header}");
+
+    // Now it stops to ask something.
+    app.agents[generator].needs_user_input = true;
+    let screen = render_screen(&mut app, 140, 12);
+    let header = screen.lines().next().unwrap_or_default().to_string();
+    assert!(
+        header.contains("needs you"),
+        "a blocked generator is the pair's state, not 'writing': {header}"
+    );
+    assert!(
+        !header.contains("gen · refactor auth · writing"),
+        "and it must not still claim to be writing: {header}"
+    );
+    // The reviewer is genuinely standing by; it is not the one blocked.
+    assert!(header.contains("standing by"), "reviewer unchanged: {header}");
+
+    // A permission prompt halts it just the same.
+    app.agents[generator].needs_user_input = false;
+    app.agents[generator].needs_permission = true;
+    let screen = render_screen(&mut app, 140, 12);
+    assert!(
+        screen.lines().next().unwrap_or_default().contains("needs you"),
+        "a permission prompt blocks the pair too"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
