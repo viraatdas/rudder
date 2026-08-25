@@ -19396,6 +19396,21 @@ fn the_echoed_output_contract_is_not_mistaken_for_a_verdict() {
         "the template is an instruction, not an answer"
     );
 
+    // And an answer BEFORE the echoed contract is still found. This is the case
+    // that matters: taking only the final block and giving up on it would stop a
+    // pair whose reviewer had answered perfectly well a few lines earlier.
+    let mut answered_first = vec![
+        "RUDDER_GAM_VERDICT_START".to_string(),
+        r#"{"verdict":"revise","message":"no test for the burst window"}"#.to_string(),
+        "RUDDER_GAM_VERDICT_END".to_string(),
+    ];
+    answered_first.extend(contract.clone());
+    assert_eq!(
+        parse_gam_verdict(&answered_first),
+        Some(GamVerdict::Revise("no test for the burst window".to_string())),
+        "an echoed contract after the answer must be skipped, not fatal"
+    );
+
     // A real answer AFTER the echoed contract still wins.
     let mut answered = contract.clone();
     answered.extend([

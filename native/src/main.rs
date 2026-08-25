@@ -883,59 +883,68 @@ fn strip_code_fences(block: &str) -> String {
 
 /// Parse the verdict out of the adversarial pane's visible lines.
 ///
-/// Scans for the LAST complete sentinel block (the buffer restarts on every
-/// injection, so within one round there is exactly one candidate). A JSON body
-/// wins; a malformed body degrades to its raw text as a REVISE when anything
-/// readable remains — the objection content matters more than the envelope —
-/// and returns None (caller escalates) only when the block is absent or empty.
+/// Scans BACKWARDS through every sentinel block and takes the last one that is
+/// an actual answer. A JSON body wins; a malformed body degrades to its raw text
+/// as a REVISE when anything readable remains -- the objection content matters
+/// more than the envelope -- and None (the caller escalates) means no answer was
+/// found at all.
+///
+/// Backwards through ALL of them, not just the last, because the packet Rudder
+/// injects contains the output contract, sentinels and template included, and
+/// the reviewer's PTY echoes it back. Taking only the final block and giving up
+/// when it turned out to be that echo would stop a pair whose reviewer had
+/// answered perfectly well a few lines earlier.
 fn parse_gam_verdict(lines: &[String]) -> Option<GamVerdict> {
-    let start_index = lines
+    let starts: Vec<usize> = lines
         .iter()
-        .rposition(|line| line.trim() == GAM_VERDICT_START)?;
-    let end_offset = lines[start_index + 1..]
-        .iter()
-        .position(|line| line.trim() == GAM_VERDICT_END);
-    let end_index = end_offset.map(|offset| start_index + 1 + offset);
-    let mut body = match end_index {
-        Some(end) => lines[start_index + 1..end].join("\n"),
-        None => lines[start_index + 1..].join("\n"),
-    };
-    if body.is_empty() {
-        return None;
-    }
-    body = strip_code_fences(&body);
-    // The packet we injected CONTAINS the output contract, sentinels and all,
-    // and the reviewer's PTY echoes it back into the pane. That echoed template
-    // is not an answer: its body is the literal `"accept"|"revise"|"escalate"`
-    // alternation, which is not valid JSON, so the tolerant fallback below would
-    // read it as a REVISE carrying the contract text as its objection.
-    if body.contains("\"accept\"|\"revise\"") || body.contains("<under 120 words>") {
-        return None;
-    }
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) {
-        let message = value
-            .get("message")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-        return match value.get("verdict").and_then(serde_json::Value::as_str) {
-            Some("accept") => Some(GamVerdict::Accept(message)),
-            Some("revise") => Some(GamVerdict::Revise(message)),
-            Some("escalate") => Some(GamVerdict::Escalate(message)),
-            _ if !message.is_empty() => Some(GamVerdict::Revise(message)),
-            _ => None,
+        .enumerate()
+        .filter(|(_, line)| line.trim() == GAM_VERDICT_START)
+        .map(|(index, _)| index)
+        .collect();
+    for &start_index in starts.iter().rev() {
+        let end_offset = lines[start_index + 1..]
+            .iter()
+            .position(|line| line.trim() == GAM_VERDICT_END);
+        let end_index = end_offset.map(|offset| start_index + 1 + offset);
+        let body = match end_index {
+            Some(end) => lines[start_index + 1..end].join("\n"),
+            None => lines[start_index + 1..].join("\n"),
         };
-    }
-    let fallback: String = body.trim().to_string();
-    if fallback.is_empty() {
-        None
-    } else {
-        Some(GamVerdict::Revise(truncate_chars(
+        if body.is_empty() {
+            continue;
+        }
+        let body = strip_code_fences(&body);
+        // Our own instructions, echoed. Not an answer: the alternation is not
+        // valid JSON, so the tolerant fallback below would read the contract
+        // itself as the reviewer's objection.
+        if body.contains("\"accept\"|\"revise\"") || body.contains("<under 120 words>") {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) {
+            let message = value
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            return match value.get("verdict").and_then(serde_json::Value::as_str) {
+                Some("accept") => Some(GamVerdict::Accept(message)),
+                Some("revise") => Some(GamVerdict::Revise(message)),
+                Some("escalate") => Some(GamVerdict::Escalate(message)),
+                _ if !message.is_empty() => Some(GamVerdict::Revise(message)),
+                _ => continue,
+            };
+        }
+        let fallback = body.trim().to_string();
+        if fallback.is_empty() {
+            continue;
+        }
+        return Some(GamVerdict::Revise(truncate_chars(
             &fallback,
             GAM_MESSAGE_BUDGET_CHARS,
-        )))
+        )));
     }
+    None
 }
 
 /// Lift the generator's latest `{GAM_REPLY_START}…{GAM_REPLY_END}` note from its
