@@ -3748,6 +3748,109 @@ pub(crate) fn gam_split_halves(inner: Rect) -> (Rect, Rect) {
     (columns[0], columns[1])
 }
 
+/// Split the worker area into (the two conversation panes, the dialogue strip).
+///
+/// The strip only appears once the two models have actually said something to
+/// each other, and never when it would leave the panes too short to read: an
+/// empty box explaining that nobody has spoken yet is worse than no box.
+pub(crate) fn gam_split_rows(
+    area: Rect,
+    app: &App,
+    generator_index: usize,
+) -> (Rect, Option<Rect>) {
+    if !app.gam_transcript_visible {
+        return (area, None);
+    }
+    let entries = app
+        .agents
+        .get(generator_index)
+        .and_then(|run| run.gam.as_ref())
+        .map(|gam| gam.transcript.len())
+        .unwrap_or(0);
+    if entries == 0 || area.height < 16 {
+        return (area, None);
+    }
+    // Two border rows plus at least two lines of dialogue, capped so the live
+    // panes always keep the majority of the height.
+    let strip = (entries as u16 + 2).clamp(4, (area.height / 3).max(4));
+    let panes = Rect {
+        height: area.height.saturating_sub(strip),
+        ..area
+    };
+    let strip = Rect {
+        y: area.y + panes.height,
+        height: strip,
+        ..area
+    };
+    (panes, Some(strip))
+}
+
+/// The DIALOGUE between the two models: who said what, oldest first, newest
+/// pinned to the bottom.
+///
+/// The split shows two terminals arguing past each other — each half holds only
+/// its own side of the exchange, and the reviewer's half is a wall of packet
+/// text it was sent, not the sentence that mattered. This strip is the
+/// conversation itself: one line per turn, labelled by speaker, so the argument
+/// can be followed without reading either pane.
+pub(crate) fn render_gam_transcript(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    generator_index: usize,
+) {
+    let Some(gam) = app
+        .agents
+        .get(generator_index)
+        .and_then(|run| run.gam.as_ref())
+    else {
+        return;
+    };
+    let inner = block_inner(area);
+    let rows = inner.height as usize;
+    let width = inner.width as usize;
+    let start = gam.transcript.len().saturating_sub(rows);
+    let lines = gam.transcript[start..]
+        .iter()
+        .map(|message| {
+            let label = format!(
+                "{} · {}: ",
+                message.round + 1,
+                message.kind.label(message.speaker)
+            );
+            let body = message.text.trim().replace('\n', " ");
+            let body = truncate_chars(&body, width.saturating_sub(label.chars().count() + 1).max(8));
+            Line::from(vec![
+                Span::styled(label, gam_speaker_style(message)),
+                Span::styled(body, pane_text_style(true)),
+            ])
+        })
+        .collect::<Vec<_>>();
+    let hidden = start;
+    let title = if hidden > 0 {
+        format!("dialogue · {hidden} earlier · ^w t hides")
+    } else {
+        "dialogue · ^w t hides".to_string()
+    };
+    let paragraph = Paragraph::new(lines)
+        .style(app_style())
+        .block(pane_block(&title, false, app.nav_mode));
+    frame.render_widget(paragraph, area);
+}
+
+/// Colour carries the speaker (the theme emphasises by colour, not weight), and
+/// a stop is the one line in the strip that should read as an alarm.
+fn gam_speaker_style(message: &crate::GamMessage) -> Style {
+    match message.kind {
+        crate::GamMessageKind::Stop => error_style(),
+        crate::GamMessageKind::Accept => accent_style(true),
+        _ => match message.speaker {
+            crate::GamRole::Generator => model_style(true),
+            crate::GamRole::Adversarial => accent_style(true),
+        },
+    }
+}
+
 /// Terminal lines for ANY agent's pane — `worker_lines` parameterized by
 /// index so the gam split can draw both conversations side by side. The
 /// unfocused half gets no text selection or cursor.
@@ -3808,7 +3911,11 @@ pub(crate) fn render_gam_split(frame: &mut Frame<'_>, area: Rect, app: &mut App)
     let Some((generator_index, adversarial_index)) = app.gam_pair_indices_for_selected() else {
         return;
     };
-    let (left, right) = gam_split_halves(area);
+    let (panes, transcript) = gam_split_rows(area, app, generator_index);
+    if let Some(strip) = transcript {
+        render_gam_transcript(frame, strip, app, generator_index);
+    }
+    let (left, right) = gam_split_halves(panes);
     for (half, index, role_label) in [
         (left, generator_index, "gen"),
         (right, adversarial_index, "adv"),
@@ -3890,11 +3997,29 @@ pub(crate) fn render_gam_split(frame: &mut Frame<'_>, area: Rect, app: &mut App)
                     } else {
                         format!("under review{waited}")
                     },
+                    // The mid-turn check: the generator is NOT waiting on this,
+                    // so its badge keeps saying what it is doing.
+                    crate::GamPhase::AwaitingInterim => {
+                        if adversarial {
+                            format!("checking in{waited}")
+                        } else if gam.round == 0 {
+                            format!("writing · watched{waited}")
+                        } else {
+                            format!("revision {} · watched{waited}", gam.round)
+                        }
+                    }
                     crate::GamPhase::Settled(crate::GamOutcome::Accepted) => {
                         "accepted".to_string()
                     }
                     crate::GamPhase::Settled(crate::GamOutcome::Escalated(_)) => {
                         "needs you".to_string()
+                    }
+                    crate::GamPhase::Settled(crate::GamOutcome::Halted(_)) => {
+                        if adversarial {
+                            "stopped it".to_string()
+                        } else {
+                            "stopped by reviewer".to_string()
+                        }
                     }
                 }
             })

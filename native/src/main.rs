@@ -578,6 +578,11 @@ enum GamPhase {
     /// The review packet was delivered to the adversarial pane; waiting on its
     /// verdict.
     AwaitingVerdict,
+    /// A MID-TURN check is with the reviewer while the generator keeps working.
+    /// Distinct from `AwaitingVerdict` because the generator is not waiting on
+    /// the answer: whatever comes back is a live nudge (or a stop), not a
+    /// judgement on a finished turn.
+    AwaitingInterim,
     /// The automatic loop ended. Both panes stay live; the user drives from here.
     Settled(GamOutcome),
 }
@@ -587,8 +592,10 @@ impl GamPhase {
         match self {
             Self::GeneratorWorking => "working",
             Self::AwaitingVerdict => "verdict",
+            Self::AwaitingInterim => "interim",
             Self::Settled(GamOutcome::Accepted) => "accepted",
             Self::Settled(GamOutcome::Escalated(_)) => "escalated",
+            Self::Settled(GamOutcome::Halted(_)) => "halted",
         }
     }
 }
@@ -600,6 +607,12 @@ enum GamOutcome {
     /// Cap reached, verdict unparseable, reviewer gone, or the adversarial model
     /// explicitly asked for a human.
     Escalated(String),
+    /// The REVIEWER pulled the plug: it judged the work unrecoverable (wrong
+    /// approach, out of scope, actively destructive) and Rudder killed the
+    /// generator's turn rather than letting it keep writing. Separate from
+    /// `Escalated`, where the generator is merely left idle: here its process is
+    /// gone and the workspace is frozen where the reviewer stopped it.
+    Halted(String),
 }
 
 /// One generator/adversarial pair ("gam"). Mirrored on BOTH rows so either pane
@@ -640,12 +653,145 @@ struct GamState {
     /// it, and the honest answer to "what is happening" is usually "this turn
     /// has been running for eighteen minutes".
     phase_since: Option<Instant>,
+    /// The running DIALOGUE between the two models, oldest first: every
+    /// objection, rebuttal, mid-flight steer and final verdict. It exists for
+    /// three readers at once -- the user (the transcript strip under the split),
+    /// the reviewer (older turns are quoted back in each packet, so an argument
+    /// survives a compacted session), and a restart (it is the only part of the
+    /// exchange that outlives the PTYs). Bounded at `GAM_TRANSCRIPT_LIMIT`
+    /// entries, each truncated on the way in.
+    transcript: Vec<GamMessage>,
+    /// How many mid-turn steers the reviewer has sent. Counted separately from
+    /// `round` because a steer does not end a turn: it is advice delivered into
+    /// a turn already in flight.
+    steers: u32,
+    /// When the next MID-TURN check is due. `None` disables the watch entirely
+    /// (post-restart, and while the pair is settled), because a check is only
+    /// meaningful against a live generator PTY we have been watching all along.
+    /// TRANSIENT, like `awaiting_since`.
+    next_interim_at: Option<Instant>,
+    /// Fingerprint of what the reviewer saw at the last mid-turn check. An
+    /// identical fingerprint means nothing has happened since, so the check is
+    /// skipped rather than spending a reviewer turn to be told "continue".
+    last_interim_progress: Option<u64>,
     /// When the latest packet was delivered. TRANSIENT (not persisted): the
     /// verdict-routing gate compares the reviewer's `completed_at` against it,
     /// so the reviewer's PREVIOUS turn's Done (e.g. its bootstrap ack) can never
     /// satisfy the wait — only a completion that happened after we asked. This
     /// closes the race where delivery and routing fired on consecutive frames.
     awaiting_since: Option<Instant>,
+}
+
+/// One line of the generator/reviewer dialogue.
+#[derive(Clone, Debug, PartialEq)]
+struct GamMessage {
+    /// The review round this was said in. Mid-turn steers carry the round they
+    /// interrupted, so the transcript reads in order.
+    round: u32,
+    speaker: GamRole,
+    kind: GamMessageKind,
+    text: String,
+}
+
+/// What a transcript line IS, so the strip and the packet can label it without
+/// re-deriving intent from the prose.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GamMessageKind {
+    /// A blocking objection at a turn boundary (a `revise` verdict).
+    Objection,
+    /// The generator arguing back inside its reply sentinels.
+    Reply,
+    /// A mid-turn course correction, delivered while the generator was running.
+    Steer,
+    /// The reviewer accepted the work.
+    Accept,
+    /// The reviewer asked for a human.
+    Escalate,
+    /// The reviewer stopped the generator.
+    Stop,
+}
+
+impl GamMessageKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Objection => "objection",
+            Self::Reply => "reply",
+            Self::Steer => "steer",
+            Self::Accept => "accept",
+            Self::Escalate => "escalate",
+            Self::Stop => "stop",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "objection" => Some(Self::Objection),
+            "reply" => Some(Self::Reply),
+            "steer" => Some(Self::Steer),
+            "accept" => Some(Self::Accept),
+            "escalate" => Some(Self::Escalate),
+            "stop" => Some(Self::Stop),
+            _ => None,
+        }
+    }
+
+    /// Prefix used in the transcript strip and in the history quoted back to the
+    /// reviewer, so each line says who is talking and in what capacity.
+    fn label(self, speaker: GamRole) -> &'static str {
+        match (speaker, self) {
+            (GamRole::Generator, _) => "generator",
+            (GamRole::Adversarial, Self::Steer) => "reviewer (steering)",
+            (GamRole::Adversarial, Self::Accept) => "reviewer (accepted)",
+            (GamRole::Adversarial, Self::Escalate) => "reviewer (escalated)",
+            (GamRole::Adversarial, Self::Stop) => "reviewer (stopped it)",
+            (GamRole::Adversarial, _) => "reviewer",
+        }
+    }
+}
+
+impl GamState {
+    /// A fresh pair link. Both rows start from this and differ only in role and
+    /// peer, so the mirrored halves can never drift apart at birth.
+    fn new(role: GamRole, peer_run_id: String, task: String) -> Self {
+        Self {
+            role,
+            peer_run_id,
+            round: 0,
+            runaway_rounds: GAM_RUNAWAY_ROUNDS,
+            last_progress: None,
+            phase: GamPhase::GeneratorWorking,
+            task,
+            last_objection: String::new(),
+            last_reply: String::new(),
+            phase_since: Some(Instant::now()),
+            transcript: Vec::new(),
+            steers: 0,
+            // The first turn starts now, so the first mid-turn check is due one
+            // interval into it.
+            next_interim_at: Some(Instant::now() + GAM_INTERIM_INTERVAL),
+            last_interim_progress: None,
+            awaiting_since: None,
+        }
+    }
+
+    /// Append one line of dialogue, bounded and trimmed. Empty text is dropped:
+    /// a verdict with no message is a route, not something either model said.
+    fn say(&mut self, speaker: GamRole, kind: GamMessageKind, text: &str) {
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        self.transcript.push(GamMessage {
+            round: self.round,
+            speaker,
+            kind,
+            text: truncate_chars(text, GAM_MESSAGE_BUDGET_CHARS),
+        });
+        let overflow = self.transcript.len().saturating_sub(GAM_TRANSCRIPT_LIMIT);
+        if overflow > 0 {
+            self.transcript.drain(0..overflow);
+        }
+    }
 }
 
 const GAM_VERDICT_START: &str = "RUDDER_GAM_VERDICT_START";
@@ -667,6 +813,44 @@ const GAM_REPLY_END: &str = "RUDDER_GAM_REPLY_END";
 /// pasted into the peer's PTY. A reviewer essay longer than this has stopped
 /// reviewing and started writing its own implementation.
 const GAM_MESSAGE_BUDGET_CHARS: usize = 4_000;
+/// How long a generator turn runs before the reviewer is asked whether it is
+/// still on track. Long enough that a normal turn finishes first (the turn
+/// boundary review is still the main event), short enough that a generator
+/// building the wrong thing is caught while it is building it rather than after.
+const GAM_INTERIM_INTERVAL: Duration = Duration::from_secs(150);
+/// Dialogue lines kept per pair. Old rounds fall off the front; the packet only
+/// ever quotes the tail anyway, and the strip renders what fits on screen.
+const GAM_TRANSCRIPT_LIMIT: usize = 60;
+/// How many EARLIER dialogue lines ride along in a review packet. The current
+/// round's objection and reply have their own anchored sections; this is the
+/// memory behind them, so the reviewer can say "you promised this two rounds
+/// ago" without depending on its own session being intact.
+const GAM_PACKET_HISTORY: usize = 8;
+/// Per-line budget for the quoted history, so eight earlier turns cannot crowd
+/// out the diff they are supposed to give context to.
+const GAM_HISTORY_LINE_CHARS: usize = 400;
+/// Tail of the generator's live pane included in a MID-TURN check. The diff
+/// alone cannot show a generator that is about to do the wrong thing but has
+/// not written it yet; its pane can.
+const GAM_PANE_TAIL_CHARS: usize = 2_000;
+/// How long a mid-turn check may stay unanswered before it is abandoned.
+///
+/// The check is best-effort, but the phase it sits in is not: while a pair waits
+/// on one, no review packet flows, so a reviewer that wedges mid-check would
+/// silently freeze the pair. Past this the check is dropped unread (its pane is
+/// mid-turn, so anything on it is half-written) and the turn-boundary loop
+/// resumes.
+const GAM_INTERIM_TIMEOUT: Duration = Duration::from_secs(300);
+/// How long after an injection a Done generator is treated as "about to start
+/// its next turn" rather than "finished and ready for review".
+///
+/// A revision or a steer goes in while the row still reads Done: status only
+/// flips to Running when the first output of the new turn arrives, one input
+/// latency later. In that window the diff is last round's, so reviewing it would
+/// re-review work already judged — and, because the diff and the reply are both
+/// unchanged, the progress gate would read it as a stall and end the pair.
+/// Bounded in time so a dead PTY that never answers cannot wedge the loop shut.
+const GAM_TURN_START_GRACE: Duration = Duration::from_secs(15);
 const GAM_USAGE: &str = "usage: /gam [main] [<claude|codex|opencode> [model]] <task> — start a generator + adversarial reviewer pair (reviewer model defaults to the other provider; 'main' runs in the shared checkout instead of an isolated workspace)";
 
 /// A parsed `/gam` invocation.
@@ -789,16 +973,80 @@ fn parse_gam_args(
 fn gam_generator_protocol_note() -> String {
     format!(
         "\n\nADVERSARIAL REVIEW PAIRING: You are the generator in a Rudder gam pair. \
-A separate read-only reviewer model audits your diff after each turn and may send \
-revision requests. They arrive as user messages beginning \"[gam reviewer\" — treat \
-them as review feedback from a colleague: address the substance directly. If you \
-disagree with an objection, do not silently comply; state your reasoning in one \
-short paragraph wrapped exactly in {start} and {end} lines, and keep implementing \
-unless the objection is clearly right. Your edits stay yours alone; the reviewer \
-cannot modify anything.",
+A separate read-only reviewer model audits your work and may send revision \
+requests. They arrive as user messages beginning \"[gam reviewer\" — treat them as \
+review feedback from a colleague: address the substance directly. If you disagree \
+with an objection, do not silently comply; state your reasoning in one short \
+paragraph wrapped exactly in {start} and {end} lines, and keep implementing unless \
+the objection is clearly right. Two of those messages can arrive MID-TURN, while \
+you are still working: one marked \"steering\" is a course correction to fold into \
+what you are doing now rather than defer to the end, and the reviewer can also \
+have Rudder STOP your turn outright if it judges the approach unrecoverable — so \
+answer a steer promptly instead of arguing with it silently. Your edits stay yours \
+alone; the reviewer cannot modify anything.",
         start = GAM_REPLY_START,
         end = GAM_REPLY_END,
     )
+}
+
+/// Defang protocol sentinels inside RELAYED text (a diff, a pane tail).
+///
+/// Rudder's own control lines are matched by exact trimmed line, and a `/gam`
+/// pair editing Rudder — or any repo whose docs quote the protocol — can put a
+/// bare sentinel line inside the diff we paste into the reviewer's pane. Left
+/// alone, the reviewer's terminal echoes it and the verdict parser reads the
+/// generator's own file content as a verdict. Prefixing the echoed copy keeps it
+/// readable while making it unmatchable.
+fn neutralize_gam_sentinels(text: &str) -> String {
+    if !text.contains("RUDDER_GAM_") {
+        return text.to_string();
+    }
+    text.lines()
+        .map(|line| {
+            let trimmed = line.trim();
+            if matches!(
+                trimmed,
+                GAM_VERDICT_START | GAM_VERDICT_END | GAM_REPLY_START | GAM_REPLY_END
+            ) {
+                format!("(quoted) {trimmed}")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The dialogue so far, oldest first, as quoted lines for a packet. Only turns
+/// from BEFORE `up_to_round` are included: the current round's objection and
+/// reply have their own anchored sections, and repeating them here would have
+/// the reviewer answering the same words twice.
+fn gam_history_block(transcript: &[GamMessage], up_to_round: u32) -> String {
+    let earlier = transcript
+        .iter()
+        .filter(|message| message.round < up_to_round)
+        .collect::<Vec<_>>();
+    if earlier.is_empty() {
+        return String::new();
+    }
+    let start = earlier.len().saturating_sub(GAM_PACKET_HISTORY);
+    let mut block = String::from(
+        "EARLIER IN THIS CONVERSATION (oldest first; your own session may have \
+compacted it away)\n",
+    );
+    for message in &earlier[start..] {
+        block.push_str(&format!(
+            "- round {} · {}: {}\n",
+            message.round + 1,
+            message.kind.label(message.speaker),
+            truncate_chars(
+                &message.text.trim().replace('\n', " "),
+                GAM_HISTORY_LINE_CHARS
+            ),
+        ));
+    }
+    block.push('\n');
+    block
 }
 
 /// The packet handed to the adversarial reviewer. Round 1 arrives right after
@@ -815,6 +1063,7 @@ you cannot edit any file, ever.\n\n\
 ORIGINAL TASK\n{task}\n\n",
         task = gam.task,
     ));
+    packet.push_str(&gam_history_block(&gam.transcript, gam.round));
     if gam.round > 0 {
         if !gam.last_objection.trim().is_empty() {
             packet.push_str(&format!(
@@ -839,20 +1088,7 @@ your objection was addressed.)\n\n",
             ));
         }
     }
-    if diff.trim().is_empty() {
-        packet.push_str(
-            "DIFF\n(empty — the generator's working copy has no changes yet)\n\n",
-        );
-    } else if diff.chars().count() >= GAM_DIFF_BUDGET_CHARS {
-        packet.push_str(&format!(
-            "DIFF (TRUNCATED at {budget} chars — object to nothing outside what is shown; \
-say so in your verdict if the unseen remainder matters)\n{diff}\n\n",
-            budget = GAM_DIFF_BUDGET_CHARS,
-            diff = diff,
-        ));
-    } else {
-        packet.push_str(&format!("DIFF\n{diff}\n\n"));
-    }
+    push_gam_diff_section(&mut packet, diff);
     packet.push_str(
         "REVIEW CONTRACT\n\
 - If you objected last round, open by saying whether that objection was \
@@ -866,15 +1102,93 @@ defects you can demonstrate.\n\
 - Revise means concrete, actionable objections (file, symptom, why it blocks the \
 task). Nitpicks belong in the message, not in blocking acceptance.\n\
 - Escalate when the disagreement needs a human: scope disputes, irreconcilable \
-approaches, or the generator repeatedly ignoring a correct objection.\n\n\
+approaches, or the generator repeatedly ignoring a correct objection.\n\
+- Stop is yours to call and it is REAL: Rudder kills the generator's process on \
+the spot and freezes its workspace where it stands. Use it when continuing is \
+worse than stopping — the wrong thing is being built, work is being destroyed, \
+or the task has been misread at the root — and never as a stronger `revise`.\n\n\
 OUTPUT CONTRACT — end your reply with EXACTLY this block:\n\
 ```\n\
 RUDDER_GAM_VERDICT_START\n\
-{\"verdict\":\"accept\"|\"revise\"|\"escalate\",\"message\":\"<under 120 words>\"}\n\
+{\"verdict\":\"accept\"|\"revise\"|\"escalate\"|\"stop\",\"message\":\"<under 120 words>\"}\n\
 RUDDER_GAM_VERDICT_END\n\
 ```\n\
 Rudder parses that block mechanically; a missing or malformed block stops the \
 pair and pages the human.",
+    );
+    packet
+}
+
+/// The diff section, shared by both packet kinds so a truncation is announced
+/// identically wherever the reviewer meets one.
+fn push_gam_diff_section(packet: &mut String, diff: &str) {
+    let diff = neutralize_gam_sentinels(diff);
+    if diff.trim().is_empty() {
+        packet.push_str("DIFF\n(empty — the generator's working copy has no changes yet)\n\n");
+    } else if diff.chars().count() >= GAM_DIFF_BUDGET_CHARS {
+        packet.push_str(&format!(
+            "DIFF (TRUNCATED at {budget} chars — object to nothing outside what is shown; \
+say so in your verdict if the unseen remainder matters)\n{diff}\n\n",
+            budget = GAM_DIFF_BUDGET_CHARS,
+            diff = diff,
+        ));
+    } else {
+        packet.push_str(&format!("DIFF\n{diff}\n\n"));
+    }
+}
+
+/// The MID-TURN check: the generator is still working, and the reviewer is asked
+/// whether to let it keep going, nudge it now, or stop it.
+///
+/// Deliberately a different contract from the round packet. Nothing here is a
+/// judgement on finished work — the turn is not finished — so `accept` and
+/// `revise` are not on the menu; the only three answers are the three things
+/// Rudder can actually DO to a running agent: nothing, inject a line, or kill it.
+fn gam_interim_packet(gam: &GamState, diff: &str, pane_tail: &str) -> String {
+    let mut packet = String::new();
+    packet.push_str(&format!(
+        "[gam reviewer · mid-turn check] The generator is STILL WORKING on round \
+{round} — this is not a finished turn and you are not judging it. You are deciding \
+whether to let it keep going, steer it now, or stop it.\n\n\
+ORIGINAL TASK\n{task}\n\n",
+        round = gam.round + 1,
+        task = gam.task,
+    ));
+    packet.push_str(&gam_history_block(&gam.transcript, gam.round + 1));
+    if !gam.last_objection.trim().is_empty() {
+        packet.push_str(&format!(
+            "YOUR STANDING OBJECTION\n{}\n\n",
+            truncate_chars(gam.last_objection.trim(), GAM_MESSAGE_BUDGET_CHARS)
+        ));
+    }
+    push_gam_diff_section(&mut packet, diff);
+    let pane_tail = neutralize_gam_sentinels(pane_tail.trim());
+    if !pane_tail.is_empty() {
+        packet.push_str(&format!(
+            "GENERATOR'S LIVE PANE (tail — raw terminal output, may include UI chrome \
+and half-written lines)\n{pane_tail}\n\n"
+        ));
+    }
+    packet.push_str(
+        "MID-TURN CONTRACT\n\
+- The default is `continue`. Work in progress looks unfinished; that is not a \
+reason to interrupt. Say continue unless you can name what is going wrong.\n\
+- `steer` injects your message into the generator's live session immediately, so \
+write it as an instruction it can act on inside the turn it is already in \
+(\"you are editing the wrong file — the router lives in src/net\"), not as a review \
+comment. It does not end the turn and does not count as a review round.\n\
+- `stop` kills the generator's process now and freezes its workspace. Reach for \
+it only when letting the turn finish is worse than ending it: the wrong thing is \
+being built, existing work is being destroyed, or the task has been misread at \
+the root. The full review at the turn boundary is the normal way to object.\n\n\
+OUTPUT CONTRACT — end your reply with EXACTLY this block:\n\
+```\n\
+RUDDER_GAM_VERDICT_START\n\
+{\"verdict\":\"continue\"|\"steer\"|\"stop\",\"message\":\"<under 80 words>\"}\n\
+RUDDER_GAM_VERDICT_END\n\
+```\n\
+A missing or malformed block is read as `continue`: an interrupted turn is not \
+worth a guess.",
     );
     packet
 }
@@ -885,6 +1199,14 @@ enum GamVerdict {
     Accept(String),
     Revise(String),
     Escalate(String),
+    /// End the pair NOW: kill the generator's turn. Reachable from either
+    /// contract, because a reviewer that can only stop the work at a turn
+    /// boundary cannot stop the turn that is going wrong.
+    Stop(String),
+    /// Mid-turn only: inject this into the running generator and let it carry on.
+    Steer(String),
+    /// Mid-turn only: nothing to say, do not interrupt.
+    Continue(String),
 }
 
 /// Strip markdown fences the model may wrap around the JSON payload.
@@ -915,6 +1237,12 @@ fn strip_code_fences(block: &str) -> String {
 /// the reviewer's PTY echoes it back. Taking only the final block and giving up
 /// when it turned out to be that echo would stop a pair whose reviewer had
 /// answered perfectly well a few lines earlier.
+///
+/// One parser, two contracts: the round packet asks for accept/revise/escalate/
+/// stop and the mid-turn check asks for continue/steer/stop. Nothing here
+/// enforces which words belong to which -- the callers map an out-of-contract
+/// answer onto their own vocabulary, so a reviewer that says `revise` mid-turn
+/// gets its objection delivered as a steer instead of being thrown away.
 fn parse_gam_verdict(lines: &[String]) -> Option<GamVerdict> {
     let starts: Vec<usize> = lines
         .iter()
@@ -937,8 +1265,13 @@ fn parse_gam_verdict(lines: &[String]) -> Option<GamVerdict> {
         let body = strip_code_fences(&body);
         // Our own instructions, echoed. Not an answer: the alternation is not
         // valid JSON, so the tolerant fallback below would read the contract
-        // itself as the reviewer's objection.
-        if body.contains("\"accept\"|\"revise\"") || body.contains("<under 120 words>") {
+        // itself as the reviewer's objection. Both contracts are listed: the
+        // round packet's and the mid-turn check's.
+        if body.contains("\"accept\"|\"revise\"")
+            || body.contains("\"continue\"|\"steer\"")
+            || body.contains("<under 120 words>")
+            || body.contains("<under 80 words>")
+        {
             continue;
         }
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) {
@@ -952,6 +1285,9 @@ fn parse_gam_verdict(lines: &[String]) -> Option<GamVerdict> {
                 Some("accept") => Some(GamVerdict::Accept(message)),
                 Some("revise") => Some(GamVerdict::Revise(message)),
                 Some("escalate") => Some(GamVerdict::Escalate(message)),
+                Some("stop") | Some("halt") => Some(GamVerdict::Stop(message)),
+                Some("steer") | Some("nudge") => Some(GamVerdict::Steer(message)),
+                Some("continue") | Some("none") | Some("ok") => Some(GamVerdict::Continue(message)),
                 _ if !message.is_empty() => Some(GamVerdict::Revise(message)),
                 _ => continue,
             };
@@ -973,7 +1309,9 @@ fn parse_gam_verdict(lines: &[String]) -> Option<GamVerdict> {
 /// in one turn); returns None when it stayed silent, which is legal — silence
 /// means "no pushback".
 fn lift_gam_reply(lines: &[String]) -> Option<String> {
-    let start_index = lines.iter().rposition(|line| line.trim() == GAM_REPLY_START)?;
+    let start_index = lines
+        .iter()
+        .rposition(|line| line.trim() == GAM_REPLY_START)?;
     let end_offset = lines[start_index + 1..]
         .iter()
         .position(|line| line.trim() == GAM_REPLY_END);
@@ -1087,6 +1425,10 @@ struct App {
     /// command (focus a pane, review, merge, ...) instead of reaching the pane.
     leader_pending: bool,
     worker_view: WorkerView,
+    /// Whether the `/gam` split shows the dialogue strip. Session state, not a
+    /// setting: it defaults on because the conversation is the point of a pair,
+    /// and a user who wants the full terminals hides it with `^w t`.
+    gam_transcript_visible: bool,
     /// When true, the agents pane renders a topological dependency tree (nest view)
     /// instead of the flat main/workspaces/merged sections. Toggled with `g`.
     nest_view: bool,
@@ -2204,6 +2546,7 @@ impl App {
             nav_mode: false,
             leader_pending: false,
             worker_view: WorkerView::Terminal,
+            gam_transcript_visible: true,
             nest_view: false,
             pty_output_waker: None,
             pending_enters: Vec::new(),
@@ -3194,6 +3537,20 @@ impl App {
                     };
                     self.selected_agent = target;
                     self.focus = FocusPane::Worker;
+                    self.dirty = true;
+                }
+            }
+            // 't' shows or hides the /gam dialogue strip. On the leader chord
+            // rather than a bare key because the worker pane forwards bare keys
+            // to the PTY, and the split is only ever seen from inside it.
+            KeyCode::Char('t') => {
+                if self.gam_pair_indices_for_selected().is_some() {
+                    self.gam_transcript_visible = !self.gam_transcript_visible;
+                    self.notice = Some(if self.gam_transcript_visible {
+                        "gam dialogue shown".to_string()
+                    } else {
+                        "gam dialogue hidden · ^w t shows it".to_string()
+                    });
                     self.dirty = true;
                 }
             }
@@ -5005,7 +5362,8 @@ impl App {
             else {
                 return false;
             };
-            let (left, right) = gam_split_halves(inner);
+            let (panes, _) = gam_split_rows(inner, self, generator_index);
+            let (left, right) = gam_split_halves(panes);
             let target = if rect_contains(left, mouse.column, mouse.row) {
                 Some(generator_index)
             } else if rect_contains(right, mouse.column, mouse.row) {
@@ -5536,7 +5894,8 @@ impl App {
         else {
             return false;
         };
-        let (left, right) = gam_split_halves(area);
+        let (panes, _) = gam_split_rows(area, self, generator_index);
+        let (left, right) = gam_split_halves(panes);
         let target = if rect_contains(left, mouse.column, mouse.row) {
             generator_index
         } else if rect_contains(right, mouse.column, mouse.row) {
@@ -5544,7 +5903,7 @@ impl App {
         } else {
             return false;
         };
-        self.scroll_gam_half(mouse, area, target)
+        self.scroll_gam_half(mouse, panes, target)
     }
 
     fn scroll_gam_half(&mut self, mouse: MouseEvent, area: Rect, index: usize) -> bool {
@@ -6493,9 +6852,14 @@ impl App {
         let adversarial_bootstrap = format!(
             "[gam reviewer] You are the ADVERSARIAL REVIEWER half of a Rudder pair. \
 A generator agent implements the task; you question its work. You have READ-ONLY \
-access: never attempt to edit, create, or write any file. Rudder will deliver each \
-review packet as a user message ending with a verdict contract. Until the first \
-packet arrives, reply only: \"standing by\"."
+access: never attempt to edit, create, or write any file — but you are not \
+powerless. Rudder acts on your verdicts: it delivers your objections to the \
+generator as its next turn, injects a mid-turn `steer` into the session it is \
+already working in, and on `stop` it kills the generator's process outright. Two \
+kinds of packet arrive as user messages, each ending with its own verdict \
+contract: a full review of a finished turn, and a shorter mid-turn check while \
+the generator is still working. Follow whichever contract the packet carries. \
+Until the first packet arrives, reply only: \"standing by\"."
         );
 
         // Build both commands before mutating the roster. The reviewer command
@@ -6595,19 +6959,11 @@ packet arrives, reply only: \"standing by\"."
             done_summary: None,
             tokens_in: 0,
             tokens_out: 0,
-            gam: Some(GamState {
-                role: GamRole::Generator,
-                peer_run_id: adversarial_id.clone(),
-                round: 0,
-                runaway_rounds: GAM_RUNAWAY_ROUNDS,
-                last_progress: None,
-                phase: GamPhase::GeneratorWorking,
+            gam: Some(GamState::new(
+                GamRole::Generator,
+                adversarial_id.clone(),
                 task,
-                last_objection: String::new(),
-                last_reply: String::new(),
-                phase_since: Some(Instant::now()),
-                awaiting_since: None,
-            }),
+            )),
         };
 
         let generator_options = TerminalPaneOptions {
@@ -6695,19 +7051,11 @@ packet arrives, reply only: \"standing by\"."
             done_summary: None,
             tokens_in: 0,
             tokens_out: 0,
-            gam: Some(GamState {
-                role: GamRole::Adversarial,
-                peer_run_id: generator_id,
-                round: 0,
-                runaway_rounds: GAM_RUNAWAY_ROUNDS,
-                last_progress: None,
-                phase: GamPhase::GeneratorWorking,
-                task: run.task_summary.clone(),
-                last_objection: String::new(),
-                last_reply: String::new(),
-                phase_since: Some(Instant::now()),
-                awaiting_since: None,
-            }),
+            gam: Some(GamState::new(
+                GamRole::Adversarial,
+                generator_id,
+                run.task_summary.clone(),
+            )),
         };
         let adversarial_options = TerminalPaneOptions {
             size: TerminalSize::default(),
@@ -6788,6 +7136,14 @@ packet arrives, reply only: \"standing by\"."
             DeliverPacket(usize),
             /// The reviewer's verdict turn ended: parse it and route.
             ReadVerdict(usize),
+            /// The generator is still working and the mid-turn check is due:
+            /// ask the reviewer whether to let it keep going.
+            DeliverInterim(usize),
+            /// The reviewer answered a mid-turn check: steer, stop, or nothing.
+            ReadInterim(usize),
+            /// The mid-turn check went unanswered for too long: drop it unread
+            /// so the turn-boundary loop is not held behind it.
+            AbandonInterim(usize),
         }
         let mut actions: Vec<GamAction> = Vec::new();
         for index in 0..self.agents.len() {
@@ -6801,13 +7157,69 @@ packet arrives, reply only: \"standing by\"."
             }
             match gam.phase {
                 GamPhase::GeneratorWorking => {
-                    // Deliberately NOT gated on the peer existing. A deleted
-                    // reviewer used to mean this arm simply never fired: the
-                    // generator sat Done forever, the poll retried every tick,
-                    // and nothing told the user. deliver_gam_packet ends the
-                    // pair with a reason instead.
+                    // The packet is deliberately NOT gated on the peer still
+                    // existing. A deleted reviewer used to mean this arm never
+                    // fired: the generator sat Done forever, the poll retried
+                    // every tick, and nothing told the user. deliver_gam_packet
+                    // ends the pair with a reason instead. The MID-TURN check
+                    // below does need a live peer, so it asks separately.
+                    let peer = self.gam_peer_index_of(index);
                     if self.agents[index].status == AgentStatus::Done {
-                        actions.push(GamAction::DeliverPacket(index));
+                        // Not while a turn is starting: something was just typed
+                        // into this generator (our own revision or steer, or the
+                        // user), and its diff is still last round's.
+                        let starting_new_turn = post_completion_output_is_new_turn(
+                            self.agents[index].last_worker_input_at,
+                            self.agents[index].completed_at,
+                        ) && self.agents[index]
+                            .last_worker_input_at
+                            .is_some_and(|at| at.elapsed() < GAM_TURN_START_GRACE);
+                        if !starting_new_turn {
+                            actions.push(GamAction::DeliverPacket(index));
+                        }
+                    } else if self.agents[index].status == AgentStatus::Running
+                        && gam
+                            .next_interim_at
+                            .is_some_and(|due| Instant::now() >= due)
+                        && peer.is_some_and(|peer| self.gam_reviewer_is_idle(peer))
+                    {
+                        // MID-TURN STEERING. The turn-boundary review is still
+                        // the main event; this exists because a reviewer that
+                        // can only speak between turns cannot stop the turn that
+                        // is going wrong. Rate-limited by `next_interim_at` and
+                        // skipped in `deliver_gam_interim` when nothing has
+                        // changed, so a quiet generator costs no reviewer turns.
+                        actions.push(GamAction::DeliverInterim(index));
+                    }
+                }
+                GamPhase::AwaitingInterim => {
+                    let Some(peer) = self.gam_peer_index_of(index) else {
+                        // No reviewer left to answer. A lost mid-turn check is
+                        // not fatal -- the generator is still working -- so drop
+                        // back to the turn-boundary loop rather than escalate.
+                        actions.push(GamAction::ReadInterim(index));
+                        continue;
+                    };
+                    if !matches!(
+                        self.agents[peer].status,
+                        AgentStatus::Done | AgentStatus::Failed | AgentStatus::Stopped
+                    ) {
+                        if gam
+                            .awaiting_since
+                            .is_some_and(|at| at.elapsed() >= GAM_INTERIM_TIMEOUT)
+                        {
+                            actions.push(GamAction::AbandonInterim(index));
+                        }
+                        continue;
+                    }
+                    let fresh_completion = match gam.awaiting_since {
+                        Some(awaiting_since) => self.agents[peer]
+                            .completed_at
+                            .is_some_and(|at| at > awaiting_since),
+                        None => true,
+                    };
+                    if fresh_completion {
+                        actions.push(GamAction::ReadInterim(index));
                     }
                 }
                 GamPhase::AwaitingVerdict => {
@@ -6849,8 +7261,277 @@ packet arrives, reply only: \"standing by\"."
             match action {
                 GamAction::DeliverPacket(index) => self.deliver_gam_packet(index),
                 GamAction::ReadVerdict(index) => self.route_gam_verdict(index),
+                GamAction::DeliverInterim(index) => self.deliver_gam_interim(index),
+                GamAction::ReadInterim(index) => self.route_gam_interim(index),
+                GamAction::AbandonInterim(index) => self.abandon_gam_interim(index),
             }
         }
+    }
+
+    /// Can the reviewer take a packet right now? Never inject into one that is
+    /// still mid-turn or dead: a queued packet would collide with live output,
+    /// and a failed one cannot answer.
+    fn gam_reviewer_is_idle(&self, peer_index: usize) -> bool {
+        self.agents.get(peer_index).is_some_and(|reviewer| {
+            !matches!(
+                reviewer.status,
+                AgentStatus::Failed | AgentStatus::Stopped | AgentStatus::Running
+            ) && reviewer.terminal.is_some()
+        })
+    }
+
+    /// Fingerprint of everything a reviewer would look at right now. Used to
+    /// skip a mid-turn check that would show the reviewer exactly what it saw
+    /// last time.
+    fn gam_watch_fingerprint(diff: &str, pane_tail: &str) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        diff.hash(&mut hasher);
+        pane_tail.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// The tail of a run's visible pane, bounded, for the mid-turn packet.
+    fn gam_pane_tail(&self, index: usize) -> String {
+        let Some(terminal) = self.agents.get(index).and_then(|run| run.terminal.as_ref()) else {
+            return String::new();
+        };
+        let lines = terminal.visible_lines_snapshot();
+        let joined = lines
+            .iter()
+            .map(|line| line.trim_end())
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        // The TAIL is what matters (what it is doing NOW), so trim from the
+        // front rather than truncating the end off the newest output.
+        let count = joined.chars().count();
+        if count <= GAM_PANE_TAIL_CHARS {
+            joined
+        } else {
+            joined
+                .chars()
+                .skip(count - GAM_PANE_TAIL_CHARS)
+                .collect::<String>()
+        }
+    }
+
+    /// MID-TURN CHECK step 1: the generator is still working and the watch
+    /// interval elapsed. Show the reviewer the partial diff plus the tail of the
+    /// generator's live pane and ask it to continue / steer / stop.
+    ///
+    /// Costs nothing when nothing happened: if the fingerprint matches the last
+    /// check, the interval is simply rearmed and no reviewer turn is spent.
+    fn deliver_gam_interim(&mut self, generator_index: usize) {
+        let Some(peer_index) = self.gam_peer_index_of(generator_index) else {
+            return;
+        };
+        if !self.gam_reviewer_is_idle(peer_index) {
+            return;
+        }
+        let mut gam = match self.agents[generator_index].gam.as_ref() {
+            Some(gam) => gam.clone(),
+            None => return,
+        };
+        let diff = jj_diff_text(&self.agents[generator_index].cwd, GAM_DIFF_BUDGET_CHARS);
+        let pane_tail = self.gam_pane_tail(generator_index);
+        let fingerprint = Self::gam_watch_fingerprint(&diff, &pane_tail);
+        let rearm = Some(Instant::now() + GAM_INTERIM_INTERVAL);
+        if gam.last_interim_progress == Some(fingerprint) {
+            // Nothing has moved since the last check. Asking again would spend a
+            // reviewer turn to be told "continue" about a screen it has seen.
+            for side in [generator_index, peer_index] {
+                if let Some(recorded) = self.agents[side].gam.as_mut() {
+                    recorded.next_interim_at = rearm;
+                }
+            }
+            return;
+        }
+        let packet = gam_interim_packet(&gam, &diff, &pane_tail);
+        if !self.live_inject_at(peer_index, &packet) {
+            // A mid-turn check is best-effort: an unreachable reviewer pane is
+            // not a reason to end a turn that is still running. Back off and let
+            // the turn boundary escalate if the reviewer is really gone.
+            for side in [generator_index, peer_index] {
+                if let Some(recorded) = self.agents[side].gam.as_mut() {
+                    recorded.next_interim_at = rearm;
+                }
+            }
+            return;
+        }
+        gam.last_interim_progress = Some(fingerprint);
+        gam.awaiting_since = Some(Instant::now());
+        for side in [generator_index, peer_index] {
+            if let Some(recorded) = self.agents[side].gam.as_mut() {
+                recorded.phase = GamPhase::AwaitingInterim;
+                // The badge clock moves for the REVIEWER only. A mid-turn check
+                // is a reviewer-side wait; the generator's turn is still the one
+                // that started minutes ago, and restarting its clock every 150s
+                // would make a turn that has run for an hour read as fresh --
+                // exactly the "is this dead?" ambiguity phase_since exists for.
+                if side != generator_index {
+                    recorded.phase_since = gam.awaiting_since;
+                }
+                recorded.awaiting_since = gam.awaiting_since;
+                recorded.last_interim_progress = gam.last_interim_progress;
+                recorded.next_interim_at = rearm;
+            }
+        }
+        for side in [generator_index, peer_index] {
+            if let Some(run) = self.agents.get_mut(side) {
+                let _ = save_native_run_record(&self.cwd, run);
+            }
+        }
+        self.record_activity(format!(
+            "gam: mid-turn check sent to {} while the generator works",
+            truncate_chars(self.agents[peer_index].model.trim(), 24),
+        ));
+        self.dirty = true;
+    }
+
+    /// MID-TURN CHECK step 2: route the reviewer's answer.
+    ///
+    /// `steer` is injected into the RUNNING generator, which is the whole point:
+    /// the correction lands inside the turn it is meant to change. `stop` ends
+    /// the pair. Anything else — including an unparseable block — is read as
+    /// "carry on", because interrupting a turn on a guess is worse than missing
+    /// one check.
+    fn route_gam_interim(&mut self, generator_index: usize) {
+        let peer_index = self.gam_peer_index_of(generator_index);
+        let verdict = peer_index.and_then(|peer| {
+            let lines = self.agents[peer]
+                .terminal
+                .as_ref()
+                .map(|terminal| terminal.visible_lines_snapshot())
+                .unwrap_or_default();
+            parse_gam_verdict(&lines)
+        });
+        // Whatever happens, the turn-boundary loop takes over again from here.
+        for side in [Some(generator_index), peer_index].into_iter().flatten() {
+            if let Some(recorded) = self.agents[side].gam.as_mut() {
+                recorded.phase = GamPhase::GeneratorWorking;
+                // Reviewer only, for the same reason as on the way in: the
+                // generator never stopped working, so its clock never restarts.
+                if Some(side) != Some(generator_index) {
+                    recorded.phase_since = Some(Instant::now());
+                }
+                recorded.awaiting_since = None;
+            }
+        }
+        self.dirty = true;
+        match verdict {
+            Some(GamVerdict::Stop(message)) => {
+                self.halt_gam_pair(generator_index, message, "mid-turn");
+            }
+            // `revise`/`escalate` are not on the mid-turn menu, but a reviewer
+            // that reaches for them has still said something actionable about
+            // work in flight. Deliver it as a steer rather than discard it.
+            Some(GamVerdict::Steer(message))
+            | Some(GamVerdict::Revise(message))
+            | Some(GamVerdict::Escalate(message)) => {
+                self.apply_gam_steer(generator_index, message);
+            }
+            Some(GamVerdict::Accept(_)) | Some(GamVerdict::Continue(_)) | None => {
+                // Silence is the expected answer. Nothing is logged for it: a
+                // check that found nothing is not news, and one activity line
+                // every couple of minutes would bury the ones that matter.
+            }
+        }
+        for side in [Some(generator_index), peer_index].into_iter().flatten() {
+            if let Some(run) = self.agents.get_mut(side) {
+                let _ = save_native_run_record(&self.cwd, run);
+            }
+        }
+    }
+
+    /// Drop an unanswered mid-turn check. Deliberately does NOT read the
+    /// reviewer's pane: it is still mid-turn, so whatever is on it is
+    /// half-written, and acting on half a verdict is worse than acting on none.
+    fn abandon_gam_interim(&mut self, generator_index: usize) {
+        let peer_index = self.gam_peer_index_of(generator_index);
+        for side in [Some(generator_index), peer_index].into_iter().flatten() {
+            if let Some(recorded) = self.agents[side].gam.as_mut() {
+                recorded.phase = GamPhase::GeneratorWorking;
+                // Reviewer only, for the same reason as on the way in: the
+                // generator never stopped working, so its clock never restarts.
+                if Some(side) != Some(generator_index) {
+                    recorded.phase_since = Some(Instant::now());
+                }
+                recorded.awaiting_since = None;
+            }
+        }
+        self.record_activity(
+            "gam: the reviewer never answered the mid-turn check; the round loop continues"
+                .to_string(),
+        );
+        self.dirty = true;
+    }
+
+    /// Deliver a mid-turn steer into the generator's live session.
+    fn apply_gam_steer(&mut self, generator_index: usize, message: String) {
+        let message = message.trim().to_string();
+        if message.is_empty() {
+            return;
+        }
+        let injection = format!(
+            "[gam reviewer · steering, mid-turn] {message}\n\
+This is a course correction for the turn you are in now, not a review of \
+finished work: fold it into what you are doing. If it is wrong, say why inside \
+{start} / {end} lines and carry on.",
+            start = GAM_REPLY_START,
+            end = GAM_REPLY_END,
+        );
+        if !self.live_inject_at(generator_index, &injection) {
+            self.record_activity(
+                "gam: the reviewer's mid-turn steer could not reach the generator".to_string(),
+            );
+            return;
+        }
+        let peer_index = self.gam_peer_index_of(generator_index);
+        for side in [Some(generator_index), peer_index].into_iter().flatten() {
+            if let Some(recorded) = self.agents[side].gam.as_mut() {
+                recorded.steers = recorded.steers.saturating_add(1);
+                recorded.say(GamRole::Adversarial, GamMessageKind::Steer, &message);
+            }
+        }
+        self.record_activity(format!(
+            "gam: reviewer steered the generator mid-turn — {}",
+            truncate_chars(&message, 120)
+        ));
+        self.notice = Some(format!(
+            "gam: reviewer steered mid-turn — {}",
+            truncate_chars(&message, 96)
+        ));
+    }
+
+    /// The reviewer pulled the plug. Kill the generator's turn, freeze its
+    /// workspace where it stands, and settle the pair as Halted.
+    ///
+    /// The REVIEWER's pane is deliberately left running: the user's first
+    /// question after an unexpected stop is "why?", and the only agent that can
+    /// answer is the one that made the call.
+    fn halt_gam_pair(&mut self, generator_index: usize, message: String, when: &str) {
+        let reason = if message.trim().is_empty() {
+            "the reviewer stopped the run (no reason given — see its pane)".to_string()
+        } else {
+            truncate_chars(message.trim(), GAM_MESSAGE_BUDGET_CHARS)
+        };
+        let peer_index = self.gam_peer_index_of(generator_index);
+        for side in [Some(generator_index), peer_index].into_iter().flatten() {
+            if let Some(recorded) = self.agents[side].gam.as_mut() {
+                recorded.say(GamRole::Adversarial, GamMessageKind::Stop, &reason);
+            }
+        }
+        self.stop_agent_at(generator_index);
+        self.record_activity(format!(
+            "gam: reviewer STOPPED the generator ({when}) — {}",
+            truncate_chars(&reason, 160)
+        ));
+        self.notice = Some(format!(
+            "gam: the reviewer stopped the generator — {}. Its workspace is frozen; the reviewer pane is still live if you want to ask why.",
+            truncate_chars(&reason, 120)
+        ));
+        self.settle_gam_pair(generator_index, GamOutcome::Halted(reason));
     }
 
     /// Round step 1: the generator finished a turn. Lift its optional reply
@@ -6945,6 +7626,7 @@ packet arrives, reply only: \"standing by\"."
         gam.phase_since = gam.awaiting_since;
         let round = gam.round;
         let reviewer_model = self.agents[peer_index].model.clone();
+        let rebuttal = gam.last_reply.clone();
         for side in [generator_index, peer_index] {
             if let Some(recorded) = self.agents[side].gam.as_mut() {
                 recorded.phase = GamPhase::AwaitingVerdict;
@@ -6953,6 +7635,12 @@ packet arrives, reply only: \"standing by\"."
                 recorded.last_objection = gam.last_objection.clone();
                 recorded.last_reply = gam.last_reply.clone();
                 recorded.awaiting_since = gam.awaiting_since;
+                recorded.last_progress = gam.last_progress;
+                // The turn is over, so there is no turn left to steer. The watch
+                // rearms when the next one starts.
+                recorded.next_interim_at = None;
+                recorded.last_interim_progress = None;
+                recorded.say(GamRole::Generator, GamMessageKind::Reply, &rebuttal);
             }
         }
         if let Some(run) = self.agents.get_mut(generator_index) {
@@ -7000,8 +7688,26 @@ packet arrives, reply only: \"standing by\"."
             .as_ref()
             .map(|gam| gam.runaway_rounds)
             .unwrap_or(GAM_RUNAWAY_ROUNDS);
+        // `continue` and `steer` belong to the MID-TURN contract. Arriving here,
+        // against a finished turn, they are only an answer if they carry
+        // something the generator can act on; empty, they say nothing at all and
+        // must not become an objection with no content in it.
+        let verdict = match verdict {
+            Some(GamVerdict::Continue(ref message)) | Some(GamVerdict::Steer(ref message))
+                if message.trim().is_empty() =>
+            {
+                None
+            }
+            other => other,
+        };
         let escalated_by_reviewer = matches!(verdict, Some(GamVerdict::Escalate(_)));
         match verdict {
+            // The reviewer can end the run itself, not just ask a human to.
+            // Reachable from the turn boundary as well as mid-turn: a finished
+            // turn can be just as unrecoverable as one in flight.
+            Some(GamVerdict::Stop(message)) => {
+                self.halt_gam_pair(generator_index, message, "after review");
+            }
             Some(GamVerdict::Accept(message)) => {
                 self.record_activity(format!(
                     "gam: {} accepted the work after {} review round(s){}",
@@ -7015,9 +7721,20 @@ packet arrives, reply only: \"standing by\"."
                 ));
                 self.notice =
                     Some("gam: adversarial reviewer accepted the work".to_string());
+                for side in [generator_index, peer_index] {
+                    if let Some(recorded) = self.agents[side].gam.as_mut() {
+                        recorded.say(GamRole::Adversarial, GamMessageKind::Accept, &message);
+                    }
+                }
                 self.settle_gam_pair(generator_index, GamOutcome::Accepted);
             }
-            Some(GamVerdict::Revise(message)) | Some(GamVerdict::Escalate(message)) => {
+            Some(GamVerdict::Revise(message))
+            | Some(GamVerdict::Escalate(message))
+            // Off-contract at a turn boundary (they belong to the mid-turn
+            // menu), but both carry an objection the generator can act on, and
+            // a `continue` about finished work means "nothing more to add".
+            | Some(GamVerdict::Steer(message))
+            | Some(GamVerdict::Continue(message)) => {
                 let revise_message = if message.trim().is_empty() {
                     "(the reviewer gave no detail — see its pane)".to_string()
                 } else {
@@ -7032,6 +7749,16 @@ Address the objection directly. If you disagree, say why inside \
                     start = GAM_REPLY_START,
                     end = GAM_REPLY_END,
                 );
+                for side in [generator_index, peer_index] {
+                    if let Some(recorded) = self.agents[side].gam.as_mut() {
+                        let kind = if escalated_by_reviewer {
+                            GamMessageKind::Escalate
+                        } else {
+                            GamMessageKind::Objection
+                        };
+                        recorded.say(GamRole::Adversarial, kind, &revise_message);
+                    }
+                }
                 let injected = self.live_inject_at(generator_index, &injection);
                 let reason = if capped {
                     format!(
@@ -7090,6 +7817,9 @@ Address the objection directly. If you disagree, say why inside \
                 recorded.phase_since = Some(Instant::now());
                 recorded.last_objection = message.clone();
                 recorded.last_reply = String::new();
+                // A fresh turn starts now; the mid-turn watch runs against it.
+                recorded.next_interim_at = Some(Instant::now() + GAM_INTERIM_INTERVAL);
+                recorded.last_interim_progress = None;
             }
         }
         if let Some(run) = self.agents.get_mut(generator_index) {
@@ -7118,6 +7848,10 @@ Address the objection directly. If you disagree, say why inside \
             if let Some(recorded) = self.agents[side].gam.as_mut() {
                 recorded.phase = GamPhase::Settled(outcome.clone());
                 recorded.phase_since = Some(Instant::now());
+                // Nothing automatic runs after this: no packets, no mid-turn
+                // checks. Both panes are the user's to drive.
+                recorded.next_interim_at = None;
+                recorded.awaiting_since = None;
             }
             if let Some(run) = self.agents.get_mut(side) {
                 let _ = save_native_run_record(&self.cwd, run);
@@ -8766,7 +9500,7 @@ Address the objection directly. If you disagree, say why inside \
                 match parse_gam_args(rest, self.backend, &self.model) {
                     Ok(request) => {
                         self.notice = Some(format!(
-                            "gam pair starting · adversarial: {} {} · generator: {} {}{}",
+                            "gam pair starting · adversarial: {} {} · generator: {} {}{} · the reviewer reviews each turn, can steer mid-turn, and can stop the run",
                             request.adversarial_backend.as_str(),
                             truncate_chars(&request.adversarial_model, 28),
                             self.backend.as_str(),
@@ -8949,7 +9683,7 @@ It will tend to agree with itself — name another with /gam <provider> <model> 
             }
             Some("/help") => {
                 self.notice = Some(
-                    "plain input -> one isolated mergeable worker in its own jj workspace · /plan <task> -> an orchestrator that plans and runs a DAG · /gam [model] <task> -> generator + adversarial reviewer pair (split panes, ^W a toggles sides) · /main|/m <task> -> another agent in this shared checkout · panes: Option-1/2/3 or ^W · keys: j/k select · Option-[ / Option-] step agents from any pane · Enter focus · v diff · m merge · u undo a merge · M merge all · R review all · g nest · o web ui · x stop · b branch chat · dd delete · cc clear merged · P model; commands: /model /fast /sound /color /main /plan /gam /resume /restore /share /usage /goal /cloud /web /feedback"
+                    "plain input -> one isolated mergeable worker in its own jj workspace · /plan <task> -> an orchestrator that plans and runs a DAG · /gam [model] <task> -> generator + adversarial reviewer pair; the reviewer can steer the generator mid-turn and stop it outright (split panes, ^W a toggles sides, ^W t shows the dialogue) · /main|/m <task> -> another agent in this shared checkout · panes: Option-1/2/3 or ^W · keys: j/k select · Option-[ / Option-] step agents from any pane · Enter focus · v diff · m merge · u undo a merge · M merge all · R review all · g nest · o web ui · x stop · b branch chat · dd delete · cc clear merged · P model; commands: /model /fast /sound /color /main /plan /gam /resume /restore /share /usage /goal /cloud /web /feedback"
                         .to_string(),
                 );
                 true

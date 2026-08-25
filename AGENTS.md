@@ -1510,8 +1510,11 @@ is given), and an ADVERSARIAL reviewer (the model named after `/gam`) questions
 it. Only the generator ever edits; the reviewer is read-only by construction —
 Claude via a tool ALLOWLIST (`GAM_ADVERSARIAL_CLAUDE_TOOLS`, no Bash because a
 Claude Bash call can write), Codex via `--sandbox read-only` (runtime-enforced).
+The reviewer is read-only over the FILES, not powerless over the RUN: Rudder
+acts on its verdicts, so it can revise, steer the generator mid-turn, or stop it.
 The pair renders as a SPLIT worker pane (generator left, adversarial right,
-`render_gam_split`); click a half or `^W` `a` to move between them; wheel routes
+`render_gam_split`) over a dialogue strip carrying the exchange between them
+(`^W` `t` hides it); click a half or `^W` `a` to move between them; wheel routes
 to whichever half is under the pointer.
 
 - **Grammar**: `/gam [main] [<claude|codex|opencode> [model] [effort]] <task>`.
@@ -1520,17 +1523,65 @@ to whichever half is under the pointer.
   task verbs. No spec at all cross-picks the OTHER backend's default model.
 - **Round loop** (`poll_gam_pairs`, runs every heartbeat after status updates):
   generator turn Done → lift its optional `{GAM_REPLY_START..END}` reply note →
-  packet (original task + reply + `jj_diff_text` bounded at 16k with a VISIBLE
-  truncation marker) pasted into the reviewer pane → reviewer turn Done → parse
-  `{GAM_VERDICT_START..END}` JSON from its screen → route accept / revise
-  (becomes the generator's next user turn) / escalate. Cap `MAX_GAM_ROUNDS = 4`,
-  then settle Escalated but still deliver the final objection. Unparseable
-  verdicts escalate rather than guess. Both panes stay live after settling for
-  manual driving.
+  packet (original task + earlier dialogue + last objection/reply + `jj_diff_text`
+  bounded at 16k with a VISIBLE truncation marker) pasted into the reviewer pane
+  → reviewer turn Done → parse `{GAM_VERDICT_START..END}` JSON from its screen →
+  route accept / revise (becomes the generator's next user turn) / escalate /
+  stop. No round cap: the pair ends when the reviewer accepts, escalates or
+  stops, or when the generator stops making progress (same diff AND same
+  rebuttal two rounds running). `GAM_RUNAWAY_ROUNDS = 40` is a pure runaway
+  backstop. Unparseable verdicts escalate rather than guess. Both panes stay live
+  after settling for manual driving.
+- **The reviewer can stop the run** (`stop` verdict → `halt_gam_pair`): it kills
+  the generator's PTY through `stop_agent_at`, freezes its workspace, and settles
+  `GamOutcome::Halted`. Distinct from `escalate`, which leaves the generator idle
+  but alive — an escalation is "a human should decide", a stop is "continuing is
+  worse than stopping". The REVIEWER pane is deliberately left running, because
+  the user's first question after an unexpected stop is "why?" and it is the only
+  agent that can answer.
+- **The reviewer can steer mid-turn** (`GamPhase::AwaitingInterim`): a reviewer
+  that only speaks between turns cannot stop the turn that is going wrong. While
+  the generator is Running, every `GAM_INTERIM_INTERVAL` (150s) Rudder sends the
+  reviewer a DIFFERENT packet — partial diff plus the tail of the generator's
+  live pane (`gam_pane_tail`) — on a contract of continue / steer / stop.
+  `steer` is injected into the running generator's session and does NOT end the
+  turn or bump `round` (it bumps `steers`); `stop` halts; anything else,
+  including an unparseable block, means continue, because interrupting a turn on
+  a guess is worse than missing a check. Skipped with no reviewer turn spent when
+  the (diff, pane) fingerprint is unchanged, so a quiet turn is free. The watch
+  is armed only by a live turn (`next_interim_at`, transient), so it never runs
+  after a restart or after settling, and an unanswered check is abandoned UNREAD
+  after `GAM_INTERIM_TIMEOUT` — no review packet flows while one is out, so a
+  wedged reviewer would otherwise freeze the pair, and a pane still mid-turn
+  holds half a verdict at best.
+- **Relayed text cannot forge a control line** (`neutralize_gam_sentinels`): the
+  reviewer's PTY echoes whatever we paste, and a diff CONTEXT line (no `+`) or a
+  raw pane tail can be a bare sentinel — trivially so when the pair is working on
+  Rudder itself. Echoed sentinels are prefixed `(quoted) ` so they stay readable
+  and stop matching. The contract template the packet itself carries is caught by
+  the existing template guard in `parse_gam_verdict`.
+- **The dialogue is first-class** (`GamState.transcript`): every objection,
+  rebuttal, steer and final verdict, bounded at `GAM_TRANSCRIPT_LIMIT`. It serves
+  three readers — the user (the strip under the split, `^W t`), the reviewer
+  (earlier rounds are quoted back in every packet, so an argument survives its own
+  session being compacted; the CURRENT round is never duplicated there because it
+  has anchored sections), and a restart (it is the only part of the exchange that
+  outlives the PTYs).
 - **Zero new filesystem state by design**: packets/replies cross through PTY
   stdin + the terminal buffers Rudder already owns; the only durable state is
-  the `gam` object inside each run.json (role, peerId, round, maxRounds, phase,
-  task, lastMessage). Signals reuse `<rudder_home>/signals/<run_id>.json`.
+  the `gam` object inside each run.json (role, peerId, round, runawayRounds,
+  phase, task, lastObjection, lastReply, steers, transcript). Signals reuse
+  `<rudder_home>/signals/<run_id>.json`.
+- **Turn-start window** (`GAM_TURN_START_GRACE`): a revision or a steer is
+  injected while the generator row still reads Done — status only flips to
+  Running when the new turn's first output arrives. Delivering a review packet in
+  that window re-reviews the diff just judged, and since neither the diff nor the
+  reply has moved, the progress gate reads it as a stall and ends the pair one
+  heartbeat after the revision was sent. `poll_gam_pairs` therefore skips a Done
+  generator whose last input landed after its completion, bounded in time so a
+  dead PTY cannot wedge the loop shut. (The stall gate only became reachable when
+  `last_progress` started being written back to the ROWS: it had been set on a
+  local clone and dropped, so no stall was ever detected.)
 - **Freshness gate**: `GamState.awaiting_since` (transient, not serialized) is
   stamped at delivery; routing requires the reviewer's `completed_at` AFTER it.
   Without this, the reviewer's PREVIOUS Done satisfied the wait one frame after

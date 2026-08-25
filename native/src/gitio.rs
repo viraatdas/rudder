@@ -939,7 +939,9 @@ pub(crate) fn agent_status_from_record(status: Option<&str>) -> AgentStatus {
 /// Read a persisted `/gam` pair link back off a run record. Old records (and
 /// every non-gam run) have no `gam` object and load as `None`.
 pub(crate) fn gam_state_from_record(record: &serde_json::Value) -> Option<crate::GamState> {
-    use crate::{GamOutcome, GamPhase, GamRole, GamState, GAM_RUNAWAY_ROUNDS};
+    use crate::{
+        GamMessage, GamMessageKind, GamOutcome, GamPhase, GamRole, GamState, GAM_RUNAWAY_ROUNDS,
+    };
     let gam = record.get("gam")?;
     let role = gam
         .get("role")
@@ -961,8 +963,46 @@ pub(crate) fn gam_state_from_record(record: &serde_json::Value) -> Option<crate:
         // An escalation reason is not persisted (it lives in the activity log);
         // a reloaded escalated pair still reads as ended-without-agreement.
         Some("escalated") => GamPhase::Settled(GamOutcome::Escalated(String::new())),
+        Some("halted") => GamPhase::Settled(GamOutcome::Halted(String::new())),
+        // A mid-turn check cannot survive a restart: the generator turn it was
+        // watching is gone with its PTY. It reloads as an ordinary working turn,
+        // which is the state the pair would have been in either way.
         _ => GamPhase::GeneratorWorking,
     };
+    let transcript = gam
+        .get("transcript")
+        .and_then(serde_json::Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| {
+                    let text = entry
+                        .get("text")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    if text.trim().is_empty() {
+                        return None;
+                    }
+                    Some(GamMessage {
+                        round: entry
+                            .get("round")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0) as u32,
+                        speaker: entry
+                            .get("speaker")
+                            .and_then(serde_json::Value::as_str)
+                            .and_then(GamRole::parse)?,
+                        kind: entry
+                            .get("kind")
+                            .and_then(serde_json::Value::as_str)
+                            .and_then(GamMessageKind::parse)?,
+                        text,
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     Some(GamState {
         role,
         peer_run_id,
@@ -995,6 +1035,15 @@ pub(crate) fn gam_state_from_record(record: &serde_json::Value) -> Option<crate:
             .to_string(),
         // Transient timestamps: meaningless across a restart.
         phase_since: None,
+        transcript,
+        steers: gam
+            .get("steers")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as u32,
+        // The mid-turn watch is armed by a live turn, not by a record: there is
+        // no PTY to watch until something starts one again.
+        next_interim_at: None,
+        last_interim_progress: None,
         awaiting_since: None,
     })
 }
@@ -1011,6 +1060,21 @@ pub(crate) fn gam_state_to_json(gam: &crate::GamState) -> serde_json::Value {
         "task": gam.task,
         "lastObjection": gam.last_objection,
         "lastReply": gam.last_reply,
+        "steers": gam.steers,
+        // The dialogue is the only part of the exchange that outlives the PTYs,
+        // so it is the one thing here worth writing per round.
+        "transcript": gam
+            .transcript
+            .iter()
+            .map(|message| {
+                serde_json::json!({
+                    "round": message.round,
+                    "speaker": message.speaker.as_str(),
+                    "kind": message.kind.as_str(),
+                    "text": message.text,
+                })
+            })
+            .collect::<Vec<_>>(),
     })
 }
 
