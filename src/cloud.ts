@@ -534,7 +534,8 @@ async function launch(
     const client = await cloudClient({ requireToken: true });
     const runtime = await selectedCloudRuntime(explicitRuntime);
     const task = mode === "task" || runtime === "byo-vm" ? raw : "";
-    const name = task ? cloudNameFromTask(task) : raw || randomCloudName();
+    const launchName = process.env.RUDDER_CLOUD_LAUNCH_NAME?.trim();
+    const name = launchName || (task ? cloudNameFromTask(task) : raw || randomCloudName());
     const body: Record<string, JsonValue> = {
       repoName: path.basename(repoRoot),
       name,
@@ -2713,7 +2714,13 @@ async function workspaceStatus(args: string[], options: CloudCommandOptions): Pr
   const clientCount = typeof workspace.clientCount === "number" ? workspace.clientCount : 0;
   const lastActivityAt = typeof workspace.lastActivityAt === "string" ? workspace.lastActivityAt : undefined;
   const idleMinutes = computeIdleMinutes(lastActivityAt);
-  const activeAgents = clientCount > 0 || (idleMinutes !== null && idleMinutes < 5);
+  // Prefer the server's worker-reported busy count (a fact: how many rudder
+  // runs are actively working in that machine). Fall back to the old activity
+  // heuristic only for control planes that predate the field.
+  const serverActiveAgents = typeof workspace.activeAgents === "number" ? workspace.activeAgents : null;
+  const activeAgents = serverActiveAgents !== null
+    ? serverActiveAgents > 0
+    : clientCount > 0 || (idleMinutes !== null && idleMinutes < 5);
   if (options.json) {
     printJson({
       id,
@@ -2722,13 +2729,20 @@ async function workspaceStatus(args: string[], options: CloudCommandOptions): Pr
       lastActivityAt: lastActivityAt ?? null,
       idleMinutes,
       activeAgents,
+      activeAgentCount: serverActiveAgents,
       repoName: typeof workspace.repoName === "string" ? workspace.repoName : null,
     });
     return;
   }
   const idlePart = idleMinutes !== null ? `  idle ${idleMinutes}m` : "";
   console.log(`workspace ${id}  ${status}  clients=${clientCount}${idlePart}`);
-  if (activeAgents) {
+  if (serverActiveAgents !== null) {
+    if (serverActiveAgents > 0) {
+      console.log(`${serverActiveAgents} agent(s) actively running in the cloud.`);
+    } else {
+      console.log("No agents running in the cloud right now.");
+    }
+  } else if (activeAgents) {
     console.log("Active agents likely running.");
   } else {
     console.log("No recent activity.");
@@ -2805,6 +2819,9 @@ type AttachTarget = {
 
 type AttachResult = "exited" | "failed";
 
+const KITTY_KEYBOARD_PUSH = "\x1b[>5u";
+const KITTY_KEYBOARD_POP = "\x1b[<u";
+
 async function runAttach(target: AttachTarget, options: CloudCommandOptions): Promise<AttachResult> {
   const client = await cloudClient({ requireToken: true });
   const baseUrl = client.baseUrl;
@@ -2825,6 +2842,15 @@ async function runAttach(target: AttachTarget, options: CloudCommandOptions): Pr
   return await new Promise<AttachResult>((resolve, reject) => {
     const socket = new WebSocket(wsUrl, {
       headers: { authorization: `Bearer ${token}` },
+      // Do NOT negotiate permessage-deflate on the attach client. Keystrokes and
+      // echoes are tiny (uncompressed either way), the remote dashboard writes
+      // cell-diffs, and with deflate enabled every redraw over 1KB pays a zlib
+      // round on BOTH sides — on the relay's event loop that also head-of-line
+      // blocks the keystroke frames queued behind a redraw burst, which is
+      // exactly "typing feels slow while the agent is streaming". Raw frames
+      // are bounded (~100KB worst-case repaint), so the bandwidth cost of
+      // skipping compression is negligible next to the latency it removes.
+      perMessageDeflate: false,
     });
     socket.binaryType = "nodebuffer";
     let opened = false;
@@ -2900,6 +2926,7 @@ async function runAttach(target: AttachTarget, options: CloudCommandOptions): Pr
         // Disable local mouse capture before leaving raw mode so the user's
         // shell prompt does not get spammed with mouse SGR bytes.
         try {
+          stdout.write(KITTY_KEYBOARD_POP);
           stdout.write("\x1b[?1006l\x1b[?1002l\x1b[?1000l");
         } catch {
           // ignore
@@ -3061,6 +3088,11 @@ async function runAttach(target: AttachTarget, options: CloudCommandOptions): Pr
         // to enable mouse capture locally too.
         try {
           stdout.write("\x1b[?1000h\x1b[?1002h\x1b[?1006h");
+        } catch {
+          // ignore
+        }
+        try {
+          stdout.write(KITTY_KEYBOARD_PUSH);
         } catch {
           // ignore
         }

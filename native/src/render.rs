@@ -422,6 +422,7 @@ pub(crate) enum Bucket {
     Todo,
     InProgress,
     Review,
+    Cloud,
     Done,
     Closed,
 }
@@ -429,11 +430,15 @@ pub(crate) enum Bucket {
 impl Bucket {
     /// Sections in display order; main agents + the orchestrator render above all of these.
     /// One-off agents lead (they are quick, transient, and what you most recently asked for).
-    const ORDER: [Bucket; 6] = [
+    /// Cloud-owned rows sit after review: that is live remote work, and burying it
+    /// in the collapsed closed drawer is exactly how a migrated agent got
+    /// misread as dead and deleted while it was still running in Rudder Cloud.
+    const ORDER: [Bucket; 7] = [
         Bucket::OneOff,
         Bucket::Todo,
         Bucket::InProgress,
         Bucket::Review,
+        Bucket::Cloud,
         Bucket::Done,
         Bucket::Closed,
     ];
@@ -445,6 +450,7 @@ impl Bucket {
             Bucket::Todo => "todo",
             Bucket::InProgress => "in progress",
             Bucket::Review => "review",
+            Bucket::Cloud => "cloud",
             Bucket::Done => "done",
             Bucket::Closed => "closed",
         }
@@ -505,6 +511,10 @@ pub(crate) fn in_drawer(agents: &[AgentRun], agent: &AgentRun) -> bool {
 ///                `planned_nodes` queue, not from agents).
 /// - in progress: Running (incl. steering/verifying via AgentStatus::Running).
 /// - review:      completed-but-not-merged (Done), plus needs-permission/-input.
+/// - cloud:       Migrated — the row's work lives in Rudder Cloud now. Rudder
+///                owns the record but NOT the execution: it must stay visible
+///                (live remote work) and must not be locally deleted, merged,
+///                resumed, or reviewed as if the workspace were still local.
 /// - done:        Merged.
 /// - closed:      Failed / Stopped (cancelled).
 ///
@@ -539,6 +549,9 @@ pub(crate) fn status_bucket(agent: &AgentRun) -> Bucket {
     // and is awaiting your review/merge. (Previously needs_permission/needs_user_input
     // forced a running agent into Review, which read as "finished" and was confusing.)
     // One-off conversational agents get their own leading section regardless of run status.
+    if is_cloud_owned_agent(agent) {
+        return Bucket::Cloud;
+    }
     if agent.is_oneoff() {
         return Bucket::OneOff;
     }
@@ -546,11 +559,11 @@ pub(crate) fn status_bucket(agent: &AgentRun) -> Bucket {
         AgentStatus::Running => Bucket::InProgress,
         AgentStatus::Done => Bucket::Review,
         AgentStatus::Merged => Bucket::Done,
+        AgentStatus::Migrated => Bucket::Cloud,
         AgentStatus::Failed
         | AgentStatus::Stopped
         | AgentStatus::Paused
-        | AgentStatus::Orphaned
-        | AgentStatus::Migrated => Bucket::Closed,
+        | AgentStatus::Orphaned => Bucket::Closed,
     }
 }
 
@@ -896,8 +909,15 @@ fn render_status_section<'a>(
         ])));
         return true;
     }
+    // The cloud section gets the ☁ glyph on the header so it reads as "live
+    // in Rudder Cloud", not as another local status bucket.
+    let header_label = if bucket == Bucket::Cloud {
+        "☁ cloud"
+    } else {
+        bucket.label()
+    };
     lines.push(ListItem::new(Line::from(vec![
-        Span::styled(bucket.label(), header_style(focused)),
+        Span::styled(header_label, header_style(focused)),
         Span::styled(format!(" {}", members.len()), muted_style(focused)),
     ])));
 
@@ -4293,7 +4313,9 @@ pub(crate) fn review_lines(app: &mut App, height: usize) -> Vec<Line<'static>> {
 /// the SAME string: if these drift, the pane height and mouse selection bounds
 /// disagree and clicks on valid input rows get rejected.
 pub(crate) fn task_default_hint(app: &App) -> &'static str {
-    if app.plan().planner_paused_for_input {
+    if app.cloud_mode {
+        "cloud mode  ·  tasks start in Rudder Cloud and keep running while you're away  ·  /cloud off to go local"
+    } else if app.plan().planner_paused_for_input {
         "↳ the planner asked a question — answer here or in the orchestrator pane"
     } else if app.plan().awaiting_approval {
         "type to talk to the orchestrator, or press Enter to approve  ·  Option-1/2/3 or ^W pane"
@@ -4339,6 +4361,12 @@ pub(crate) fn notice_style(text: &str, focused: bool) -> Style {
 /// `task · claude opus(high)` — the backend, model and effort a new agent gets.
 /// `/fast` is called out because it changes behaviour without changing the model.
 pub(crate) fn task_pane_title(app: &App) -> String {
+    // Cloud mode moves execution off this machine; the local model dial is not
+    // the model that would run. Say where the task goes instead of implying a
+    // local launch.
+    if app.cloud_mode {
+        return "task · Rudder Cloud".to_string();
+    }
     let model = app.model.trim();
     if model.is_empty() {
         // opencode's legitimate "use your configured default".
@@ -4386,6 +4414,8 @@ pub(crate) fn render_task(frame: &mut Frame<'_>, area: Rect, app: &App) {
             let display = if app.task_input.is_empty() {
                 if app.plan().awaiting_approval {
                     "Type to refine the plan, or press Enter to approve"
+                } else if app.cloud_mode {
+                    "Type a task to run in Rudder Cloud"
                 } else {
                     "Type a task to plan and run"
                 }
@@ -5341,6 +5371,18 @@ pub(crate) fn is_cloud_agent(agent: &AgentRun) -> bool {
         || agent.task.starts_with("cloud ")
         || agent.current_prompt == "cloud"
         || agent.current_prompt.starts_with("cloud ")
+}
+
+pub(crate) fn cloud_sail_id(agent: &AgentRun) -> Option<&str> {
+    agent
+        .task
+        .strip_prefix("cloud sail ")
+        .and_then(|rest| rest.split_once(" · ").map(|(id, _)| id).or(Some(rest)))
+        .filter(|id| !id.trim().is_empty())
+}
+
+pub(crate) fn is_cloud_owned_agent(agent: &AgentRun) -> bool {
+    agent.status == AgentStatus::Migrated || cloud_sail_id(agent).is_some()
 }
 
 // status_color now lives in theme.rs (re-exported via the crate root).

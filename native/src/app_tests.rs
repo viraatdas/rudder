@@ -113,10 +113,12 @@ static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// Every process-global var the harness injects. `EnvGuard` snapshots these on
 /// acquisition and puts them back on drop, so the list must stay a superset of what
 /// the tests set — a var missing here is a var that can leak.
-const GUARDED_ENV: [&str; 8] = [
+const GUARDED_ENV: [&str; 10] = [
     "HOME",
     "PATH",
     "RUDDER_CLAUDE_BIN",
+    "RUDDER_CLI",
+    "RUDDER_CLOUD_TOKEN",
     "RUDDER_CODEX_BIN",
     "RUDDER_HOME",
     "RUDDER_INTERACTIVE_ORCHESTRATOR",
@@ -20615,4 +20617,163 @@ fn the_gam_reviewer_can_never_raise_a_permission_prompt() {
     // The generator is unchanged: it writes, so it bypasses by design.
     let gen = agent_command(Backend::Claude, "opus", None, "do it", AgentMode::Execute, None);
     assert!(gen.args.join(" ").contains("bypassPermissions"));
+}
+
+#[test]
+fn cloud_owned_agents_stay_visible_and_refuse_local_actions() {
+    let mut command = test_agent_run("cloud-command", "cloud list");
+    command.status = AgentStatus::Done;
+    assert!(!is_cloud_owned_agent(&command));
+    assert_eq!(status_bucket(&command), Bucket::Review);
+
+    let mut app = App::new();
+    let mut run = test_agent_run("cloud-1", "finish the remote task");
+    run.status = AgentStatus::Migrated;
+    app.agents = vec![run];
+    app.selected_agent = 0;
+
+    assert_eq!(app.visible_agent_indices(), vec![0]);
+    assert_eq!(status_bucket(&app.agents[0]), Bucket::Cloud);
+    assert!(!crate::render::bucket_is_drawer(&app.agents, Bucket::Cloud));
+    let screen = render_screen(&mut app, 120, 40);
+    assert!(
+        screen.contains("cloud"),
+        "cloud section stays visible:\n{screen}"
+    );
+
+    app.toggle_worker_view();
+    assert!(app
+        .notice
+        .as_deref()
+        .unwrap_or_default()
+        .contains("cloud workspace"));
+    assert_eq!(app.worker_view, WorkerView::Terminal);
+
+    app.request_merge_selected_agent();
+    assert!(app
+        .notice
+        .as_deref()
+        .unwrap_or_default()
+        .contains("merges from"));
+    assert!(!app.stop_agent_at(0));
+    assert!(app
+        .notice
+        .as_deref()
+        .unwrap_or_default()
+        .contains("nothing to stop locally"));
+
+    app.delete_selected_agent();
+    assert!(app.delete_pending.is_none());
+    assert!(app
+        .notice
+        .as_deref()
+        .unwrap_or_default()
+        .contains("cloud-owned"));
+    assert_eq!(
+        app.agents.len(),
+        1,
+        "the local pointer to remote work survives"
+    );
+}
+
+#[test]
+fn cloud_mode_persists_and_routes_plain_tasks_to_cloud() {
+    let _env = env_guard();
+    let repo = unique_test_repo("cloud-mode");
+    let fake_rudder = repo.join("rudder");
+    write_fake_bin(
+        &fake_rudder,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$PWD/cloud-args.txt\"\nsleep 10\n",
+    );
+    std::env::set_var("RUDDER_CLI", &fake_rudder);
+    std::env::set_var("RUDDER_CLOUD_TOKEN", "rdr_test_cloud_mode");
+
+    let mut app = App::new();
+    app.cwd = repo.clone();
+    assert!(app.handle_command("/cloud on"));
+    assert!(app.cloud_mode);
+    assert!(read_cloud_mode(&repo));
+
+    app.start_task_from_input("fix this remotely");
+    let run = app.agents.last_mut().expect("cloud command row");
+    assert!(run.plain_process);
+    let sail_id = cloud_sail_id(run).expect("durable sail id").to_string();
+    assert!(sail_id.starts_with("cloud-rdr-"));
+    assert_eq!(status_bucket(run), Bucket::Cloud);
+    assert!(run.terminal.is_some());
+    if let Some(terminal) = run.terminal.as_mut() {
+        terminal.terminate_and_wait();
+    }
+    run.terminal = None;
+    run.status = AgentStatus::Paused;
+
+    let row_count = app.agents.len();
+    app.handle_agents_key(KeyEvent::from(KeyCode::Enter));
+    assert_eq!(app.agents.len(), row_count, "reattach reuses the Cloud row");
+    assert_eq!(app.agents.last().unwrap().status, AgentStatus::Running);
+    assert!(app.agents.last().unwrap().terminal.is_some());
+    let args_path = repo.join("cloud-args.txt");
+    let mut attached_args = String::new();
+    for _ in 0..40 {
+        attached_args = fs::read_to_string(&args_path).unwrap_or_default();
+        if attached_args == format!("cloud\nattach\n{sail_id}\n") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert_eq!(attached_args, format!("cloud\nattach\n{sail_id}\n"));
+    if let Some(terminal) = app.agents.last_mut().unwrap().terminal.as_mut() {
+        terminal.terminate_and_wait();
+    }
+    app.agents.last_mut().unwrap().terminal = None;
+
+    assert!(app.handle_command("/cloud off"));
+    assert!(!app.cloud_mode);
+    assert!(!read_cloud_mode(&repo));
+    let _ = fs::remove_dir_all(repo);
+}
+
+#[test]
+fn cloud_workspace_label_distinguishes_attached_running_and_idle() {
+    let base = CloudWorkspaceStatus {
+        id: Some("ws-123".to_string()),
+        status: Some("running".to_string()),
+        active_agents_known: true,
+        ..CloudWorkspaceStatus::default()
+    };
+
+    let mut attached = base.clone();
+    attached.client_count = 2;
+    assert!(cloud_workspace_label(Some(&attached)).contains("2 attached"));
+
+    let mut working = base.clone();
+    working.active_agents = 3;
+    assert!(cloud_workspace_label(Some(&working)).contains("3 running"));
+
+    assert!(cloud_workspace_label(Some(&base)).ends_with("idle"));
+}
+
+#[test]
+fn alt_h_hides_panes_from_the_task_pane_too() {
+    let mut app = App::new();
+    app.focus = FocusPane::Task;
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::ALT));
+    assert!(
+        app.solo_pane,
+        "Option+h works at the cloud dashboard's initial task focus"
+    );
+    assert_eq!(
+        app.focus,
+        FocusPane::Worker,
+        "hidden task input cannot retain focus"
+    );
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::ALT));
+    assert!(!app.solo_pane);
+    assert_eq!(
+        app.focus,
+        FocusPane::Task,
+        "restoring panes restores task focus"
+    );
 }

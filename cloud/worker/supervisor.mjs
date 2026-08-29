@@ -13,6 +13,8 @@ import { StringDecoder } from "node:string_decoder";
 import { WebSocket } from "ws";
 import pty from "node-pty";
 
+import { countActiveAgents } from "./active-runs.mjs";
+
 const cloudUrl = (process.env.RUDDER_CLOUD_URL || "").trim();
 const sailId = (process.env.RUDDER_SAIL_ID || "").trim();
 const workspaceId = (process.env.RUDDER_WORKSPACE_ID || "").trim();
@@ -672,6 +674,13 @@ function heartbeatUrl() {
   return `${cloudUrl.replace(/\/$/, "")}/api/rudder/${sessionKind}/${encodeURIComponent(sessionId)}/heartbeat`;
 }
 
+// Count the rudder runs that are ACTIVELY WORKING in this worker (the remote
+// dashboard/worker writes <repo>/.rudder/runs/<id>/run.json for each agent).
+// The control plane uses this as the busy signal for idle sweeps: a workspace
+// whose agents are mid-task must never be stopped just because the user's
+// laptop disconnected — heartbeats alone only prove the machine is alive, not
+// that it is doing something. 0 when nothing rudder-shaped is running (or the
+// state is unreadable — a broken read must read as idle, not busy).
 function reportHeartbeat() {
   if (!cloudUrl || !sessionId || !workerToken) {
     return;
@@ -682,7 +691,11 @@ function reportHeartbeat() {
       "content-type": "application/json",
       authorization: `Bearer ${workerToken}`,
     },
-    body: JSON.stringify({ state: lastReportedState, machineId: flyMachineId || undefined }),
+    body: JSON.stringify({
+      state: lastReportedState,
+      machineId: flyMachineId || undefined,
+      activeAgents: countActiveAgents(),
+    }),
   }).catch(() => undefined);
 }
 

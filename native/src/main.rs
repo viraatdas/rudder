@@ -1502,6 +1502,10 @@ struct App {
     effort: Option<EffortLevel>,
     notice: Option<String>,
     cloud_prompt: Option<CloudLaunchPrompt>,
+    /// Per-repo cloud mode: plain task input launches a Rudder Cloud worker
+    /// instead of a local one, and the task pane says so. Persisted to
+    /// `.rudder/cloud-mode.json` (cloudio::read/write_cloud_mode).
+    cloud_mode: bool,
     delete_pending: Option<String>,
     /// Frame counter + the frame at which `delete_pending` was armed. The
     /// confirming `d` only counts once at least one frame has RENDERED after
@@ -1782,7 +1786,11 @@ struct CloudSummary {
 struct CloudWorkspaceStatus {
     id: Option<String>,
     status: Option<String>,
-    active_agents: bool,
+    /// How many rudder runs are ACTIVELY WORKING in the cloud machine, as
+    /// reported by the worker itself (0 = nothing running; None/unknown = the
+    /// control plane predates the field). A fact, not the old activity guess.
+    active_agents: u32,
+    active_agents_known: bool,
     client_count: u32,
     idle_minutes: Option<u32>,
 }
@@ -2477,6 +2485,13 @@ impl App {
             .map(|path| dashboard_root(&path))
             .unwrap_or_else(|_| PathBuf::from("."));
         let selection = initial_selection();
+        // Read the per-repo cloud-mode flag BEFORE the struct literal takes
+        // ownership of `cwd`. Tests pin it off (they share repo dirs).
+        let cloud_mode = if cfg!(test) {
+            false
+        } else {
+            read_cloud_mode(&cwd)
+        };
         let bg_notices = mpsc::channel::<String>();
         let dashboard_color_mode = if cfg!(test) {
             ColorMode::Terminal
@@ -2602,6 +2617,7 @@ impl App {
             effort: selection.effort,
             notice: None,
             cloud_prompt: None,
+            cloud_mode,
             delete_pending: None,
             frames_drawn: 0,
             delete_armed_frame: 0,
@@ -3033,6 +3049,99 @@ impl App {
             .get(self.selected_agent)
             .map(|run| run.is_orchestrator())
             .unwrap_or(false)
+    }
+
+    /// True when the selected row's work lives in Rudder Cloud. The local
+    /// dashboard owns the record, not the execution, so local actions that assume
+    /// a live local workspace (merge,
+    /// stop, review, resume, delete) must refuse instead of guessing.
+    fn selected_is_cloud_owned(&self) -> bool {
+        self.agents
+            .get(self.selected_agent)
+            .is_some_and(is_cloud_owned_agent)
+    }
+
+    /// Open an attach pane for the cloud workspace that owns the selected
+    /// migrated row. That workspace IS the execution; attaching is the only
+    /// local action that reaches it.
+    fn attach_selected_cloud_agent(&mut self) {
+        if !rudder_cloud_authenticated() {
+            self.notice = Some("not logged in to Rudder Cloud; run /login first".to_string());
+            return;
+        }
+        let Some(run) = self.agents.get(self.selected_agent) else {
+            return;
+        };
+        if let Some(sail_id) = cloud_sail_id(run).map(str::to_string) {
+            self.reattach_cloud_sail_at(self.selected_agent, &sail_id);
+        } else if run.status == AgentStatus::Migrated {
+            self.push_activity(
+                "cloud: opening the workspace that owns a migrated agent".to_string(),
+            );
+            self.start_rudder_cli_command(
+                "cloud workspace attach",
+                vec![
+                    "cloud".to_string(),
+                    "workspace".to_string(),
+                    "attach".to_string(),
+                ],
+            );
+        } else {
+            self.notice = Some(
+                "cloud session has no saved sail id; use /cloud list, then /cloud attach <id>"
+                    .to_string(),
+            );
+        }
+    }
+
+    fn reattach_cloud_sail_at(&mut self, index: usize, sail_id: &str) {
+        let program = crate::cloudio::locate_rudder_cli()
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_else(|| "rudder".to_string());
+        let command = TerminalCommand::with_args(
+            program,
+            vec![
+                "cloud".to_string(),
+                "attach".to_string(),
+                sail_id.to_string(),
+            ],
+        );
+        let options = TerminalPaneOptions {
+            size: TerminalSize::default(),
+            cwd: Some(self.cwd.clone()),
+            ..TerminalPaneOptions::default()
+        };
+        match TerminalPane::spawn_shell_or_command(Some(command), options) {
+            Ok(mut terminal) => {
+                let _ = terminal.drain_output();
+                Self::attach_output_waker(&self.pty_output_waker, &terminal);
+                let Some(run) = self.agents.get_mut(index) else {
+                    terminal.terminate_and_wait();
+                    return;
+                };
+                if let Some(mut old_terminal) = run.terminal.take() {
+                    old_terminal.terminate_and_wait();
+                }
+                run.terminal = Some(terminal);
+                run.status = AgentStatus::Running;
+                run.completed_at = None;
+                run.last_error = None;
+                run.last_output_at = Instant::now();
+                let _ = save_native_run_record(&self.cwd, run);
+                self.notice = Some(format!("reattached cloud sail {sail_id}"));
+                self.push_activity(format!("cloud: reattached {sail_id}"));
+                self.dirty = true;
+            }
+            Err(error) => {
+                if let Some(run) = self.agents.get_mut(index) {
+                    run.status = AgentStatus::Paused;
+                    run.last_error = Some(error.to_string());
+                    let _ = save_native_run_record(&self.cwd, run);
+                }
+                self.notice = Some(format!("cloud attach failed: {error}"));
+                self.dirty = true;
+            }
+        }
     }
 
     fn selected_uses_headless_orchestrator_chat(&self) -> bool {
@@ -3602,6 +3711,13 @@ impl App {
                     self.delete_pending = None;
                     if self.selected_is_main() {
                         self.focus_or_spawn_main();
+                    } else if self.selected_is_cloud_owned() {
+                        let has_live_attach = self.agents[self.selected_agent].terminal.is_some()
+                            && self.agents[self.selected_agent].status == AgentStatus::Running;
+                        if !has_live_attach {
+                            self.attach_selected_cloud_agent();
+                        }
+                        self.focus = FocusPane::Worker;
                     } else if self.agents[self.selected_agent].status == AgentStatus::Paused {
                         let index = self.selected_agent;
                         if self.agents[index].is_orchestrator() {
@@ -4351,6 +4467,17 @@ impl App {
                 }
             };
             self.focus = FocusPane::Worker;
+            return;
+        }
+        // A cloud-owned row has no local diff to review: the workspace snapshot
+        // is stale the moment the cloud agent keeps editing. The diff that
+        // matters is in the cloud workspace. (Diff -> Terminal still works so
+        // a view left open when the row migrated can be backed out of.)
+        if self.selected_is_cloud_owned() && self.worker_view == WorkerView::Terminal {
+            self.notice = Some(
+                "cloud-owned agent: review it in its cloud workspace — Enter attaches to it"
+                    .to_string(),
+            );
             return;
         }
         self.worker_view = match self.worker_view {
@@ -6157,6 +6284,15 @@ impl App {
         // loses all prior context.
         if self.planner_awaiting_input() {
             self.refine_plan(&input);
+            return;
+        }
+
+        // CLOUD MODE: the per-repo `/cloud` flag redirects the DEFAULT route.
+        // Everything above (slash commands, plan refine/approval, planner
+        // questions) still wins, because those are conversations with things
+        // already running HERE; only "start new work" changes where it starts.
+        if self.cloud_mode {
+            self.start_cloud_task(input);
             return;
         }
 
@@ -8486,8 +8622,12 @@ Address the objection directly. If you disagree, say why inside \
         if run.terminal.is_some()
             || run.plain_process
             || run.is_orchestrator()
+            || run.status == AgentStatus::Migrated
             || !can_resume_agent(run)
         {
+            // Migrated rows never reopen locally: the live conversation belongs
+            // to the cloud workspace now, and `claude --resume` here would run a
+            // second, diverging copy of the same session.
             return false;
         }
         if !self.focus_resume_attempted.insert(run.id.clone()) {
@@ -9694,24 +9834,50 @@ It will tend to agree with itself — name another with /gam <provider> <model> 
             }
             Some("/cloud") => {
                 let raw_args = parts.collect::<Vec<_>>();
-                if cloud_args_need_auth(&raw_args) && !rudder_cloud_authenticated() {
-                    self.notice =
-                        Some("not logged in to Rudder Cloud; run /login first".to_string());
-                    return true;
+                // Cloud mode is dashboard state, not a CLI passthrough: bare
+                // `/cloud` toggles it, and `on`/`off` set it explicitly. With
+                // it on, plain task input starts workers in Rudder Cloud and
+                // keeps running there when this laptop disconnects.
+                match raw_args.first().copied() {
+                    None | Some("mode") => {
+                        self.set_cloud_mode(!self.cloud_mode);
+                    }
+                    Some("on") => {
+                        self.set_cloud_mode(true);
+                    }
+                    Some("off") | Some("local") => {
+                        self.set_cloud_mode(false);
+                    }
+                    Some("latency") => {
+                        if !rudder_cloud_authenticated() {
+                            self.notice =
+                                Some("not logged in to Rudder Cloud; run /login first".to_string());
+                            return true;
+                        }
+                        self.start_rudder_cli_command(
+                            "cloud latency probe",
+                            vec![
+                                "cloud".to_string(),
+                                "workspace".to_string(),
+                                "attach".to_string(),
+                                "--latency-probe".to_string(),
+                            ],
+                        );
+                    }
+                    Some(_) => {
+                        if cloud_args_need_auth(&raw_args) && !rudder_cloud_authenticated() {
+                            self.notice =
+                                Some("not logged in to Rudder Cloud; run /login first".to_string());
+                            return true;
+                        }
+                        if self.maybe_prompt_cloud_launch(&raw_args) {
+                            return true;
+                        }
+                        let args = self.cloud_command_args(raw_args.clone());
+                        let label = cloud_agent_label(&args);
+                        self.start_rudder_cli_command(&label, args);
+                    }
                 }
-                if raw_args.is_empty() {
-                    self.notice = Some(
-                        "Exit this dashboard and run `rudder cloud` to open the cloud workspace."
-                            .to_string(),
-                    );
-                    return true;
-                }
-                if self.maybe_prompt_cloud_launch(&raw_args) {
-                    return true;
-                }
-                let args = self.cloud_command_args(raw_args.clone());
-                let label = cloud_agent_label(&args);
-                self.start_rudder_cli_command(&label, args);
                 true
             }
             Some("/main") | Some("/m") => {
@@ -10069,6 +10235,65 @@ It will tend to agree with itself — name another with /gam <provider> <model> 
         self.task_cursor = 0;
         self.focus = FocusPane::Worker;
         self.worker_view = WorkerView::Terminal;
+    }
+
+    /// Toggle the per-repo cloud-mode flag with the auth gate and a notice that
+    /// says what changed. Enabling requires cloud login; disabling never does.
+    fn set_cloud_mode(&mut self, enabled: bool) {
+        if enabled && !rudder_cloud_authenticated() {
+            self.notice = Some("not logged in to Rudder Cloud; run /login first".to_string());
+            return;
+        }
+        if self.cloud_mode == enabled {
+            self.notice = Some(if enabled {
+                "cloud mode is already on · /cloud off returns task input to local workers"
+                    .to_string()
+            } else {
+                "cloud mode is already off".to_string()
+            });
+            return;
+        }
+        self.cloud_mode = enabled;
+        let cwd = self.cwd.clone();
+        write_cloud_mode(&cwd, enabled);
+        self.push_activity(if enabled {
+            "cloud mode on: plain task input now starts workers in Rudder Cloud".to_string()
+        } else {
+            "cloud mode off: plain task input returns to local workers".to_string()
+        });
+        self.notice = Some(if enabled {
+            "cloud mode on: tasks typed here start in Rudder Cloud and keep running when you disconnect  ·  /cloud off to go local"
+                .to_string()
+        } else {
+            "cloud mode off: tasks start locally again".to_string()
+        });
+        self.dirty = true;
+    }
+
+    /// Launch a cloud worker on `task` (`rudder cloud "<task>"` starts a sail
+    /// that runs the task in the cloud). The pane is the local window onto it;
+    /// the execution keeps going after this laptop disconnects.
+    fn start_cloud_task(&mut self, task: &str) {
+        if !rudder_cloud_authenticated() {
+            self.notice = Some("not logged in to Rudder Cloud; run /login first".to_string());
+            return;
+        }
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let launch_name = format!("rdr-{nanos}-{}", std::process::id());
+        let sail_id = format!("cloud-{launch_name}");
+        let label = format!("cloud sail {sail_id} · {}", short_task(task));
+        self.push_activity(format!("cloud task: {task}"));
+        self.start_rudder_cli_command_with_env(
+            &label,
+            vec!["cloud".to_string(), task.to_string()],
+            &[
+                ("RUDDER_CLOUD_RUNTIME", "fly"),
+                ("RUDDER_CLOUD_LAUNCH_NAME", &launch_name),
+            ],
+        );
     }
 
     fn maybe_prompt_cloud_launch(&mut self, raw_args: &[&str]) -> bool {
@@ -14606,6 +14831,21 @@ Files involved: {}
         let Some(selected) = self.agents.get(self.selected_agent) else {
             return;
         };
+        // Cloud-owned rows are records of work executing in Rudder Cloud.
+        // Deleting one here would silently discard the only local pointer to a
+        // fleet that keeps running remotely; attach manages the real thing.
+        if is_cloud_owned_agent(selected) {
+            let label = if selected.task_summary.trim().is_empty() {
+                short_task(&selected.task)
+            } else {
+                truncate_chars(selected.task_summary.trim(), 40)
+            };
+            self.notice = Some(format!(
+                "{label} is cloud-owned - manage it from its Cloud session; Enter attaches"
+            ));
+            self.dirty = true;
+            return;
+        }
         // A LIVE main row used to dead-end here: the refusal said "stop it with
         // x", but the x handler excludes main rows, so a running main agent
         // could be neither stopped nor deleted — dd just re-printed advice that
@@ -15167,6 +15407,16 @@ Files involved: {}
             self.notice = Some("no agent selected".to_string());
             return;
         };
+        // A cloud-owned row's diff lives in the cloud workspace and keeps
+        // moving there; merging the stale local workspace snapshot would land
+        // half-finished work in trunk while the real agent keeps editing it.
+        if is_cloud_owned_agent(run) {
+            self.notice = Some(
+                "cloud-owned agent: it merges from its cloud workspace — Enter attaches to it"
+                    .to_string(),
+            );
+            return;
+        }
         if run.status == AgentStatus::Merged {
             self.notice = Some("selected agent is already merged".to_string());
             return;
@@ -15886,6 +16136,16 @@ Files involved: {}
             let Some(run) = self.agents.get_mut(index) else {
                 return false;
             };
+            // Cloud-owned rows have no local PTY to kill; "stopping" one locally
+            // would just mislabel remote work that is still running. Stop it in
+            // the cloud workspace (Enter attaches there).
+            if is_cloud_owned_agent(run) {
+                self.notice = Some(
+                    "cloud-owned agent: there is nothing to stop locally — Enter attaches to its cloud workspace"
+                        .to_string(),
+                );
+                return false;
+            }
             // Main rows are stoppable: the body below only kills the PTY and
             // records Stopped — nothing here touches a workspace. The old
             // is_main() refusal here was the bottom of a three-layer dead end

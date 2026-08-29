@@ -225,16 +225,17 @@ pub(crate) fn suggestions_for(app: &App) -> Vec<Suggestion> {
         {
             let trailing_space = rest.ends_with(char::is_whitespace);
             let parts = rest.split_whitespace().collect::<Vec<_>>();
-            return match parts.first().and_then(|provider| provider_backend(provider)) {
+            return match parts
+                .first()
+                .and_then(|provider| provider_backend(provider))
+            {
                 // A named provider: offer its models, still filtering while the
                 // model token is being typed. A trailing space after the model
                 // means the rest of the line is task text, so the palette goes
                 // away.
                 Some(backend) => match parts.as_slice() {
                     [_provider] => gam_model_suggestions(backend, ""),
-                    [_provider, model] if !trailing_space => {
-                        gam_model_suggestions(backend, model)
-                    }
+                    [_provider, model] if !trailing_space => gam_model_suggestions(backend, model),
                     _ => Vec::new(),
                 },
                 // Not a provider. Only a lone, still-being-typed first word can
@@ -645,8 +646,13 @@ pub(crate) fn command_suggestions() -> Vec<Suggestion> {
         },
         Suggestion {
             label: "/cloud".to_string(),
-            detail: "onload this Rudder workspace or start scratch in Fly".to_string(),
+            detail: "toggle cloud mode: plain tasks run in Rudder Cloud".to_string(),
             action: SuggestionAction::RunCommand("/cloud".to_string()),
+        },
+        Suggestion {
+            label: "/cloud off".to_string(),
+            detail: "return plain task input to local workers".to_string(),
+            action: SuggestionAction::RunCommand("/cloud off".to_string()),
         },
         Suggestion {
             label: "/cloud list".to_string(),
