@@ -113,7 +113,7 @@ static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// Every process-global var the harness injects. `EnvGuard` snapshots these on
 /// acquisition and puts them back on drop, so the list must stay a superset of what
 /// the tests set — a var missing here is a var that can leak.
-const GUARDED_ENV: [&str; 10] = [
+const GUARDED_ENV: [&str; 13] = [
     "HOME",
     "PATH",
     "RUDDER_CLAUDE_BIN",
@@ -123,6 +123,9 @@ const GUARDED_ENV: [&str; 10] = [
     "RUDDER_HOME",
     "RUDDER_INTERACTIVE_ORCHESTRATOR",
     "RUDDER_NATIVE_PERF",
+    "RUDDER_SAIL_ID",
+    "RUDDER_WORKSPACE_ID",
+    "RUDDER_WORKER_TOKEN",
     "RUDDER_WORKTREE_GC_GRACE_SECS",
 ];
 
@@ -20751,6 +20754,40 @@ fn cloud_workspace_label_distinguishes_attached_running_and_idle() {
     assert!(cloud_workspace_label(Some(&working)).contains("3 running"));
 
     assert!(cloud_workspace_label(Some(&base)).ends_with("idle"));
+}
+
+#[test]
+fn cloud_worker_is_connected_without_exposing_worker_token_to_dashboard() {
+    let _env = env_guard();
+    std::env::set_var("RUDDER_WORKSPACE_ID", "churper-062a");
+    std::env::remove_var("RUDDER_WORKER_TOKEN");
+    std::env::remove_var("RUDDER_CLOUD_TOKEN");
+
+    let summary = read_cloud_summary();
+    assert!(summary.connected, "the in-VM identity is sufficient cloud proof");
+
+    let mut app = App::new();
+    app.cloud_connected = summary.connected;
+    app.cloud_workspace = query_cloud_workspace_status(&app.cwd);
+    app.focus = FocusPane::Agents;
+    let mut run = test_agent_run("cloud-main", "keep working remotely");
+    run.mode = AgentMode::Main;
+    app.agents = vec![run];
+    let screen = render_screen(&mut app, 220, 52);
+    assert!(screen.contains("cloud connected"), "{screen}");
+    assert!(
+        screen.contains("cloud 1 agent · persistent"),
+        "remote agents identify their real execution location:\n{screen}"
+    );
+    assert!(!screen.contains("shared checkout"), "{screen}");
+
+    std::env::remove_var("RUDDER_WORKSPACE_ID");
+    std::env::set_var("RUDDER_SAIL_ID", "sail-123");
+    let sail_screen = render_screen(&mut app, 220, 52);
+    assert!(
+        sail_screen.contains("cloud 1 agent · ephemeral"),
+        "sails must not claim persistent storage:\n{sail_screen}"
+    );
 }
 
 #[test]

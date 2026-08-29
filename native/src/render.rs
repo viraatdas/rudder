@@ -1578,10 +1578,17 @@ pub(crate) fn render_agents(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             // the SAME working copy, so the header states it: with only the per-row
             // "main" tag the shared-checkout risk had to be inferred by counting rows.
             let noun = if main_count == 1 { "agent" } else { "agents" };
+            let (section_name, location) = if is_cloud_workspace_session() {
+                ("☁ cloud", "persistent")
+            } else if is_cloud_worker_session() {
+                ("☁ cloud", "ephemeral")
+            } else {
+                ("main", "shared checkout")
+            };
             lines.push(ListItem::new(Line::from(vec![
-                Span::styled("main", header_style(focused)),
+                Span::styled(section_name, header_style(focused)),
                 Span::styled(
-                    format!(" {main_count} {noun} · shared checkout"),
+                    format!(" {main_count} {noun} · {location}"),
                     muted_style(focused),
                 ),
             ])));

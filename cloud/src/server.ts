@@ -767,7 +767,14 @@ function attachWorker(kind: ChannelKind, id: string, ws: WebSocket): void {
 function attachClient(kind: ChannelKind, id: string, ws: WebSocket): void {
   const channel = getChannel(kind, id);
   channel.clients.add(ws);
-  channel.controller = ws;
+  // One terminal owns input + PTY geometry at a time. A second observer must
+  // not steal control merely by connecting: doing so resized the shared PTY to
+  // the observer's dimensions and made the original terminal appear frozen.
+  // Control moves only when the current controller disconnects.
+  const becomesController = !isOpen(channel.controller);
+  if (becomesController) {
+    channel.controller = ws;
+  }
   enableSocketLiveness(ws);
   if (kind === "workspace") {
     touchWorkspaceActivity(id);
@@ -776,7 +783,7 @@ function attachClient(kind: ChannelKind, id: string, ws: WebSocket): void {
   sendSocket(ws, JSON.stringify({
     type: "status",
     state: isOpen(channel.worker) ? "worker-connected" : "worker-waiting",
-    control: "active",
+    control: becomesController ? "active" : "read-only",
   }));
   if (channel.bufferBytes > 0) {
     sendSocket(ws, Buffer.concat(channel.buffer, channel.bufferBytes), true);
@@ -791,6 +798,13 @@ function attachClient(kind: ChannelKind, id: string, ws: WebSocket): void {
     if (isBinary && data instanceof Buffer) {
       if (isOpen(worker)) {
         sendSocket(worker, data, true);
+      } else if (containsNonReplayableInterrupt(data)) {
+        // Ctrl+C is an instruction for the LOCAL attach to disconnect while
+        // the worker is absent. Replaying it into the next worker boot kills
+        // the fresh dashboard immediately. Drop the whole coalesced terminal
+        // chunk: bytes typed alongside a disconnect request are not safe to
+        // replay into a later process either.
+        sendSocket(ws, JSON.stringify({ type: "status", state: "interrupt-dropped" }));
       } else {
         pushPendingInput(channel, data);
         sendSocket(ws, JSON.stringify({ type: "status", state: "input-buffered" }));
@@ -814,6 +828,11 @@ function attachClient(kind: ChannelKind, id: string, ws: WebSocket): void {
   ws.on("close", () => {
     channel.clients.delete(ws);
     if (channel.controller === ws) {
+      // Buffered input and geometry belong to the controller that produced
+      // them. Never hand those bytes to a different terminal after promotion.
+      channel.pendingInput = [];
+      channel.pendingInputBytes = 0;
+      channel.latestResize = undefined;
       channel.controller = Array.from(channel.clients).reverse().find(isOpen);
       if (channel.controller) {
         sendSocket(channel.controller, JSON.stringify({
@@ -826,6 +845,17 @@ function attachClient(kind: ChannelKind, id: string, ws: WebSocket): void {
     disposeChannelIfEmpty(kind, id);
   });
   ws.on("error", () => undefined);
+}
+
+function containsNonReplayableInterrupt(data: Buffer): boolean {
+  return data.includes(0x03) || containsKittyCtrlC(data);
+}
+
+function containsKittyCtrlC(data: Buffer): boolean {
+  // With the disambiguate-escape-codes flag enabled, Kitty reports Ctrl+C as
+  // CSI 99;5u. Accept the optional event-type suffix used when a terminal has
+  // additional reporting flags enabled as well.
+  return /\x1b\[99;5(?::[123])?u/.test(data.toString("latin1"));
 }
 
 function pushBuffer(channel: Channel, chunk: Buffer): void {

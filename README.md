@@ -434,6 +434,14 @@ when the task is done; idle sails pause and can resume), while a **workspace** i
 persistent, volume-backed dev environment you can come back to. Both restore the same
 workspace snapshot.
 
+An active workspace agent keeps running when you close the terminal or lose the
+connection; the idle sweeper only stops a workspace after its reported active-agent
+count reaches zero. Re-running `rudder cloud` reconnects to the same volume and saved
+sessions. If several terminals attach, the first remains the input and resize
+controller; additional terminals are read-only observers until the controller leaves.
+This prevents another terminal's dimensions or disconnect keys from disrupting the
+shared remote dashboard.
+
 You can also tell the live orchestrator: "take the current agents and run them on
 Rudder Cloud." Rudder freezes the local worker PTYs first, then migrates every live
 isolated workspace. Claude sessions resume from their transcript when available;

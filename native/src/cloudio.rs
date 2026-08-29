@@ -3,24 +3,25 @@
 use super::*;
 
 pub(crate) fn is_cloud_worker_session() -> bool {
-    env::var("RUDDER_WORKSPACE_ID")
-        .ok()
-        .is_some_and(|v| !v.trim().is_empty())
+    is_cloud_workspace_session()
         || env::var("RUDDER_SAIL_ID")
             .ok()
             .is_some_and(|v| !v.trim().is_empty())
 }
 
+pub(crate) fn is_cloud_workspace_session() -> bool {
+    env::var("RUDDER_WORKSPACE_ID")
+        .ok()
+        .is_some_and(|v| !v.trim().is_empty())
+}
+
 pub(crate) fn read_cloud_summary() -> CloudSummary {
-    // Inside a cloud worker VM there is no user auth file and no
-    // RUDDER_CLOUD_TOKEN — the machine authenticates with its own
-    // RUDDER_WORKER_TOKEN. Without this, every in-VM dashboard rendered
+    // Inside a cloud worker VM there is no user auth file or client token.
+    // RUDDER_WORKSPACE_ID / RUDDER_SAIL_ID is the process's authoritative
+    // execution identity; the supervisor deliberately withholds its worker
+    // bearer from the dashboard child. Requiring that secret here rendered
     // "cloud offline" about the very cloud it was running in.
-    if is_cloud_worker_session()
-        && env::var("RUDDER_WORKER_TOKEN")
-            .ok()
-            .is_some_and(|token| !token.trim().is_empty())
-    {
+    if is_cloud_worker_session() {
         return CloudSummary {
             connected: true,
             runtime: env::var("RUDDER_CLOUD_RUNTIME")

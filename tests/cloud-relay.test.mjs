@@ -221,12 +221,22 @@ test("input is injected into the worker and output is read back", async (t) => {
     headers: { authorization: `Bearer ${cliToken}` },
   });
   clientWs.binaryType = "nodebuffer";
+  const clientStatuses = [];
+  clientWs.on("message", (data, isBinary) => {
+    if (isBinary) return;
+    try { clientStatuses.push(JSON.parse(Buffer.from(data).toString("utf8"))); } catch { /* ignore */ }
+  });
   await new Promise((resolve, reject) => {
     clientWs.once("open", resolve);
     clientWs.once("error", reject);
   });
   clientWs.send(JSON.stringify({ type: "resize", cols: 100, rows: 40 }));
+  clientWs.send(Buffer.from([0x61, 0x03, 0x62]), { binary: true });
+  await waitFor(() => clientStatuses.some((item) => item.state === "interrupt-dropped"));
+  clientWs.send(Buffer.from("x\x1b[99;5uy", "latin1"), { binary: true });
+  await waitFor(() => clientStatuses.filter((item) => item.state === "interrupt-dropped").length >= 2);
   clientWs.send(Buffer.from("buffered-keystroke", "utf8"), { binary: true });
+  await waitFor(() => clientStatuses.some((item) => item.state === "input-buffered"));
 
   const workspaceReceived = [];
   const workerWs = new WebSocket(`ws://127.0.0.1:${port}/api/rudder/workspace/${workspaceId}/worker`, {
@@ -246,6 +256,18 @@ test("input is injected into the worker and output is read back", async (t) => {
   await waitFor(() => workspaceReceived.some((item) => item.text.includes("buffered-keystroke")));
   assert.ok(workspaceReceived.some((item) => !item.isBinary && item.text.includes('"resize"')));
   assert.ok(workspaceReceived.some((item) => item.isBinary && item.text === "buffered-keystroke"));
+  assert.ok(
+    !workspaceReceived.some((item) => item.isBinary && item.text.includes("\x03")),
+    `coalesced Ctrl+C is never replayed into a newly booted dashboard: ${JSON.stringify(workspaceReceived)}`,
+  );
+  assert.ok(
+    !workspaceReceived.some((item) => item.isBinary && item.text.includes("\x1b[99;5u")),
+    "Kitty-encoded Ctrl+C is never replayed into a newly booted dashboard",
+  );
+  assert.ok(
+    !workspaceReceived.some((item) => item.isBinary && (item.text.includes("ab") || item.text.includes("xy"))),
+    "the entire terminal chunk containing a disconnect interrupt is discarded",
+  );
 
   // Historical PTY output is sent as one bounded replay frame instead of
   // thousands of per-write WebSocket frames.
@@ -264,12 +286,17 @@ test("input is injected into the worker and output is read back", async (t) => {
   await waitFor(() => liveBytes >= 320 * 1024, { timeout: 15000 });
   clientWs.off("message", countLiveBytes);
   const replayFrames = [];
+  const replayStatuses = [];
   const replayClient = new WebSocket(`ws://127.0.0.1:${port}/api/rudder/workspace/${workspaceId}/attach`, {
     headers: { authorization: `Bearer ${cliToken}` },
   });
   replayClient.binaryType = "nodebuffer";
   replayClient.on("message", (data, isBinary) => {
-    if (isBinary) replayFrames.push(Buffer.from(data));
+    if (isBinary) {
+      replayFrames.push(Buffer.from(data));
+    } else {
+      try { replayStatuses.push(JSON.parse(Buffer.from(data).toString("utf8"))); } catch { /* ignore */ }
+    }
   });
   await new Promise((resolve, reject) => {
     replayClient.once("open", resolve);
@@ -280,8 +307,28 @@ test("input is injected into the worker and output is read back", async (t) => {
   assert.equal(replayFrames.length, 1, "replay is coalesced into one frame");
   assert.ok(replayFrames[0].length <= 256 * 1024, "replay stays within its byte budget");
 
-  ws.close();
+  // A second viewer is read-only: it must not steal PTY geometry or input from
+  // the terminal already controlling the workspace.
+  await waitFor(() => replayStatuses.some((item) => item.control === "read-only"));
+  const beforeObserverInput = workspaceReceived.length;
+  replayClient.send(JSON.stringify({ type: "resize", cols: 55, rows: 10 }));
+  replayClient.send(Buffer.from("observer-must-not-type", "utf8"), { binary: true });
+  await sleep(150);
+  const observerTraffic = workspaceReceived.slice(beforeObserverInput);
+  assert.ok(!observerTraffic.some((item) => item.text.includes("observer-must-not-type")));
+  assert.ok(!observerTraffic.some((item) => item.text.includes('"cols":55')));
+
+  // When the controller leaves, the waiting viewer is promoted and sends its
+  // own current dimensions. Stale bytes/size from the old controller are not
+  // inherited across the ownership change.
   clientWs.close();
+  await waitFor(() => replayStatuses.some((item) => item.state === "controller-promoted"));
+  replayClient.send(JSON.stringify({ type: "resize", cols: 140, rows: 50 }));
+  replayClient.send(Buffer.from("promoted-input", "utf8"), { binary: true });
+  await waitFor(() => workspaceReceived.some((item) => item.text.includes("promoted-input")));
+  assert.ok(workspaceReceived.some((item) => item.text.includes('"cols":140')));
+
+  ws.close();
   replayClient.close();
   workerWs.close();
 });
