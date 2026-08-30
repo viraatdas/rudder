@@ -3,6 +3,7 @@ cloud/dist/
 dist/
 target/
 .rudder/
+.ledger/
 .rudder-worktrees/
 .claude/
 npm-debug.log*
