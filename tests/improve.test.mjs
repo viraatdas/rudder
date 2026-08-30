@@ -12,6 +12,7 @@ import {
   runHadMergeConflict,
   watermarkValueMs,
 } from "../dist/improve/collect.js";
+import { IMPROVE_DEFAULTS, resolveImproveSettings } from "../dist/improve/state.js";
 
 const finding = (over = {}) => ({
   id: "f-test-0",
@@ -23,6 +24,19 @@ const finding = (over = {}) => ({
   frequency: 3,
   suspectedSurfaces: ["native/src/tasks.rs"],
   ...over,
+});
+
+test("continual improvement prepares review branches by default instead of publishing", () => {
+  assert.equal(IMPROVE_DEFAULTS.autonomy, "propose");
+  const settings = resolveImproveSettings({ backends: {} }, "/tmp/rudder");
+  assert.equal(settings.autonomy, "propose");
+  assert.equal(settings.enabled, true);
+
+  const optedIn = resolveImproveSettings(
+    { backends: {}, improve: { autonomy: "ship" } },
+    "/tmp/rudder",
+  );
+  assert.equal(optedIn.autonomy, "ship");
 });
 
 test("parseFindingsJson reads a fenced json array", () => {

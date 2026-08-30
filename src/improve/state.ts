@@ -71,7 +71,10 @@ export type ImproveSettings = {
 };
 
 export const IMPROVE_DEFAULTS = {
-  autonomy: "ship" as ImproveAutonomy,
+  // The loop may prepare a complete, reviewed branch by default, but publishing
+  // a globally installed CLI is an explicit trust decision. Users who want the
+  // old unattended behavior can opt in with `improve.autonomy: "ship"`.
+  autonomy: "propose" as ImproveAutonomy,
   budgetUsd: 5,
   maxFindings: 3,
   allowedRemote: "viraatdas/rudder",

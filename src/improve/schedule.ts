@@ -70,6 +70,8 @@ export async function scheduleCommand(action: string): Promise<void> {
         await runCommand("launchctl", ["load", "-w", plistPath()]);
       }
       console.log(`Installed ${shortenHome(plistPath())}: nightly \`rudder improve run\` at 03:30.`);
+      console.log('Default autonomy is "propose": reviewed branches are pushed for you, but releases require a human.');
+      console.log('Set improve.autonomy to "ship" only if you explicitly want unattended npm releases.');
       console.log(`Logs: ${shortenHome(launchdLogPath())}`);
       return;
     }

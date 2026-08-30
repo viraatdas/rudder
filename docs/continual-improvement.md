@@ -263,7 +263,11 @@ Autonomy levels (`improve.autonomy` in config):
 - `observe` — collect/mine/rank only; write the report, propose nothing.
 - `propose` — full pipeline, then push branch `improve/<finding-id>` for
   human review instead of touching main.
-- `ship` — **default.** The full auto-push + auto-version flow above.
+- `ship` — explicit opt-in. The full auto-push + auto-version flow above.
+
+The default is `propose`: a scheduled loop can do the expensive collection,
+implementation, gates, and adversarial review unattended, but a person remains
+the release boundary for a globally installed CLI.
 
 ### 4.9 Report
 
@@ -276,8 +280,10 @@ spend. The dashboard surfaces one notice line when a new report exists
 
 ## 5. Budget and cost control
 
-Hard per-cycle ceiling, checked before every model call and every live eval
-trial: `improve.budgetUsd` (default 5). Order of spend is cheapest-first by
+Estimated per-cycle ceiling, checked before model calls and agent runs:
+`improve.budgetUsd` (default 5). CLI-backed agent usage is charged as a flat
+estimate because subscription authentication does not expose billable usage;
+API-backed judge/miner calls use reported tokens when available. Order of spend is cheapest-first by
 construction (collect is free; judges run last and only for survivors).
 Exhausting the budget mid-cycle is normal: the cycle closes, banks the
 remainder, and the report says where it stopped.
@@ -342,9 +348,9 @@ before/after. Three outcomes, all recorded:
   weight nudges up.
 - **no-effect** — metric flat; the ledger notes it, and a repeat finding on the
   same surface escalates to a bigger proposal rather than another tweak.
-- **regressed** — metric moved the wrong way; the loop opens a *revert
-  proposal* PR referencing the original, and the finding class's tractability
-  weight nudges down.
+- **regressed** — metric moved the wrong way; the ledger records the regression
+  and allows the finding to resurface for a new proposal. The loop does not
+  silently unpublish or revert a released npm version.
 
 This is the "continual" part: the judge panel approximates ground truth,
 production telemetry *is* ground truth, and disagreements retrain the loop's
@@ -385,7 +391,8 @@ adjusting rank weights).
 
 ## 10. Risks and mitigations
 
-- **A bad change auto-ships.** This is the accepted risk of `ship` autonomy.
+- **A bad change auto-ships.** This is the accepted risk of explicitly opting
+  into `ship` autonomy; the default `propose` mode keeps a human release gate.
   Defenses in order: deterministic gates (full test suites), refute-first
   judge panel that fails closed, non-forced push (main moving wins), remote
   allowlist, `rudder undo` / `git revert` for anything that lands, and the §8
