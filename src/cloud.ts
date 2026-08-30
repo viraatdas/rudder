@@ -539,7 +539,8 @@ async function launch(
     const client = await cloudClient({ requireToken: true });
     const runtime = await selectedCloudRuntime(explicitRuntime);
     const task = mode === "task" || runtime === "byo-vm" ? raw : "";
-    const name = task ? cloudNameFromTask(task) : raw || randomCloudName();
+    const launchName = process.env.RUDDER_CLOUD_LAUNCH_NAME?.trim();
+    const name = launchName || (task ? cloudNameFromTask(task) : raw || randomCloudName());
     const body: Record<string, JsonValue> = {
       repoName: path.basename(repoRoot),
       name,
@@ -2817,7 +2818,13 @@ async function workspaceStatus(args: string[], options: CloudCommandOptions): Pr
   const clientCount = typeof workspace.clientCount === "number" ? workspace.clientCount : 0;
   const lastActivityAt = typeof workspace.lastActivityAt === "string" ? workspace.lastActivityAt : undefined;
   const idleMinutes = computeIdleMinutes(lastActivityAt);
-  const activeAgents = clientCount > 0 || (idleMinutes !== null && idleMinutes < 5);
+  // Prefer the server's worker-reported busy count (a fact: how many rudder
+  // runs are actively working in that machine). Fall back to the old activity
+  // heuristic only for control planes that predate the field.
+  const serverActiveAgents = typeof workspace.activeAgents === "number" ? workspace.activeAgents : null;
+  const activeAgents = serverActiveAgents !== null
+    ? serverActiveAgents > 0
+    : clientCount > 0 || (idleMinutes !== null && idleMinutes < 5);
   if (options.json) {
     printJson({
       id,
@@ -2826,13 +2833,20 @@ async function workspaceStatus(args: string[], options: CloudCommandOptions): Pr
       lastActivityAt: lastActivityAt ?? null,
       idleMinutes,
       activeAgents,
+      activeAgentCount: serverActiveAgents,
       repoName: typeof workspace.repoName === "string" ? workspace.repoName : null,
     });
     return;
   }
   const idlePart = idleMinutes !== null ? `  idle ${idleMinutes}m` : "";
   console.log(`workspace ${id}  ${status}  clients=${clientCount}${idlePart}`);
-  if (activeAgents) {
+  if (serverActiveAgents !== null) {
+    if (serverActiveAgents > 0) {
+      console.log(`${serverActiveAgents} agent(s) actively running in the cloud.`);
+    } else {
+      console.log("No agents running in the cloud right now.");
+    }
+  } else if (activeAgents) {
     console.log("Active agents likely running.");
   } else {
     console.log("No recent activity.");
@@ -2920,6 +2934,10 @@ type AttachResult = "exited" | "failed";
 const KITTY_KEYBOARD_PUSH = "\x1b[>5u";
 const KITTY_KEYBOARD_POP = "\x1b[<u";
 
+function containsCtrlCInput(data: Buffer): boolean {
+  return data.includes(0x03) || /\x1b\[99;5(?::[123])?u/.test(data.toString("latin1"));
+}
+
 async function runAttach(target: AttachTarget, options: CloudCommandOptions): Promise<AttachResult> {
   const client = await cloudClient({ requireToken: true });
   const baseUrl = client.baseUrl;
@@ -2940,11 +2958,23 @@ async function runAttach(target: AttachTarget, options: CloudCommandOptions): Pr
   return await new Promise<AttachResult>((resolve, reject) => {
     const socket = new WebSocket(wsUrl, {
       headers: { authorization: `Bearer ${token}` },
+      // Do NOT negotiate permessage-deflate on the attach client. Keystrokes and
+      // echoes are tiny (uncompressed either way), the remote dashboard writes
+      // cell-diffs, and with deflate enabled every redraw over 1KB pays a zlib
+      // round on BOTH sides — on the relay's event loop that also head-of-line
+      // blocks the keystroke frames queued behind a redraw burst, which is
+      // exactly "typing feels slow while the agent is streaming". Raw frames
+      // are bounded (~100KB worst-case repaint), so the bandwidth cost of
+      // skipping compression is negligible next to the latency it removes.
+      perMessageDeflate: false,
     });
     socket.binaryType = "nodebuffer";
     let opened = false;
     let cleaned = false;
     let firstFrameRendered = false;
+    let workerConnected = false;
+    let hasControl = true;
+    let readOnlyNoticeShown = false;
     let result: AttachResult = "failed";
 
     const splashAllowed = isInteractive && !options.json && !options.quietBanner;
@@ -2965,11 +2995,37 @@ async function runAttach(target: AttachTarget, options: CloudCommandOptions): Pr
         return;
       }
       const buffer = typeof chunk === "string" ? Buffer.from(chunk, "utf8") : chunk;
-      const isCtrlC = buffer.length === 1 && buffer[0] === 0x03;
+      const hasCtrlC = containsCtrlCInput(buffer);
+      // Once the relay says the worker is gone, Ctrl+C means "leave this local
+      // attach". Forwarding/buffering it would kill the next dashboard as soon
+      // as the persistent machine reconnects.
+      if (hasCtrlC && !workerConnected) {
+        try { socket.close(1000, "client-cancel-disconnected"); } catch { /* ignore */ }
+        cleanup();
+        process.stderr.write("\nDetached from disconnected cloud worker.\n");
+        resolve("exited");
+        return;
+      }
+      // An observer must always be able to leave without sending an interrupt
+      // into the controller's shared PTY.
+      if (hasCtrlC && !hasControl) {
+        try { socket.close(1000, "read-only-client-cancel"); } catch { /* ignore */ }
+        cleanup();
+        process.stderr.write("\nDetached read-only cloud attachment.\n");
+        resolve("exited");
+        return;
+      }
+      if (!hasControl) {
+        if (!readOnlyNoticeShown) {
+          process.stderr.write("\nThis cloud attachment is read-only while another terminal controls the session.\n");
+          readOnlyNoticeShown = true;
+        }
+        return;
+      }
       // While the loading splash is up (no remote frame has rendered yet),
       // Ctrl+C should cancel the local attach instead of being forwarded to
       // a remote dashboard the user can't see.
-      if (isCtrlC && !firstFrameRendered) {
+      if (hasCtrlC && !firstFrameRendered) {
         try { socket.close(1000, "client-cancel"); } catch { /* ignore */ }
         cleanup();
         if (!opened) {
@@ -2983,7 +3039,7 @@ async function runAttach(target: AttachTarget, options: CloudCommandOptions): Pr
       // After handoff: forward Ctrl+C to the remote so Claude/codex can be
       // cancelled, but if the user mashes Ctrl+C twice within 2 seconds we
       // take it as "the remote is unresponsive; get me out".
-      if (isCtrlC && firstFrameRendered) {
+      if (hasCtrlC && firstFrameRendered) {
         const now = Date.now();
         if (now - lastCtrlC < 2000) {
           process.stderr.write("\nForce-exiting local attach (press Ctrl+C again to re-enter).\n");
@@ -2998,7 +3054,9 @@ async function runAttach(target: AttachTarget, options: CloudCommandOptions): Pr
     };
 
     const onResize = () => {
-      sendResize();
+      if (hasControl) {
+        sendResize();
+      }
       splash?.redraw();
     };
 
@@ -3021,6 +3079,7 @@ async function runAttach(target: AttachTarget, options: CloudCommandOptions): Pr
           // ignore
         }
         try {
+          stdout.write(KITTY_KEYBOARD_POP);
           stdout.write("\x1b[?1006l\x1b[?1002l\x1b[?1000l");
         } catch {
           // ignore
@@ -3279,7 +3338,7 @@ async function runAttach(target: AttachTarget, options: CloudCommandOptions): Pr
       if (!payload || typeof payload !== "object") {
         return;
       }
-      const message = payload as { type?: string; state?: string; code?: number; id?: number };
+      const message = payload as { type?: string; state?: string; code?: number; id?: number; control?: string };
       if (message.type === "probe-reply") {
         if (typeof message.id === "number") {
           probeReplies.get(message.id)?.(performance.now());
@@ -3294,6 +3353,20 @@ async function runAttach(target: AttachTarget, options: CloudCommandOptions): Pr
         return;
       }
       if (message.type === "status") {
+        if (message.state === "worker-connected") {
+          workerConnected = true;
+        } else if (message.state === "worker-disconnected" || message.state === "worker-waiting") {
+          workerConnected = false;
+        }
+        if (message.control === "read-only" || message.state === "read-only") {
+          hasControl = false;
+        } else if (message.control === "active" || message.state === "controller-promoted") {
+          const promoted = !hasControl;
+          hasControl = true;
+          if (promoted || message.state === "controller-promoted") {
+            sendResize();
+          }
+        }
         // If the worker dies before we've ever seen a remote frame, the
         // session is effectively dead. Don't sit on a splash spinner pretending
         // it'll come back; bail.

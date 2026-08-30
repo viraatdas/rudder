@@ -514,7 +514,8 @@ Both use the same worker image and snapshot format; they differ in lifecycle + s
 - **Workspaces** — persistent dev environments (Fly-only). Backed by a persistent volume
   (default ~3GB). Statuses: `queued | running | paused | stopped | failed`. Idle-swept
   (`sweepIdleWorkspaces`, every ~60s) and stopped after `RUDDER_WORKSPACE_IDLE_MS`
-  (~30 min). Keyed by `(account_id, workspace_key)` so re-launch reuses the same volume.
+  (~30 min), except while the supervisor reports at least one active agent with a fresh
+  heartbeat. Keyed by `(account_id, workspace_key)` so re-launch reuses the same volume.
 
 ### 9.2 CLI (`src/cloud.ts`)
 Subcommands: `login`, `launch`, `sail`, `byoc`, `vm`/`byo-vm`, `list`/`ls`, `status`,
@@ -596,6 +597,13 @@ broadcasts them to clients (permessage-deflate for frames over ~1KB). A channel 
 disposed when the worker and all clients disconnect. (This is a WebSocket bridge, not an
 SSH tunnel: no key distribution, simpler firewall traversal, but Fly must not strip the
 `Upgrade` header.)
+
+Exactly one client is the channel controller. The first live attachment retains input
+and PTY-resize ownership; later clients observe read-only and are promoted only when the
+controller disconnects. Promotion clears the former controller's queued input/geometry
+and asks the promoted client for its current size. Ctrl+C is never buffered while the
+worker is absent, because replaying an old interrupt into the next worker boot kills the
+new dashboard before it can reconnect.
 
 ### 9.8 Worker image (`cloud/worker/`)
 `Dockerfile` (base `node:22-slim`, runs as non-root `rudder`) + `entrypoint.sh` +

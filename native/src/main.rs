@@ -3088,13 +3088,14 @@ impl App {
             .unwrap_or(false)
     }
 
-    /// True when the selected row's work lives in Rudder Cloud. The local dashboard owns the RECORD, not the
-    /// execution, so local actions that assume a live local workspace (merge,
+    /// True when the selected row's work lives in Rudder Cloud. The local
+    /// dashboard owns the record, not the execution, so local actions that assume
+    /// a live local workspace (merge,
     /// stop, review, resume, delete) must refuse instead of guessing.
     fn selected_is_cloud_owned(&self) -> bool {
         self.agents
             .get(self.selected_agent)
-            .is_some_and(|run| run.status == AgentStatus::Migrated || is_cloud_agent(run))
+            .is_some_and(is_cloud_owned_agent)
     }
 
     /// Open an attach pane for the cloud workspace that owns the selected
@@ -15013,7 +15014,7 @@ Files involved: {}
         // Cloud-owned rows are records of work executing in Rudder Cloud.
         // Deleting one here would silently discard the only local pointer to a
         // fleet that keeps running remotely; attach manages the real thing.
-        if selected.status == AgentStatus::Migrated || is_cloud_agent(selected) {
+        if is_cloud_owned_agent(selected) {
             let label = if selected.task_summary.trim().is_empty() {
                 short_task(&selected.task)
             } else {
@@ -15590,7 +15591,7 @@ Files involved: {}
         // A cloud-owned row's diff lives in the cloud workspace and keeps
         // moving there; merging the stale local workspace snapshot would land
         // half-finished work in trunk while the real agent keeps editing it.
-        if run.status == AgentStatus::Migrated || is_cloud_agent(run) {
+        if is_cloud_owned_agent(run) {
             self.notice = Some(
                 "cloud-owned agent: it merges from its cloud workspace — Enter attaches to it"
                     .to_string(),
@@ -16324,7 +16325,7 @@ Files involved: {}
             // Cloud-owned rows have no local PTY to kill; "stopping" one locally
             // would just mislabel remote work that is still running. Stop it in
             // the cloud workspace (Enter attaches there).
-            if run.status == AgentStatus::Migrated || is_cloud_agent(run) {
+            if is_cloud_owned_agent(run) {
                 self.notice = Some(
                     "cloud-owned agent: there is nothing to stop locally — Enter attaches to its cloud workspace"
                         .to_string(),

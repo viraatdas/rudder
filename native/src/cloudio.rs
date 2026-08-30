@@ -3,12 +3,16 @@
 use super::*;
 
 pub(crate) fn is_cloud_worker_session() -> bool {
-    env::var("RUDDER_WORKSPACE_ID")
-        .ok()
-        .is_some_and(|v| !v.trim().is_empty())
+    is_cloud_workspace_session()
         || env::var("RUDDER_SAIL_ID")
             .ok()
             .is_some_and(|v| !v.trim().is_empty())
+}
+
+pub(crate) fn is_cloud_workspace_session() -> bool {
+    env::var("RUDDER_WORKSPACE_ID")
+        .ok()
+        .is_some_and(|v| !v.trim().is_empty())
 }
 
 pub(crate) fn read_cloud_summary() -> CloudSummary {

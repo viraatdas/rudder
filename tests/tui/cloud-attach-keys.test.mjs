@@ -68,6 +68,7 @@ async function fakeRelay() {
     socket.on("message", (data, isBinary) => {
       if (isBinary && Buffer.isBuffer(data)) keystrokes.push(data);
     });
+    socket.send(JSON.stringify({ type: "status", state: "worker-connected", control: "active" }));
     // One frame of "screen", so the client leaves the splash and reaches the
     // steady state a human would be sitting in.
     socket.send(Buffer.from("REMOTE-DASHBOARD-FRAME\r\n", "utf8"), { binary: true });
@@ -82,6 +83,11 @@ async function fakeRelay() {
       onConnect = (socket) => { socket.close(1000, "worker-exit"); resolve(); };
       for (const socket of wss.clients) { socket.close(1000, "worker-exit"); resolve(); }
     }),
+    workerDisconnected: () => {
+      for (const socket of wss.clients) {
+        socket.send(JSON.stringify({ type: "status", state: "worker-disconnected", control: "active" }));
+      }
+    },
     close: () => new Promise((resolve) => wss.close(resolve)),
   };
 }
@@ -132,5 +138,36 @@ test("cloud attach asks the local terminal for the kitty keyboard protocol", { t
   assert.ok(
     afterExit.includes(JSON.stringify(KITTY_POP).slice(1, -1)),
     "attach pops the flags again when it detaches",
+  );
+});
+
+test("Ctrl+C detaches locally while the cloud worker is disconnected", { timeout: 60_000 }, async (t) => {
+  const relay = await fakeRelay();
+  t.after(() => relay.close());
+
+  const session = await launch({
+    binary: process.execPath,
+    args: [cli, "cloud", "attach", "disconnected-worker-test"],
+    cwd: repoRoot,
+    cols: 100,
+    rows: 30,
+    env: {
+      RUDDER_CLOUD_URL: `http://127.0.0.1:${relay.port}`,
+      RUDDER_CLOUD_TOKEN: "rdr_test_token",
+      TERM: "xterm-256color",
+    },
+  }, t);
+
+  await session.waitForText("REMOTE-DASHBOARD-FRAME", { timeout: 20_000 });
+  relay.workerDisconnected();
+  await session.waitForText("Cloud worker disconnected", { timeout: 20_000 });
+  // Rudder enables Kitty keyboard disambiguation, where Ctrl+C is CSI 99;5u
+  // instead of the legacy one-byte ETX value.
+  await session.write("\x1b[99;5u");
+  await session.waitForExit({ timeout: 20_000 });
+
+  assert.ok(
+    !Buffer.concat(relay.keystrokes).includes(0x03),
+    "disconnect Ctrl+C never enters the remote input stream",
   );
 });
