@@ -526,6 +526,16 @@ Subcommands: `login`, `launch`, `sail`, `byoc`, `vm`/`byo-vm`, `list`/`ls`, `sta
   `cloudUrl`, `defaultRuntime`, `byocSshHost`, `accountId`, `email`, `expiresAt`.
 - `onload` snapshots the current Rudder workspace (repo + selected HOME auth/config) and
   uploads it via an S3 presigned URL so a worker can continue the task.
+- `onload <runId>` is the single-agent cloud handoff (bare `/handoff` in the dashboard):
+  it builds a migration plan scoped to that run (`buildSingleRunPlan` — every other
+  candidate is forced to "stay" so the cloud dashboard never resumes agents still
+  running locally), snapshots the repo with only that run's record
+  (`rudderStateRunIds`), stages its workspace + Claude session jsonl, and launches a
+  sail with NO task — the worker then boots the bare dashboard, which resumes the
+  conversation via `claude --resume`. The manifest field names are a three-way
+  contract (CLI writer / `cloud/worker/supervisor.mjs` stager / `native/src/gitio.rs`
+  reader) pinned by `tests/cloud-handoff.test.mjs`; the vocabulary is "workspace"
+  ("worktree" spellings are read for old snapshots, never written).
 - Error messages prefer the parsed server error, then the body, then `<status>
   <statusText>` (so empty gateway responses still report a code).
 
@@ -778,8 +788,10 @@ is a separate piece of work.
 Continuing an EXISTING CLI conversation as a Rudder agent. Two entry points, one
 launcher (`App::start_handoff_task`):
 
-- **Pull:** `/resume` in the task bar (`/handoff` is a working alias — see
-  `RESUME_COMMANDS` / `resume_command_rest`, which every call site goes through).
+- **Pull:** `/resume` in the task bar (`/handoff <session-id>` is a working alias — see
+  `RESUME_COMMANDS` / `resume_command_rest`, which every call site goes through; BARE
+  `/handoff` is different: it routes to `handoff_selected_agent_to_cloud`, the
+  single-run cloud handoff described in §9.2).
   `suggestions_for` routes it to `handoff_suggestions`, which reads
   `App::handoff_candidates` — a cache refilled on KEYSTROKES
   (`maybe_refresh_handoff_candidates`, 3s throttle), never on the render path,

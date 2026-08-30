@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
+import http from "node:http";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -183,15 +184,22 @@ test("input is injected into the worker and output is read back", async (t) => {
   const heartbeat = await fetch(`${base}/api/rudder/workspace/${workspaceId}/heartbeat`, {
     method: "POST",
     headers: heartbeatHeaders,
-    body: JSON.stringify({ state: "running", machineId: "machine-current" }),
+    body: JSON.stringify({ state: "running", machineId: "machine-current", activeAgents: 2 }),
   });
   assert.equal(heartbeat.status, 200);
   const heartbeatDb = new Database(dbPath);
   let workspaceRow = heartbeatDb.prepare(
-    "select status, last_activity_at, last_heartbeat_at from rudder_workspaces where id = ?",
+    "select status, active_agents, last_activity_at, last_heartbeat_at from rudder_workspaces where id = ?",
   ).get(workspaceId);
   assert.equal(workspaceRow.last_activity_at, oldActivity, "heartbeat preserves the idle clock");
   assert.ok(workspaceRow.last_heartbeat_at, "heartbeat still updates liveness");
+  assert.equal(workspaceRow.active_agents, 2, "heartbeat persists the real busy count");
+
+  const workspaceList = await fetch(`${base}/api/rudder/workspace`, { headers: authHeaders });
+  assert.equal(workspaceList.status, 200);
+  const listedWorkspace = (await workspaceList.json()).workspaces.find((item) => item.id === workspaceId);
+  assert.equal(listedWorkspace.activeAgents, 2, "workspace status exposes the real busy count");
+
   heartbeatDb.prepare("update rudder_workspaces set status = 'stopped' where id = ?").run(workspaceId);
   heartbeatDb.close();
 
@@ -445,4 +453,95 @@ test("secrets vault round trip and latency-probe relay", async (t) => {
 
   workerWs.close();
   clientWs.close();
+});
+
+test("idle sweep keeps a disconnected workspace alive while an agent is running", { timeout: 25_000 }, async (t) => {
+  const port = await freePort();
+  const flyPort = await freePort();
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "rudder-cloud-sweep-test-"));
+  const dbPath = path.join(dataDir, "state.sqlite");
+  const base = `http://127.0.0.1:${port}`;
+  const stoppedMachines = [];
+
+  const fly = http.createServer((req, res) => {
+    const match = req.url?.match(/\/machines\/([^/]+)\/stop$/);
+    if (req.method === "POST" && match) {
+      stoppedMachines.push(decodeURIComponent(match[1]));
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ id: match[1], state: "stopping" }));
+      return;
+    }
+    res.writeHead(404).end();
+  });
+  await new Promise((resolve, reject) => {
+    fly.once("error", reject);
+    fly.listen(flyPort, "127.0.0.1", resolve);
+  });
+
+  const child = spawn(process.execPath, [path.join(cloudDir, "dist", "server.js")], {
+    env: {
+      ...process.env,
+      PORT: String(port),
+      BETTER_AUTH_URL: base,
+      BETTER_AUTH_SECRET: "test-secret-test-secret",
+      RUDDER_CLOUD_DATA_DIR: dataDir,
+      RUDDER_CLOUD_DB: dbPath,
+      RUDDER_CLOUD_PERSIST_STATE: "0",
+      RUDDER_S3_BUCKET: "",
+      SLACK_BOT_TOKEN: "",
+      FLY_API_TOKEN: "test-fly-token",
+      RUDDER_FLY_APP_NAME: "test-rudder-cloud",
+      FLY_API_HOSTNAME: `http://127.0.0.1:${flyPort}`,
+      RUDDER_WORKSPACE_IDLE_MS: "60000",
+      RUDDER_WORKSPACE_SWEEP_MS: "10000",
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  t.after(async () => {
+    child.kill("SIGKILL");
+    await new Promise((resolve) => fly.close(resolve));
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  await waitFor(async () => {
+    const res = await fetch(`${base}/health`).catch(() => null);
+    return res?.ok;
+  });
+  await waitFor(() => fs.existsSync(dbPath));
+  await sleep(150);
+
+  const now = new Date().toISOString();
+  const old = "2024-01-01T00:00:00.000Z";
+  const db = new Database(dbPath);
+  const insert = db.prepare(`
+    insert into rudder_workspaces (
+      id, account_id, workspace_key, status, machine_id, machine_state,
+      worker_token_hash, active_agents, last_activity_at, last_heartbeat_at,
+      created_at, updated_at
+    ) values (?,?,?,?,?,?,?,?,?,?,?,?)
+  `);
+  insert.run(
+    "busy-workspace", "acct", "busy-key", "running", "machine-busy", "started",
+    tokenHash("busy-token"), 1, old, now, old, now,
+  );
+  insert.run(
+    "idle-workspace", "acct", "idle-key", "running", "machine-idle", "started",
+    tokenHash("idle-token"), 0, old, old, old, old,
+  );
+  db.close();
+
+  await waitFor(() => stoppedMachines.includes("machine-idle"), {
+    timeout: 15_000,
+    interval: 100,
+  });
+  assert.ok(!stoppedMachines.includes("machine-busy"), "fresh busy heartbeat prevents idle stop");
+
+  const resultDb = new Database(dbPath);
+  const rows = resultDb.prepare(
+    "select id, status from rudder_workspaces where id in ('busy-workspace', 'idle-workspace')",
+  ).all();
+  resultDb.close();
+  const statuses = Object.fromEntries(rows.map((row) => [row.id, row.status]));
+  assert.equal(statuses["busy-workspace"], "running");
+  assert.equal(statuses["idle-workspace"], "stopped");
 });

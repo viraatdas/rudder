@@ -306,7 +306,9 @@ pub(crate) struct HardeningItem {
 /// only decides CLUSTERING, so a miss costs an extra node rather than correctness.
 pub(crate) fn extract_file_mentions(text: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    for raw in text.split(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | '(' | ')' | '`' | '"' | '\'' | '<' | '>')) {
+    for raw in text.split(|c: char| {
+        c.is_whitespace() || matches!(c, ',' | ';' | '(' | ')' | '`' | '"' | '\'' | '<' | '>')
+    }) {
         let token = raw.trim_matches(|c: char| matches!(c, '.' | ':' | '*' | '-' | '[' | ']'));
         if token.len() < 3 || token.len() > 200 {
             continue;

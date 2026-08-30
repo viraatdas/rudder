@@ -56,10 +56,10 @@ pub(crate) fn terminal_looks_ready_for_input_from_lines(
     backend: Backend,
     lines: &[String],
 ) -> bool {
-    if terminal_needs_permission_from_lines(lines) {
+    if terminal_needs_permission_from_lines(backend, lines) {
         return false;
     }
-    if terminal_needs_user_input_from_lines(lines) {
+    if terminal_needs_user_input_from_lines(backend, lines) {
         // Waiting on a question, not "done".
         return false;
     }
@@ -92,6 +92,10 @@ pub(crate) fn terminal_looks_ready_for_input_from_lines(
         .any(|line| looks_like_agent_prompt(backend, line))
 }
 
+/// opencode draws its hints as a compact footer strip. Anything appreciably
+/// wider than this is the agent talking, not chrome.
+const OPENCODE_FOOTER_MAX_WIDTH: usize = 80;
+
 /// Returns true if the given line looks like static footer/chrome text that
 /// the agent only renders while idle at its prompt.
 pub(crate) fn looks_like_idle_chrome(backend: Backend, line: &str) -> bool {
@@ -111,12 +115,18 @@ pub(crate) fn looks_like_idle_chrome(backend: Backend, line: &str) -> bool {
     }
     match backend {
         Backend::Claude => lower.contains("(shift+tab"),
-        // opencode's idle footer: the status/help hints it draws under the composer.
+        // opencode's idle footer: the status/help hints it draws under the
+        // composer. Every one of these used to be a bare substring test against
+        // the whole line, so an agent WRITING about "ctrl+c" or "the tab bar" —
+        // or any line at all containing "/help" — read as an idle footer. Prose
+        // runs long and footers do not, so require footer width first; that
+        // alone removes the overwhelming majority of the false hits.
         Backend::Opencode => {
-            lower.contains("/help")
-                || lower.contains("ctrl+")
-                || lower.contains("tab ")
-                || lower.contains("· opencode")
+            line.chars().count() <= OPENCODE_FOOTER_MAX_WIDTH
+                && (lower.contains("/help")
+                    || lower.contains("ctrl+")
+                    || lower.starts_with("tab ")
+                    || lower.contains(" \u{00b7} opencode"))
         }
         Backend::Codex => {
             // Codex idle markers seen in the wild:
@@ -158,15 +168,54 @@ fn looks_like_codex_status_bar(lower: &str) -> bool {
     (tail.starts_with("~/") || tail.starts_with('/')) && !tail.contains(' ')
 }
 
-pub(crate) fn terminal_needs_user_input_from_lines(lines: &[String]) -> bool {
-    // Collect the most recent non-empty normalized lines (top of list = most recent).
-    let recent_rev = lines
+/// The most recent non-empty lines with the BACKEND'S OWN CHROME removed, newest
+/// first.
+///
+/// Without this, "the last thing on screen" meant something different per
+/// backend. Claude's composer floats above blank rows, so its last line really is
+/// the agent's last word. Codex pins a status bar and a composer to the bottom of
+/// the pane, so its last line is always `gpt-5.5 xhigh · ~/some/path` — the
+/// agent's actual closing question sat two rows up and was never once examined.
+pub(crate) fn recent_agent_lines(backend: Backend, lines: &[String], take: usize) -> Vec<String> {
+    lines
         .iter()
         .rev()
         .map(|line| normalize_terminal_line(line))
         .filter(|line| !line.is_empty())
-        .take(6)
-        .collect::<Vec<_>>();
+        .filter(|line| !looks_like_idle_chrome(backend, line))
+        .filter(|line| !looks_like_agent_prompt(backend, line))
+        .take(take)
+        .collect()
+}
+
+/// True when the pane looks like the backend sitting at rest rather than
+/// mid-output — the precondition for reading a trailing line as a question.
+///
+/// This was one rule for all three backends: "the last few rows are blank". That
+/// holds for Claude and opencode, whose composers leave empty rows beneath them,
+/// and never for Codex, which pins a status bar to the last row. So a Codex agent
+/// asking a question failed this gate on every single tick and could not be shown
+/// as waiting — and Codex's `notify` reports turn-end and nothing else, so no
+/// second source existed to catch it either. Its own idle chrome is the tell.
+pub(crate) fn cursor_at_rest(backend: Backend, lines: &[String]) -> bool {
+    let tail_blank = lines
+        .iter()
+        .rev()
+        .take(3)
+        .any(|line| normalize_terminal_line(line).is_empty());
+    if tail_blank || lines.len() <= 6 {
+        return true;
+    }
+    lines
+        .iter()
+        .rev()
+        .take(4)
+        .any(|line| looks_like_idle_chrome(backend, line))
+}
+
+pub(crate) fn terminal_needs_user_input_from_lines(backend: Backend, lines: &[String]) -> bool {
+    // The most recent lines the AGENT wrote, newest first.
+    let recent_rev = recent_agent_lines(backend, lines, 6);
     if recent_rev.is_empty() {
         return false;
     }
@@ -183,20 +232,9 @@ pub(crate) fn terminal_needs_user_input_from_lines(lines: &[String]) -> bool {
         return false;
     }
 
-    // Tail cursor heuristic: most of the trailing screen rows must be empty.
-    // (visible_lines_snapshot returns the whole pane; if the cursor sits at
-    // the bottom of the screen, the last rows will be blank.)
-    let tail_blanks = lines
-        .iter()
-        .rev()
-        .take(3)
-        .filter(|line| normalize_terminal_line(line).is_empty())
-        .count();
-    // The cursor sits at the bottom of a real prompt, so the trailing rows are
-    // blank. When they are NOT (and the pane is taller than the recent window),
-    // there is content below the last non-empty line: the agent is emitting
-    // output, not waiting. Only an explicit numbered selection menu overrides this.
-    let cursor_near_bottom = tail_blanks > 0 || lines.len() <= 6;
+    // Is the backend parked at its composer, or still emitting? Only an explicit
+    // numbered selection menu overrides a "still emitting" read.
+    let cursor_near_bottom = cursor_at_rest(backend, lines);
     if !cursor_near_bottom && !has_numbered_menu_pattern(&recent_rev) {
         return false;
     }
@@ -255,14 +293,11 @@ pub(crate) fn has_numbered_menu_pattern(recent_rev: &[String]) -> bool {
     seen_indices.len() >= 2 || (saw_cursor_option && !seen_indices.is_empty())
 }
 
-pub(crate) fn terminal_needs_permission_from_lines(lines: &[String]) -> bool {
-    let recent = lines
-        .iter()
-        .rev()
-        .take(14)
-        .map(|line| normalize_terminal_line(line))
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>();
+pub(crate) fn terminal_needs_permission_from_lines(backend: Backend, lines: &[String]) -> bool {
+    // Chrome-filtered for the same reason as above: Codex's status bar and
+    // composer are two of the last three rows, so an unfiltered 14-line window
+    // spent them on text the agent never wrote.
+    let recent = recent_agent_lines(backend, lines, 14);
     if recent.is_empty() {
         return false;
     }

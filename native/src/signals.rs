@@ -22,10 +22,26 @@ use std::time::{Duration, SystemTime};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SignalState {
-    /// The worker finished its turn (Claude `Stop` / Codex `agent-turn-complete`).
+    /// The worker finished its turn (Claude `Stop` / Codex `agent-turn-complete`
+    /// / opencode root-session `session.idle`).
     Done,
-    /// The worker paused for input (Claude `Notification` matcher `idle_prompt`).
+    /// The worker paused with a question (Claude `Notification` matcher
+    /// `idle_prompt`).
     Input,
+    /// The worker is blocked on an approval prompt (Claude `Notification`
+    /// matcher `permission_request` / opencode `permission.updated`). Distinct
+    /// from `Input`: a question needs an answer, a permission needs a decision,
+    /// and the dashboard colours them differently.
+    Permission,
+    /// The human answered and the worker went back to work (Claude
+    /// `UserPromptSubmit` / opencode `permission.replied`).
+    ///
+    /// This is the counterpart the protocol was missing. `Input` and
+    /// `Permission` latch — they have to, or a row would drop its "needs you"
+    /// badge the moment the prompt scrolled out of the visible pane — and
+    /// nothing ever lifted the latch, so answering an agent left it flagged
+    /// until its NEXT turn ended.
+    Working,
 }
 
 /// Extra launch wiring for a worker so it emits official completion signals.
@@ -148,6 +164,8 @@ pub(crate) fn parse_signal_state(body: &str) -> Option<SignalState> {
     match value.get("state").and_then(|s| s.as_str())? {
         "done" => Some(SignalState::Done),
         "input" => Some(SignalState::Input),
+        "permission" => Some(SignalState::Permission),
+        "working" => Some(SignalState::Working),
         _ => None,
     }
 }
@@ -180,9 +198,25 @@ pub(crate) fn claude_settings_json(signal: &Path, fast_mode: bool) -> String {
             "Stop": [{
                 "hooks": [{ "type": "command", "command": write_signal_command(signal, "done") }]
             }],
-            "Notification": [{
-                "matcher": "idle_prompt",
-                "hooks": [{ "type": "command", "command": write_signal_command(signal, "input") }]
+            "Notification": [
+                {
+                    "matcher": "idle_prompt",
+                    "hooks": [{ "type": "command", "command": write_signal_command(signal, "input") }]
+                },
+                {
+                    // Claude's OTHER notification matcher. Only `idle_prompt` was
+                    // wired, so a worker blocked on a tool-approval prompt — the
+                    // single most common reason an agent stops dead — had no
+                    // native signal at all and was left to the string heuristics.
+                    "matcher": "permission_request",
+                    "hooks": [{ "type": "command", "command": write_signal_command(signal, "permission") }]
+                }
+            ],
+            // The human answered: back to work, clear the latch. Fires once per
+            // human turn, so it costs one tiny write — unlike PreToolUse, which
+            // would fire on every tool call.
+            "UserPromptSubmit": [{
+                "hooks": [{ "type": "command", "command": write_signal_command(signal, "working") }]
             }]
         }
     });
@@ -210,18 +244,32 @@ pub(crate) fn codex_notify_script(signal: &Path) -> String {
 /// The opencode plugin that reports turn-end, generated per run.
 ///
 /// opencode has no hook flag like Claude's `--settings` or Codex's `notify`; it has
-/// a plugin API instead. A plugin's `event` hook sees `session.idle` when a turn
-/// ends and `permission.updated` when the agent stops to ask — exactly the two
-/// states Rudder's signal file carries. The plugin is loaded from Rudder's own
-/// directory via `OPENCODE_CONFIG`, never written into the worker's workspace,
-/// so it can never show up in the diff Rudder merges.
+/// a plugin API instead. A plugin's `event` hook sees the session and permission
+/// lifecycle — exactly the states Rudder's signal file carries. The plugin is
+/// loaded from Rudder's own directory via `OPENCODE_CONFIG`, never written into
+/// the worker's workspace, so it can never show up in the diff Rudder merges.
+///
+/// Two things this has to get right that the first version did not:
+///
+/// 1. **`session.idle` fires for SUBAGENT sessions too.** opencode's `Session`
+///    carries a `parentID`, and a child session finishing its work idles just
+///    like the root one. Reporting `done` on those marked the whole run complete
+///    the first time the agent delegated anything. We resolve the session and
+///    ignore any that has a parent.
+/// 2. **`permission.updated` has a counterpart, `permission.replied`.** Only the
+///    ask was wired, so the waiting state latched on and never lifted.
+///
+/// Every lookup fails OPEN: if the session cannot be resolved for any reason
+/// (older opencode, changed client shape, server hiccup) we report anyway. A
+/// wrong guess about a subagent is a cosmetic early "done"; a silent plugin is a
+/// worker that never completes at all, which is far worse.
 ///
 /// Writes to a pid-suffixed temp and renames, like the other two backends, so the
 /// poll loop can never read a torn signal.
 pub(crate) fn opencode_plugin_js(signal: &Path) -> String {
     let path = signal.display();
     format!(
-        r#"// Generated by Rudder. Reports opencode turn-end to the dashboard.
+        r#"// Generated by Rudder. Reports opencode turn state to the dashboard.
 import {{ writeFileSync, renameSync, mkdirSync }} from "node:fs";
 import {{ dirname }} from "node:path";
 
@@ -238,15 +286,42 @@ function report(state) {{
   }}
 }}
 
-export const RudderSignal = async () => ({{
-  event: async ({{ event }}) => {{
-    if (event?.type === "session.idle") {{
-      report("done");
-    }} else if (event?.type === "permission.updated") {{
-      report("input");
+export const RudderSignal = async ({{ client }}) => {{
+  // Sessions we have already classified. A run emits many events per session,
+  // and resolving each one would put an HTTP round-trip on the event path.
+  const isSubagent = new Map();
+
+  async function rootSession(sessionID) {{
+    if (!sessionID) return true; // Nothing to check against: fail open.
+    if (isSubagent.has(sessionID)) return !isSubagent.get(sessionID);
+    let child = false;
+    try {{
+      const result = await client.session.get({{ path: {{ id: sessionID }} }});
+      const session = result?.data ?? result;
+      child = Boolean(session?.parentID);
+    }} catch {{
+      child = false; // Fail open: report rather than go silent.
     }}
-  }},
-}});
+    isSubagent.set(sessionID, child);
+    return !child;
+  }}
+
+  return {{
+    event: async ({{ event }}) => {{
+      const type = event?.type;
+      const sessionID = event?.properties?.sessionID;
+      if (type === "session.idle") {{
+        // A delegated subagent going idle is not this run finishing its turn.
+        if (await rootSession(sessionID)) report("done");
+      }} else if (type === "permission.updated") {{
+        if (await rootSession(sessionID)) report("permission");
+      }} else if (type === "permission.replied") {{
+        // The human decided. Back to work — this is what lifts the latch.
+        if (await rootSession(sessionID)) report("working");
+      }}
+    }},
+  }};
+}};
 "#
     )
 }

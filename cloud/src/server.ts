@@ -83,6 +83,7 @@ type Workspace = {
   gitRef?: string;
   lastActivityAt?: string;
   lastHeartbeatAt?: string;
+  activeAgents?: number;
   createdAt: string;
   updatedAt: string;
 };
@@ -244,6 +245,11 @@ ensureColumn("rudder_workspaces", "volume_id", "text");
 ensureColumn("rudder_workspaces", "source_kind", "text");
 ensureColumn("rudder_workspaces", "repo_url", "text");
 ensureColumn("rudder_workspaces", "git_ref", "text");
+// Busy signal reported by the worker supervisor in each heartbeat: how many
+// rudder runs are actively working in that machine. The idle sweep must not
+// stop a workspace whose agents are mid-task just because nobody is attached
+// (the laptop disconnected) — that is the "sessions survive the commute" case.
+ensureColumn("rudder_workspaces", "active_agents", "integer");
 
 // Secrets vault: initialized lazily so a missing RUDDER_SECRETS_KEY only
 // breaks the vault endpoints, not the rest of the control plane.
@@ -274,6 +280,12 @@ const insertSail = database.prepare(`
     @snapshotKey, @manifestJson, @workerTokenHash, @lastHeartbeatAt, @createdAt, @updatedAt
   )
 `);
+// Only ever used to clear a dead sail so its preferred id can be relaunched
+// (see createSail); account-scoped so one account cannot clear another's row.
+const deleteSailRow = database.prepare(`
+  delete from rudder_sails where id = @id and account_id = @accountId
+`);
+
 const updateSail = database.prepare(`
   update rudder_sails
   set status = @status,
@@ -395,6 +407,7 @@ const updateWorkspaceHeartbeat = database.prepare(`
   set status = @status,
       machine_id = coalesce(@machineId, machine_id),
       machine_state = @machineState,
+      active_agents = @activeAgents,
       last_heartbeat_at = @lastHeartbeatAt,
       updated_at = @updatedAt
   where id = @id
@@ -994,6 +1007,13 @@ if (workspaceIdleMs >= 60 * 1000 && workspaceSweepIntervalMs >= 10 * 1000) {
   timer.unref?.();
 }
 
+// How stale the busy signal may be and still count: the supervisor heartbeats
+// every 30s, so a machine that is alive and busy refreshes it constantly. A
+// frozen active_agents > 0 with NO recent heartbeat means the supervisor died
+// (or the machine is wedged) — that must NOT keep a dead machine un-stopped
+// forever, so the busy exemption requires a fresh heartbeat.
+const busyHeartbeatFreshMs = 5 * 60 * 1000;
+
 async function sweepIdleWorkspaces(): Promise<void> {
   if (!flyApiToken || !flyAppName) {
     return;
@@ -1007,6 +1027,16 @@ async function sweepIdleWorkspaces(): Promise<void> {
     }
     if (Array.from(workspaceChannels.get(workspace.id)?.clients ?? []).some(isOpen)) {
       continue;
+    }
+    // BUSY EXEMPTION: agents are actively working in this machine (reported by
+    // the worker, not guessed from user activity). Stopping it would kill live
+    // cloud sessions the moment the user's laptop disconnected for longer than
+    // the idle window — the exact opposite of what the workspace is for.
+    if ((workspace.activeAgents ?? 0) > 0) {
+      const heartbeatMs = Date.parse(workspace.lastHeartbeatAt ?? "");
+      if (Number.isFinite(heartbeatMs) && now - heartbeatMs <= busyHeartbeatFreshMs) {
+        continue;
+      }
     }
     const last = workspace.lastActivityAt ?? workspace.lastHeartbeatAt ?? workspace.updatedAt;
     const lastMs = Date.parse(last);
@@ -2148,6 +2178,24 @@ async function createSail(
   const runtime = sailRuntimeFromBody(body);
   ensureCloudRuntimeConfigured(runtime);
   const now = new Date().toISOString();
+  // A preferred id (onload keys sails by the local run id) must be retryable:
+  // a handoff whose first attempt died mid-flight leaves a sail row behind,
+  // and the retry used to 500 on the id's UNIQUE constraint. If that sail's
+  // worker is LIVE, the conversation is already in the cloud — return it
+  // instead of cloning it. Otherwise clear the corpse (row + any machine)
+  // and launch fresh.
+  if (preferredId) {
+    const existing = getAccountSail(preferredId, accountId);
+    if (existing) {
+      if (instanceHasLiveWorker("sail", preferredId)) {
+        return existing;
+      }
+      if (existing.machineId) {
+        await destroyFlyMachine(existing.machineId).catch(() => undefined);
+      }
+      deleteSailRow.run({ id: preferredId, accountId });
+    }
+  }
   // Slack-launched sails reuse an already-stored snapshot (there is no terminal
   // to upload a fresh one from); everything else uploads as before.
   const snapshot = existingSnapshotKey
@@ -3334,12 +3382,14 @@ async function handleWorkspaceHeartbeat(req: IncomingMessage, res: ServerRespons
     return;
   }
   const status: WorkspaceStatus = state === "failed" ? "failed" : "running";
+  const activeAgents = numberField(body, "activeAgents");
   const now = new Date().toISOString();
   updateWorkspaceHeartbeat.run({
     id: workspaceId,
     status,
     machineId: machineId ?? null,
     machineState: state || status,
+    activeAgents: activeAgents ?? 0,
     lastHeartbeatAt: now,
     updatedAt: now,
   });
@@ -3398,6 +3448,9 @@ function rowToWorkspace(row: unknown): Workspace {
     gitRef: optionalString(value.git_ref),
     lastActivityAt: optionalString(value.last_activity_at),
     lastHeartbeatAt: optionalString(value.last_heartbeat_at),
+    activeAgents: Number.isFinite(Number(value.active_agents)) && value.active_agents !== null
+      ? Math.max(0, Math.floor(Number(value.active_agents)))
+      : 0,
     createdAt: String(value.created_at),
     updatedAt: String(value.updated_at),
   };
@@ -4189,6 +4242,11 @@ function stringField(value: Json | undefined, field: string): string | undefined
   return value && typeof value === "object" && !Array.isArray(value) && typeof value[field] === "string"
     ? value[field]
     : undefined;
+}
+function numberField(value: Json | undefined, field: string): number | undefined {
+  const raw = value && typeof value === "object" && !Array.isArray(value) ? value[field] : undefined;
+  const num = typeof raw === "number" ? raw : typeof raw === "string" ? Number(raw) : NaN;
+  return Number.isFinite(num) && num >= 0 ? Math.floor(num) : undefined;
 }
 
 function optionalString(value: unknown): string | undefined {

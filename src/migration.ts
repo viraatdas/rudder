@@ -128,7 +128,15 @@ async function classify(record: RunRecord): Promise<MigrationCandidate | null> {
   const status = record.status;
   // Only consider agents the user might care about migrating: anything that is
   // not already terminal. We include "running"/"steering"/"verifying"/"created".
-  if (status === "completed" || status === "merged" || status === "cancelled" || status === "paused" || status === "failed") {
+  if (
+    status === "completed"
+    || status === "merged"
+    || status === "cancelled"
+    || status === "paused"
+    || status === "failed"
+    // Already living in the cloud — re-migrating would clone the session.
+    || status === "migrated"
+  ) {
     return null;
   }
   const workspacePath = record.workspace?.path;

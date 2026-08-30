@@ -13,6 +13,8 @@ import { StringDecoder } from "node:string_decoder";
 import { WebSocket } from "ws";
 import pty from "node-pty";
 
+import { countActiveAgents } from "./active-runs.mjs";
+
 const cloudUrl = (process.env.RUDDER_CLOUD_URL || "").trim();
 const sailId = (process.env.RUDDER_SAIL_ID || "").trim();
 const workspaceId = (process.env.RUDDER_WORKSPACE_ID || "").trim();
@@ -79,6 +81,7 @@ if (alreadyStaged()) {
 }
 
 const cwd = process.cwd();
+preTrustClaudeProjects([cwd]);
 console.log(`Rudder worker ready in ${cwd}`);
 
 const capturedEnv = loadCapturedEnv();
@@ -537,6 +540,39 @@ function removeAppleDoubleFiles(directory) {
   }
 }
 
+// Interactive claude asks "do you trust this folder?" once per project
+// directory, and a resumed cloud agent has nobody at the keyboard to answer —
+// the migrated conversation sat blocked on that dialog until someone attached.
+// Everything under /workspace came from the user's own snapshot or repo, so
+// answer up front by seeding claude's per-project trust store.
+function preTrustClaudeProjects(paths) {
+  const home = os.homedir() || process.env.HOME || "/root";
+  const configPath = path.join(home, ".claude.json");
+  let config = {};
+  try {
+    config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+  } catch {
+    config = {};
+  }
+  if (!config.projects || typeof config.projects !== "object") {
+    config.projects = {};
+  }
+  for (const projectPath of paths) {
+    if (typeof projectPath !== "string" || projectPath.trim().length === 0) {
+      continue;
+    }
+    config.projects[projectPath] = {
+      ...(config.projects[projectPath] || {}),
+      hasTrustDialogAccepted: true,
+    };
+  }
+  try {
+    fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
+  } catch (error) {
+    console.error(`Pre-trust write failed: ${error.message}`);
+  }
+}
+
 function stageMigratedAgents(workdir) {
   const migrationPath = "/workspace/unpacked/migration.json";
   if (!fs.existsSync(migrationPath)) {
@@ -563,21 +599,26 @@ function stageMigratedAgents(workdir) {
     if (typeof agent.runId !== "string") {
       continue;
     }
-    const cloudWorktree = typeof agent.cloudWorktreeRelativePath === "string"
-      ? agent.cloudWorktreeRelativePath
-      : null;
-    if (!cloudWorktree) {
+    // Field names and staging dirs are a contract with stageMigratedAgents in
+    // src/cloud.ts / MigrationManifestEntry in src/migration.ts ("workspace"
+    // vocabulary); the "worktree" spellings are accepted for snapshots made by
+    // older CLIs. tests/cloud-handoff.test.mjs greps both sides.
+    const cloudWorkspace = [agent.cloudWorkspaceRelativePath, agent.cloudWorktreeRelativePath]
+      .find((value) => typeof value === "string" && value.trim().length > 0) || null;
+    if (!cloudWorkspace) {
       continue;
     }
-    const stagedWorktree = path.join("/workspace/unpacked/migrated-worktrees", agent.runId);
-    if (fs.existsSync(stagedWorktree)) {
-      fs.mkdirSync(cloudWorktree, { recursive: true });
-      sh(`cp -R ${shQuote(stagedWorktree + "/.")} ${shQuote(cloudWorktree + "/")}`);
-      if (!fs.existsSync(path.join(cloudWorktree, ".git"))) {
-        shSoft(`cd ${shQuote(cloudWorktree)} && git init -q && git config user.email rudder-cloud@local && git config user.name "Rudder Cloud" && git add -A && git commit -qm "rudder cloud baseline (migrated agent ${agent.runId})"`);
+    const stagedWorkspace = ["migrated-workspaces", "migrated-worktrees"]
+      .map((dir) => path.join("/workspace/unpacked", dir, agent.runId))
+      .find((candidate) => fs.existsSync(candidate));
+    if (stagedWorkspace) {
+      fs.mkdirSync(cloudWorkspace, { recursive: true });
+      sh(`cp -R ${shQuote(stagedWorkspace + "/.")} ${shQuote(cloudWorkspace + "/")}`);
+      if (!fs.existsSync(path.join(cloudWorkspace, ".git"))) {
+        shSoft(`cd ${shQuote(cloudWorkspace)} && git init -q && git config user.email rudder-cloud@local && git config user.name "Rudder Cloud" && git add -A && git commit -qm "rudder cloud baseline (migrated agent ${agent.runId})"`);
       }
     } else {
-      fs.mkdirSync(cloudWorktree, { recursive: true });
+      fs.mkdirSync(cloudWorkspace, { recursive: true });
     }
 
     const sessionId = typeof agent.sessionId === "string" && agent.sessionId.trim().length > 0
@@ -590,7 +631,7 @@ function stageMigratedAgents(workdir) {
     if (sessionId && sessionPathHint) {
       const stagedJsonl = path.join("/workspace/unpacked", sessionPathHint);
       if (fs.existsSync(stagedJsonl)) {
-        const encoded = encodeClaudeProjectsCwd(cloudWorktree);
+        const encoded = encodeClaudeProjectsCwd(cloudWorkspace);
         const claudeProjectDir = path.join(home, ".claude", "projects", encoded);
         fs.mkdirSync(claudeProjectDir, { recursive: true });
         const dest = path.join(claudeProjectDir, `${sessionId}.jsonl`);
@@ -603,8 +644,12 @@ function stageMigratedAgents(workdir) {
     placed.push({
       runId: agent.runId,
       sessionId: sessionPlaced,
-      worktreePath: cloudWorktree,
-      worktreeBranch: agent.worktreeBranch || null,
+      // workspacePath is what the dashboard's read_migration_manifest
+      // (native/src/gitio.rs) resumes from; worktreePath stays for dashboards
+      // older than the rename.
+      workspacePath: cloudWorkspace,
+      worktreePath: cloudWorkspace,
+      workspaceBranch: agent.workspaceBranch || agent.worktreeBranch || null,
       task: agent.task || "",
       taskSummary: agent.taskSummary || "",
       backend: agent.backend || "claude",
@@ -628,12 +673,17 @@ function stageMigratedAgents(workdir) {
       continue;
     }
     record.repoRoot = workdir;
-    record.worktree = {
-      ...(record.worktree || {}),
+    // Write the canonical "workspace" key and drop any legacy "worktree" one:
+    // loadRunRecord / adoptLegacyWorkspaceKey prefer an existing "workspace"
+    // block, so leaving the local machine's stale one in place would point the
+    // cloud dashboard at a path that only exists on the user's laptop.
+    record.workspace = {
+      ...(record.workspace || record.worktree || {}),
       enabled: true,
-      path: entry.worktreePath,
-      branch: entry.worktreeBranch || record.worktree?.branch,
+      path: entry.workspacePath,
+      branch: entry.workspaceBranch || record.workspace?.branch || record.worktree?.branch,
     };
+    delete record.worktree;
     if (entry.sessionId) {
       record.session = {
         ...(record.session || {}),
@@ -652,6 +702,8 @@ function stageMigratedAgents(workdir) {
     };
     fs.writeFileSync(runJsonPath, JSON.stringify(record, null, 2));
   }
+
+  preTrustClaudeProjects(placed.map((entry) => entry.workspacePath));
 
   const summary = {
     version: 1,
@@ -672,6 +724,13 @@ function heartbeatUrl() {
   return `${cloudUrl.replace(/\/$/, "")}/api/rudder/${sessionKind}/${encodeURIComponent(sessionId)}/heartbeat`;
 }
 
+// Count the rudder runs that are ACTIVELY WORKING in this worker (the remote
+// dashboard/worker writes <repo>/.rudder/runs/<id>/run.json for each agent).
+// The control plane uses this as the busy signal for idle sweeps: a workspace
+// whose agents are mid-task must never be stopped just because the user's
+// laptop disconnected — heartbeats alone only prove the machine is alive, not
+// that it is doing something. 0 when nothing rudder-shaped is running (or the
+// state is unreadable — a broken read must read as idle, not busy).
 function reportHeartbeat() {
   if (!cloudUrl || !sessionId || !workerToken) {
     return;
@@ -682,7 +741,11 @@ function reportHeartbeat() {
       "content-type": "application/json",
       authorization: `Bearer ${workerToken}`,
     },
-    body: JSON.stringify({ state: lastReportedState, machineId: flyMachineId || undefined }),
+    body: JSON.stringify({
+      state: lastReportedState,
+      machineId: flyMachineId || undefined,
+      activeAgents: countActiveAgents(),
+    }),
   }).catch(() => undefined);
 }
 

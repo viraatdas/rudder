@@ -38,8 +38,8 @@ fn git_state_stamps(repo_root: &Path) -> GitStamps {
 }
 
 #[allow(clippy::type_complexity)]
-fn git_state_cache() -> &'static std::sync::Mutex<HashMap<(PathBuf, &'static str), (GitStamps, Option<String>)>>
-{
+fn git_state_cache(
+) -> &'static std::sync::Mutex<HashMap<(PathBuf, &'static str), (GitStamps, Option<String>)>> {
     static CACHE: std::sync::OnceLock<
         std::sync::Mutex<HashMap<(PathBuf, &'static str), (GitStamps, Option<String>)>>,
     > = std::sync::OnceLock::new();
@@ -334,6 +334,7 @@ pub(crate) fn create_main_agent(
         interactive_orchestrator: false,
         needs_permission: false,
         needs_user_input: false,
+        wait_signal: None,
         last_error: None,
         worker_input_draft: String::new(),
         worker_input_cursor: 0,
@@ -829,6 +830,7 @@ pub(crate) fn agent_from_run_record(
         interactive_orchestrator,
         needs_permission: false,
         needs_user_input: false,
+        wait_signal: None,
         last_error: None,
         worker_input_draft: String::new(),
         worker_input_cursor: 0,
@@ -1006,7 +1008,10 @@ pub(crate) fn gam_state_from_record(record: &serde_json::Value) -> Option<crate:
     Some(GamState {
         role,
         peer_run_id,
-        round: gam.get("round").and_then(serde_json::Value::as_u64).unwrap_or(0) as u32,
+        round: gam
+            .get("round")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as u32,
         runaway_rounds: gam
             .get("runawayRounds")
             // Records written before the round cap became a runaway guard carry
@@ -1078,7 +1083,8 @@ pub(crate) fn gam_state_to_json(gam: &crate::GamState) -> serde_json::Value {
     })
 }
 
-pub(crate) fn integration_evidence_from_record(record: &serde_json::Value) -> IntegrationEvidence {    let merge = record.get("merge");
+pub(crate) fn integration_evidence_from_record(record: &serde_json::Value) -> IntegrationEvidence {
+    let merge = record.get("merge");
     let text = |field: &str| {
         merge
             .and_then(|value| value.get(field))

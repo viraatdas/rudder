@@ -173,6 +173,15 @@ command, even while typing inside the worker pane:
 `Ctrl-G` toggles the same command set as a sticky "nav mode" (`Esc` exits) if you
 prefer a held mode over the one-shot leader.
 
+**In the task pane:** `Enter` runs the draft. A newline is `Option+Enter`,
+`Shift+Enter`, `Ctrl+Enter`, `Cmd+Enter`, or `Ctrl-J` — they all mean the same
+thing, because only some terminals pass each of them through, and a trailing
+`\` before `Enter` works even in the ones that pass none. Once the draft has
+more than one line, `Up` / `Down` move between its lines and only reach task
+history from the top or bottom line; `Home` / `End`, `Ctrl-A` / `Ctrl-E` and
+`Ctrl-K` act on the current line, and `Ctrl`/`Cmd` with `Home` / `End` jumps to
+the ends of the whole draft.
+
 **In the worker pane:** keystrokes go to the agent. `Tab` / `Shift+Tab` are
 forwarded to it, `Shift+Enter` inserts a newline, and `PageUp` / `PageDown`
 scroll the pane.
@@ -418,7 +427,7 @@ rudder login                 # connect this machine to Rudder Cloud
 rudder cloud                 # onload the current workspace or start a worker
 rudder cloud list            # list cloud workers
 rudder cloud logs <id>       # worker status
-rudder cloud onload [runId]  # upload the current workspace (or one run)
+rudder cloud onload [runId]  # hand one agent off to the cloud (or upload the workspace)
 rudder cloud workspace attach # migrate all live isolated agents into one cloud workspace
 rudder sail <name>           # short alias for starting a cloud worker
 ```
@@ -428,6 +437,12 @@ confirmation pane: the default option onloads the current workspace (repo
 snapshot plus selected auth/config) to a Fly worker; press Down to start a fresh
 scratch worker instead. Completed cloud work returns through the same review and
 merge path as local work.
+
+Bare `/handoff` moves the **selected agent pane** to Rudder Cloud: the local
+worker is quiesced, its workspace and Claude session upload with the snapshot,
+and the pane reattaches to a cloud machine that resumes the same conversation
+(`claude --resume`) — so the work keeps going after this laptop disconnects.
+(`/handoff <session-id>` still adopts an outside CLI chat, like `/resume`.)
 
 Cloud comes in two shapes: a **sail** is an ephemeral, task-scoped worker (it goes away
 when the task is done; idle sails pause and can resume), while a **workspace** is a
@@ -500,10 +515,11 @@ batch job (launchd on macOS, not a resident daemon) that:
    surface map, prior failed attempts, repo conventions).
 4. **Judges** each candidate with the repo's full test gates plus a
    three-lens adversarial LLM panel that fails closed.
-5. **Ships** survivors automatically: rebase onto `origin/main`,
-   `npm version patch`, push main + tag, and the normal tag-driven CI
-   publishes the new version to npm. Later cycles verify the targeted metric
-   actually improved and flag regressions for revert.
+5. **Prepares** survivors as pushed review branches by default. If you
+   explicitly opt into `ship` autonomy, Rudder instead rebases onto
+   `origin/main`, runs `npm version patch`, and pushes main + tag for the normal
+   tag-driven npm release. Later cycles verify whether the targeted metric
+   improved and record regressions for review.
 
 ```bash
 rudder improve run --dry-run     # see what it would do, propose nothing
@@ -511,10 +527,11 @@ rudder improve schedule install  # nightly cycle at 03:30 via launchd
 rudder improve status            # shipped versions, metrics trend, ledger
 ```
 
-Everything stays on your machine, spend is hard-capped per cycle
-(`improve.budgetUsd`, default $5), autonomy is configurable
-(`improve.autonomy`: `observe` | `propose` | `ship`), and `RUDDER_IMPROVE=0`
-disables it. The full harness spec is in
+Everything stays on your machine. Estimated model/agent spend is bounded per
+cycle (`improve.budgetUsd`, default $5), and autonomy is configurable:
+`observe` only reports, `propose` (the default) pushes a review branch, and
+`ship` is an explicit opt-in to unattended releases. `RUDDER_IMPROVE=0`
+disables the loop. The full harness spec is in
 [`docs/continual-improvement.md`](./docs/continual-improvement.md);
 implementation details live in [`AGENTS.md`](./AGENTS.md) section 15.
 

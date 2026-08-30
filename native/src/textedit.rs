@@ -22,8 +22,22 @@ pub(crate) fn update_worker_prompt_draft_for_key(
     key: KeyEvent,
     capture_as_prompt: bool,
 ) -> Option<String> {
+    // Newline chords first: matching on `key.code` alone treated Option+Enter as
+    // a plain Enter and SENT the half-written line, and Shift+Enter fell through
+    // to `_ => {}`, so the one documented newline key silently did nothing here.
+    if is_newline_key(key) {
+        if draft.is_empty() {
+            *is_prompt = capture_as_prompt;
+        }
+        insert_str_at_cursor(draft, cursor, "\n");
+        return None;
+    }
+
     match key.code {
-        KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+        KeyCode::Enter => {
+            if take_escaped_newline(draft, *cursor) {
+                return None;
+            }
             return finish_worker_prompt_draft(draft, cursor, is_prompt);
         }
         KeyCode::Char('u') | KeyCode::Char('U')
@@ -79,8 +93,8 @@ pub(crate) fn update_worker_prompt_draft_for_key(
                 *cursor = (*cursor + 1).min(len);
             }
         }
-        KeyCode::Home => *cursor = 0,
-        KeyCode::End => *cursor = draft.chars().count(),
+        KeyCode::Home => *cursor = line_start_position(draft, *cursor),
+        KeyCode::End => *cursor = line_end_position(draft, *cursor),
         KeyCode::Char(ch)
             if !key.modifiers.intersects(
                 KeyModifiers::ALT
@@ -406,4 +420,100 @@ pub(crate) fn expand_pasted_chips(input: &str, chunks: &[PastedChunk]) -> String
         }
     }
     out
+}
+
+/// True when this Enter means "newline", not "send".
+///
+/// Shift+Enter only survives the trip when the terminal speaks the kitty
+/// keyboard protocol (Ghostty, kitty, WezTerm, recent iTerm). Terminal.app and
+/// plenty of others send a bare CR for it, indistinguishable from a real Enter,
+/// so every one of these is a synonym: Option/Alt+Enter, Cmd+Enter, Ctrl+Enter,
+/// and Ctrl+J — the literal LF some terminals emit for those chords. Before
+/// this, Option+Enter fell through to the plain-Enter arm and LAUNCHED the task
+/// mid-sentence.
+pub(crate) fn is_newline_key(key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Enter => key.modifiers.intersects(
+            KeyModifiers::SHIFT
+                | KeyModifiers::ALT
+                | KeyModifiers::CONTROL
+                | KeyModifiers::SUPER
+                | KeyModifiers::META,
+        ),
+        KeyCode::Char('j') | KeyCode::Char('J') => key.modifiers.contains(KeyModifiers::CONTROL),
+        _ => false,
+    }
+}
+
+/// `\` + Enter — the last-resort newline for terminals that eat every chord.
+/// Consumes the backslash and leaves a newline in its place, so the escape
+/// never reaches the agent. One char out, one char in: the cursor stays put.
+pub(crate) fn take_escaped_newline(input: &mut String, cursor: usize) -> bool {
+    if cursor == 0 || input.chars().nth(cursor - 1) != Some('\\') {
+        return false;
+    }
+    let start = byte_index_for_char(input, cursor - 1);
+    let end = byte_index_for_char(input, cursor);
+    input.replace_range(start..end, "\n");
+    true
+}
+
+/// One VISUAL row up or down inside a wrapped draft, keeping the column.
+///
+/// Visual, not logical: a long line occupies several rows on screen, and an
+/// Up that skipped all of them at once looked like the cursor teleporting.
+/// `None` means there is no row that way, and the caller falls through to
+/// history navigation — which is all Up/Down ever meant on a one-line draft.
+pub(crate) fn cursor_row_move(value: &str, cursor: usize, width: u16, down: bool) -> Option<usize> {
+    let (row, col) = task_cursor_position(value, cursor, width);
+    let target = if down { row + 1 } else { row.checked_sub(1)? };
+    if target >= wrap_input_text(value, width).len() {
+        return None;
+    }
+    Some(task_cursor_from_selection_point(
+        value,
+        SelectionPoint { row: target, col },
+        width,
+    ))
+}
+
+/// First char index of the logical line the cursor sits on.
+pub(crate) fn line_start_position(input: &str, cursor: usize) -> usize {
+    let mut start = 0;
+    for (index, ch) in input.chars().enumerate().take(cursor) {
+        if ch == '\n' {
+            start = index + 1;
+        }
+    }
+    start
+}
+
+/// Char index of the newline ending this logical line, or the end of the draft.
+pub(crate) fn line_end_position(input: &str, cursor: usize) -> usize {
+    for (index, ch) in input.chars().enumerate().skip(cursor) {
+        if ch == '\n' {
+            return index;
+        }
+    }
+    input.chars().count()
+}
+
+/// Ctrl+K: kill to the end of THIS line, not to the end of the draft. Killing
+/// everything downstream silently ate the rest of a multi-line task. Sitting
+/// already at a line end, swallow the newline instead, so repeated presses join
+/// lines the way readline does.
+pub(crate) fn kill_to_line_end(input: &mut String, cursor: usize) {
+    let total = input.chars().count();
+    let end = line_end_position(input, cursor);
+    let end = if end == cursor {
+        (cursor + 1).min(total)
+    } else {
+        end
+    };
+    if end == cursor {
+        return;
+    }
+    let start_byte = byte_index_for_char(input, cursor);
+    let end_byte = byte_index_for_char(input, end);
+    input.replace_range(start_byte..end_byte, "");
 }

@@ -13,14 +13,14 @@ pub(crate) fn is_cloud_worker_session() -> bool {
 
 pub(crate) fn read_cloud_summary() -> CloudSummary {
     // Inside a cloud worker VM there is no user auth file and no
-    // RUDDER_CLOUD_TOKEN — the machine authenticates with its own
-    // RUDDER_WORKER_TOKEN. Without this, every in-VM dashboard rendered
-    // "cloud offline" about the very cloud it was running in.
-    if is_cloud_worker_session()
-        && env::var("RUDDER_WORKER_TOKEN")
-            .ok()
-            .is_some_and(|token| !token.trim().is_empty())
-    {
+    // RUDDER_CLOUD_TOKEN — the supervisor authenticates with its own
+    // RUDDER_WORKER_TOKEN and deliberately SCRUBS that token from the
+    // dashboard's env (a steered agent must not be able to read it). So the
+    // token can never be the evidence here: the machine's identity env
+    // (RUDDER_WORKSPACE_ID / RUDDER_SAIL_ID) is proof enough that this
+    // dashboard IS the cloud. Requiring the scrubbed token made every in-VM
+    // dashboard render "cloud offline" one line above its own workspace id.
+    if is_cloud_worker_session() {
         return CloudSummary {
             connected: true,
             runtime: env::var("RUDDER_CLOUD_RUNTIME")
@@ -74,6 +74,11 @@ pub(crate) fn cloud_workspace_label(workspace: Option<&CloudWorkspaceStatus>) ->
     let Some(workspace) = workspace else {
         return "cloud workspace · none".to_string();
     };
+    let kind = if workspace.is_sail {
+        "cloud sail"
+    } else {
+        "cloud workspace"
+    };
     let status = workspace.status.as_deref().unwrap_or("unknown");
     // Name the workspace, not just its state: "cloud workspace · running" told
     // the user nothing about WHICH workspace they were in (unclear enough to
@@ -86,15 +91,24 @@ pub(crate) fn cloud_workspace_label(workspace: Option<&CloudWorkspaceStatus>) ->
         .unwrap_or_default();
     if workspace.client_count > 0 {
         format!(
-            "cloud workspace{name} · {status} · {} attached",
+            "{kind}{name} · {status} · {} attached",
             workspace.client_count
         )
-    } else if workspace.active_agents {
-        format!("cloud workspace{name} · {status} · active")
+    } else if workspace.active_agents_known && workspace.active_agents > 0 {
+        // The worker-reported count is the busy FACT: agents are mid-task in
+        // the cloud machine even with nobody attached, and the idle sweep
+        // leaves them alone because of it. Show the count so "it's still
+        // working" is answerable at a glance after a disconnect.
+        format!(
+            "{kind}{name} · {status} · {} running",
+            workspace.active_agents
+        )
+    } else if workspace.active_agents_known {
+        format!("{kind}{name} · {status} · idle")
     } else if let Some(idle) = workspace.idle_minutes {
-        format!("cloud workspace{name} · {status} · idle {idle}m")
+        format!("{kind}{name} · {status} · idle {idle}m")
     } else {
-        format!("cloud workspace{name} · {status}")
+        format!("{kind}{name} · {status}")
     }
 }
 
@@ -107,6 +121,17 @@ pub(crate) fn query_cloud_workspace_status(cwd: &Path) -> Option<CloudWorkspaceS
         if !id.trim().is_empty() {
             return Some(CloudWorkspaceStatus {
                 id: Some(id),
+                status: Some("running".to_string()),
+                ..CloudWorkspaceStatus::default()
+            });
+        }
+    }
+    // Same story for a sail VM: RUDDER_SAIL_ID is the machine's identity.
+    if let Ok(id) = env::var("RUDDER_SAIL_ID") {
+        if !id.trim().is_empty() {
+            return Some(CloudWorkspaceStatus {
+                id: Some(id),
+                is_sail: true,
                 status: Some("running".to_string()),
                 ..CloudWorkspaceStatus::default()
             });
@@ -167,18 +192,35 @@ pub(crate) fn query_cloud_workspace_status(cwd: &Path) -> Option<CloudWorkspaceS
         .and_then(serde_json::Value::as_u64)
         .map(|n| n as u32)
         .unwrap_or(0);
-    let active_agents = value
-        .get("activeAgents")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
+    // The CLI reports `activeAgentCount` (worker-reported, may be null on old
+    // control planes) and `activeAgents` (bool, the legacy heuristic). Prefer
+    // the fact; fall back to the bool so an old CLI still degrades gracefully.
+    let (active_agents, active_agents_known) = match value
+        .get("activeAgentCount")
+        .and_then(serde_json::Value::as_u64)
+    {
+        Some(count) => (count as u32, true),
+        None => match value.get("activeAgentCount") {
+            Some(serde_json::Value::Null) => (
+                value
+                    .get("activeAgents")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false) as u32,
+                false,
+            ),
+            _ => (0, false),
+        },
+    };
     let idle_minutes = value
         .get("idleMinutes")
         .and_then(serde_json::Value::as_u64)
         .map(|n| n as u32);
     Some(CloudWorkspaceStatus {
         id,
+        is_sail: false,
         status,
         active_agents,
+        active_agents_known,
         client_count,
         idle_minutes,
     })
@@ -296,6 +338,42 @@ pub(crate) fn user_home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
+}
+
+/// Where the per-repo cloud-mode flag lives. Plain task input routes to
+/// Rudder Cloud while this is on, so it must survive a dashboard restart.
+fn cloud_mode_path(cwd: &Path) -> PathBuf {
+    cwd.join(".rudder").join("cloud-mode.json")
+}
+
+/// Read the per-repo cloud-mode flag. Absent or corrupt = off; a corrupted
+/// one-line flag must never keep a user stuck routing tasks to the cloud.
+pub(crate) fn read_cloud_mode(cwd: &Path) -> bool {
+    let Ok(raw) = fs::read_to_string(cloud_mode_path(cwd)) else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()
+        .and_then(|value| value.get("enabled").and_then(|v| v.as_bool()))
+        .unwrap_or(false)
+}
+
+/// Persist the flag atomically (temp + rename), matching every other
+/// `.rudder` ledger write. Best effort: the in-memory flag stays authoritative
+/// for this session even if the disk write fails.
+pub(crate) fn write_cloud_mode(cwd: &Path, enabled: bool) {
+    let dir = cwd.join(".rudder");
+    if fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let path = cloud_mode_path(cwd);
+    let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    let Ok(json) = serde_json::to_string(&serde_json::json!({ "enabled": enabled })) else {
+        return;
+    };
+    if fs::write(&tmp, json).is_ok() {
+        let _ = fs::rename(&tmp, &path);
+    }
 }
 
 pub(crate) fn latest_codex_session_id_for_cwd(cwd: &Path) -> Option<String> {

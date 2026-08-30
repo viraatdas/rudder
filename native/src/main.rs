@@ -30,9 +30,8 @@ use ratatui::{
     Frame, Terminal,
 };
 use rudder_native::pty_terminal::{
-    describe_exit_code,
-    CellContents, PtyOutputWaker, StyledTerminalCell, TerminalCommand, TerminalCursor,
-    TerminalPane, TerminalPaneOptions, TerminalSize,
+    describe_exit_code, CellContents, PtyOutputWaker, StyledTerminalCell, TerminalCommand,
+    TerminalCursor, TerminalPane, TerminalPaneOptions, TerminalSize,
 };
 
 /// A single message the main event loop selects on. Either a terminal input
@@ -924,7 +923,8 @@ fn parse_gam_args(
     }
 
     let explicit_spec = adversarial_backend.is_some() || adversarial_model.is_some();
-    let adversarial_backend = adversarial_backend.unwrap_or_else(|| cross_gam_backend(default_backend));
+    let adversarial_backend =
+        adversarial_backend.unwrap_or_else(|| cross_gam_backend(default_backend));
     let adversarial_model = adversarial_model
         .map(|model| model.trim().to_string())
         .filter(|model| !model.is_empty())
@@ -1318,8 +1318,7 @@ fn lift_gam_reply(lines: &[String]) -> Option<String> {
     let end_index = end_offset.map(|offset| start_index + 1 + offset)?;
     let reply = lines[start_index + 1..end_index].join("\n");
     let reply = reply.trim().to_string();
-    (!reply.is_empty())
-        .then(|| truncate_chars(&reply, GAM_MESSAGE_BUDGET_CHARS))
+    (!reply.is_empty()).then(|| truncate_chars(&reply, GAM_MESSAGE_BUDGET_CHARS))
 }
 
 /// Everything ONE `/plan` owns. Several orchestrators run at once, each driving its
@@ -1502,6 +1501,10 @@ struct App {
     effort: Option<EffortLevel>,
     notice: Option<String>,
     cloud_prompt: Option<CloudLaunchPrompt>,
+    /// Per-repo cloud mode: plain task input launches a Rudder Cloud worker
+    /// instead of a local one, and the task pane says so. Persisted to
+    /// `.rudder/cloud-mode.json` (cloudio::read/write_cloud_mode).
+    cloud_mode: bool,
     delete_pending: Option<String>,
     /// Frame counter + the frame at which `delete_pending` was armed. The
     /// confirming `d` only counts once at least one frame has RENDERED after
@@ -1734,6 +1737,15 @@ struct MigratedAgent {
     fresh_prompt: Option<String>,
 }
 
+/// Which kind of wait a backend hook reported. A question and an approval are
+/// different states to a human — one needs an answer typed, the other needs a
+/// yes or no — and the dashboard renders them differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitSignal {
+    Input,
+    Permission,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SelectionPoint {
     row: usize,
@@ -1781,8 +1793,15 @@ struct CloudSummary {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct CloudWorkspaceStatus {
     id: Option<String>,
+    /// "workspace" unless this identity came from RUDDER_SAIL_ID — a sail VM
+    /// labeled "cloud workspace · unknown" reads like a broken lookup.
+    is_sail: bool,
     status: Option<String>,
-    active_agents: bool,
+    /// How many rudder runs are ACTIVELY WORKING in the cloud machine, as
+    /// reported by the worker itself (0 = nothing running; None/unknown = the
+    /// control plane predates the field). A fact, not the old activity guess.
+    active_agents: u32,
+    active_agents_known: bool,
     client_count: u32,
     idle_minutes: Option<u32>,
 }
@@ -1916,6 +1935,18 @@ struct AgentRun {
     interactive_orchestrator: bool,
     needs_permission: bool,
     needs_user_input: bool,
+    /// A wait the BACKEND reported through its own hook, latched until something
+    /// deterministic lifts it: the human answering, the agent visibly resuming,
+    /// or the turn ending.
+    ///
+    /// It has to latch — the prompt scrolls out of the visible pane, and a badge
+    /// derived only from what is currently on screen would blink out while the
+    /// agent still sat there waiting. But nothing ever LIFTED it: the signal file
+    /// was read every tick and never consumed, so `needs_user_input` was rewritten
+    /// to true forever and answering an agent could not clear its "needs you"
+    /// badge. The signal is one-shot now, exactly like the done signal, and this
+    /// field is what remembers it.
+    wait_signal: Option<WaitSignal>,
     last_error: Option<String>,
     worker_input_draft: String,
     worker_input_cursor: usize,
@@ -2076,6 +2107,20 @@ impl AgentRun {
         self.workspace_path.is_some()
             || self.workspace_name.is_some()
             || self.jj_change_id.is_some()
+    }
+
+    /// Can this run be handed off to Rudder Cloud on its own (`/handoff`)?
+    /// The same shape migrate_current_agents_to_cloud selects: a live isolated
+    /// worker — the CLI's migration planner can only stage runs that have a
+    /// workspace of their own, and a run already in the cloud has nothing to
+    /// move.
+    pub(crate) fn is_cloud_handoff_eligible(&self) -> bool {
+        self.status == AgentStatus::Running
+            && self.has_merge_source()
+            && !self.is_orchestrator()
+            && !self.is_main()
+            && !self.is_oneoff()
+            && !is_cloud_agent(self)
     }
 
     fn has_merge_conflict(&self) -> bool {
@@ -2477,6 +2522,13 @@ impl App {
             .map(|path| dashboard_root(&path))
             .unwrap_or_else(|_| PathBuf::from("."));
         let selection = initial_selection();
+        // Read the per-repo cloud-mode flag BEFORE the struct literal takes
+        // ownership of `cwd`. Tests pin it off (they share repo dirs).
+        let cloud_mode = if cfg!(test) {
+            false
+        } else {
+            read_cloud_mode(&cwd)
+        };
         let bg_notices = mpsc::channel::<String>();
         let dashboard_color_mode = if cfg!(test) {
             ColorMode::Terminal
@@ -2602,6 +2654,7 @@ impl App {
             effort: selection.effort,
             notice: None,
             cloud_prompt: None,
+            cloud_mode,
             delete_pending: None,
             frames_drawn: 0,
             delete_armed_frame: 0,
@@ -3033,6 +3086,98 @@ impl App {
             .get(self.selected_agent)
             .map(|run| run.is_orchestrator())
             .unwrap_or(false)
+    }
+
+    /// True when the selected row's work lives in Rudder Cloud. The local dashboard owns the RECORD, not the
+    /// execution, so local actions that assume a live local workspace (merge,
+    /// stop, review, resume, delete) must refuse instead of guessing.
+    fn selected_is_cloud_owned(&self) -> bool {
+        self.agents
+            .get(self.selected_agent)
+            .is_some_and(|run| run.status == AgentStatus::Migrated || is_cloud_agent(run))
+    }
+
+    /// Open an attach pane for the cloud workspace that owns the selected
+    /// migrated row. That workspace IS the execution; attaching is the only
+    /// local action that reaches it.
+    fn attach_selected_cloud_agent(&mut self) {
+        if !rudder_cloud_authenticated() {
+            self.notice = Some("not logged in to Rudder Cloud; run /login first".to_string());
+            return;
+        }
+        let Some(run) = self.agents.get(self.selected_agent) else {
+            return;
+        };
+        if let Some(sail_id) = cloud_sail_id(run).map(str::to_string) {
+            self.reattach_cloud_sail_at(self.selected_agent, &sail_id);
+        } else if run.status == AgentStatus::Migrated {
+            self.push_activity(
+                "cloud: opening the workspace that owns a migrated agent".to_string(),
+            );
+            self.start_rudder_cli_command(
+                "cloud workspace attach",
+                vec![
+                    "cloud".to_string(),
+                    "workspace".to_string(),
+                    "attach".to_string(),
+                ],
+            );
+        } else {
+            self.notice = Some(
+                "cloud session has no saved sail id; use /cloud list, then /cloud attach <id>"
+                    .to_string(),
+            );
+        }
+    }
+
+    fn reattach_cloud_sail_at(&mut self, index: usize, sail_id: &str) {
+        let program = crate::cloudio::locate_rudder_cli()
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_else(|| "rudder".to_string());
+        let command = TerminalCommand::with_args(
+            program,
+            vec![
+                "cloud".to_string(),
+                "attach".to_string(),
+                sail_id.to_string(),
+            ],
+        );
+        let options = TerminalPaneOptions {
+            size: TerminalSize::default(),
+            cwd: Some(self.cwd.clone()),
+            ..TerminalPaneOptions::default()
+        };
+        match TerminalPane::spawn_shell_or_command(Some(command), options) {
+            Ok(mut terminal) => {
+                let _ = terminal.drain_output();
+                Self::attach_output_waker(&self.pty_output_waker, &terminal);
+                let Some(run) = self.agents.get_mut(index) else {
+                    terminal.terminate_and_wait();
+                    return;
+                };
+                if let Some(mut old_terminal) = run.terminal.take() {
+                    old_terminal.terminate_and_wait();
+                }
+                run.terminal = Some(terminal);
+                run.status = AgentStatus::Running;
+                run.completed_at = None;
+                run.last_error = None;
+                run.last_output_at = Instant::now();
+                let _ = save_native_run_record(&self.cwd, run);
+                self.notice = Some(format!("reattached cloud sail {sail_id}"));
+                self.push_activity(format!("cloud: reattached {sail_id}"));
+                self.dirty = true;
+            }
+            Err(error) => {
+                if let Some(run) = self.agents.get_mut(index) {
+                    run.status = AgentStatus::Paused;
+                    run.last_error = Some(error.to_string());
+                    let _ = save_native_run_record(&self.cwd, run);
+                }
+                self.notice = Some(format!("cloud attach failed: {error}"));
+                self.dirty = true;
+            }
+        }
     }
 
     fn selected_uses_headless_orchestrator_chat(&self) -> bool {
@@ -3602,6 +3747,13 @@ impl App {
                     self.delete_pending = None;
                     if self.selected_is_main() {
                         self.focus_or_spawn_main();
+                    } else if self.selected_is_cloud_owned() {
+                        let has_live_attach = self.agents[self.selected_agent].terminal.is_some()
+                            && self.agents[self.selected_agent].status == AgentStatus::Running;
+                        if !has_live_attach {
+                            self.attach_selected_cloud_agent();
+                        }
+                        self.focus = FocusPane::Worker;
                     } else if self.agents[self.selected_agent].status == AgentStatus::Paused {
                         let index = self.selected_agent;
                         if self.agents[index].is_orchestrator() {
@@ -4046,9 +4198,13 @@ impl App {
 
     fn clear_selected_attention_flags(&mut self) {
         if let Some(run) = self.agents.get_mut(self.selected_agent) {
-            if run.needs_permission || run.needs_user_input {
+            if run.needs_permission || run.needs_user_input || run.wait_signal.is_some() {
                 run.needs_permission = false;
                 run.needs_user_input = false;
+                // Clearing only the derived flags was useless: the latch put them
+                // straight back on the next tick, so answering an agent never
+                // cleared its badge. Answering IS the thing that ends the wait.
+                run.wait_signal = None;
                 self.dirty = true;
             }
         }
@@ -4353,6 +4509,17 @@ impl App {
             self.focus = FocusPane::Worker;
             return;
         }
+        // A cloud-owned row has no local diff to review: the workspace snapshot
+        // is stale the moment the cloud agent keeps editing. The diff that
+        // matters is in the cloud workspace. (Diff -> Terminal still works so
+        // a view left open when the row migrated can be backed out of.)
+        if self.selected_is_cloud_owned() && self.worker_view == WorkerView::Terminal {
+            self.notice = Some(
+                "cloud-owned agent: review it in its cloud workspace — Enter attaches to it"
+                    .to_string(),
+            );
+            return;
+        }
         self.worker_view = match self.worker_view {
             WorkerView::Terminal => {
                 self.ensure_review_diff();
@@ -4597,8 +4764,44 @@ impl App {
         Ok(())
     }
 
+    /// The width the renderer wrapped the draft at, so cursor motion agrees with
+    /// what is on screen. Unrendered (headless tests): a width nothing wraps at,
+    /// which makes row motion fall back to logical lines.
+    fn task_wrap_width(&self) -> u16 {
+        self.task_area
+            .map(|area| area.width.saturating_sub(2).max(1))
+            .unwrap_or(u16::MAX)
+    }
+
+    /// Up/Down inside a multi-row draft moves the cursor a row instead of
+    /// swapping in a history entry. Returns false when there is no row that
+    /// way — then Up/Down mean history, as they always have on one line.
+    fn move_task_cursor_row(&mut self, down: bool) -> bool {
+        match cursor_row_move(
+            &self.task_input,
+            self.task_cursor,
+            self.task_wrap_width(),
+            down,
+        ) {
+            Some(cursor) => {
+                self.task_cursor = cursor;
+                true
+            }
+            None => false,
+        }
+    }
+
     fn handle_task_key(&mut self, key: KeyEvent) -> bool {
         self.task_selection = None;
+        // Before the history and palette claims below: a draft with rows above or
+        // below the cursor owns Up/Down. Losing a half-written multi-line task to
+        // a history entry on the first Up was the worst of the multiline gaps.
+        if matches!(key.code, KeyCode::Up | KeyCode::Down)
+            && key.modifiers.is_empty()
+            && self.move_task_cursor_row(key.code == KeyCode::Down)
+        {
+            return false;
+        }
         if self.task_history_index.is_some() {
             match key.code {
                 KeyCode::Up => {
@@ -4611,6 +4814,16 @@ impl App {
                 }
                 _ => {}
             }
+        }
+
+        // The palette's Enter arm accepts a suggestion; a newline chord is not an
+        // accept, so it has to jump the queue or Shift+Enter would pick a command.
+        if is_newline_key(key) {
+            self.reset_task_history_navigation();
+            insert_str_at_cursor(&mut self.task_input, &mut self.task_cursor, "\n");
+            self.clamp_picker_index();
+            self.maybe_refresh_handoff_candidates();
+            return false;
         }
 
         if self.handle_picker_key(key) {
@@ -4636,13 +4849,16 @@ impl App {
                     self.picker_dismissed_input = None;
                 }
             }
-            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                // Shift+Enter inserts a literal newline in the task draft.
-                self.reset_task_history_navigation();
-                insert_str_at_cursor(&mut self.task_input, &mut self.task_cursor, "\n");
-                self.clamp_picker_index();
+            KeyCode::Enter => {
+                // Trailing "\" + Enter is the newline of last resort, for terminals
+                // that pass no Enter chord through at all.
+                if take_escaped_newline(&mut self.task_input, self.task_cursor) {
+                    self.reset_task_history_navigation();
+                    self.clamp_picker_index();
+                } else {
+                    self.start_task();
+                }
             }
-            KeyCode::Enter => self.start_task(),
             KeyCode::Up => self.show_previous_task_history(),
             KeyCode::Down => self.show_next_task_history(),
             KeyCode::Backspace => {
@@ -4699,11 +4915,27 @@ impl App {
             {
                 self.task_cursor = next_word_position(&self.task_input, self.task_cursor);
             }
+            // Line-relative, the way every editor and readline behave. Whole-draft
+            // jumps kept their Ctrl/Cmd forms, which is where they belong.
             KeyCode::Home => {
-                self.task_cursor = 0;
+                self.task_cursor = if key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::META)
+                {
+                    0
+                } else {
+                    line_start_position(&self.task_input, self.task_cursor)
+                };
             }
             KeyCode::End => {
-                self.task_cursor = self.task_input.chars().count();
+                self.task_cursor = if key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::META)
+                {
+                    self.task_input.chars().count()
+                } else {
+                    line_end_position(&self.task_input, self.task_cursor)
+                };
             }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.reset_task_history_navigation();
@@ -4718,14 +4950,14 @@ impl App {
                 self.clamp_picker_index();
             }
             KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.task_cursor = 0;
+                self.task_cursor = line_start_position(&self.task_input, self.task_cursor);
             }
             KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.task_cursor = self.task_input.chars().count();
+                self.task_cursor = line_end_position(&self.task_input, self.task_cursor);
             }
             KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.reset_task_history_navigation();
-                truncate_at_cursor(&mut self.task_input, self.task_cursor);
+                kill_to_line_end(&mut self.task_input, self.task_cursor);
                 self.clamp_picker_index();
             }
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -4864,9 +5096,7 @@ impl App {
                 // to a model picker.
                 let gam_tokens = trimmed.split_whitespace().count();
                 let showing = |variant: fn(&SuggestionAction) -> bool| {
-                    suggestions
-                        .first()
-                        .is_some_and(|s| variant(&s.action))
+                    suggestions.first().is_some_and(|s| variant(&s.action))
                 };
                 let showing_providers =
                     showing(|action| matches!(action, SuggestionAction::ChooseGamProvider(_)));
@@ -5357,8 +5587,7 @@ impl App {
             && mouse.kind == MouseEventKind::Down(MouseButton::Left)
             && self.gam_pair_indices_for_selected().is_some()
         {
-            let Some((generator_index, adversarial_index)) =
-                self.gam_pair_indices_for_selected()
+            let Some((generator_index, adversarial_index)) = self.gam_pair_indices_for_selected()
             else {
                 return false;
             };
@@ -5909,7 +6138,10 @@ impl App {
     fn scroll_gam_half(&mut self, mouse: MouseEvent, area: Rect, index: usize) -> bool {
         let rows = mouse_scrollback_delta(mouse, area.height);
         let mouse_bytes = mouse_event_to_sgr(mouse, area);
-        let Some(terminal) = self.agents.get_mut(index).and_then(|run| run.terminal.as_mut())
+        let Some(terminal) = self
+            .agents
+            .get_mut(index)
+            .and_then(|run| run.terminal.as_mut())
         else {
             return false;
         };
@@ -6157,6 +6389,15 @@ impl App {
         // loses all prior context.
         if self.planner_awaiting_input() {
             self.refine_plan(&input);
+            return;
+        }
+
+        // CLOUD MODE: the per-repo `/cloud` flag redirects the DEFAULT route.
+        // Everything above (slash commands, plan refine/approval, planner
+        // questions) still wins, because those are conversations with things
+        // already running HERE; only "start new work" changes where it starts.
+        if self.cloud_mode {
+            self.start_cloud_task(input);
             return;
         }
 
@@ -6534,6 +6775,7 @@ impl App {
             interactive_orchestrator: false,
             needs_permission: false,
             needs_user_input: false,
+            wait_signal: None,
             last_error: None,
             worker_input_draft: String::new(),
             worker_input_cursor: 0,
@@ -6720,6 +6962,7 @@ impl App {
             interactive_orchestrator: false,
             needs_permission: false,
             needs_user_input: false,
+            wait_signal: None,
             last_error: None,
             worker_input_draft: String::new(),
             worker_input_cursor: 0,
@@ -6807,8 +7050,8 @@ impl App {
         self.notice = None;
 
         // ---- GENERATOR ------------------------------------------------------
-        let workspace_label = rudder_plan_worker_title_from_prompt(&task)
-            .unwrap_or_else(|| task.clone());
+        let workspace_label =
+            rudder_plan_worker_title_from_prompt(&task).unwrap_or_else(|| task.clone());
         let task_summary = summarize_task(&task);
         let workspace = if in_main {
             WorkspaceInfo::current(self.cwd.clone())
@@ -6936,6 +7179,7 @@ Until the first packet arrives, reply only: \"standing by\"."
             interactive_orchestrator: false,
             needs_permission: false,
             needs_user_input: false,
+            wait_signal: None,
             last_error: None,
             worker_input_draft: String::new(),
             worker_input_cursor: 0,
@@ -7028,6 +7272,7 @@ Until the first packet arrives, reply only: \"standing by\"."
             interactive_orchestrator: false,
             needs_permission: false,
             needs_user_input: false,
+            wait_signal: None,
             last_error: None,
             worker_input_draft: String::new(),
             worker_input_cursor: 0,
@@ -7075,8 +7320,7 @@ Until the first packet arrives, reply only: \"standing by\"."
                 Err(error) => {
                     adversarial_run.status = AgentStatus::Failed;
                     adversarial_run.last_error = Some(error.to_string());
-                    self.notice =
-                        Some(format!("failed to start reviewer: {error}"));
+                    self.notice = Some(format!("failed to start reviewer: {error}"));
                 }
             }
         }
@@ -7178,9 +7422,7 @@ Until the first packet arrives, reply only: \"standing by\"."
                             actions.push(GamAction::DeliverPacket(index));
                         }
                     } else if self.agents[index].status == AgentStatus::Running
-                        && gam
-                            .next_interim_at
-                            .is_some_and(|due| Instant::now() >= due)
+                        && gam.next_interim_at.is_some_and(|due| Instant::now() >= due)
                         && peer.is_some_and(|peer| self.gam_reviewer_is_idle(peer))
                     {
                         // MID-TURN STEERING. The turn-boundary review is still
@@ -7616,9 +7858,10 @@ finished work: fold it into what you are doing. If it is wrong, say why inside \
         gam.last_progress = Some(progress);
         let packet = gam_review_packet(&gam, &diff);
         if !self.live_inject_at(peer_index, &packet) {
-            self.settle_gam_pair(generator_index, GamOutcome::Escalated(
-                "could not reach the reviewer pane".to_string(),
-            ));
+            self.settle_gam_pair(
+                generator_index,
+                GamOutcome::Escalated("could not reach the reviewer pane".to_string()),
+            );
             return;
         }
         gam.phase = GamPhase::AwaitingVerdict;
@@ -7973,6 +8216,7 @@ Address the objection directly. If you disagree, say why inside \
             interactive_orchestrator: interactive_planner,
             needs_permission: false,
             needs_user_input: false,
+            wait_signal: None,
             last_error: None,
             worker_input_draft: String::new(),
             worker_input_cursor: 0,
@@ -8486,8 +8730,12 @@ Address the objection directly. If you disagree, say why inside \
         if run.terminal.is_some()
             || run.plain_process
             || run.is_orchestrator()
+            || run.status == AgentStatus::Migrated
             || !can_resume_agent(run)
         {
+            // Migrated rows never reopen locally: the live conversation belongs
+            // to the cloud workspace now, and `claude --resume` here would run a
+            // second, diverging copy of the same session.
             return false;
         }
         if !self.focus_resume_attempted.insert(run.id.clone()) {
@@ -9555,14 +9803,20 @@ It will tend to agree with itself — name another with /gam <provider> <model> 
                 true
             }
             Some("/resume") | Some("/handoff") => {
-                // Adopt a chat that was happening OUTSIDE the dashboard. With no
-                // session id the palette (which lists this repo's recent
-                // conversations) is the interface; reaching here means the user
-                // dismissed it, so say what the command wants.
+                // With a session id, both commands ADOPT a chat that was
+                // happening outside the dashboard. Bare, they diverge: /resume
+                // keeps pointing at the palette of recent conversations, while
+                // bare /handoff hands the SELECTED agent pane to Rudder Cloud —
+                // the pane reopens attached to a cloud machine that resumes the
+                // same conversation.
                 let rest = resume_command_rest(input)
                     .unwrap_or_default()
                     .trim()
                     .to_string();
+                if rest.is_empty() && input.trim_start().starts_with("/handoff") {
+                    self.handoff_selected_agent_to_cloud();
+                    return true;
+                }
                 let (target, session_id, instruction) = crate::handoff::parse_resume_args(&rest);
                 if session_id.is_empty() {
                     self.maybe_refresh_handoff_candidates();
@@ -9683,7 +9937,7 @@ It will tend to agree with itself — name another with /gam <provider> <model> 
             }
             Some("/help") => {
                 self.notice = Some(
-                    "plain input -> one isolated mergeable worker in its own jj workspace · /plan <task> -> an orchestrator that plans and runs a DAG · /gam [model] <task> -> generator + adversarial reviewer pair; the reviewer can steer the generator mid-turn and stop it outright (split panes, ^W a toggles sides, ^W t shows the dialogue) · /main|/m <task> -> another agent in this shared checkout · panes: Option-1/2/3 or ^W · keys: j/k select · Option-[ / Option-] step agents from any pane · Enter focus · v diff · m merge · u undo a merge · M merge all · R review all · g nest · o web ui · x stop · b branch chat · dd delete · cc clear merged · P model; commands: /model /fast /sound /color /main /plan /gam /resume /restore /share /usage /goal /cloud /web /feedback"
+                    "plain input -> one isolated mergeable worker in its own jj workspace · /plan <task> -> an orchestrator that plans and runs a DAG · /gam [model] <task> -> generator + adversarial reviewer pair; the reviewer can steer the generator mid-turn and stop it outright (split panes, ^W a toggles sides, ^W t shows the dialogue) · /main|/m <task> -> another agent in this shared checkout · panes: Option-1/2/3 or ^W · keys: j/k select · Option-[ / Option-] step agents from any pane · Enter focus · v diff · m merge · u undo a merge · M merge all · R review all · g nest · o web ui · x stop · b branch chat · dd delete · cc clear merged · P model; · /handoff -> selected agent moves to Rudder Cloud and resumes there; commands: /model /fast /sound /color /main /plan /gam /resume /restore /handoff /share /usage /goal /cloud /web /feedback"
                         .to_string(),
                 );
                 true
@@ -9694,24 +9948,50 @@ It will tend to agree with itself — name another with /gam <provider> <model> 
             }
             Some("/cloud") => {
                 let raw_args = parts.collect::<Vec<_>>();
-                if cloud_args_need_auth(&raw_args) && !rudder_cloud_authenticated() {
-                    self.notice =
-                        Some("not logged in to Rudder Cloud; run /login first".to_string());
-                    return true;
+                // Cloud mode is dashboard state, not a CLI passthrough: bare
+                // `/cloud` toggles it, and `on`/`off` set it explicitly. With
+                // it on, plain task input starts workers in Rudder Cloud and
+                // keeps running there when this laptop disconnects.
+                match raw_args.first().copied() {
+                    None | Some("mode") => {
+                        self.set_cloud_mode(!self.cloud_mode);
+                    }
+                    Some("on") => {
+                        self.set_cloud_mode(true);
+                    }
+                    Some("off") | Some("local") => {
+                        self.set_cloud_mode(false);
+                    }
+                    Some("latency") => {
+                        if !rudder_cloud_authenticated() {
+                            self.notice =
+                                Some("not logged in to Rudder Cloud; run /login first".to_string());
+                            return true;
+                        }
+                        self.start_rudder_cli_command(
+                            "cloud latency probe",
+                            vec![
+                                "cloud".to_string(),
+                                "workspace".to_string(),
+                                "attach".to_string(),
+                                "--latency-probe".to_string(),
+                            ],
+                        );
+                    }
+                    Some(_) => {
+                        if cloud_args_need_auth(&raw_args) && !rudder_cloud_authenticated() {
+                            self.notice =
+                                Some("not logged in to Rudder Cloud; run /login first".to_string());
+                            return true;
+                        }
+                        if self.maybe_prompt_cloud_launch(&raw_args) {
+                            return true;
+                        }
+                        let args = self.cloud_command_args(raw_args.clone());
+                        let label = cloud_agent_label(&args);
+                        self.start_rudder_cli_command(&label, args);
+                    }
                 }
-                if raw_args.is_empty() {
-                    self.notice = Some(
-                        "Exit this dashboard and run `rudder cloud` to open the cloud workspace."
-                            .to_string(),
-                    );
-                    return true;
-                }
-                if self.maybe_prompt_cloud_launch(&raw_args) {
-                    return true;
-                }
-                let args = self.cloud_command_args(raw_args.clone());
-                let label = cloud_agent_label(&args);
-                self.start_rudder_cli_command(&label, args);
                 true
             }
             Some("/main") | Some("/m") => {
@@ -10071,6 +10351,65 @@ It will tend to agree with itself — name another with /gam <provider> <model> 
         self.worker_view = WorkerView::Terminal;
     }
 
+    /// Toggle the per-repo cloud-mode flag with the auth gate and a notice that
+    /// says what changed. Enabling requires cloud login; disabling never does.
+    fn set_cloud_mode(&mut self, enabled: bool) {
+        if enabled && !rudder_cloud_authenticated() {
+            self.notice = Some("not logged in to Rudder Cloud; run /login first".to_string());
+            return;
+        }
+        if self.cloud_mode == enabled {
+            self.notice = Some(if enabled {
+                "cloud mode is already on · /cloud off returns task input to local workers"
+                    .to_string()
+            } else {
+                "cloud mode is already off".to_string()
+            });
+            return;
+        }
+        self.cloud_mode = enabled;
+        let cwd = self.cwd.clone();
+        write_cloud_mode(&cwd, enabled);
+        self.push_activity(if enabled {
+            "cloud mode on: plain task input now starts workers in Rudder Cloud".to_string()
+        } else {
+            "cloud mode off: plain task input returns to local workers".to_string()
+        });
+        self.notice = Some(if enabled {
+            "cloud mode on: tasks typed here start in Rudder Cloud and keep running when you disconnect  ·  /cloud off to go local"
+                .to_string()
+        } else {
+            "cloud mode off: tasks start locally again".to_string()
+        });
+        self.dirty = true;
+    }
+
+    /// Launch a cloud worker on `task` (`rudder cloud "<task>"` starts a sail
+    /// that runs the task in the cloud). The pane is the local window onto it;
+    /// the execution keeps going after this laptop disconnects.
+    fn start_cloud_task(&mut self, task: &str) {
+        if !rudder_cloud_authenticated() {
+            self.notice = Some("not logged in to Rudder Cloud; run /login first".to_string());
+            return;
+        }
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let launch_name = format!("rdr-{nanos}-{}", std::process::id());
+        let sail_id = format!("cloud-{launch_name}");
+        let label = format!("cloud sail {sail_id} · {}", short_task(task));
+        self.push_activity(format!("cloud task: {task}"));
+        self.start_rudder_cli_command_with_env(
+            &label,
+            vec!["cloud".to_string(), task.to_string()],
+            &[
+                ("RUDDER_CLOUD_RUNTIME", "fly"),
+                ("RUDDER_CLOUD_LAUNCH_NAME", &launch_name),
+            ],
+        );
+    }
+
     fn maybe_prompt_cloud_launch(&mut self, raw_args: &[&str]) -> bool {
         if !cloud_args_start_worker(raw_args) {
             return false;
@@ -10202,14 +10541,7 @@ It will tend to agree with itself — name another with /gam <provider> <model> 
             .agents
             .iter()
             .enumerate()
-            .filter(|(_, run)| {
-                run.status == AgentStatus::Running
-                    && run.has_merge_source()
-                    && !run.is_orchestrator()
-                    && !run.is_main()
-                    && !run.is_oneoff()
-                    && !is_cloud_agent(run)
-            })
+            .filter(|(_, run)| run.is_cloud_handoff_eligible())
             .map(|(index, _)| index)
             .collect::<Vec<_>>();
         if indices.is_empty() {
@@ -10282,13 +10614,86 @@ It will tend to agree with itself — name another with /gam <provider> <model> 
         let _ = self.write_rudder_context_timed(None);
     }
 
+    /// Bare `/handoff`: move the SELECTED agent pane to Rudder Cloud — the
+    /// single-run version of migrate_current_agents_to_cloud. Quiesce the
+    /// local worker (its session jsonl is durable, so dropping the PTY loses
+    /// nothing that `--resume` needs), then `rudder cloud onload <runId>`
+    /// uploads the repo, that run's record, its workspace, and its Claude
+    /// session; the pane reattaches to a cloud machine whose dashboard resumes
+    /// the same conversation.
+    fn handoff_selected_agent_to_cloud(&mut self) {
+        if !rudder_cloud_authenticated() {
+            self.notice = Some("not logged in to Rudder Cloud; run /login first".to_string());
+            return;
+        }
+        let eligible = self
+            .agents
+            .get(self.selected_agent)
+            .is_some_and(AgentRun::is_cloud_handoff_eligible);
+        if !eligible {
+            self.notice = Some(
+                "/handoff moves the selected agent pane to Rudder Cloud — select a running isolated worker first (/handoff <session-id> still adopts an outside chat)"
+                    .to_string(),
+            );
+            return;
+        }
+        let (run_id, summary) = {
+            let run = &mut self.agents[self.selected_agent];
+            if run.backend == Backend::Codex
+                && run
+                    .session_id
+                    .as_deref()
+                    .is_none_or(|session| session.trim().is_empty())
+            {
+                run.session_id = latest_codex_session_id_for_cwd(&run.cwd);
+            }
+            run.terminal = None;
+            run.review_terminal = None;
+            run.needs_permission = false;
+            run.needs_user_input = false;
+            // Nonterminal on disk: the CLI's migration planner only stages
+            // runs it can still consider live.
+            run.status = AgentStatus::Running;
+            let _ = save_native_run_record(&self.cwd, run);
+            (run.id.clone(), run.task_summary.clone())
+        };
+        self.push_activity(format!("cloud handoff: {summary}"));
+        let args = vec!["cloud".to_string(), "onload".to_string(), run_id.clone()];
+        let label = cloud_agent_label(&args);
+        self.start_rudder_cli_command_with_env(&label, args, &[("RUDDER_CLOUD_RUNTIME", "fly")]);
+        if let Some(cloud_run) = self.agents.last_mut() {
+            if cloud_run.task == label {
+                cloud_run.review_source_ids = vec![run_id.clone()];
+            }
+        }
+        if self
+            .agents
+            .last()
+            .is_some_and(|run| run.task == label && run.status == AgentStatus::Failed)
+        {
+            self.restore_running_agents();
+            self.notice = Some("cloud handoff failed to start; the local agent resumed".to_string());
+            return;
+        }
+        if let Some(run) = self.agents.iter_mut().find(|run| run.id == run_id) {
+            run.status = AgentStatus::Migrated;
+            run.last_error = None;
+            let _ = save_native_run_record(&self.cwd, run);
+        }
+        self.notice = Some(format!(
+            "handing off \"{summary}\" to Rudder Cloud — the pane reattaches there and the conversation resumes"
+        ));
+        let _ = self.write_rudder_context_timed(None);
+    }
+
     fn recover_failed_cloud_migrations(&mut self) {
         let failed = self
             .agents
             .iter_mut()
             .filter(|run| {
                 run.status == AgentStatus::Failed
-                    && run.task.starts_with("cloud migrate ")
+                    && (run.task.starts_with("cloud migrate ")
+                        || run.task.starts_with("cloud onload "))
                     && !run.review_source_ids.is_empty()
             })
             .flat_map(|run| std::mem::take(&mut run.review_source_ids))
@@ -10385,6 +10790,7 @@ It will tend to agree with itself — name another with /gam <provider> <model> 
             interactive_orchestrator: false,
             needs_permission: false,
             needs_user_input: false,
+            wait_signal: None,
             last_error: None,
             worker_input_draft: String::new(),
             worker_input_cursor: 0,
@@ -10874,10 +11280,7 @@ It will tend to agree with itself — name another with /gam <provider> <model> 
             // notice we read back belong to this marker and no earlier one.
             self.notice = None;
             self.handle_orchestrator_skill_marker(&action);
-            let outcome = self
-                .notice
-                .clone()
-                .unwrap_or_else(|| "acted".to_string());
+            let outcome = self.notice.clone().unwrap_or_else(|| "acted".to_string());
             self.record_control_result(&action, outcome);
         }
         self.dirty = true;
@@ -12565,10 +12968,8 @@ It will tend to agree with itself — name another with /gam <provider> <model> 
                 break;
             }
             let files: Vec<String> = {
-                let mut all: Vec<String> = cluster
-                    .iter()
-                    .flat_map(|item| item.files.clone())
-                    .collect();
+                let mut all: Vec<String> =
+                    cluster.iter().flat_map(|item| item.files.clone()).collect();
                 all.sort();
                 all.dedup();
                 all
@@ -12600,9 +13001,12 @@ It will tend to agree with itself — name another with /gam <provider> <model> 
                 ));
             }
             if !files.is_empty() {
-                prompt.push_str(&format!("
+                prompt.push_str(&format!(
+                    "
 Files involved: {}
-", files.join(", ")));
+",
+                    files.join(", ")
+                ));
             }
             let node = PlannedNode {
                 id: self.uniquify_node_id("harden"),
@@ -14606,6 +15010,21 @@ Files involved: {}
         let Some(selected) = self.agents.get(self.selected_agent) else {
             return;
         };
+        // Cloud-owned rows are records of work executing in Rudder Cloud.
+        // Deleting one here would silently discard the only local pointer to a
+        // fleet that keeps running remotely; attach manages the real thing.
+        if selected.status == AgentStatus::Migrated || is_cloud_agent(selected) {
+            let label = if selected.task_summary.trim().is_empty() {
+                short_task(&selected.task)
+            } else {
+                truncate_chars(selected.task_summary.trim(), 40)
+            };
+            self.notice = Some(format!(
+                "{label} is cloud-owned - manage it from its Cloud session; Enter attaches"
+            ));
+            self.dirty = true;
+            return;
+        }
         // A LIVE main row used to dead-end here: the refusal said "stop it with
         // x", but the x handler excludes main rows, so a running main agent
         // could be neither stopped nor deleted — dd just re-printed advice that
@@ -14976,6 +15395,7 @@ Files involved: {}
             interactive_orchestrator: false,
             needs_permission: false,
             needs_user_input: false,
+            wait_signal: None,
             last_error: None,
             worker_input_draft: String::new(),
             worker_input_cursor: 0,
@@ -15167,6 +15587,16 @@ Files involved: {}
             self.notice = Some("no agent selected".to_string());
             return;
         };
+        // A cloud-owned row's diff lives in the cloud workspace and keeps
+        // moving there; merging the stale local workspace snapshot would land
+        // half-finished work in trunk while the real agent keeps editing it.
+        if run.status == AgentStatus::Migrated || is_cloud_agent(run) {
+            self.notice = Some(
+                "cloud-owned agent: it merges from its cloud workspace — Enter attaches to it"
+                    .to_string(),
+            );
+            return;
+        }
         if run.status == AgentStatus::Merged {
             self.notice = Some("selected agent is already merged".to_string());
             return;
@@ -15595,8 +16025,13 @@ Files involved: {}
         } else {
             "merge"
         };
-        let conflict_task =
-            short_task(&self.conflict_prompt.as_ref().map(|p| p.task.clone()).unwrap_or_default());
+        let conflict_task = short_task(
+            &self
+                .conflict_prompt
+                .as_ref()
+                .map(|p| p.task.clone())
+                .unwrap_or_default(),
+        );
 
         // A conflict must NEVER stop the fleet. Integration is automatic, so its
         // failure path has to be automatic too: this used to raise a y/n modal and
@@ -15886,6 +16321,16 @@ Files involved: {}
             let Some(run) = self.agents.get_mut(index) else {
                 return false;
             };
+            // Cloud-owned rows have no local PTY to kill; "stopping" one locally
+            // would just mislabel remote work that is still running. Stop it in
+            // the cloud workspace (Enter attaches there).
+            if run.status == AgentStatus::Migrated || is_cloud_agent(run) {
+                self.notice = Some(
+                    "cloud-owned agent: there is nothing to stop locally — Enter attaches to its cloud workspace"
+                        .to_string(),
+                );
+                return false;
+            }
             // Main rows are stoppable: the body below only kills the PTY and
             // records Stopped — nothing here touches a workspace. The old
             // is_main() refusal here was the bottom of a three-layer dead end
@@ -16966,18 +17411,35 @@ What to do\n\
                     };
                 let previous_needs_permission = run.needs_permission;
                 let previous_needs_user_input = run.needs_user_input;
-                let needs_permission = visible_lines
+                // A visible spinner is proof the agent went back to work, so it
+                // lifts a latched wait even when no backend said so. This is the
+                // only recovery Codex has (its `notify` reports turn-end and
+                // nothing else), and the belt-and-braces one for the other two.
+                if run.wait_signal.is_some()
+                    && visible_lines
+                        .as_ref()
+                        .is_some_and(|lines| recent_lines_look_busy(lines))
+                {
+                    run.wait_signal = None;
+                }
+                let chrome_permission = visible_lines
                     .as_ref()
-                    .is_some_and(|lines| terminal_needs_permission_from_lines(lines));
+                    .is_some_and(|lines| terminal_needs_permission_from_lines(run.backend, lines));
+                // The latch and the live screen are two sources for one badge, and
+                // either alone is wrong: chrome misses a prompt that scrolled away,
+                // the latch misses a backend that reports nothing. Take both.
+                let needs_permission =
+                    chrome_permission || run.wait_signal == Some(WaitSignal::Permission);
                 run.needs_permission = needs_permission;
                 // needs_permission / needs_user_input are surfaced visually (amber
                 // status label) but DO NOT ring: only entering review pings (see
                 // mark_run_done). Previously these rang on every detector flicker,
                 // which fired a ping whenever you selected a waiting agent.
                 let needs_user_input = !needs_permission
-                    && visible_lines
-                        .as_ref()
-                        .is_some_and(|lines| terminal_needs_user_input_from_lines(lines));
+                    && (run.wait_signal == Some(WaitSignal::Input)
+                        || visible_lines.as_ref().is_some_and(|lines| {
+                            terminal_needs_user_input_from_lines(run.backend, lines)
+                        }));
                 run.needs_user_input = needs_user_input;
                 if run.needs_permission != previous_needs_permission
                     || run.needs_user_input != previous_needs_user_input
@@ -17027,12 +17489,40 @@ What to do\n\
                         match signal {
                             Some(signals::SignalState::Done) => {
                                 signals::clear_signal(&run.id);
+                                run.wait_signal = None;
                                 mark_run_done(run);
                                 changed = true;
                             }
+                            // Each of these is consumed the way Done always was.
+                            // Leaving them on disk was the bug: the file was re-read
+                            // every tick and re-applied, so a row that had asked one
+                            // question once could never stop asking it.
                             Some(signals::SignalState::Input) => {
-                                if !run.needs_user_input {
+                                signals::clear_signal(&run.id);
+                                if run.wait_signal != Some(WaitSignal::Input) {
+                                    run.wait_signal = Some(WaitSignal::Input);
                                     run.needs_user_input = true;
+                                    changed = true;
+                                }
+                            }
+                            Some(signals::SignalState::Permission) => {
+                                signals::clear_signal(&run.id);
+                                if run.wait_signal != Some(WaitSignal::Permission) {
+                                    run.wait_signal = Some(WaitSignal::Permission);
+                                    run.needs_permission = true;
+                                    run.needs_user_input = false;
+                                    changed = true;
+                                }
+                            }
+                            // The human answered. The counterpart the protocol
+                            // never had, and the only deterministic way to know
+                            // a wait is over without reading the screen.
+                            Some(signals::SignalState::Working) => {
+                                signals::clear_signal(&run.id);
+                                if run.wait_signal.is_some() {
+                                    run.wait_signal = None;
+                                    run.needs_user_input = false;
+                                    run.needs_permission = false;
                                     changed = true;
                                 }
                             }
@@ -17081,9 +17571,11 @@ What to do\n\
                     }
                 }
             } else {
-                let had_waiting_state = run.needs_permission || run.needs_user_input;
+                let had_waiting_state =
+                    run.needs_permission || run.needs_user_input || run.wait_signal.is_some();
                 run.needs_permission = false;
                 run.needs_user_input = false;
+                run.wait_signal = None;
                 if had_waiting_state {
                     changed = true;
                 }

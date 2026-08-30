@@ -72,6 +72,7 @@ COPY cloud/worker/package.json ./package.json
 RUN npm install --omit=dev --no-audit --no-fund \
   && npm cache clean --force
 COPY cloud/worker/supervisor.mjs ./supervisor.mjs
+COPY cloud/worker/active-runs.mjs ./active-runs.mjs
 
 COPY cloud/worker/entrypoint.sh /usr/local/bin/rudder-worker
 RUN chmod +x /usr/local/bin/rudder-worker

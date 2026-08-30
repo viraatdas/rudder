@@ -14,6 +14,7 @@ import {
   buildFreshHandoffPrompt,
   cloudWorkspaceAbsolutePath,
   findMigrationCandidates,
+  formatCandidateReason,
   migrationSummary,
   summaryAsJson,
 } from "./migration.js";
@@ -86,6 +87,10 @@ type SnapshotManifest = {
 
 type SnapshotOptions = {
   includeRudderState?: boolean;
+  // Ship only these runs' records instead of all of .rudder/runs. A single-run
+  // handoff must not carry the rest of the fleet: records marked "running"
+  // would be resumed by the cloud dashboard while still running locally.
+  rudderStateRunIds?: string[];
   // False once the account has vault secrets: the snapshot then carries only
   // the working tree, never home-dir credentials or captured env vars.
   includeCredentials?: boolean;
@@ -565,25 +570,18 @@ async function launch(
 async function onload(args: string[], options: CloudCommandOptions): Promise<void> {
   const runId = args[0];
   const repoRoot = findRepoRoot();
-  const runRecord = runId
-    ? await readJson<JsonValue>(path.join(repoRoot, ".rudder", "runs", runId, "run.json"))
-    : null;
-  const workspacePath = runRecord && typeof runRecord === "object" && !Array.isArray(runRecord)
-    ? (runRecord as Record<string, JsonValue>).workspace
-    : undefined;
-  const sourceRoot = workspacePath && typeof workspacePath === "object" && !Array.isArray(workspacePath)
-    ? ((workspacePath as Record<string, JsonValue>).path as string | undefined)
-    : undefined;
-  const snapshotRoot = sourceRoot && await pathExists(sourceRoot) ? sourceRoot : repoRoot;
-  const snapshot = await createSnapshot(snapshotRoot, options.homePaths ?? [], { includeRudderState: !runId });
+  if (runId) {
+    await handoffRunToCloud(repoRoot, runId, options);
+    return;
+  }
+  const snapshot = await createSnapshot(repoRoot, options.homePaths ?? [], { includeRudderState: true });
   try {
     const client = await cloudClient({ requireToken: true });
     const runtime = await selectedCloudRuntime();
-    const name = runId ? undefined : `workspace-${path.basename(repoRoot)}`;
     const body: Record<string, JsonValue> = {
       repoName: path.basename(repoRoot),
-      run: runRecord ?? null,
-      workspace: !runId,
+      workspace: true,
+      name: `workspace-${path.basename(repoRoot)}`,
       snapshot: {
         name: path.basename(snapshot.archivePath),
         contentType: "application/gzip",
@@ -591,11 +589,6 @@ async function onload(args: string[], options: CloudCommandOptions): Promise<voi
         manifest: snapshot.manifest as unknown as JsonValue,
       },
     };
-    if (runId) {
-      body.runId = runId;
-    } else {
-      body.name = name ?? `workspace-${path.basename(repoRoot)}`;
-    }
     if (runtime !== "fly") {
       body.runtime = runtime;
     }
@@ -605,6 +598,91 @@ async function onload(args: string[], options: CloudCommandOptions): Promise<voi
     });
     await printResult(result, options);
     await maybeAutoAttach(result, options);
+  } finally {
+    await fsp.rm(snapshot.tempDir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Scope a fleet migration plan down to one run: only `runId` moves, every
+ * other candidate stays local. Fleet migration classifies EVERY non-terminal
+ * run with a workspace as movable, so without this a single-run handoff would
+ * drag the rest of the fleet's records into the snapshot marked "migrate" —
+ * and the cloud dashboard would resume agents that are still running locally.
+ */
+export function buildSingleRunPlan(candidates: MigrationCandidate[], runId: string): MigrationPlan {
+  return applyDefaultDecisions(
+    candidates.map((candidate) =>
+      candidate.runId === runId ? candidate : { ...candidate, decision: "stay" as const },
+    ),
+  );
+}
+
+/**
+ * `rudder cloud onload <runId>` — hand ONE local agent off to its own cloud
+ * machine. The snapshot carries the repo, that run's record (and only that
+ * run's), its isolated workspace, and its Claude session jsonl. The worker
+ * boots the bare dashboard (no task ⇒ no fresh worker), which finds the
+ * migration marker and resumes the conversation via `claude --resume` — the
+ * same machinery as fleet migration, scoped to a single run.
+ */
+async function handoffRunToCloud(repoRoot: string, runId: string, options: CloudCommandOptions): Promise<void> {
+  const candidates = await findMigrationCandidates(repoRoot);
+  const candidate = candidates.find((entry) => entry.runId === runId);
+  if (!candidate) {
+    throw new Error(
+      `Run ${runId} has no migratable record under .rudder/runs — it needs a non-terminal status and an isolated workspace.`,
+    );
+  }
+  if (candidate.decision !== "migrate" && candidate.decision !== "migrate-fresh") {
+    throw new Error(`Run ${runId} cannot be handed off: ${formatCandidateReason(candidate)}.`);
+  }
+  const plan = buildSingleRunPlan(candidates, runId);
+  const repoName = path.basename(repoRoot);
+  const client = await cloudClient({ requireToken: true });
+  const vaultActive = await accountHasVaultSecrets(client);
+  if (!options.json) {
+    const how = candidate.decision === "migrate"
+      ? `resuming session ${candidate.sessionId}`
+      : `fresh restart with a context handoff (${formatCandidateReason(candidate)})`;
+    process.stderr.write(`Handing off ${runId} to Rudder Cloud — ${how}...\n`);
+  }
+  const snapshot = await createSnapshot(repoRoot, options.homePaths ?? [], {
+    includeCredentials: !vaultActive,
+    migration: { repoName, plan },
+    rudderStateRunIds: [runId],
+  });
+  try {
+    const runtime = await selectedCloudRuntime();
+    const body: Record<string, JsonValue> = {
+      repoName,
+      runId,
+      snapshot: {
+        name: path.basename(snapshot.archivePath),
+        contentType: "application/gzip",
+        base64: await fsp.readFile(snapshot.archivePath, "base64"),
+        manifest: snapshot.manifest as unknown as JsonValue,
+      },
+    };
+    if (runtime !== "fly") {
+      body.runtime = runtime;
+    }
+    const result = await client.request<JsonValue>("/api/rudder/sail/onload", {
+      method: "POST",
+      body,
+    });
+    await printResult(result, options);
+    await maybeAutoAttach(result, options);
+    // The handoff SUCCEEDED the moment the sail launched: the cloud machine
+    // owns the conversation now. An attach that drops afterwards (network
+    // blip, remote quit, machine still staging) must not fail this process —
+    // the dashboard reads a non-zero exit as "handoff failed" and resumes the
+    // agent LOCALLY, which would run a second copy of a conversation that is
+    // alive in the cloud.
+    process.exitCode = 0;
+    if (!options.json) {
+      process.stderr.write(`Handed off. Reattach any time: rudder cloud attach ${runId}\n`);
+    }
   } finally {
     await fsp.rm(snapshot.tempDir, { recursive: true, force: true });
   }
@@ -1314,7 +1392,9 @@ async function createSnapshot(repoRoot: string, requestedHomePaths: string[], op
   const projectEnvFiles = options.migration
     ? await copyProjectEnvFiles(repoRoot, repoStage)
     : 0;
-  const rudderState = options.includeRudderState ? await copyRudderState(repoRoot, repoStage) : undefined;
+  const rudderState = options.includeRudderState || (options.rudderStateRunIds?.length ?? 0) > 0
+    ? await copyRudderState(repoRoot, repoStage, options.includeRudderState ? undefined : options.rudderStateRunIds)
+    : undefined;
 
   const includeCredentials = options.includeCredentials !== false;
   const includedHomePaths: string[] = [];
@@ -1596,7 +1676,7 @@ export async function copyProjectEnvFiles(sourceRoot: string, targetRoot: string
   return copied;
 }
 
-async function copyRudderState(repoRoot: string, repoStage: string): Promise<{ runs: number; files: string[] }> {
+export async function copyRudderState(repoRoot: string, repoStage: string, onlyRuns?: string[]): Promise<{ runs: number; files: string[] }> {
   const copied: string[] = [];
   const rudderMd = path.join(repoRoot, "RUDDER.md");
   if (await pathExists(rudderMd)) {
@@ -1610,6 +1690,9 @@ async function copyRudderState(repoRoot: string, repoStage: string): Promise<{ r
   let runs = 0;
   for (const entry of entries) {
     if (!entry.isDirectory() || entry.name.includes("/") || entry.name.includes("\\")) {
+      continue;
+    }
+    if (onlyRuns && !onlyRuns.includes(entry.name)) {
       continue;
     }
     const runJson = path.join(runsDir, entry.name, "run.json");
@@ -2555,7 +2638,28 @@ async function workspaceAttach(args: string[], options: CloudCommandOptions): Pr
   if (!result) {
     throw new Error("Workspace attach returned no result");
   }
+  // The cloud workspace owns the migrated agents now. Mark their local
+  // records so the next `rudder cloud` doesn't classify the same runs as
+  // migratable again — without this, every attach re-offered (and re-staged)
+  // agents that were already living in the cloud, forever. The dashboard's
+  // migrate path does the same thing via AgentStatus::Migrated.
+  if (migrationPlan) {
+    await markRunsMigrated(repoRoot, migrationPlan.migrated.map((candidate) => candidate.runId));
+  }
   await attachToWorkspaceResult(result, options);
+}
+
+async function markRunsMigrated(repoRoot: string, runIds: string[]): Promise<void> {
+  for (const runId of runIds) {
+    const recordPath = path.join(repoRoot, ".rudder", "runs", runId, "run.json");
+    const record = await readJson<Record<string, JsonValue>>(recordPath);
+    if (!record || record.id !== runId) {
+      continue;
+    }
+    record.status = "migrated";
+    record.updatedAt = nowIso();
+    await writeJson(recordPath, record as unknown as JsonValue);
+  }
 }
 
 async function planAgentMigration(
@@ -2805,6 +2909,17 @@ type AttachTarget = {
 
 type AttachResult = "exited" | "failed";
 
+// The remote TUI pushes the kitty keyboard enhancement flags once, in its own
+// setup_terminal(), and the worker only keeps the TAIL of its output — so by the
+// time an attach connects, that push is long gone and this terminal never sees
+// it. Same class of bug as the mouse modes below. Without the protocol, macOS
+// terminals report Option+h as the character it TYPES (˙ on a US layout) rather
+// than Alt+h, so ⌥h stops hiding panes, and Alt+[ / Alt+] cannot be encoded at
+// all. Push exactly what the remote asked for: DISAMBIGUATE_ESCAPE_CODES (1) |
+// REPORT_ALTERNATE_KEYS (4). Terminals without the protocol ignore both.
+const KITTY_KEYBOARD_PUSH = "\x1b[>5u";
+const KITTY_KEYBOARD_POP = "\x1b[<u";
+
 async function runAttach(target: AttachTarget, options: CloudCommandOptions): Promise<AttachResult> {
   const client = await cloudClient({ requireToken: true });
   const baseUrl = client.baseUrl;
@@ -2897,8 +3012,14 @@ async function runAttach(target: AttachTarget, options: CloudCommandOptions): Pr
       process.off("SIGINT", onSigint);
       splash?.dispose();
       if (isInteractive && stdin.isTTY) {
-        // Disable local mouse capture before leaving raw mode so the user's
-        // shell prompt does not get spammed with mouse SGR bytes.
+        // Hand the terminal back the way we found it: pop the keyboard flags we
+        // pushed, then disable local mouse capture before leaving raw mode so the
+        // user's shell prompt does not get spammed with mouse SGR bytes.
+        try {
+          stdout.write(KITTY_KEYBOARD_POP);
+        } catch {
+          // ignore
+        }
         try {
           stdout.write("\x1b[?1006l\x1b[?1002l\x1b[?1000l");
         } catch {
@@ -3061,6 +3182,13 @@ async function runAttach(target: AttachTarget, options: CloudCommandOptions): Pr
         // to enable mouse capture locally too.
         try {
           stdout.write("\x1b[?1000h\x1b[?1002h\x1b[?1006h");
+        } catch {
+          // ignore
+        }
+        // Ask the local terminal for the kitty keyboard protocol on the remote's
+        // behalf, so real modifiers reach the remote dashboard.
+        try {
+          stdout.write(KITTY_KEYBOARD_PUSH);
         } catch {
           // ignore
         }
@@ -3346,7 +3474,9 @@ Usage:
   rudder cloud vm ["task"]
   rudder cloud list
   rudder cloud onload [runId]
-      no runId uploads the current Rudder workspace state
+      with a runId, hands that agent off to its own cloud machine and
+      resumes its conversation there; no runId uploads the current
+      Rudder workspace state
   rudder cloud logs <id>
   rudder cloud attach <id>
       stream the live cloud worker terminal into this pane
