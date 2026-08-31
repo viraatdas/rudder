@@ -2815,12 +2815,15 @@ impl App {
             .map(|n| n.to_string_lossy().into_owned())
             .filter(|n| !n.is_empty())
             .unwrap_or_else(|| self.cwd.display().to_string());
-        let prefix = if is_cloud_worker_session() {
-            "Rudder cloud"
+        // No "Rudder:" prefix — the status glyph already marks the tab as a
+        // rudder dashboard, and the prefix ate tab-bar width the repo name
+        // needs. A cloud dashboard keeps a ☁ so a local and a cloud tab of the
+        // SAME repo stay tellable-apart.
+        let title = if is_cloud_worker_session() {
+            format!("{glyph} {repo} \u{2601}")
         } else {
-            "Rudder"
+            format!("{glyph} {repo}")
         };
-        let title = format!("{glyph} {prefix}: {repo}");
         let mut stdout = io::stdout();
         let _ = write!(stdout, "\x1b]0;{title}\x07");
         let _ = stdout.flush();
@@ -17925,13 +17928,14 @@ fn startup_title() -> String {
         .map(|n| n.to_string_lossy().into_owned())
         .filter(|n| !n.is_empty())
         .unwrap_or_else(|| cwd.display().to_string());
-    let prefix = if is_cloud_worker_session() {
-        "Rudder cloud"
+    // Start in the idle state; refresh_tab_title overwrites once we have
+    // agents. Same shape as refresh_tab_title: glyph + repo, no "Rudder:"
+    // prefix, ☁ marks an in-cloud dashboard.
+    if is_cloud_worker_session() {
+        format!("\u{26aa} {name} \u{2601}")
     } else {
-        "Rudder"
-    };
-    // Start in the idle state; refresh_tab_title overwrites once we have agents.
-    format!("\u{26aa} {prefix}: {name}")
+        format!("\u{26aa} {name}")
+    }
 }
 
 fn set_terminal_title(stdout: &mut impl Write, title: &str) -> io::Result<()> {

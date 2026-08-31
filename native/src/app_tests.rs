@@ -21698,3 +21698,13 @@ fn a_worker_pane_surfaces_claude_osc_notifications_to_the_app() {
     );
     pane.terminate_and_wait();
 }
+
+#[test]
+fn tab_titles_are_repo_first_with_no_rudder_prefix() {
+    let title = startup_title();
+    assert!(
+        !title.contains("Rudder"),
+        "the glyph identifies rudder; the prefix wasted tab width: {title}"
+    );
+    assert!(title.starts_with('\u{26aa}'), "idle glyph leads: {title}");
+}
