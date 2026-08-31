@@ -637,6 +637,12 @@ pub(crate) fn command_suggestions() -> Vec<Suggestion> {
             action: SuggestionAction::RunCommand("/verify".to_string()),
         },
         Suggestion {
+            label: "/notify".to_string(),
+            detail: "toggle desktop notifications for unfocused tabs (done/failed/needs you)"
+                .to_string(),
+            action: SuggestionAction::RunCommand("/notify".to_string()),
+        },
+        Suggestion {
             label: "/color terminal|paper".to_string(),
             detail: "pick dashboard color mode; terminal uses your terminal background"
                 .to_string(),

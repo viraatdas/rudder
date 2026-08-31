@@ -138,6 +138,7 @@ pub struct TerminalPane {
     region_scrollback_limit: usize,
     tracked_scroll_region: Option<(u16, u16)>,
     ansi_state: AnsiTrackState,
+    notification_scanner: OscNotificationScanner,
     styled_lines_cache: Option<Vec<Vec<StyledTerminalCell>>>,
     output_log: String,
     output_log_limit: usize,
@@ -152,6 +153,118 @@ enum AnsiTrackState {
     Ground,
     Escape,
     Csi(Vec<u8>),
+}
+
+/// A desktop-notification escape captured from worker output: OSC 777
+/// (`ESC ] 777 ; notify ; title ; body`) or OSC 9 (`ESC ] 9 ; body`).
+///
+/// Claude Code emits these itself ("Claude needs your permission", "Claude is
+/// waiting for your input"), but `vt100` consumes and silently drops OSCs it
+/// does not model — so the backend's own notifications died inside the embedded
+/// terminal and never reached the real emulator. The scanner below lifts them
+/// out of the byte stream so the app can re-emit them to the outer terminal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalNotification {
+    pub title: String,
+    pub body: String,
+}
+
+/// Parse one OSC payload (the bytes between `ESC ]` and its terminator) as a
+/// desktop notification. Returns `None` for every other OSC (titles, clipboard,
+/// hyperlinks, ...).
+pub fn parse_osc_notification(payload: &str) -> Option<TerminalNotification> {
+    let (title, body) = if let Some(rest) = payload.strip_prefix("777;notify;") {
+        // urxvt format is title;body — a lone field with no separator is a
+        // bare message, not a title.
+        match rest.split_once(';') {
+            Some((title, body)) => (title, body),
+            None => ("", rest),
+        }
+    } else if let Some(rest) = payload.strip_prefix("9;") {
+        ("", rest)
+    } else {
+        return None;
+    };
+    if title.trim().is_empty() && body.trim().is_empty() {
+        return None;
+    }
+    Some(TerminalNotification {
+        title: title.trim().to_string(),
+        body: body.trim().to_string(),
+    })
+}
+
+/// Longest OSC payload the scanner accumulates. Anything larger (an OSC 52
+/// clipboard blob, a runaway unterminated sequence) is truncated in place; the
+/// scanner still tracks the sequence to its terminator so stream state stays
+/// aligned with the real parser.
+const OSC_SCAN_MAX_BYTES: usize = 4096;
+/// Undrained notifications kept per pane; older ones are dropped first. A pane
+/// is drained every tick while its process lives, so this only bounds panes
+/// nobody is sweeping.
+const MAX_PENDING_NOTIFICATIONS: usize = 16;
+
+#[derive(Debug, Default)]
+enum OscScanState {
+    #[default]
+    Ground,
+    Escape,
+    Osc(Vec<u8>),
+    /// Saw ESC inside an OSC: either the start of the ST terminator (`ESC \`)
+    /// or a malformed sequence.
+    OscEscape(Vec<u8>),
+}
+
+/// Byte-at-a-time scanner that runs alongside `vt100`, capturing notification
+/// OSCs the parser would drop. Chunk boundaries are irrelevant: state carries
+/// across calls, so a sequence split anywhere still parses.
+#[derive(Debug, Default)]
+pub struct OscNotificationScanner {
+    state: OscScanState,
+    pending: Vec<TerminalNotification>,
+}
+
+impl OscNotificationScanner {
+    pub fn scan(&mut self, byte: u8) {
+        self.state = match std::mem::take(&mut self.state) {
+            OscScanState::Ground if byte == 0x1b => OscScanState::Escape,
+            OscScanState::Ground => OscScanState::Ground,
+            OscScanState::Escape if byte == b']' => OscScanState::Osc(Vec::new()),
+            OscScanState::Escape if byte == 0x1b => OscScanState::Escape,
+            OscScanState::Escape => OscScanState::Ground,
+            OscScanState::Osc(bytes) if byte == 0x07 => {
+                self.complete(bytes);
+                OscScanState::Ground
+            }
+            OscScanState::Osc(bytes) if byte == 0x1b => OscScanState::OscEscape(bytes),
+            OscScanState::Osc(mut bytes) => {
+                if bytes.len() < OSC_SCAN_MAX_BYTES {
+                    bytes.push(byte);
+                }
+                OscScanState::Osc(bytes)
+            }
+            OscScanState::OscEscape(bytes) if byte == b'\\' => {
+                self.complete(bytes);
+                OscScanState::Ground
+            }
+            OscScanState::OscEscape(_) if byte == 0x1b => OscScanState::Escape,
+            OscScanState::OscEscape(_) => OscScanState::Ground,
+        };
+    }
+
+    fn complete(&mut self, bytes: Vec<u8>) {
+        let payload = String::from_utf8_lossy(&bytes);
+        if let Some(note) = parse_osc_notification(&payload) {
+            if self.pending.len() >= MAX_PENDING_NOTIFICATIONS {
+                self.pending.remove(0);
+            }
+            self.pending.push(note);
+        }
+    }
+
+    pub fn take(&mut self) -> Vec<TerminalNotification> {
+        std::mem::take(&mut self.pending)
+    }
 }
 
 /// The number of bytes a single cell's grapheme cluster can occupy.
@@ -397,6 +510,7 @@ impl TerminalPane {
             region_scrollback_limit: options.scrollback_lines,
             tracked_scroll_region: None,
             ansi_state: AnsiTrackState::Ground,
+            notification_scanner: OscNotificationScanner::default(),
             styled_lines_cache: None,
             output_log: String::new(),
             output_log_limit: 200_000,
@@ -802,8 +916,17 @@ impl TerminalPane {
             self.capture_top_origin_scroll_region_line_before(*byte);
             self.parser.process(&[*byte]);
             self.track_ansi_byte(*byte);
+            self.notification_scanner.scan(*byte);
         }
         self.capture_alternate_snapshot();
+    }
+
+    /// Drain desktop-notification OSCs (777/9) the worker emitted since the
+    /// last call. The sweep re-emits these to the outer terminal — the only way
+    /// a backend's own "needs your permission" notification survives the
+    /// embedded parser.
+    pub fn take_notifications(&mut self) -> Vec<TerminalNotification> {
+        self.notification_scanner.take()
     }
 
     fn capture_top_origin_scroll_region_line_before(&mut self, byte: u8) {
@@ -1080,6 +1203,74 @@ fn default_shell() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn osc_notification_parsing_recognizes_777_and_9_only() {
+        assert_eq!(
+            parse_osc_notification("777;notify;Claude Code;Claude needs your permission"),
+            Some(TerminalNotification {
+                title: "Claude Code".to_string(),
+                body: "Claude needs your permission".to_string(),
+            })
+        );
+        // A 777 with no body separator is a bare message, not a title.
+        assert_eq!(
+            parse_osc_notification("777;notify;Claude is waiting for your input"),
+            Some(TerminalNotification {
+                title: String::new(),
+                body: "Claude is waiting for your input".to_string(),
+            })
+        );
+        // iTerm2-style OSC 9.
+        assert_eq!(
+            parse_osc_notification("9;Task complete"),
+            Some(TerminalNotification {
+                title: String::new(),
+                body: "Task complete".to_string(),
+            })
+        );
+        // Window titles, clipboard, hyperlinks: not notifications.
+        assert_eq!(parse_osc_notification("0;some title"), None);
+        assert_eq!(parse_osc_notification("52;c;YWJj"), None);
+        assert_eq!(parse_osc_notification("8;;https://x"), None);
+        assert_eq!(parse_osc_notification("777;notify;;"), None);
+    }
+
+    #[test]
+    fn notification_scanner_survives_chunk_splits_and_both_terminators() {
+        let mut scanner = OscNotificationScanner::default();
+        // BEL-terminated, split mid-sequence across "chunks" (scan is per-byte,
+        // so any split point is exercised by feeding byte-at-a-time).
+        let stream = b"hello \x1b]777;notify;Claude Code;needs you\x07 world \x1b]9;done\x1b\\ tail \x1b]0;title\x07";
+        for byte in stream.iter() {
+            scanner.scan(*byte);
+        }
+        let notes = scanner.take();
+        assert_eq!(notes.len(), 2, "777 and 9 captured, title OSC ignored");
+        assert_eq!(notes[0].title, "Claude Code");
+        assert_eq!(notes[0].body, "needs you");
+        assert_eq!(notes[1].body, "done");
+        assert!(scanner.take().is_empty(), "take drains");
+    }
+
+    #[test]
+    fn notification_scanner_caps_runaway_payloads_without_desyncing() {
+        let mut scanner = OscNotificationScanner::default();
+        scanner.scan(0x1b);
+        scanner.scan(b']');
+        for _ in 0..(OSC_SCAN_MAX_BYTES * 2) {
+            scanner.scan(b'x');
+        }
+        scanner.scan(0x07);
+        // Not a notification prefix, so nothing pending — but the stream is
+        // back in ground state and a following notification still parses.
+        for byte in b"\x1b]9;after\x07".iter() {
+            scanner.scan(*byte);
+        }
+        let notes = scanner.take();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].body, "after");
+    }
 
     #[test]
     fn terminal_size_rejects_zero_dimensions() {

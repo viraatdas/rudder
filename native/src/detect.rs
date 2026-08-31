@@ -44,6 +44,9 @@ pub(crate) fn mark_run_done(run: &mut AgentRun) {
         // completion is a planning transition, not work awaiting your review.
         if !run.is_pinned_planner() {
             play_completion_sound();
+            // Same once-per-transition guarantee as the sound, so an unfocused
+            // Ghostty tab surfaces "ready for review" as an OS notification.
+            notify_run(run, "✔ ready for review");
         }
         // Reflect the transition in the workspace's jj description so `jj log`
         // (and any agent reading it) sees this node reach review. Best-effort,

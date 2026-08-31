@@ -14,9 +14,10 @@ use std::{
 use anyhow::{bail, Context, Result};
 use crossterm::{
     event::{
-        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind,
-        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        self, DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange,
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+        MouseButton, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -31,7 +32,7 @@ use ratatui::{
 };
 use rudder_native::pty_terminal::{
     describe_exit_code, CellContents, PtyOutputWaker, StyledTerminalCell, TerminalCommand,
-    TerminalCursor, TerminalPane, TerminalPaneOptions, TerminalSize,
+    TerminalCursor, TerminalNotification, TerminalPane, TerminalPaneOptions, TerminalSize,
 };
 
 /// A single message the main event loop selects on. Either a terminal input
@@ -68,6 +69,8 @@ mod render;
 use crate::render::*;
 mod detect;
 use crate::detect::*;
+mod notify;
+use crate::notify::*;
 mod theme;
 use crate::theme::*;
 mod perf;
@@ -9938,7 +9941,7 @@ It will tend to agree with itself — name another with /gam <provider> <model> 
             }
             Some("/help") => {
                 self.notice = Some(
-                    "plain input -> one isolated mergeable worker in its own jj workspace · /plan <task> -> an orchestrator that plans and runs a DAG · /gam [model] <task> -> generator + adversarial reviewer pair; the reviewer can steer the generator mid-turn and stop it outright (split panes, ^W a toggles sides, ^W t shows the dialogue) · /main|/m <task> -> another agent in this shared checkout · panes: Option-1/2/3 or ^W · keys: j/k select · Option-[ / Option-] step agents from any pane · Enter focus · v diff · m merge · u undo a merge · M merge all · R review all · g nest · o web ui · x stop · b branch chat · dd delete · cc clear merged · P model; · /handoff -> selected agent moves to Rudder Cloud and resumes there; commands: /model /fast /sound /color /main /plan /gam /resume /restore /handoff /share /usage /goal /cloud /web /feedback"
+                    "plain input -> one isolated mergeable worker in its own jj workspace · /plan <task> -> an orchestrator that plans and runs a DAG · /gam [model] <task> -> generator + adversarial reviewer pair; the reviewer can steer the generator mid-turn and stop it outright (split panes, ^W a toggles sides, ^W t shows the dialogue) · /main|/m <task> -> another agent in this shared checkout · panes: Option-1/2/3 or ^W · keys: j/k select · Option-[ / Option-] step agents from any pane · Enter focus · v diff · m merge · u undo a merge · M merge all · R review all · g nest · o web ui · x stop · b branch chat · dd delete · cc clear merged · P model; · /handoff -> selected agent moves to Rudder Cloud and resumes there; commands: /model /fast /sound /notify /color /main /plan /gam /resume /restore /handoff /share /usage /goal /cloud /web /feedback"
                         .to_string(),
                 );
                 true
@@ -10116,6 +10119,35 @@ It will tend to agree with itself — name another with /gam <provider> <model> 
                             "opencode has no fast mode or effort dial — pick a faster model with /model opencode <provider/model>"
                                 .to_string(),
                         );
+                    }
+                }
+                true
+            }
+            Some("/notify") => {
+                let arg = parts.next().unwrap_or("toggle").to_ascii_lowercase();
+                let enabled = match arg.as_str() {
+                    "on" | "true" | "1" => true,
+                    "off" | "false" | "0" => false,
+                    "toggle" => !config::desktop_notifications_enabled(),
+                    _ => {
+                        self.notice = Some(
+                            "usage: /notify [on|off|toggle] — desktop notifications for unfocused tabs are on by default"
+                                .to_string(),
+                        );
+                        return true;
+                    }
+                };
+                match config::save_desktop_notifications(enabled) {
+                    Ok(()) => {
+                        self.notice = Some(if enabled {
+                            "desktop notifications ON (saved): unfocused tabs notify when a worker finishes, fails, or needs you"
+                                .to_string()
+                        } else {
+                            "desktop notifications OFF (saved)".to_string()
+                        });
+                    }
+                    Err(error) => {
+                        self.notice = Some(format!("notify setting failed: {error}"));
                     }
                 }
                 true
@@ -17326,6 +17358,17 @@ What to do\n\
             let drained = terminal.drain_output();
             let drained_bytes = drained.len();
             let had_output = drained_bytes > 0;
+            // Re-emit the backend's OWN desktop notifications (Claude's OSC 777
+            // "needs your permission" / "waiting for your input") to the outer
+            // terminal — the embedded parser otherwise swallows them and no
+            // Ghostty tab ever notifies. Only while Running: once a run enters
+            // review, rudder's own lifecycle notification already covered it.
+            let worker_notes = terminal.take_notifications();
+            if run.status == AgentStatus::Running {
+                for note in &worker_notes {
+                    forward_worker_notification(&run.cwd, &run.task_summary, note);
+                }
+            }
             let headless_planner = run.mode == AgentMode::RudderPlan
                 && (run.reconcile_planner || !run.interactive_orchestrator);
             let drain_duration = drain_started.elapsed();
@@ -17472,6 +17515,9 @@ What to do\n\
                             run.needs_permission = false;
                             run.needs_user_input = false;
                             changed = true;
+                            // A user-initiated stop happens in the focused tab, so
+                            // the focus gate keeps this from ringing on your own `x`.
+                            notify_run(run, "✗ failed");
                         };
                     }
                     Ok(None) => {
@@ -17504,6 +17550,15 @@ What to do\n\
                                     run.wait_signal = Some(WaitSignal::Input);
                                     run.needs_user_input = true;
                                     changed = true;
+                                    // Backend-signalled, so edge-triggered by the
+                                    // guard above — never the chrome detector's
+                                    // flicker. Claude is excluded: its own OSC 777
+                                    // notification is forwarded verbatim from the
+                                    // pane (see take_notifications above), and a
+                                    // synthesized copy would ring twice.
+                                    if run.backend != Backend::Claude {
+                                        notify_run(run, "waiting for your answer");
+                                    }
                                 }
                             }
                             Some(signals::SignalState::Permission) => {
@@ -17513,6 +17568,11 @@ What to do\n\
                                     run.needs_permission = true;
                                     run.needs_user_input = false;
                                     changed = true;
+                                    // Claude forwards its own notification; see
+                                    // the Input arm above.
+                                    if run.backend != Backend::Claude {
+                                        notify_run(run, "needs permission");
+                                    }
                                 }
                             }
                             // The human answered. The counterpart the protocol
@@ -17842,6 +17902,9 @@ fn setup_terminal() -> Result<Tui> {
         stdout,
         EnterAlternateScreen,
         EnableBracketedPaste,
+        // Focus reporting (CSI ?1004) drives the desktop-notification gate: a
+        // focused tab never notifies, an unfocused one does. See notify.rs.
+        EnableFocusChange,
         PushKeyboardEnhancementFlags(
             KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
                 | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
@@ -18120,6 +18183,7 @@ fn restore_terminal(terminal: &mut Tui) -> Result<()> {
     execute!(
         terminal.backend_mut(),
         PopKeyboardEnhancementFlags,
+        DisableFocusChange,
         DisableBracketedPaste,
         LeaveAlternateScreen
     )?;
@@ -18867,7 +18931,16 @@ fn handle_event(app: &mut App, event: Event) -> bool {
             app.mark_dirty();
             false
         }
-        _ => false,
+        // Focus flips gate desktop notifications (notify.rs): the tab being
+        // looked at stays silent, every other tab may notify.
+        Event::FocusGained => {
+            set_terminal_focused(true);
+            false
+        }
+        Event::FocusLost => {
+            set_terminal_focused(false);
+            false
+        }
     }
 }
 

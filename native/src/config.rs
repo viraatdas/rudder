@@ -108,6 +108,41 @@ pub(crate) fn completion_sound_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Whether the dashboard emits desktop notifications through the terminal
+/// emulator (OSC 777) when an unfocused tab's worker finishes, fails, or needs
+/// input. Default ON: unlike the audio ping this only fires for tabs you are
+/// NOT looking at, and the emulator/OS notification settings still gate it.
+pub(crate) fn config_desktop_notifications(config: &serde_json::Value) -> Option<bool> {
+    config
+        .get("desktopNotifications")
+        .and_then(serde_json::Value::as_bool)
+}
+
+pub(crate) fn desktop_notifications_enabled() -> bool {
+    load_rudder_config()
+        .as_ref()
+        .and_then(config_desktop_notifications)
+        .unwrap_or(true)
+}
+
+/// Persist the `/notify` toggle so the next session keeps the same behavior.
+pub(crate) fn save_desktop_notifications(enabled: bool) -> Result<()> {
+    let path = rudder_config_path().context("could not determine Rudder config path")?;
+    let mut config = load_config_for_write(&path);
+    if !config.is_object() {
+        config = default_config_value();
+    }
+    ensure_config_defaults(&mut config);
+    let root = config
+        .as_object_mut()
+        .context("Rudder config root is not an object")?;
+    root.insert(
+        "desktopNotifications".to_string(),
+        serde_json::Value::Bool(enabled),
+    );
+    write_config_atomically(&path, &config)
+}
+
 /// Dashboard color mode. `terminal` is the default so the native TUI leaves the
 /// terminal foreground/background alone and blends with the surrounding tab bar.
 /// `paper` preserves the previous hard-white canvas.

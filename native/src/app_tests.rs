@@ -21548,3 +21548,153 @@ fn alt_h_hides_panes_from_the_task_pane_too() {
         "restoring panes restores task focus"
     );
 }
+
+// --- Desktop notifications (notify.rs) -------------------------------------
+
+#[test]
+fn notification_sequence_is_a_clean_osc_777() {
+    let seq = build_notification_sequence("Rudder · repo", "✔ ready for review — fix auth", false);
+    assert!(seq.starts_with("\x1b]777;notify;"), "urxvt notify OSC:\n{seq:?}");
+    assert!(seq.ends_with('\x07'), "BEL-terminated:\n{seq:?}");
+    assert!(seq.contains("Rudder · repo;✔ ready for review — fix auth"));
+}
+
+#[test]
+fn notification_fields_cannot_break_out_of_the_osc() {
+    // Control chars (ESC/BEL would terminate the OSC mid-payload) are blanked,
+    // and a semicolon in the TITLE cannot shift the body into the title slot.
+    let seq = build_notification_sequence("bad;title\x1b[31m", "body\x07with\nbell", false);
+    let inner = seq
+        .strip_prefix("\x1b]777;notify;")
+        .and_then(|rest| rest.strip_suffix('\x07'))
+        .expect("well-formed OSC");
+    assert!(!inner.contains('\x1b'), "no stray ESC in payload:\n{inner:?}");
+    assert!(!inner.contains('\x07'), "no stray BEL in payload:\n{inner:?}");
+    assert_eq!(
+        inner.matches(';').count(),
+        1,
+        "exactly one title/body separator:\n{inner:?}"
+    );
+}
+
+#[test]
+fn notification_truncates_a_novel_length_task() {
+    let long = "x".repeat(4000);
+    let seq = build_notification_sequence("t", &long, false);
+    assert!(
+        seq.chars().count() < 200,
+        "oversized OSC payloads get dropped whole by intermediaries: {}",
+        seq.len()
+    );
+    assert!(seq.contains('…'), "truncation is visible");
+}
+
+#[test]
+fn notification_is_tmux_passthrough_wrapped_under_tmux() {
+    let seq = build_notification_sequence("t", "b", true);
+    assert!(seq.starts_with("\x1bPtmux;"), "DCS tmux; envelope:\n{seq:?}");
+    assert!(seq.ends_with("\x1b\\"), "ST-terminated envelope:\n{seq:?}");
+    assert!(
+        seq.contains("\x1b\x1b]777;"),
+        "inner ESC doubled per the tmux passthrough protocol:\n{seq:?}"
+    );
+}
+
+#[test]
+fn focus_events_flip_the_notification_gate() {
+    let mut app = App::new();
+    set_terminal_focused(true);
+    assert!(terminal_focused(), "sessions start assumed-focused");
+    handle_event(&mut app, Event::FocusLost);
+    assert!(!terminal_focused(), "FocusLost arms notifications");
+    handle_event(&mut app, Event::FocusGained);
+    assert!(terminal_focused(), "FocusGained silences the tab again");
+}
+
+#[test]
+fn notify_command_flips_and_persists_the_setting() {
+    let _env = env_guard();
+    let home = std::env::temp_dir().join(format!("rudder-notify-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    std::env::set_var("RUDDER_HOME", &home);
+
+    assert!(
+        config::desktop_notifications_enabled(),
+        "desktop notifications default ON"
+    );
+
+    let mut app = App::new();
+    assert!(app.handle_command("/notify off"), "/notify is a command");
+    assert!(
+        !config::desktop_notifications_enabled(),
+        "/notify off persists to config: {:?}",
+        app.notice
+    );
+
+    assert!(app.handle_command("/notify on"));
+    assert!(config::desktop_notifications_enabled());
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn worker_notification_composition_keeps_claudes_wording() {
+    let cwd = PathBuf::from("/Users/x/code/rudder");
+    let note = TerminalNotification {
+        title: "Claude Code".to_string(),
+        body: "Claude needs your permission to use Bash".to_string(),
+    };
+    let (title, body) = compose_worker_notification(&cwd, "fix the auth flow", &note);
+    assert_eq!(title, "Claude Code · rudder", "repo distinguishes tabs");
+    assert_eq!(
+        body, "Claude needs your permission to use Bash — fix the auth flow",
+        "Claude's wording survives; the task tells agents apart"
+    );
+
+    // OSC 9 has no title; the run may have no summary.
+    let bare = TerminalNotification {
+        title: String::new(),
+        body: "Task complete".to_string(),
+    };
+    let (title, body) = compose_worker_notification(&cwd, "", &bare);
+    assert_eq!(title, "Rudder · rudder");
+    assert_eq!(body, "Task complete");
+}
+
+#[test]
+fn a_worker_pane_surfaces_claude_osc_notifications_to_the_app() {
+    // End to end through the REAL pane plumbing: a child process writes Claude's
+    // notification OSC; the pane's drain must both keep it out of the rendered
+    // screen and hand it to the app for re-emission.
+    let mut pane = TerminalPane::spawn_shell_or_command(
+        Some(TerminalCommand::with_args(
+            "/bin/sh",
+            [
+                "-c",
+                "printf 'before \\033]777;notify;Claude Code;needs you\\007after'; sleep 2",
+            ],
+        )),
+        TerminalPaneOptions::default(),
+    )
+    .expect("spawn test pty");
+
+    let mut notes = Vec::new();
+    for _ in 0..100 {
+        pane.drain_output();
+        notes.extend(pane.take_notifications());
+        if !notes.is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(notes.len(), 1, "notification captured from the pane");
+    assert_eq!(notes[0].title, "Claude Code");
+    assert_eq!(notes[0].body, "needs you");
+    let screen = pane.visible_lines().join("\n");
+    assert!(
+        screen.contains("before after"),
+        "payload never leaks into the rendered screen:\n{screen}"
+    );
+    pane.terminate_and_wait();
+}
