@@ -409,6 +409,35 @@ pub(crate) fn apply_task_paste(
     insert_str_at_cursor(input, cursor, &placeholder);
 }
 
+/// Attach a clipboard image to the task draft as an `[Image #N]` chip. Rides
+/// the same chip machinery as large text pastes: the placeholder stays small
+/// in the input line, and `expand_pasted_chips` swaps it on submit for an
+/// instruction pointing the worker at the saved file, so the agent opens the
+/// screenshot with its Read tool.
+pub(crate) fn apply_task_image_paste(
+    input: &mut String,
+    cursor: &mut usize,
+    chunks: &mut Vec<PastedChunk>,
+    image_path: &Path,
+) {
+    // Same fresh-start rule as apply_task_paste: an empty draft means every
+    // prior chip is gone, so numbering restarts at #1.
+    if input.is_empty() {
+        chunks.clear();
+    }
+    let id = chunks.iter().map(|chunk| chunk.id).max().unwrap_or(0) + 1;
+    let placeholder = format!("[Image #{id}]");
+    chunks.push(PastedChunk {
+        id,
+        text: format!(
+            "[attached image: {} — open this file with the Read tool to view it]",
+            image_path.display()
+        ),
+        placeholder: placeholder.clone(),
+    });
+    insert_str_at_cursor(input, cursor, &placeholder);
+}
+
 /// Expand every collapsed paste chip in `input` back to its full text, so a
 /// submitted command/task carries the real content whether or not the user
 /// expanded the chips on screen.

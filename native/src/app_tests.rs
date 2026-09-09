@@ -21708,3 +21708,46 @@ fn tab_titles_are_repo_first_with_no_rudder_prefix() {
     );
     assert!(title.starts_with('\u{26aa}'), "idle glyph leads: {title}");
 }
+
+#[test]
+fn image_paste_chip_expands_to_a_read_instruction_on_submit() {
+    let mut input = String::new();
+    let mut cursor = 0usize;
+    let mut chunks = Vec::new();
+    apply_task_image_paste(
+        &mut input,
+        &mut cursor,
+        &mut chunks,
+        Path::new("/repo/.rudder/pastes/paste-123.png"),
+    );
+    assert_eq!(input, "[Image #1]", "small chip in the draft, not the path");
+
+    insert_str_at_cursor(&mut input, &mut cursor, " fix the misaligned button");
+    let expanded = expand_pasted_chips(&input, &chunks);
+    assert!(
+        expanded.contains("/repo/.rudder/pastes/paste-123.png"),
+        "submit carries the real path:\n{expanded}"
+    );
+    assert!(
+        expanded.contains("Read tool"),
+        "the worker is told HOW to view it:\n{expanded}"
+    );
+    assert!(!expanded.contains("[Image #1]"), "chip is gone on submit");
+}
+
+#[test]
+fn image_chips_share_numbering_with_text_paste_chips() {
+    let mut input = String::new();
+    let mut cursor = 0usize;
+    let mut chunks = Vec::new();
+    let long_text = "line one\nline two\nline three";
+    apply_task_paste(&mut input, &mut cursor, &mut chunks, long_text);
+    apply_task_image_paste(&mut input, &mut cursor, &mut chunks, Path::new("/tmp/s.png"));
+    assert!(
+        input.contains("[Image #2]"),
+        "image continues the chip sequence: {input}"
+    );
+    let expanded = expand_pasted_chips(&input, &chunks);
+    assert!(expanded.contains("line two"));
+    assert!(expanded.contains("/tmp/s.png"));
+}

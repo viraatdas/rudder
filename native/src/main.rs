@@ -931,7 +931,15 @@ fn parse_gam_args(
     let adversarial_model = adversarial_model
         .map(|model| model.trim().to_string())
         .filter(|model| !model.is_empty())
-        .unwrap_or_else(|| default_model_for(adversarial_backend).trim().to_string());
+        // Last-used before hardcoded: the reviewer defaults to whatever the
+        // user last picked for that backend (saved by every /model choice),
+        // falling back to the static table only on a fresh config.
+        .unwrap_or_else(|| {
+            load_rudder_config()
+                .as_ref()
+                .and_then(|config| config_model(config, adversarial_backend))
+                .unwrap_or_else(|| default_model_for(adversarial_backend).trim().to_string())
+        });
     // A recognized model spec may be followed by ONE effort word. Never consumed
     // mid-task: without a preceding model spec, "high" stays part of the ask.
     if explicit_spec {
@@ -4839,6 +4847,19 @@ impl App {
         }
 
         match key.code {
+            // Ctrl+V (or Cmd+V where the terminal forwards it): clipboard paste
+            // handled by the APP, which is the only way an IMAGE can arrive —
+            // terminals only deliver text pastes, so a screenshot on the
+            // clipboard never reaches Event::Paste. An image becomes an
+            // [Image #N] chip; a text clipboard pastes like any other paste.
+            KeyCode::Char('v') | KeyCode::Char('V')
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
+            {
+                self.reset_task_history_navigation();
+                self.attach_clipboard_to_task();
+            }
             KeyCode::Esc => {
                 // First Esc with the palette open just dismisses the palette;
                 // clearing the whole draft here lost long typed tasks whose
@@ -5241,6 +5262,46 @@ impl App {
                 is_current_model_suggestion(suggestion, self.backend, &self.model, self.effort)
             })
             .unwrap_or(0);
+    }
+
+    /// Task-pane Ctrl+V: image first, text second. A clipboard image is saved
+    /// under `.rudder/pastes/` and attached as an [Image #N] chip whose
+    /// submit-time expansion points the worker at the file; with no image, the
+    /// text clipboard pastes through the ordinary chip path.
+    fn attach_clipboard_to_task(&mut self) {
+        let pastes_dir = self.cwd.join(".rudder").join("pastes");
+        match save_clipboard_image(&pastes_dir) {
+            Ok(path) => {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string());
+                apply_task_image_paste(
+                    &mut self.task_input,
+                    &mut self.task_cursor,
+                    &mut self.pasted_chunks,
+                    &path,
+                );
+                self.notice = Some(format!(
+                    "image attached ({name}) — the worker reads it with its Read tool"
+                ));
+                self.clamp_picker_index();
+            }
+            Err(_) => match read_clipboard_text() {
+                Some(text) if !text.trim().is_empty() => {
+                    apply_task_paste(
+                        &mut self.task_input,
+                        &mut self.task_cursor,
+                        &mut self.pasted_chunks,
+                        &text,
+                    );
+                    self.clamp_picker_index();
+                }
+                _ => {
+                    self.notice = Some("clipboard has no image or text to paste".to_string());
+                }
+            },
+        }
     }
 
     fn handle_paste(&mut self, text: String) {

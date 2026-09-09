@@ -1005,13 +1005,17 @@ pub(crate) fn fallback_model_rows() -> Vec<(Backend, &'static str, &'static str)
         (Backend::Claude, "fable", "hard, long-running tasks"),
         (Backend::Claude, "sonnet", "efficient routine tasks"),
         (Backend::Claude, "haiku", "fastest quick answers"),
-        (Backend::Claude, "claude-sonnet-4-6", "explicit id"),
-        (Backend::Codex, "gpt-5.6", "newest · needs API-key auth"),
-        (Backend::Codex, "gpt-5.5", "latest · works on ChatGPT auth"),
-        (Backend::Codex, "gpt-5.4-codex", "coding"),
-        (Backend::Codex, "gpt-5.4", "general"),
-        (Backend::Codex, "gpt-5.3-codex", "coding"),
-        (Backend::Codex, "gpt-5.3-codex-spark", "fast"),
+        (Backend::Claude, "claude-sonnet-5", "explicit id"),
+        // Codex rows mirror the ChatGPT-auth account cache (2026-09): the 5.6
+        // family ships as capability tiers (sol > terra > luna, by price);
+        // gpt-6-astra is API-key only; gpt-5.4 and the 5.4/5.3 codex variants
+        // were retired from ChatGPT auth.
+        (Backend::Codex, "gpt-6-astra", "newest · needs API-key auth"),
+        (Backend::Codex, "gpt-5.6-sol", "flagship · works on ChatGPT auth"),
+        (Backend::Codex, "gpt-5.6-terra", "balanced"),
+        (Backend::Codex, "gpt-5.6-luna", "fast · cheapest"),
+        (Backend::Codex, "gpt-5.5", "prior flagship"),
+        (Backend::Codex, "gpt-5.3-codex-spark", "fast coding"),
     ]
 }
 

@@ -1,4 +1,5 @@
 import path from "node:path";
+import fs from "node:fs";
 import fsp from "node:fs/promises";
 import type {
   AuthProfileStore,
@@ -39,6 +40,30 @@ export function globalConfigPath(): string {
 
 export function projectsRegistryPath(): string {
   return path.join(rudderHome(), "projects.json");
+}
+
+let lastUsedCodexModelCache: string | undefined | null = null;
+
+// The model the user last picked for codex (`backends.codex.model`, saved by
+// every /model choice). Synchronous so the sync arg-builders can consult it
+// before falling back to a hardcoded model: "the default is the last used
+// model", not whatever release was current when this file last shipped.
+// Cached for the life of the process — the CLI is short-lived, and a mid-run
+// /model change updates the run record itself, not these fallbacks.
+export function lastUsedCodexModelSync(): string | undefined {
+  if (lastUsedCodexModelCache === null) {
+    let model: string | undefined;
+    try {
+      const raw = fs.readFileSync(globalConfigPath(), "utf8");
+      const parsed = JSON.parse(raw) as RudderConfig;
+      const value = parsed?.backends?.codex?.model;
+      model = typeof value === "string" && value.trim() ? value.trim() : undefined;
+    } catch {
+      model = undefined;
+    }
+    lastUsedCodexModelCache = model;
+  }
+  return lastUsedCodexModelCache;
 }
 
 export function authStorePath(): string {

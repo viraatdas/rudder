@@ -465,3 +465,133 @@ pub(crate) fn map_vt100_color(color: vt100::Color) -> Option<Color> {
         vt100::Color::Rgb(red, green, blue) => Some(Color::Rgb(red, green, blue)),
     }
 }
+
+/// Save an image from the system clipboard into `dir` as a PNG, returning the
+/// saved path. This is the task pane's Ctrl+V: terminals only paste TEXT, so a
+/// screenshot on the clipboard never arrives as a paste event — the app has to
+/// read the OS clipboard itself (the same reason Claude Code binds Ctrl+V for
+/// images). Errors when the clipboard holds no image.
+pub(crate) fn save_clipboard_image(dir: &Path) -> Result<PathBuf> {
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("could not create {}", dir.display()))?;
+    prune_old_pastes(dir);
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let path = dir.join(format!("paste-{stamp}.png"));
+
+    #[cfg(target_os = "macos")]
+    {
+        // AppleScript writes the clipboard's PNG rendition straight to the file
+        // (no hex round-trip); «class PNGf» coercion also converts TIFF
+        // clipboards (app-copied images), and errors (-1700) when the clipboard
+        // has no image at all.
+        let script = format!(
+            "set p to POSIX file \"{}\"\n\
+             set f to open for access p with write permission\n\
+             try\n\
+               write (the clipboard as \u{ab}class PNGf\u{bb}) to f\n\
+               close access f\n\
+             on error m number n\n\
+               close access f\n\
+               error m number n\n\
+             end try",
+            path.display()
+        );
+        let status = Command::new("osascript")
+            .arg("-e")
+            .arg(script)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        if !status.map(|s| s.success()).unwrap_or(false) {
+            let _ = std::fs::remove_file(&path);
+            bail!("no image on the clipboard");
+        }
+    }
+
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        let commands: &[(&str, &[&str])] = &[
+            ("wl-paste", &["--type", "image/png"]),
+            ("xclip", &["-selection", "clipboard", "-t", "image/png", "-o"]),
+        ];
+        let mut wrote = false;
+        for (command, args) in commands {
+            if let Ok(output) = Command::new(command)
+                .args(*args)
+                .stdin(Stdio::null())
+                .output()
+            {
+                if output.status.success() && !output.stdout.is_empty() {
+                    std::fs::write(&path, &output.stdout)?;
+                    wrote = true;
+                    break;
+                }
+            }
+        }
+        if !wrote {
+            bail!("no image on the clipboard");
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        bail!("clipboard image paste is not supported on Windows");
+    }
+
+    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    if size == 0 {
+        let _ = std::fs::remove_file(&path);
+        bail!("no image on the clipboard");
+    }
+    Ok(path)
+}
+
+/// Read plain text off the system clipboard, so Ctrl+V still pastes when the
+/// clipboard holds text rather than an image.
+pub(crate) fn read_clipboard_text() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    let commands: &[(&str, &[&str])] = &[("pbpaste", &[])];
+    #[cfg(target_os = "windows")]
+    let commands: &[(&str, &[&str])] = &[("powershell", &["-command", "Get-Clipboard"])];
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    let commands: &[(&str, &[&str])] = &[
+        ("wl-paste", &["--no-newline"]),
+        ("xclip", &["-selection", "clipboard", "-o"]),
+        ("xsel", &["--clipboard", "--output"]),
+    ];
+    for (command, args) in commands {
+        if let Ok(output) = Command::new(command)
+            .args(*args)
+            .stdin(Stdio::null())
+            .output()
+        {
+            if output.status.success() && !output.stdout.is_empty() {
+                return String::from_utf8(output.stdout).ok();
+            }
+        }
+    }
+    None
+}
+
+/// Pasted screenshots are transient working context, not repo artifacts; drop
+/// ones older than a week so `.rudder/pastes` never grows without bound.
+fn prune_old_pastes(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let cutoff = SystemTime::now() - Duration::from_secs(7 * 24 * 60 * 60);
+    for entry in entries.flatten() {
+        let stale = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .map(|modified| modified < cutoff)
+            .unwrap_or(false);
+        if stale {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}

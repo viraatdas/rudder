@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import type { BackendAdapter, BackendId, RunRequest, RudderEvent, AuthProfileStore, EffortLevel } from "./types.js";
 import { CODEX_RUDDER_WORKER_CONFIG_ARGS, codexLaunchEnv, ensureRudderCodexBinary } from "./codex-binary.js";
-import { loadAuthStore, loadConfig, saveRunRecord } from "./state.js";
+import { lastUsedCodexModelSync, loadAuthStore, loadConfig, saveRunRecord } from "./state.js";
 import { normalizeEffortForBackend } from "./effort.js";
 import {
   commandExists,
@@ -183,7 +183,7 @@ function codexBackend(): BackendAdapter {
             "resume",
             "--json",
             "--model",
-            request.run.model || "gpt-5.5",
+            request.run.model || lastUsedCodexModelSync() || "gpt-5.5",
             "--dangerously-bypass-approvals-and-sandbox",
             "--enable",
             "goals",
@@ -199,7 +199,7 @@ function codexBackend(): BackendAdapter {
             "--color",
             "never",
             "--model",
-            request.run.model || "gpt-5.5",
+            request.run.model || lastUsedCodexModelSync() || "gpt-5.5",
             "--dangerously-bypass-approvals-and-sandbox",
             "--enable",
             "goals",
@@ -313,7 +313,7 @@ function acpxBackend(): BackendAdapter {
 }
 
 function acpxCodexModel(model: string | undefined, effort: EffortLevel | undefined): string | undefined {
-  const selectedModel = model || "gpt-5.5";
+  const selectedModel = model || lastUsedCodexModelSync() || "gpt-5.5";
   if (selectedModel.includes("/")) {
     return selectedModel;
   }

@@ -21,7 +21,7 @@ export { loadInstructionFiles } from "./brain.js";
 
 // A sonnet-class model: planning/decomposition is too hard for haiku, which is
 // the task-summary model. Keep this a single constant so it is easy to bump.
-export const PLANNER_MODEL = "claude-sonnet-4-6";
+export const PLANNER_MODEL = "claude-sonnet-5";
 
 const PLAN_START = "RUDDER_PLAN_TASKS_START";
 const PLAN_END = "RUDDER_PLAN_TASKS_END";

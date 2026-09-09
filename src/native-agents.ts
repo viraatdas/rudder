@@ -2,6 +2,7 @@ import type { RunRecord } from "./types.js";
 import { CODEX_RUDDER_PLANNER_CONFIG_ARGS, CODEX_RUDDER_WORKER_CONFIG_ARGS } from "./codex-binary.js";
 import { normalizeEffortForBackend } from "./effort.js";
 import { PLAN_MODE_CONTRACT } from "./plan-mode.js";
+import { lastUsedCodexModelSync } from "./state.js";
 import { taskDisplayLabel } from "./task-summary.js";
 import { shellQuote, stripRudderPromptWrappers } from "./util.js";
 
@@ -66,7 +67,7 @@ function opencodeArgs(run: RunRecord, prompt: string, contract: string): string[
 }
 
 function codexArgs(run: RunRecord, prompt: string, contract: string, codexCommand = "codex"): string[] {
-  const model = run.model || "gpt-5.5";
+  const model = run.model || lastUsedCodexModelSync() || "gpt-5.5";
   const effort = normalizeEffortForBackend("codex", run.effort);
   return [
     "env",
@@ -121,7 +122,7 @@ function claudePlanArgs(run: RunRecord, prompt: string): string[] {
 }
 
 function codexPlanArgs(run: RunRecord, prompt: string, codexCommand = "codex"): string[] {
-  const model = run.model || "gpt-5.5";
+  const model = run.model || lastUsedCodexModelSync() || "gpt-5.5";
   const effort = normalizeEffortForBackend("codex", run.effort);
   return compact([
     "env",
