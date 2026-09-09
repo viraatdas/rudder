@@ -116,6 +116,18 @@ to `~/.rudder/config.json`.
 Mouse wheel and trackpad scroll the pane under the pointer. Over the worker or
 review pane they scroll Rudder's captured scrollback.
 
+### Usage dashboard
+
+Press `U` in the agents pane (or type `/usage web`) for a machine-wide usage
+page in your browser: subscription quota meters for every signed-in Claude Code
+and Codex account (session and weekly windows with time to reset, read from the
+providers' own usage endpoints using the sign-ins the CLIs already hold), token
+costs estimated at API list rates from the CLIs' local session logs (per day,
+provider, model, and workspace, with the top sessions per workspace and a
+click-to-copy id for `--resume`), and a live view of CPU and memory for Rudder
+and every agent process. Bare `/usage` keeps the one-line summary for the
+current session.
+
 ### Web board
 
 Press `o` in the agents pane (or type `/web`) to open the live project board in
@@ -189,7 +201,8 @@ scroll the pane.
 **In the agents pane:** `j` / `k` or arrows move the selection, `Enter` focuses
 the worker, `m` / `M` / `R` / `r` / `d` act on the selection, `x` stops a running
 agent (keeping its workspace), `c` clears all merged agents from the list (press
-twice to confirm), `g` toggles the nested DAG view, and `o` opens the web board.
+twice to confirm), `g` toggles the nested DAG view, `o` opens the web board, and
+`U` opens the usage dashboard.
 
 **Finished work collapses.** A long session ends with dozens of merged and failed
 rows, which bury the two or three still moving, so `done` and `closed` each render

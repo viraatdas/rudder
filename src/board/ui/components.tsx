@@ -128,6 +128,11 @@ export function ProjectIndex() {
           <span class="brand-name">Rudder</span>
           <span class="brand-sub mono">board</span>
         </div>
+        <div class="toolbar-actions">
+          <a class="btn" href="/usage" title="Quota meters, token costs, machine resources">
+            Usage
+          </a>
+        </div>
       </header>
 
       <main class="index-main">
@@ -334,6 +339,9 @@ function Toolbar({
       </div>
 
       <div class="toolbar-actions">
+        <a class="btn" href="/usage" title="Quota meters, token costs, machine resources">
+          Usage
+        </a>
         <div class="view-toggle" role="group" aria-label="View">
           <button
             type="button"

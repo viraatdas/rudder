@@ -76,6 +76,7 @@ import type { RudderBus } from "../bus.js";
 import { createLogger } from "../logger.js";
 import { mergeNodeIntoIntegration, reconcileInjection, withSchedulerLock } from "../scheduler.js";
 import { nowIso } from "../util.js";
+import { fetchQuota, machineResources, scanTokenUsage, type UsageRange } from "../usage.js";
 import type {
   BoardColumn,
   BoardEdge,
@@ -247,6 +248,41 @@ async function handleRequest(
   }
   if (method === "GET" && pathname === "/board.css") {
     await sendStatic(res, BOARD_CSS_PATH, "text/css; charset=utf-8");
+    return;
+  }
+
+  // Usage dashboard (`U` in the TUI): quota meters, token costs, machine
+  // resources. Read-only, machine-wide (not per project), loopback-only like
+  // everything else here.
+  if (method === "GET" && (pathname === "/usage" || pathname === "/rudder/usage")) {
+    sendHtml(res, renderShell("", controlMode, false, "usage"));
+    return;
+  }
+  if (method === "GET" && pathname === "/api/usage/tokens") {
+    const raw = url.searchParams.get("range") ?? "30d";
+    const range: UsageRange = raw === "7d" || raw === "90d" ? raw : "30d";
+    try {
+      const projects = (await loadProjects()).map((p) => ({ slug: p.slug, name: p.name, repoRoot: p.repoRoot }));
+      sendJson(res, 200, await scanTokenUsage({ range, projects }));
+    } catch (error) {
+      sendJson(res, 500, { error: String((error as Error)?.message ?? error) });
+    }
+    return;
+  }
+  if (method === "GET" && pathname === "/api/usage/quota") {
+    try {
+      sendJson(res, 200, await fetchQuota({ force: url.searchParams.get("refresh") === "1" }));
+    } catch (error) {
+      sendJson(res, 500, { error: String((error as Error)?.message ?? error) });
+    }
+    return;
+  }
+  if (method === "GET" && pathname === "/api/usage/machine") {
+    try {
+      sendJson(res, 200, await machineResources());
+    } catch (error) {
+      sendJson(res, 500, { error: String((error as Error)?.message ?? error) });
+    }
     return;
   }
 
@@ -1577,19 +1613,24 @@ async function loadActivity(repoRoot: string): Promise<BoardSnapshot["activity"]
 // HTML shell. The SPA owns all CSS; this carries no inline styles.
 // ---------------------------------------------------------------------------
 
-function renderShell(slug: string, controlMode: BoardControlMode, canMutate: boolean): string {
+function renderShell(
+  slug: string,
+  controlMode: BoardControlMode,
+  canMutate: boolean,
+  view: "board" | "usage" = "board",
+): string {
   const slugJson = JSON.stringify(slug ?? "");
   return `<!doctype html>
 <html lang="en">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>rudder</title>
+    <title>${view === "usage" ? "rudder · usage" : "rudder"}</title>
     <link rel="stylesheet" href="/board.css" />
   </head>
   <body>
     <div id="app"></div>
-    <script>window.__RUDDER_SLUG__ = ${slugJson}; window.__RUDDER_TOKEN__ = ${JSON.stringify(BOARD_TOKEN)}; window.__RUDDER_CONTROL_MODE__ = ${JSON.stringify(controlMode)}; window.__RUDDER_CAN_MUTATE__ = ${JSON.stringify(canMutate)}</script>
+    <script>window.__RUDDER_SLUG__ = ${slugJson}; window.__RUDDER_TOKEN__ = ${JSON.stringify(BOARD_TOKEN)}; window.__RUDDER_CONTROL_MODE__ = ${JSON.stringify(controlMode)}; window.__RUDDER_CAN_MUTATE__ = ${JSON.stringify(canMutate)}; window.__RUDDER_VIEW__ = ${JSON.stringify(view)}</script>
     <script type="module" src="/board.js"></script>
   </body>
 </html>

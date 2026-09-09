@@ -129,6 +129,85 @@ function mutationHeaders(extra?: Record<string, string>): Record<string, string>
   return { "x-rudder-token": token, ...(extra ?? {}) };
 }
 
+// Usage dashboard payloads (shapes owned by src/usage.ts; duplicated here so the
+// browser bundle never imports node code).
+export type UsageRange = "7d" | "30d" | "90d";
+export type Totals = {
+  input: number;
+  output: number;
+  cacheWrite: number;
+  cacheRead: number;
+  cost: number;
+  cacheSavings: number;
+  calls: number;
+};
+export type DayBucket = { day: string; claude: Totals; codex: Totals };
+export type ModelRow = { provider: "claude" | "codex"; model: string; totals: Totals; sessions: number };
+export type SessionRow = {
+  id: string;
+  provider: "claude" | "codex";
+  model: string;
+  startedAt: string;
+  lastAt: string;
+  cwd: string;
+  totals: Totals;
+};
+export type ProjectRow = { key: string; name: string; slug: string | null; totals: Totals; sessions: SessionRow[] };
+export type TokenUsageReport = {
+  range: UsageRange;
+  since: string;
+  generatedAt: string;
+  days: DayBucket[];
+  providers: Record<"claude" | "codex", Totals>;
+  total: Totals;
+  models: ModelRow[];
+  projects: ProjectRow[];
+  scannedFiles: number;
+  pricingNote: string;
+};
+export type QuotaWindow = { label: string; percent: number; resetsAt: string | null };
+export type AccountQuota = {
+  provider: "claude" | "codex";
+  email: string | null;
+  plan: string | null;
+  windows: QuotaWindow[];
+  error: string | null;
+  fetchedAt: string;
+};
+export type QuotaReport = { accounts: AccountQuota[]; fetchedAt: string; ttlSeconds: number };
+export type ProcessKind = "rudder" | "claude" | "codex" | "opencode" | "other";
+export type ProcessRow = {
+  pid: number;
+  ppid: number;
+  kind: ProcessKind;
+  cpu: number;
+  rss: number;
+  elapsed: string;
+  command: string;
+};
+export type MachineReport = {
+  at: string;
+  cpus: number;
+  load: number[];
+  totalMem: number;
+  freeMem: number;
+  rudder: { cpu: number; rss: number; pid: number };
+  processes: ProcessRow[];
+  byKind: Record<ProcessKind, { cpu: number; rss: number; count: number }>;
+};
+
+export async function fetchTokenUsage(range: UsageRange): Promise<TokenUsageReport> {
+  return jsonOrThrow(await fetch(`/api/usage/tokens?range=${encodeURIComponent(range)}`));
+}
+
+export async function fetchQuota(force = false): Promise<QuotaReport> {
+  return jsonOrThrow(await fetch(`/api/usage/quota${force ? "?refresh=1" : ""}`));
+}
+
+export async function fetchMachine(): Promise<MachineReport> {
+  return jsonOrThrow(await fetch("/api/usage/machine"));
+}
+
 export async function fetchProjects(): Promise<{ projects: ProjectSummary[] }> {
   return jsonOrThrow(await fetch("/api/projects"));
 }

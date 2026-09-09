@@ -650,7 +650,8 @@ pub(crate) fn command_suggestions() -> Vec<Suggestion> {
         },
         Suggestion {
             label: "/usage".to_string(),
-            detail: "show tokens and estimated cost per model".to_string(),
+            detail: "tokens and estimated cost this session; `/usage web` or U opens the dashboard"
+                .to_string(),
             action: SuggestionAction::RunCommand("/usage".to_string()),
         },
         Suggestion {

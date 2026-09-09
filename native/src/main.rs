@@ -3840,6 +3840,7 @@ impl App {
             KeyCode::Char('u') => self.undo_selected_merge(),
             KeyCode::Char('P') => self.open_main_model_switcher(),
             KeyCode::Char('o') => self.open_web_ui(),
+            KeyCode::Char('U') => self.open_usage_dashboard(),
             // Esc backs out of an open drawer, leaving the cursor on its header row.
             KeyCode::Esc | KeyCode::Left if self.drawer.is_some() => self.close_drawer(),
             _ => {}
@@ -10024,7 +10025,7 @@ It will tend to agree with itself — name another with /gam <provider> <model> 
             }
             Some("/help") => {
                 self.notice = Some(
-                    "plain input -> one isolated mergeable worker in its own jj workspace · /plan <task> -> an orchestrator that plans and runs a DAG · /gam [model] <task> -> generator + adversarial reviewer pair; the reviewer can steer the generator mid-turn and stop it outright (split panes, ^W a toggles sides, ^W t shows the dialogue) · /main|/m <task> -> another agent in this shared checkout · panes: Option-1/2/3 or ^W · keys: j/k select · Option-[ / Option-] step agents from any pane · Enter focus · v diff · m merge · u undo a merge · M merge all · R review all · g nest · o web ui · x stop · b branch chat · dd delete · cc clear merged · P model; · /handoff -> selected agent moves to Rudder Cloud and resumes there; commands: /model /fast /sound /notify /color /main /plan /gam /resume /restore /handoff /share /usage /goal /cloud /web /feedback"
+                    "plain input -> one isolated mergeable worker in its own jj workspace · /plan <task> -> an orchestrator that plans and runs a DAG · /gam [model] <task> -> generator + adversarial reviewer pair; the reviewer can steer the generator mid-turn and stop it outright (split panes, ^W a toggles sides, ^W t shows the dialogue) · /main|/m <task> -> another agent in this shared checkout · panes: Option-1/2/3 or ^W · keys: j/k select · Option-[ / Option-] step agents from any pane · Enter focus · v diff · m merge · u undo a merge · M merge all · R review all · g nest · o web ui · U usage dashboard · x stop · b branch chat · dd delete · cc clear merged · P model; · /handoff -> selected agent moves to Rudder Cloud and resumes there; commands: /model /fast /sound /notify /color /main /plan /gam /resume /restore /handoff /share /usage /goal /cloud /web /feedback"
                         .to_string(),
                 );
                 true
@@ -10095,7 +10096,14 @@ It will tend to agree with itself — name another with /gam <provider> <model> 
                 true
             }
             Some("/usage") => {
-                self.show_usage_summary();
+                // `/usage web` (or `open`) goes straight to the dashboard; bare
+                // `/usage` keeps the one-line summary for this session.
+                let arg = command_rest(input, "/usage").trim().to_ascii_lowercase();
+                if matches!(arg.as_str(), "web" | "open" | "dashboard") {
+                    self.open_usage_dashboard();
+                } else {
+                    self.show_usage_summary();
+                }
                 true
             }
             Some("/goal") => {
@@ -10428,6 +10436,7 @@ It will tend to agree with itself — name another with /gam <provider> <model> 
             format_token_count(total_cache_read),
             total_cost,
         ));
+        parts.push("U opens the usage dashboard".to_string());
         self.notice = Some(parts.join("  ·  "));
     }
 
@@ -12729,6 +12738,32 @@ It will tend to agree with itself — name another with /gam <provider> <model> 
 
     /// Open the live web board in the user's default browser (the `/web` command and
     /// the `o` key). No-op with a notice when no board URL was provided.
+    /// `U`: the usage dashboard in the browser — subscription quota meters for
+    /// every signed-in Claude Code / Codex account, token costs from the CLIs'
+    /// session logs at API rates, and live machine resources. Machine-wide,
+    /// so it lives at the board root rather than under a project.
+    fn open_usage_dashboard(&mut self) {
+        match self.board_url.clone() {
+            Some(url) => {
+                let usage = format!("{}/usage", url.trim_end_matches('/'));
+                match open_url_in_browser(&usage) {
+                    Ok(()) => {
+                        self.notice =
+                            Some("opening the usage dashboard in your browser".to_string())
+                    }
+                    Err(err) => {
+                        self.notice = Some(format!(
+                            "could not open browser ({err}); open {usage} manually"
+                        ))
+                    }
+                }
+            }
+            None => {
+                self.notice = Some("web UI is not running for this session".to_string());
+            }
+        }
+    }
+
     fn open_web_ui(&mut self) {
         match self.board_url.clone() {
             Some(url) => match open_url_in_browser(&url) {
