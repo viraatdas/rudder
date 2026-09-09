@@ -198,8 +198,9 @@ pub(crate) fn recent_agent_lines(backend: Backend, lines: &[String], take: usize
 /// holds for Claude and opencode, whose composers leave empty rows beneath them,
 /// and never for Codex, which pins a status bar to the last row. So a Codex agent
 /// asking a question failed this gate on every single tick and could not be shown
-/// as waiting — and Codex's `notify` reports turn-end and nothing else, so no
-/// second source existed to catch it either. Its own idle chrome is the tell.
+/// as waiting — and at the time Codex's `notify` reported turn-end and nothing
+/// else (its lifecycle hooks are wired now, see signals.rs), so no second source
+/// existed to catch it either. Its own idle chrome is the tell.
 pub(crate) fn cursor_at_rest(backend: Backend, lines: &[String]) -> bool {
     let tail_blank = lines
         .iter()

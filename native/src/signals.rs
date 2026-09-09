@@ -13,7 +13,12 @@
 //!   `[hooks]` are trust-gated, so unusable for a headless child; `notify` needs
 //!   no trust and is the right fit.)
 //!
-//! Both write `<rudder_home>/signals/<run_id>.json` = `{"state":"done"|"input"}`.
+//! - **opencode** (`opencode.ai/docs/plugins`): a generated plugin's `event` hook
+//!   sees `session.idle`, `session.error`, `permission.asked` / `permission.replied`.
+//!
+//! All write `<rudder_home>/signals/<run_id>.json` =
+//! `{"state":"done"|"input"|"permission"|"working"|"error","detail":"..."}`.
+//! `detail` is optional and only carried by `error` (the backend's error type).
 
 #![allow(unused_imports)]
 use super::*;
@@ -42,6 +47,12 @@ pub(crate) enum SignalState {
     /// nothing ever lifted the latch, so answering an agent left it flagged
     /// until its NEXT turn ended.
     Working,
+    /// The turn ENDED, but on an error rather than a reply (Claude `StopFailure`:
+    /// rate limit, auth, overloaded, billing...; opencode `session.error`). The
+    /// process is still alive and idle, so process exit never reports it, and
+    /// `Stop` does not fire for it either — a row hit by a rate limit used to
+    /// spin as "running" until you happened to look at the pane.
+    Failed,
 }
 
 /// Extra launch wiring for a worker so it emits official completion signals.
@@ -56,7 +67,7 @@ pub(crate) struct WorkerSignals {
     pub(crate) opencode_config: Option<PathBuf>,
 }
 
-fn rudder_home() -> Option<PathBuf> {
+pub(crate) fn rudder_home() -> Option<PathBuf> {
     if let Some(value) = std::env::var_os("RUDDER_HOME") {
         let value = PathBuf::from(value);
         if !value.as_os_str().is_empty() {
@@ -166,8 +177,26 @@ pub(crate) fn parse_signal_state(body: &str) -> Option<SignalState> {
         "input" => Some(SignalState::Input),
         "permission" => Some(SignalState::Permission),
         "working" => Some(SignalState::Working),
+        "error" => Some(SignalState::Failed),
         _ => None,
     }
+}
+
+/// The optional `detail` a signal carries (the backend's own error type for an
+/// `error` signal). Read before `clear_signal` consumes the file.
+pub(crate) fn read_signal_detail(run_id: &str) -> Option<String> {
+    let body = std::fs::read_to_string(signal_path(run_id)?).ok()?;
+    parse_signal_detail(&body)
+}
+
+pub(crate) fn parse_signal_detail(body: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body.trim()).ok()?;
+    value
+        .get("detail")
+        .and_then(|d| d.as_str())
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+        .map(|d| d.chars().take(80).collect())
 }
 
 /// POSIX-sh one-liner that writes `{"state":"<state>"}` to `signal`, creating the
@@ -187,8 +216,32 @@ fn write_signal_command(signal: &Path, state: &str) -> String {
     )
 }
 
-/// The `claude --settings` JSON: a `Stop` hook (turn ended) and a `Notification`
-/// hook matched to `idle_prompt` (paused for input), each writing the signal file.
+/// Like `write_signal_command`, but the hook's stdin JSON is scanned for
+/// `"<key>":"<value>"` and the value is carried as the signal's `detail`. Plain
+/// sed so the hook stays a `sh -c` one-liner with no jq/node dependency; the
+/// keys this is used for (Claude's `error_type`) are closed sets of simple
+/// tokens, so the `[^"]*` capture cannot smuggle a quote into the JSON.
+fn write_signal_with_detail_command(signal: &Path, state: &str, key: &str) -> String {
+    let path = signal.display();
+    format!(
+        "d=$(sed -n 's/.*\"{key}\":\"\\([^\"]*\\)\".*/\\1/p' | head -n 1); mkdir -p '{dir}' && printf '{{\"state\":\"{state}\",\"detail\":\"%s\"}}' \"$d\" > '{path}'.$$.tmp && mv -f '{path}'.$$.tmp '{path}'",
+        dir = signal
+            .parent()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default()
+    )
+}
+
+/// The `claude --settings` JSON: a `Stop` hook (turn ended), a `StopFailure` hook
+/// (turn ended on an API error), and `Notification` hooks for the pause states,
+/// each writing the signal file.
+///
+/// Matcher names are Claude's OWN notification types, verified against the
+/// installed binary: `permission_prompt`, `idle_prompt`, `agent_needs_input`,
+/// `elicitation_dialog`. The permission matcher was first wired as
+/// `permission_request` — a name from Claude's remote-bridge protocol, not a
+/// notification type — so it never matched and a Claude worker blocked on an
+/// approval had no native signal at all.
 /// When `fast_mode` is set, also carries `fastMode: true` — the SAME settings key
 /// Claude Code's own `/fast` uses — so a launched worker runs in native fast mode
 /// (Opus, accelerated output) instead of being faked with a reduced effort level.
@@ -204,14 +257,23 @@ pub(crate) fn claude_settings_json(signal: &Path, fast_mode: bool) -> String {
                     "hooks": [{ "type": "command", "command": write_signal_command(signal, "input") }]
                 },
                 {
-                    // Claude's OTHER notification matcher. Only `idle_prompt` was
-                    // wired, so a worker blocked on a tool-approval prompt — the
-                    // single most common reason an agent stops dead — had no
-                    // native signal at all and was left to the string heuristics.
-                    "matcher": "permission_request",
+                    // AskUserQuestion / teammate prompts ("agent_needs_input") and MCP
+                    // elicitation dialogs are questions too, not just the idle prompt.
+                    "matcher": "agent_needs_input|elicitation_dialog",
+                    "hooks": [{ "type": "command", "command": write_signal_command(signal, "input") }]
+                },
+                {
+                    // Blocked on a tool-approval prompt — the single most common
+                    // reason an agent stops dead.
+                    "matcher": "permission_prompt",
                     "hooks": [{ "type": "command", "command": write_signal_command(signal, "permission") }]
                 }
             ],
+            // The turn ended on an API error (rate_limit, overloaded, billing...).
+            // `Stop` does NOT fire for these, so without this the row spun forever.
+            "StopFailure": [{
+                "hooks": [{ "type": "command", "command": write_signal_with_detail_command(signal, "error", "error_type") }]
+            }],
             // The human answered: back to work, clear the latch. Fires once per
             // human turn, so it costs one tiny write — unlike PreToolUse, which
             // would fire on every tool call.
@@ -228,8 +290,21 @@ pub(crate) fn claude_settings_json(signal: &Path, fast_mode: bool) -> String {
     settings.to_string()
 }
 
-/// The Codex `notify` script: Codex calls it with the event JSON as `$1`. We only
-/// act on `agent-turn-complete` (the turn-ended event), writing the done signal.
+/// The Codex signal script. It is wired TWICE, because Codex has two lifecycle
+/// channels and each covers what the other cannot:
+///
+/// - as the `notify` program: Codex calls it with the event JSON as `$1`; only
+///   `agent-turn-complete` exists there, so it reports `done`.
+/// - as a lifecycle hook (`hooks.<Event>` config overrides, see
+///   `codex_hook_overrides`): Codex pipes the event JSON on stdin with
+///   `hook_event_name` set. `Stop`/`Interrupt` -> done, `PermissionRequest` ->
+///   permission, `UserPromptSubmit` -> working. Before hooks were wired Codex
+///   reported turn-end and nothing else, so a Codex worker waiting on an
+///   approval could only be caught by scraping its screen.
+///
+/// Matching on the literal `"hook_event_name":"Stop"` is deliberate: Codex writes
+/// compact JSON (verified against the installed binary), and a looser pattern
+/// could match inside `last_assistant_message`.
 pub(crate) fn codex_notify_script(signal: &Path) -> String {
     let path = signal.display();
     let dir = signal
@@ -237,8 +312,61 @@ pub(crate) fn codex_notify_script(signal: &Path) -> String {
         .map(|p| p.display().to_string())
         .unwrap_or_default();
     format!(
-        "#!/bin/sh\n# Rudder Codex completion signal (notify program).\n# Temp + mv so the TUI never reads a torn half-written signal.\ncase \"$1\" in\n  *agent-turn-complete*)\n    mkdir -p '{dir}' && printf '{{\"state\":\"done\"}}' > '{path}'.$$.tmp && mv -f '{path}'.$$.tmp '{path}' ;;\nesac\n"
+        r#"#!/bin/sh
+# Rudder Codex lifecycle signal: `notify` program (event in $1) AND hook (event on stdin).
+# Temp + mv so the TUI never reads a torn half-written signal.
+emit() {{
+  mkdir -p '{dir}' && printf '{{"state":"%s"}}' "$1" > '{path}'.$$.tmp && mv -f '{path}'.$$.tmp '{path}'
+}}
+case "$1" in
+  *agent-turn-complete*) emit done; exit 0 ;;
+  "") ;;
+  *) exit 0 ;;
+esac
+payload=$(cat)
+case "$payload" in
+  *'"hook_event_name":"Stop"'*|*'"hook_event_name": "Stop"'*) emit done ;;
+  *'"hook_event_name":"Interrupt"'*|*'"hook_event_name": "Interrupt"'*) emit done ;;
+  *'"hook_event_name":"PermissionRequest"'*|*'"hook_event_name": "PermissionRequest"'*) emit permission ;;
+  *'"hook_event_name":"UserPromptSubmit"'*|*'"hook_event_name": "UserPromptSubmit"'*) emit working ;;
+esac
+exit 0
+"#
     )
+}
+
+/// The Codex hook events the signal script listens for, mapped onto the protocol.
+pub(crate) const CODEX_HOOK_EVENTS: [&str; 4] =
+    ["Stop", "Interrupt", "PermissionRequest", "UserPromptSubmit"];
+
+/// `-c hooks.<Event>=[...]` overrides pointing every lifecycle event Rudder cares
+/// about at the signal script, plus the flag that lets them run.
+///
+/// Codex hooks are trust-gated: a hook definition has to be reviewed in `/hooks`
+/// before it runs, which a headless child can never do. `--dangerously-bypass-
+/// hook-trust` lifts that for one invocation. Rudder generated this hook itself
+/// (it is the vetting), so the bypass is exactly the "automation that already
+/// vets hook sources" the flag exists for. It also lets the user's OWN untrusted
+/// hooks run inside the worker — the same hooks they would trust in a plain
+/// Codex session, so nothing new is executed on their behalf.
+///
+/// Inline-TOML `-c` values replace the `[hooks]` tables in config.toml for the
+/// same event (hooks.json entries still merge in); the script path carries no
+/// TOML-special characters (it lives under `RUDDER_HOME`, never the workspace).
+pub(crate) fn codex_hook_overrides(script: &Path) -> Vec<String> {
+    let mut args = vec!["--dangerously-bypass-hook-trust".to_string()];
+    let script = script
+        .display()
+        .to_string()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    for event in CODEX_HOOK_EVENTS {
+        args.push("-c".to_string());
+        args.push(format!(
+            "hooks.{event}=[{{hooks=[{{type=\"command\",command=\"{script}\"}}]}}]"
+        ));
+    }
+    args
 }
 
 /// The opencode plugin that reports turn-end, generated per run.
@@ -256,8 +384,13 @@ pub(crate) fn codex_notify_script(signal: &Path) -> String {
 ///    like the root one. Reporting `done` on those marked the whole run complete
 ///    the first time the agent delegated anything. We resolve the session and
 ///    ignore any that has a parent.
-/// 2. **`permission.updated` has a counterpart, `permission.replied`.** Only the
-///    ask was wired, so the waiting state latched on and never lifted.
+/// 2. **The ask is `permission.asked`, and it has a counterpart, `permission.replied`.**
+///    The first version listened for `permission.updated`, which opencode never
+///    emits (verified against the installed binary), so no opencode worker was
+///    ever shown as blocked on an approval; and only the ask was wired, so a
+///    latch, had it ever set, would never have lifted.
+/// 3. **`session.error` is a turn ending too.** A provider error idles the
+///    session without `session.idle`, so the row spun as running forever.
 ///
 /// Every lookup fails OPEN: if the session cannot be resolved for any reason
 /// (older opencode, changed client shape, server hiccup) we report anyway. A
@@ -275,11 +408,11 @@ import {{ dirname }} from "node:path";
 
 const SIGNAL = "{path}";
 
-function report(state) {{
+function report(state, detail) {{
   try {{
     mkdirSync(dirname(SIGNAL), {{ recursive: true }});
     const temp = SIGNAL + "." + process.pid + ".tmp";
-    writeFileSync(temp, JSON.stringify({{ state }}));
+    writeFileSync(temp, JSON.stringify(detail ? {{ state, detail }} : {{ state }}));
     renameSync(temp, SIGNAL);
   }} catch {{
     // The dashboard falls back to process exit; never break the agent over this.
@@ -313,7 +446,13 @@ export const RudderSignal = async ({{ client }}) => {{
       if (type === "session.idle") {{
         // A delegated subagent going idle is not this run finishing its turn.
         if (await rootSession(sessionID)) report("done");
-      }} else if (type === "permission.updated") {{
+      }} else if (type === "session.error") {{
+        if (await rootSession(sessionID)) {{
+          const err = event?.properties?.error;
+          const detail = String(err?.name ?? err?.data?.message ?? err?.message ?? "error").slice(0, 80);
+          report("error", detail);
+        }}
+      }} else if (type === "permission.asked" || type === "permission.updated") {{
         if (await rootSession(sessionID)) report("permission");
       }} else if (type === "permission.replied") {{
         // The human decided. Back to work — this is what lifts the latch.
@@ -464,6 +603,16 @@ pub(crate) fn augment_worker_command(
                     command.args.push("-c".to_string());
                     command.args.push(replacement);
                 }
+                // Lifecycle hooks go BEFORE any subcommand (`resume <id>`): they
+                // are root-level flags, and a `resume` launch carries the session
+                // id as a trailing positional that must stay last.
+                let at = command
+                    .args
+                    .iter()
+                    .position(|arg| arg == "resume" || arg == "exec")
+                    .unwrap_or(command.args.len());
+                let hooks = codex_hook_overrides(&path);
+                command.args.splice(at..at, hooks);
             }
         }
         Backend::Opencode => {

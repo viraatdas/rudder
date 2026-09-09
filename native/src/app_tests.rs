@@ -1341,8 +1341,12 @@ fn opencode_workers_get_a_real_completion_signal_not_a_guess() {
     assert!(plugin.contains("session.idle"), "{plugin}");
     assert!(plugin.contains("\"done\""), "idle maps to done: {plugin}");
     assert!(
-        plugin.contains("permission.updated"),
-        "a waiting-for-approval turn is the input state: {plugin}"
+        plugin.contains("permission.asked"),
+        "opencode's ask event is permission.asked (permission.updated never fires): {plugin}"
+    );
+    assert!(
+        plugin.contains("session.error") && plugin.contains("\"error\""),
+        "a provider error idles the session without session.idle: {plugin}"
     );
     assert!(
         plugin.contains("renameSync"),
@@ -2067,7 +2071,10 @@ fn resume_without_a_session_id_explains_itself_instead_of_spawning() {
     // selected (or no login), it explains itself without spawning anything.
     app.notice = None;
     app.start_task_from_input("/handoff");
-    assert!(app.agents.is_empty(), "a bare /handoff with nothing eligible starts nothing");
+    assert!(
+        app.agents.is_empty(),
+        "a bare /handoff with nothing eligible starts nothing"
+    );
     let notice = app.notice.as_deref().unwrap_or_default();
     assert!(
         notice.contains("not logged in") || notice.contains("/handoff moves the selected agent"),
@@ -2146,7 +2153,11 @@ fn handoff_palette_lists_conversations_then_gets_out_of_the_way() {
     );
     // With an argument under way, /handoff keeps the adopt-a-chat drilldown.
     app.task_input = "/handoff auth".to_string();
-    assert_eq!(suggestions_for(&app).len(), 1, "adoption filtering still works");
+    assert_eq!(
+        suggestions_for(&app).len(),
+        1,
+        "adoption filtering still works"
+    );
 }
 
 #[test]
@@ -5068,7 +5079,10 @@ fn handoff_eligibility_selects_running_isolated_worker() {
     run.status = AgentStatus::Running;
 
     run.mode = AgentMode::OneOff;
-    assert!(!run.is_cloud_handoff_eligible(), "one-off chats are not workers");
+    assert!(
+        !run.is_cloud_handoff_eligible(),
+        "one-off chats are not workers"
+    );
     run.mode = AgentMode::Execute;
 
     run.task = "cloud onload run-9".to_string();
@@ -9749,7 +9763,7 @@ fn codex_notify_script_writes_done_on_turn_complete() {
         "matches the turn-end event"
     );
     assert!(
-        script.contains("/tmp/sig/run.json") && script.contains("\"state\":\"done\""),
+        script.contains("/tmp/sig/run.json") && script.contains("emit done"),
         "writes done signal"
     );
 }
@@ -21231,8 +21245,23 @@ fn claude_wires_the_permission_matcher_and_the_answered_hook() {
         "a question still signals: {matchers:?}"
     );
     assert!(
-        matchers.iter().any(|m| m == "permission_request"),
-        "Claude's OTHER matcher — blocked on approval is the commonest stall, and it had no signal at all: {matchers:?}"
+        matchers.iter().any(|m| m == "permission_prompt"),
+        "Claude's real permission notification type (verified against the binary; `permission_request` is a bridge-protocol message and never matched): {matchers:?}"
+    );
+    assert!(
+        !matchers.iter().any(|m| m == "permission_request"),
+        "the dead matcher name must not come back: {matchers:?}"
+    );
+    assert!(
+        matchers.iter().any(|m| m.contains("agent_needs_input")),
+        "AskUserQuestion prompts are questions too: {matchers:?}"
+    );
+    let stop_failure = v["hooks"]["StopFailure"][0]["hooks"][0]["command"]
+        .as_str()
+        .expect("StopFailure hook");
+    assert!(
+        stop_failure.contains("\"state\":\"error\"") && stop_failure.contains("error_type"),
+        "an API-error turn end has no Stop and no exit; it needs its own signal: {stop_failure}"
     );
 
     let submit = v["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
@@ -21498,7 +21527,10 @@ fn cloud_worker_is_connected_without_exposing_worker_token_to_dashboard() {
     std::env::remove_var("RUDDER_CLOUD_TOKEN");
 
     let summary = read_cloud_summary();
-    assert!(summary.connected, "the in-VM identity is sufficient cloud proof");
+    assert!(
+        summary.connected,
+        "the in-VM identity is sufficient cloud proof"
+    );
 
     let mut app = App::new();
     app.cloud_connected = summary.connected;
@@ -21554,7 +21586,10 @@ fn alt_h_hides_panes_from_the_task_pane_too() {
 #[test]
 fn notification_sequence_is_a_clean_osc_777() {
     let seq = build_notification_sequence("Rudder · repo", "✔ ready for review — fix auth", false);
-    assert!(seq.starts_with("\x1b]777;notify;"), "urxvt notify OSC:\n{seq:?}");
+    assert!(
+        seq.starts_with("\x1b]777;notify;"),
+        "urxvt notify OSC:\n{seq:?}"
+    );
     assert!(seq.ends_with('\x07'), "BEL-terminated:\n{seq:?}");
     assert!(seq.contains("Rudder · repo;✔ ready for review — fix auth"));
 }
@@ -21568,8 +21603,14 @@ fn notification_fields_cannot_break_out_of_the_osc() {
         .strip_prefix("\x1b]777;notify;")
         .and_then(|rest| rest.strip_suffix('\x07'))
         .expect("well-formed OSC");
-    assert!(!inner.contains('\x1b'), "no stray ESC in payload:\n{inner:?}");
-    assert!(!inner.contains('\x07'), "no stray BEL in payload:\n{inner:?}");
+    assert!(
+        !inner.contains('\x1b'),
+        "no stray ESC in payload:\n{inner:?}"
+    );
+    assert!(
+        !inner.contains('\x07'),
+        "no stray BEL in payload:\n{inner:?}"
+    );
     assert_eq!(
         inner.matches(';').count(),
         1,
@@ -21592,7 +21633,10 @@ fn notification_truncates_a_novel_length_task() {
 #[test]
 fn notification_is_tmux_passthrough_wrapped_under_tmux() {
     let seq = build_notification_sequence("t", "b", true);
-    assert!(seq.starts_with("\x1bPtmux;"), "DCS tmux; envelope:\n{seq:?}");
+    assert!(
+        seq.starts_with("\x1bPtmux;"),
+        "DCS tmux; envelope:\n{seq:?}"
+    );
     assert!(seq.ends_with("\x1b\\"), "ST-terminated envelope:\n{seq:?}");
     assert!(
         seq.contains("\x1b\x1b]777;"),
@@ -21636,30 +21680,6 @@ fn notify_command_flips_and_persists_the_setting() {
     assert!(config::desktop_notifications_enabled());
 
     let _ = std::fs::remove_dir_all(&home);
-}
-
-#[test]
-fn worker_notification_composition_keeps_claudes_wording() {
-    let cwd = PathBuf::from("/Users/x/code/rudder");
-    let note = TerminalNotification {
-        title: "Claude Code".to_string(),
-        body: "Claude needs your permission to use Bash".to_string(),
-    };
-    let (title, body) = compose_worker_notification(&cwd, "fix the auth flow", &note);
-    assert_eq!(title, "Claude Code · rudder", "repo distinguishes tabs");
-    assert_eq!(
-        body, "Claude needs your permission to use Bash — fix the auth flow",
-        "Claude's wording survives; the task tells agents apart"
-    );
-
-    // OSC 9 has no title; the run may have no summary.
-    let bare = TerminalNotification {
-        title: String::new(),
-        body: "Task complete".to_string(),
-    };
-    let (title, body) = compose_worker_notification(&cwd, "", &bare);
-    assert_eq!(title, "Rudder · rudder");
-    assert_eq!(body, "Task complete");
 }
 
 #[test]
@@ -21742,7 +21762,12 @@ fn image_chips_share_numbering_with_text_paste_chips() {
     let mut chunks = Vec::new();
     let long_text = "line one\nline two\nline three";
     apply_task_paste(&mut input, &mut cursor, &mut chunks, long_text);
-    apply_task_image_paste(&mut input, &mut cursor, &mut chunks, Path::new("/tmp/s.png"));
+    apply_task_image_paste(
+        &mut input,
+        &mut cursor,
+        &mut chunks,
+        Path::new("/tmp/s.png"),
+    );
     assert!(
         input.contains("[Image #2]"),
         "image continues the chip sequence: {input}"
@@ -21750,4 +21775,523 @@ fn image_chips_share_numbering_with_text_paste_chips() {
     let expanded = expand_pasted_chips(&input, &chunks);
     assert!(expanded.contains("line two"));
     assert!(expanded.contains("/tmp/s.png"));
+}
+
+#[test]
+fn signal_state_parses_error_and_carries_its_detail() {
+    use crate::signals::{parse_signal_detail, parse_signal_state, SignalState};
+    let body = r#"{"state":"error","detail":"rate_limit"}"#;
+    assert_eq!(parse_signal_state(body), Some(SignalState::Failed));
+    assert_eq!(parse_signal_detail(body).as_deref(), Some("rate_limit"));
+    assert_eq!(
+        parse_signal_state(r#"{"state":"error"}"#),
+        Some(SignalState::Failed)
+    );
+    assert_eq!(
+        parse_signal_detail(r#"{"state":"error","detail":""}"#),
+        None
+    );
+    assert_eq!(parse_signal_detail(r#"{"state":"done"}"#), None);
+}
+
+/// Run a generated `sh -c` hook command exactly as Claude would: JSON on stdin.
+#[cfg(not(windows))]
+fn run_hook_command(command: &str, stdin: &str) {
+    use std::io::Write;
+    let mut child = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn sh");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(stdin.as_bytes())
+        .expect("write stdin");
+    assert!(
+        child.wait().expect("wait").success(),
+        "hook command failed: {command}"
+    );
+}
+
+#[cfg(not(windows))]
+#[test]
+fn claude_stop_failure_hook_writes_the_error_type_into_the_signal() {
+    let dir = std::env::temp_dir().join(format!("rudder-sig-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let signal = dir.join("run.json");
+    let json = crate::signals::claude_settings_json(&signal, false);
+    let v: serde_json::Value = serde_json::from_str(&json).expect("settings json");
+    let command = v["hooks"]["StopFailure"][0]["hooks"][0]["command"]
+        .as_str()
+        .expect("StopFailure command")
+        .to_string();
+    run_hook_command(
+        &command,
+        r#"{"session_id":"s","hook_event_name":"StopFailure","error_type":"rate_limit","error_message":"slow down"}"#,
+    );
+    let body = std::fs::read_to_string(&signal).expect("signal written");
+    assert_eq!(
+        crate::signals::parse_signal_state(&body),
+        Some(crate::signals::SignalState::Failed),
+        "{body}"
+    );
+    assert_eq!(
+        crate::signals::parse_signal_detail(&body).as_deref(),
+        Some("rate_limit"),
+        "{body}"
+    );
+    // No error_type at all still yields a well-formed error signal.
+    run_hook_command(&command, r#"{"hook_event_name":"StopFailure"}"#);
+    let body = std::fs::read_to_string(&signal).expect("signal written");
+    assert_eq!(
+        crate::signals::parse_signal_state(&body),
+        Some(crate::signals::SignalState::Failed),
+        "{body}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(not(windows))]
+#[test]
+fn codex_signal_script_serves_both_notify_argv_and_hook_stdin() {
+    use crate::signals::{parse_signal_state, SignalState};
+    let dir = std::env::temp_dir().join(format!("rudder-codex-sig-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("dir");
+    let signal = dir.join("run.json");
+    let script_path = dir.join("notify.sh");
+    std::fs::write(&script_path, crate::signals::codex_notify_script(&signal)).expect("script");
+    let script = script_path.display().to_string();
+    let read = |what: &str| -> SignalState {
+        let body =
+            std::fs::read_to_string(&signal).unwrap_or_else(|_| panic!("no signal after {what}"));
+        let _ = std::fs::remove_file(&signal);
+        parse_signal_state(&body).unwrap_or_else(|| panic!("bad signal after {what}: {body}"))
+    };
+
+    // notify program: event JSON as $1, only turn-complete matters.
+    run_hook_command(
+        &format!("sh '{script}' '{{\"type\":\"agent-turn-complete\",\"turn-id\":\"t\"}}'"),
+        "",
+    );
+    assert_eq!(read("notify"), SignalState::Done);
+    run_hook_command(
+        &format!("sh '{script}' '{{\"type\":\"something-else\"}}'"),
+        "",
+    );
+    assert!(!signal.exists(), "unknown notify events write nothing");
+
+    // hooks: event JSON on stdin, compact as Codex writes it.
+    for (event, expected) in [
+        ("Stop", SignalState::Done),
+        ("Interrupt", SignalState::Done),
+        ("PermissionRequest", SignalState::Permission),
+        ("UserPromptSubmit", SignalState::Working),
+    ] {
+        run_hook_command(
+            &format!("sh '{script}'"),
+            &format!(
+                r#"{{"session_id":"s","turn_id":"t","cwd":"/x","hook_event_name":"{event}","last_assistant_message":"Stop"}}"#
+            ),
+        );
+        assert_eq!(read(event), expected, "{event}");
+    }
+    run_hook_command(
+        &format!("sh '{script}'"),
+        r#"{"hook_event_name":"PreToolUse"}"#,
+    );
+    assert!(!signal.exists(), "unmapped hook events write nothing");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn codex_workers_get_lifecycle_hooks_ahead_of_the_resume_subcommand() {
+    let _env = env_guard();
+    let run_id = "codex-hooks-itest";
+    signals::cleanup_run_signals(run_id);
+    let mut command = TerminalCommand::with_args(
+        "codex",
+        ["--no-alt-screen", "-c", "notify=[]", "resume", "sess-1"],
+    );
+    signals::augment_worker_command(&mut command, Backend::Codex, AgentMode::Execute, run_id);
+    let args = command.args.clone();
+    signals::cleanup_run_signals(run_id);
+
+    let bypass = args
+        .iter()
+        .position(|a| a == "--dangerously-bypass-hook-trust")
+        .expect("hooks are trust-gated; a headless child can never approve them in /hooks");
+    let resume = args
+        .iter()
+        .position(|a| a == "resume")
+        .expect("resume kept");
+    assert!(
+        bypass < resume,
+        "root flag must precede the subcommand: {args:?}"
+    );
+    for event in signals::CODEX_HOOK_EVENTS {
+        let hook = args
+            .iter()
+            .position(|a| a.starts_with(&format!("hooks.{event}=[")))
+            .unwrap_or_else(|| panic!("hooks.{event} override missing: {args:?}"));
+        assert!(
+            hook < resume,
+            "{event} override after the subcommand: {args:?}"
+        );
+        assert_eq!(args[hook - 1], "-c");
+        assert!(
+            args[hook].contains("-notify.sh"),
+            "every hook points at the one signal script: {}",
+            args[hook]
+        );
+    }
+    assert_eq!(
+        args.last().map(String::as_str),
+        Some("sess-1"),
+        "session id stays last"
+    );
+    assert!(
+        args.iter().any(|a| a.starts_with("notify=[\"")),
+        "notify still wired as belt-and-braces: {args:?}"
+    );
+}
+
+/// A live worker whose turn ends on an API error reports it, the tab shows a
+/// failure, and the next prompt clears it — without the run ever being Failed.
+#[cfg(not(windows))]
+#[test]
+fn an_api_error_turn_end_is_shown_as_a_failure_until_the_next_prompt() {
+    let _env = env_guard();
+    let run_id = "sig-error-itest";
+    let Some(sig) = crate::signals::signal_path(run_id) else {
+        return;
+    };
+    let _ = std::fs::remove_file(&sig);
+    crate::signals::prepare_worker_signals(run_id, Backend::Claude);
+
+    let mut app = App::new();
+    app.cwd = std::env::temp_dir();
+    let pane = TerminalPane::spawn_shell_or_command(
+        Some(TerminalCommand::with_args("/bin/sh", ["-lc", "sleep 30"])),
+        TerminalPaneOptions {
+            size: TerminalSize { rows: 10, cols: 80 },
+            scrollback_lines: 100,
+            ..Default::default()
+        },
+    )
+    .expect("spawn worker pty");
+    let mut run = test_agent_run(run_id, "do the thing");
+    run.cwd = app.cwd.clone();
+    run.backend = Backend::Claude;
+    run.terminal = Some(pane);
+    app.agents.push(run);
+    app.selected_agent = 0;
+    if let Some(parent) = sig.parent() {
+        std::fs::create_dir_all(parent).expect("signals dir");
+    }
+
+    std::fs::write(&sig, "{\"state\":\"error\",\"detail\":\"rate_limit\"}").expect("write signal");
+    app.poll_agents();
+    assert_eq!(
+        app.agents[0].status,
+        AgentStatus::Running,
+        "process is alive; not Failed"
+    );
+    assert_eq!(app.agents[0].turn_error(), Some("rate_limit"));
+    assert!(!sig.exists(), "consumed one-shot");
+    assert_eq!(
+        crate::render::agent_status_label(&app.agents[0]),
+        "turn failed · retry"
+    );
+    assert_eq!(
+        app.tab_status_glyph(),
+        '⊗',
+        "the tab says something needs you"
+    );
+    app.poll_agents();
+    assert_eq!(
+        app.agents[0].turn_error(),
+        Some("rate_limit"),
+        "latched: the error is still what it waits on"
+    );
+
+    // The human sends a new prompt: back to work.
+    std::fs::write(&sig, "{\"state\":\"working\"}").expect("write signal");
+    app.poll_agents();
+    assert_eq!(app.agents[0].turn_error(), None);
+    assert!(
+        App::TAB_SPINNER.contains(&app.tab_status_glyph()),
+        "running again"
+    );
+
+    // An error with no detail still shows as an error.
+    std::fs::write(&sig, "{\"state\":\"error\"}").expect("write signal");
+    app.poll_agents();
+    assert_eq!(app.agents[0].turn_error(), Some("api error"));
+    signals::cleanup_run_signals(run_id);
+}
+
+#[test]
+fn native_notification_commands_pass_text_as_argv_never_as_script() {
+    use crate::notify::{native_notification_command, DesktopNote, NativeNotifier};
+    let hostile = "fix \"auth\"; rm -rf / && say 'hi'";
+    let note = DesktopNote {
+        repo: "repo".to_string(),
+        event: "✔ ready for review".to_string(),
+        task: hostile.to_string(),
+    };
+
+    let (program, args) = native_notification_command(
+        &NativeNotifier::TerminalNotifier(PathBuf::from(
+            "/x/Rudder.app/Contents/MacOS/terminal-notifier",
+        )),
+        &note,
+        Some("com.mitchellh.ghostty"),
+    );
+    assert_eq!(
+        program,
+        PathBuf::from("/x/Rudder.app/Contents/MacOS/terminal-notifier")
+    );
+    assert_eq!(
+        args[0..4],
+        ["-title", "repo", "-message", hostile],
+        "repo on top, task as the message; the bundle carries the Rudder name"
+    );
+    assert!(
+        args.windows(2)
+            .any(|w| w[0] == "-subtitle" && w[1] == "✔ ready for review"),
+        "the event is the subtitle line: {args:?}"
+    );
+    assert!(
+        args.windows(2)
+            .any(|w| w[0] == "-activate" && w[1] == "com.mitchellh.ghostty"),
+        "clicking the notification brings the terminal forward: {args:?}"
+    );
+
+    // No task: the event is the message, and there is no empty subtitle.
+    let bare = DesktopNote {
+        repo: "repo".to_string(),
+        event: "needs permission".to_string(),
+        task: String::new(),
+    };
+    let (_, args) = native_notification_command(
+        &NativeNotifier::TerminalNotifier(PathBuf::from("tn")),
+        &bare,
+        None,
+    );
+    assert_eq!(
+        args[0..4],
+        ["-title", "repo", "-message", "needs permission"]
+    );
+    assert!(!args.iter().any(|a| a == "-subtitle"), "{args:?}");
+    assert!(
+        !args.iter().any(|a| a == "-activate"),
+        "no bundle, no flag: {args:?}"
+    );
+
+    let (program, args) = native_notification_command(
+        &NativeNotifier::Osascript(PathBuf::from("/usr/bin/osascript")),
+        &note,
+        None,
+    );
+    assert_eq!(program, PathBuf::from("/usr/bin/osascript"));
+    let script = args
+        .iter()
+        .filter(|a| !a.starts_with('-'))
+        .take(3)
+        .cloned()
+        .collect::<Vec<_>>();
+    assert!(
+        script.iter().all(|line| !line.contains(hostile)),
+        "text must reach AppleScript through argv, not by interpolation: {args:?}"
+    );
+    assert_eq!(
+        args[args.len() - 2..],
+        [
+            "Rudder · repo".to_string(),
+            format!("✔ ready for review — {hostile}")
+        ]
+    );
+
+    let (_, args) = native_notification_command(
+        &NativeNotifier::NotifySend(PathBuf::from("/usr/bin/notify-send")),
+        &bare,
+        None,
+    );
+    assert_eq!(args, ["-a", "Rudder", "Rudder · repo", "needs permission"]);
+
+    // Control characters are scrubbed on every channel, same as the OSC path.
+    let dirty = DesktopNote {
+        repo: "a\x1b]b".to_string(),
+        event: "c\x07d".to_string(),
+        task: String::new(),
+    };
+    let (_, args) = native_notification_command(
+        &NativeNotifier::NotifySend(PathBuf::from("n")),
+        &dirty,
+        None,
+    );
+    assert_eq!(args[2..], ["Rudder · a ]b", "c d"]);
+}
+
+#[test]
+fn terminal_notifier_bundle_is_found_behind_a_wrapper_or_a_symlink() {
+    use crate::notify::terminal_notifier_app_from;
+    let _env = env_guard();
+    let dir = std::env::temp_dir().join(format!("rudder-tn-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let app = dir.join("Cellar/terminal-notifier.app");
+    let exe_dir = app.join("Contents/MacOS");
+    std::fs::create_dir_all(&exe_dir).expect("bundle dirs");
+    std::fs::write(exe_dir.join("terminal-notifier"), "").expect("exe");
+    std::fs::create_dir_all(dir.join("bin")).expect("bin");
+
+    // Homebrew's bash wrapper.
+    let wrapper = dir.join("bin/terminal-notifier");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/bash\nexec \"{}/Contents/MacOS/terminal-notifier\" \"$@\"\n",
+            app.display()
+        ),
+    )
+    .expect("wrapper");
+    let found = terminal_notifier_app_from(&wrapper).expect("wrapper resolves");
+    assert_eq!(
+        std::fs::canonicalize(found).ok(),
+        std::fs::canonicalize(&app).ok()
+    );
+
+    // A direct path into the bundle.
+    let found = terminal_notifier_app_from(&exe_dir.join("terminal-notifier")).expect("inside");
+    assert_eq!(
+        std::fs::canonicalize(found).ok(),
+        std::fs::canonicalize(&app).ok()
+    );
+
+    // Something unrelated: nothing, never a guess.
+    std::fs::write(dir.join("bin/other"), "#!/bin/sh\necho hi\n").expect("other");
+    assert_eq!(terminal_notifier_app_from(&dir.join("bin/other")), None);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Against the REAL homebrew bundle when present: the copy must be renamed,
+/// re-iconed and validly signed, and a second call must be a no-op.
+#[cfg(target_os = "macos")]
+#[test]
+fn rudder_notifier_app_is_a_renamed_signed_copy_of_terminal_notifier() {
+    use crate::notify::{ensure_rudder_notifier_app, terminal_notifier_app_from};
+    let _env = env_guard();
+    let Some(source) = crate::notify::detect_native_notifier().and_then(|n| match n {
+        crate::notify::NativeNotifier::TerminalNotifier(_) => {
+            let path = std::env::var_os("PATH")?;
+            std::env::split_paths(&path)
+                .map(|d| d.join("terminal-notifier"))
+                .find(|c| c.is_file())
+                .and_then(|bin| terminal_notifier_app_from(&bin))
+        }
+        _ => None,
+    }) else {
+        return; // no terminal-notifier here
+    };
+    let home = std::env::temp_dir().join(format!("rudder-home-tn-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+
+    let exe = ensure_rudder_notifier_app(&source, &home).expect("bundle built");
+    assert!(exe.is_file(), "{}", exe.display());
+    let app = home.join("notifier/Rudder.app");
+    let plist = |key: &str| -> String {
+        let out = std::process::Command::new("plutil")
+            .args(["-extract", key, "raw", "-o", "-"])
+            .arg(app.join("Contents/Info.plist"))
+            .output()
+            .expect("plutil");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    assert_eq!(plist("CFBundleIdentifier"), "dev.viraat.rudder.notifier");
+    assert_eq!(plist("CFBundleName"), "Rudder");
+    assert_eq!(plist("CFBundleIconFile"), "Rudder");
+    assert!(
+        app.join("Contents/Resources/Rudder.icns").is_file(),
+        "icon shipped"
+    );
+    assert!(
+        !app.join("Contents/Resources/Terminal.icns").exists(),
+        "Terminal's icon gone"
+    );
+    let verified = std::process::Command::new("codesign")
+        .args(["--verify", "--deep"])
+        .arg(&app)
+        .status()
+        .expect("codesign")
+        .success();
+    assert!(
+        verified,
+        "ad-hoc signature must validate or macOS drops the notification"
+    );
+
+    // Second call: cached, same executable, no rebuild (stamp unchanged).
+    let stamp = home.join("notifier/Rudder.app.stamp");
+    assert!(
+        stamp.is_file(),
+        "stamp is beside the bundle, never inside the seal"
+    );
+    let before = std::fs::metadata(&stamp)
+        .and_then(|m| m.modified())
+        .expect("stamp");
+    let again = ensure_rudder_notifier_app(&source, &home).expect("cached");
+    assert_eq!(again, exe);
+    let after = std::fs::metadata(&stamp)
+        .and_then(|m| m.modified())
+        .expect("stamp");
+    assert_eq!(before, after, "no rebuild when nothing changed");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn native_notifier_detection_prefers_terminal_notifier_then_osascript() {
+    use crate::notify::{detect_native_notifier, NativeNotifier};
+    let _env = env_guard();
+    let dir = std::env::temp_dir().join(format!("rudder-notifier-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("dir");
+    let saved = std::env::var_os("PATH");
+    std::env::set_var("PATH", &dir);
+    assert_eq!(
+        detect_native_notifier(),
+        None,
+        "empty PATH: OSC 777 fallback"
+    );
+
+    if cfg!(target_os = "macos") {
+        std::fs::write(dir.join("osascript"), "").expect("fake osascript");
+        assert_eq!(
+            detect_native_notifier(),
+            Some(NativeNotifier::Osascript(dir.join("osascript")))
+        );
+        std::fs::write(dir.join("terminal-notifier"), "").expect("fake tn");
+        assert_eq!(
+            detect_native_notifier(),
+            Some(NativeNotifier::TerminalNotifier(
+                dir.join("terminal-notifier")
+            )),
+            "terminal-notifier wins: it can activate the terminal on click"
+        );
+    } else {
+        std::fs::write(dir.join("notify-send"), "").expect("fake notify-send");
+        assert_eq!(
+            detect_native_notifier(),
+            Some(NativeNotifier::NotifySend(dir.join("notify-send")))
+        );
+    }
+    match saved {
+        Some(path) => std::env::set_var("PATH", path),
+        None => std::env::remove_var("PATH"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }

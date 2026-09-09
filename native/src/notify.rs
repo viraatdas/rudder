@@ -1,14 +1,23 @@
 #![allow(unused_imports)]
-//! Desktop notifications delivered THROUGH the terminal emulator (OSC 777).
+//! Desktop notifications for lifecycle transitions.
 //!
 //! Workers run inside Rudder's embedded terminal, so a backend's own desktop
 //! notification escapes (Claude emits OSC 777 "needs your permission") are
 //! consumed by our VT parser and never reach the real terminal. The dashboard
-//! therefore re-emits its own notification at each lifecycle transition it
-//! owns: entering review, failing, and a worker latching a question/permission
-//! wait. Ghostty, kitty and other urxvt-notify-aware emulators render these as
-//! native OS notifications per tab; emulators that don't understand OSC 777
-//! ignore it silently.
+//! therefore emits its own notification at each lifecycle transition, driven
+//! by the backend's OWN lifecycle events (the hook signals in `signals.rs`:
+//! Claude `Stop`/`StopFailure`/`Notification`, Codex `Stop`/`PermissionRequest`,
+//! opencode `session.idle`/`permission.asked`/`session.error`): entering
+//! review, a turn failing, and a worker latching a question/permission wait.
+//!
+//! Two channels, native first:
+//! - **OS-native**: `terminal-notifier` or `osascript` on macOS, `notify-send`
+//!   on Linux, spawned off-thread. Works in every emulator, including ones with
+//!   no notification escape at all (Terminal.app), and is what makes "the
+//!   session is done" reach the user reliably.
+//! - **OSC 777** through the emulator, used only when no native notifier is on
+//!   PATH. Ghostty, kitty and other urxvt-notify-aware emulators render it;
+//!   others ignore it silently. Never both: Ghostty would show two.
 //!
 //! Focus gating: the tab the user is looking at never notifies — they can see
 //! the row change color. Focus is tracked via the terminal's focus-report mode
@@ -68,11 +77,260 @@ pub(crate) fn build_notification_sequence(title: &str, body: &str, under_tmux: b
     }
 }
 
-/// Emit one desktop notification via the outer terminal. No-op when disabled
-/// (`/notify off`), when this tab currently has focus (the user can already
-/// see the dashboard), or in tests. Safe to write directly: event handling and
-/// drawing share one thread, so this never interleaves with a frame.
-pub(crate) fn notify_desktop(title: &str, body: &str) {
+/// Rudder's own icon, baked into the binary so the notifier bundle can be
+/// built anywhere `RUDDER_HOME` is writable (rendered from site/favicon.svg).
+const RUDDER_ICNS: &[u8] = include_bytes!("../../assets/rudder.icns");
+const RUDDER_NOTIFIER_BUNDLE_ID: &str = "dev.viraat.rudder.notifier";
+
+/// Which OS-native notifier this machine has. Detected once per process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NativeNotifier {
+    /// macOS, homebrew `terminal-notifier`: clicking the notification can
+    /// activate the terminal app, and it shows title / subtitle / message.
+    /// The path is the executable to run — ideally inside Rudder's own
+    /// renamed copy of the bundle (see `ensure_rudder_notifier_app`), so the
+    /// notification carries Rudder's icon and name instead of Terminal's.
+    TerminalNotifier(PathBuf),
+    /// macOS, always present: `display notification` via AppleScript.
+    Osascript(PathBuf),
+    /// Linux freedesktop.
+    NotifySend(PathBuf),
+}
+
+fn find_on_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
+}
+
+/// The `terminal-notifier.app` bundle behind a `terminal-notifier` executable.
+/// Homebrew installs a bash wrapper in `bin/` that execs the bundle's binary;
+/// other installs symlink straight into the bundle. Both are handled.
+pub(crate) fn terminal_notifier_app_from(bin: &Path) -> Option<PathBuf> {
+    let resolved = std::fs::canonicalize(bin).unwrap_or_else(|_| bin.to_path_buf());
+    if let Some(app) = resolved
+        .ancestors()
+        .find(|dir| dir.extension().is_some_and(|ext| ext == "app"))
+    {
+        return Some(app.to_path_buf());
+    }
+    // A wrapper script: find the quoted bundle path it execs.
+    let text = std::fs::read_to_string(&resolved).ok()?;
+    let marker = ".app/Contents/MacOS/terminal-notifier";
+    let end = text.find(marker)?;
+    let start = text[..end].rfind(|c: char| c == '"' || c == '\'' || c.is_whitespace())? + 1;
+    let app = PathBuf::from(&text[start..end + 4]);
+    app.is_dir().then_some(app)
+}
+
+/// Build (or refresh) `<home>/notifier/Rudder.app`: terminal-notifier's own
+/// documented way to get a notification that looks like YOUR app — a copy of
+/// its bundle with the icon, name and bundle id swapped, ad-hoc signed so macOS
+/// accepts it as a notification sender. Returns the executable to run.
+///
+/// Rebuilt whenever the source bundle, the embedded icon, or the Rudder version
+/// changes (a stamp file records all three); otherwise a cheap existence check.
+/// macOS asks once, per bundle id, whether "Rudder" may notify — that prompt is
+/// the point: it is Rudder asking, not Terminal.
+pub(crate) fn ensure_rudder_notifier_app(source_app: &Path, home: &Path) -> Option<PathBuf> {
+    use std::process::Command;
+    let app = home.join("notifier").join("Rudder.app");
+    let exe = app.join("Contents/MacOS/terminal-notifier");
+    // The stamp lives NEXT TO the bundle, not inside it: any file added under
+    // Contents/ after signing is "a sealed resource missing or invalid" and
+    // the notification center silently drops everything the app sends.
+    let stamp_path = home.join("notifier").join("Rudder.app.stamp");
+    let source_mtime = std::fs::metadata(source_app.join("Contents/Info.plist"))
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let stamp = format!(
+        "{}|{source_mtime}|{}|{}",
+        source_app.display(),
+        RUDDER_ICNS.len(),
+        env!("CARGO_PKG_VERSION")
+    );
+    if exe.is_file() && std::fs::read_to_string(&stamp_path).ok().as_deref() == Some(stamp.as_str())
+    {
+        return Some(exe);
+    }
+    let _ = std::fs::remove_dir_all(&app);
+    std::fs::create_dir_all(app.parent()?).ok()?;
+    // `cp -R` keeps the bundle layout (symlinks, lproj dirs) that a file-by-file
+    // copy would have to reimplement.
+    let copied = Command::new("cp")
+        .arg("-R")
+        .arg(source_app)
+        .arg(&app)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !copied || !exe.is_file() {
+        let _ = std::fs::remove_dir_all(&app);
+        return None;
+    }
+    let resources = app.join("Contents/Resources");
+    std::fs::write(resources.join("Rudder.icns"), RUDDER_ICNS).ok()?;
+    let _ = std::fs::remove_file(resources.join("Terminal.icns"));
+    let plist = app.join("Contents/Info.plist");
+    for (key, value) in [
+        ("CFBundleIdentifier", RUDDER_NOTIFIER_BUNDLE_ID),
+        ("CFBundleName", "Rudder"),
+        ("CFBundleDisplayName", "Rudder"),
+        ("CFBundleIconFile", "Rudder"),
+    ] {
+        let ok = Command::new("plutil")
+            .args(["-replace", key, "-string", value])
+            .arg(&plist)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            let _ = std::fs::remove_dir_all(&app);
+            return None;
+        }
+    }
+    // Editing Resources/Info.plist broke whatever signature the copy carried;
+    // an ad-hoc signature is enough for the notification center to trust it.
+    let signed = Command::new("codesign")
+        .args(["--force", "--deep", "--sign", "-"])
+        .arg(&app)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !signed {
+        let _ = std::fs::remove_dir_all(&app);
+        return None;
+    }
+    std::fs::write(&stamp_path, stamp).ok()?;
+    Some(exe)
+}
+
+pub(crate) fn detect_native_notifier() -> Option<NativeNotifier> {
+    if cfg!(target_os = "macos") {
+        if let Some(path) = find_on_path("terminal-notifier") {
+            // Rudder's own bundle when it can be built; the stock one otherwise.
+            let branded = terminal_notifier_app_from(&path)
+                .zip(crate::signals::rudder_home())
+                .and_then(|(app, home)| ensure_rudder_notifier_app(&app, &home));
+            return Some(NativeNotifier::TerminalNotifier(branded.unwrap_or(path)));
+        }
+        if let Some(path) = find_on_path("osascript") {
+            return Some(NativeNotifier::Osascript(path));
+        }
+        return None;
+    }
+    find_on_path("notify-send").map(NativeNotifier::NotifySend)
+}
+
+fn native_notifier() -> Option<&'static NativeNotifier> {
+    static NOTIFIER: std::sync::OnceLock<Option<NativeNotifier>> = std::sync::OnceLock::new();
+    NOTIFIER.get_or_init(detect_native_notifier).as_ref()
+}
+
+/// One lifecycle notification, in parts, so each channel can lay it out the
+/// way it looks best there: terminal-notifier has title / subtitle / message
+/// lines; the others get a single title and body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DesktopNote {
+    /// The repo the dashboard is running in.
+    pub(crate) repo: String,
+    /// What happened: "✔ ready for review", "needs permission"...
+    pub(crate) event: String,
+    /// The agent's task, possibly empty.
+    pub(crate) task: String,
+}
+
+impl DesktopNote {
+    /// `Rudder · <repo>` for channels with one title line.
+    pub(crate) fn flat_title(&self) -> String {
+        format!("Rudder · {}", self.repo)
+    }
+
+    /// `<event> — <task>` for channels with one body line.
+    pub(crate) fn flat_body(&self) -> String {
+        let task = self.task.trim();
+        if task.is_empty() {
+            self.event.clone()
+        } else {
+            format!("{} — {task}", self.event)
+        }
+    }
+}
+
+/// The program and argv for one native notification. Text is passed as
+/// separate arguments, never interpolated into a script, so a task summary
+/// containing quotes cannot break out (osascript reads them from `argv`).
+/// `activate` is the bundle id of the terminal app to bring forward on click
+/// (macOS sets `__CFBundleIdentifier` on GUI-launched processes).
+pub(crate) fn native_notification_command(
+    notifier: &NativeNotifier,
+    note: &DesktopNote,
+    activate: Option<&str>,
+) -> (PathBuf, Vec<String>) {
+    let title = sanitize_field(&note.flat_title(), false);
+    let body = sanitize_field(&note.flat_body(), false);
+    match notifier {
+        NativeNotifier::TerminalNotifier(path) => {
+            // Three lines: the repo up top, the event as the subtitle, the
+            // task as the message. The Rudder name is carried by the bundle's
+            // icon and app name, so it is not repeated in the title.
+            let task = sanitize_field(note.task.trim(), false);
+            let event = sanitize_field(&note.event, false);
+            let (subtitle, message) = if task.is_empty() {
+                (String::new(), event)
+            } else {
+                (event, task)
+            };
+            let mut args = vec![
+                "-title".to_string(),
+                sanitize_field(&note.repo, false),
+                "-message".to_string(),
+                message,
+                "-ignoreDnD".to_string(),
+            ];
+            if !subtitle.is_empty() {
+                args.push("-subtitle".to_string());
+                args.push(subtitle);
+            }
+            if let Some(bundle) = activate.filter(|b| !b.trim().is_empty()) {
+                args.push("-activate".to_string());
+                args.push(bundle.to_string());
+            }
+            (path.clone(), args)
+        }
+        NativeNotifier::Osascript(path) => (
+            path.clone(),
+            vec![
+                "-e".to_string(),
+                "on run argv".to_string(),
+                "-e".to_string(),
+                "display notification (item 2 of argv) with title (item 1 of argv)".to_string(),
+                "-e".to_string(),
+                "end run".to_string(),
+                title,
+                body,
+            ],
+        ),
+        NativeNotifier::NotifySend(path) => (
+            path.clone(),
+            vec!["-a".to_string(), "Rudder".to_string(), title, body],
+        ),
+    }
+}
+
+/// Emit one desktop notification. No-op when disabled (`/notify off`), when
+/// this tab currently has focus (the user can already see the dashboard), or
+/// in tests. Native notifier when one exists, else OSC 777 through the outer
+/// terminal. The native process runs on a throwaway thread so the poll loop
+/// never blocks on it (osascript can take a few hundred ms) and the child is
+/// always reaped.
+pub(crate) fn notify_desktop(note: DesktopNote) {
     if cfg!(test) {
         return;
     }
@@ -82,10 +340,46 @@ pub(crate) fn notify_desktop(title: &str, body: &str) {
     if terminal_focused() {
         return;
     }
-    let seq = build_notification_sequence(title, body, std::env::var_os("TMUX").is_some());
+    if native_notifier_available() {
+        let activate = std::env::var("__CFBundleIdentifier").ok();
+        // Detection (and, the first time, building the Rudder.app bundle:
+        // cp + plutil + codesign) happens on the thread too, so the poll loop
+        // never pays for it.
+        std::thread::spawn(move || {
+            let Some(notifier) = native_notifier() else {
+                return;
+            };
+            let (program, args) = native_notification_command(notifier, &note, activate.as_deref());
+            let _ = std::process::Command::new(program)
+                .args(args)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        });
+        return;
+    }
+    let seq = build_notification_sequence(
+        &note.flat_title(),
+        &note.flat_body(),
+        std::env::var_os("TMUX").is_some(),
+    );
     let mut out = std::io::stdout().lock();
     let _ = out.write_all(seq.as_bytes());
     let _ = out.flush();
+}
+
+/// Cheap PATH-only check for the channel decision; the full detection (which
+/// may build the bundle) runs off-thread in `native_notifier`.
+fn native_notifier_available() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        if cfg!(target_os = "macos") {
+            find_on_path("terminal-notifier").is_some() || find_on_path("osascript").is_some()
+        } else {
+            find_on_path("notify-send").is_some()
+        }
+    })
 }
 
 fn repo_display_name(cwd: &Path) -> String {
@@ -95,51 +389,12 @@ fn repo_display_name(cwd: &Path) -> String {
         .unwrap_or_else(|| "rudder".to_string())
 }
 
-/// One lifecycle notification for a run: "Rudder · <repo>" + "<event> — <task>".
-/// The repo name distinguishes tabs when several dashboards are open.
+/// One lifecycle notification for a run. The repo name distinguishes tabs when
+/// several dashboards are open; the task tells agents apart.
 pub(crate) fn notify_run(run: &AgentRun, event: &str) {
-    let repo = repo_display_name(&run.cwd);
-    let summary = run.task_summary.trim();
-    let body = if summary.is_empty() {
-        event.to_string()
-    } else {
-        format!("{event} — {summary}")
-    };
-    notify_desktop(&format!("Rudder · {repo}"), &body);
-}
-
-/// Compose the (title, body) for a notification the WORKER itself emitted
-/// (Claude Code's own OSC 777/9, captured by the embedded terminal's scanner).
-/// The backend's wording is kept verbatim — that is the point of forwarding —
-/// with the repo appended to the title and the task appended to the body so
-/// several tabs and several agents stay tellable-apart.
-pub(crate) fn compose_worker_notification(
-    cwd: &Path,
-    task_summary: &str,
-    note: &TerminalNotification,
-) -> (String, String) {
-    let repo = repo_display_name(cwd);
-    let title = if note.title.trim().is_empty() {
-        format!("Rudder · {repo}")
-    } else {
-        format!("{} · {repo}", note.title.trim())
-    };
-    let summary = task_summary.trim();
-    let body = if summary.is_empty() {
-        note.body.clone()
-    } else if note.body.trim().is_empty() {
-        summary.to_string()
-    } else {
-        format!("{} — {summary}", note.body.trim())
-    };
-    (title, body)
-}
-
-pub(crate) fn forward_worker_notification(
-    cwd: &Path,
-    task_summary: &str,
-    note: &TerminalNotification,
-) {
-    let (title, body) = compose_worker_notification(cwd, task_summary, note);
-    notify_desktop(&title, &body);
+    notify_desktop(DesktopNote {
+        repo: repo_display_name(&run.cwd),
+        event: event.to_string(),
+        task: run.task_summary.trim().to_string(),
+    });
 }

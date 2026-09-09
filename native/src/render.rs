@@ -5211,7 +5211,11 @@ pub(crate) fn agent_status_text(agent: &AgentRun) -> String {
     // running agent has been silent well past any normal pause, say how long.
     // (The clock restarts when a dashboard reloads a row, so this reports
     // silence within the current session, never a fabricated longer one.)
-    if agent.status == AgentStatus::Running && !agent.needs_permission && !agent.needs_user_input {
+    if agent.status == AgentStatus::Running
+        && !agent.needs_permission
+        && !agent.needs_user_input
+        && agent.turn_error().is_none()
+    {
         let quiet = agent.last_output_at.elapsed();
         if quiet >= QUIET_AGENT_THRESHOLD {
             return format!("{label} · quiet {}", humanize_quiet(quiet));
@@ -5250,6 +5254,11 @@ pub(crate) fn agent_status_label(agent: &AgentRun) -> &'static str {
         "needs permission"
     } else if agent.needs_user_input {
         "needs input"
+    } else if agent.turn_error().is_some() {
+        // A live worker whose last turn died on the API (rate limit, auth,
+        // overloaded). It is not Failed — the process is fine — but it is not
+        // working either, and "running" was a lie that hid every rate limit.
+        "turn failed \u{b7} retry"
     } else if matches!(agent.mode, AgentMode::Plan | AgentMode::RudderPlan)
         && agent.status == AgentStatus::Running
     {
@@ -5363,6 +5372,8 @@ pub(crate) fn agent_awaits_merge(agent: &AgentRun) -> bool {
 pub(crate) fn agent_status_style(agent: &AgentRun) -> Style {
     if agent.needs_permission || agent.needs_user_input {
         Style::default().fg(RUNNING_COLOR)
+    } else if agent.turn_error().is_some() {
+        Style::default().fg(FAILED_COLOR)
     } else if agent.has_merge_conflict() {
         Style::default().fg(FAILED_COLOR)
     } else if agent.status == AgentStatus::Done

@@ -32,7 +32,7 @@ use ratatui::{
 };
 use rudder_native::pty_terminal::{
     describe_exit_code, CellContents, PtyOutputWaker, StyledTerminalCell, TerminalCommand,
-    TerminalCursor, TerminalNotification, TerminalPane, TerminalPaneOptions, TerminalSize,
+    TerminalCursor, TerminalPane, TerminalPaneOptions, TerminalSize,
 };
 
 /// A single message the main event loop selects on. Either a terminal input
@@ -1751,10 +1751,15 @@ struct MigratedAgent {
 /// Which kind of wait a backend hook reported. A question and an approval are
 /// different states to a human — one needs an answer typed, the other needs a
 /// yes or no — and the dashboard renders them differently.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum WaitSignal {
     Input,
     Permission,
+    /// The turn ended on a backend error (rate limit, auth, overloaded...) with
+    /// the process still alive. Carries the backend's own error type when it
+    /// reported one. Lifted exactly like the other waits: the human sends a new
+    /// prompt, or the agent is visibly working again.
+    Error(Option<String>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2132,6 +2137,16 @@ impl AgentRun {
             && !self.is_main()
             && !self.is_oneoff()
             && !is_cloud_agent(self)
+    }
+
+    /// The error a still-alive worker's last turn ended on, if that is what it
+    /// is waiting on. Rendered like a failure (it needs you) without marking the
+    /// run Failed (the process is fine; a retry is one prompt away).
+    fn turn_error(&self) -> Option<&str> {
+        match &self.wait_signal {
+            Some(WaitSignal::Error(detail)) => Some(detail.as_deref().unwrap_or("api error")),
+            _ => None,
+        }
     }
 
     fn has_merge_conflict(&self) -> bool {
@@ -2786,8 +2801,12 @@ impl App {
         {
             return '\u{2b13}'; // ⬓ square, bottom half filled - waiting on you
         }
-        if self.agents.iter().any(|a| a.status == AgentStatus::Failed) {
-            return '\u{2297}'; // ⊗ - something failed
+        if self
+            .agents
+            .iter()
+            .any(|a| a.status == AgentStatus::Failed || a.turn_error().is_some())
+        {
+            return '\u{2297}'; // ⊗ - something failed (a dead run, or a live turn that ended on an API error)
         }
         if self.agents.iter().any(|a| a.status == AgentStatus::Running) {
             // Advance on a wall clock rather than per frame: the draw loop runs at
@@ -10769,7 +10788,8 @@ It will tend to agree with itself — name another with /gam <provider> <model> 
             .is_some_and(|run| run.task == label && run.status == AgentStatus::Failed)
         {
             self.restore_running_agents();
-            self.notice = Some("cloud handoff failed to start; the local agent resumed".to_string());
+            self.notice =
+                Some("cloud handoff failed to start; the local agent resumed".to_string());
             return;
         }
         if let Some(run) = self.agents.iter_mut().find(|run| run.id == run_id) {
@@ -17422,17 +17442,13 @@ What to do\n\
             let drained = terminal.drain_output();
             let drained_bytes = drained.len();
             let had_output = drained_bytes > 0;
-            // Re-emit the backend's OWN desktop notifications (Claude's OSC 777
-            // "needs your permission" / "waiting for your input") to the outer
-            // terminal — the embedded parser otherwise swallows them and no
-            // Ghostty tab ever notifies. Only while Running: once a run enters
-            // review, rudder's own lifecycle notification already covered it.
-            let worker_notes = terminal.take_notifications();
-            if run.status == AgentStatus::Running {
-                for note in &worker_notes {
-                    forward_worker_notification(&run.cwd, &run.task_summary, note);
-                }
-            }
+            // The backend's OWN desktop notification escapes (Claude's OSC 777
+            // "needs your permission") are captured by the pane so they never
+            // reach the rendered screen, and then DROPPED: every state they
+            // describe now arrives as a lifecycle signal (signals.rs) for all
+            // three backends, and rudder notifies from that. Forwarding them as
+            // well showed each prompt twice.
+            let _ = terminal.take_notifications();
             let headless_planner = run.mode == AgentMode::RudderPlan
                 && (run.reconcile_planner || !run.interactive_orchestrator);
             let drain_duration = drain_started.elapsed();
@@ -17616,13 +17632,8 @@ What to do\n\
                                     changed = true;
                                     // Backend-signalled, so edge-triggered by the
                                     // guard above — never the chrome detector's
-                                    // flicker. Claude is excluded: its own OSC 777
-                                    // notification is forwarded verbatim from the
-                                    // pane (see take_notifications above), and a
-                                    // synthesized copy would ring twice.
-                                    if run.backend != Backend::Claude {
-                                        notify_run(run, "waiting for your answer");
-                                    }
+                                    // flicker.
+                                    notify_run(run, "waiting for your answer");
                                 }
                             }
                             Some(signals::SignalState::Permission) => {
@@ -17632,11 +17643,7 @@ What to do\n\
                                     run.needs_permission = true;
                                     run.needs_user_input = false;
                                     changed = true;
-                                    // Claude forwards its own notification; see
-                                    // the Input arm above.
-                                    if run.backend != Backend::Claude {
-                                        notify_run(run, "needs permission");
-                                    }
+                                    notify_run(run, "needs permission");
                                 }
                             }
                             // The human answered. The counterpart the protocol
@@ -17649,6 +17656,25 @@ What to do\n\
                                     run.needs_user_input = false;
                                     run.needs_permission = false;
                                     changed = true;
+                                }
+                            }
+                            // The turn ended on an API error (Claude `StopFailure`,
+                            // opencode `session.error`). Neither `Stop` nor process
+                            // exit reports it, so this row used to spin as running
+                            // until someone looked. Not `Failed` — the process is
+                            // alive and a retry is one prompt away — but shown as a
+                            // failure because it needs you.
+                            Some(signals::SignalState::Failed) => {
+                                let detail = signals::read_signal_detail(&run.id);
+                                signals::clear_signal(&run.id);
+                                if !matches!(run.wait_signal, Some(WaitSignal::Error(_))) {
+                                    let label =
+                                        detail.clone().unwrap_or_else(|| "api error".to_string());
+                                    run.wait_signal = Some(WaitSignal::Error(detail));
+                                    run.needs_user_input = false;
+                                    run.needs_permission = false;
+                                    changed = true;
+                                    notify_run(run, &format!("\u{2717} turn failed: {label}"));
                                 }
                             }
                             None => {
