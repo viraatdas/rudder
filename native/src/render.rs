@@ -3907,7 +3907,9 @@ fn worker_lines_at(app: &mut App, index: usize, height: usize, width: usize) -> 
             )));
         }
         lines.push(Line::from(Span::styled(
-            "This agent is not running.",
+            run.worker_exit_note
+                .clone()
+                .unwrap_or_else(|| "This agent is not running.".to_string()),
             muted_style(true),
         )));
         return lines;

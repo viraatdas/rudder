@@ -891,6 +891,7 @@ pub(crate) fn review_all_run(
         needs_permission: false,
         needs_user_input: false,
         wait_signal: None,
+        worker_exit_note: None,
         last_error: None,
         worker_input_draft: String::new(),
         worker_input_cursor: 0,

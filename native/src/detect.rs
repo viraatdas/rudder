@@ -55,6 +55,23 @@ pub(crate) fn mark_run_done(run: &mut AgentRun) {
     }
 }
 
+/// A worker whose process exited AFTER its turn had ended (the run was Done and
+/// idle). The run STAYS Done: the work it reported is intact and must remain
+/// reviewable and mergeable, and a clean exit after completion is not a new
+/// failure. What changes is the pane: the caller drops the dead terminal so a
+/// keystroke can no longer be swallowed by a corpse, and the static card says
+/// what happened instead of showing a frozen screen.
+pub(crate) fn mark_worker_gone_after_done(run: &mut AgentRun, exit_code: u32) {
+    run.needs_permission = false;
+    run.needs_user_input = false;
+    run.wait_signal = None;
+    run.worker_exit_note = Some(format!(
+        "worker exited after finishing its turn ({}); resume to continue the conversation",
+        describe_exit_code(exit_code)
+    ));
+    notify_run(run, "\u{2717} worker exited after finishing");
+}
+
 pub(crate) fn terminal_looks_ready_for_input_from_lines(
     backend: Backend,
     lines: &[String],

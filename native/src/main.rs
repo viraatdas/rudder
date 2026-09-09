@@ -1963,6 +1963,11 @@ struct AgentRun {
     /// badge. The signal is one-shot now, exactly like the done signal, and this
     /// field is what remembers it.
     wait_signal: Option<WaitSignal>,
+    /// Set when the worker process exited AFTER its turn had ended: the run
+    /// stays Done (the work is intact and still reviewable/mergeable) but the
+    /// pane is gone, and this is what the static card says instead of a
+    /// frozen screen. Cleared when the run is resumed or relaunched.
+    worker_exit_note: Option<String>,
     last_error: Option<String>,
     worker_input_draft: String,
     worker_input_cursor: usize,
@@ -6864,6 +6869,7 @@ impl App {
             needs_permission: false,
             needs_user_input: false,
             wait_signal: None,
+            worker_exit_note: None,
             last_error: None,
             worker_input_draft: String::new(),
             worker_input_cursor: 0,
@@ -7051,6 +7057,7 @@ impl App {
             needs_permission: false,
             needs_user_input: false,
             wait_signal: None,
+            worker_exit_note: None,
             last_error: None,
             worker_input_draft: String::new(),
             worker_input_cursor: 0,
@@ -7268,6 +7275,7 @@ Until the first packet arrives, reply only: \"standing by\"."
             needs_permission: false,
             needs_user_input: false,
             wait_signal: None,
+            worker_exit_note: None,
             last_error: None,
             worker_input_draft: String::new(),
             worker_input_cursor: 0,
@@ -7361,6 +7369,7 @@ Until the first packet arrives, reply only: \"standing by\"."
             needs_permission: false,
             needs_user_input: false,
             wait_signal: None,
+            worker_exit_note: None,
             last_error: None,
             worker_input_draft: String::new(),
             worker_input_cursor: 0,
@@ -8305,6 +8314,7 @@ Address the objection directly. If you disagree, say why inside \
             needs_permission: false,
             needs_user_input: false,
             wait_signal: None,
+            worker_exit_note: None,
             last_error: None,
             worker_input_draft: String::new(),
             worker_input_cursor: 0,
@@ -10917,6 +10927,7 @@ It will tend to agree with itself — name another with /gam <provider> <model> 
             needs_permission: false,
             needs_user_input: false,
             wait_signal: None,
+            worker_exit_note: None,
             last_error: None,
             worker_input_draft: String::new(),
             worker_input_cursor: 0,
@@ -15548,6 +15559,7 @@ Files involved: {}
             needs_permission: false,
             needs_user_input: false,
             wait_signal: None,
+            worker_exit_note: None,
             last_error: None,
             worker_input_draft: String::new(),
             worker_input_cursor: 0,
@@ -17434,6 +17446,7 @@ What to do\n\
         let mut drain_perf: Vec<(Duration, serde_json::Value)> = Vec::new();
         for (index, run) in self.agents.iter_mut().enumerate() {
             let mut changed = false;
+            let mut worker_gone_exit: Option<u32> = None;
             let is_orchestrator = run.is_orchestrator();
             let Some(terminal) = run.terminal.as_mut() else {
                 continue;
@@ -17465,6 +17478,14 @@ What to do\n\
                             run.needs_permission = false;
                             run.needs_user_input = false;
                         }
+                        let _ = save_native_run_record(&repo_root, run);
+                        any_dirty = true;
+                        context_dirty = true;
+                    }
+                } else if run.status == AgentStatus::Done {
+                    if let Ok(Some(status)) = terminal.try_wait() {
+                        mark_worker_gone_after_done(run, status.exit_code());
+                        run.terminal = None;
                         let _ = save_native_run_record(&repo_root, run);
                         any_dirty = true;
                         context_dirty = true;
@@ -17765,6 +17786,21 @@ What to do\n\
                 if had_waiting_state {
                     changed = true;
                 }
+                // Liveness was only ever checked while Running. A worker that
+                // died AFTER its turn ended (killed, crashed, exited) stayed a
+                // "done" row with a live-looking pane, and the next keystroke
+                // went to a corpse and surfaced as a bare "agent process
+                // exited" failure minutes or hours later.
+                if run.status == AgentStatus::Done {
+                    if let Ok(Some(status)) = terminal.try_wait() {
+                        worker_gone_exit = Some(status.exit_code());
+                    }
+                }
+            }
+            if let Some(code) = worker_gone_exit {
+                mark_worker_gone_after_done(run, code);
+                run.terminal = None;
+                changed = true;
             }
             if changed {
                 if run.mode == AgentMode::RudderPlan

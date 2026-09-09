@@ -6549,6 +6549,7 @@ fn test_agent_run(id: &str, task: &str) -> AgentRun {
         needs_permission: false,
         needs_user_input: false,
         wait_signal: None,
+        worker_exit_note: None,
         last_error: None,
         worker_input_draft: String::new(),
         worker_input_cursor: 0,
@@ -8384,6 +8385,7 @@ fn delete_agent_requires_second_d() {
         needs_permission: false,
         needs_user_input: false,
         wait_signal: None,
+        worker_exit_note: None,
         last_error: None,
         worker_input_draft: String::new(),
         worker_input_cursor: 0,
@@ -22294,4 +22296,107 @@ fn native_notifier_detection_prefers_terminal_notifier_then_osascript() {
         None => std::env::remove_var("PATH"),
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Spawn a short-lived PTY standing in for a worker that dies AFTER its turn
+/// ended: the run is already Done and idle when the process goes away.
+#[cfg(not(windows))]
+fn done_run_with_dying_worker(id: &str, cwd: &std::path::Path, seconds: &str) -> AgentRun {
+    let pane = TerminalPane::spawn_shell_or_command(
+        Some(TerminalCommand::with_args(
+            "/bin/sh",
+            ["-c", &format!("sleep {seconds}")],
+        )),
+        TerminalPaneOptions {
+            size: TerminalSize { rows: 10, cols: 80 },
+            scrollback_lines: 100,
+            ..Default::default()
+        },
+    )
+    .expect("spawn worker pty");
+    let mut run = test_agent_run(id, "do the thing");
+    run.cwd = cwd.to_path_buf();
+    run.backend = Backend::Claude;
+    run.status = AgentStatus::Done;
+    run.completed_at = Some(Instant::now());
+    run.terminal = Some(pane);
+    run
+}
+
+#[cfg(not(windows))]
+fn poll_until(app: &mut App, index: usize, done: impl Fn(&AgentRun) -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < deadline {
+        app.poll_agents();
+        if done(&app.agents[index]) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!(
+        "condition not reached: {:?} {:?}",
+        app.agents[index].status, app.agents[index].last_error
+    );
+}
+
+/// The manas case: a worker answered, the row went to review, and fifteen
+/// minutes later the process was gone. The row kept a live-looking pane, and
+/// the next keystroke died in a dead PTY. The row must stay Done (the work
+/// landed; it is still reviewable) but lose the pane and say why.
+#[cfg(not(windows))]
+#[test]
+fn a_worker_that_dies_after_its_turn_ended_loses_its_pane_but_stays_done() {
+    let _env = env_guard();
+    let mut app = App::new();
+    app.cwd = std::env::temp_dir();
+    let run = done_run_with_dying_worker("gone-after-done-focused", &app.cwd, "0.2");
+    app.agents.push(run);
+    app.selected_agent = 0;
+
+    // While the process lives, Done stays Done (no false orphaning).
+    app.poll_agents();
+    assert_eq!(app.agents[0].status, AgentStatus::Done);
+    assert!(app.agents[0].terminal.is_some());
+
+    poll_until(&mut app, 0, |run| run.terminal.is_none());
+    let run = &app.agents[0];
+    assert_eq!(
+        run.status,
+        AgentStatus::Done,
+        "the work is intact: still reviewable and mergeable, never a new failure"
+    );
+    assert!(run.last_error.is_none(), "not painted as a failed run");
+    let note = run.worker_exit_note.as_deref().unwrap_or_default();
+    assert!(
+        note.contains("exited after finishing") && note.contains("resume"),
+        "says what happened and what to do: {note}"
+    );
+    assert!(!run.needs_user_input && !run.needs_permission && run.wait_signal.is_none());
+}
+
+/// Same death on an UNFOCUSED row, which takes the throttled fast path that
+/// only ever polled liveness while Running.
+#[cfg(not(windows))]
+#[test]
+fn an_unfocused_done_row_notices_its_worker_dying_too() {
+    let _env = env_guard();
+    let mut app = App::new();
+    app.cwd = std::env::temp_dir();
+    let dying = done_run_with_dying_worker("gone-after-done-unfocused", &app.cwd, "0.2");
+    let mut focused = test_agent_run("still-here", "other work");
+    focused.cwd = app.cwd.clone();
+    app.agents.push(dying);
+    app.agents.push(focused);
+    app.selected_agent = 1;
+    // Freshly drained, so the next ticks skip the drain and hit the fast path.
+    app.agents[0].last_drain_at = Some(Instant::now());
+
+    poll_until(&mut app, 0, |run| run.terminal.is_none());
+    assert_eq!(app.agents[0].status, AgentStatus::Done);
+    assert!(app.agents[0].worker_exit_note.is_some());
+    assert_eq!(
+        app.agents[1].status,
+        AgentStatus::Running,
+        "the live row is untouched"
+    );
 }
