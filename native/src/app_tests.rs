@@ -23010,3 +23010,66 @@ deleted file mode 100644
     svg.push_str("</svg>\n");
     std::fs::write(&out, svg).expect("write svg");
 }
+
+#[test]
+fn a_plan_whose_planner_row_never_landed_is_dropped_on_reload_not_restored_as_a_ghost() {
+    // `/plan` writes plan-queue.json, then spawns the planner and writes its run
+    // record ~100ms later (that write shells out to git). A process killed in
+    // between leaves a queued plan with no row: restored as-is it was a ghost with
+    // nothing on screen to steer or delete. Seen in CI's restart test.
+    let mut harness = ReloadHarness::new("ghost-plan");
+    let mut orch_a = test_agent_run("orch-a", "plan A");
+    orch_a.mode = AgentMode::RudderPlan;
+    orch_a.plan_id = Some("plan-a".to_string());
+    harness.save(&mut orch_a);
+    harness.plan("plan-a").plan("plan-b");
+    for plan in harness.plans.iter_mut() {
+        plan.plan_request = format!("{} objective", plan.id);
+    }
+    let app = harness.reload();
+    assert_eq!(
+        app.plans
+            .iter()
+            .map(|plan| plan.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["plan-a"],
+        "the rowless, nodeless plan is gone; the real one is untouched"
+    );
+    assert_eq!(app.agents.len(), 1);
+
+    // Work in flight keeps a plan even without its planner row: the nodes are
+    // what the user cares about, and the row is one resume away.
+    let mut harness = ReloadHarness::new("ghost-plan-with-nodes");
+    let mut orch_c = test_agent_run("orch-c", "plan C");
+    orch_c.mode = AgentMode::RudderPlan;
+    orch_c.plan_id = Some("plan-c".to_string());
+    harness.save(&mut orch_c);
+    harness.plan("plan-c").plan("plan-d");
+    for plan in harness.plans.iter_mut() {
+        plan.plan_request = format!("{} objective", plan.id);
+    }
+    let mut node = test_planned_node("n0", &[]);
+    node.plan_id = "plan-d".to_string();
+    harness
+        .plans
+        .last_mut()
+        .expect("plan-d staged")
+        .planned_nodes
+        .push(node);
+    let app = harness.reload();
+    let mut ids: Vec<&str> = app.plans.iter().map(|plan| plan.id.as_str()).collect();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        vec!["plan-c", "plan-d"],
+        "queued work is never dropped"
+    );
+
+    // A single plan is left alone even when rowless (the single-plan adoption
+    // path above it owns that case), so an empty dashboard restarts as before.
+    let mut harness = ReloadHarness::new("ghost-plan-single");
+    harness.plan("plan-only");
+    let app = harness.reload();
+    assert_eq!(app.plans.len(), 1);
+    assert_eq!(app.plans[0].id, "plan-only");
+}

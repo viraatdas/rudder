@@ -97,9 +97,23 @@ test("two /plan orchestrators survive a process restart", { timeout: 120_000 }, 
       const queue = await fsp
         .readFile(path.join(repo, ".rudder", "plan-queue.json"), "utf8")
         .catch(() => "");
-      return queue.includes("alpha objective") && queue.includes("beta objective");
+      if (!queue.includes("alpha objective") || !queue.includes("beta objective")) return false;
+      // The queue is written before the orchestrator's own record; a plan
+      // whose row is not on disk yet is not durable yet (this is exactly the
+      // window CI kept hitting: an empty run.json on a slow disk).
+      const runs = await fsp.readdir(path.join(repo, ".rudder", "runs")).catch(() => []);
+      let planners = 0;
+      for (const dir of runs) {
+        const raw = await fsp.readFile(path.join(repo, ".rudder", "runs", dir, "run.json"), "utf8").catch(() => "");
+        try {
+          if (raw && JSON.parse(raw).mode === "rudder-plan") planners += 1;
+        } catch {
+          // half-written: keep waiting
+        }
+      }
+      return planners >= 2;
     },
-    { timeout: 10_000, label: "both plans persisted" },
+    { timeout: 10_000, label: "both plans and their planner rows persisted" },
   );
 
   await session.kill();

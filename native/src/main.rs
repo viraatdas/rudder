@@ -18831,7 +18831,7 @@ fn restore_persisted_state(cwd: &Path) -> (Vec<AgentRun>, Vec<PlanState>) {
             snapshot.final_gate_summary = None;
         }
     }
-    let restored_plans = restored_queue.into_plans();
+    let mut restored_plans = restored_queue.into_plans();
     // Runs persisted before plans had ids carry no `plan_id`. With one restored plan
     // there is exactly one answer, so adopt them into it — otherwise the restored
     // fleet would look ownerless and the plan would read as spent. With SEVERAL plans
@@ -18860,6 +18860,31 @@ fn restore_persisted_state(cwd: &Path) -> (Vec<AgentRun>, Vec<PlanState>) {
                     .as_deref()
                     .is_none_or(|plan_id| live.contains(plan_id))
         });
+    }
+    // The inverse gap. `/plan` writes plan-queue.json, then spawns the planner and
+    // writes its run record — and that second write shells out to git, so the two
+    // are ~100ms apart. A process killed in between (CI hit this) leaves a plan in
+    // the queue with no row on disk. Restored as-is it is a ghost: nothing on
+    // screen to steer, resume or delete, carried in the queue forever. A plan with
+    // no planner row and nothing else to its name (no queued nodes, no workers)
+    // never really started, so it is dropped; a plan with work in flight stays,
+    // row or no row, because its nodes are what the user cares about.
+    // Only a plan the user actually asked for qualifies (it carries the request);
+    // an idle default plan has no row by design and is left alone.
+    if restored_plans.len() > 1 {
+        restored_plans.retain(|plan| {
+            plan.plan_request.trim().is_empty()
+                || !plan.planned_nodes.is_empty()
+                || agents
+                    .iter()
+                    .any(|run| run.plan_id.as_deref() == Some(plan.id.as_str()))
+        });
+        if restored_plans.is_empty() {
+            restored_plans.push(PlanState {
+                id: new_plan_id(),
+                ..PlanState::default()
+            });
+        }
     }
     (agents, restored_plans)
 }
