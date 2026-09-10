@@ -128,6 +128,18 @@ click-to-copy id for `--resume`), and a live view of CPU and memory for Rudder
 and every agent process. Bare `/usage` keeps the one-line summary for the
 current session.
 
+### Diff panel
+
+Press `⌥d` (or type `/diff`) to open a diff panel beside the worker pane: the
+selected agent's change set parsed from `jj diff` (or `git diff` against HEAD
+plus untracked files in a plain checkout), with per-file `+`/`−` counts, line
+numbers, and the run's token usage and estimated API-rate cost in the header.
+It refreshes as the agent edits. `j`/`k` and the wheel scroll, `n`/`p` jump
+between files, `r` refreshes, `Esc` or `⌥d` closes it, and `⌥h` solos it like
+any other pane. On a narrow terminal it takes the worker's place instead of
+squeezing both. `v` still swaps the worker pane for a live `jj diff` when you
+want the raw stream.
+
 ### Web board
 
 Press `o` in the agents pane (or type `/web`) to open the live project board in
@@ -202,7 +214,7 @@ scroll the pane.
 the worker, `m` / `M` / `R` / `r` / `d` act on the selection, `x` stops a running
 agent (keeping its workspace), `c` clears all merged agents from the list (press
 twice to confirm), `g` toggles the nested DAG view, `o` opens the web board, and
-`U` opens the usage dashboard.
+`U` opens the usage dashboard, and `⌥d` toggles the diff panel.
 
 **Finished work collapses.** A long session ends with dozens of merged and failed
 rows, which bury the two or three still moving, so `done` and `closed` each render

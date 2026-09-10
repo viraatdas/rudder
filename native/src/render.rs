@@ -22,17 +22,19 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
         // ⌥h restores both the split and the focus you had.
         let solo = match app.focus {
             FocusPane::Agents => FocusPane::Agents,
+            FocusPane::Diff if app.diff_panel.open => FocusPane::Diff,
             _ => FocusPane::Worker,
         };
         // Areas the hit-testing and scroll code read: a hidden pane gets NONE, so a
         // stale rect cannot take a click meant for the pane that is actually drawn.
         app.agents_area = (solo == FocusPane::Agents).then_some(area);
         app.worker_area = (solo == FocusPane::Worker).then_some(area);
+        app.diff_area = (solo == FocusPane::Diff).then_some(area);
         app.task_area = None;
-        if solo == FocusPane::Agents {
-            render_agents(frame, area, app);
-        } else {
-            render_worker(frame, area, app);
+        match solo {
+            FocusPane::Agents => render_agents(frame, area, app),
+            FocusPane::Diff => render_diff_panel(frame, area, app),
+            _ => render_worker(frame, area, app),
         }
         render_cloud_prompt(frame, area, app);
         render_merge_prompt(frame, area, app);
@@ -59,12 +61,38 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
         .split(rows[0]);
 
     app.agents_area = Some(main[0]);
-    app.worker_area = Some(main[2]);
     app.task_area = Some(rows[2]);
 
     render_agents(frame, main[0], app);
     render_gutter(frame, main[1], Gutter::Vertical);
-    render_worker(frame, main[2], app);
+    if app.diff_panel.open {
+        // The diff panel sits beside the worker when there is room for both;
+        // on a narrow screen it takes the worker's place (⌥d brings the
+        // conversation back), never a squeezed pair that nobody can read.
+        if main[2].width >= 100 {
+            let split = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Percentage(45),
+                    Constraint::Length(1),
+                    Constraint::Percentage(55),
+                ])
+                .split(main[2]);
+            app.worker_area = Some(split[0]);
+            app.diff_area = Some(split[2]);
+            render_worker(frame, split[0], app);
+            render_gutter(frame, split[1], Gutter::Vertical);
+            render_diff_panel(frame, split[2], app);
+        } else {
+            app.worker_area = None;
+            app.diff_area = Some(main[2]);
+            render_diff_panel(frame, main[2], app);
+        }
+    } else {
+        app.worker_area = Some(main[2]);
+        app.diff_area = None;
+        render_worker(frame, main[2], app);
+    }
     render_gutter(frame, rows[1], Gutter::Horizontal);
     render_task(frame, rows[2], app);
     render_suggestions(frame, rows[2], app);
@@ -3743,6 +3771,56 @@ pub(crate) fn set_plan_review_cursor(frame: &mut Frame<'_>, inner: Rect, app: &A
     frame.set_cursor_position((inner.x + col as u16, inner.y + visible_row as u16));
 }
 
+/// The ⌥d diff panel: header (stats, tokens, cost), file summary, hunks.
+pub(crate) fn render_diff_panel(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    let focused = app.focus == FocusPane::Diff;
+    let inner = block_inner(area);
+    let title = {
+        let files = app.diff_panel.files.len();
+        if app.diff_panel.loaded && app.diff_panel.error.is_none() {
+            format!(
+                "diff · +{} −{} · {} file{}",
+                app.diff_panel.additions(),
+                app.diff_panel.deletions(),
+                files,
+                if files == 1 { "" } else { "s" }
+            )
+        } else {
+            "diff".to_string()
+        }
+    };
+    let viewport = inner.height as usize;
+    let lines: Vec<Line<'static>> = match app.agents.get(app.selected_agent) {
+        Some(run) => {
+            let run_ref: &AgentRun = run;
+            // Borrow dance: the panel caches by revision, the run is read-only.
+            let (all, _) = app.diff_panel.lines(run_ref, inner.width, focused);
+            let all = all.to_vec();
+            let max = all.len().saturating_sub(viewport);
+            let scroll = app.diff_panel.scroll.min(max);
+            app.diff_panel.scroll = scroll;
+            all.into_iter().skip(scroll).take(viewport).collect()
+        }
+        None => vec![Line::from(Span::styled(
+            "No agent selected.",
+            muted_style(focused),
+        ))],
+    };
+    let scrolled = app.diff_panel.scroll;
+    let total = app.diff_panel.max_scroll(viewport) + viewport;
+    let title = if scrolled > 0 {
+        format!("{title} · {}%", (scrolled * 100) / total.max(1))
+    } else {
+        title
+    };
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(app_style())
+            .block(pane_block(&title, focused, app.nav_mode)),
+        area,
+    );
+}
+
 pub(crate) fn set_worker_cursor(frame: &mut Frame<'_>, inner: Rect, app: &App) {
     let Some(run) = app.agents.get(app.selected_agent) else {
         return;
@@ -5175,7 +5253,9 @@ pub(crate) fn page_scroll_rows(area: Option<Rect>) -> isize {
 /// the key is not an alt-scroll binding. Vim grammar, held behind Alt so the
 /// bare letters still reach the agent when the pane is focused:
 ///   Alt+k / Alt+Up   → one line up        Alt+j / Alt+Down → one line down
-///   Alt+u            → half a page up     Alt+d            → half a page down
+///   Alt+u            → half a page up     Alt+n            → half a page down
+/// (Alt+d used to be the half-page-down key; it now opens the diff panel from
+/// every pane, and "n" for the next half page keeps the pair one-handed.)
 /// Positive rows scroll toward history (up), matching scrollback_by.
 pub(crate) fn alt_scroll_rows(key: KeyEvent, area: Option<Rect>) -> Option<isize> {
     if !key
@@ -5189,7 +5269,7 @@ pub(crate) fn alt_scroll_rows(key: KeyEvent, area: Option<Rect>) -> Option<isize
         KeyCode::Char('k') | KeyCode::Up => Some(1),
         KeyCode::Char('j') | KeyCode::Down => Some(-1),
         KeyCode::Char('u') => Some(half),
-        KeyCode::Char('d') => Some(-half),
+        KeyCode::Char('n') => Some(-half),
         _ => None,
     }
 }

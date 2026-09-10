@@ -61,7 +61,7 @@ test("mouse wheel scrolls the worker pane through real SGR sequences", { timeout
   await session.assertIntact();
 });
 
-test("Alt+u/k/j/d travel the worker scrollback without typing into the agent", { timeout: 90_000 }, async (t) => {
+test("Alt+u/k/j/n travel the worker scrollback without typing into the agent", { timeout: 90_000 }, async (t) => {
   const repo = await scratchRepo("rudder-tui-scroll-");
   t.after(() => removeScratch(repo));
   const scroller = await scrollerBackend(repo, 200);
@@ -92,8 +92,9 @@ test("Alt+u/k/j/d travel the worker scrollback without typing into the agent", {
   await session.press("Alt+k");
   await session.waitForText("LINE-001", { timeout: 10_000 });
 
-  // Alt+d half-pages toward the live tail; enough presses return to LINE-200.
-  for (let i = 0; i < 40; i += 1) await session.press("Alt+d");
+  // Alt+n half-pages toward the live tail; enough presses return to LINE-200.
+  // (Alt+d is the diff panel now.)
+  for (let i = 0; i < 40; i += 1) await session.press("Alt+n");
   await session.waitForText("LINE-200", { timeout: 10_000 });
 
   // Scrolling must not have typed anything into the agent: the pane's live

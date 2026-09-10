@@ -22400,3 +22400,359 @@ fn an_unfocused_done_row_notices_its_worker_dying_too() {
         "the live row is untouched"
     );
 }
+
+// ---- ⌥d diff panel ----
+
+const SAMPLE_DIFF: &str = "\
+diff --git a/src/lib.rs b/src/lib.rs
+index 1111111..2222222 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,4 +1,5 @@ fn main() {
+ use std::io;
+-fn old() {}
++fn new_one() {}
++fn new_two() {}
+ fn keep() {}
+ fn tail() {}
+\\ No newline at end of file
+diff --git a/README.md b/README.md
+new file mode 100644
+--- /dev/null
++++ b/README.md
+@@ -0,0 +1,2 @@
++# hello
++world
+diff --git a/gone.txt b/gone.txt
+deleted file mode 100644
+--- a/gone.txt
++++ /dev/null
+@@ -1 +0,0 @@
+-bye
+diff --git a/a.txt b/b.txt
+similarity index 100%
+rename from a.txt
+rename to b.txt
+diff --git a/logo.png b/logo.png
+new file mode 100644
+Binary files /dev/null and b/logo.png differ
+";
+
+#[test]
+fn unified_diff_parses_files_hunks_line_numbers_and_counts() {
+    use crate::diffview::{parse_unified_diff, FileKind, LineKind};
+    let files = parse_unified_diff(SAMPLE_DIFF);
+    assert_eq!(files.len(), 5, "{files:#?}");
+
+    let lib = &files[0];
+    assert_eq!(lib.path, "src/lib.rs");
+    assert_eq!(lib.kind, FileKind::Modified);
+    assert_eq!((lib.additions, lib.deletions), (2, 1));
+    assert_eq!(lib.hunks.len(), 1);
+    assert_eq!(lib.hunks[0].header, "@@ -1,4 +1,5 @@ fn main() {");
+    let kinds: Vec<(LineKind, Option<u32>, Option<u32>)> = lib.hunks[0]
+        .lines
+        .iter()
+        .map(|l| (l.kind, l.old_no, l.new_no))
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            (LineKind::Context, Some(1), Some(1)),
+            (LineKind::Del, Some(2), None),
+            (LineKind::Add, None, Some(2)),
+            (LineKind::Add, None, Some(3)),
+            (LineKind::Context, Some(3), Some(4)),
+            (LineKind::Context, Some(4), Some(5)),
+            (LineKind::Meta, None, None),
+        ],
+        "line numbers advance per side"
+    );
+
+    assert_eq!(files[1].kind, FileKind::Added);
+    assert_eq!(files[1].additions, 2);
+    assert_eq!(files[2].kind, FileKind::Deleted);
+    assert_eq!(files[2].deletions, 1);
+    assert_eq!(files[3].kind, FileKind::Renamed);
+    assert_eq!(files[3].old_path.as_deref(), Some("a.txt"));
+    assert_eq!(files[3].path, "b.txt");
+    assert!(files[3].hunks.is_empty());
+    assert!(files[4].binary);
+    assert_eq!(files[4].kind, FileKind::Added);
+}
+
+#[test]
+fn a_jj_style_diff_without_mode_lines_still_classifies_adds_and_deletes() {
+    use crate::diffview::{parse_unified_diff, FileKind};
+    let text = "diff --git a/n.txt b/n.txt\n--- /dev/null\n+++ b/n.txt\n@@ -0,0 +1 @@\n+new\ndiff --git a/g.txt b/g.txt\n--- a/g.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-old\n";
+    let files = parse_unified_diff(text);
+    assert_eq!(files[0].kind, FileKind::Added);
+    assert_eq!(files[1].kind, FileKind::Deleted);
+    assert_eq!(parse_unified_diff("").len(), 0);
+    assert_eq!(
+        parse_unified_diff("garbage\n+not a diff\n").len(),
+        0,
+        "stray lines never fabricate a file"
+    );
+}
+
+fn diff_panel_text(panel: &crate::diffview::DiffPanel, run: &AgentRun, width: u16) -> Vec<String> {
+    crate::diffview::diff_panel_lines(panel, run, width, true)
+        .0
+        .iter()
+        .map(flatten_line)
+        .collect()
+}
+
+#[test]
+fn the_diff_panel_header_carries_stats_tokens_and_an_api_rate_cost() {
+    use crate::diffview::{DiffPanel, DiffSource};
+    let mut run = test_agent_run("diff-1", "tighten the parser");
+    run.model = "claude-opus-5".to_string();
+    run.tokens_in = 2_000_000;
+    run.tokens_out = 100_000;
+    let mut panel = DiffPanel::new();
+    panel.open = true;
+    panel.track("diff-1");
+
+    let before = diff_panel_text(&panel, &run, 100);
+    assert!(
+        before.iter().any(|l| l.contains("computing diff")),
+        "{before:?}"
+    );
+
+    panel.apply(
+        "other-run",
+        Ok((SAMPLE_DIFF.to_string(), DiffSource::Jj, false)),
+    );
+    assert!(!panel.loaded, "a result for another run is ignored");
+    panel.apply(
+        "diff-1",
+        Ok((SAMPLE_DIFF.to_string(), DiffSource::Jj, false)),
+    );
+    let text = diff_panel_text(&panel, &run, 100);
+    let joined = text.join("\n");
+    assert!(text[0].contains("tighten the parser"));
+    assert!(joined.contains("+4 −2"), "totals across files: {joined}");
+    assert!(joined.contains("5 files"));
+    // 2M opus input at $15/M + 100k output at $75/M = $30 + $7.50.
+    assert!(joined.contains("≈ $37.50 at API rates"), "{joined}");
+    assert!(joined.contains("tokens in 2.00M · out 100.0k"), "{joined}");
+    assert!(
+        joined.contains(" M src/lib.rs") && joined.contains("+2 −1"),
+        "file summary: {joined}"
+    );
+    assert!(joined.contains(" A README.md") && joined.contains(" D gone.txt"));
+    assert!(
+        joined.contains("a.txt → b.txt"),
+        "rename shows both names: {joined}"
+    );
+    assert!(joined.contains("binary"), "{joined}");
+    assert!(
+        joined.contains("@@ -1,4 +1,5 @@"),
+        "hunk headers survive: {joined}"
+    );
+    assert!(
+        joined.contains("│+fn new_one() {}"),
+        "additions carry a gutter and sigil: {joined}"
+    );
+    assert!(
+        joined.contains("  2     │−fn old() {}"),
+        "deletions show the old line number: {joined}"
+    );
+    assert!(joined.contains("No newline at end of file"));
+
+    // Unpriced model: tokens still show, cost is honest about being unknown.
+    run.model = "mystery-9".to_string();
+    panel.revision += 1;
+    let joined = diff_panel_text(&panel, &run, 100).join("\n");
+    assert!(joined.contains("cost n/a"), "{joined}");
+
+    // Errors and empties are states, not blank screens.
+    panel.apply("diff-1", Err("workspace is gone".to_string()));
+    let joined = diff_panel_text(&panel, &run, 100).join("\n");
+    assert!(joined.contains("diff unavailable") && joined.contains("workspace is gone"));
+    panel.apply("diff-1", Ok((String::new(), DiffSource::Git, false)));
+    let joined = diff_panel_text(&panel, &run, 100).join("\n");
+    assert!(
+        joined.contains("no changes yet") && joined.contains("git vs HEAD"),
+        "{joined}"
+    );
+    panel.apply(
+        "diff-1",
+        Ok((SAMPLE_DIFF.to_string(), DiffSource::Git, true)),
+    );
+    assert!(diff_panel_text(&panel, &run, 100)
+        .join("\n")
+        .contains("diff truncated"));
+}
+
+#[test]
+fn diff_panel_scrolling_clamps_and_jumps_between_files() {
+    use crate::diffview::{DiffPanel, DiffSource};
+    let run = test_agent_run("diff-2", "scroll me");
+    let mut panel = DiffPanel::new();
+    panel.open = true;
+    panel.track("diff-2");
+    panel.apply(
+        "diff-2",
+        Ok((SAMPLE_DIFF.to_string(), DiffSource::Jj, false)),
+    );
+    let (lines, starts) = {
+        let (l, s) = panel.lines(&run, 80, true);
+        (l.len(), s.to_vec())
+    };
+    assert_eq!(starts.len(), 5, "one anchor per file");
+    let viewport = 6;
+    assert!(
+        panel.jump_file(true, viewport),
+        "n moves to the first file header"
+    );
+    assert_eq!(panel.scroll, starts[0]);
+    assert!(panel.jump_file(true, viewport));
+    assert_eq!(panel.scroll, starts[1]);
+    assert!(panel.jump_file(false, viewport));
+    assert_eq!(panel.scroll, starts[0]);
+    assert!(panel.scroll_by(1000, viewport));
+    assert_eq!(panel.scroll, lines - viewport, "never past the end");
+    assert!(!panel.jump_file(true, viewport), "no file below the end");
+    assert!(panel.scroll_by(-1000, viewport));
+    assert_eq!(panel.scroll, 0);
+    assert!(!panel.scroll_by(-1, viewport), "already at the top");
+
+    // A new run resets the view; a fresh identical apply keeps the revision.
+    let rev = panel.revision;
+    panel.apply(
+        "diff-2",
+        Ok((SAMPLE_DIFF.to_string(), DiffSource::Jj, false)),
+    );
+    assert_eq!(
+        panel.revision, rev,
+        "unchanged content does not invalidate the cache"
+    );
+    panel.track("diff-3");
+    assert_eq!(panel.scroll, 0);
+    assert!(panel.files.is_empty() && !panel.loaded);
+}
+
+fn alt(c: char) -> KeyEvent {
+    KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT)
+}
+
+#[test]
+fn alt_d_opens_the_diff_panel_beside_the_worker_and_esc_closes_it() {
+    let mut app = App::new();
+    app.cwd = std::env::temp_dir();
+    let mut run = test_agent_run("diff-app", "tighten the parser");
+    run.cwd = app.cwd.clone();
+    app.agents.push(run);
+    app.selected_agent = 0;
+    app.focus = FocusPane::Worker;
+
+    let before = render_screen(&mut app, 160, 30);
+    assert!(!before.contains("┌ diff"), "closed by default:\n{before}");
+
+    app.handle_key(alt('d'));
+    assert!(app.diff_panel.open);
+    assert_eq!(app.focus, FocusPane::Diff, "opening focuses the panel");
+    assert_eq!(app.diff_panel.run_id.as_deref(), Some("diff-app"));
+    let open = render_screen(&mut app, 160, 30);
+    assert!(
+        open.contains("┌ diff"),
+        "the panel has its own titled pane:\n{open}"
+    );
+    assert!(
+        app.worker_area.is_some() && app.diff_area.is_some(),
+        "side by side at 160 columns"
+    );
+    assert!(open.contains("computing diff"), "{open}");
+    let worker_right = app.worker_area.unwrap().right();
+    let diff_left = app.diff_area.unwrap().x;
+    assert!(
+        diff_left > worker_right,
+        "diff sits to the right of the worker"
+    );
+
+    // Narrow screen: the panel takes the worker's place rather than squeezing both.
+    let narrow = render_screen(&mut app, 100, 30);
+    assert!(narrow.contains("┌ diff"));
+    assert!(app.worker_area.is_none() && app.diff_area.is_some());
+
+    // Keys while focused: scroll, then Esc closes and hands focus back.
+    app.diff_panel.apply(
+        "diff-app",
+        Ok((
+            SAMPLE_DIFF.to_string(),
+            crate::diffview::DiffSource::Jj,
+            false,
+        )),
+    );
+    let _ = render_screen(&mut app, 160, 30);
+    app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+    assert!(app.diff_panel.scroll > 0, "n jumped to the first file");
+    let shown = render_screen(&mut app, 160, 30);
+    assert!(shown.contains("src/lib.rs"), "{shown}");
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(!app.diff_panel.open);
+    assert_eq!(app.focus, FocusPane::Worker);
+    let closed = render_screen(&mut app, 160, 30);
+    assert!(!closed.contains("┌ diff"), "{closed}");
+
+    // The typographic fallback (Option+d without an Alt modifier) and /diff work too.
+    app.handle_key(KeyEvent::new(KeyCode::Char('\u{2202}'), KeyModifiers::NONE));
+    assert!(app.diff_panel.open);
+    app.handle_key(alt('d'));
+    assert!(!app.diff_panel.open);
+    assert!(app.handle_command("/diff"));
+    assert!(app.diff_panel.open);
+}
+
+#[test]
+fn soloing_with_the_diff_panel_focused_shows_only_the_diff_and_alt_h_restores() {
+    let mut app = App::new();
+    app.cwd = std::env::temp_dir();
+    let mut run = test_agent_run("diff-solo", "tighten the parser");
+    run.cwd = app.cwd.clone();
+    app.agents.push(run);
+    app.selected_agent = 0;
+    app.focus = FocusPane::Worker;
+    app.handle_key(alt('d'));
+    app.diff_panel.apply(
+        "diff-solo",
+        Ok((
+            SAMPLE_DIFF.to_string(),
+            crate::diffview::DiffSource::Jj,
+            false,
+        )),
+    );
+
+    app.handle_key(alt('h'));
+    assert!(app.solo_pane);
+    let solo = render_screen(&mut app, 160, 30);
+    assert!(solo.contains("┌ diff"), "{solo}");
+    assert!(app.agents_area.is_none() && app.worker_area.is_none());
+    assert_eq!(app.diff_area.map(|a| a.width), Some(160), "full width");
+
+    app.handle_key(alt('h'));
+    assert!(!app.solo_pane);
+    let back = render_screen(&mut app, 160, 30);
+    assert!(
+        back.contains("┌ diff"),
+        "panel comes back with the split: {back}"
+    );
+    assert!(app.agents_area.is_some() && app.worker_area.is_some() && app.diff_area.is_some());
+}
+
+#[test]
+fn a_cloud_owned_row_refuses_the_local_diff_panel() {
+    let mut app = App::new();
+    app.cwd = std::env::temp_dir();
+    let mut run = test_agent_run("diff-cloud", "remote work");
+    run.cwd = app.cwd.clone();
+    run.status = AgentStatus::Migrated;
+    app.agents.push(run);
+    app.selected_agent = 0;
+    app.handle_key(alt('d'));
+    assert!(!app.diff_panel.open);
+    assert!(app.notice.as_deref().unwrap_or_default().contains("cloud"));
+}

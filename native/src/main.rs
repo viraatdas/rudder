@@ -75,6 +75,8 @@ mod theme;
 use crate::theme::*;
 mod perf;
 use crate::perf::*;
+mod diffview;
+use crate::diffview::*;
 mod lifecycle;
 use crate::lifecycle::*;
 mod publish;
@@ -214,7 +216,7 @@ const AGENT_PANE_HINTS: &[&str] = &[
     "⌥[/] agents",
     "Enter focus",
     "r rename",
-    "v diff",
+    "v/⌥d diff",
     "g nest",
     "R review all",
     "m merge",
@@ -232,6 +234,9 @@ enum FocusPane {
     Agents,
     Worker,
     Task,
+    /// The ⌥d diff panel, drawn beside the worker. Not part of the ^W cycle:
+    /// ⌥d is the way in and out, and ⌥1/2/3 still reach the other panes.
+    Diff,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1622,6 +1627,9 @@ struct App {
     orch_follow_bottom: bool,
     agents_area: Option<Rect>,
     worker_area: Option<Rect>,
+    /// Where the ⌥d diff panel was drawn this frame (None when hidden).
+    diff_area: Option<Rect>,
+    diff_panel: DiffPanel,
     /// SOLO view: the focused pane full-screen, with the sidebar, task line and
     /// gutters all hidden.
     solo_pane: bool,
@@ -2724,6 +2732,8 @@ impl App {
             orch_follow_bottom: true,
             agents_area: None,
             worker_area: None,
+            diff_area: None,
+            diff_panel: DiffPanel::new(),
             solo_pane: false,
             solo_restore_focus: None,
             task_area: None,
@@ -3515,6 +3525,14 @@ impl App {
                 self.toggle_worker_view();
                 return false;
             }
+            // Alt+d opens the diff PANEL beside the worker (and focuses it); a
+            // second press closes it. Distinct from `v`, which swaps the worker
+            // pane itself for a live jj diff: this one keeps the conversation
+            // in view while you read the change set.
+            KeyCode::Char('d') if alt_like => {
+                self.toggle_diff_panel();
+                return false;
+            }
             // Alt+h HIDES the other panes. It previously stepped to the previous
             // agent, but that was only an alias: the stepper's real binding is
             // Alt+[ / Alt+], which still works. Hiding is the more valuable thing
@@ -3548,6 +3566,10 @@ impl App {
             }
             KeyCode::Char('\u{221a}') => {
                 self.toggle_worker_view();
+                return false;
+            }
+            KeyCode::Char('\u{2202}') => {
+                self.toggle_diff_panel();
                 return false;
             }
             _ => {}
@@ -3632,6 +3654,7 @@ impl App {
             FocusPane::Agents => self.handle_agents_key(key),
             FocusPane::Worker => self.handle_worker_key(key),
             FocusPane::Task => self.handle_task_key(key),
+            FocusPane::Diff => self.handle_diff_key(key),
         }
     }
 
@@ -3866,12 +3889,14 @@ impl App {
                 FocusPane::Agents => FocusPane::Worker,
                 FocusPane::Worker => FocusPane::Task,
                 FocusPane::Task => FocusPane::Agents,
+                FocusPane::Diff => FocusPane::Task,
             }
         } else {
             match self.focus {
                 FocusPane::Agents => FocusPane::Task,
                 FocusPane::Worker => FocusPane::Agents,
                 FocusPane::Task => FocusPane::Worker,
+                FocusPane::Diff => FocusPane::Worker,
             }
         };
     }
@@ -4293,6 +4318,7 @@ impl App {
                     FocusPane::Worker => "copied worker selection".to_string(),
                     FocusPane::Agents => "copied selection".to_string(),
                     FocusPane::Task => "copied task selection".to_string(),
+                    FocusPane::Diff => "copied diff selection".to_string(),
                 });
             }
             Err(error) => self.notice = Some(format!("copy failed: {error}")),
@@ -4573,6 +4599,118 @@ impl App {
             WorkerView::PlanReview => WorkerView::Terminal,
         };
         self.focus = FocusPane::Worker;
+    }
+
+    /// ⌥d: show or hide the diff panel. Opening focuses it and counts as having
+    /// reviewed the row (same weak gate as `v`); closing returns focus to the
+    /// worker so the next keystroke lands where the conversation is.
+    fn toggle_diff_panel(&mut self) {
+        if self.diff_panel.open {
+            self.diff_panel.open = false;
+            self.diff_area = None;
+            if self.focus == FocusPane::Diff {
+                self.focus = FocusPane::Worker;
+            }
+            self.notice = None;
+        } else {
+            if self.selected_is_cloud_owned() {
+                self.notice = Some(
+                    "cloud-owned agent: its diff lives in the cloud workspace — Enter attaches to it"
+                        .to_string(),
+                );
+                return;
+            }
+            self.diff_panel.open = true;
+            self.focus = FocusPane::Diff;
+            self.mark_selected_reviewed();
+            self.refresh_diff_panel();
+            self.notice = Some(
+                "diff panel · j/k scroll · n/p next/prev file · r refresh · ⌥d or Esc closes · ⌥h solo"
+                    .to_string(),
+            );
+        }
+        self.dirty = true;
+    }
+
+    /// Keep the diff panel pointed at the selected run and its content fresh.
+    /// Runs every poll tick; cheap when the panel is closed or nothing changed.
+    fn refresh_diff_panel(&mut self) {
+        if !self.diff_panel.open {
+            return;
+        }
+        if self.diff_panel.drain() {
+            self.dirty = true;
+        }
+        let Some(run) = self.agents.get_mut(self.selected_agent) else {
+            return;
+        };
+        let run_id = run.id.clone();
+        self.diff_panel.track(&run_id);
+        // Token totals come from the backend's session log; refresh them
+        // while the panel is open so the header's cost keeps up with the turn.
+        let tokens_due = self
+            .diff_panel
+            .tokens_refreshed_at
+            .is_none_or(|at| at.elapsed() >= DIFF_PANEL_TOKEN_REFRESH);
+        if tokens_due && !cfg!(test) {
+            let before = (run.tokens_in, run.tokens_out);
+            refresh_run_token_usage(run);
+            self.diff_panel.tokens_refreshed_at = Some(Instant::now());
+            if (run.tokens_in, run.tokens_out) != before {
+                self.diff_panel.revision += 1;
+                self.dirty = true;
+            }
+        }
+        if cfg!(test) {
+            return;
+        }
+        if self.diff_panel.due(run.last_output_at) {
+            let cwd = run.cwd.clone();
+            self.diff_panel.request(&run_id, cwd, run.last_output_at);
+        }
+    }
+
+    fn handle_diff_key(&mut self, key: KeyEvent) -> bool {
+        let viewport = self
+            .diff_area
+            .map(|area| block_inner(area).height as usize)
+            .unwrap_or(20)
+            .max(1);
+        let page = viewport.saturating_sub(2).max(1) as isize;
+        let changed = match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.toggle_diff_panel();
+                return false;
+            }
+            KeyCode::Down | KeyCode::Char('j') => self.diff_panel.scroll_by(1, viewport),
+            KeyCode::Up | KeyCode::Char('k') => self.diff_panel.scroll_by(-1, viewport),
+            KeyCode::PageDown | KeyCode::Char(' ') => self.diff_panel.scroll_by(page, viewport),
+            KeyCode::PageUp => self.diff_panel.scroll_by(-page, viewport),
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.diff_panel.scroll_by(page / 2, viewport)
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.diff_panel.scroll_by(-(page / 2), viewport)
+            }
+            KeyCode::Home | KeyCode::Char('g') => self.diff_panel.scroll_to(0, viewport),
+            KeyCode::End | KeyCode::Char('G') => self.diff_panel.scroll_to(usize::MAX, viewport),
+            KeyCode::Char('n') | KeyCode::Tab => self.diff_panel.jump_file(true, viewport),
+            KeyCode::Char('p') | KeyCode::BackTab => self.diff_panel.jump_file(false, viewport),
+            KeyCode::Char('r') => {
+                self.diff_panel.refreshed_at = None;
+                self.refresh_diff_panel();
+                true
+            }
+            KeyCode::Enter => {
+                self.focus = FocusPane::Worker;
+                true
+            }
+            _ => false,
+        };
+        if changed {
+            self.dirty = true;
+        }
+        false
     }
 
     /// Record that this row's diff has been put in front of the user. This is the
@@ -5387,6 +5525,8 @@ impl App {
                     self.record_selected_worker_prompts(prompts);
                 }
             }
+            // The diff panel is read-only; a paste there has nowhere to go.
+            FocusPane::Diff => {}
             FocusPane::Task => {
                 self.reset_task_history_navigation();
                 // Collapse a large paste into a "[Pasted #N …]" chip; re-pasting the
@@ -5812,6 +5952,32 @@ impl App {
                 }
                 return changed;
             }
+        }
+
+        if let Some(area) = self
+            .diff_area
+            .filter(|area| rect_contains(*area, mouse.column, mouse.row))
+        {
+            let inner = block_inner(area);
+            self.set_mouse_debug(format!(
+                "mouse {:?} @{},{} pane=diff",
+                mouse.kind, mouse.column, mouse.row
+            ));
+            let viewport = inner.height as usize;
+            let changed = match mouse.kind {
+                MouseEventKind::ScrollUp => self.diff_panel.scroll_by(-3, viewport),
+                MouseEventKind::ScrollDown => self.diff_panel.scroll_by(3, viewport),
+                MouseEventKind::Down(_) => {
+                    let was = self.focus;
+                    self.focus = FocusPane::Diff;
+                    was != FocusPane::Diff
+                }
+                _ => false,
+            };
+            if changed {
+                self.note_scroll_dirty();
+            }
+            return changed;
         }
 
         if let Some(area) = self
@@ -9568,6 +9734,7 @@ Address the objection directly. If you disagree, say why inside \
                 FocusPane::Agents => "agents",
                 FocusPane::Worker => "worker",
                 FocusPane::Task => "task",
+                FocusPane::Diff => "diff",
             },
             "view": match self.worker_view {
                 WorkerView::Terminal => "terminal",
@@ -10035,7 +10202,7 @@ It will tend to agree with itself — name another with /gam <provider> <model> 
             }
             Some("/help") => {
                 self.notice = Some(
-                    "plain input -> one isolated mergeable worker in its own jj workspace · /plan <task> -> an orchestrator that plans and runs a DAG · /gam [model] <task> -> generator + adversarial reviewer pair; the reviewer can steer the generator mid-turn and stop it outright (split panes, ^W a toggles sides, ^W t shows the dialogue) · /main|/m <task> -> another agent in this shared checkout · panes: Option-1/2/3 or ^W · keys: j/k select · Option-[ / Option-] step agents from any pane · Enter focus · v diff · m merge · u undo a merge · M merge all · R review all · g nest · o web ui · U usage dashboard · x stop · b branch chat · dd delete · cc clear merged · P model; · /handoff -> selected agent moves to Rudder Cloud and resumes there; commands: /model /fast /sound /notify /color /main /plan /gam /resume /restore /handoff /share /usage /goal /cloud /web /feedback"
+                    "plain input -> one isolated mergeable worker in its own jj workspace · /plan <task> -> an orchestrator that plans and runs a DAG · /gam [model] <task> -> generator + adversarial reviewer pair; the reviewer can steer the generator mid-turn and stop it outright (split panes, ^W a toggles sides, ^W t shows the dialogue) · /main|/m <task> -> another agent in this shared checkout · panes: Option-1/2/3 or ^W · keys: j/k select · Option-[ / Option-] step agents from any pane · Enter focus · v diff · m merge · u undo a merge · M merge all · R review all · g nest · ⌥d diff panel (n/p files, j/k scroll) · o web ui · U usage dashboard · x stop · b branch chat · dd delete · cc clear merged · P model; · /handoff -> selected agent moves to Rudder Cloud and resumes there; commands: /model /fast /sound /notify /color /main /plan /gam /resume /restore /handoff /share /usage /goal /cloud /web /feedback"
                         .to_string(),
                 );
                 true
@@ -10318,6 +10485,10 @@ It will tend to agree with itself — name another with /gam <provider> <model> 
             }
             Some("/web") | Some("/ui") | Some("/board") => {
                 self.open_web_ui();
+                true
+            }
+            Some("/diff") => {
+                self.toggle_diff_panel();
                 true
             }
             _ => false,
@@ -17421,6 +17592,7 @@ What to do\n\
 
         self.refresh_cloud_workspace_status();
         self.maybe_notify_workspace_idle();
+        self.refresh_diff_panel();
 
         // Browser control + narration heartbeat, throttled to ~1s so the render
         // loop (11-33ms tick) is never stalled by the readdir/fs work.
