@@ -120,7 +120,10 @@ test("arrows walk a multi-line draft before they reach task history", { timeout:
   await session.press("3");
 
   await session.type("line one");
-  await session.write(CHORDS["Option+Enter (ESC + CR)"]);
+  // The subject here is arrow navigation, not the chord. The kitty sequence is
+  // one unambiguous escape; ESC + CR can be split by a slow PTY reader into a
+  // bare Esc (draft cleared) and an Enter, which failed this test on CI twice.
+  await session.write(CHORDS["Shift+Enter (kitty)"]);
   await session.type("line two");
 
   // Up belongs to the draft here. Before this fix it swapped in "an older task".
