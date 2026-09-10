@@ -22756,3 +22756,58 @@ fn a_cloud_owned_row_refuses_the_local_diff_panel() {
     assert!(!app.diff_panel.open);
     assert!(app.notice.as_deref().unwrap_or_default().contains("cloud"));
 }
+
+#[test]
+fn alt_4_and_leader_4_focus_the_diff_panel_opening_it_first_and_never_closing_it() {
+    let mut app = App::new();
+    app.cwd = std::env::temp_dir();
+    let mut run = test_agent_run("diff-four", "tighten the parser");
+    run.cwd = app.cwd.clone();
+    app.agents.push(run);
+    app.selected_agent = 0;
+    app.focus = FocusPane::Worker;
+
+    // Closed: ⌥4 opens and focuses.
+    app.handle_key(alt('4'));
+    assert!(app.diff_panel.open);
+    assert_eq!(app.focus, FocusPane::Diff);
+
+    // Open but unfocused: ⌥4 focuses without toggling it shut.
+    app.handle_key(alt('2'));
+    assert_eq!(app.focus, FocusPane::Worker);
+    assert!(app.diff_panel.open, "⌥2 leaves the panel open");
+    app.handle_key(alt('4'));
+    assert!(app.diff_panel.open, "⌥4 never closes the panel");
+    assert_eq!(app.focus, FocusPane::Diff);
+    app.handle_key(alt('4'));
+    assert!(
+        app.diff_panel.open && app.focus == FocusPane::Diff,
+        "safe to mash"
+    );
+
+    // ⌥4 then ⌥h: the diff has the whole screen.
+    app.handle_key(alt('h'));
+    let solo = render_screen(&mut app, 160, 30);
+    assert!(
+        solo.contains("┌ diff") && !solo.contains("┌ worker"),
+        "{solo}"
+    );
+    app.handle_key(alt('h'));
+
+    // Option+4 without an Alt modifier arrives as ¢ on a US layout.
+    app.handle_key(alt('d'));
+    assert!(!app.diff_panel.open);
+    app.handle_key(KeyEvent::new(KeyCode::Char('\u{00a2}'), KeyModifiers::NONE));
+    assert!(app.diff_panel.open && app.focus == FocusPane::Diff);
+
+    // Ctrl+W then 4 does the same through the leader.
+    app.handle_key(alt('d'));
+    assert!(!app.diff_panel.open);
+    app.focus = FocusPane::Agents;
+    app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+    app.handle_key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE));
+    assert!(
+        app.diff_panel.open && app.focus == FocusPane::Diff,
+        "^W 4 focuses the panel"
+    );
+}

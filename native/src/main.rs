@@ -3521,6 +3521,12 @@ impl App {
                 self.focus = FocusPane::Task;
                 return false;
             }
+            // ⌥4 is the diff panel's seat in the pane row: it opens the panel if
+            // it is closed and focuses it either way, so ⌥4 then ⌥h solos the diff.
+            KeyCode::Char('4') if alt_like => {
+                self.focus_diff_panel();
+                return false;
+            }
             KeyCode::Char('v') if alt_like => {
                 self.toggle_worker_view();
                 return false;
@@ -3562,6 +3568,10 @@ impl App {
             }
             KeyCode::Char('\u{00a3}') => {
                 self.focus = FocusPane::Task;
+                return false;
+            }
+            KeyCode::Char('\u{00a2}') => {
+                self.focus_diff_panel();
                 return false;
             }
             KeyCode::Char('\u{221a}') => {
@@ -3729,6 +3739,10 @@ impl App {
             KeyCode::Char('3') | KeyCode::Char('\u{00a3}') => {
                 self.delete_pending = None;
                 self.focus = FocusPane::Task;
+            }
+            KeyCode::Char('4') | KeyCode::Char('\u{00a2}') => {
+                self.delete_pending = None;
+                self.focus_diff_panel();
             }
             KeyCode::Char('v') | KeyCode::Char('\u{221a}') => self.toggle_worker_view(),
             // 'a' toggles between the two halves of a /gam pair (generator left,
@@ -4632,6 +4646,17 @@ impl App {
         self.dirty = true;
     }
 
+    /// ⌥4 / ^W 4: put focus on the diff panel, opening it first if it is
+    /// closed. Unlike ⌥d this never closes it, so it is safe to mash.
+    fn focus_diff_panel(&mut self) {
+        if !self.diff_panel.open {
+            self.toggle_diff_panel();
+            return;
+        }
+        self.focus = FocusPane::Diff;
+        self.dirty = true;
+    }
+
     /// Keep the diff panel pointed at the selected run and its content fresh.
     /// Runs every poll tick; cheap when the panel is closed or nothing changed.
     fn refresh_diff_panel(&mut self) {
@@ -5401,7 +5426,7 @@ impl App {
                 self.task_cursor = 0;
                 self.picker_index = 0;
                 self.notice = Some(
-                    "Option-1/2/3 or ^W pane  Enter start/focus  wheel scrolls worker  R review all  M merge all"
+                    "Option-1/2/3/4 or ^W pane  Enter start/focus  wheel scrolls worker  R review all  M merge all"
                         .to_string(),
                 );
             }
@@ -10202,7 +10227,7 @@ It will tend to agree with itself — name another with /gam <provider> <model> 
             }
             Some("/help") => {
                 self.notice = Some(
-                    "plain input -> one isolated mergeable worker in its own jj workspace · /plan <task> -> an orchestrator that plans and runs a DAG · /gam [model] <task> -> generator + adversarial reviewer pair; the reviewer can steer the generator mid-turn and stop it outright (split panes, ^W a toggles sides, ^W t shows the dialogue) · /main|/m <task> -> another agent in this shared checkout · panes: Option-1/2/3 or ^W · keys: j/k select · Option-[ / Option-] step agents from any pane · Enter focus · v diff · m merge · u undo a merge · M merge all · R review all · g nest · ⌥d diff panel (n/p files, j/k scroll) · o web ui · U usage dashboard · x stop · b branch chat · dd delete · cc clear merged · P model; · /handoff -> selected agent moves to Rudder Cloud and resumes there; commands: /model /fast /sound /notify /color /main /plan /gam /resume /restore /handoff /share /usage /goal /cloud /web /feedback"
+                    "plain input -> one isolated mergeable worker in its own jj workspace · /plan <task> -> an orchestrator that plans and runs a DAG · /gam [model] <task> -> generator + adversarial reviewer pair; the reviewer can steer the generator mid-turn and stop it outright (split panes, ^W a toggles sides, ^W t shows the dialogue) · /main|/m <task> -> another agent in this shared checkout · panes: Option-1/2/3/4 (4 = diff panel) or ^W · keys: j/k select · Option-[ / Option-] step agents from any pane · Enter focus · v diff · m merge · u undo a merge · M merge all · R review all · g nest · ⌥d diff panel (n/p files, j/k scroll) · o web ui · U usage dashboard · x stop · b branch chat · dd delete · cc clear merged · P model; · /handoff -> selected agent moves to Rudder Cloud and resumes there; commands: /model /fast /sound /notify /color /main /plan /gam /resume /restore /handoff /share /usage /goal /cloud /web /feedback"
                         .to_string(),
                 );
                 true

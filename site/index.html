@@ -175,17 +175,18 @@
                   <div class="row"><span class="row-task">drop the legacy session table</span><span class="state state--merged">merged</span></div>
                 </div>
                 <div class="pane pane-main">
-                  <div class="pane-label">nothing here is yours yet</div>
-                  <pre class="tty"><span class="dim">jj diff · .rudder-workspaces/settings-form</span>
+                  <div class="pane-label">diff · +3 −1 · 2 files</div>
+                  <pre class="tty"><span class="dim">claude sonnet · done · jj · tokens in 412k · out 18k · ≈ $1.51</span>
 
-<span class="dim">src/settings/Form.tsx</span>
-<span class="del">- const [state, setState] = useState(initial)</span>
-<span class="add">+ const form = useForm({ defaultValues: initial })</span>
-<span class="add">+ const { isDirty } = form.formState</span>
+ M src/settings/Form.tsx                              +2 −1
+ A src/settings/index.tsx                             +1 −0
 
-<span class="dim">src/settings/index.tsx</span>
-<span class="add">+ import { Form } from "./Form"</span></pre>
-                  <div class="tty-input"><span class="dim">m merges it · u undoes that</span></div>
+<span class="dim">M src/settings/Form.tsx ─────────────────────────────</span>
+<span class="dim">@@ -12,3 +12,4 @@</span>
+<span class="dim"> 12     │</span><span class="del">−const [state, setState] = useState(initial)</span>
+<span class="dim">     12 │</span><span class="add">+const form = useForm({ defaultValues: initial })</span>
+<span class="dim">     13 │</span><span class="add">+const { isDirty } = form.formState</span></pre>
+                  <div class="tty-input"><span class="dim">⌥4 opens it · n/p next file · m merges it · u undoes that</span></div>
                 </div>
               </div>
 

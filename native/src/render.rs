@@ -4415,7 +4415,7 @@ pub(crate) fn task_default_hint(app: &App) -> &'static str {
     } else if app.plan().planner_paused_for_input {
         "↳ the planner asked a question — answer here or in the orchestrator pane"
     } else if app.plan().awaiting_approval {
-        "type to talk to the orchestrator, or press Enter to approve  ·  Option-1/2/3 or ^W pane"
+        "type to talk to the orchestrator, or press Enter to approve  ·  Option-1/2/3/4 or ^W pane"
     } else if app.plan_is_active() {
         "type to talk to the live orchestrator; it can add, re-plan, merge, stop, or re-goal workers  ·  ^W pane"
     } else if app.agents.iter().any(|run| run.node_id.is_some())
@@ -4423,7 +4423,7 @@ pub(crate) fn task_default_hint(app: &App) -> &'static str {
     {
         "type to talk to the live orchestrator for status, retro, or follow-up control  ·  ^W pane"
     } else {
-        "type for one isolated mergeable worker; /plan for a DAG; /main for this checkout  ·  Option-1/2/3 or ^W pane"
+        "type for one isolated mergeable worker; /plan for a DAG; /main for this checkout  ·  Option-1/2/3/4 or ^W pane"
     }
 }
 

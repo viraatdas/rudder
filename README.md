@@ -130,7 +130,8 @@ current session.
 
 ### Diff panel
 
-Press `⌥d` (or type `/diff`) to open a diff panel beside the worker pane: the
+Press `⌥d` (or type `/diff`) to open a diff panel beside the worker pane, or
+`⌥4` (also `^W 4`) to jump straight to it as the fourth pane: the
 selected agent's change set parsed from `jj diff` (or `git diff` against HEAD
 plus untracked files in a plain checkout), with per-file `+`/`−` counts, line
 numbers, and the run's token usage and estimated API-rate cost in the header.

@@ -103,7 +103,7 @@ task and a second one starts beside it, unable to see or overwrite the first.</p
   <thead><tr><th>you do</th><th>what happens</th></tr></thead>
   <tbody>
     <tr><td>type a task</td><td>One isolated agent starts in its own workspace.</td></tr>
-    <tr><td>Option-1 / 2 / 3</td><td>Agents list · the agent's terminal · the task box.</td></tr>
+    <tr><td>Option-1 / 2 / 3 / 4</td><td>Agents list · the agent's terminal · the task box · the diff panel.</td></tr>
     <tr><td>j / k</td><td>Move between agents.</td></tr>
     <tr><td>m</td><td>Show me the diff. Then: land it.</td></tr>
     <tr><td>u</td><td>Undo that.</td></tr>
@@ -256,6 +256,10 @@ inside, and adds a row to the agents list.</p>
 <p>Press <kbd>Option-2</kbd> for the worker pane. That is the agent's own terminal,
 unmodified: its prompts, its output, its permission questions. You can talk to it
 directly. <kbd>Option-1</kbd> goes back to the agents list.</p>
+<p>Press <kbd>Option-4</kbd> (or <kbd>Option-d</kbd>) for the diff panel: the agent's
+change set so far, file by file with line numbers, refreshing as it edits, with the
+run's token usage and estimated cost at the top. Read it while the agent is still
+working; <kbd>m</kbd> is still how you land it.</p>
 <p>With several agents running, <kbd>Option-[</kbd> and <kbd>Option-]</kbd> step
 between them from any pane.</p>
 
@@ -738,7 +742,8 @@ a reviewer's objection and a generator's answer attached.</p>
     <tr><td>/restore</td><td>Reopen a specific session id in a new pane.</td></tr>
     <tr><td>/share</td><td>Durable local context every agent reads. For tokens, URLs, env details.</td></tr>
     <tr><td>/goal</td><td>Set or change the session's overall goal.</td></tr>
-    <tr><td>/usage</td><td>Token and cost usage for this session.</td></tr>
+    <tr><td>/usage</td><td>Token and cost usage for this session. <code>/usage web</code> (or <kbd>U</kbd>) opens the usage dashboard in the browser: subscription quota meters for every signed-in Claude Code and Codex account, token costs at API rates per day, model and workspace, and live machine resources.</td></tr>
+    <tr><td>/diff</td><td>Toggle the diff panel beside the worker (same as <kbd>Option-d</kbd>).</td></tr>
     <tr><td>/cloud</td><td>Move the fleet onto Rudder Cloud.</td></tr>
     <tr><td>/web</td><td>Open the web board for this project.</td></tr>
     <tr><td>/feedback</td><td>Send a report, with the local copy written first.</td></tr>
@@ -754,7 +759,11 @@ a reviewer's objection and a generator's answer attached.</p>
     <tr><td>Enter</td><td>Focus the selected agent's pane.</td></tr>
     <tr><td>Option-[ / Option-]</td><td>Step to the previous or next agent from any pane.</td></tr>
     <tr><td>Option-h</td><td>Full-screen the focused pane; press again to bring the others back.</td></tr>
-    <tr><td>v</td><td>Live jj diff of the selected agent.</td></tr>
+    <tr><td>Option-d</td><td>Open or close the diff panel: the selected agent's change set parsed into files and hunks, with line numbers, per-file counts, and the run's tokens and cost in the header. <kbd>j</kbd>/<kbd>k</kbd> scroll, <kbd>n</kbd>/<kbd>p</kbd> jump between files, <kbd>r</kbd> refreshes, <kbd>Esc</kbd> closes.</td></tr>
+    <tr><td>Option-4</td><td>Focus the diff panel, opening it if needed. <kbd>Option-4</kbd> then <kbd>Option-h</kbd> gives the diff the whole screen.</td></tr>
+    <tr><td>v</td><td>Swap the worker pane for a live <code>jj diff</code> stream of the selected agent.</td></tr>
+    <tr><td>U</td><td>Open the usage dashboard in the browser.</td></tr>
+    <tr><td>Option-j / Option-k</td><td>Scroll the worker's scrollback a line; <kbd>Option-u</kbd> / <kbd>Option-n</kbd> half a page.</td></tr>
     <tr><td>m</td><td>Merge the selected agent.</td></tr>
     <tr><td>M</td><td>Merge everything ready.</td></tr>
     <tr><td>u</td><td>Undo a merge.</td></tr>
@@ -770,15 +779,18 @@ a reviewer's objection and a generator's answer attached.</p>
 </table>
 
 <h2 id="panes">Panes</h2>
-<p><kbd>Option-1</kbd>, <kbd>Option-2</kbd> and <kbd>Option-3</kbd> always mean Agents,
-Worker and Task.</p>
+<p><kbd>Option-1</kbd>, <kbd>Option-2</kbd>, <kbd>Option-3</kbd> and <kbd>Option-4</kbd>
+always mean Agents, Worker, Task and the diff panel. The diff panel is the one pane
+that is closed by default: <kbd>Option-4</kbd> opens it beside the worker and focuses
+it, <kbd>Option-d</kbd> toggles it, and on a narrow terminal it takes the worker's
+place instead of squeezing both.</p>
 <p><kbd>Option-h</kbd> gives the focused pane the whole screen: no sidebar, no task
 line, no gutters. Press it again to bring them back. Reaching for it from the task
 line hands the screen to the worker, since the task input is no longer drawn, and
 you land back on the task line when the panes return.</p>
 <p>The worker pane belongs to the agent, so its keystrokes go to Claude or Codex, not
 to Rudder. To send a dashboard key from inside it, use the <kbd>Ctrl-W</kbd> leader:
-<kbd>Ctrl-W v</kbd> reviews, <kbd>Ctrl-W m</kbd> merges, <kbd>Ctrl-W 1/2/3</kbd>
+<kbd>Ctrl-W v</kbd> reviews, <kbd>Ctrl-W m</kbd> merges, <kbd>Ctrl-W 1/2/3/4</kbd>
 switches panes.</p>
 `,
   },
