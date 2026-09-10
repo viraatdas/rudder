@@ -746,7 +746,7 @@ a reviewer's objection and a generator's answer attached.</p>
     <tr><td>/restore</td><td>Reopen a specific session id in a new pane.</td></tr>
     <tr><td>/share</td><td>Durable local context every agent reads. For tokens, URLs, env details.</td></tr>
     <tr><td>/goal</td><td>Set or change the session's overall goal.</td></tr>
-    <tr><td>/usage</td><td>Token and cost usage for this session. <code>/usage web</code> (or <kbd>U</kbd>) opens the usage dashboard in the browser: subscription quota meters for every signed-in Claude Code and Codex account, token costs at API rates per day, model and workspace, and live machine resources.</td></tr>
+    <tr><td>/usage</td><td>Token and cost usage for this session. <code>/usage web</code> (or <kbd>U</kbd>) opens the <a href="#usage">usage dashboard</a> in the browser.</td></tr>
     <tr><td>/diff</td><td>Toggle the diff panel beside the worker (same as <kbd>Option-d</kbd>).</td></tr>
     <tr><td>/cloud</td><td>Move the fleet onto Rudder Cloud.</td></tr>
     <tr><td>/web</td><td>Open the web board for this project.</td></tr>
@@ -754,6 +754,21 @@ a reviewer's objection and a generator's answer attached.</p>
     <tr><td>/sound, /color</td><td>Notification sound and colour preferences.</td></tr>
   </tbody>
 </table>
+
+<h2 id="usage">Usage dashboard</h2>
+<p>Press <kbd>U</kbd> (or type <code>/usage web</code>) for a page in your browser that
+tracks what your agents consume on this machine: subscription quota for every
+signed-in Claude Code and Codex account, read from the providers' own usage
+endpoints with the sign-ins the CLIs already hold; token costs estimated at API
+list rates from the CLIs' local session logs, per day, provider, model and
+workspace, with the top sessions per workspace and a click-to-copy id for
+<code>--resume</code>; and a live view of CPU and memory for Rudder and every
+agent process. Subscription usage is not billed per token, so the page shows
+<em>cost to you: $0</em> and what the same work would have cost on the API.</p>
+<figure class="docs-shot docs-shot--image">
+  <img src="/usage-dashboard.png" alt="The usage dashboard: quota meters for a Claude Code Max account and a Codex Pro account, then token usage for 30 days with cost at API rates, caching saved, a daily stacked chart, a models table and workspace bars" loading="lazy" width="1280" height="1290" />
+  <figcaption>The usage dashboard, opened with <kbd>U</kbd>.</figcaption>
+</figure>
 
 <h2 id="keys">Keys</h2>
 <table class="docs-table">
