@@ -107,7 +107,21 @@ test("two /plan orchestrators survive a process restart", { timeout: 120_000 }, 
 
   // Both plans must come back. Before the fix, reload kept exactly one.
   await session.waitForText("alpha objective", { timeout: 30_000 });
-  await session.waitForText("beta objective", { timeout: 30_000 });
+  try {
+    await session.waitForText("beta objective", { timeout: 30_000 });
+  } catch (error) {
+    // Say what was on disk, so a CI-only failure names the half that broke.
+    const rudder = path.join(repo, ".rudder");
+    const queue = await fsp.readFile(path.join(rudder, "plan-queue.json"), "utf8").catch((e) => `<${e.code}>`);
+    const runs = await fsp.readdir(path.join(rudder, "runs")).catch(() => []);
+    const records = [];
+    for (const dir of runs) {
+      const raw = await fsp.readFile(path.join(rudder, "runs", dir, "run.json"), "utf8").catch(() => "");
+      const rec = raw ? JSON.parse(raw) : {};
+      records.push(`${dir}: mode=${rec.mode} status=${rec.status} planId=${rec.planId} task=${String(rec.taskSummary ?? rec.task ?? "").slice(0, 40)}`);
+    }
+    throw new Error(`${error.message}\n--- plan-queue.json ---\n${queue}\n--- runs ---\n${records.join("\n")}\n--- screen ---\n${await session.screen()}`);
+  }
 });
 
 test("a typed task becomes an isolated worker on screen", { timeout: 60_000 }, async (t) => {
