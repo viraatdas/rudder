@@ -1,0 +1,293 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1507.2 930" width="1507.2" height="930" font-family="ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, monospace" font-size="16px">
+<rect width="1507.2" height="930" rx="14" fill="#ffffff"/>
+<rect x="878.4" y="24.0" width="230.4" height="21" fill="#0b747c"/>
+<text x="24.0" y="39.2" fill="#a6adb8" xml:space="preserve">┌</text>
+<text x="33.6" y="39.2" fill="#6b7280" xml:space="preserve"> agents </text>
+<text x="110.4" y="39.2" fill="#a6adb8" xml:space="preserve">────────────────────────┐ ┌</text>
+<text x="369.6" y="39.2" fill="#6b7280" xml:space="preserve"> worker · settings-form · port the settings screen</text>
+<text x="849.6" y="39.2" fill="#a6adb8" xml:space="preserve">┐ </text>
+<text x="868.8" y="39.2" fill="#0b747c" xml:space="preserve">┌</text>
+<text x="878.4" y="39.2" fill="#ffffff" xml:space="preserve"> diff · +6 −4 · 3 files </text>
+<text x="1108.8" y="39.2" fill="#0b747c" xml:space="preserve">──────────────────────────────────────┐</text>
+<text x="24.0" y="60.2" fill="#a6adb8" xml:space="preserve">│</text>
+<text x="33.6" y="60.2" fill="#6b7280" xml:space="preserve">rudder</text>
+<text x="340.8" y="60.2" fill="#a6adb8" xml:space="preserve">│ │</text>
+<text x="369.6" y="60.2" fill="#1a1a1a" xml:space="preserve">&gt; port the settings screen to react-hook-form     </text>
+<text x="849.6" y="60.2" fill="#a6adb8" xml:space="preserve">│ </text>
+<text x="868.8" y="60.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="878.4" y="60.2" fill="#1a1a1a" font-weight="600" xml:space="preserve">port the settings screen to react-hook-form</text>
+<text x="1473.6" y="60.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="24.0" y="81.2" fill="#a6adb8" xml:space="preserve">│</text>
+<text x="33.6" y="81.2" fill="#6b7280" xml:space="preserve">/Users/you/code/api</text>
+<text x="225.6" y="81.2" fill="#a6adb8" xml:space="preserve">no-branch</text>
+<text x="340.8" y="81.2" fill="#a6adb8" xml:space="preserve">│ │</text>
+<text x="849.6" y="81.2" fill="#a6adb8" xml:space="preserve">│ </text>
+<text x="868.8" y="81.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="878.4" y="81.2" fill="#7e22ce" xml:space="preserve">claude sonnet-5</text>
+<text x="1022.4" y="81.2" fill="#15803d" xml:space="preserve">  ·  done</text>
+<text x="1108.8" y="81.2" fill="#6b7280" xml:space="preserve">  ·  jj</text>
+<text x="1473.6" y="81.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="24.0" y="102.2" fill="#a6adb8" xml:space="preserve">│</text>
+<text x="33.6" y="102.2" fill="#6b7280" xml:space="preserve">agents </text>
+<text x="100.8" y="102.2" fill="#a6adb8" xml:space="preserve">3</text>
+<text x="110.4" y="102.2" fill="#6b7280" xml:space="preserve"> runs</text>
+<text x="158.4" y="102.2" fill="#a6adb8" xml:space="preserve">  ·  plan integrati│ │</text>
+<text x="369.6" y="102.2" fill="#1a1a1a" xml:space="preserve">●</text>
+<text x="379.2" y="102.2" fill="#1a1a1a" xml:space="preserve"> Read src/settings/Form.tsx                      </text>
+<text x="849.6" y="102.2" fill="#a6adb8" xml:space="preserve">│ </text>
+<text x="868.8" y="102.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="878.4" y="102.2" fill="#15803d" xml:space="preserve">+6</text>
+<text x="897.6" y="102.2" fill="#c0392b" xml:space="preserve"> −4</text>
+<text x="926.4" y="102.2" fill="#1a1a1a" xml:space="preserve">  ·  3 files</text>
+<text x="1041.6" y="102.2" fill="#6b7280" xml:space="preserve">  ·  tokens in 412.0k · out 18.4k</text>
+<text x="1358.4" y="102.2" fill="#1a1a1a" xml:space="preserve">  ·  ≈ $1.51</text>
+<text x="1473.6" y="102.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="24.0" y="123.2" fill="#a6adb8" xml:space="preserve">│</text>
+<text x="340.8" y="123.2" fill="#a6adb8" xml:space="preserve">│ │</text>
+<text x="369.6" y="123.2" fill="#1a1a1a" xml:space="preserve">●</text>
+<text x="379.2" y="123.2" fill="#1a1a1a" xml:space="preserve"> Edit src/settings/Form.tsx  +4 −2               </text>
+<text x="849.6" y="123.2" fill="#a6adb8" xml:space="preserve">│ </text>
+<text x="868.8" y="123.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="1473.6" y="123.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="24.0" y="144.2" fill="#a6adb8" xml:space="preserve">│j/k move</text>
+<text x="340.8" y="144.2" fill="#a6adb8" xml:space="preserve">│ │</text>
+<text x="369.6" y="144.2" fill="#1a1a1a" xml:space="preserve">●</text>
+<text x="379.2" y="144.2" fill="#1a1a1a" xml:space="preserve"> Write src/settings/index.tsx                    </text>
+<text x="849.6" y="144.2" fill="#a6adb8" xml:space="preserve">│ </text>
+<text x="868.8" y="144.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="878.4" y="144.2" fill="#b45309" xml:space="preserve"> M </text>
+<text x="907.2" y="144.2" fill="#1a1a1a" xml:space="preserve">src/settings/Form.tsx                       </text>
+<text x="1329.6" y="144.2" fill="#6b7280" xml:space="preserve">          +4 −2</text>
+<text x="1473.6" y="144.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="24.0" y="165.2" fill="#a6adb8" xml:space="preserve">│⌥j/k scroll</text>
+<text x="340.8" y="165.2" fill="#a6adb8" xml:space="preserve">│ │</text>
+<text x="369.6" y="165.2" fill="#1a1a1a" xml:space="preserve">●</text>
+<text x="379.2" y="165.2" fill="#1a1a1a" xml:space="preserve"> Bash npm test -- settings  · 41 passed          </text>
+<text x="849.6" y="165.2" fill="#a6adb8" xml:space="preserve">│ </text>
+<text x="868.8" y="165.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="878.4" y="165.2" fill="#15803d" xml:space="preserve"> A </text>
+<text x="907.2" y="165.2" fill="#1a1a1a" xml:space="preserve">src/settings/index.tsx                      </text>
+<text x="1329.6" y="165.2" fill="#6b7280" xml:space="preserve">          +2 −0</text>
+<text x="1473.6" y="165.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="24.0" y="186.2" fill="#a6adb8" xml:space="preserve">│⌥h hide panes</text>
+<text x="340.8" y="186.2" fill="#a6adb8" xml:space="preserve">│ │</text>
+<text x="849.6" y="186.2" fill="#a6adb8" xml:space="preserve">│ </text>
+<text x="868.8" y="186.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="878.4" y="186.2" fill="#c0392b" xml:space="preserve"> D </text>
+<text x="907.2" y="186.2" fill="#1a1a1a" xml:space="preserve">src/settings/legacy.css                     </text>
+<text x="1329.6" y="186.2" fill="#6b7280" xml:space="preserve">          +0 −2</text>
+<text x="1473.6" y="186.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="24.0" y="207.2" fill="#a6adb8" xml:space="preserve">│⌥[/] agents</text>
+<text x="340.8" y="207.2" fill="#a6adb8" xml:space="preserve">│ │</text>
+<text x="369.6" y="207.2" fill="#1a1a1a" xml:space="preserve">Ported the form to react-hook-form: the dirty     </text>
+<text x="849.6" y="207.2" fill="#a6adb8" xml:space="preserve">│ </text>
+<text x="868.8" y="207.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="1473.6" y="207.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="24.0" y="228.2" fill="#a6adb8" xml:space="preserve">│Enter focus</text>
+<text x="340.8" y="228.2" fill="#a6adb8" xml:space="preserve">│ │</text>
+<text x="369.6" y="228.2" fill="#1a1a1a" xml:space="preserve">check now comes from formState instead of a       </text>
+<text x="849.6" y="228.2" fill="#a6adb8" xml:space="preserve">│ </text>
+<text x="868.8" y="228.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="878.4" y="228.2" fill="#0b747c" font-weight="600" xml:space="preserve">M src/settings/Form.tsx </text>
+<text x="1108.8" y="228.2" fill="#a6adb8" xml:space="preserve">─────────────────────────────────────</text>
+<text x="1473.6" y="228.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="24.0" y="249.2" fill="#a6adb8" xml:space="preserve">│r rename</text>
+<text x="340.8" y="249.2" fill="#a6adb8" xml:space="preserve">│ │</text>
+<text x="369.6" y="249.2" fill="#1a1a1a" xml:space="preserve">manual comparison, and the legacy stylesheet      </text>
+<text x="849.6" y="249.2" fill="#a6adb8" xml:space="preserve">│ </text>
+<text x="868.8" y="249.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="878.4" y="249.2" fill="#0b6e74" xml:space="preserve">@@ -1,6 +1,7 @@</text>
+<text x="1473.6" y="249.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="24.0" y="270.2" fill="#a6adb8" xml:space="preserve">│⌥d diff</text>
+<text x="340.8" y="270.2" fill="#a6adb8" xml:space="preserve">│ │</text>
+<text x="369.6" y="270.2" fill="#1a1a1a" xml:space="preserve">is gone. Tests pass. Ready for review.            </text>
+<text x="849.6" y="270.2" fill="#a6adb8" xml:space="preserve">│ </text>
+<text x="868.8" y="270.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="878.4" y="270.2" fill="#a6adb8" xml:space="preserve">  1   1 │</text>
+<text x="964.8" y="270.2" fill="#1a1a1a" xml:space="preserve"> import { useState } from "react"                    </text>
+<text x="1473.6" y="270.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="24.0" y="291.2" fill="#a6adb8" xml:space="preserve">│g nest</text>
+<text x="340.8" y="291.2" fill="#a6adb8" xml:space="preserve">│ │</text>
+<text x="849.6" y="291.2" fill="#a6adb8" xml:space="preserve">│ </text>
+<text x="868.8" y="291.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="878.4" y="291.2" fill="#a6adb8" xml:space="preserve">      2 │</text>
+<text x="964.8" y="291.2" fill="#15803d" xml:space="preserve">+import { useForm } from "react-hook-form"</text>
+<text x="1473.6" y="291.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="24.0" y="312.2" fill="#a6adb8" xml:space="preserve">│R review all</text>
+<text x="340.8" y="312.2" fill="#a6adb8" xml:space="preserve">│ │</text>
+<text x="369.6" y="312.2" fill="#1a1a1a" xml:space="preserve">&gt;                                                 </text>
+<text x="849.6" y="312.2" fill="#a6adb8" xml:space="preserve">│ </text>
+<text x="868.8" y="312.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="878.4" y="312.2" fill="#a6adb8" xml:space="preserve">  2   3 │</text>
+<text x="964.8" y="312.2" fill="#1a1a1a" xml:space="preserve"> import { Field } from "../ui/Field"                 </text>
+<text x="1473.6" y="312.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="24.0" y="333.2" fill="#a6adb8" xml:space="preserve">│m merge</text>
+<text x="340.8" y="333.2" fill="#a6adb8" xml:space="preserve">│ │</text>
+<text x="849.6" y="333.2" fill="#a6adb8" xml:space="preserve">│ </text>
+<text x="868.8" y="333.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="878.4" y="333.2" fill="#a6adb8" xml:space="preserve">  3   4 │</text>
+<text x="1473.6" y="333.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="24.0" y="354.2" fill="#a6adb8" xml:space="preserve">│M merge all</text>
+<text x="340.8" y="354.2" fill="#a6adb8" xml:space="preserve">│ │</text>
+<text x="849.6" y="354.2" fill="#a6adb8" xml:space="preserve">│ </text>
+<text x="868.8" y="354.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="878.4" y="354.2" fill="#a6adb8" xml:space="preserve">  4   5 │</text>
+<text x="964.8" y="354.2" fill="#1a1a1a" xml:space="preserve"> export function SettingsForm({ initial }: Props) {  </text>
+<text x="1473.6" y="354.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="24.0" y="375.2" fill="#a6adb8" xml:space="preserve">│o web ui</text>
+<text x="340.8" y="375.2" fill="#a6adb8" xml:space="preserve">│ │</text>
+<text x="849.6" y="375.2" fill="#a6adb8" xml:space="preserve">│ </text>
+<text x="868.8" y="375.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="878.4" y="375.2" fill="#a6adb8" xml:space="preserve">  5     │</text>
+<text x="964.8" y="375.2" fill="#c0392b" xml:space="preserve">−  const [state, setState] = useState(initial)</text>
+<text x="1473.6" y="375.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="24.0" y="396.2" fill="#a6adb8" xml:space="preserve">│x stop</text>
+<text x="340.8" y="396.2" fill="#a6adb8" xml:space="preserve">│ │</text>
+<text x="849.6" y="396.2" fill="#a6adb8" xml:space="preserve">│ </text>
+<text x="868.8" y="396.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="878.4" y="396.2" fill="#a6adb8" xml:space="preserve">      6 │</text>
+<text x="964.8" y="396.2" fill="#15803d" xml:space="preserve">+  const form = useForm({ defaultValues: initial })</text>
+<text x="1473.6" y="396.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="24.0" y="417.2" fill="#a6adb8" xml:space="preserve">│b branch</text>
+<text x="340.8" y="417.2" fill="#a6adb8" xml:space="preserve">│ │</text>
+<text x="849.6" y="417.2" fill="#a6adb8" xml:space="preserve">│ </text>
+<text x="868.8" y="417.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="878.4" y="417.2" fill="#a6adb8" xml:space="preserve">      7 │</text>
+<text x="964.8" y="417.2" fill="#15803d" xml:space="preserve">+  const { isDirty } = form.formState</text>
+<text x="1473.6" y="417.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="24.0" y="438.2" fill="#a6adb8" xml:space="preserve">│dd delete</text>
+<text x="340.8" y="438.2" fill="#a6adb8" xml:space="preserve">│ │</text>
+<text x="849.6" y="438.2" fill="#a6adb8" xml:space="preserve">│ </text>
+<text x="868.8" y="438.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="878.4" y="438.2" fill="#a6adb8" xml:space="preserve">  6   8 │</text>
+<text x="964.8" y="438.2" fill="#1a1a1a" xml:space="preserve">   return (                                          </text>
+<text x="1473.6" y="438.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="24.0" y="459.2" fill="#a6adb8" xml:space="preserve">│cc clear merged</text>
+<text x="340.8" y="459.2" fill="#a6adb8" xml:space="preserve">│ │</text>
+<text x="849.6" y="459.2" fill="#a6adb8" xml:space="preserve">│ </text>
+<text x="868.8" y="459.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="878.4" y="459.2" fill="#0b6e74" xml:space="preserve">@@ -18,7 +19,7 @@ export function SettingsForm({ initial }: Pr</text>
+<text x="1473.6" y="459.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="24.0" y="480.2" fill="#a6adb8" xml:space="preserve">│P model</text>
+<text x="340.8" y="480.2" fill="#a6adb8" xml:space="preserve">│ │</text>
+<text x="849.6" y="480.2" fill="#a6adb8" xml:space="preserve">│ </text>
+<text x="868.8" y="480.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="878.4" y="480.2" fill="#a6adb8" xml:space="preserve"> 18  19 │</text>
+<text x="964.8" y="480.2" fill="#1a1a1a" xml:space="preserve">       &lt;Field label="Display name" {...form.register(</text>
+<text x="1473.6" y="480.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="24.0" y="501.2" fill="#a6adb8" xml:space="preserve">│</text>
+<text x="340.8" y="501.2" fill="#a6adb8" xml:space="preserve">│ │</text>
+<text x="849.6" y="501.2" fill="#a6adb8" xml:space="preserve">│ </text>
+<text x="868.8" y="501.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="878.4" y="501.2" fill="#a6adb8" xml:space="preserve"> 19     │</text>
+<text x="964.8" y="501.2" fill="#c0392b" xml:space="preserve">−      &lt;button disabled={state === initial}&gt;Save&lt;/but</text>
+<text x="1473.6" y="501.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="24.0" y="522.2" fill="#a6adb8" xml:space="preserve">│in progress 1</text>
+<text x="340.8" y="522.2" fill="#a6adb8" xml:space="preserve">│ │</text>
+<text x="849.6" y="522.2" fill="#a6adb8" xml:space="preserve">│ </text>
+<text x="868.8" y="522.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="878.4" y="522.2" fill="#a6adb8" xml:space="preserve">     20 │</text>
+<text x="964.8" y="522.2" fill="#15803d" xml:space="preserve">+      &lt;button disabled={!isDirty}&gt;Save&lt;/button&gt;</text>
+<text x="1473.6" y="522.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="24.0" y="543.2" fill="#a6adb8" xml:space="preserve">│  </text>
+<text x="52.8" y="543.2" fill="#6b7280" xml:space="preserve">rate-limit the public API</text>
+<text x="340.8" y="543.2" fill="#a6adb8" xml:space="preserve">│ │</text>
+<text x="849.6" y="543.2" fill="#a6adb8" xml:space="preserve">│ </text>
+<text x="868.8" y="543.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="878.4" y="543.2" fill="#a6adb8" xml:space="preserve"> 20  21 │</text>
+<text x="964.8" y="543.2" fill="#1a1a1a" xml:space="preserve">     &lt;/form&gt;                                         </text>
+<text x="1473.6" y="543.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="24.0" y="564.2" fill="#a6adb8" xml:space="preserve">│</text>
+<text x="52.8" y="564.2" fill="#b45309" xml:space="preserve">●</text>
+<text x="72.0" y="564.2" fill="#b45309" xml:space="preserve">working</text>
+<text x="158.4" y="564.2" fill="#a6adb8" xml:space="preserve">run</text>
+<text x="340.8" y="564.2" fill="#a6adb8" xml:space="preserve">│ │</text>
+<text x="849.6" y="564.2" fill="#a6adb8" xml:space="preserve">│ </text>
+<text x="868.8" y="564.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="878.4" y="564.2" fill="#a6adb8" xml:space="preserve"> 21  22 │</text>
+<text x="964.8" y="564.2" fill="#1a1a1a" xml:space="preserve">   )                                                 </text>
+<text x="1473.6" y="564.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="24.0" y="585.2" fill="#a6adb8" xml:space="preserve">│</text>
+<text x="72.0" y="585.2" fill="#a6adb8" xml:space="preserve">claude</text>
+<text x="148.8" y="585.2" fill="#a6adb8" xml:space="preserve">claude-opus-5(auto)</text>
+<text x="340.8" y="585.2" fill="#a6adb8" xml:space="preserve">│ │</text>
+<text x="849.6" y="585.2" fill="#a6adb8" xml:space="preserve">│ </text>
+<text x="868.8" y="585.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="878.4" y="585.2" fill="#a6adb8" xml:space="preserve"> 22  23 │</text>
+<text x="964.8" y="585.2" fill="#1a1a1a" xml:space="preserve"> }                                                   </text>
+<text x="1473.6" y="585.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="24.0" y="606.2" fill="#a6adb8" xml:space="preserve">│</text>
+<text x="340.8" y="606.2" fill="#a6adb8" xml:space="preserve">│ │</text>
+<text x="849.6" y="606.2" fill="#a6adb8" xml:space="preserve">│ </text>
+<text x="868.8" y="606.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="1473.6" y="606.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="24.0" y="627.2" fill="#a6adb8" xml:space="preserve">│review 1</text>
+<text x="340.8" y="627.2" fill="#a6adb8" xml:space="preserve">│ │</text>
+<text x="849.6" y="627.2" fill="#a6adb8" xml:space="preserve">│ </text>
+<text x="868.8" y="627.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="878.4" y="627.2" fill="#0b747c" font-weight="600" xml:space="preserve">A src/settings/index.tsx </text>
+<text x="1118.4" y="627.2" fill="#a6adb8" xml:space="preserve">────────────────────────────────────</text>
+<text x="1473.6" y="627.2" fill="#0b747c" xml:space="preserve">│</text>
+<rect x="52.8" y="633.0" width="288.0" height="21" fill="#0b747c"/>
+<text x="24.0" y="648.2" fill="#a6adb8" xml:space="preserve">│</text>
+<text x="33.6" y="648.2" fill="#0b747c" font-weight="600" xml:space="preserve">▶ </text>
+<text x="52.8" y="648.2" fill="#ffffff" font-weight="600" xml:space="preserve">port the settings screen to...</text>
+<text x="340.8" y="648.2" fill="#a6adb8" xml:space="preserve">│ │</text>
+<text x="849.6" y="648.2" fill="#a6adb8" xml:space="preserve">│ </text>
+<text x="868.8" y="648.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="878.4" y="648.2" fill="#0b6e74" xml:space="preserve">@@ -0,0 +1,2 @@</text>
+<text x="1473.6" y="648.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="24.0" y="669.2" fill="#a6adb8" xml:space="preserve">│</text>
+<text x="52.8" y="669.2" fill="#15803d" xml:space="preserve">●</text>
+<text x="72.0" y="669.2" fill="#15803d" xml:space="preserve">review</text>
+<text x="148.8" y="669.2" fill="#a6adb8" xml:space="preserve">run</text>
+<text x="340.8" y="669.2" fill="#a6adb8" xml:space="preserve">│ │</text>
+<text x="849.6" y="669.2" fill="#a6adb8" xml:space="preserve">│ </text>
+<text x="868.8" y="669.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="878.4" y="669.2" fill="#a6adb8" xml:space="preserve">      1 │</text>
+<text x="964.8" y="669.2" fill="#15803d" xml:space="preserve">+export { SettingsForm } from "./Form"</text>
+<text x="1473.6" y="669.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="24.0" y="690.2" fill="#a6adb8" xml:space="preserve">│</text>
+<text x="72.0" y="690.2" fill="#a6adb8" xml:space="preserve">claude</text>
+<text x="148.8" y="690.2" fill="#a6adb8" xml:space="preserve">claude-sonnet-5(auto│ │</text>
+<text x="849.6" y="690.2" fill="#a6adb8" xml:space="preserve">│ </text>
+<text x="868.8" y="690.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="878.4" y="690.2" fill="#a6adb8" xml:space="preserve">      2 │</text>
+<text x="964.8" y="690.2" fill="#15803d" xml:space="preserve">+export type { Props } from "./Form"</text>
+<text x="1473.6" y="690.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="24.0" y="711.2" fill="#a6adb8" xml:space="preserve">│</text>
+<text x="340.8" y="711.2" fill="#a6adb8" xml:space="preserve">│ │</text>
+<text x="849.6" y="711.2" fill="#a6adb8" xml:space="preserve">│ </text>
+<text x="868.8" y="711.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="1473.6" y="711.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="24.0" y="732.2" fill="#a6adb8" xml:space="preserve">│  done 1  ›</text>
+<text x="340.8" y="732.2" fill="#a6adb8" xml:space="preserve">│ │</text>
+<text x="849.6" y="732.2" fill="#a6adb8" xml:space="preserve">│ </text>
+<text x="868.8" y="732.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="878.4" y="732.2" fill="#0b747c" font-weight="600" xml:space="preserve">D src/settings/legacy.css </text>
+<text x="1128.0" y="732.2" fill="#a6adb8" xml:space="preserve">───────────────────────────────────</text>
+<text x="1473.6" y="732.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="24.0" y="753.2" fill="#a6adb8" xml:space="preserve">│</text>
+<text x="340.8" y="753.2" fill="#a6adb8" xml:space="preserve">│ │</text>
+<text x="849.6" y="753.2" fill="#a6adb8" xml:space="preserve">│ </text>
+<text x="868.8" y="753.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="878.4" y="753.2" fill="#0b6e74" xml:space="preserve">@@ -1,2 +0,0 @@</text>
+<text x="1473.6" y="753.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="24.0" y="774.2" fill="#a6adb8" xml:space="preserve">│</text>
+<text x="340.8" y="774.2" fill="#a6adb8" xml:space="preserve">│ │</text>
+<text x="849.6" y="774.2" fill="#a6adb8" xml:space="preserve">│ </text>
+<text x="868.8" y="774.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="878.4" y="774.2" fill="#a6adb8" xml:space="preserve">  1     │</text>
+<text x="964.8" y="774.2" fill="#c0392b" xml:space="preserve">−.settings input { border: 1px solid #ccc }</text>
+<text x="1473.6" y="774.2" fill="#0b747c" xml:space="preserve">│</text>
+<text x="24.0" y="795.2" fill="#a6adb8" xml:space="preserve">└────────────────────────────────┘ └──────────────────────────────────────────────────┘ </text>
+<text x="868.8" y="795.2" fill="#0b747c" xml:space="preserve">└──────────────────────────────────────────────────────────────┘</text>
+<text x="24.0" y="837.2" fill="#a6adb8" xml:space="preserve">┌</text>
+<text x="33.6" y="837.2" fill="#6b7280" xml:space="preserve"> task · codex gpt-5.5(low) </text>
+<text x="292.8" y="837.2" fill="#a6adb8" xml:space="preserve">───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐</text>
+<text x="24.0" y="858.2" fill="#a6adb8" xml:space="preserve">│Type a task to plan and run</text>
+<text x="1473.6" y="858.2" fill="#a6adb8" xml:space="preserve">│</text>
+<text x="24.0" y="879.2" fill="#a6adb8" xml:space="preserve">│diff panel · j/k scroll · n/p next/prev file · r refresh · ⌥d or Esc closes · ⌥h solo</text>
+<text x="1473.6" y="879.2" fill="#a6adb8" xml:space="preserve">│</text>
+<text x="24.0" y="900.2" fill="#a6adb8" xml:space="preserve">└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘</text>
+</svg>

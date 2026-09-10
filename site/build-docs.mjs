@@ -260,6 +260,10 @@ directly. <kbd>Option-1</kbd> goes back to the agents list.</p>
 change set so far, file by file with line numbers, refreshing as it edits, with the
 run's token usage and estimated cost at the top. Read it while the agent is still
 working; <kbd>m</kbd> is still how you land it.</p>
+<figure class="docs-shot docs-shot--image" id="diff">
+  <img src="/diff-panel.svg" alt="The rudder dashboard with the diff panel open beside the worker: a header with +6 −4 across 3 files, tokens and cost, a per-file summary, and hunks with line numbers" loading="lazy" />
+  <figcaption>The diff panel beside the worker, opened with Option-4.</figcaption>
+</figure>
 <p>With several agents running, <kbd>Option-[</kbd> and <kbd>Option-]</kbd> step
 between them from any pane.</p>
 
@@ -760,8 +764,7 @@ a reviewer's objection and a generator's answer attached.</p>
     <tr><td>Option-[ / Option-]</td><td>Step to the previous or next agent from any pane.</td></tr>
     <tr><td>Option-h</td><td>Full-screen the focused pane; press again to bring the others back.</td></tr>
     <tr><td>Option-d</td><td>Open or close the diff panel: the selected agent's change set parsed into files and hunks, with line numbers, per-file counts, and the run's tokens and cost in the header. <kbd>j</kbd>/<kbd>k</kbd> scroll, <kbd>n</kbd>/<kbd>p</kbd> jump between files, <kbd>r</kbd> refreshes, <kbd>Esc</kbd> closes.</td></tr>
-    <tr><td>Option-4</td><td>Focus the diff panel, opening it if needed. <kbd>Option-4</kbd> then <kbd>Option-h</kbd> gives the diff the whole screen.</td></tr>
-    <tr><td>v</td><td>Swap the worker pane for a live <code>jj diff</code> stream of the selected agent.</td></tr>
+    <tr><td>Option-4</td><td>Focus the diff panel, opening it if needed. <kbd>Option-4</kbd> then <kbd>Option-h</kbd> gives the diff the whole screen. <a href="/docs/first-agent#diff">See it</a>.</td></tr>
     <tr><td>U</td><td>Open the usage dashboard in the browser.</td></tr>
     <tr><td>Option-j / Option-k</td><td>Scroll the worker's scrollback a line; <kbd>Option-u</kbd> / <kbd>Option-n</kbd> half a page.</td></tr>
     <tr><td>m</td><td>Merge the selected agent.</td></tr>
@@ -790,7 +793,7 @@ line hands the screen to the worker, since the task input is no longer drawn, an
 you land back on the task line when the panes return.</p>
 <p>The worker pane belongs to the agent, so its keystrokes go to Claude or Codex, not
 to Rudder. To send a dashboard key from inside it, use the <kbd>Ctrl-W</kbd> leader:
-<kbd>Ctrl-W v</kbd> reviews, <kbd>Ctrl-W m</kbd> merges, <kbd>Ctrl-W 1/2/3/4</kbd>
+<kbd>Ctrl-W v</kbd> opens the diff panel, <kbd>Ctrl-W m</kbd> merges, <kbd>Ctrl-W 1/2/3/4</kbd>
 switches panes.</p>
 `,
   },

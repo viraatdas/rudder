@@ -138,8 +138,7 @@ numbers, and the run's token usage and estimated API-rate cost in the header.
 It refreshes as the agent edits. `j`/`k` and the wheel scroll, `n`/`p` jump
 between files, `r` refreshes, `Esc` or `⌥d` closes it, and `⌥h` solos it like
 any other pane. On a narrow terminal it takes the worker's place instead of
-squeezing both. `v` still swaps the worker pane for a live `jj diff` when you
-want the raw stream.
+squeezing both. `v` opens the same panel.
 
 ### Web board
 

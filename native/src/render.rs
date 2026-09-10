@@ -3460,19 +3460,11 @@ pub(crate) fn render_worker(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                     }
                 }
             }
-            if app.worker_view == WorkerView::Diff && run.review_size != Some(size) {
-                if let Some(review) = run.review_terminal.as_mut() {
-                    if review.resize(size).is_ok() {
-                        run.review_size = Some(size);
-                    }
-                }
-            }
         }
     }
 
     let lines = match app.worker_view {
         WorkerView::Terminal => worker_lines(app, inner.height as usize, inner.width as usize),
-        WorkerView::Diff => review_lines(app, inner.height as usize),
         WorkerView::PlanReview => {
             plan_review_lines(app, inner.height as usize, inner.width as usize)
         }
@@ -3502,10 +3494,6 @@ pub(crate) fn render_worker(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 _ => role.to_string(),
             }
         }
-        WorkerView::Diff => match &identity {
-            Some(identity) => format!("review · {identity} · Esc/v back · m merge"),
-            None => "review · Esc/v back · m merge".to_string(),
-        },
         WorkerView::PlanReview => format!(
             "plan review · {} · Ctrl+S save · Ctrl+Enter approve · Esc hide",
             app.plan().plan_review.field.label()
@@ -3521,7 +3509,6 @@ pub(crate) fn render_worker(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     if focused {
         match app.worker_view {
             WorkerView::Terminal => set_worker_cursor(frame, inner, app),
-            WorkerView::Diff => set_review_cursor(frame, inner, app),
             WorkerView::PlanReview => set_plan_review_cursor(frame, inner, app),
         }
     }
@@ -4196,24 +4183,6 @@ pub(crate) fn render_gam_split(frame: &mut Frame<'_>, area: Rect, app: &mut App)
     }
 }
 
-pub(crate) fn set_review_cursor(frame: &mut Frame<'_>, inner: Rect, app: &App) {
-    let Some(terminal) = app
-        .agents
-        .get(app.selected_agent)
-        .and_then(|run| run.review_terminal.as_ref())
-    else {
-        return;
-    };
-    if terminal.scrollback() > 0 {
-        return;
-    }
-    let cursor = terminal.cursor();
-    if cursor.row >= inner.height || cursor.col >= inner.width || !cursor.visible {
-        return;
-    }
-    frame.set_cursor_position((inner.x + cursor.col, inner.y + cursor.row));
-}
-
 pub(crate) fn worker_lines(app: &mut App, height: usize, width: usize) -> Vec<Line<'static>> {
     let perf_start = Instant::now();
     let Some(run) = app.agents.get_mut(app.selected_agent) else {
@@ -4343,60 +4312,6 @@ pub(crate) fn worker_render_cursor(
 
 pub(crate) fn force_worker_cursor(backend: Backend) -> bool {
     matches!(backend, Backend::Claude | Backend::Codex)
-}
-
-pub(crate) fn review_lines(app: &mut App, height: usize) -> Vec<Line<'static>> {
-    let perf_start = Instant::now();
-    let Some(run) = app.agents.get_mut(app.selected_agent) else {
-        return vec![Line::from(Span::styled(
-            "No agent selected.",
-            muted_style(true),
-        ))];
-    };
-
-    if let Some(error) = &run.review_error {
-        return vec![
-            Line::from(Span::styled("diff failed", error_style())),
-            Line::from(Span::styled(error.clone(), error_style())),
-            Line::from(""),
-            Line::from(Span::styled(
-                "Press Ctrl-G then v to return to the worker.",
-                muted_style(true),
-            )),
-        ];
-    }
-
-    let run_id = run.id.clone();
-    let Some(review) = run.review_terminal.as_mut() else {
-        return vec![
-            Line::from(Span::styled("Opening jj diff...", muted_style(true))),
-            Line::from(""),
-            Line::from(Span::styled(
-                "Live `jj diff` of this agent's workspace.",
-                pane_text_style(true),
-            )),
-        ];
-    };
-
-    let (_start_row, styled_rows) = review.styled_line_window_snapshot(height);
-    let row_count = styled_rows.len();
-    let lines = styled_rows
-        .into_iter()
-        .map(|cells| styled_terminal_line(cells, None, None))
-        .collect::<Vec<_>>();
-    let duration = perf_start.elapsed();
-    app.record_perf_duration("review_lines", duration);
-    app.log_perf_duration_over(
-        "review_lines",
-        duration,
-        SLOW_LINE_RENDER_THRESHOLD,
-        serde_json::json!({
-            "run_id": run_id,
-            "rows": row_count,
-            "height": height,
-        }),
-    );
-    lines
 }
 
 /// The default task-pane hint shown when there is no transient notice. Centralised

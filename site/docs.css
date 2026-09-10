@@ -489,3 +489,22 @@
     grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   }
 }
+
+/* A real capture of the dashboard (SVG from the renderer), not a mock-up. */
+.docs-shot--image {
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid var(--line, #e8e8e8);
+  border-radius: 12px;
+  background: #ffffff;
+}
+.docs-shot--image img {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+.docs-shot--image figcaption {
+  padding: 10px 14px;
+  font-size: 13px;
+  color: var(--ink-2, #6b7280);
+}

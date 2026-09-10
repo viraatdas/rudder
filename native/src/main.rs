@@ -216,7 +216,7 @@ const AGENT_PANE_HINTS: &[&str] = &[
     "⌥[/] agents",
     "Enter focus",
     "r rename",
-    "v/⌥d diff",
+    "⌥d diff",
     "g nest",
     "R review all",
     "m merge",
@@ -242,7 +242,6 @@ enum FocusPane {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WorkerView {
     Terminal,
-    Diff,
     PlanReview,
 }
 
@@ -1943,9 +1942,6 @@ struct AgentRun {
     session_id: Option<String>,
     terminal: Option<TerminalPane>,
     terminal_size: Option<TerminalSize>,
-    review_terminal: Option<TerminalPane>,
-    review_size: Option<TerminalSize>,
-    review_error: Option<String>,
     last_output_at: Instant,
     completed_at: Option<Instant>,
     autosteered: bool,
@@ -3939,34 +3935,6 @@ impl App {
             return self.handle_plan_review_key(key);
         }
 
-        if self.worker_view == WorkerView::Diff {
-            match key.code {
-                KeyCode::Esc | KeyCode::Char('v') => {
-                    self.worker_view = WorkerView::Terminal;
-                    self.notice = None;
-                    return false;
-                }
-                KeyCode::Char('m') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.request_merge_selected_agent();
-                    return false;
-                }
-                _ => {}
-            }
-
-            if self.selected_review_terminal_mut().is_none() {
-                return false;
-            }
-
-            if let Some(bytes) = terminal_bytes_for_key(key) {
-                if let Some(review) = self.selected_review_terminal_mut() {
-                    if let Err(error) = review.write_input(&bytes) {
-                        self.set_selected_review_error(error.to_string());
-                    }
-                }
-            }
-            return false;
-        }
-
         // Orchestrator pane = a CHAT with the planner. For HEADLESS planners
         // typing composes a follow-up: Enter-with-text refines, Enter-on-empty approves;
         // we intercept before the PTY-forward path because writing to a -p process is
@@ -4589,30 +4557,13 @@ impl App {
             self.focus = FocusPane::Worker;
             return;
         }
-        // A cloud-owned row has no local diff to review: the workspace snapshot
-        // is stale the moment the cloud agent keeps editing. The diff that
-        // matters is in the cloud workspace. (Diff -> Terminal still works so
-        // a view left open when the row migrated can be backed out of.)
-        if self.selected_is_cloud_owned() && self.worker_view == WorkerView::Terminal {
-            self.notice = Some(
-                "cloud-owned agent: review it in its cloud workspace — Enter attaches to it"
-                    .to_string(),
-            );
-            return;
-        }
-        self.worker_view = match self.worker_view {
-            WorkerView::Terminal => {
-                self.ensure_review_diff();
-                self.mark_selected_reviewed();
-                WorkerView::Diff
-            }
-            WorkerView::Diff => {
-                self.notice = None;
-                WorkerView::Terminal
-            }
-            WorkerView::PlanReview => WorkerView::Terminal,
-        };
-        self.focus = FocusPane::Worker;
+        // `v` used to swap the worker pane for a live `jj diff` PTY. The ⌥d
+        // panel replaced it — same review gate (opening it marks the row
+        // reviewed), but the conversation stays in view and the diff is parsed
+        // into files and hunks instead of streamed — so `v` now simply puts
+        // that panel on screen and focuses it.
+        self.worker_view = WorkerView::Terminal;
+        self.focus_diff_panel();
     }
 
     /// ⌥d: show or hide the diff panel. Opening focuses it and counts as having
@@ -5496,13 +5447,7 @@ impl App {
         match self.focus {
             FocusPane::Worker => {
                 self.worker_selection = None;
-                if self.worker_view == WorkerView::Diff {
-                    if let Some(terminal) = self.selected_review_terminal_mut() {
-                        if let Err(error) = terminal.write_input(text.as_bytes()) {
-                            self.set_selected_review_error(error.to_string());
-                        }
-                    }
-                } else if self.worker_view == WorkerView::PlanReview {
+                if self.worker_view == WorkerView::PlanReview {
                     self.with_plan_review_text_mut(|value, cursor| {
                         insert_str_at_cursor(value, cursor, &text);
                     });
@@ -5821,13 +5766,6 @@ impl App {
             return true;
         }
 
-        if self.worker_view == WorkerView::Diff {
-            if self.write_mouse_to_selected_review(mouse, inner) {
-                return true;
-            }
-            return false;
-        }
-
         // Headless orchestrator renders composed Lines, not a PTY: select over the
         // captured rows. Interactive orchestrator is split: DAG selection above,
         // normal terminal selection/input below.
@@ -5952,8 +5890,6 @@ impl App {
                     self.scroll_interactive_orchestrator(mouse, area)
                 } else if self.selected_headless_orchestrator_rendered_view_active() {
                     self.scroll_orchestrator_dag(mouse, inner)
-                } else if self.worker_view == WorkerView::Diff {
-                    self.scroll_selected_review_or_forward(mouse, inner)
                 } else if self.gam_pair_indices_for_selected().is_some() {
                     self.scroll_gam_split(mouse, inner)
                 } else {
@@ -6020,8 +5956,6 @@ impl App {
                 self.scroll_interactive_orchestrator(mouse, area)
             } else if self.selected_headless_orchestrator_rendered_view_active() {
                 self.scroll_orchestrator_dag(mouse, inner)
-            } else if self.worker_view == WorkerView::Diff {
-                self.scroll_selected_review_or_forward(mouse, inner)
             } else {
                 self.scroll_selected_worker_or_forward(mouse, inner)
             };
@@ -6492,82 +6426,6 @@ impl App {
             self.orch_follow_bottom
         ));
         self.orch_dag_scroll != before || self.orch_follow_bottom != before_follow || had_selection
-    }
-
-    fn write_mouse_to_selected_review(&mut self, mouse: MouseEvent, area: Rect) -> bool {
-        let Some(bytes) = mouse_event_to_sgr(mouse, area) else {
-            return false;
-        };
-        let result = match self.selected_review_terminal_mut() {
-            Some(review) => {
-                if !review.wants_sgr_mouse_events() {
-                    return false;
-                }
-                review.reset_scrollback();
-                review.write_input(&bytes)
-            }
-            None => return false,
-        };
-        if let Err(error) = result {
-            self.set_selected_review_error(error.to_string());
-        }
-        true
-    }
-
-    fn scroll_selected_review_or_forward(&mut self, mouse: MouseEvent, area: Rect) -> bool {
-        let rows = mouse_scrollback_delta(mouse, area.height);
-        let mouse_bytes = mouse_event_to_sgr(mouse, area);
-        let Some(review) = self.selected_review_terminal_mut() else {
-            self.set_mouse_debug(format!(
-                "mouse {:?} @{},{} pane=review route=no-terminal",
-                mouse.kind, mouse.column, mouse.row
-            ));
-            return false;
-        };
-        let before = review.scrollback();
-        let alternate = review.uses_alternate_screen_snapshot();
-        // Same precedence as the worker pane: a mouse-tracking alternate-screen app
-        // scrolls itself, so keep our snapshot history out of the way.
-        let child_owns_wheel = alternate && review.wants_sgr_mouse_events_snapshot();
-        if !child_owns_wheel {
-            review.scrollback_by(rows);
-        }
-        let after = review.scrollback();
-        let moved = after != before;
-        let wants_mouse = if moved || rows == 0 {
-            false
-        } else {
-            review.wants_sgr_mouse_events_snapshot()
-        };
-        let mut forwarded = false;
-        let mut write_error = None;
-        if !moved && rows != 0 && wants_mouse {
-            if let Some(bytes) = mouse_bytes {
-                if let Err(error) = review.write_input(&bytes) {
-                    write_error = Some(error.to_string());
-                } else {
-                    forwarded = true;
-                }
-            }
-        }
-        self.set_mouse_debug(format!(
-            "mouse {:?} @{},{} pane=review rows={} before={} after={} moved={} alt={} wants_mouse={} forwarded={}",
-            mouse.kind,
-            mouse.column,
-            mouse.row,
-            rows,
-            before,
-            after,
-            moved,
-            alternate,
-            wants_mouse,
-            forwarded
-        ));
-        if let Some(error) = write_error {
-            self.set_selected_review_error(error);
-            return true;
-        }
-        moved || forwarded
     }
 
     /// Alt-modified scrollback for the worker pane. Unlike PageUp/Down this
@@ -7049,9 +6907,6 @@ impl App {
             session_id,
             terminal: None,
             terminal_size: None,
-            review_terminal: None,
-            review_size: None,
-            review_error: None,
             last_output_at: Instant::now(),
             completed_at: None,
             autosteered: true,
@@ -7237,9 +7092,6 @@ impl App {
             session_id,
             terminal: None,
             terminal_size: None,
-            review_terminal: None,
-            review_size: None,
-            review_error: None,
             last_output_at: Instant::now(),
             completed_at: None,
             autosteered: false,
@@ -7455,9 +7307,6 @@ Until the first packet arrives, reply only: \"standing by\"."
             session_id,
             terminal: None,
             terminal_size: None,
-            review_terminal: None,
-            review_size: None,
-            review_error: None,
             last_output_at: Instant::now(),
             completed_at: None,
             autosteered: false,
@@ -7549,9 +7398,6 @@ Until the first packet arrives, reply only: \"standing by\"."
             session_id: adversarial_session,
             terminal: None,
             terminal_size: None,
-            review_terminal: None,
-            review_size: None,
-            review_error: None,
             last_output_at: Instant::now(),
             completed_at: None,
             autosteered: false,
@@ -8494,9 +8340,6 @@ Address the objection directly. If you disagree, say why inside \
             session_id,
             terminal: None,
             terminal_size: None,
-            review_terminal: None,
-            review_size: None,
-            review_error: None,
             last_output_at: Instant::now(),
             completed_at: None,
             autosteered: true,
@@ -9763,7 +9606,6 @@ Address the objection directly. If you disagree, say why inside \
             },
             "view": match self.worker_view {
                 WorkerView::Terminal => "terminal",
-                WorkerView::Diff => "diff",
                 WorkerView::PlanReview => "plan-review",
             },
             "planActive": self.plan_is_active(),
@@ -10227,7 +10069,7 @@ It will tend to agree with itself — name another with /gam <provider> <model> 
             }
             Some("/help") => {
                 self.notice = Some(
-                    "plain input -> one isolated mergeable worker in its own jj workspace · /plan <task> -> an orchestrator that plans and runs a DAG · /gam [model] <task> -> generator + adversarial reviewer pair; the reviewer can steer the generator mid-turn and stop it outright (split panes, ^W a toggles sides, ^W t shows the dialogue) · /main|/m <task> -> another agent in this shared checkout · panes: Option-1/2/3/4 (4 = diff panel) or ^W · keys: j/k select · Option-[ / Option-] step agents from any pane · Enter focus · v diff · m merge · u undo a merge · M merge all · R review all · g nest · ⌥d diff panel (n/p files, j/k scroll) · o web ui · U usage dashboard · x stop · b branch chat · dd delete · cc clear merged · P model; · /handoff -> selected agent moves to Rudder Cloud and resumes there; commands: /model /fast /sound /notify /color /main /plan /gam /resume /restore /handoff /share /usage /goal /cloud /web /feedback"
+                    "plain input -> one isolated mergeable worker in its own jj workspace · /plan <task> -> an orchestrator that plans and runs a DAG · /gam [model] <task> -> generator + adversarial reviewer pair; the reviewer can steer the generator mid-turn and stop it outright (split panes, ^W a toggles sides, ^W t shows the dialogue) · /main|/m <task> -> another agent in this shared checkout · panes: Option-1/2/3/4 (4 = diff panel) or ^W · keys: j/k select · Option-[ / Option-] step agents from any pane · Enter focus · m merge · u undo a merge · M merge all · R review all · g nest · ⌥d diff panel (n/p files, j/k scroll) · o web ui · U usage dashboard · x stop · b branch chat · dd delete · cc clear merged · P model; · /handoff -> selected agent moves to Rudder Cloud and resumes there; commands: /model /fast /sound /notify /color /main /plan /gam /resume /restore /handoff /share /usage /goal /cloud /web /feedback"
                         .to_string(),
                 );
                 true
@@ -10893,7 +10735,6 @@ It will tend to agree with itself — name another with /gam <provider> <model> 
                 run.session_id = latest_codex_session_id_for_cwd(&run.cwd);
             }
             run.terminal = None;
-            run.review_terminal = None;
             run.needs_permission = false;
             run.needs_user_input = false;
             // Keep the record nonterminal. The cloud migration planner selects
@@ -10979,7 +10820,6 @@ It will tend to agree with itself — name another with /gam <provider> <model> 
                 run.session_id = latest_codex_session_id_for_cwd(&run.cwd);
             }
             run.terminal = None;
-            run.review_terminal = None;
             run.needs_permission = false;
             run.needs_user_input = false;
             // Nonterminal on disk: the CLI's migration planner only stages
@@ -11112,9 +10952,6 @@ It will tend to agree with itself — name another with /gam <provider> <model> 
             session_id: None,
             terminal: None,
             terminal_size: None,
-            review_terminal: None,
-            review_size: None,
-            review_error: None,
             last_output_at: Instant::now(),
             completed_at: None,
             autosteered: true,
@@ -15229,12 +15066,6 @@ Files involved: {}
             .and_then(|run| run.terminal.as_mut())
     }
 
-    fn selected_review_terminal_mut(&mut self) -> Option<&mut TerminalPane> {
-        self.agents
-            .get_mut(self.selected_agent)
-            .and_then(|run| run.review_terminal.as_mut())
-    }
-
     fn set_selected_error(&mut self, message: String) {
         // A write that fails because the agent process ALREADY exited cleanly is
         // not a run failure — the process simply finished (common for the
@@ -15261,104 +15092,6 @@ Files involved: {}
         }
         if clean_exit {
             self.notice = Some("agent already finished".to_string());
-        }
-    }
-
-    fn set_selected_review_error(&mut self, message: String) {
-        if let Some(run) = self.agents.get_mut(self.selected_agent) {
-            run.review_error = Some(message);
-        }
-    }
-
-    fn ensure_review_diff(&mut self) {
-        let Some(run) = self.agents.get_mut(self.selected_agent) else {
-            return;
-        };
-        if let Some(review) = run.review_terminal.as_mut() {
-            if review.is_alive() {
-                return;
-            }
-            // The watch loop died (workspace deleted, jj crash): keep the last
-            // frame and a frozen pane was all the user got. Respawn instead.
-            review.terminate_and_wait();
-            run.review_terminal = None;
-        }
-        // A once-failed pane must not pin its error forever; each open retries.
-        run.review_error = None;
-
-        #[cfg(test)]
-        {
-            run.review_error = None;
-            self.notice = Some("opening review".to_string());
-            return;
-        }
-
-        #[cfg(not(test))]
-        {
-            // A cloud agent's cwd is the LOCAL repo root — its real workspace
-            // lives on the remote worker and there is no diff fetch-back yet.
-            // Watching the local checkout here would confidently show the
-            // user's own edits as the worker's. Be honest instead.
-            if render::is_cloud_agent(run) {
-                run.review_error = Some(
-                    "cloud worker: its diff lives on the remote workspace (local diff view \
-                     would show YOUR checkout) · use `rudder cloud logs <id>` or merge-back"
-                        .to_string(),
-                );
-                return;
-            }
-            // The workspace can be gone (merged + GC'd): spawning sh in a deleted
-            // cwd yields a bare ENOENT that reads like a Rudder bug. Say what
-            // actually happened instead.
-            if !run.cwd.exists() {
-                run.review_error = Some(
-                    "workspace was reclaimed (merged work is cleaned up); nothing left to diff"
-                        .to_string(),
-                );
-                return;
-            }
-            // The review pane is jj's own diff, watched live: `jj status` (the
-            // working-copy summary) + `jj diff` (jj's default diff program). The
-            // agent works in a jj workspace, so this is the faithful view of its
-            // changes. Falls back to `git diff` only if jj is somehow unavailable.
-            //
-            // The loop only repaints when the capture CHANGED: an unconditional
-            // clear+reprint every 2s shifted the scroll position by a whole diff
-            // length per tick (scrollback is measured from the bottom), making any
-            // >1-screen diff unreadable while an idle pane still churned CPU.
-            // A stale working copy (siblings snapshotting concurrently) recovers
-            // via `jj workspace update-stale` instead of erroring forever.
-            //
-            // CRITICAL: pipe jj through `cat` (and use git `--no-pager`). The pane is
-            // a real PTY, so jj/git see a tty on stdout and would launch a PAGER on a
-            // long diff, blocking the watch loop forever. Piping to cat makes stdout a
-            // pipe, so jj's auto-pager stays off and the loop keeps refreshing.
-            let command = TerminalCommand::with_args(
-                "sh",
-                [
-                    "-lc",
-                    "if command -v jj >/dev/null 2>&1 && jj root >/dev/null 2>&1; then snap() { jj --color=always status 2>&1 | cat; printf '\\n'; jj --color=always diff 2>&1 | cat; }; else snap() { git --no-pager status --short 2>&1; printf '\\n'; git --no-pager diff --color=always HEAD 2>&1; }; fi; prev='__rudder_unrendered__'; while :; do cur=$(snap); case \"$cur\" in *'working copy is stale'*) jj workspace update-stale >/dev/null 2>&1; cur=$(snap);; esac; if [ \"$cur\" != \"$prev\" ]; then printf '\\033[2J\\033[H'; printf '%s\\n' \"$cur\"; prev=$cur; fi; sleep 2; done",
-                ],
-            );
-            let options = TerminalPaneOptions {
-                size: run.terminal_size.unwrap_or_default(),
-                cwd: Some(run.cwd.clone()),
-                ..TerminalPaneOptions::default()
-            };
-
-            match TerminalPane::spawn_shell_or_command(Some(command), options) {
-                Ok(mut terminal) => {
-                    let _ = terminal.drain_output();
-                    Self::attach_output_waker(&self.pty_output_waker, &terminal);
-                    run.review_terminal = Some(terminal);
-                    run.review_error = None;
-                    self.notice = Some("opening review".to_string());
-                }
-                Err(error) => {
-                    run.review_error = Some(error.to_string());
-                    self.notice = Some(format!("failed to open diff: {error}"));
-                }
-            }
         }
     }
 
@@ -15744,9 +15477,6 @@ Files involved: {}
             session_id: None,
             terminal: None,
             terminal_size: None,
-            review_terminal: None,
-            review_size: None,
-            review_error: None,
             last_output_at: Instant::now(),
             completed_at: None,
             autosteered: false,
@@ -16575,7 +16305,6 @@ Files involved: {}
         };
         if let Some(run) = self.agents.get_mut(index) {
             run.terminal = None;
-            run.review_terminal = None;
         }
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
             Ok(mut terminal) => {
@@ -16706,7 +16435,6 @@ Files involved: {}
                 terminal.terminate_and_wait();
             }
             run.terminal = None;
-            run.review_terminal = None;
             // User cancellation is absorbing. Integration conflict remains a
             // separate durable fact, so a stopped resolver can still be resumed
             // without lying that the process completed successfully.
@@ -16920,7 +16648,6 @@ Files involved: {}
         // contains the conflicted git operation.
         if let Some(run) = self.agents.get_mut(index) {
             run.terminal = None;
-            run.review_terminal = None;
         }
 
         match TerminalPane::spawn_shell_or_command(Some(command), options) {
@@ -17298,7 +17025,6 @@ What to do\n\
         for merge_index in merge_indices {
             if let Some(run) = self.agents.get_mut(merge_index) {
                 run.terminal = None;
-                run.review_terminal = None;
                 run.status = AgentStatus::Merged;
                 run.integration.phase = if run.integration.pushed {
                     IntegrationPhase::Pushed
@@ -18133,28 +17859,6 @@ What to do\n\
 
         if context_dirty {
             let _ = self.write_rudder_context_timed(None);
-        }
-
-        // Live diff pane: the loop above drains each agent's MAIN terminal but not
-        // its review_terminal, so the `jj diff` watch loop's every-2s output never
-        // reached the grid and `v` looked frozen. Drain the selected agent's review
-        // pane here whenever the Diff view is open so it refreshes as the agent edits.
-        // Every OTHER review terminal is torn down: nothing drains it (its PTY
-        // buffer would grow without bound) and its sh+jj watch loop would keep
-        // spinning for the run's lifetime. `v` respawns one instantly on re-open.
-        let viewed_review = (self.worker_view == WorkerView::Diff).then_some(self.selected_agent);
-        for (index, run) in self.agents.iter_mut().enumerate() {
-            let Some(review) = run.review_terminal.as_mut() else {
-                continue;
-            };
-            if Some(index) == viewed_review {
-                if !review.drain_output().is_empty() {
-                    any_dirty = true;
-                }
-            } else {
-                review.terminate_and_wait();
-                run.review_terminal = None;
-            }
         }
 
         if any_dirty {

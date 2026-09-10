@@ -1852,7 +1852,7 @@ fn feedback_carries_what_was_on_screen_and_nothing_else() {
     app.model = "gpt-5.6-sol".to_string();
     app.effort = Some(EffortLevel::High);
     app.focus = FocusPane::Worker;
-    app.worker_view = WorkerView::Diff;
+    app.worker_view = WorkerView::PlanReview;
     let mut running = test_agent_run("run-1", "implement the cache");
     running.status = AgentStatus::Running;
     let mut failed = test_agent_run("run-2", "port the parser");
@@ -1871,7 +1871,7 @@ fn feedback_carries_what_was_on_screen_and_nothing_else() {
     assert_eq!(context["agents"], 2);
     assert_eq!(context["agentsRunning"], 1);
     assert_eq!(context["focus"], "worker");
-    assert_eq!(context["view"], "diff");
+    assert_eq!(context["view"], "plan-review");
     assert_eq!(context["lastError"], "jj workspace failed: no such change");
     assert!(context["notices"]
         .as_array()
@@ -2362,7 +2362,7 @@ fn wraps_long_notice_text_to_width() {
 }
 
 #[test]
-fn converts_mouse_events_to_review_terminal_coordinates() {
+fn converts_mouse_events_to_terminal_coordinates() {
     let area = Rect {
         x: 10,
         y: 5,
@@ -6538,9 +6538,6 @@ fn test_agent_run(id: &str, task: &str) -> AgentRun {
         session_id: None,
         terminal: None,
         terminal_size: None,
-        review_terminal: None,
-        review_size: None,
-        review_error: None,
         last_output_at: Instant::now(),
         completed_at: None,
         autosteered: false,
@@ -7517,7 +7514,12 @@ fn unread_work_cannot_be_merged_without_being_shown_first() {
         app.merge_confirm.is_none(),
         "unread work does not reach the merge confirmation"
     );
-    assert_eq!(app.worker_view, WorkerView::Diff, "its diff is opened");
+    assert!(app.diff_panel.open, "its diff panel is opened");
+    assert_eq!(
+        app.focus,
+        FocusPane::Diff,
+        "and focused, so the next key reads it"
+    );
     assert!(
         app.agents[0].reviewed_at.is_some(),
         "being shown the diff is what marks it reviewed"
@@ -7553,7 +7555,7 @@ fn rows_with_nothing_to_merge_never_claim_to_be_reviewed() {
     app.worker_view = WorkerView::Terminal;
     app.toggle_worker_view();
 
-    assert_eq!(app.worker_view, WorkerView::Diff);
+    assert!(app.diff_panel.open, "v opens the diff panel");
     assert!(
         app.agents[0].reviewed_at.is_none(),
         "a main-checkout row has no merge to gate"
@@ -8374,9 +8376,6 @@ fn delete_agent_requires_second_d() {
         session_id: None,
         terminal: None,
         terminal_size: None,
-        review_terminal: None,
-        review_size: None,
-        review_error: None,
         last_output_at: Instant::now(),
         completed_at: Some(Instant::now()),
         autosteered: false,
@@ -8582,10 +8581,10 @@ fn only_finished_workers_are_conversable_after_their_pty_exits() {
         "the orchestrator has its own view"
     );
     app.selected_agent = 0;
-    app.worker_view = WorkerView::Diff;
+    app.worker_view = WorkerView::PlanReview;
     assert!(
         !app.selected_finished_worker_conversable(),
-        "diff view is never hijacked"
+        "a non-terminal worker view is never hijacked"
     );
 }
 
@@ -8832,17 +8831,29 @@ fn event_dispatch_handles_paste_and_ctrl_c() {
 }
 
 #[test]
-fn v_and_escape_leave_review_view() {
+fn v_opens_the_diff_panel_and_escape_leaves_it() {
+    // `v` used to swap the worker pane for a live jj diff; the ⌥d panel
+    // replaced that view, so `v` is now just another way to reach the panel.
     let mut app = App::new();
-    app.worker_view = WorkerView::Diff;
-    app.focus = FocusPane::Worker;
+    app.cwd = std::env::temp_dir();
+    let mut run = test_agent_run("v-panel", "port the parser");
+    run.cwd = app.cwd.clone();
+    app.agents.push(run);
+    app.selected_agent = 0;
+    app.focus = FocusPane::Agents;
 
     assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::empty())));
-    assert_eq!(app.worker_view, WorkerView::Terminal);
+    assert!(app.diff_panel.open);
+    assert_eq!(app.focus, FocusPane::Diff);
+    assert_eq!(
+        app.worker_view,
+        WorkerView::Terminal,
+        "the worker pane is never swapped out"
+    );
 
-    app.worker_view = WorkerView::Diff;
     assert!(!app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty())));
-    assert_eq!(app.worker_view, WorkerView::Terminal);
+    assert!(!app.diff_panel.open);
+    assert_eq!(app.focus, FocusPane::Worker);
 }
 
 // --- CHANGE 1: plan -> planned-node queue (DAG orchestration) ------------
@@ -16827,10 +16838,9 @@ fn the_diff_gate_guards_the_local_road_only() {
 
     assert_eq!(app.merge_route_for(0), MergeRoute::Publish);
     app.request_merge_selected_agent();
-    assert_ne!(
-        app.worker_view,
-        WorkerView::Diff,
-        "publishing does not send you to the pane diff first"
+    assert!(
+        !app.diff_panel.open,
+        "publishing does not send you to the diff panel first"
     );
     assert!(
         app.agents[0].reviewed_at.is_none(),
@@ -16848,10 +16858,9 @@ fn the_diff_gate_guards_the_local_road_only() {
 
     assert_eq!(local.merge_route_for(0), MergeRoute::LocalMerge);
     local.request_merge_selected_agent();
-    assert_eq!(
-        local.worker_view,
-        WorkerView::Diff,
-        "the local road shows the diff before it touches the checkout"
+    assert!(
+        local.diff_panel.open,
+        "the local road shows the diff panel before it touches the checkout"
     );
     assert!(
         local.merge_confirm.is_none(),
@@ -21408,7 +21417,10 @@ fn cloud_owned_agents_stay_visible_and_refuse_local_actions() {
         .as_deref()
         .unwrap_or_default()
         .contains("cloud workspace"));
-    assert_eq!(app.worker_view, WorkerView::Terminal);
+    assert!(
+        !app.diff_panel.open,
+        "a cloud row never opens the local panel"
+    );
 
     app.request_merge_selected_agent();
     assert!(app
@@ -22810,4 +22822,191 @@ fn alt_4_and_leader_4_focus_the_diff_panel_opening_it_first_and_never_closing_it
         app.diff_panel.open && app.focus == FocusPane::Diff,
         "^W 4 focuses the panel"
     );
+}
+
+// ---- website capture: `RUDDER_SCREENSHOT_SVG=/path cargo test -- --ignored diff_panel_screenshot` ----
+
+/// Render the dashboard with the diff panel open through the REAL renderer and
+/// write it as an SVG (one <text> per styled run of cells), so the website shows
+/// the actual panel rather than a mock-up. Ignored: it writes a file.
+#[test]
+#[ignore]
+fn diff_panel_screenshot_svg() {
+    let Some(out) = std::env::var_os("RUDDER_SCREENSHOT_SVG") else {
+        return;
+    };
+    crate::theme::set_color_mode(ColorMode::Paper);
+    let mut app = App::new();
+    app.cwd = PathBuf::from("/Users/you/code/api");
+    let mut other = test_agent_run("rate-limit", "rate-limit the public API");
+    other.status = AgentStatus::Running;
+    other.model = "claude-opus-5".to_string();
+    let mut run = test_agent_run(
+        "settings-form",
+        "port the settings screen to react-hook-form",
+    );
+    run.cwd = PathBuf::from("/Users/you/code/api/.rudder-workspaces/settings-form");
+    run.status = AgentStatus::Done;
+    run.completed_at = Some(Instant::now());
+    run.model = "claude-sonnet-5".to_string();
+    run.tokens_in = 412_000;
+    run.tokens_out = 18_400;
+    // A real PTY standing in for the agent's conversation, so the worker pane
+    // shows a transcript rather than the "not running" card.
+    let transcript = concat!(
+        "printf '\\033[2m> port the settings screen to react-hook-form\\033[0m\\n\\n';",
+        "printf '\\033[32m\\xe2\\x97\\x8f\\033[0m Read src/settings/Form.tsx\\n';",
+        "printf '\\033[32m\\xe2\\x97\\x8f\\033[0m Edit src/settings/Form.tsx  +4 \\xe2\\x88\\x922\\n';",
+        "printf '\\033[32m\\xe2\\x97\\x8f\\033[0m Write src/settings/index.tsx\\n';",
+        "printf '\\033[32m\\xe2\\x97\\x8f\\033[0m Bash npm test -- settings  \\033[2m\\xc2\\xb7 41 passed\\033[0m\\n\\n';",
+        "printf 'Ported the form to react-hook-form: the dirty\\n';",
+        "printf 'check now comes from formState instead of a\\n';",
+        "printf 'manual comparison, and the legacy stylesheet\\n';",
+        "printf 'is gone. Tests pass. Ready for review.\\n\\n';",
+        "printf '\\033[2m>\\033[0m ';",
+        "sleep 30"
+    );
+    run.terminal = TerminalPane::spawn_shell_or_command(
+        Some(TerminalCommand::with_args("/bin/sh", ["-c", transcript])),
+        TerminalPaneOptions {
+            size: TerminalSize { rows: 40, cols: 50 },
+            scrollback_lines: 200,
+            ..Default::default()
+        },
+    )
+    .ok();
+    let mut merged = test_agent_run("legacy", "drop the legacy session table");
+    merged.status = AgentStatus::Merged;
+    merged.model = "gpt-5.6-sol".to_string();
+    merged.backend = Backend::Codex;
+    app.agents.push(other);
+    app.agents.push(run);
+    app.agents.push(merged);
+    app.selected_agent = 1;
+    app.focus = FocusPane::Worker;
+    std::thread::sleep(Duration::from_millis(400));
+    app.poll_agents();
+    app.handle_key(alt('4'));
+    let diff = "\
+diff --git a/src/settings/Form.tsx b/src/settings/Form.tsx
+--- a/src/settings/Form.tsx
++++ b/src/settings/Form.tsx
+@@ -1,6 +1,7 @@
+ import { useState } from \"react\"
++import { useForm } from \"react-hook-form\"
+ import { Field } from \"../ui/Field\"
+ 
+ export function SettingsForm({ initial }: Props) {
+-  const [state, setState] = useState(initial)
++  const form = useForm({ defaultValues: initial })
++  const { isDirty } = form.formState
+   return (
+@@ -18,7 +19,7 @@ export function SettingsForm({ initial }: Props) {
+       <Field label=\"Display name\" {...form.register(\"name\")} />
+-      <button disabled={state === initial}>Save</button>
++      <button disabled={!isDirty}>Save</button>
+     </form>
+   )
+ }
+diff --git a/src/settings/index.tsx b/src/settings/index.tsx
+new file mode 100644
+--- /dev/null
++++ b/src/settings/index.tsx
+@@ -0,0 +1,2 @@
++export { SettingsForm } from \"./Form\"
++export type { Props } from \"./Form\"
+diff --git a/src/settings/legacy.css b/src/settings/legacy.css
+deleted file mode 100644
+--- a/src/settings/legacy.css
++++ /dev/null
+@@ -1,2 +0,0 @@
+-.settings input { border: 1px solid #ccc }
+-.settings button { float: right }
+";
+    app.diff_panel.apply(
+        "settings-form",
+        Ok((diff.to_string(), crate::diffview::DiffSource::Jj, false)),
+    );
+
+    let (width, height) = (152_u16, 42_u16);
+    let backend = ratatui::backend::TestBackend::new(width, height);
+    let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+    terminal
+        .draw(|frame| crate::render::render(frame, &mut app))
+        .expect("draw");
+    let buffer = terminal.backend().buffer().clone();
+
+    let (cw, ch, fs) = (9.6_f64, 21.0_f64, 16.0_f64);
+    let pad = 24.0;
+    let w = width as f64 * cw + pad * 2.0;
+    let h = height as f64 * ch + pad * 2.0;
+    let color = |c: ratatui::style::Color, fallback: &str| -> String {
+        match c {
+            ratatui::style::Color::Rgb(r, g, b) => format!("#{r:02x}{g:02x}{b:02x}"),
+            _ => fallback.to_string(),
+        }
+    };
+    let esc = |s: &str| {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+    };
+    let mut svg = String::new();
+    svg.push_str(&format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {w} {h}\" width=\"{w}\" height=\"{h}\" font-family=\"ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, monospace\" font-size=\"{fs}px\">\n<rect width=\"{w}\" height=\"{h}\" rx=\"14\" fill=\"#ffffff\"/>\n"
+    ));
+    for y in 0..height {
+        // Backgrounds first, merged per run of equal colour.
+        let mut x = 0_u16;
+        while x < width {
+            let cell = buffer.cell((x, y)).expect("cell");
+            let bg = cell.bg;
+            let mut end = x + 1;
+            while end < width && buffer.cell((end, y)).expect("cell").bg == bg {
+                end += 1;
+            }
+            if let ratatui::style::Color::Rgb(..) = bg {
+                let fill = color(bg, "#ffffff");
+                if fill != "#ffffff" {
+                    svg.push_str(&format!(
+                        "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"{ch}\" fill=\"{fill}\"/>\n",
+                        pad + x as f64 * cw,
+                        pad + y as f64 * ch,
+                        (end - x) as f64 * cw
+                    ));
+                }
+            }
+            x = end;
+        }
+        // Then text runs of equal fg + bold.
+        let mut x = 0_u16;
+        while x < width {
+            let cell = buffer.cell((x, y)).expect("cell");
+            let fg = cell.fg;
+            let bold = cell.modifier.contains(Modifier::BOLD);
+            let mut text = String::new();
+            let mut end = x;
+            while end < width {
+                let c = buffer.cell((end, y)).expect("cell");
+                if c.fg != fg || c.modifier.contains(Modifier::BOLD) != bold {
+                    break;
+                }
+                text.push_str(c.symbol());
+                end += 1;
+            }
+            if !text.trim().is_empty() {
+                svg.push_str(&format!(
+                    "<text x=\"{:.1}\" y=\"{:.1}\" fill=\"{}\"{} xml:space=\"preserve\">{}</text>\n",
+                    pad + x as f64 * cw,
+                    pad + y as f64 * ch + fs * 0.95,
+                    color(fg, "#1a1a1a"),
+                    if bold { " font-weight=\"600\"" } else { "" },
+                    esc(&text)
+                ));
+            }
+            x = end;
+        }
+    }
+    svg.push_str("</svg>\n");
+    std::fs::write(&out, svg).expect("write svg");
 }
