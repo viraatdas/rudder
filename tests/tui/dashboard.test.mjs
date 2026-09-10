@@ -88,6 +88,19 @@ test("two /plan orchestrators survive a process restart", { timeout: 120_000 }, 
   await session.type("/plan beta objective");
   await session.press("Enter");
   await session.waitForText("beta objective", { timeout: 30_000 });
+  // Both plans must be on disk before the kill (creation persists them
+  // synchronously); on a slow runner this turns "beta vanished after restart"
+  // from a mystery into either a persistence failure here or a restore failure
+  // below, whichever it actually is.
+  await session.waitFor(
+    async () => {
+      const queue = await fsp
+        .readFile(path.join(repo, ".rudder", "plan-queue.json"), "utf8")
+        .catch(() => "");
+      return queue.includes("alpha objective") && queue.includes("beta objective");
+    },
+    { timeout: 10_000, label: "both plans persisted" },
+  );
 
   await session.kill();
   session = await session.respawn();

@@ -583,12 +583,19 @@ test("idle sweep keeps a disconnected workspace alive while an agent is running"
   });
   assert.ok(!stoppedMachines.includes("machine-busy"), "fresh busy heartbeat prevents idle stop");
 
-  const resultDb = new Database(dbPath);
-  const rows = resultDb.prepare(
-    "select id, status from rudder_workspaces where id in ('busy-workspace', 'idle-workspace')",
-  ).all();
-  resultDb.close();
-  const statuses = Object.fromEntries(rows.map((row) => [row.id, row.status]));
+  // The server marks the row stopped AFTER the Fly stop call returns, so a
+  // single read right after seeing that call raced it (flaked twice in CI).
+  // Poll the row instead.
+  const readStatuses = () => {
+    const resultDb = new Database(dbPath);
+    const rows = resultDb.prepare(
+      "select id, status from rudder_workspaces where id in ('busy-workspace', 'idle-workspace')",
+    ).all();
+    resultDb.close();
+    return Object.fromEntries(rows.map((row) => [row.id, row.status]));
+  };
+  await waitFor(() => readStatuses()["idle-workspace"] === "stopped", { timeout: 10_000, interval: 100 });
+  const statuses = readStatuses();
   assert.equal(statuses["busy-workspace"], "running");
   assert.equal(statuses["idle-workspace"], "stopped");
 });
