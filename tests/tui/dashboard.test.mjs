@@ -116,6 +116,18 @@ test("two /plan orchestrators survive a process restart", { timeout: 120_000 }, 
     { timeout: 10_000, label: "both plans and their planner rows persisted" },
   );
 
+  // What was on disk the instant before the kill, for the failure message.
+  const listRuns = async () => {
+    const runs = await fsp.readdir(path.join(repo, ".rudder", "runs")).catch(() => []);
+    const out = [];
+    for (const dir of runs) {
+      const entries = await fsp.readdir(path.join(repo, ".rudder", "runs", dir)).catch(() => []);
+      out.push(`${dir}: [${entries.join(",")}]`);
+    }
+    return out.join("\n");
+  };
+  const beforeKill = await listRuns();
+
   await session.kill();
   session = await session.respawn();
 
@@ -130,11 +142,19 @@ test("two /plan orchestrators survive a process restart", { timeout: 120_000 }, 
     const runs = await fsp.readdir(path.join(rudder, "runs")).catch(() => []);
     const records = [];
     for (const dir of runs) {
-      const raw = await fsp.readFile(path.join(rudder, "runs", dir, "run.json"), "utf8").catch(() => "");
-      const rec = raw ? JSON.parse(raw) : {};
-      records.push(`${dir}: mode=${rec.mode} status=${rec.status} planId=${rec.planId} task=${String(rec.taskSummary ?? rec.task ?? "").slice(0, 40)}`);
+      const entries = await fsp.readdir(path.join(rudder, "runs", dir)).catch((e) => [`<${e.code}>`]);
+      const raw = await fsp.readFile(path.join(rudder, "runs", dir, "run.json"), "utf8").catch((e) => `<${e.code}>`);
+      let rec = {};
+      try {
+        rec = JSON.parse(raw);
+      } catch {
+        rec = {};
+      }
+      records.push(
+        `${dir}: files=[${entries.join(",")}] bytes=${raw.length} mode=${rec.mode} status=${rec.status} planId=${rec.planId} head=${JSON.stringify(raw.slice(0, 120))}`,
+      );
     }
-    throw new Error(`${error.message}\n--- plan-queue.json ---\n${queue}\n--- runs ---\n${records.join("\n")}\n--- screen ---\n${await session.screen()}`);
+    throw new Error(`${error.message}\n--- runs before kill ---\n${beforeKill}\n--- plan-queue.json ---\n${queue}\n--- runs ---\n${records.join("\n")}\n--- screen ---\n${await session.screen()}`);
   }
 });
 
