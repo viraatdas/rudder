@@ -81,12 +81,14 @@ test("Alt+h hides the panes and never moves the selection", { timeout: 60_000 },
   await waitSelected(session, "beta worker");
 });
 
-test("v opens the diff/review view and toggles back", { timeout: 60_000 }, async (t) => {
+test("v opens the diff panel and Esc closes it", { timeout: 60_000 }, async (t) => {
+  // `v` no longer swaps the worker pane for a live jj diff; it puts the ⌥d
+  // diff panel on screen (and focuses it), so Esc is the way back.
   const { session } = await twoWorkerDashboard(t, "rudder-tui-diff-");
   await session.press("v");
-  await session.waitForText("Esc/v back", { timeout: 15_000 });
-  await session.press("v");
-  await session.waitForGone("Esc/v back", { timeout: 15_000 });
+  await session.waitForText("┌ diff", { timeout: 15_000 });
+  await session.press("Escape");
+  await session.waitForGone("┌ diff", { timeout: 15_000 });
 });
 
 test("r opens rename on the selected row; Esc cancels", { timeout: 60_000 }, async (t) => {
