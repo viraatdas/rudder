@@ -264,9 +264,30 @@ docker buildx build --platform linux/arm64 \
   --push .
 ```
 
+When the local docker VM has no room for an amd64 build (it runs under
+emulation on Apple Silicon), build on Fly's remote builder instead and point
+`RUDDER_WORKER_IMAGE` at the Fly registry, which the workers app can pull
+from directly:
+
+```bash
+printf 'app = "rudder-workers-exla"\n' > /tmp/fly-worker.toml
+FLY_API_TOKEN="$(awk '/^access_token:/{print $2}' ~/.fly/config.yml)" \
+  flyctl deploy --config /tmp/fly-worker.toml --dockerfile cloud/worker/Dockerfile \
+  --build-only --push --remote-only --image-label <version> .
+# -> registry.fly.io/rudder-workers-exla:<version>
+# mirror an arm64 build under the same name so the `:arm64` derivation resolves:
+docker buildx imagetools create -t registry.fly.io/rudder-workers-exla:arm64 \
+  public.ecr.aws/exla/rudder-worker:<version>-arm64
+```
+
 The worker image installs Rudder, acpx, and Hunk at startup, downloads the
 snapshot from S3, restores selected HOME config, and starts `rudder run
---worktree "$RUDDER_TASK"` inside the unpacked repo.
+--worktree "$RUDDER_TASK"` inside the unpacked repo. Agent CLIs are installed
+as the non-root `rudder` user (Claude Code through its native installer, the
+npm ones under a home npm prefix) and the entrypoint runs a bounded
+`claude update` at every boot, so a worker runs the current Claude Code even
+on an image tag built weeks earlier. `RUDDER_WORKER_SKIP_AGENT_UPDATE=1`
+turns that off.
 
 ## Bring Your Own VM
 

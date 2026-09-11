@@ -1,6 +1,8 @@
 FROM rust:1-bookworm AS native-builder
 WORKDIR /src
 COPY native ./native
+# The binary embeds assets (the notifier icon) with include_bytes!.
+COPY assets ./assets
 COPY Cargo.toml Cargo.lock ./
 RUN cargo build --release --manifest-path native/Cargo.toml \
   && cp target/release/rudder-native /rudder-native \
@@ -30,12 +32,13 @@ RUN set -eux; \
     apt-get install -y --no-install-recommends gh; \
     rm -rf /var/lib/apt/lists/*
 
-RUN npm install -g \
-    @anthropic-ai/claude-code@latest \
-    @openai/codex@latest \
-    acpx@latest \
-    hunkdiff@latest \
-  && npm cache clean --force
+# Agent CLIs are installed later, as the non-root user, into locations that
+# user can write: Claude Code through its native installer (~/.local/bin, which
+# `claude update` and its auto-updater can replace in place), the npm ones
+# under an npm prefix in the user's home. The image used to `npm install -g`
+# claude-code as root, so a worker could never actually update it: the
+# auto-updater printed "Updated to latest" into ~/.local/share/claude while
+# every launch kept running the root-owned npm copy the image was built with.
 
 # jj (Jujutsu) is Rudder's required internal VCS substrate. node:22-slim ships no
 # jj, and the postinstall auto-installer needs brew/cargo (absent here), so fetch
@@ -84,6 +87,13 @@ RUN useradd --create-home --shell /bin/bash --uid 1500 rudder \
   && chown -R rudder:rudder /workspace /opt/rudder-worker
 
 USER rudder
+ENV NPM_CONFIG_PREFIX=/home/rudder/.npm-global \
+    PATH=/home/rudder/.local/bin:/home/rudder/.npm-global/bin:${PATH}
+RUN curl -fsSL https://claude.ai/install.sh | bash \
+  && claude --version \
+  && npm install -g @openai/codex@latest acpx@latest hunkdiff@latest \
+  && npm cache clean --force \
+  && codex --version
 WORKDIR /workspace
 
 ENTRYPOINT ["rudder-worker"]
