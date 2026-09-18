@@ -171,6 +171,7 @@ export type AccountQuota = {
   email: string | null;
   plan: string | null;
   windows: QuotaWindow[];
+  blocked: string | null;
   error: string | null;
   fetchedAt: string;
 };

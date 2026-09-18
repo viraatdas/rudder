@@ -67,6 +67,8 @@ mod selection;
 use crate::selection::*;
 mod render;
 use crate::render::*;
+mod claude_nav;
+use crate::claude_nav::*;
 mod detect;
 use crate::detect::*;
 mod notify;
@@ -101,6 +103,79 @@ struct PendingEnter {
     run_id: String,
     due: Instant,
 }
+
+/// One in-flight Alt+V for a Claude Code worker: scroll its normal view up
+/// to the previous message start and put that on the top row. Driven a step
+/// per poll tick by `drive_claude_message_navs`, because every step waits on
+/// the child's repaint — see the `claude_nav` module for why this is a
+/// screen-driven walk and not a single keystroke.
+struct ClaudeMessageNav {
+    run_id: String,
+    phase: ClaudeNavPhase,
+    /// Pages sent so far without a message start coming into view; bounded
+    /// by `CLAUDE_NAV_MAX_PAGES` so a pathological transcript can't leave the
+    /// walk running forever.
+    pages: u16,
+    /// Whether the last-resort Ctrl+Home probe has been sent (see the
+    /// give-up branch in `drive_claude_message_navs`).
+    probed: bool,
+}
+
+enum ClaudeNavPhase {
+    /// PageUp sent; waiting for the repaint, then comparing against `before`.
+    PagedUp {
+        before: Vec<String>,
+        sent_at: Instant,
+        /// The first changed screen seen; the walk waits one more tick for it
+        /// to hold still before trusting it, since a repaint can arrive in
+        /// more than one read.
+        settling: Option<Vec<String>>,
+        /// PageUp changed nothing, so a burst of wheel-up events (a separate
+        /// input path Claude honours even while busy) was sent instead. Only
+        /// when that changes nothing either is this the top.
+        wheeled: bool,
+    },
+    /// Target found; wheeling down one line at a time until it's as high as
+    /// it can go: row 1, under the prompt Claude pins to row 0 while
+    /// scrolled. A blind burst covers the safe distance (the target stays
+    /// ≥ 3 rows down), then each notch is verified: the target must show up
+    /// one row higher. Claude drops the first wheel event after a change of
+    /// direction, so a notch that changes nothing is re-sent before the walk
+    /// concludes anything; if the target slid under the sticky line, one
+    /// notch up restores it.
+    Aligning {
+        target: String,
+        row: usize,
+        blind: usize,
+        step: ClaudeAlignStep,
+        last_sent: Instant,
+        sent_screen: Vec<String>,
+        settling: Option<Vec<String>>,
+        resends: u8,
+    },
+}
+
+enum ClaudeAlignStep {
+    /// Ready to send the next wheel-down.
+    Idle,
+    /// Wheel-down sent; waiting for the repaint to confirm the target moved up.
+    Down,
+    /// The target slid off the top; wheel-up sent to bring it back, then done.
+    Restore,
+}
+
+/// A page-up that changes nothing on screen for this long means the top of
+/// the transcript: the walk stops there.
+const CLAUDE_NAV_REPAINT_TIMEOUT: Duration = Duration::from_millis(700);
+/// A wheel notch that changes nothing for this long is taken as dropped (the
+/// first one after a change of direction always is) and sent again.
+const CLAUDE_NAV_RESEND_AFTER: Duration = Duration::from_millis(250);
+const CLAUDE_NAV_MAX_RESENDS: u8 = 2;
+/// Gap between the single-line wheel events that align the target: one per
+/// poll tick, each its own write.
+const CLAUDE_NAV_KEY_SPACING: Duration = Duration::from_millis(30);
+const CLAUDE_NAV_MAX_PAGES: u16 = 200;
+
 /// Animation-only redraw cadence. Real PTY output wakes the loop immediately; this
 /// interval only advances the idle spinner.
 const SPINNER_FRAME_INTERVAL: Duration = Duration::from_millis(100);
@@ -1456,6 +1531,7 @@ struct App {
     /// sites write the text as a bracketed paste and queue the CR here; it is
     /// flushed as a separate write once ENTER_SUBMIT_DELAY has passed.
     pending_enters: Vec<PendingEnter>,
+    claude_message_navs: Vec<ClaudeMessageNav>,
     /// Injected tasks waiting to be folded into the active plan, one at a time.
     /// Without this, rapid injections each spawned their own RudderPlan planner
     /// and the agent pane filled with 5+ concurrent "planning" rows.
@@ -2637,6 +2713,7 @@ impl App {
             nest_view: false,
             pty_output_waker: None,
             pending_enters: Vec::new(),
+            claude_message_navs: Vec::new(),
             pending_reconcile_inputs: Vec::new(),
             cwd,
             branch,
@@ -3523,14 +3600,10 @@ impl App {
                 self.focus_diff_panel();
                 return false;
             }
-            KeyCode::Char('v') if alt_like => {
-                self.toggle_worker_view();
-                return false;
-            }
             // Alt+d opens the diff PANEL beside the worker (and focuses it); a
-            // second press closes it. Distinct from `v`, which swaps the worker
-            // pane itself for a live jj diff: this one keeps the conversation
-            // in view while you read the change set.
+            // second press closes it. (Alt+v used to swap the worker pane
+            // itself for a live jj diff; that binding was dropped to free the
+            // chord for Alt+v/Alt+b message navigation, below.)
             KeyCode::Char('d') if alt_like => {
                 self.toggle_diff_panel();
                 return false;
@@ -3568,10 +3641,6 @@ impl App {
             }
             KeyCode::Char('\u{00a2}') => {
                 self.focus_diff_panel();
-                return false;
-            }
-            KeyCode::Char('\u{221a}') => {
-                self.toggle_worker_view();
                 return false;
             }
             KeyCode::Char('\u{2202}') => {
@@ -3653,6 +3722,161 @@ impl App {
                     return false;
                 }
                 _ => {}
+            }
+        }
+
+        // Alt+V scrolls the selected Claude Code worker's normal view up to
+        // the previous message start: Rudder pages the view up (PageUp),
+        // reads the screen, and wheels the nearest newly revealed `⏺`/`❯`
+        // line up to the top — a screen-driven walk run by
+        // `drive_claude_message_navs`; see the `claude_nav` module for why
+        // nothing simpler works (no scrollback to scan, no previous-message
+        // key, and the transcript pager's `{` jumps by *prompt*). Alt+B
+        // sends Ctrl+End, which Claude Code binds to "jump to the latest
+        // message and resume auto-follow" — closing the transcript view
+        // first (`q`) if the user opened it by hand, since Ctrl+End is a
+        // no-op in there. Whether that view is open is read off the
+        // worker's screen, never tracked in a flag (a flag went stale and
+        // shipped a bug once).
+        //
+        // (Alt+v was freed by dropping its old "swap worker pane for live jj
+        // diff" binding; Alt+b was freed from "move cursor back a word" in
+        // the worker input draft, unused.) Codex and opencode have no
+        // equivalent shortcut worth macroing today (see this session's
+        // research), so this is Claude-only; everything else falls through
+        // unchanged.
+        //
+        // Terminals that don't report Alt for Option+key (Ghostty's default
+        // unless macos-option-as-alt is set, and the historical default for
+        // Terminal.app/iTerm2) send the typographic character instead: on a
+        // US layout Option+v is "√" and Option+b is "∫". Accept those bare
+        // characters too, the same way the Option+1/2/3/h fallbacks above
+        // do — but a real ALT modifier is unambiguous and doesn't need the
+        // focus guard the composed-character case needs to avoid hijacking
+        // normal typing.
+        if self.focus != FocusPane::Task {
+            let is_previous = (matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V')) && alt_like)
+                || matches!(key.code, KeyCode::Char('\u{221a}'));
+            let is_latest = (matches!(key.code, KeyCode::Char('b') | KeyCode::Char('B')) && alt_like)
+                || matches!(key.code, KeyCode::Char('\u{222b}'));
+            if is_previous || is_latest {
+                let jump_to_latest = is_latest;
+                let key_name = if jump_to_latest { "Alt+B" } else { "Alt+V" };
+                // Alt+H acts unconditionally the moment it sees a real (or
+                // composed-character) Option modifier — it never silently
+                // falls through to normal dispatch. This should too: either
+                // run the macro, or say exactly why it can't, rather than
+                // doing nothing and leaving you to guess.
+                match self.agents.get(self.selected_agent) {
+                    None => {
+                        self.notice = Some(format!("{key_name}: no worker selected"));
+                    }
+                    Some(run) if run.backend != Backend::Claude => {
+                        self.notice = Some(format!(
+                            "{key_name} only works for a Claude Code worker (this one is {})",
+                            run.backend.as_str()
+                        ));
+                    }
+                    Some(run) if run.terminal.is_none() => {
+                        self.notice =
+                            Some(format!("{key_name}: no live terminal for this worker yet"));
+                    }
+                    Some(_) => {
+                        let run_id = self.agents[self.selected_agent].id.clone();
+                        Self::claude_nav_log(&format!(
+                            "{key_name} pressed run={run_id} walk_active={}",
+                            self.claude_message_nav_active(&run_id)
+                        ));
+                        if !jump_to_latest {
+                            let by_id = self.agents.iter().position(|run| run.id == run_id);
+                            if by_id != Some(self.selected_agent) {
+                                Self::claude_nav_log(&format!(
+                                    "WARNING: run id {run_id} resolves to pane {by_id:?} but pane {} is selected",
+                                    self.selected_agent
+                                ));
+                            }
+                        }
+                        if !jump_to_latest && self.claude_message_nav_active(&run_id) {
+                            // A walk is still in progress for this pane; let
+                            // it finish rather than race it.
+                            return false;
+                        }
+                        let run = &mut self.agents[self.selected_agent];
+                        // Claude Code renders one of two ways, and they need
+                        // opposite handling. On the alternate screen it owns a
+                        // viewport and Rudder asks IT to scroll (PageUp, wheel,
+                        // Ctrl+End). Rendered inline it has no viewport at all:
+                        // it never enables mouse reporting and ignores PageUp,
+                        // and the scrollback the user sees belongs to Rudder —
+                        // so only Rudder can move it. Sending keys to an inline
+                        // worker is why Alt+V looked dead in a real session
+                        // (`alt_screen=false wants_mouse=false` in the walk log)
+                        // while every direct-spawn test passed, since a Claude
+                        // spawned outside Rudder takes the alternate screen.
+                        let inline = run
+                            .terminal
+                            .as_ref()
+                            .is_some_and(|terminal| !terminal.uses_alternate_screen_snapshot());
+                        let view_open = !inline && Self::claude_transcript_view_open(run);
+                        if jump_to_latest || !inline {
+                            // Alt+B always returns to the live bottom, and the
+                            // key-driven walk always starts from it.
+                            if let Some(terminal) = run.terminal.as_mut() {
+                                terminal.reset_scrollback();
+                            }
+                        }
+                        if jump_to_latest {
+                            self.cancel_claude_message_nav(&run_id);
+                            if inline {
+                                // reset_scrollback above already put the pane
+                                // back at the live bottom; there is nothing to
+                                // ask the child for.
+                                Self::claude_nav_log("Alt+B: inline pane, reset Rudder's scrollback");
+                                self.dirty = true;
+                                return false;
+                            }
+                            let bytes = if view_open {
+                                CLAUDE_TRANSCRIPT_EXIT_TO_LATEST_BYTES
+                            } else {
+                                CLAUDE_JUMP_TO_LATEST_BYTES
+                            };
+                            let result = self
+                                .selected_terminal_mut()
+                                .map(|terminal| terminal.write_input(bytes));
+                            if let Some(Err(error)) = result {
+                                self.set_selected_error(error.to_string());
+                            }
+                        } else if inline {
+                            let scrolled = run
+                                .terminal
+                                .as_mut()
+                                .map(Self::scroll_pane_to_previous_message)
+                                .unwrap_or(0);
+                            Self::claude_nav_log(&format!(
+                                "Alt+V: inline pane, scrolled Rudder's own view up {scrolled} rows to offset {:?}",
+                                run.terminal.as_ref().map(|terminal| terminal.scrollback())
+                            ));
+                            if scrolled == 0 {
+                                self.notice = Some(
+                                    "Alt+V: nothing above — the whole conversation is already on screen"
+                                        .to_string(),
+                                );
+                            }
+                            self.dirty = true;
+                        } else if view_open {
+                            // The user opened Claude's transcript view by
+                            // hand; the walk drives the normal view, so
+                            // leave that view alone rather than scroll it.
+                            self.notice = Some(
+                                "Alt+V scrolls the normal view — press q to leave the transcript view first"
+                                    .to_string(),
+                            );
+                        } else {
+                            self.start_claude_message_nav(&run_id);
+                        }
+                    }
+                }
+                return false;
             }
         }
 
@@ -4131,16 +4355,6 @@ impl App {
                         let len = run.worker_input_draft.chars().count();
                         run.worker_input_cursor = (run.worker_input_cursor + 1).min(len);
                     }
-                }
-            }
-            KeyCode::Char('b') | KeyCode::Char('B')
-                if key
-                    .modifiers
-                    .intersects(KeyModifiers::ALT | KeyModifiers::META) =>
-            {
-                if let Some(run) = self.agents.get_mut(self.selected_agent) {
-                    run.worker_input_cursor =
-                        previous_word_position(&run.worker_input_draft, run.worker_input_cursor);
                 }
             }
             KeyCode::Char('f') | KeyCode::Char('F')
@@ -6588,6 +6802,393 @@ impl App {
             }
         }
         self.pending_enters = remaining;
+    }
+
+    /// Append one line to `~/.rudder/logs/claude-nav.log`. The Alt+V walk
+    /// runs blind inside a live TUI where a stall looks like "nothing
+    /// happened"; this is how a report from a real session gets diagnosed.
+    fn claude_nav_log(message: &str) {
+        use std::io::Write as _;
+        let Some(home) = crate::signals::rudder_home() else {
+            return;
+        };
+        let path = home.join("logs").join("claude-nav.log");
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        else {
+            return;
+        };
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let _ = writeln!(file, "{stamp} {message}");
+    }
+
+    /// Whether an Alt+V walk is already in flight for `run_id`. A second
+    /// press while one runs is dropped rather than queued: the walk reads the
+    /// screen as it goes, and two of them would race each other's keystrokes.
+    fn claude_message_nav_active(&self, run_id: &str) -> bool {
+        self.claude_message_navs.iter().any(|nav| nav.run_id == run_id)
+    }
+
+    /// Scroll a worker pane's OWN scrollback (Rudder's, not the child's) up
+    /// until the previous message start sits on the top row, and return how
+    /// many rows that took — 0 when it was already at the top of the history.
+    ///
+    /// This is the path for a Claude Code worker rendering inline, where
+    /// there is nothing to ask the child (see the dispatch comment). It needs
+    /// no keystrokes and no repaint waits, so it lands within the keypress
+    /// instead of over the next second.
+    fn scroll_pane_to_previous_message(terminal: &mut TerminalPane) -> usize {
+        // Bounded so one press can't walk an enormous history; a message is
+        // far shorter than this, and a press that hits the bound has still
+        // scrolled a long way up.
+        const MAX_ROWS: usize = 4000;
+        for scrolled in 1..=MAX_ROWS {
+            let before = terminal.scrollback();
+            terminal.scrollback_by(1);
+            if terminal.scrollback() == before {
+                // Top of the history: report what we actually moved.
+                return scrolled - 1;
+            }
+            if terminal
+                .visible_lines_snapshot()
+                .first()
+                .is_some_and(|line| is_claude_message_start(line))
+            {
+                return scrolled;
+            }
+        }
+        MAX_ROWS
+    }
+
+    /// Begin an Alt+V walk for `run_id`: the first page-up goes out now and
+    /// the walk picks up from the repaint on the next ticks.
+    fn start_claude_message_nav(&mut self, run_id: &str) {
+        let Some(terminal) = self
+            .agents
+            .iter_mut()
+            .find(|run| run.id == run_id)
+            .and_then(|run| run.terminal.as_mut())
+        else {
+            return;
+        };
+        let before = terminal.live_screen_lines();
+        let write = terminal.write_input(CLAUDE_PAGE_UP_BYTES);
+        Self::claude_nav_log(&format!(
+            "start run={run_id}; paging up; pane {}x{}; write={:?}; alt_screen={}; wants_mouse={}; scrollback={}; content_end={}; screen:\n{}",
+            terminal.size().cols,
+            terminal.size().rows,
+            write.as_ref().err().map(|e| e.to_string()),
+            terminal.uses_alternate_screen(),
+            terminal.wants_sgr_mouse_events(),
+            terminal.scrollback(),
+            claude_content_end(&before),
+            before
+                .iter()
+                .enumerate()
+                .map(|(row, line)| format!("  {row:2}| {}", line.chars().take(110).collect::<String>()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+        self.claude_message_navs.push(ClaudeMessageNav {
+            run_id: run_id.to_string(),
+            phase: ClaudeNavPhase::PagedUp {
+                before,
+                sent_at: Instant::now(),
+                settling: None,
+                wheeled: false,
+            },
+            pages: 0,
+            probed: false,
+        });
+    }
+
+    /// Drop any in-flight Alt+V walk for `run_id`. Called when Alt+B closes
+    /// that worker's transcript view — pager keys landing after that would
+    /// be typed into the prompt instead of navigating.
+    fn cancel_claude_message_nav(&mut self, run_id: &str) {
+        self.claude_message_navs.retain(|nav| nav.run_id != run_id);
+    }
+
+    /// Advance every in-flight Alt+V walk by one step. Called each poll tick.
+    fn drive_claude_message_navs(&mut self) {
+        if self.claude_message_navs.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let mut finished: Vec<usize> = Vec::new();
+        for (index, nav) in self.claude_message_navs.iter_mut().enumerate() {
+            let Some(terminal) = self
+                .agents
+                .iter_mut()
+                .find(|run| run.id == nav.run_id)
+                .and_then(|run| run.terminal.as_mut())
+            else {
+                Self::claude_nav_log(&format!("drop run={} (no run/terminal)", nav.run_id));
+                finished.push(index);
+                continue;
+            };
+            match &mut nav.phase {
+                ClaudeNavPhase::PagedUp {
+                    before,
+                    sent_at,
+                    settling,
+                    wheeled,
+                } => {
+                    let screen = terminal.live_screen_lines();
+                    if !claude_view_moved(before, &screen) {
+                        if sent_at.elapsed() > CLAUDE_NAV_REPAINT_TIMEOUT && !*wheeled {
+                            // PageUp changed nothing. Before calling this the
+                            // top, try the mouse path: half a page of wheel-up
+                            // events in one write (bundled wheel events all
+                            // land, measured).
+                            let notches = (screen.len() / 2).max(1);
+                            Self::claude_nav_log(&format!(
+                                "page up changed nothing after {}ms; trying {notches} wheel-up notches",
+                                sent_at.elapsed().as_millis()
+                            ));
+                            let burst: Vec<u8> = CLAUDE_LINE_UP_BYTES.repeat(notches);
+                            let write = terminal.write_input(&burst);
+                            if let Err(error) = &write {
+                                Self::claude_nav_log(&format!("wheel write failed: {error}"));
+                            }
+                            self.dirty = true;
+                            *wheeled = true;
+                            *sent_at = now;
+                            continue;
+                        }
+                        if sent_at.elapsed() > CLAUDE_NAV_REPAINT_TIMEOUT {
+                            // Neither PageUp nor the wheel moved the view. Before
+                            // calling this the top, ask Claude one question it
+                            // always answers when it is listening at all:
+                            // Ctrl+Home (jump to the very top). If even that does
+                            // nothing, the worker is not taking scroll input and
+                            // the log says so instead of blaming the transcript.
+                            if !nav.probed {
+                                nav.probed = true;
+                                let write = terminal.write_input(b"\x1b[1;5H");
+                                Self::claude_nav_log(&format!(
+                                    "neither PageUp nor wheel moved the view; probing Ctrl+Home; write={:?}",
+                                    write.as_ref().err().map(|e| e.to_string())
+                                ));
+                                *sent_at = now;
+                                self.dirty = true;
+                                continue;
+                            }
+                            Self::claude_nav_log(&format!(
+                                "Ctrl+Home moved nothing either: already at the top, or this worker is not taking scroll input; screen:\n{}",
+                                screen
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(row, line)| format!("  {row:2}| {}", line.chars().take(110).collect::<String>()))
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            ));
+                            self.notice = Some(if nav.pages == 0 {
+                                "Alt+V: nothing above — the whole conversation is already on screen"
+                                    .to_string()
+                            } else {
+                                "Alt+V: top of the transcript".to_string()
+                            });
+                            finished.push(index);
+                        }
+                        continue;
+                    }
+                    match settling {
+                        Some(seen) if *seen == screen => {}
+                        _ => {
+                            *settling = Some(screen);
+                            continue;
+                        }
+                    }
+                    Self::claude_nav_log(&format!(
+                        "page {} shift={:?} starts={:?} target={:?} before[0..3]={:?} after[0..3]={:?}",
+                        nav.pages,
+                        claude_page_shift(before, &screen),
+                        claude_message_start_rows(&screen),
+                        claude_previous_message_row(before, &screen),
+                        &before[..before.len().min(3)],
+                        &screen[..screen.len().min(3)],
+                    ));
+                    // A message start on row 0 is ignored, so the walk pages
+                    // once more. While scrolled, Claude pins the current
+                    // prompt to row 0, and a pinned `❯` line looks exactly
+                    // like a user message that just came into view — taking
+                    // it as the target ended the walk after a single page.
+                    // One more page tells them apart for free: a pinned line
+                    // reads the same before and after, so it is filtered out,
+                    // while real content moves down and is aligned as usual.
+                    match claude_previous_message_row(before, &screen).filter(|row| *row > 0) {
+                        Some(row) => {
+                            nav.phase = ClaudeNavPhase::Aligning {
+                                target: screen[row].clone(),
+                                row,
+                                blind: row.saturating_sub(3),
+                                step: ClaudeAlignStep::Idle,
+                                last_sent: now - CLAUDE_NAV_KEY_SPACING,
+                                sent_screen: Vec::new(),
+                                settling: None,
+                                resends: 0,
+                            };
+                        }
+                        None => {
+                            nav.pages += 1;
+                            if nav.pages >= CLAUDE_NAV_MAX_PAGES {
+                                Self::claude_nav_log("gave up: max pages");
+                                self.notice = Some(
+                                    "Alt+V: no earlier message found — press ⌥b to return to the latest"
+                                        .to_string(),
+                                );
+                                finished.push(index);
+                                continue;
+                            }
+                            // Nothing began a message on this page, so send
+                            // several at once from here on: one whole message
+                            // can run to hundreds of lines (a long answer),
+                            // and a page at a time crawls through it — a real
+                            // session hit the page cap mid-message and gave
+                            // up. The jump stays under one screen so the
+                            // pages still overlap and no message start can
+                            // slip through the gap between them.
+                            let jump = claude_page_shift(before, &screen)
+                                .filter(|shift| *shift > 0)
+                                .map(|shift| ((screen.len().saturating_sub(3)) / shift).clamp(1, 4))
+                                .unwrap_or(1);
+                            let _ = terminal.write_input(&CLAUDE_PAGE_UP_BYTES.repeat(jump));
+                            self.dirty = true;
+                            nav.phase = ClaudeNavPhase::PagedUp {
+                                before: screen,
+                                sent_at: now,
+                                settling: None,
+                                wheeled: false,
+                            };
+                        }
+                    }
+                }
+                ClaudeNavPhase::Aligning {
+                    target,
+                    row,
+                    blind,
+                    step,
+                    last_sent,
+                    sent_screen,
+                    settling,
+                    resends,
+                } => match step {
+                    ClaudeAlignStep::Idle => {
+                        if *row <= 1 {
+                            Self::claude_nav_log(&format!("done: {target:?} at row {row}"));
+                            finished.push(index);
+                            continue;
+                        }
+                        if last_sent.elapsed() < CLAUDE_NAV_KEY_SPACING {
+                            continue;
+                        }
+                        *sent_screen = terminal.live_screen_lines();
+                        *settling = None;
+                        *resends = 0;
+                        let _ = terminal.write_input(CLAUDE_LINE_DOWN_BYTES);
+                        self.dirty = true;
+                        *last_sent = now;
+                        if *blind > 0 {
+                            *blind -= 1;
+                            *row -= 1;
+                        } else {
+                            *step = ClaudeAlignStep::Down;
+                        }
+                    }
+                    ClaudeAlignStep::Down => {
+                        let screen = terminal.live_screen_lines();
+                        if screen == *sent_screen {
+                            if last_sent.elapsed() > CLAUDE_NAV_RESEND_AFTER {
+                                if *resends < CLAUDE_NAV_MAX_RESENDS {
+                                    *resends += 1;
+                                    let _ = terminal.write_input(CLAUDE_LINE_DOWN_BYTES);
+                                    *last_sent = now;
+                                } else {
+                                    Self::claude_nav_log(&format!(
+                                        "done: wheel down changed nothing with {target:?} at row {row}"
+                                    ));
+                                    finished.push(index);
+                                }
+                            }
+                            continue;
+                        }
+                        match settling {
+                            Some(seen) if *seen == screen => {}
+                            _ => {
+                                *settling = Some(screen);
+                                continue;
+                            }
+                        }
+                        if screen.get(*row - 1) == Some(target) {
+                            *row -= 1;
+                            *step = ClaudeAlignStep::Idle;
+                        } else if let Some(found) = screen.iter().position(|line| line == target) {
+                            // A blind notch was dropped or doubled; pick up
+                            // from where the target actually is.
+                            *row = found;
+                            *step = ClaudeAlignStep::Idle;
+                        } else {
+                            // Slid off the top (under the sticky prompt).
+                            // Undo that step.
+                            Self::claude_nav_log(&format!(
+                                "{target:?} left the screen from row {row}; rows[0..3]={:?}; restoring",
+                                &screen[..screen.len().min(3)]
+                            ));
+                            *sent_screen = screen;
+                            *resends = 0;
+                            let _ = terminal.write_input(CLAUDE_LINE_UP_BYTES);
+                            self.dirty = true;
+                            *last_sent = now;
+                            *step = ClaudeAlignStep::Restore;
+                        }
+                    }
+                    ClaudeAlignStep::Restore => {
+                        let screen = terminal.live_screen_lines();
+                        if screen == *sent_screen && last_sent.elapsed() > CLAUDE_NAV_RESEND_AFTER {
+                            if *resends < CLAUDE_NAV_MAX_RESENDS {
+                                *resends += 1;
+                                let _ = terminal.write_input(CLAUDE_LINE_UP_BYTES);
+                                *last_sent = now;
+                            } else {
+                                Self::claude_nav_log("done: restore changed nothing");
+                                finished.push(index);
+                            }
+                            continue;
+                        }
+                        if screen.iter().any(|line| line == target)
+                            || last_sent.elapsed() > CLAUDE_NAV_REPAINT_TIMEOUT
+                        {
+                            Self::claude_nav_log(&format!(
+                                "done: restored, {target:?} at row {:?}",
+                                screen.iter().position(|line| line == target)
+                            ));
+                            finished.push(index);
+                        }
+                    }
+                },
+            }
+        }
+        for index in finished.into_iter().rev() {
+            self.claude_message_navs.remove(index);
+        }
+    }
+
+    /// Whether a Claude Code worker's own transcript view (Ctrl+O) is open,
+    /// read off its screen (the footer marker). Alt+B closes it with `q`
+    /// first when it is; Alt+V leaves it alone.
+    fn claude_transcript_view_open(run: &mut AgentRun) -> bool {
+        run.terminal
+            .as_mut()
+            .is_some_and(|terminal| terminal.live_screen_contains(CLAUDE_TRANSCRIPT_VIEW_MARKER))
     }
 
     fn send_to_interactive_orchestrator(&mut self, input: &str) -> bool {
@@ -17307,6 +17908,7 @@ What to do\n\
         }
         self.emit_dashboard_opened_once();
         self.flush_pending_enters();
+        self.drive_claude_message_navs();
         self.maybe_start_queued_reconcile();
         self.poll_task_summary_workers();
         self.poll_completion_summary_workers();

@@ -1674,6 +1674,17 @@ button:focus-visible {
   margin-top: 14px;
 }
 
+.quota-blocked {
+  color: var(--st-failed);
+  background: color-mix(in srgb, var(--st-failed) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--st-failed) 35%, transparent);
+  border-radius: 6px;
+  font-size: 12px;
+  padding: 4px 8px;
+  margin-top: 8px;
+  text-transform: capitalize;
+}
+
 .meters {
   display: grid;
   gap: 12px;

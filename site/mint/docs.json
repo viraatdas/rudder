@@ -1,0 +1,66 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "mint",
+  "name": "Rudder",
+  "description": "Run coding agents in parallel on one repo. Each works in its own copy, so they cannot collide.",
+  "colors": {
+    "primary": "#0b747c",
+    "light": "#3aa7ae",
+    "dark": "#0b6e74"
+  },
+  "logo": {
+    "light": "/logo.svg",
+    "dark": "/logo.svg",
+    "href": "https://rudder.viraat.dev"
+  },
+  "favicon": "/logo.svg",
+  "navigation": {
+    "groups": [
+      {
+        "group": "Get Started",
+        "pages": [
+          "index",
+          "install",
+          "first-agent"
+        ]
+      },
+      {
+        "group": "Core",
+        "pages": [
+          "workspaces",
+          "plans",
+          "gam"
+        ]
+      },
+      {
+        "group": "Reference",
+        "pages": [
+          "commands",
+          "faq"
+        ]
+      }
+    ]
+  },
+  "navbar": {
+    "links": [
+      {
+        "label": "GitHub",
+        "href": "https://github.com/viraatdas/rudder"
+      },
+      {
+        "label": "npm",
+        "href": "https://www.npmjs.com/package/@viraatdas/rudder"
+      }
+    ],
+    "primary": {
+      "type": "button",
+      "label": "Website",
+      "href": "https://rudder.viraat.dev"
+    }
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/viraatdas/rudder"
+    }
+  }
+}

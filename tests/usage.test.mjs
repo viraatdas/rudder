@@ -227,6 +227,46 @@ test("Claude quota meters come from the OAuth usage body and the plan from the p
   assert.match(bare.error, /does not expose limits/);
 });
 
+test("Claude's weekly per-model limit (usage.limits[]) supplements the blended seven_day figure, and a locked window reports blocked", () => {
+  const usage = {
+    five_hour: { utilization: 7, resets_at: "2026-09-11T21:10:00+00:00" },
+    seven_day: { utilization: 25, resets_at: "2026-09-12T22:00:00+00:00" },
+    seven_day_opus: null,
+    seven_day_sonnet: null,
+    limits: [
+      { kind: "session", group: "session", percent: 7, resets_at: "2026-09-11T21:10:00+00:00", scope: null, is_active: false },
+      { kind: "weekly_all", group: "weekly", percent: 25, resets_at: "2026-09-12T22:00:00+00:00", scope: null, is_active: false },
+      {
+        kind: "weekly_scoped",
+        group: "weekly",
+        percent: 41,
+        resets_at: "2026-09-12T22:00:00+00:00",
+        scope: { model: { id: null, display_name: "Fable" } },
+        is_active: true,
+      },
+    ],
+  };
+  const profile = { account: { email: "me@example.com" }, organization: { rate_limit_tier: "default_claude_max_20x" } };
+  const quota = parseClaudeQuota(usage, profile, "max");
+  assert.deepEqual(
+    quota.windows.map((w) => [w.label, w.percent]),
+    [
+      ["Session (5h)", 7],
+      ["Weekly", 25],
+      ["Weekly · Fable", 41],
+    ],
+    "the currently-active model's scoped weekly limit is surfaced alongside the blended one",
+  );
+  assert.equal(quota.blocked, null);
+
+  const locked = parseClaudeQuota(
+    { five_hour: { utilization: 100, resets_at: null, locked_reason: "usage_limit_reached" } },
+    profile,
+    "max",
+  );
+  assert.equal(locked.blocked, "blocked — usage limit reached");
+});
+
 test("Codex quota meters label windows by length and include the extra per-model limits", () => {
   const body = {
     email: "me@example.com",
@@ -257,6 +297,28 @@ test("Codex quota meters label windows by length and include the extra per-model
     ],
   );
   assert.equal(quota.windows[0].resetsAt, new Date(1789586739 * 1000).toISOString());
+});
+
+test("Codex plan labels come from OpenAI's own plan_type enum, exact-matched so 'prolite' isn't swallowed by a 'pro' substring check", () => {
+  assert.equal(parseCodexQuota({ plan_type: "pro" }).plan, "Pro");
+  assert.equal(parseCodexQuota({ plan_type: "prolite" }).plan, "Pro Lite");
+  assert.equal(parseCodexQuota({ plan_type: "plus" }).plan, "Plus");
+  assert.equal(parseCodexQuota({ plan_type: "self_serve_business_prolite" }).plan, "Self Serve Business Prolite");
+  assert.equal(parseCodexQuota({}).plan, null);
+});
+
+test("a Codex account that has hit its rate limit reports why, without hiding the meters", () => {
+  const body = {
+    plan_type: "plus",
+    rate_limit: { allowed: false, limit_reached: true, primary_window: { used_percent: 100, limit_window_seconds: 604800, reset_at: 1789586739 } },
+    rate_limit_reached_type: { type: "workspace_owner_credits_depleted" },
+  };
+  const quota = parseCodexQuota(body);
+  assert.equal(quota.blocked, "blocked — workspace owner's credits are depleted");
+  assert.equal(quota.windows.length, 1, "the meter is still reported alongside the block reason");
+
+  const clear = parseCodexQuota({ plan_type: "plus", rate_limit: { allowed: true, limit_reached: false } });
+  assert.equal(clear.blocked, null);
 });
 
 test("ps output is reduced to agent processes, classified and sorted by cpu", () => {

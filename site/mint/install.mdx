@@ -1,0 +1,45 @@
+---
+title: "Install"
+description: "One global npm install. Rudder checks for jj on the way in and installs it if you do not have it."
+---
+
+## Install it
+
+```bash
+$ npm install -g @viraatdas/rudder@latest
+```
+
+Then, from inside any git repository:
+
+```bash
+$ cd ~/code/your-project
+$ rudder
+```
+
+That opens the dashboard. On a repository Rudder has not seen before, it sets up the jj colocation it needs and leaves your git history alone.
+
+## About jj
+
+Rudder uses [jj (Jujutsu)](https://jj-vcs.github.io/jj/latest/) as its isolation mechanism. jj sits **alongside** git in the same repository, so your git remotes, branches and history keep working exactly as before, and your teammates never need to know it is there.
+
+The install script checks for jj and installs it if it is missing. It never fails the install: if it cannot, it prints how to install jj yourself and exits cleanly.
+
+## Agent CLIs
+
+Rudder drives agent CLIs you have already installed and signed into. Install whichever you want to use:
+
+| backend | what to install |
+| --- | --- |
+| claude | Claude Code |
+| codex | OpenAI Codex CLI |
+| opencode | opencode |
+
+You do not need all three. Rudder detects what is present and offers only those.
+
+## Updating
+
+```bash
+$ npm install -g @viraatdas/rudder@latest
+```
+
+Rudder tells you in the dashboard when a newer version is published.

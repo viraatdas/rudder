@@ -3396,6 +3396,534 @@ fn no_op_worker_scroll_does_not_mark_dirty() {
     assert!(!app.dirty, "no-op scroll must not force a redraw");
 }
 
+#[test]
+fn claude_message_nav_byte_constants() {
+    assert_eq!(CLAUDE_PAGE_UP_BYTES, b"\x1b[5~".as_slice());
+    assert_eq!(CLAUDE_LINE_UP_BYTES, b"\x1b[<64;1;1M".as_slice());
+    assert_eq!(CLAUDE_LINE_DOWN_BYTES, b"\x1b[<65;1;1M".as_slice());
+    assert_eq!(
+        CLAUDE_JUMP_TO_LATEST_BYTES,
+        b"\x1b[1;5F\x1b[1;5F".as_slice()
+    );
+    assert_eq!(
+        CLAUDE_TRANSCRIPT_EXIT_TO_LATEST_BYTES,
+        b"q\x1b[1;5F\x1b[1;5F".as_slice()
+    );
+    assert_eq!(CLAUDE_TRANSCRIPT_VIEW_MARKER, "Showing detailed transcript");
+}
+
+#[test]
+fn claude_transcript_view_open_is_read_off_the_screen_only() {
+    let mut run = test_agent_run("claude-1", "task");
+    run.backend = Backend::Claude;
+    assert!(
+        !App::claude_transcript_view_open(&mut run),
+        "no terminal: nothing on screen, so closed"
+    );
+}
+
+/// A stand-in for Claude Code's normal view, faithful in the ways the Alt+V
+/// walk depends on (all measured against claude 2.1.276): PageUp/PageDown
+/// move half a page; a mouse-wheel notch moves one line, except that the
+/// first notch after a change of direction is dropped; while scrolled, the
+/// current prompt is pinned to row 0 over the content; Ctrl+End jumps to
+/// the bottom; Ctrl+O toggles a transcript view whose footer carries the
+/// marker text and which `q` leaves; anything else typed in the normal view
+/// lands in the prompt line (so a stray nav key is visible). The transcript
+/// is five-line items — blank, timestamp, `⏺ message N`, body, body.
+#[cfg(not(windows))]
+const FAKE_CLAUDE_PAGER: &str = r#"
+import os, sys, tty
+ROWS = int(sys.argv[1]); N = int(sys.argv[2])
+lines = []
+for i in range(N):
+    k, off = divmod(i, 5)
+    lines.append(["", "  12:00 PM", f"⏺ message {k}", f"  body {i}", f"  body {i}"][off])
+content = ROWS - 2
+bottom = max(0, N - content)
+top = bottom
+view = "normal"
+typed = ""
+last_dir = None
+STICKY = "❯ the task prompt"
+def draw():
+    if view == "normal" and top < bottom:
+        rows = [STICKY] + lines[top + 1:top + content]
+    else:
+        rows = lines[top:top + content]
+    rows += [""] * (content - len(rows))
+    footer = "Showing detailed transcript · fake" if view == "transcript" else "❯ " + typed
+    sys.stdout.write("\x1b[H\x1b[2J" + "\r\n".join(rows + ["-" * 20, footer]))
+    sys.stdout.flush()
+tty.setraw(sys.stdin.fileno())
+draw()
+while True:
+    data = os.read(0, 256)
+    if not data:
+        break
+    while data:
+        key = None
+        for seq in (b"\x1b[1;5F", b"\x1b[5~", b"\x1b[6~", b"\x1b[<64;1;1M", b"\x1b[<65;1;1M"):
+            if data.startswith(seq):
+                key, data = seq, data[len(seq):]
+                break
+        if key is None:
+            key, data = data[:1], data[1:]
+        if key == b"\x03":
+            sys.exit(0)
+        if key == b"\x0f":
+            view = "transcript" if view == "normal" else "normal"
+            top = bottom
+        elif view == "transcript":
+            if key == b"q":
+                view = "normal"; top = bottom
+        else:
+            if key == b"\x1b[1;5F":
+                top = bottom; last_dir = None
+            elif key == b"\x1b[5~":
+                top = max(0, top - content // 2); last_dir = None
+            elif key == b"\x1b[6~":
+                top = min(bottom, top + content // 2); last_dir = None
+            elif key == b"\x1b[<64;1;1M":
+                if last_dir == "up":
+                    top = max(0, top - 1)
+                last_dir = "up"
+            elif key == b"\x1b[<65;1;1M":
+                if last_dir == "down":
+                    top = min(bottom, top + 1)
+                last_dir = "down"
+            else:
+                typed += key.decode("utf-8", "replace")
+    draw()
+"#;
+
+#[cfg(not(windows))]
+fn spawn_fake_claude_pager_app(rows: u16, transcript_lines: usize) -> App {
+    let script = std::env::temp_dir().join(format!(
+        "rudder-fake-claude-pager-{}.py",
+        std::process::id()
+    ));
+    std::fs::write(&script, FAKE_CLAUDE_PAGER).unwrap();
+    let command = TerminalCommand::with_args(
+        "python3",
+        [
+            script.to_string_lossy().to_string(),
+            rows.to_string(),
+            transcript_lines.to_string(),
+        ],
+    );
+    let pane = TerminalPane::spawn_shell_or_command(
+        Some(command),
+        TerminalPaneOptions {
+            size: TerminalSize { rows, cols: 60 },
+            scrollback_lines: 100,
+            ..Default::default()
+        },
+    )
+    .expect("spawn fake pager");
+
+    let mut app = App::new();
+    app.focus = FocusPane::Worker;
+    app.worker_area = Some(Rect {
+        x: 0,
+        y: 0,
+        width: 60,
+        height: rows + 2,
+    });
+    let mut run = test_agent_run_with_terminal(&app, pane);
+    run.backend = Backend::Claude;
+    app.agents.push(run);
+    app.selected_agent = 0;
+    // Wait for the first draw.
+    for _ in 0..100 {
+        std::thread::sleep(Duration::from_millis(20));
+        if app.agents[0]
+            .terminal
+            .as_mut()
+            .unwrap()
+            .live_screen_contains("❯")
+        {
+            break;
+        }
+    }
+    app
+}
+
+/// Tick the app the way the main loop does until the Alt+V walk finishes.
+#[cfg(not(windows))]
+fn drive_nav_to_completion(app: &mut App) -> Vec<String> {
+    let start = Instant::now();
+    while !app.claude_message_navs.is_empty() {
+        assert!(
+            start.elapsed() < Duration::from_secs(8),
+            "the Alt+V walk should finish: {:?}",
+            app.agents[0].terminal.as_mut().unwrap().live_screen_lines()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+        app.drive_claude_message_navs();
+    }
+    // Let the last keystroke's redraw land.
+    std::thread::sleep(Duration::from_millis(150));
+    app.agents[0].terminal.as_mut().unwrap().live_screen_lines()
+}
+
+#[cfg(not(windows))]
+#[test]
+fn alt_v_walks_the_normal_view_to_each_previous_message() {
+    // 16 rows: 14 of content, 2 of footer. 60 transcript lines in five-line
+    // items (blank, timestamp, `⏺ message N`, body, body); the bottom page
+    // (lines 46..60) shows messages 9, 10 and 11, with 9 on row 1.
+    let mut app = spawn_fake_claude_pager_app(16, 60);
+    let at_rest = app.agents[0].terminal.as_mut().unwrap().live_screen_lines();
+    assert_eq!(at_rest[1], "⏺ message 9", "{at_rest:?}");
+
+    // First Alt+V: PageUp only — never Ctrl+O — then the walk wheels the
+    // nearest message above the old top up under the sticky prompt line.
+    app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::ALT));
+    assert_eq!(app.claude_message_navs.len(), 1);
+    let screen = drive_nav_to_completion(&mut app);
+    assert_eq!(
+        &screen[..2],
+        ["❯ the task prompt", "⏺ message 8"],
+        "the previous message sits right under the pinned prompt: {screen:?}"
+    );
+    assert!(
+        !screen.iter().any(|l| l.contains(CLAUDE_TRANSCRIPT_VIEW_MARKER)),
+        "Alt+V must not open the transcript view: {screen:?}"
+    );
+
+    // Each further press goes one message further up — the whole point.
+    for expected in ["⏺ message 7", "⏺ message 6", "⏺ message 5"] {
+        app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::ALT));
+        assert_eq!(app.claude_message_navs.len(), 1, "a press starts one walk");
+        let screen = drive_nav_to_completion(&mut app);
+        assert_eq!(screen[1], expected, "{screen:?}");
+        assert_eq!(screen[0], "❯ the task prompt", "{screen:?}");
+    }
+
+    // Alt+B: Ctrl+End puts the bottom back, with nothing typed into the
+    // prompt along the way.
+    app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT));
+    std::thread::sleep(Duration::from_millis(200));
+    let screen = app.agents[0].terminal.as_mut().unwrap().live_screen_lines();
+    assert_eq!(screen, at_rest, "back at the bottom page: {screen:?}");
+    assert_eq!(
+        screen.last().map(String::as_str),
+        Some("❯"),
+        "no nav key was ever typed into the prompt: {screen:?}"
+    );
+
+    // And a second Alt+B from the normal view is a plain Ctrl+End: still
+    // nothing typed.
+    app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT));
+    std::thread::sleep(Duration::from_millis(200));
+    let screen = app.agents[0].terminal.as_mut().unwrap().live_screen_lines();
+    assert_eq!(screen.last().map(String::as_str), Some("❯"), "{screen:?}");
+}
+
+#[cfg(not(windows))]
+#[test]
+fn alt_v_stops_at_the_top_of_the_transcript_and_says_so() {
+    // 12 transcript lines on a 16-row pane: everything fits on one page, so
+    // a page-up changes nothing. The walk must notice and stop instead of
+    // paging forever.
+    let mut app = spawn_fake_claude_pager_app(16, 12);
+    app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::ALT));
+    let start = Instant::now();
+    drive_nav_to_completion(&mut app);
+    assert!(
+        start.elapsed() < Duration::from_secs(3),
+        "an unmovable page finishes within the repaint timeout"
+    );
+    assert_eq!(
+        app.notice.as_deref(),
+        Some("Alt+V: nothing above — the whole conversation is already on screen")
+    );
+}
+
+#[cfg(not(windows))]
+#[test]
+fn a_second_alt_v_during_a_walk_is_dropped_not_queued() {
+    let mut app = spawn_fake_claude_pager_app(16, 60);
+    app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::ALT));
+    app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::ALT));
+    assert_eq!(
+        app.claude_message_navs.len(),
+        1,
+        "two walks would race each other's keystrokes"
+    );
+    let screen = drive_nav_to_completion(&mut app);
+    assert_eq!(screen[1], "⏺ message 8", "{screen:?}");
+}
+
+#[cfg(not(windows))]
+#[test]
+fn alt_b_cancels_an_in_flight_alt_v_walk() {
+    let mut app = spawn_fake_claude_pager_app(16, 60);
+    app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::ALT));
+    assert!(app.claude_message_nav_active("run-1"));
+
+    // Alt+B fires mid-walk: the walk must be dropped, not left to keep
+    // scrolling a view that was just sent back to the bottom.
+    app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT));
+    assert!(app.claude_message_navs.is_empty());
+    std::thread::sleep(Duration::from_millis(300));
+    app.drive_claude_message_navs();
+    let screen = app.agents[0].terminal.as_mut().unwrap().live_screen_lines();
+    assert_eq!(screen[1], "⏺ message 9", "at the bottom, walk gone: {screen:?}");
+
+    // A walk for a run with no terminal never starts.
+    let mut bare = App::new();
+    let mut run = test_agent_run("claude-1", "task");
+    run.backend = Backend::Claude;
+    bare.agents.push(run);
+    bare.start_claude_message_nav("claude-1");
+    assert!(bare.claude_message_navs.is_empty());
+}
+
+#[cfg(not(windows))]
+fn spawn_claude_nav_test_app() -> App {
+    // `cat -v` renders control/escape bytes in caret notation (ESC -> `^[`,
+    // Ctrl+O -> `^O`) so the exact byte sequence rudder sent is visible and
+    // assertable, instead of relying on vt100 to render something
+    // distinguishing.
+    let command = TerminalCommand::with_args("/bin/sh", ["-lc", "cat -v"]);
+    let pane = TerminalPane::spawn_shell_or_command(
+        Some(command),
+        TerminalPaneOptions {
+            size: TerminalSize { rows: 8, cols: 60 },
+            scrollback_lines: 100,
+            ..Default::default()
+        },
+    )
+    .expect("spawn test pty");
+    std::thread::sleep(Duration::from_millis(80));
+
+    let mut app = App::new();
+    app.focus = FocusPane::Worker;
+    app.worker_area = Some(Rect {
+        x: 0,
+        y: 0,
+        width: 60,
+        height: 10,
+    });
+    let mut run = test_agent_run_with_terminal(&app, pane);
+    run.backend = Backend::Claude;
+    app.agents.push(run);
+    app.selected_agent = 0;
+    app
+}
+
+/// Poll the child's echo until `predicate` holds (or give up), returning the
+/// screen text either way so a failing assertion can show it.
+#[cfg(not(windows))]
+fn wait_for_screen(app: &mut App, predicate: impl Fn(&str) -> bool) -> String {
+    let mut snapshot = String::new();
+    for _ in 0..20 {
+        std::thread::sleep(Duration::from_millis(25));
+        app.agents[0].terminal.as_mut().unwrap().drain_output();
+        snapshot = app.agents[0]
+            .terminal
+            .as_ref()
+            .unwrap()
+            .visible_lines_snapshot()
+            .join("\n");
+        if predicate(&snapshot) {
+            break;
+        }
+    }
+    snapshot
+}
+
+#[cfg(not(windows))]
+#[test]
+fn alt_v_and_alt_b_read_the_transcript_view_state_off_the_screen() {
+    let mut app = spawn_claude_nav_test_app();
+
+    // Nothing sent yet and the screen shows no footer marker: Alt+B is a
+    // plain Ctrl+End (no `q`, which would be typed into the prompt in the
+    // normal view).
+    app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT));
+    let snapshot = wait_for_screen(&mut app, |s| s.contains("^[[1;5F^[[1;5F"));
+    assert!(
+        snapshot.contains("^[[1;5F^[[1;5F") && !snapshot.contains('q'),
+        "Alt+B from the normal view is Ctrl+End only: {snapshot:?}"
+    );
+
+    // Alt+V in the normal view: PageUp, never Ctrl+O.
+    app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::ALT));
+    assert_eq!(app.claude_message_navs.len(), 1);
+    let snapshot = wait_for_screen(&mut app, |s| s.contains("^[[5~"));
+    assert!(
+        snapshot.contains("^[[5~") && !snapshot.contains("^O"),
+        "Alt+V pages the normal view up: {snapshot:?}"
+    );
+    app.cancel_claude_message_nav("run-1");
+
+    // Now the child's screen shows Claude Code's transcript-view footer
+    // (cat echoes it back): the user opened that view by hand. Alt+V must
+    // leave it alone and say so — PageUp/wheel events there would scroll
+    // the wrong thing — and Alt+B must close it with `q` before Ctrl+End,
+    // which is a no-op inside it.
+    app.agents[0]
+        .terminal
+        .as_mut()
+        .unwrap()
+        .write_input(b"Showing detailed transcript\n")
+        .unwrap();
+    let snapshot = wait_for_screen(&mut app, |s| s.contains("Showing detailed transcript"));
+    assert!(snapshot.contains("Showing detailed transcript"), "{snapshot:?}");
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::ALT));
+    assert!(app.claude_message_navs.is_empty(), "no walk inside the transcript view");
+    assert_eq!(
+        app.notice.as_deref(),
+        Some("Alt+V scrolls the normal view — press q to leave the transcript view first")
+    );
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT));
+    let snapshot = wait_for_screen(&mut app, |s| s.contains("q^[[1;5F^[[1;5F"));
+    assert!(
+        snapshot.contains("q^[[1;5F^[[1;5F"),
+        "Alt+B with the footer on screen closes the view: {snapshot:?}"
+    );
+}
+
+#[cfg(not(windows))]
+#[test]
+fn alt_v_and_alt_b_work_even_when_the_terminal_swallows_the_alt_modifier() {
+    // On Ghostty's default (macos-option-as-alt unset, non-US-standard
+    // layout) and the historical Terminal.app/iTerm2 default, Option+key
+    // doesn't report an ALT modifier at all — it produces the macOS composed
+    // character instead: Option+v is "√" (U+221A) and Option+b is "∫"
+    // (U+222B). If the dispatcher requires KeyModifiers::ALT on top of
+    // matching one of those characters, this path can never fire, since the
+    // whole reason the composed character was sent is that ALT was NOT
+    // reported. This regression shipped once already.
+    let command = TerminalCommand::with_args("/bin/sh", ["-lc", "cat -v"]);
+    let pane = TerminalPane::spawn_shell_or_command(
+        Some(command),
+        TerminalPaneOptions {
+            size: TerminalSize { rows: 5, cols: 40 },
+            scrollback_lines: 100,
+            ..Default::default()
+        },
+    )
+    .expect("spawn test pty");
+    std::thread::sleep(Duration::from_millis(80));
+
+    let mut app = App::new();
+    app.focus = FocusPane::Worker;
+    app.worker_area = Some(Rect {
+        x: 0,
+        y: 0,
+        width: 40,
+        height: 7,
+    });
+    let mut run = test_agent_run_with_terminal(&app, pane);
+    run.backend = Backend::Claude;
+    app.agents.push(run);
+    app.selected_agent = 0;
+
+    // No ALT modifier at all — just the composed characters, as a
+    // Option-as-alt-swallowing terminal would actually deliver them.
+    app.handle_key(KeyEvent::new(
+        KeyCode::Char('\u{221a}'),
+        KeyModifiers::empty(),
+    ));
+    let mut snapshot = String::new();
+    for _ in 0..20 {
+        std::thread::sleep(Duration::from_millis(25));
+        app.agents[0].terminal.as_mut().unwrap().drain_output();
+        snapshot = app.agents[0]
+            .terminal
+            .as_ref()
+            .unwrap()
+            .visible_lines_snapshot()
+            .join("\n");
+        if snapshot.contains("^[[5~") {
+            break;
+        }
+    }
+    assert!(
+        snapshot.contains("^[[5~"),
+        "composed √ should still page the worker up: {snapshot:?}"
+    );
+
+    app.handle_key(KeyEvent::new(
+        KeyCode::Char('\u{222b}'),
+        KeyModifiers::empty(),
+    ));
+    for _ in 0..20 {
+        std::thread::sleep(Duration::from_millis(25));
+        app.agents[0].terminal.as_mut().unwrap().drain_output();
+        snapshot = app.agents[0]
+            .terminal
+            .as_ref()
+            .unwrap()
+            .visible_lines_snapshot()
+            .join("\n");
+        if snapshot.contains("^[[1;5F") {
+            break;
+        }
+    }
+    assert!(
+        snapshot.contains("^[[1;5F"),
+        "composed ∫ should still send Ctrl+End: {snapshot:?}"
+    );
+}
+
+#[cfg(not(windows))]
+#[test]
+fn alt_v_is_a_no_op_for_non_claude_backends() {
+    let command = TerminalCommand::with_args("/bin/sh", ["-lc", "cat -v"]);
+    let pane = TerminalPane::spawn_shell_or_command(
+        Some(command),
+        TerminalPaneOptions {
+            size: TerminalSize { rows: 5, cols: 40 },
+            scrollback_lines: 100,
+            ..Default::default()
+        },
+    )
+    .expect("spawn test pty");
+    std::thread::sleep(Duration::from_millis(80));
+
+    let mut app = App::new();
+    app.focus = FocusPane::Worker;
+    app.worker_area = Some(Rect {
+        x: 0,
+        y: 0,
+        width: 40,
+        height: 7,
+    });
+    let mut run = test_agent_run_with_terminal(&app, pane);
+    run.backend = Backend::Codex;
+    app.agents.push(run);
+    app.selected_agent = 0;
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::ALT));
+    std::thread::sleep(Duration::from_millis(120));
+    app.agents[0].terminal.as_mut().unwrap().drain_output();
+    let snapshot = app.agents[0]
+        .terminal
+        .as_ref()
+        .unwrap()
+        .visible_lines_snapshot()
+        .join("\n");
+    assert!(
+        !snapshot.contains("^O"),
+        "Codex has no native transcript-view macro to send: {snapshot:?}"
+    );
+    // Alt+H never silently no-ops — it either acts or nothing about the key
+    // was recognized at all. When Alt+V/Alt+B IS recognized but can't run
+    // (wrong backend here), it should say so instead of doing nothing
+    // invisibly, the same way a failed action elsewhere sets self.notice.
+    assert_eq!(
+        app.notice.as_deref(),
+        Some("Alt+V only works for a Claude Code worker (this one is codex)")
+    );
+}
+
 #[cfg(not(windows))]
 #[test]
 fn wheel_scroll_routes_to_worker_under_pointer_even_when_task_is_focused() {
@@ -3824,6 +4352,30 @@ fn maps_page_keys_for_terminal_passthrough() {
     assert_eq!(
         terminal_bytes_for_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)),
         Some(b"\x1b[Z".to_vec())
+    );
+}
+
+#[test]
+fn ctrl_home_and_ctrl_end_reach_the_child_with_their_modifier_intact() {
+    // Claude Code's fullscreen renderer binds Ctrl+Home/Ctrl+End to jump to the
+    // start of the conversation and to the latest message. Plain Home/End must
+    // keep working unmodified for everything else that relies on them (readline
+    // editing, other backends' transcript modes).
+    assert_eq!(
+        terminal_bytes_for_key(KeyEvent::new(KeyCode::Home, KeyModifiers::empty())),
+        Some(b"\x1b[H".to_vec())
+    );
+    assert_eq!(
+        terminal_bytes_for_key(KeyEvent::new(KeyCode::End, KeyModifiers::empty())),
+        Some(b"\x1b[F".to_vec())
+    );
+    assert_eq!(
+        terminal_bytes_for_key(KeyEvent::new(KeyCode::Home, KeyModifiers::CONTROL)),
+        Some(b"\x1b[1;5H".to_vec())
+    );
+    assert_eq!(
+        terminal_bytes_for_key(KeyEvent::new(KeyCode::End, KeyModifiers::CONTROL)),
+        Some(b"\x1b[1;5F".to_vec())
     );
 }
 
@@ -6190,11 +6742,11 @@ fn orchestrator_chat_word_editing_keys() {
         "use python ".chars().count()
     );
 
-    // Alt+Left jumps back over a word ("python "), then Alt+Backspace removes it.
+    // Alt+Left jumps back over a word ("python "). (Alt+B used to do the same
+    // via previous_word_position, but that binding was unused and was freed
+    // for the Alt+B "jump to latest message" worker shortcut instead.)
     app.handle_orchestrator_chat_key(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT));
     assert_eq!(app.agents[0].worker_input_cursor, "use ".chars().count());
-    app.handle_orchestrator_chat_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT));
-    assert_eq!(app.agents[0].worker_input_cursor, 0);
 
     // Ctrl+K truncates from the cursor to the end of the line.
     app.handle_orchestrator_chat_key(KeyEvent::new(KeyCode::End, KeyModifiers::empty()));
@@ -23072,4 +23624,748 @@ fn a_plan_whose_planner_row_never_landed_is_dropped_on_reload_not_restored_as_a_
     let app = harness.reload();
     assert_eq!(app.plans.len(), 1);
     assert_eq!(app.plans[0].id, "plan-only");
+}
+
+/// Manual reproduction against the real `claude` binary through Rudder's own
+/// code path (TerminalPane + handle_key + the deferred flush): builds a short
+/// conversation, then presses Alt+V repeatedly at slow (> grace window) and
+/// fast spacing and prints what the pane shows after each press. Costs API
+/// calls; run by hand:
+///   cargo test --bin rudder-native live_claude_alt_v_repro -- --ignored --nocapture
+#[cfg(not(windows))]
+#[test]
+#[ignore]
+fn live_claude_alt_v_repro() {
+    let claude = std::env::var("RUDDER_TEST_CLAUDE")
+        .unwrap_or_else(|_| "/Users/viraat/.local/bin/claude".to_string());
+    let cwd = std::env::temp_dir().join("rudder-live-alt-v-repro");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let command = TerminalCommand::with_args(
+        claude,
+        [
+            "--model",
+            "claude-haiku-4-5-20251001",
+            "--permission-mode",
+            "bypassPermissions",
+        ],
+    )
+    .with_env("CLAUDE_CODE_CHILD_SESSION", "")
+    .with_env("TERM", "xterm-256color");
+    let rows: u16 = std::env::var("RUDDER_TEST_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
+    let cols: u16 = std::env::var("RUDDER_TEST_COLS").ok().and_then(|v| v.parse().ok()).unwrap_or(100);
+    let pane = TerminalPane::spawn_shell_or_command(
+        Some(command),
+        TerminalPaneOptions {
+            size: TerminalSize { rows, cols },
+            cwd: Some(cwd),
+            scrollback_lines: 2000,
+            ..Default::default()
+        },
+    )
+    .expect("spawn claude");
+
+    let mut app = App::new();
+    app.focus = FocusPane::Worker;
+    app.worker_area = Some(Rect { x: 0, y: 0, width: cols, height: rows + 2 });
+    let mut run = test_agent_run_with_terminal(&app, pane);
+    run.backend = Backend::Claude;
+    app.agents.push(run);
+    app.selected_agent = 0;
+
+    fn settle(app: &mut App, quiet: Duration, max: Duration) {
+        let start = Instant::now();
+        let mut last = Instant::now();
+        loop {
+            std::thread::sleep(Duration::from_millis(33));
+            app.drive_claude_message_navs();
+            let bytes = app.agents[0].terminal.as_mut().unwrap().drain_output();
+            if !bytes.is_empty() {
+                last = Instant::now();
+            } else if last.elapsed() >= quiet {
+                return;
+            }
+            if start.elapsed() > max {
+                eprintln!("!!! settle timed out");
+                return;
+            }
+        }
+    }
+
+    settle(&mut app, Duration::from_secs(1), Duration::from_secs(10));
+    let screen = app.agents[0].terminal.as_mut().unwrap().visible_lines().join("\n");
+    eprintln!("--- boot screen ---\n{screen}\n--- log tail: {:?}", {
+        let log = app.agents[0].terminal.as_ref().unwrap().output_log_snapshot();
+        log.chars().rev().take(600).collect::<String>().chars().rev().collect::<String>()
+    });
+    if screen.to_lowercase().contains("trust") {
+        // "No, exit" is the default; pick "Yes, I trust this folder".
+        app.agents[0].terminal.as_mut().unwrap().write_input(b"\x1b[B").unwrap();
+        settle(&mut app, Duration::from_millis(500), Duration::from_secs(3));
+        app.agents[0].terminal.as_mut().unwrap().write_input(b"\r").unwrap();
+        settle(&mut app, Duration::from_secs(1), Duration::from_secs(5));
+    }
+    // Rudder-shaped session: ONE prompt, then a long tool-calling turn.
+    // Claude's own `{` (previous prompt) is useless here; the walk must step
+    // message by message anyway.
+    app.agents[0].terminal.as_mut().unwrap().write_input(b"Run these as SEPARATE Bash tool calls, one at a time, in order: `echo alpha`, `echo bravo`, `echo charlie`, `echo delta`, `echo echo`, `echo foxtrot`. After each one, write one short sentence saying which word it printed. Then say done.").unwrap();
+    settle(&mut app, Duration::from_millis(800), Duration::from_secs(5));
+    app.agents[0].terminal.as_mut().unwrap().write_input(b"\r").unwrap();
+    settle(&mut app, Duration::from_secs(3), Duration::from_secs(150));
+    std::thread::sleep(Duration::from_secs(2));
+    settle(&mut app, Duration::from_secs(1), Duration::from_secs(3));
+    eprintln!(
+        "alt screen: {}  scrollback rows: {}",
+        app.agents[0].terminal.as_mut().unwrap().uses_alternate_screen(),
+        app.agents[0].terminal.as_ref().unwrap().scrollback()
+    );
+    let mut tops: Vec<String> = Vec::new();
+    for i in 1..=8 {
+        let start = Instant::now();
+        app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::ALT));
+        while !app.claude_message_navs.is_empty() && start.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(33));
+            app.drive_claude_message_navs();
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        let lines = app.agents[0].terminal.as_mut().unwrap().live_screen_lines();
+        let notice = app.notice.take();
+        eprintln!(
+            "Alt+V #{i} ({}ms): row0={:?} notice={notice:?} marker={}",
+            start.elapsed().as_millis(),
+            lines[0],
+            lines.iter().any(|l| l.contains(CLAUDE_TRANSCRIPT_VIEW_MARKER))
+        );
+        tops.push(lines[0].clone());
+    }
+    let distinct: std::collections::BTreeSet<&String> = tops.iter().collect();
+    eprintln!("distinct top rows: {} of {}", distinct.len(), tops.len());
+    app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT));
+    settle(&mut app, Duration::from_secs(1), Duration::from_secs(4));
+    let lines = app.agents[0].terminal.as_mut().unwrap().live_screen_lines();
+    eprintln!(
+        "Alt+B: marker={} prompt_line={:?} last rows={:?}",
+        lines.iter().any(|l| l.contains(CLAUDE_TRANSCRIPT_VIEW_MARKER)),
+        lines.iter().rev().find(|l| l.contains('❯')),
+        &lines[lines.len().saturating_sub(6)..]
+    );
+    app.agents[0].terminal.as_mut().unwrap().write_input(b"\x03").unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    app.agents[0].terminal.as_mut().unwrap().write_input(b"/exit\r").unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    app.agents[0].terminal.as_mut().unwrap().terminate_and_wait();
+}
+
+/// Manual probe of Claude Code's transcript pager as seen through Rudder's
+/// own vt100 pane: one prompt, a long tool-calling turn, then each pager
+/// key with a screen dump after it. Run by hand:
+///   cargo test --bin rudder-native live_claude_pager_probe -- --ignored --nocapture
+#[cfg(not(windows))]
+#[test]
+#[ignore]
+fn live_claude_pager_probe() {
+    let claude = std::env::var("RUDDER_TEST_CLAUDE")
+        .unwrap_or_else(|_| "/Users/viraat/.local/bin/claude".to_string());
+    let cwd = std::env::temp_dir().join("rudder-live-alt-v-repro");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let command = TerminalCommand::with_args(
+        claude,
+        ["--model", "claude-haiku-4-5-20251001", "--permission-mode", "bypassPermissions"],
+    )
+    .with_env("CLAUDE_CODE_CHILD_SESSION", "")
+    .with_env("TERM", "xterm-256color");
+    let rows: u16 = std::env::var("RUDDER_TEST_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
+    let cols: u16 = std::env::var("RUDDER_TEST_COLS").ok().and_then(|v| v.parse().ok()).unwrap_or(100);
+    let mut pane = TerminalPane::spawn_shell_or_command(
+        Some(command),
+        TerminalPaneOptions {
+            size: TerminalSize { rows, cols },
+            cwd: Some(cwd),
+            scrollback_lines: 2000,
+            ..Default::default()
+        },
+    )
+    .expect("spawn claude");
+
+    fn settle(pane: &mut TerminalPane, quiet: Duration, max: Duration) {
+        let start = Instant::now();
+        let mut last = Instant::now();
+        loop {
+            std::thread::sleep(Duration::from_millis(33));
+            if !pane.drain_output().is_empty() {
+                last = Instant::now();
+            } else if last.elapsed() >= quiet {
+                return;
+            }
+            if start.elapsed() > max {
+                eprintln!("!!! settle timed out");
+                return;
+            }
+        }
+    }
+    fn dump(pane: &mut TerminalPane, label: &str) {
+        eprintln!("----- {label} -----");
+        for (i, line) in pane.visible_lines().iter().enumerate() {
+            eprintln!("{i:2}| {}", line.chars().take(90).collect::<String>());
+        }
+    }
+    fn wait_change(pane: &mut TerminalPane, before: &[String], timeout: Duration) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < timeout {
+            std::thread::sleep(Duration::from_millis(30));
+            if pane.visible_lines() != before {
+                // settle briefly
+                let mut snap = pane.visible_lines();
+                loop {
+                    std::thread::sleep(Duration::from_millis(50));
+                    let again = pane.visible_lines();
+                    if again == snap {
+                        return true;
+                    }
+                    snap = again;
+                }
+            }
+        }
+        false
+    }
+
+    settle(&mut pane, Duration::from_secs(1), Duration::from_secs(10));
+    if pane.visible_lines().join("\n").to_lowercase().contains("trust") {
+        pane.write_input(b"\x1b[B").unwrap();
+        settle(&mut pane, Duration::from_millis(500), Duration::from_secs(3));
+        pane.write_input(b"\r").unwrap();
+        settle(&mut pane, Duration::from_secs(1), Duration::from_secs(5));
+    }
+    pane.write_input(b"Run these as SEPARATE Bash tool calls, one at a time, in order: `echo alpha`, `echo bravo`, `echo charlie`, `echo delta`, `echo echo`, `echo foxtrot`. After each one, write one short sentence saying which word it printed. Then say done.").unwrap();
+    settle(&mut pane, Duration::from_millis(800), Duration::from_secs(5));
+    pane.write_input(b"\r").unwrap();
+    settle(&mut pane, Duration::from_secs(3), Duration::from_secs(150));
+    std::thread::sleep(Duration::from_secs(2));
+    settle(&mut pane, Duration::from_secs(1), Duration::from_secs(4));
+    dump(&mut pane, "normal view at rest");
+    pane.write_input(b"\x0f").unwrap();
+    settle(&mut pane, Duration::from_millis(800), Duration::from_secs(4));
+    dump(&mut pane, "transcript view, bottom");
+    let steps: &[(&str, &[u8])] = &[
+        ("b", b"b"), ("b", b"b"), ("k", b"k"), ("k", b"k"), ("j", b"j"), ("jjj bundled", b"jjj"),
+        ("ctrl+u", b"\x15"), ("ctrl+d", b"\x04"), ("up arrow", b"\x1b[A"), ("down arrow", b"\x1b[B"),
+        ("g", b"g"), ("G", b"G"),
+    ];
+    for (label, bytes) in steps {
+        let before = pane.visible_lines();
+        pane.write_input(bytes).unwrap();
+        let changed = wait_change(&mut pane, &before, Duration::from_millis(900));
+        dump(&mut pane, &format!("after {label} (changed={changed})"));
+    }
+    // How many single-line keystrokes survive at a given spacing? From the
+    // top (`g`), send N `j`s spaced S apart and see how far the view moved.
+    for (spacing_ms, count) in [(40u64, 10usize), (80, 10), (150, 10), (40, 5)] {
+        pane.write_input(b"g").unwrap();
+        settle(&mut pane, Duration::from_millis(500), Duration::from_secs(3));
+        let start = pane.visible_lines();
+        for _ in 0..count {
+            pane.write_input(b"j").unwrap();
+            std::thread::sleep(Duration::from_millis(spacing_ms));
+            pane.drain_output();
+        }
+        settle(&mut pane, Duration::from_millis(600), Duration::from_secs(3));
+        let end = pane.visible_lines();
+        // Where did the old row 6 ("❯ Run these…", a stable line) land?
+        let probe = start.iter().position(|l| l.starts_with("❯ Run these")).unwrap_or(0);
+        let landed = end.iter().position(|l| l == &start[probe]);
+        eprintln!(
+            "j x{count} @ {spacing_ms}ms: '❯ Run these' moved from row {probe} to {landed:?} => {} lines scrolled",
+            landed.map(|r| probe as isize - r as isize).map(|v| v.to_string()).unwrap_or("off-screen (>= probe)".into())
+        );
+    }
+    pane.write_input(b"q").unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    pane.write_input(b"\x03").unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    pane.write_input(b"/exit\r").unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    pane.terminate_and_wait();
+}
+
+#[cfg(not(windows))]
+#[test]
+#[ignore]
+fn live_claude_normal_view_probe() {
+    let claude = std::env::var("RUDDER_TEST_CLAUDE")
+        .unwrap_or_else(|_| "/Users/viraat/.local/bin/claude".to_string());
+    let cwd = std::env::temp_dir().join("rudder-live-alt-v-repro");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let command = TerminalCommand::with_args(
+        claude,
+        ["--model", "claude-haiku-4-5-20251001", "--permission-mode", "bypassPermissions"],
+    )
+    .with_env("CLAUDE_CODE_CHILD_SESSION", "")
+    .with_env("TERM", "xterm-256color");
+    let rows: u16 = std::env::var("RUDDER_TEST_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
+    let cols: u16 = std::env::var("RUDDER_TEST_COLS").ok().and_then(|v| v.parse().ok()).unwrap_or(100);
+    let mut pane = TerminalPane::spawn_shell_or_command(
+        Some(command),
+        TerminalPaneOptions {
+            size: TerminalSize { rows, cols },
+            cwd: Some(cwd),
+            scrollback_lines: 2000,
+            ..Default::default()
+        },
+    )
+    .expect("spawn claude");
+
+    fn settle(pane: &mut TerminalPane, quiet: Duration, max: Duration) {
+        let start = Instant::now();
+        let mut last = Instant::now();
+        loop {
+            std::thread::sleep(Duration::from_millis(33));
+            if !pane.drain_output().is_empty() {
+                last = Instant::now();
+            } else if last.elapsed() >= quiet {
+                return;
+            }
+            if start.elapsed() > max {
+                eprintln!("!!! settle timed out");
+                return;
+            }
+        }
+    }
+    fn dump(pane: &mut TerminalPane, label: &str) {
+        eprintln!("----- {label} -----");
+        for (i, line) in pane.visible_lines().iter().enumerate() {
+            eprintln!("{i:2}| {}", line.chars().take(90).collect::<String>());
+        }
+    }
+    fn wait_change(pane: &mut TerminalPane, before: &[String], timeout: Duration) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < timeout {
+            std::thread::sleep(Duration::from_millis(30));
+            if pane.visible_lines() != before {
+                // settle briefly
+                let mut snap = pane.visible_lines();
+                loop {
+                    std::thread::sleep(Duration::from_millis(50));
+                    let again = pane.visible_lines();
+                    if again == snap {
+                        return true;
+                    }
+                    snap = again;
+                }
+            }
+        }
+        false
+    }
+
+    settle(&mut pane, Duration::from_secs(1), Duration::from_secs(10));
+    if pane.visible_lines().join("\n").to_lowercase().contains("trust") {
+        pane.write_input(b"\x1b[B").unwrap();
+        settle(&mut pane, Duration::from_millis(500), Duration::from_secs(3));
+        pane.write_input(b"\r").unwrap();
+        settle(&mut pane, Duration::from_secs(1), Duration::from_secs(5));
+    }
+    pane.write_input(b"Run these as SEPARATE Bash tool calls, one at a time, in order: `echo alpha`, `echo bravo`, `echo charlie`, `echo delta`, `echo echo`, `echo foxtrot`. After each one, write one short sentence saying which word it printed. Then say done.").unwrap();
+    settle(&mut pane, Duration::from_millis(800), Duration::from_secs(5));
+    pane.write_input(b"\r").unwrap();
+    settle(&mut pane, Duration::from_secs(3), Duration::from_secs(150));
+    std::thread::sleep(Duration::from_secs(2));
+    settle(&mut pane, Duration::from_secs(1), Duration::from_secs(4));
+    dump(&mut pane, "normal view at rest");
+    eprintln!("wants sgr mouse events: {}", pane.wants_sgr_mouse_events());
+    let steps: &[(&str, &[u8])] = &[
+        ("PageUp", b"\x1b[5~"), ("PageUp", b"\x1b[5~"), ("PageUp", b"\x1b[5~"),
+        ("wheel down x1 @10;10", b"\x1b[<65;10;10M"), ("wheel down x1 @10;10", b"\x1b[<65;10;10M"),
+        ("wheel down x1 @1;1", b"\x1b[<65;1;1M"), ("wheel down x1 @1;1", b"\x1b[<65;1;1M"),
+        ("wheel up x1 @1;1", b"\x1b[<64;1;1M"), ("wheel up x1 @1;1", b"\x1b[<64;1;1M"),
+        ("wheel down x1 @50;8", b"\x1b[<65;50;8M"),
+        ("PageDown", b"\x1b[6~"),
+        ("Ctrl+End x2", b"\x1b[1;5F\x1b[1;5F"),
+    ];
+    for (label, bytes) in steps {
+        let before = pane.visible_lines();
+        pane.write_input(bytes).unwrap();
+        let changed = wait_change(&mut pane, &before, Duration::from_millis(900));
+        dump(&mut pane, &format!("after {label} (changed={changed})"));
+    }
+    pane.write_input(b"\x15").unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    pane.write_input(b"q").unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    pane.write_input(b"\x03").unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    pane.write_input(b"/exit\r").unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    pane.terminate_and_wait();
+}
+
+#[cfg(not(windows))]
+#[test]
+#[ignore]
+fn live_claude_streaming_scroll_probe() {
+    let claude = std::env::var("RUDDER_TEST_CLAUDE")
+        .unwrap_or_else(|_| "/Users/viraat/.local/bin/claude".to_string());
+    let cwd = std::env::temp_dir().join("rudder-live-alt-v-repro");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let command = TerminalCommand::with_args(
+        claude,
+        ["--model", "claude-haiku-4-5-20251001", "--permission-mode", "bypassPermissions"],
+    )
+    .with_env("CLAUDE_CODE_CHILD_SESSION", "")
+    .with_env("TERM", "xterm-256color");
+    let rows: u16 = std::env::var("RUDDER_TEST_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
+    let cols: u16 = std::env::var("RUDDER_TEST_COLS").ok().and_then(|v| v.parse().ok()).unwrap_or(100);
+    let mut pane = TerminalPane::spawn_shell_or_command(
+        Some(command),
+        TerminalPaneOptions {
+            size: TerminalSize { rows, cols },
+            cwd: Some(cwd),
+            scrollback_lines: 2000,
+            ..Default::default()
+        },
+    )
+    .expect("spawn claude");
+
+    fn settle(pane: &mut TerminalPane, quiet: Duration, max: Duration) {
+        let start = Instant::now();
+        let mut last = Instant::now();
+        loop {
+            std::thread::sleep(Duration::from_millis(33));
+            if !pane.drain_output().is_empty() {
+                last = Instant::now();
+            } else if last.elapsed() >= quiet {
+                return;
+            }
+            if start.elapsed() > max {
+                eprintln!("!!! settle timed out");
+                return;
+            }
+        }
+    }
+    fn dump(pane: &mut TerminalPane, label: &str) {
+        eprintln!("----- {label} -----");
+        for (i, line) in pane.visible_lines().iter().enumerate() {
+            eprintln!("{i:2}| {}", line.chars().take(90).collect::<String>());
+        }
+    }
+    fn wait_change(pane: &mut TerminalPane, before: &[String], timeout: Duration) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < timeout {
+            std::thread::sleep(Duration::from_millis(30));
+            if pane.visible_lines() != before {
+                // settle briefly
+                let mut snap = pane.visible_lines();
+                loop {
+                    std::thread::sleep(Duration::from_millis(50));
+                    let again = pane.visible_lines();
+                    if again == snap {
+                        return true;
+                    }
+                    snap = again;
+                }
+            }
+        }
+        false
+    }
+
+    settle(&mut pane, Duration::from_secs(1), Duration::from_secs(10));
+    if pane.visible_lines().join("\n").to_lowercase().contains("trust") {
+        pane.write_input(b"\x1b[B").unwrap();
+        settle(&mut pane, Duration::from_millis(500), Duration::from_secs(3));
+        pane.write_input(b"\r").unwrap();
+        settle(&mut pane, Duration::from_secs(1), Duration::from_secs(5));
+    }
+    // A long, slow answer so the view is streaming for a while.
+    pane.write_input(b"Count from 1 to 150, one number per line, nothing else.").unwrap();
+    settle(&mut pane, Duration::from_millis(800), Duration::from_secs(5));
+    pane.write_input(b"\r").unwrap();
+    // Wait until the transcript is longer than the screen (row 0 non-empty
+    // content and numbers visible), then probe while it's still streaming.
+    let start = Instant::now();
+    loop {
+        std::thread::sleep(Duration::from_millis(200));
+        pane.drain_output();
+        let lines = pane.visible_lines();
+        if lines.iter().filter(|l| l.trim().parse::<u32>().is_ok()).count() >= 6 || start.elapsed() > Duration::from_secs(20) {
+            break;
+        }
+    }
+    dump(&mut pane, "streaming: before PageUp");
+    let before = pane.visible_lines();
+    pane.write_input(b"\x1b[5~").unwrap();
+    std::thread::sleep(Duration::from_millis(400));
+    pane.drain_output();
+    dump(&mut pane, "streaming: 400ms after PageUp");
+    std::thread::sleep(Duration::from_millis(1500));
+    pane.drain_output();
+    dump(&mut pane, "streaming: 1.9s after PageUp");
+    let _ = before;
+    pane.write_input(b"\x1b[<64;1;1M\x1b[<64;1;1M").unwrap();
+    std::thread::sleep(Duration::from_millis(600));
+    pane.drain_output();
+    dump(&mut pane, "streaming: after wheel up x2");
+    // Let the turn finish, then the same keys.
+    settle(&mut pane, Duration::from_secs(3), Duration::from_secs(120));
+    dump(&mut pane, "idle: at rest");
+    pane.write_input(b"\x1b[5~").unwrap();
+    std::thread::sleep(Duration::from_millis(600));
+    pane.drain_output();
+    dump(&mut pane, "idle: after PageUp");
+    pane.write_input(b"\x1b[1;5F\x1b[1;5F").unwrap();
+    std::thread::sleep(Duration::from_millis(600));
+    pane.drain_output();
+    dump(&mut pane, "idle: at the bottom of a long last message (after Ctrl+End)");
+    pane.write_input(b"\x1b[5~").unwrap();
+    std::thread::sleep(Duration::from_millis(600));
+    pane.drain_output();
+    dump(&mut pane, "idle: PageUp from that bottom");
+    pane.write_input(b"\x1b[5~").unwrap();
+    std::thread::sleep(Duration::from_millis(600));
+    pane.drain_output();
+    dump(&mut pane, "idle: second PageUp");
+    pane.write_input(b"\x1b[1;5F\x1b[1;5F").unwrap();
+    std::thread::sleep(Duration::from_millis(600));
+    pane.drain_output();
+    pane.write_input(b"\x1b[<64;1;1M").unwrap();
+    std::thread::sleep(Duration::from_millis(400));
+    pane.write_input(b"\x1b[<64;1;1M").unwrap();
+    std::thread::sleep(Duration::from_millis(600));
+    pane.drain_output();
+    dump(&mut pane, "idle: wheel up x2 from the bottom");
+    pane.write_input(b"\x15").unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    pane.write_input(b"q").unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    pane.write_input(b"\x03").unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    pane.write_input(b"/exit\r").unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    pane.terminate_and_wait();
+}
+
+#[cfg(not(windows))]
+#[test]
+#[ignore]
+fn live_claude_long_message_scroll_probe() {
+    let claude = std::env::var("RUDDER_TEST_CLAUDE")
+        .unwrap_or_else(|_| "/Users/viraat/.local/bin/claude".to_string());
+    let cwd = std::env::temp_dir().join("rudder-live-alt-v-repro");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let command = TerminalCommand::with_args(
+        claude,
+        ["--model", "claude-haiku-4-5-20251001", "--permission-mode", "bypassPermissions"],
+    )
+    .with_env("CLAUDE_CODE_CHILD_SESSION", "")
+    .with_env("TERM", "xterm-256color");
+    let rows: u16 = std::env::var("RUDDER_TEST_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
+    let cols: u16 = std::env::var("RUDDER_TEST_COLS").ok().and_then(|v| v.parse().ok()).unwrap_or(100);
+    let mut pane = TerminalPane::spawn_shell_or_command(
+        Some(command),
+        TerminalPaneOptions {
+            size: TerminalSize { rows, cols },
+            cwd: Some(cwd),
+            scrollback_lines: 2000,
+            ..Default::default()
+        },
+    )
+    .expect("spawn claude");
+
+    fn settle(pane: &mut TerminalPane, quiet: Duration, max: Duration) {
+        let start = Instant::now();
+        let mut last = Instant::now();
+        loop {
+            std::thread::sleep(Duration::from_millis(33));
+            if !pane.drain_output().is_empty() {
+                last = Instant::now();
+            } else if last.elapsed() >= quiet {
+                return;
+            }
+            if start.elapsed() > max {
+                eprintln!("!!! settle timed out");
+                return;
+            }
+        }
+    }
+    fn dump(pane: &mut TerminalPane, label: &str) {
+        eprintln!("----- {label} -----");
+        for (i, line) in pane.visible_lines().iter().enumerate() {
+            eprintln!("{i:2}| {}", line.chars().take(90).collect::<String>());
+        }
+    }
+    fn wait_change(pane: &mut TerminalPane, before: &[String], timeout: Duration) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < timeout {
+            std::thread::sleep(Duration::from_millis(30));
+            if pane.visible_lines() != before {
+                // settle briefly
+                let mut snap = pane.visible_lines();
+                loop {
+                    std::thread::sleep(Duration::from_millis(50));
+                    let again = pane.visible_lines();
+                    if again == snap {
+                        return true;
+                    }
+                    snap = again;
+                }
+            }
+        }
+        false
+    }
+
+    settle(&mut pane, Duration::from_secs(1), Duration::from_secs(10));
+    if pane.visible_lines().join("\n").to_lowercase().contains("trust") {
+        pane.write_input(b"\x1b[B").unwrap();
+        settle(&mut pane, Duration::from_millis(500), Duration::from_secs(3));
+        pane.write_input(b"\r").unwrap();
+        settle(&mut pane, Duration::from_secs(1), Duration::from_secs(5));
+    }
+    // One VERY long message, like the long explainer that stopped scrolling
+    // in a real session — far longer than the 150-line case, which scrolled.
+    pane.write_input(b"Write a 400-line numbered outline of a fictional distributed system architecture, exactly one short item per line, numbered 1 to 400, no preamble and no commentary.").unwrap();
+    settle(&mut pane, Duration::from_millis(800), Duration::from_secs(5));
+    pane.write_input(b"\r").unwrap();
+    settle(&mut pane, Duration::from_secs(4), Duration::from_secs(300));
+    std::thread::sleep(Duration::from_secs(2));
+    settle(&mut pane, Duration::from_secs(1), Duration::from_secs(5));
+    dump(&mut pane, "long message: at rest");
+    for i in 1..=3 {
+        let before = pane.visible_lines();
+        pane.write_input(b"\x1b[5~").unwrap();
+        std::thread::sleep(Duration::from_millis(700));
+        pane.drain_output();
+        let after = pane.visible_lines();
+        eprintln!("PageUp #{i}: top row changed = {}", before[0] != after[0]);
+        dump(&mut pane, &format!("long message: after PageUp #{i}"));
+    }
+    let before = pane.visible_lines();
+    pane.write_input(&b"\x1b[<64;1;1M".repeat(25)).unwrap();
+    std::thread::sleep(Duration::from_millis(700));
+    pane.drain_output();
+    eprintln!("wheel burst: top row changed = {}", before[0] != pane.visible_lines()[0]);
+    dump(&mut pane, "long message: after wheel burst");
+    let before = pane.visible_lines();
+    pane.write_input(b"\x1b[1;5H").unwrap();
+    std::thread::sleep(Duration::from_millis(700));
+    pane.drain_output();
+    eprintln!("Ctrl+Home: top row changed = {}", before[0] != pane.visible_lines()[0]);
+    dump(&mut pane, "long message: after Ctrl+Home");
+    pane.write_input(b"\x15").unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    pane.write_input(b"q").unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    pane.write_input(b"\x03").unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    pane.write_input(b"/exit\r").unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    pane.terminate_and_wait();
+}
+
+#[cfg(not(windows))]
+#[test]
+#[ignore]
+fn live_claude_long_message_walk() {
+    let claude = std::env::var("RUDDER_TEST_CLAUDE")
+        .unwrap_or_else(|_| "/Users/viraat/.local/bin/claude".to_string());
+    let cwd = std::env::temp_dir().join("rudder-live-alt-v-repro");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let command = TerminalCommand::with_args(
+        claude,
+        [
+            "--model",
+            "claude-haiku-4-5-20251001",
+            "--permission-mode",
+            "bypassPermissions",
+        ],
+    )
+    .with_env("CLAUDE_CODE_CHILD_SESSION", "")
+    .with_env("TERM", "xterm-256color");
+    let rows: u16 = std::env::var("RUDDER_TEST_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
+    let cols: u16 = std::env::var("RUDDER_TEST_COLS").ok().and_then(|v| v.parse().ok()).unwrap_or(100);
+    let pane = TerminalPane::spawn_shell_or_command(
+        Some(command),
+        TerminalPaneOptions {
+            size: TerminalSize { rows, cols },
+            cwd: Some(cwd),
+            scrollback_lines: 2000,
+            ..Default::default()
+        },
+    )
+    .expect("spawn claude");
+
+    let mut app = App::new();
+    app.focus = FocusPane::Worker;
+    app.worker_area = Some(Rect { x: 0, y: 0, width: cols, height: rows + 2 });
+    let mut run = test_agent_run_with_terminal(&app, pane);
+    run.backend = Backend::Claude;
+    app.agents.push(run);
+    app.selected_agent = 0;
+
+    fn settle(app: &mut App, quiet: Duration, max: Duration) {
+        let start = Instant::now();
+        let mut last = Instant::now();
+        loop {
+            std::thread::sleep(Duration::from_millis(33));
+            app.drive_claude_message_navs();
+            let bytes = app.agents[0].terminal.as_mut().unwrap().drain_output();
+            if !bytes.is_empty() {
+                last = Instant::now();
+            } else if last.elapsed() >= quiet {
+                return;
+            }
+            if start.elapsed() > max {
+                eprintln!("!!! settle timed out");
+                return;
+            }
+        }
+    }
+
+    settle(&mut app, Duration::from_secs(1), Duration::from_secs(10));
+    let screen = app.agents[0].terminal.as_mut().unwrap().visible_lines().join("\n");
+    eprintln!("--- boot screen ---\n{screen}\n--- log tail: {:?}", {
+        let log = app.agents[0].terminal.as_ref().unwrap().output_log_snapshot();
+        log.chars().rev().take(600).collect::<String>().chars().rev().collect::<String>()
+    });
+    if screen.to_lowercase().contains("trust") {
+        // "No, exit" is the default; pick "Yes, I trust this folder".
+        app.agents[0].terminal.as_mut().unwrap().write_input(b"\x1b[B").unwrap();
+        settle(&mut app, Duration::from_millis(500), Duration::from_secs(3));
+        app.agents[0].terminal.as_mut().unwrap().write_input(b"\r").unwrap();
+        settle(&mut app, Duration::from_secs(1), Duration::from_secs(5));
+    }
+    // The shape that broke in a real session: one enormous answer, then a
+    // short follow-up. Alt+V has to traverse hundreds of lines of a single
+    // message to reach its start.
+    app.agents[0].terminal.as_mut().unwrap().write_input(b"Write a 200-line numbered outline of a fictional system, exactly one short item per line, numbered 1 to 200, no preamble.").unwrap();
+    settle(&mut app, Duration::from_millis(800), Duration::from_secs(5));
+    app.agents[0].terminal.as_mut().unwrap().write_input(b"\r").unwrap();
+    settle(&mut app, Duration::from_secs(4), Duration::from_secs(300));
+    app.agents[0].terminal.as_mut().unwrap().write_input(b"Say ok and nothing else.").unwrap();
+    settle(&mut app, Duration::from_millis(800), Duration::from_secs(5));
+    app.agents[0].terminal.as_mut().unwrap().write_input(b"\r").unwrap();
+    settle(&mut app, Duration::from_secs(3), Duration::from_secs(120));
+    std::thread::sleep(Duration::from_secs(2));
+    settle(&mut app, Duration::from_secs(1), Duration::from_secs(5));
+
+    for i in 1..=4 {
+        let start = Instant::now();
+        app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::ALT));
+        while !app.claude_message_navs.is_empty() && start.elapsed() < Duration::from_secs(40) {
+            std::thread::sleep(Duration::from_millis(20));
+            app.drive_claude_message_navs();
+        }
+        std::thread::sleep(Duration::from_millis(250));
+        let lines = app.agents[0].terminal.as_mut().unwrap().live_screen_lines();
+        let notice = app.notice.take();
+        eprintln!(
+            "Alt+V #{i} took {}ms -> rows 0..3 = {:?} notice={notice:?}",
+            start.elapsed().as_millis(),
+            &lines[..3.min(lines.len())]
+        );
+    }
+    app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT));
+    settle(&mut app, Duration::from_secs(1), Duration::from_secs(5));
+    let lines = app.agents[0].terminal.as_mut().unwrap().live_screen_lines();
+    eprintln!("Alt+B -> rows 0..3 = {:?}", &lines[..3.min(lines.len())]);
+    app.agents[0].terminal.as_mut().unwrap().write_input(b"\x03").unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    app.agents[0].terminal.as_mut().unwrap().write_input(b"/exit\r").unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    app.agents[0].terminal.as_mut().unwrap().terminate_and_wait();
 }

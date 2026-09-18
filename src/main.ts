@@ -47,6 +47,7 @@ import type { CompletionNote } from "./surfaces.js";
 import type { BackendId } from "./types.js";
 import { commandExists, isTty, MissingToolError, newRunId, runCommand } from "./util.js";
 import { autoUpdateAndRerunIfNeeded, getUpdateAvailable } from "./version-check.js";
+import { printReport } from "./report.js";
 
 type Parsed = {
   command?: string;
@@ -85,6 +86,16 @@ type Parsed = {
     issue?: boolean;
     /** `rudder __event <name> --props '{json}'` (hidden telemetry emitter). */
     props?: string;
+    /** Report options */
+    format?: "table" | "json" | "markdown" | "csv";
+    status?: string;
+    summary?: boolean;
+    limit?: number;
+    sortBy?: string;
+    reverse?: boolean;
+    detailed?: boolean;
+    after?: string;
+    before?: string;
   };
 };
 
@@ -284,6 +295,23 @@ export async function main(): Promise<void> {
     case "runs":
       await listProjectRuns({ json: parsed.flags.json });
       return;
+    case "report": {
+      const repoRoot = findRepoRoot();
+      await printReport(repoRoot, {
+        format: parsed.flags.format,
+        status: parsed.flags.status ? (parsed.flags.status.split(",") as any) : undefined,
+        backend: parsed.flags.backend ? (Array.isArray(parsed.flags.backend) ? parsed.flags.backend : [parsed.flags.backend]) : undefined,
+        model: parsed.args[0],
+        after: parsed.flags.after,
+        before: parsed.flags.before,
+        summary: parsed.flags.summary !== false,
+        limit: parsed.flags.limit,
+        sortBy: parsed.flags.sortBy as any,
+        reverse: parsed.flags.reverse,
+        detailed: parsed.flags.detailed,
+      });
+      return;
+    }
     case "stop": {
       const run = parsed.args[0];
       if (!run) {
@@ -633,6 +661,66 @@ function parseArgs(argv: string[]): Parsed {
     }
     if (arg.startsWith("--ssh-host=")) {
       parsed.flags.sshHost = arg.slice("--ssh-host=".length);
+      continue;
+    }
+    if (takesValue(arg, "--format")) {
+      parsed.flags.format = readValue(argv, ++i, arg) as any;
+      continue;
+    }
+    if (arg.startsWith("--format=")) {
+      parsed.flags.format = arg.slice("--format=".length) as any;
+      continue;
+    }
+    if (takesValue(arg, "--status")) {
+      parsed.flags.status = readValue(argv, ++i, arg);
+      continue;
+    }
+    if (arg.startsWith("--status=")) {
+      parsed.flags.status = arg.slice("--status=".length);
+      continue;
+    }
+    if (arg === "--summary" || arg === "--no-summary") {
+      parsed.flags.summary = arg === "--summary";
+      continue;
+    }
+    if (takesValue(arg, "--limit")) {
+      parsed.flags.limit = Number.parseInt(readValue(argv, ++i, arg), 10);
+      continue;
+    }
+    if (arg.startsWith("--limit=")) {
+      parsed.flags.limit = Number.parseInt(arg.slice("--limit=".length), 10);
+      continue;
+    }
+    if (takesValue(arg, "--sort-by")) {
+      parsed.flags.sortBy = readValue(argv, ++i, arg);
+      continue;
+    }
+    if (arg.startsWith("--sort-by=")) {
+      parsed.flags.sortBy = arg.slice("--sort-by=".length);
+      continue;
+    }
+    if (arg === "--reverse") {
+      parsed.flags.reverse = true;
+      continue;
+    }
+    if (arg === "--detailed") {
+      parsed.flags.detailed = true;
+      continue;
+    }
+    if (takesValue(arg, "--after")) {
+      parsed.flags.after = readValue(argv, ++i, arg);
+      continue;
+    }
+    if (arg.startsWith("--after=")) {
+      parsed.flags.after = arg.slice("--after=".length);
+      continue;
+    }
+    if (takesValue(arg, "--before")) {
+      parsed.flags.before = readValue(argv, ++i, arg);
+      continue;
+    }
+    if (arg.startsWith("--before=")) {
+      parsed.flags.before = arg.slice("--before=".length);
       continue;
     }
     if (!parsed.command && !arg.startsWith("-")) {
@@ -1167,6 +1255,7 @@ Run management:
   rudder logs [run] [--follow]    Print saved output
   rudder status [--json]          Show active runs for this repo
   rudder runs [--json]            List runs for this repo
+  rudder report [model] [options] Collect and report on runs with filtering, aggregation, and multiple formats
   rudder stop <run>               Cancel a run
   rudder delete <run>             Delete a run and its workspace
   rudder merge <run>              Merge a run into the current change
@@ -1225,7 +1314,19 @@ Cloud:
   rudder cloud resume <id>        Resume a cloud worker
   rudder sail [name or task]      Alias for starting a cloud worker
 
-Options:
+Report options:
+  --format <format>               Output format: table (default), json, markdown, csv
+  --status <status>               Filter by status (comma-separated: completed,merged,failed,etc)
+  --backend <backend>             Filter by backend: claude, codex, acpx, opencode
+  --after <date>                  Filter by creation date (ISO 8601)
+  --before <date>                 Filter by creation date (ISO 8601)
+  --summary / --no-summary        Show statistics (on by default)
+  --limit <n>                     Limit results to N runs
+  --sort-by <column>              Sort by: created (default), updated, duration, tokens, status
+  --reverse                       Reverse sort order
+  --detailed                      Show full task text and extra details
+
+General options:
   -d, --detach                    Start in background
       --workspace                  Always isolate the run in its own jj workspace
       --queue                     Queue mode (reserved)

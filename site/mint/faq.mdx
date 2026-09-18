@@ -1,0 +1,28 @@
+---
+title: "FAQ"
+description: "The questions that come up in the first hour."
+---
+
+## Does this change my git repository?
+
+jj is colocated with git in the same repository. Your git history, branches and remotes keep working exactly as they did. Rudder adds workspaces under `.rudder-workspaces/` and merges into your local branch; it does not rewrite your history behind you.
+
+## Does it push or deploy anything?
+
+It never deploys. Whether it pushes depends on the repo, and it tells you which before it does anything.
+
+With no GitHub remote, or without a signed-in `gh`, **merged means merged into local git** and nothing leaves your machine. Where Rudder can open pull requests, `m` on a reviewed row pushes a fresh branch and opens a **draft** PR instead of merging locally. The first time in a given repo it asks first, naming the remote and the branch; after you accept, it stops asking for that repo. It never pushes your default branch, and there is only ever one route to main for a given row: a PR or a local merge, never both.
+
+## Do my teammates need jj?
+
+No. What they see is ordinary git commits on ordinary branches. jj is a local tool for how *you* work; nothing about it reaches the remote.
+
+## What does it cost to run?
+
+Rudder itself is free and open source. You pay for whatever the agent CLIs cost you, exactly as you would running them by hand. `/usage` shows tokens and cost for the session.
+
+The dashboard is a native Rust TUI: about 27 MB resident, and asleep until an agent writes.
+
+## What happens if it crashes?
+
+Agent sessions belong to the backend CLIs, not to Rudder, so they survive. Rudder records each row's session id as soon as it exists and derives state on restart from jj, the filesystem and the running processes rather than from anything it remembered. Reopen it and use `/resume` for anything that lost its pane.

@@ -1,0 +1,46 @@
+---
+title: "Workspaces"
+description: "The isolation mechanism. Every agent works in its own jj workspace, so parallel work on one repository genuinely cannot collide."
+---
+
+## What a workspace is
+
+A jj workspace is a second working copy of the same repository, with its own working-copy commit. Edits in one are invisible to the others until they are merged. Rudder gives every agent one.
+
+This is the reason several agents can work on the same files at the same time. They are not coordinating, taking turns, or locking anything. They cannot reach each other.
+
+## Where they live
+
+```text
+your-repo/
+  .rudder-workspaces/
+    fix-login-redirect/
+    port-settings-form/
+    drop-sessions-table/
+```
+
+They sit beside your checkout, never nested inside it, so your editor, your build and your git status are unaffected by what the agents are doing.
+
+## How merging works
+
+Merging a row runs `jj new` against your branch and that agent's change. It is a real merge commit, not a squash of the working copy, so the agent's history stays intact and the merge is a normal thing to inspect or undo.
+
+m merges the selected row. M merges everything that is ready. u undoes a merge through jj's operation log.
+
+<Note>
+**Merged is local.** Merging integrates into your **local** git only. Rudder never pushes to a remote and never deploys. Nothing is live until you push.
+</Note>
+
+## Conflicts
+
+jj records conflicts *in the change* rather than refusing the merge. A conflicted merge still completes; the conflict is then a thing you can see, resolve, or undo, instead of a wall you hit mid-operation.
+
+This is what lets Rudder integrate several overlapping agents without stopping the whole session on the first collision.
+
+Rudder settles the conflicts that need no judgment on its own: its own coordination files union their entries, `package.json` deep-merges its dependency maps, lock files take the most complete side. Source code is never merged mechanically - guessing at a real disagreement is worse than stopping. What is left starts a resolver agent in the row that already owns the work, rather than a prompt waiting for a keypress. An unanswered prompt used to park finished nodes in review and leave everything downstream of them unable to launch.
+
+## The main checkout
+
+Some jobs are genuinely about your working tree: tagging a release, running a deploy, poking at something by hand. Those are `/main`, and they run in your real checkout with nothing to merge.
+
+Several `/main` agents can run at once. Rudder allows it because it is sometimes what you want; managing what they do to each other is yours.

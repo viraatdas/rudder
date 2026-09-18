@@ -192,6 +192,7 @@ export function QuotaCard({ account, now }: { account: AccountQuota; now: number
         {account.plan && <span class="quota-plan mono">{account.plan}</span>}
       </div>
       {account.email && <div class="quota-email mono">{account.email}</div>}
+      {account.blocked && !account.error && <div class="quota-blocked mono">{account.blocked}</div>}
       {account.error ? (
         <div class="quota-error mono">{account.error}</div>
       ) : (

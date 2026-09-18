@@ -1,0 +1,61 @@
+---
+title: "Overview"
+description: "Run coding agents in parallel on one repo. Each works in its own copy, so they cannot collide."
+---
+
+## Start in 60 seconds
+
+```bash
+$ npm install -g @viraatdas/rudder@latest
+$ cd ~/code/your-project
+$ rudder
+```
+
+Type a task into the box at the bottom and press Enter:
+
+```text
+fix the login redirect losing the query string
+```
+
+That is it. One agent is now working in its own copy of the repo. Type another task and a second one starts beside it, unable to see or overwrite the first.
+
+When a row says done, press m. Rudder shows you the diff. Press m again and it lands.
+
+## The whole loop
+
+| you do | what happens |
+| --- | --- |
+| type a task | One isolated agent starts in its own workspace. |
+| Option-1 / 2 / 3 / 4 | Agents list · the agent's terminal · the task box · the diff panel. |
+| j / k | Move between agents. |
+| m | Show me the diff. Then: land it. |
+| u | Undo that. |
+| x | Stop an agent. |
+
+Everything else in these docs is detail on top of those six lines.
+
+<Note>
+**The one thing to know.** **Nothing lands that you have not been shown.** The first m opens the diff; the second one lands it. On a repo with a GitHub remote, landing means a draft pull request rather than a local merge - and Rudder asks once, naming the remote, before it ever pushes.
+</Note>
+
+## What it is
+
+Rudder is a terminal dashboard that starts, watches, reviews and merges coding agents. It drives **Claude Code**, **Codex** and **opencode**: it does not replace them. Each agent runs in its own real terminal, with its own native prompts, inside a pane you can talk to.
+
+What Rudder adds is everything around the agent: where it works, what it can touch, how you see what it did, and how that reaches your main branch.
+
+## Why isolation
+
+Running one agent is easy. Running four on the same repository is where it falls apart: they stash over each other, leave half-finished edits in your working tree, and you lose track of which branch holds what.
+
+Rudder's answer is a **jj workspace** per agent: a private copy of the repo, gitignored, beside your checkout and never in it. Four agents editing the same file are four separate trees. Nothing merges until you say so, and your own checkout stays exactly where you left it the whole time.
+
+## Requirements
+
+- macOS or Linux
+- Node 18 or newer
+- A git repository
+- [jj](https://jj-vcs.github.io/jj/latest/), installed for you on first install if it is missing
+- At least one of the Claude Code, Codex or opencode CLIs, signed in
+
+Next: [walk through your first agent](/first-agent), or read [how the isolation works](/workspaces).

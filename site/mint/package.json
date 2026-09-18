@@ -1,0 +1,14 @@
+{
+  "name": "rudder-docs",
+  "private": true,
+  "type": "module",
+  "description": "Rudder docs: Mintlify source (docs.json + MDX), exported to a static site and self-hosted on Vercel with a local search backend.",
+  "scripts": {
+    "dev": "mint dev",
+    "validate": "mint validate",
+    "build": "node scripts/build.mjs"
+  },
+  "devDependencies": {
+    "mint": "^4.2.885"
+  }
+}

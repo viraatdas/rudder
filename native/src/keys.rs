@@ -59,8 +59,13 @@ pub(crate) fn terminal_bytes_for_key(key: KeyEvent) -> Option<Vec<u8>> {
         KeyCode::Right => b"\x1b[C".to_vec(),
         KeyCode::Up => modified_arrow("A", key.modifiers),
         KeyCode::Down => modified_arrow("B", key.modifiers),
-        KeyCode::Home => b"\x1b[H".to_vec(),
-        KeyCode::End => b"\x1b[F".to_vec(),
+        // Ctrl+Home/Ctrl+End are how Claude Code's fullscreen renderer jumps to the
+        // start of the conversation and to the latest message (re-enabling
+        // auto-follow) from the normal prompt view, not just inside its transcript
+        // mode. Reuse the same SGR modifier encoding as the arrow keys above, or the
+        // Ctrl modifier is silently dropped and the child sees a bare Home/End.
+        KeyCode::Home => modified_arrow("H", key.modifiers),
+        KeyCode::End => modified_arrow("F", key.modifiers),
         KeyCode::PageUp => b"\x1b[5~".to_vec(),
         KeyCode::PageDown => b"\x1b[6~".to_vec(),
         KeyCode::Delete => b"\x1b[3~".to_vec(),

@@ -1,0 +1,46 @@
+---
+title: "Plans and the DAG"
+description: "When a goal needs several steps in a particular order, /plan gives you an orchestrator: it proposes a task graph, you edit it, then it runs and merges the nodes as their dependencies land. Several plans can run at once, each in its own pane."
+---
+
+## Starting a plan
+
+```text
+/plan add billing with Stripe, including the webhook handler
+```
+
+A read-only planner inspects the repository, asks a round of questions if the goal is ambiguous, and proposes a graph of tasks. **Nothing is written to your code until you approve it.**
+
+Run `/plan` again for a different goal and you get a **second orchestrator beside the first**, with its own graph, its own pane, and its own workspaces. The two do not share state and merge independently; if they touch the same files, that is an ordinary merge conflict, handled the same way as any other. A plan that is finished - nothing queued, nothing running, nothing at the gate - is reused rather than piling up, so repeatedly planning does not leave a row per past goal.
+
+## Hardening
+
+Workers report follow-ups when they finish - a test worth adding, a rough edge worth smoothing. Rudder collects those into a backlog instead of scheduling each one as its own node, and runs them **clumped by file** once the current phase has merged.
+
+The reason is that hardening findings land on the same files by nature. One node per finding meant several agents racing to edit the same file and conflicting with each other - manufacturing the very conflicts they then had to resolve. As one clump they are edits in a single workspace, and one agent fixes them together with the whole file in view instead of several half-fixing it.
+
+## Editing before it runs
+
+The plan is a draft, not a verdict. Press v on the orchestrator to open plan review and edit any node in place: its title, goal, success criteria, dependencies, and the exact prompt the agent will run.
+
+| key | in plan review |
+| --- | --- |
+| v | open plan review on the orchestrator |
+| Tab | move between fields on a node |
+| Ctrl-S | save your edits to the graph |
+| Ctrl-Enter | approve and launch |
+| Esc | back to the orchestrator |
+
+## Hard and soft edges
+
+A **hard** edge means a node waits for its parent to merge. A **soft** edge is context only and never gates a launch. Work that can run in parallel does, and the plan blocks only where one task truly depends on another.
+
+As each node merges, its children unblock and launch on their own.
+
+## Steering a running plan
+
+Talk to the orchestrator's own pane. With several plans running, the pane is what says which plan you mean, so a message reaches that plan and no other. Select the orchestrator row, type into it, and it will add tasks, re-plan structurally, stop or re-goal specific workers, or explain what is happening.
+
+<Note>
+**The task box is not the orchestrator.** Typing into the task box always starts a new standalone agent, even while a plan is running. To change a plan, talk to that plan's pane.
+</Note>

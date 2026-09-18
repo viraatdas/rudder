@@ -612,6 +612,23 @@ impl TerminalPane {
         self.visible_lines_snapshot()
     }
 
+    /// Whether `needle` appears on the child's live screen right now — the
+    /// current rows, regardless of any scrollback offset Rudder's own viewport
+    /// is showing. Drains pending output first so the answer reflects the
+    /// latest repaint. Used to read a TUI's mode off its own chrome (e.g. the
+    /// footer Claude Code shows while its transcript view is open).
+    pub fn live_screen_contains(&mut self, needle: &str) -> bool {
+        self.live_screen_lines()
+            .iter()
+            .any(|line| line.contains(needle))
+    }
+
+    /// The child's live screen rows right now (see `live_screen_contains`).
+    pub fn live_screen_lines(&mut self) -> Vec<String> {
+        self.drain_output();
+        self.current_visible_lines_snapshot()
+    }
+
     pub fn visible_lines_snapshot(&self) -> Vec<String> {
         // Plan-mode front-end: always the live screen, no scrollback (see the field doc).
         if self.live_screen_only {

@@ -1,0 +1,4 @@
+out/
+export.zip
+node_modules/
+api/search/index.json

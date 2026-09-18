@@ -1,0 +1,10 @@
+{
+  "buildCommand": "npm run build",
+  "outputDirectory": "out",
+  "cleanUrls": true,
+  "trailingSlash": false,
+  "rewrites": [
+    { "source": "/api/search/:subdomain", "destination": "/api/search" },
+    { "source": "/(.*)/undefined/api/search/:subdomain", "destination": "/api/search" }
+  ]
+}

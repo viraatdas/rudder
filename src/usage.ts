@@ -547,6 +547,8 @@ export type AccountQuota = {
   email: string | null;
   plan: string | null;
   windows: QuotaWindow[];
+  /** Human-readable reason a request would be rejected or throttled right now (rate limit hit, credits depleted), or null when clear. */
+  blocked: string | null;
   /** Human-readable reason the meters are missing, with the fix. */
   error: string | null;
   fetchedAt: string;
@@ -611,7 +613,13 @@ function planLabel(tier: string | null | undefined, fallback: string | null): st
   return null;
 }
 
-/** Pure: Claude's `/api/oauth/usage` body → meters. */
+/**
+ * Pure: Claude's `/api/oauth/usage` body → meters. Newer accounts stop
+ * populating `seven_day_opus`/`seven_day_sonnet` (both come back `null`) and
+ * report the active model's weekly sub-limit in `usage.limits[]` instead,
+ * keyed by `scope.model.display_name` — e.g. a Fable-heavy week shows a
+ * higher "Weekly · Fable" percent than the blended `seven_day` figure.
+ */
 export function parseClaudeQuota(usage: any, profile: any, fallbackPlan: string | null): Omit<AccountQuota, "fetchedAt" | "provider"> {
   const windows: QuotaWindow[] = [];
   const push = (label: string, w: any) => {
@@ -622,18 +630,30 @@ export function parseClaudeQuota(usage: any, profile: any, fallbackPlan: string 
   push("Weekly", usage?.seven_day);
   push("Weekly · Opus", usage?.seven_day_opus);
   push("Weekly · Sonnet", usage?.seven_day_sonnet);
+  const seenScopes = new Set(windows.map((w) => w.label));
+  for (const limit of Array.isArray(usage?.limits) ? usage.limits : []) {
+    if (!limit?.is_active || typeof limit.percent !== "number") continue;
+    const model = limit.scope?.model?.display_name;
+    if (typeof model !== "string" || !model) continue;
+    const label = `Weekly · ${model}`;
+    if (seenScopes.has(label)) continue;
+    seenScopes.add(label);
+    windows.push({ label, percent: Math.max(0, Math.min(100, Math.round(limit.percent))), resetsAt: limit.resets_at ?? null });
+  }
   const extra = usage?.extra_usage;
   if (extra?.is_enabled && typeof extra.utilization === "number") {
     windows.push({ label: "Extra usage", percent: Math.round(extra.utilization), resetsAt: null });
   }
   const email = typeof profile?.account?.email === "string" ? profile.account.email : null;
   const plan = planLabel(profile?.organization?.rate_limit_tier, fallbackPlan);
-  return { email, plan, windows, error: windows.length ? null : "this plan does not expose limits" };
+  const lockedReason = [usage?.five_hour, usage?.seven_day].map((w) => w?.locked_reason).find((r) => typeof r === "string" && r);
+  const blocked = lockedReason ? `blocked — ${String(lockedReason).replace(/_/g, " ")}` : null;
+  return { email, plan, windows, blocked, error: windows.length ? null : "this plan does not expose limits" };
 }
 
 async function fetchClaudeQuota(): Promise<AccountQuota> {
   const fetchedAt = new Date().toISOString();
-  const base = { provider: "claude" as const, email: null, plan: null, windows: [], fetchedAt };
+  const base = { provider: "claude" as const, email: null, plan: null, windows: [], blocked: null, fetchedAt };
   const creds = await readClaudeCredentials();
   if (!creds) return { ...base, error: "not signed in — run `claude` and log in" };
   if (creds.expiresAt && creds.expiresAt < Date.now()) {
@@ -675,6 +695,55 @@ async function readCodexCredentials(): Promise<CodexCredentials | null> {
   }
 }
 
+/**
+ * Codex's own `plan_type` enum (from `codex-backend-openapi-models`, the
+ * generated client OpenAI ships inside the Codex CLI source): guest, free,
+ * go, plus, pro, prolite, free_workspace, team,
+ * self_serve_business_prolite, self_serve_business_usage_based, business,
+ * ent26, enterprise_cbp_automation, enterprise_cbp_usage_based, education,
+ * quorum, k12, enterprise, edu, edu_plus, edu_pro. Exact-match the common
+ * ones for a clean label; title-case anything else rather than leaving
+ * underscores in an unfamiliar tier's name.
+ */
+const CODEX_PLAN_LABELS: Record<string, string> = {
+  guest: "Guest",
+  free: "Free",
+  go: "Go",
+  plus: "Plus",
+  pro: "Pro",
+  prolite: "Pro Lite",
+  free_workspace: "Free (workspace)",
+  team: "Team",
+  business: "Business",
+  enterprise: "Enterprise",
+  education: "Education",
+  quorum: "Quorum",
+  k12: "K-12",
+  edu: "Edu",
+  edu_plus: "Edu Plus",
+  edu_pro: "Edu Pro",
+};
+
+function codexPlanLabel(planType: unknown): string | null {
+  if (typeof planType !== "string" || !planType) return null;
+  const known = CODEX_PLAN_LABELS[planType.toLowerCase()];
+  if (known) return known;
+  return planType
+    .split(/[_\s]+/)
+    .filter(Boolean)
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(" ");
+}
+
+/** Human labels for `rate_limit_reached_type.type`, from the same generated Codex client. */
+const CODEX_BLOCK_REASONS: Record<string, string> = {
+  rate_limit_reached: "rate limit reached",
+  workspace_owner_credits_depleted: "workspace owner's credits are depleted",
+  workspace_member_credits_depleted: "workspace member credits are depleted",
+  workspace_owner_usage_limit_reached: "workspace owner's usage limit reached",
+  workspace_member_usage_limit_reached: "workspace member usage limit reached",
+};
+
 /** Pure: Codex's `/backend-api/wham/usage` body → meters. */
 export function parseCodexQuota(body: any): Omit<AccountQuota, "fetchedAt" | "provider"> {
   const windows: QuotaWindow[] = [];
@@ -695,13 +764,17 @@ export function parseCodexQuota(body: any): Omit<AccountQuota, "fetchedAt" | "pr
     pushWindow(name, extra?.rate_limit?.secondary_window);
   }
   const email = typeof body?.email === "string" ? body.email : null;
-  const plan = planLabel(null, typeof body?.plan_type === "string" ? body.plan_type : null);
-  return { email, plan, windows, error: windows.length ? null : "this plan does not expose limits" };
+  const plan = codexPlanLabel(body?.plan_type);
+  const reachedKind = body?.rate_limit_reached_type?.type;
+  const blocked = body?.rate_limit?.limit_reached
+    ? `blocked — ${CODEX_BLOCK_REASONS[reachedKind] ?? (typeof reachedKind === "string" ? reachedKind.replace(/_/g, " ") : "rate limit reached")}`
+    : null;
+  return { email, plan, windows, blocked, error: windows.length ? null : "this plan does not expose limits" };
 }
 
 async function fetchCodexQuota(): Promise<AccountQuota> {
   const fetchedAt = new Date().toISOString();
-  const base = { provider: "codex" as const, email: null, plan: null, windows: [], fetchedAt };
+  const base = { provider: "codex" as const, email: null, plan: null, windows: [], blocked: null, fetchedAt };
   const creds = await readCodexCredentials();
   if (!creds) return { ...base, error: "not signed in — run `codex login`" };
   const headers: Record<string, string> = {
