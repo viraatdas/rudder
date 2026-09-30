@@ -3993,6 +3993,10 @@ fn an_attached_terminal_mirrors_a_pane_and_types_into_it() {
     run.backend = Backend::Claude;
     run.task_summary = "Write the parser".to_string();
     run.status = AgentStatus::Running;
+    // A bare script has no lifecycle hooks; without this the dashboard's hook
+    // sweep kills it within a tick. It only passed on a machine that had a
+    // stale `run-1` hook file under ~/.rudder/signals (CI did not).
+    run.plain_process = true;
     app.agents.push(run);
     // A second row WITHOUT a pane must not be offered.
     let mut idle = test_agent_run("no-pane", "Idle row");
@@ -4039,12 +4043,22 @@ fn an_attached_terminal_mirrors_a_pane_and_types_into_it() {
                 Err(_) => {}
             }
             if Instant::now() >= deadline {
-                let pane = app.agents[0]
+                let run = &mut app.agents[0];
+                let status = format!("{:?}", run.status);
+                let drained_at = run.last_drain_at.map(|at| at.elapsed());
+                let (alive, pane) = run
                     .terminal
                     .as_mut()
-                    .map(|terminal| terminal.visible_lines_snapshot().join("\n"))
-                    .unwrap_or_default();
-                panic!("no message within {ATTACH_TEST_WAIT}s while waiting for {step}; the pane shows:\n{pane}");
+                    .map(|terminal| (terminal.is_alive(), terminal.visible_lines().join("\n")))
+                    .unwrap_or((false, "(no terminal)".to_string()));
+                let clients: Vec<_> = app
+                    .attach_clients
+                    .iter()
+                    .map(|client| (client.id, client.run_id.clone(), client.rows, client.cols))
+                    .collect();
+                panic!(
+                    "no message within {ATTACH_TEST_WAIT}s while waiting for {step}; status {status}, alive {alive}, last drain {drained_at:?} ago, clients {clients:?}; the pane shows:\n{pane}"
+                );
             }
         }
     };
