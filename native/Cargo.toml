@@ -10,7 +10,7 @@ path = "src/lib.rs"
 
 [dependencies]
 anyhow = "1.0"
-crossterm = "0.29"
+crossterm = { version = "0.29", features = ["serde"] }
 hdrhistogram = "7.5"
 portable-pty = "0.9.0"
 ratatui = "0.30"

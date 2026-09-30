@@ -451,6 +451,62 @@ Order of handling matters; the early returns gate everything else.
   Option+3=`£` (U+00A3), Option+v=`√` (U+221A).
 - Otherwise the key is dispatched to the focused pane's handler.
 
+### `rudder attach`: other terminals mirroring a pane (`native/src/attach.rs`)
+tmux's shape without giving up the single-writer `App`. The dashboard binds a unix
+socket on its first heartbeat (`service_attach_clients`); every other terminal is a
+thin client (`rudder-native attach`, reached by `rudder attach` or by bare `rudder`
+when `attachSocketLive()` finds a dashboard already serving the checkout). Threads
+never touch `App`: connections feed `AttachEvent`s over an mpsc and the main loop
+applies them. The dashboard renders the pane for the client exactly as it renders
+its own worker pane (`styled_line_window_snapshot`), so the scrollback view and
+⌥v/⌥b are the same code (`nav_claude_messages` is keyed by run id for this
+reason), and streams changed rows as ANSI text; keys come back as PTY bytes via
+`terminal_bytes_for_key`, the same encoding the worker pane uses. Rules worth
+keeping:
+- **The socket lives at `<rudder home>/attach/<hash>.sock`** and
+  `<repo>/.rudder/attach.sock` is a SYMLINK to it: `sun_path` is ~104 bytes and a
+  checkout path is not (the first test run failed on exactly this). Clients
+  `read_link` before connecting; the TS probe uses `realpath`, which also fails on
+  the dangling link a crashed dashboard leaves behind.
+- **An attached terminal owns the pane size.** The three resize sites in render.rs
+  skip a run that `run_is_attached`, because `TerminalPane::resize` drops the
+  region scrollback, and bouncing the size between the dashboard's selection and
+  the attached tab would wipe the history ⌥v walks every time the selection moved.
+- **Attached panes drain every tick** like the focused one (the 500ms unfocused
+  throttle is bypassed for them).
+- A client that falls behind is not waited for: `try_send` on a bounded queue,
+  and a dropped frame just marks it `needs_full`.
+
+### Second dashboard views (`native/src/view.rs`)
+Bare `rudder` in a checkout whose dashboard is live runs `rudder-native attach
+--dashboard`: a FULL second view over the same attach socket, not a second App.
+Per-view state (selection, focus, task draft, popups, click maps, areas: the
+`view_state!` list) lives in a `ViewState` per client and `App::with_view` swaps
+it into `App` around that view's input and its render, so every key handler and
+all of render.rs run unchanged. Rules worth keeping:
+- **A field that belongs to a person looking at the screen goes in the
+  `view_state!` list**, or both tabs will share it (and fight over it).
+- **Selection crosses by run id**, not index: rows are inserted and removed while
+  a view is stashed. Click maps are dropped when `agents.len()` moved.
+- **The view that took input last owns pane sizes** (`pane_size_owner`); the
+  resize sites ask `pane_size_held`, which also covers single-pane attachments.
+- **A view's quit keys close the view** (`confirm_or_quit` returns early when
+  `acting_in_remote_view`), never the dashboard.
+- Frames are ratatui's own diff: the view's `Terminal` has a fixed viewport and a
+  backend writing into a buffer (`ViewOutput`), whose bytes go out as
+  `ServerMsg::Screen`. Input comes back as serialized crossterm `Event`s
+  (crossterm's `serde` feature).
+- The socket falls back to `/tmp/rudder-<uid>/` when even the rudder home is too
+  deep for `sun_path`.
+
+### Workspace names come from a title, not the prompt's first words
+`/run` (`start_single_run_task`) waits for a one-shot haiku title
+(`generate_task_summary_title`, `WORKSPACE_NAMING_TIMEOUT` = 12s, then it falls
+back to the prompt) BEFORE creating the jj workspace, because the workspace
+directory cannot be renamed under a live agent. Planner nodes already arrive
+titled. `RUDDER_WORKSPACE_NAMING=0` turns it off; tests have no namer unless
+they set `workspace_namer`.
+
 ### Orchestrator skills
 The bottom task pane remains the primary input surface for fresh requests,
 slash commands, plan refinements, and empty-Enter approval. When the interactive
@@ -1290,6 +1346,33 @@ migration-resume, and re-goal. When adding a spawn path, wire it.
 Signal hygiene: hook writes are ATOMIC (`printf > tmp && mv`, v2.6.x) so the poll loop
 never reads a torn JSON, and `cleanup_run_signals` removes a run's three signal files on
 agent delete.
+
+**What Claude's hooks actually do (measured on 2.1.278, every hook logging, in a pty):**
+a normal turn fires `UserPromptSubmit` → `MessageDisplay` (per message) → `Stop`, and
+the `idle_prompt` Notification exactly 60s after `Stop`. A local slash command
+(`/model`) fires NOTHING. An Esc interrupt fires NOTHING, for four minutes and
+counting. Two consequences in the poll loop: a Done Claude row goes back to Running
+only on the `working` signal (typing a draft or `/model` repaints without a turn, and
+no Stop ever ends a turn that never began), and `WaitSignal::Idle` is the backstop for
+any Running row whose pane has been silent at its composer for `IDLE_WITHOUT_SIGNAL`
+(60s): a working agent animates its spinner, so a minute of silence with the composer
+showing is not a slow turn. Seen live: a main agent whose first prompt got no reply
+spun for three hours.
+
+**The one hole in the official signals: a user interrupt.** When you press Esc (or
+reject a tool call) in a Claude pane, Claude prints `⎿ Interrupted · What should Claude
+do instead?` and fires NOTHING — no `Stop`, no `idle_prompt` notification, verified
+against claude 2.1.278 by driving it in a pty. A row used to spin as "running" for a day
+after that. `terminal_interrupted_from_lines` (detect.rs) reads that receipt off the pane
+and latches `WaitSignal::Interrupted` ("interrupted · waiting for you", tab glyph ⬓); the
+`UserPromptSubmit` → `working` signal of the next prompt, or a visible spinner, lifts it.
+This is a WAIT state, never completion: an interrupted plan worker must not auto-merge.
+
+**The tab glyph reports news, not history** (`tab_status_glyph`). ⊗ marks a failure only
+until you next press a key or click in the dashboard (`last_user_activity`), and a Failed
+row loaded from disk (no `completed_at`: it died in an earlier session) never pins it.
+Before this, two dead runs from a week earlier kept a repo's tab on ⊗ next to a worker
+that had quietly finished.
 
 ### 14.4c Default task input: one end-to-end main owner; `/plan` is explicit
 A FRESH task (no active plan) has a deterministic ownership contract:

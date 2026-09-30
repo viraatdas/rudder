@@ -162,7 +162,7 @@ through Review before it can merge.
 | --- | --- |
 | `Option-1` / `Option-2` / `Option-3` | Focus the agents, worker, or task pane |
 | `Option-[` / `Option-]` | Step to the previous / next agent, staying in the pane you are in |
-| `Option-v` | Toggle the selected agent's review view |
+| `Option-v` / `Option-b` | Previous question in the selected worker / back to its latest message (Claude Code and Codex) |
 | `Cmd-C` | Copy the active Rudder selection |
 | `Ctrl-C` | Quit (asks to confirm if agents are still running) |
 
@@ -171,6 +171,33 @@ whether or not "Use Option as Meta" is enabled. `Cmd-[` / `Cmd-]` also step agen
 in terminals that forward Cmd to the app (Ghostty and other terminals that speak
 the kitty keyboard protocol, and only if the terminal has not bound those keys
 itself). `Option-[`/`Option-]` are the ones that always work.
+
+## More tabs on the same session
+
+One dashboard owns the session. Run `rudder` again in another tab or split of
+the same checkout and you get a second full view of it: the same agents, plans
+and panes, with its own selection, focused pane and task bar. Start agents,
+`/plan`, merge or type into a worker from either tab; both see the result.
+`Ctrl-C` in a second view closes only that tab.
+
+A pane has one size, so the tab you typed in last sets it; the other tab shows
+that pane at the same size.
+
+To mirror a single agent at full size instead (three agents side by side in
+three splits, say), attach to it:
+
+```bash
+rudder attach            # pick from the live agents
+rudder attach n2         # a plan node
+rudder attach parser     # part of the title
+```
+
+The attached tab mirrors that agent's pane: same output, same scrollback,
+`Option-v` / `Option-b` step through messages, the wheel scrolls, and every
+other key goes to the agent. `Ctrl-W q` detaches; the agent keeps running in
+the dashboard. While a tab is attached, that agent's pane is sized to the tab
+rather than to the dashboard layout, and its row in the dashboard reads
+`attached`.
 
 Stepping agents is the shortcut worth learning: the worker pane hands every
 keystroke to the agent's own TUI, so `j`/`k` only select from the agents list —

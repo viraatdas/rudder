@@ -511,3 +511,59 @@ pub(crate) fn contains_word(text: &str, word: &str) -> bool {
     text.split(|ch: char| !ch.is_ascii_alphanumeric())
         .any(|part| part == word)
 }
+
+/// True when a Claude Code pane shows the receipt it prints after the user
+/// interrupts a turn (Esc, or rejecting a tool call):
+///
+///   ⎿  Interrupted · What should Claude do instead?
+///
+/// The turn is over and the agent is parked at its composer, but NO lifecycle
+/// hook says so — verified against claude 2.1.278: neither `Stop` nor the
+/// `idle_prompt` notification fires after an interrupt, for as long as you wait.
+/// The receipt is the only trace, so this is the one place completion-adjacent
+/// state is read off the screen. The `?`-question detector above never caught it
+/// because the composer's rule lines sit between the receipt and the cursor.
+pub(crate) fn terminal_interrupted_from_lines(backend: Backend, lines: &[String]) -> bool {
+    if !matches!(backend, Backend::Claude) {
+        return false;
+    }
+    let recent: Vec<String> = lines
+        .iter()
+        .rev()
+        .map(|line| normalize_terminal_line(line))
+        .filter(|line| !line.is_empty())
+        .take(12)
+        .collect();
+    // A visible spinner means a NEW turn is under way below an old receipt.
+    if recent.iter().any(|line| looks_busy(line)) {
+        return false;
+    }
+    recent.iter().any(|line| looks_like_interrupt_receipt(line))
+}
+
+pub(crate) fn looks_like_interrupt_receipt(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    let lower = lower.trim_start_matches(|ch: char| {
+        ch.is_whitespace() || matches!(ch, '\u{23bf}' | '\u{2514}' | '\u{23a3}' | '\u{2937}')
+    });
+    lower.starts_with("interrupted")
+        && (lower.contains("what should claude do instead")
+            || lower.starts_with("interrupted by user")
+            || lower == "interrupted")
+}
+
+/// True when the pane's bottom rows show the backend parked at its composer:
+/// its prompt line or its idle footer, with no spinner anywhere near. The
+/// precondition for `WaitSignal::Idle` (main.rs), the backstop for a turn
+/// that ended with no signal at all.
+pub(crate) fn terminal_at_idle_prompt(backend: Backend, lines: &[String]) -> bool {
+    if recent_lines_look_busy(lines) {
+        return false;
+    }
+    lines
+        .iter()
+        .rev()
+        .take(8)
+        .map(|line| normalize_terminal_line(line))
+        .any(|line| looks_like_idle_chrome(backend, &line) || looks_like_agent_prompt(backend, &line))
+}

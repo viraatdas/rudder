@@ -329,6 +329,14 @@ pub(crate) fn push_agent_row_with_trailing<'a>(
         } else {
             (agent_status_text(agent), agent_status_style(agent))
         };
+    // Another terminal is mirroring this pane (`rudder attach`): say so, since
+    // keys typed there land in the same agent and its pane is sized to that
+    // terminal rather than to this layout.
+    let status_label = if app.run_is_attached(&agent.id) {
+        format!("{status_label} \u{b7} attached")
+    } else {
+        status_label
+    };
     let badge_style = Style::default().fg(status_style.fg.unwrap_or(MUTED));
 
     let mode_span = if agent.is_main() {
@@ -3185,8 +3193,12 @@ pub(crate) fn render_interactive_orchestrator(frame: &mut Frame<'_>, area: Rect,
         return;
     }
     if let Ok(size) = TerminalSize::new(term_inner.height.max(1), term_inner.width.max(1)) {
+        let attached = app
+            .agents
+            .get(app.selected_agent)
+            .is_some_and(|run| app.pane_size_held(&run.id));
         if let Some(run) = app.agents.get_mut(app.selected_agent) {
-            if run.terminal_size != Some(size) {
+            if !attached && run.terminal_size != Some(size) {
                 if let Some(terminal) = run.terminal.as_mut() {
                     if terminal.resize(size).is_ok() {
                         run.terminal_size = Some(size);
@@ -3452,8 +3464,12 @@ pub(crate) fn render_worker(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     }
 
     if let Some(size) = terminal_size {
+        let attached = app
+            .agents
+            .get(app.selected_agent)
+            .is_some_and(|run| app.pane_size_held(&run.id));
         if let Some(run) = app.agents.get_mut(app.selected_agent) {
-            if app.worker_view == WorkerView::Terminal && run.terminal_size != Some(size) {
+            if !attached && app.worker_view == WorkerView::Terminal && run.terminal_size != Some(size) {
                 if let Some(terminal) = run.terminal.as_mut() {
                     if terminal.resize(size).is_ok() {
                         run.terminal_size = Some(size);
@@ -4020,8 +4036,12 @@ pub(crate) fn render_gam_split(frame: &mut Frame<'_>, area: Rect, app: &mut App)
     ] {
         let size = TerminalSize::new(half.height.max(1), half.width.max(1)).ok();
         if let Some(size) = size {
+            let attached = app
+                .agents
+                .get(index)
+                .is_some_and(|run| app.pane_size_held(&run.id));
             if let Some(run) = app.agents.get_mut(index) {
-                if run.terminal_size != Some(size) {
+                if !attached && run.terminal_size != Some(size) {
                     if let Some(terminal) = run.terminal.as_mut() {
                         if terminal.resize(size).is_ok() {
                             run.terminal_size = Some(size);
@@ -5180,9 +5200,12 @@ pub(crate) fn alt_scroll_rows(key: KeyEvent, area: Option<Rect>) -> Option<isize
         return None;
     }
     let half = (page_scroll_rows(area) / 2).max(1);
+    // Letters only. Alt+Up/Alt+Down used to scroll too, which meant a Codex
+    // worker never received them, and Codex binds them itself (message
+    // history). The arrows belong to the agent; ⌥k/⌥j scroll.
     match key.code {
-        KeyCode::Char('k') | KeyCode::Up => Some(1),
-        KeyCode::Char('j') | KeyCode::Down => Some(-1),
+        KeyCode::Char('k') => Some(1),
+        KeyCode::Char('j') => Some(-1),
         KeyCode::Char('u') => Some(half),
         KeyCode::Char('n') => Some(-half),
         _ => None,
@@ -5249,6 +5272,15 @@ pub(crate) fn agent_status_label(agent: &AgentRun) -> &'static str {
     }
     if agent.needs_permission {
         "needs permission"
+    } else if agent.wait_signal == Some(WaitSignal::Idle) {
+        // Silent at its composer for a minute with the row still "running":
+        // the turn ended (or never ran) and nothing reported it.
+        "idle at its prompt \u{b7} no turn running"
+    } else if agent.wait_signal == Some(WaitSignal::Interrupted) {
+        // You stopped the turn (Esc, or rejecting a tool call). Claude reports
+        // nothing for that, so this row used to read "working" for as long as
+        // you left it.
+        "interrupted \u{b7} waiting for you"
     } else if agent.needs_user_input {
         "needs input"
     } else if agent.turn_error().is_some() {

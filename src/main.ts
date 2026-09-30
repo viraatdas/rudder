@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import fsp from "node:fs/promises";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -144,6 +145,14 @@ export async function main(): Promise<void> {
       return;
     }
     if (!parsed.command && isTty() && !parsed.flags.help) {
+      // A dashboard already running for this checkout owns its agents; a
+      // second one cannot see them. Bare `rudder` in another tab opens a full
+      // second view of the live one instead (same agents, its own selection
+      // and task bar). `rudder attach <agent>` mirrors a single pane.
+      if (await attachSocketLive()) {
+        await runNativeCommand(["attach", "--dashboard"]);
+        return;
+      }
       await maybeOnboard();
       await openDashboard(parsed);
       return;
@@ -155,6 +164,10 @@ export async function main(): Promise<void> {
   switch (parsed.command) {
     case "tmux":
       throw new Error("The tmux dashboard has been removed. Run `rudder` or `rudder dashboard` to open the native dashboard.");
+    case "attach": {
+      await runNativeCommand(["attach", ...parsed.args]);
+      return;
+    }
     case "dashboard":
       await maybeOnboard();
       await openDashboard(parsed);
@@ -864,6 +877,43 @@ function restoreNativeTuiEnv(previous: string | undefined): void {
   }
 }
 
+/** Is a dashboard serving `rudder attach` for this checkout right now? A
+ *  socket file alone proves nothing (a crashed dashboard leaves one behind);
+ *  only a connection that is accepted does. */
+async function attachSocketLive(): Promise<boolean> {
+  let root: string;
+  try {
+    root = findRepoRoot();
+  } catch {
+    return false;
+  }
+  // `.rudder/attach.sock` is a symlink to the real socket under ~/.rudder
+  // (unix socket paths are length-limited; checkout paths are not). realpath
+  // fails when the link dangles, which is the crashed-dashboard case.
+  let socketPath: string;
+  try {
+    socketPath = await fsp.realpath(path.join(root, ".rudder", "attach.sock"));
+  } catch {
+    return false;
+  }
+  return await new Promise<boolean>((resolve) => {
+    const socket = net.connect(socketPath);
+    const timer = setTimeout(() => {
+      socket.destroy();
+      resolve(false);
+    }, 500);
+    socket.once("connect", () => {
+      clearTimeout(timer);
+      socket.destroy();
+      resolve(true);
+    });
+    socket.once("error", () => {
+      clearTimeout(timer);
+      resolve(false);
+    });
+  });
+}
+
 async function runNativeCommand(args: string[]): Promise<void> {
   const nativeBinary = resolveNativeBinaryPath();
   if (!nativeBinary) {
@@ -1119,6 +1169,16 @@ async function readPipedStdin(timeoutMs = 3000): Promise<string> {
     const chunks: Buffer[] = [];
     const done = (): void => {
       process.stdin.removeAllListeners("data");
+      // Let go of stdin once we stop reading it. A worker's Bash tool hands the
+      // child a socket that never closes, and a flowing, referenced stdin keeps
+      // the event loop alive after `main` returns: `rudder done` wrote its note
+      // and then sat for a day and a half in a Claude session's background
+      // task list, still "running", with the agent spinning above it.
+      process.stdin.pause();
+      const stdin = process.stdin as NodeJS.ReadStream & { unref?: () => void };
+      if (typeof stdin.unref === "function") {
+        stdin.unref();
+      }
       resolve(Buffer.concat(chunks).toString("utf8"));
     };
     const timer = setTimeout(done, timeoutMs);
@@ -1231,6 +1291,7 @@ function printHelp(): void {
 Usage:
   rudder                         Open native dashboard with real agent panes
   rudder restart                 Clear local session and open dashboard
+  rudder attach [agent]          Mirror one live agent pane of the running dashboard in this terminal
   rudder "task"
   rudder run [options] "task"
   rudder claude [options] "task"

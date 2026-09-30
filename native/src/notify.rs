@@ -382,7 +382,7 @@ fn native_notifier_available() -> bool {
     })
 }
 
-fn repo_display_name(cwd: &Path) -> String {
+pub(crate) fn repo_display_name(cwd: &Path) -> String {
     cwd.file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .filter(|name| !name.is_empty())

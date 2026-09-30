@@ -19,7 +19,12 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize};
 
 const DEFAULT_ROWS: u16 = 24;
 const DEFAULT_COLS: u16 = 80;
-const DEFAULT_SCROLLBACK_LINES: usize = 2_000;
+/// Rows of history a pane keeps. 2,000 was too few for message navigation:
+/// one Claude exchange in a real worker ran 1,674 rows, so ⌥v reached the
+/// previous question and then hit the end of what was kept. Each retained
+/// row costs ~36 bytes per column (styled cells), so 10,000 rows at 120
+/// columns is ~43MB, paid only by a pane that actually fills it.
+const DEFAULT_SCROLLBACK_LINES: usize = 10_000;
 
 /// Callback invoked by a pane's reader thread each time it hands fresh PTY bytes
 /// to the output channel, so the main event loop can wake and drain/redraw them
@@ -136,6 +141,10 @@ pub struct TerminalPane {
     region_scrollback: Vec<Vec<StyledTerminalCell>>,
     region_scrollback_offset: usize,
     region_scrollback_limit: usize,
+    /// Bumped whenever what the pane shows may have changed (every cache
+    /// invalidation). An attached terminal compares it to skip re-rendering
+    /// a pane that has not moved.
+    render_generation: u64,
     tracked_scroll_region: Option<(u16, u16)>,
     ansi_state: AnsiTrackState,
     notification_scanner: OscNotificationScanner,
@@ -508,6 +517,7 @@ impl TerminalPane {
             region_scrollback: Vec::new(),
             region_scrollback_offset: 0,
             region_scrollback_limit: options.scrollback_lines,
+            render_generation: 0,
             tracked_scroll_region: None,
             ansi_state: AnsiTrackState::Ground,
             notification_scanner: OscNotificationScanner::default(),
@@ -776,6 +786,11 @@ impl TerminalPane {
         self.size
     }
 
+    /// How many rows of history this pane retains before the oldest fall off.
+    pub fn scrollback_limit(&self) -> usize {
+        self.region_scrollback_limit
+    }
+
     pub fn scrollback(&self) -> usize {
         if self.parser.screen().alternate_screen() {
             return self.alternate_history_offset;
@@ -896,7 +911,7 @@ impl TerminalPane {
 }
 
 impl StyledTerminalCell {
-    fn plain(contents: CellContents) -> Self {
+    pub fn plain(contents: CellContents) -> Self {
         Self {
             contents,
             fg: vt100::Color::Default,
@@ -1083,6 +1098,12 @@ impl TerminalPane {
     /// benchmarks can measure a cold rebuild without faking terminal output.
     pub fn invalidate_render_cache(&mut self) {
         self.styled_lines_cache = None;
+        self.render_generation = self.render_generation.wrapping_add(1);
+    }
+
+    /// See the field: changes whenever the visible content may have.
+    pub fn render_generation(&self) -> u64 {
+        self.render_generation
     }
 
     fn append_output_log(&mut self, chunk: &[u8]) {

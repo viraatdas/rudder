@@ -75,6 +75,10 @@ mod notify;
 use crate::notify::*;
 mod theme;
 use crate::theme::*;
+mod attach;
+mod view;
+use crate::attach::*;
+use crate::view::*;
 mod perf;
 use crate::perf::*;
 mod diffview;
@@ -183,6 +187,11 @@ const SPINNER_FRAME_INTERVAL: Duration = Duration::from_millis(100);
 /// spinner: a tab is glanced at, not watched, and a fast cycle there is noise in
 /// the corner of the eye.
 const TAB_SPINNER_INTERVAL: Duration = Duration::from_millis(400);
+/// How long a Running row may show its composer with no output at all before
+/// it is read as idle (`WaitSignal::Idle`). Claude and Codex animate a spinner
+/// several times a second while a turn runs, so this is far above any real
+/// pause; a permission or question prompt is caught earlier by its own hook.
+const IDLE_WITHOUT_SIGNAL: Duration = Duration::from_secs(60);
 const MAX_EVENTS_PER_FRAME: usize = 64;
 /// Trackpad wheel bursts can deliver many tiny scroll events. The handler itself
 /// is cheap; the expensive part is flushing a full terminal draw. Briefly defer
@@ -286,7 +295,10 @@ pub(crate) const SPINNER_FRAMES: [&str; 10] = [
 ];
 const AGENT_PANE_HINTS: &[&str] = &[
     "j/k move",
-    "⌥j/k scroll",
+    // ⌥v/⌥b share this line rather than taking one of their own: the hint
+    // list is as long as the agents pane can afford, and an extra row costs
+    // every user a row of agents forever.
+    "⌥j/k scroll · ⌥v/b msg",
     "⌥h hide panes",
     "⌥[/] agents",
     "Enter focus",
@@ -1665,6 +1677,25 @@ struct App {
     /// Agents-pane row -> collapsed drawer header (done/closed), same harvest as
     /// `agent_row_map`, so a click on "done 27" resolves to that bucket.
     drawer_row_map: Vec<Option<Bucket>>,
+    /// `rudder attach`: the unix socket other terminals mirror agent panes
+    /// through (attach.rs). Started lazily on the first heartbeat, so tests
+    /// that never run the loop open no socket. `attach_server_failed` stops a
+    /// bind that failed (another dashboard owns the checkout) from being
+    /// retried every tick.
+    attach_server: Option<AttachServer>,
+    attach_server_failed: bool,
+    attach_clients: Vec<AttachClient>,
+    /// `/run` workers waiting for their workspace name (start_single_run_task).
+    /// `workspace_namer` is the model call that writes it; `None` in tests, which
+    /// set a fake, and the launch then names from the prompt as before.
+    pending_named_runs: Vec<PendingNamedRun>,
+    workspace_namer: Option<fn(&str) -> Option<String>>,
+    /// Second dashboard views (view.rs): which view is handling input or
+    /// rendering right now (`LOCAL_VIEW` = this terminal), which one owns the
+    /// pane sizes, and the panes the current render must not resize.
+    acting_view: u64,
+    pane_size_owner: u64,
+    pane_size_hold: Vec<String>,
     /// Which drawer header the sidebar cursor sits on. `None` means the cursor is on
     /// an agent row (`selected_agent`); the two are mutually exclusive, and j/k walk
     /// agent rows first, then the drawer headers in `Bucket::DRAWERS` order.
@@ -1823,6 +1854,17 @@ struct App {
     scroll_events_since_draw: usize,
 }
 
+/// A `/run` launch held until its workspace has a name.
+struct PendingNamedRun {
+    input: String,
+    rx: mpsc::Receiver<Option<String>>,
+    started: Instant,
+}
+
+/// How long a `/run` waits for its workspace name before falling back to the
+/// prompt's own words. The namer is a one-shot haiku call (a few seconds).
+const WORKSPACE_NAMING_TIMEOUT: Duration = Duration::from_secs(12);
+
 #[derive(Clone, Debug)]
 struct MigratedAgent {
     run_id: String,
@@ -1838,6 +1880,18 @@ struct MigratedAgent {
 enum WaitSignal {
     Input,
     Permission,
+    /// The pane has sat silent at its composer for `IDLE_WITHOUT_SIGNAL` while
+    /// the row still said Running: a turn ended (or never started) and no
+    /// hook reported it. Seen live: a main agent whose first prompt got no
+    /// reply, then `/model` at the prompt, spun for three hours. A working
+    /// agent animates its spinner, so a minute of silence with the composer
+    /// showing is not a slow turn.
+    Idle,
+    /// The human interrupted the turn (Claude: Esc, or rejecting a tool call).
+    /// Claude reports NOTHING for it — no `Stop`, no `idle_prompt` — so it is
+    /// read off the pane (`terminal_interrupted_from_lines`) and lifted like
+    /// the other waits: the next prompt, or the agent visibly working again.
+    Interrupted,
     /// The turn ended on a backend error (rate limit, auth, overloaded...) with
     /// the process still alive. Carries the backend's own error type when it
     /// reported one. Lifted exactly like the other waits: the human sends a new
@@ -2792,6 +2846,18 @@ impl App {
             orch_selection: None,
             orch_visible_rows: Vec::new(),
             agent_row_map: Vec::new(),
+            attach_server: None,
+            attach_server_failed: false,
+            attach_clients: Vec::new(),
+            pending_named_runs: Vec::new(),
+            workspace_namer: if cfg!(test) || std::env::var("RUDDER_WORKSPACE_NAMING").as_deref() == Ok("0") {
+                None
+            } else {
+                Some(generate_task_summary_title)
+            },
+            acting_view: LOCAL_VIEW,
+            pane_size_owner: LOCAL_VIEW,
+            pane_size_hold: Vec::new(),
             drawer_row_map: Vec::new(),
             drawer_cursor: None,
             drawer: None,
@@ -2889,12 +2955,22 @@ impl App {
         {
             return '\u{2b13}'; // ⬓ square, bottom half filled - waiting on you
         }
+        // A failure is news until you have been back at the dashboard: any
+        // keypress or click here after it counts as seen. A Failed row with no
+        // completion instant was loaded from disk — it died in an EARLIER
+        // session — and is history: it pinned ⊗ on a tab where nothing at all
+        // was happening, next to a worker that had quietly finished.
+        let seen_before = self.last_user_activity;
+        let fresh_failure = |a: &AgentRun| {
+            a.status == AgentStatus::Failed
+                && a.completed_at.is_some_and(|at| at > seen_before)
+        };
         if self
             .agents
             .iter()
-            .any(|a| a.status == AgentStatus::Failed || a.turn_error().is_some())
+            .any(|a| fresh_failure(a) || a.turn_error().is_some())
         {
-            return '\u{2297}'; // ⊗ - something failed (a dead run, or a live turn that ended on an API error)
+            return '\u{2297}'; // ⊗ - something failed (a fresh dead run, or a live turn that ended on an API error)
         }
         if self.agents.iter().any(|a| a.status == AgentStatus::Running) {
             // Advance on a wall clock rather than per frame: the draw loop runs at
@@ -3474,6 +3550,10 @@ impl App {
     /// press of the same quit intent (Ctrl+C or q). Every quit key — Ctrl+C and
     /// the pane-local `q`s — routes through here so none can skip the guard.
     fn confirm_or_quit(&mut self) -> bool {
+        // A second view closes its own tab; the agents live in this one.
+        if self.acting_in_remote_view() {
+            return true;
+        }
         let running = self
             .agents
             .iter()
@@ -3566,6 +3646,11 @@ impl App {
                 "Ctrl+W: Tab cycle  1/2/3 panes  v review  m merge  b branch chat  R review-all  M merge-all  Esc cancels"
                     .to_string(),
             );
+            return false;
+        }
+
+        // Before nav mode: see `handle_claude_message_nav` for why.
+        if self.handle_claude_message_nav(key) {
             return false;
         }
 
@@ -3686,7 +3771,8 @@ impl App {
             _ => {}
         }
 
-        // Alt+j/k/u/d scroll the selected worker's scrollback from anywhere
+        // Alt+j/k/u/n scroll the selected worker's scrollback from anywhere
+        // (letters only: Alt+Up/Down belong to the agent, Codex binds them)
         // except the task composer (Option+letter types a composed character
         // there, which is far more likely to be text than a scroll). Focused
         // pane included: bare letters forward to the agent, the Alt chord is
@@ -3725,6 +3811,27 @@ impl App {
             }
         }
 
+
+        match self.focus {
+            FocusPane::Agents => self.handle_agents_key(key),
+            FocusPane::Worker => self.handle_worker_key(key),
+            FocusPane::Task => self.handle_task_key(key),
+            FocusPane::Diff => self.handle_diff_key(key),
+        }
+    }
+
+    /// ⌥v / ⌥b: scroll the selected Claude Code worker to the previous
+    /// message, or back to the latest. Returns true when the key was one of
+    /// them and has been acted on.
+    ///
+    /// Called before nav mode gets the key. `handle_nav_key` matches plain
+    /// `v` (toggle the worker view) and `b` (branch the agent) whatever
+    /// modifiers arrive with them, so in nav mode ⌥b silently branched a
+    /// worker instead of jumping to the latest message.
+    fn handle_claude_message_nav(&mut self, key: KeyEvent) -> bool {
+        let alt_like = key
+            .modifiers
+            .intersects(KeyModifiers::ALT | KeyModifiers::META);
         // Alt+V scrolls the selected Claude Code worker's normal view up to
         // the previous message start: Rudder pages the view up (PageUp),
         // reads the screen, and wheels the nearest newly revealed `⏺`/`❯`
@@ -3771,120 +3878,147 @@ impl App {
                     None => {
                         self.notice = Some(format!("{key_name}: no worker selected"));
                     }
-                    Some(run) if run.backend != Backend::Claude => {
-                        self.notice = Some(format!(
-                            "{key_name} only works for a Claude Code worker (this one is {})",
-                            run.backend.as_str()
-                        ));
-                    }
                     Some(run) if run.terminal.is_none() => {
                         self.notice =
                             Some(format!("{key_name}: no live terminal for this worker yet"));
                     }
                     Some(_) => {
                         let run_id = self.agents[self.selected_agent].id.clone();
-                        Self::claude_nav_log(&format!(
-                            "{key_name} pressed run={run_id} walk_active={}",
-                            self.claude_message_nav_active(&run_id)
-                        ));
-                        if !jump_to_latest {
-                            let by_id = self.agents.iter().position(|run| run.id == run_id);
-                            if by_id != Some(self.selected_agent) {
-                                Self::claude_nav_log(&format!(
-                                    "WARNING: run id {run_id} resolves to pane {by_id:?} but pane {} is selected",
-                                    self.selected_agent
-                                ));
-                            }
-                        }
-                        if !jump_to_latest && self.claude_message_nav_active(&run_id) {
-                            // A walk is still in progress for this pane; let
-                            // it finish rather than race it.
-                            return false;
-                        }
-                        let run = &mut self.agents[self.selected_agent];
-                        // Claude Code renders one of two ways, and they need
-                        // opposite handling. On the alternate screen it owns a
-                        // viewport and Rudder asks IT to scroll (PageUp, wheel,
-                        // Ctrl+End). Rendered inline it has no viewport at all:
-                        // it never enables mouse reporting and ignores PageUp,
-                        // and the scrollback the user sees belongs to Rudder —
-                        // so only Rudder can move it. Sending keys to an inline
-                        // worker is why Alt+V looked dead in a real session
-                        // (`alt_screen=false wants_mouse=false` in the walk log)
-                        // while every direct-spawn test passed, since a Claude
-                        // spawned outside Rudder takes the alternate screen.
-                        let inline = run
-                            .terminal
-                            .as_ref()
-                            .is_some_and(|terminal| !terminal.uses_alternate_screen_snapshot());
-                        let view_open = !inline && Self::claude_transcript_view_open(run);
-                        if jump_to_latest || !inline {
-                            // Alt+B always returns to the live bottom, and the
-                            // key-driven walk always starts from it.
-                            if let Some(terminal) = run.terminal.as_mut() {
-                                terminal.reset_scrollback();
-                            }
-                        }
-                        if jump_to_latest {
-                            self.cancel_claude_message_nav(&run_id);
-                            if inline {
-                                // reset_scrollback above already put the pane
-                                // back at the live bottom; there is nothing to
-                                // ask the child for.
-                                Self::claude_nav_log("Alt+B: inline pane, reset Rudder's scrollback");
-                                self.dirty = true;
-                                return false;
-                            }
-                            let bytes = if view_open {
-                                CLAUDE_TRANSCRIPT_EXIT_TO_LATEST_BYTES
-                            } else {
-                                CLAUDE_JUMP_TO_LATEST_BYTES
-                            };
-                            let result = self
-                                .selected_terminal_mut()
-                                .map(|terminal| terminal.write_input(bytes));
-                            if let Some(Err(error)) = result {
-                                self.set_selected_error(error.to_string());
-                            }
-                        } else if inline {
-                            let scrolled = run
-                                .terminal
-                                .as_mut()
-                                .map(Self::scroll_pane_to_previous_message)
-                                .unwrap_or(0);
-                            Self::claude_nav_log(&format!(
-                                "Alt+V: inline pane, scrolled Rudder's own view up {scrolled} rows to offset {:?}",
-                                run.terminal.as_ref().map(|terminal| terminal.scrollback())
-                            ));
-                            if scrolled == 0 {
-                                self.notice = Some(
-                                    "Alt+V: nothing above — the whole conversation is already on screen"
-                                        .to_string(),
-                                );
-                            }
-                            self.dirty = true;
-                        } else if view_open {
-                            // The user opened Claude's transcript view by
-                            // hand; the walk drives the normal view, so
-                            // leave that view alone rather than scroll it.
-                            self.notice = Some(
-                                "Alt+V scrolls the normal view — press q to leave the transcript view first"
-                                    .to_string(),
-                            );
-                        } else {
-                            self.start_claude_message_nav(&run_id);
+                        if let Some(notice) = self.nav_claude_messages(&run_id, jump_to_latest) {
+                            self.notice = Some(notice);
                         }
                     }
                 }
-                return false;
+                return true;
             }
         }
 
-        match self.focus {
-            FocusPane::Agents => self.handle_agents_key(key),
-            FocusPane::Worker => self.handle_worker_key(key),
-            FocusPane::Task => self.handle_task_key(key),
-            FocusPane::Diff => self.handle_diff_key(key),
+        false
+    }
+
+    /// ⌥v (`jump_to_latest == false`) or ⌥b for the run `run_id`, from the
+    /// dashboard's own keys or from an attached terminal (attach.rs). Returns
+    /// the notice to show, if any; the caller decides where it goes.
+    fn nav_claude_messages(&mut self, run_id: &str, jump_to_latest: bool) -> Option<String> {
+        let key_name = if jump_to_latest { "Alt+B" } else { "Alt+V" };
+        let Some(index) = self.agents.iter().position(|run| run.id == run_id) else {
+            return Some(format!("{key_name}: that agent is gone"));
+        };
+        if self.agents[index].terminal.is_none() {
+            return Some(format!("{key_name}: no live terminal for this worker yet"));
+        }
+        let backend = self.agents[index].backend;
+        Self::claude_nav_log(&format!(
+            "{key_name} pressed run={run_id} walk_active={}",
+            self.claude_message_nav_active(run_id)
+        ));
+        if !jump_to_latest && self.claude_message_nav_active(run_id) {
+            // A walk is still in progress for this pane; let it finish rather
+            // than race it.
+            return None;
+        }
+        let run = &mut self.agents[index];
+        // Claude Code renders one of two ways, and they need opposite
+        // handling. On the alternate screen it owns a viewport and Rudder asks
+        // IT to scroll (PageUp, wheel, Ctrl+End). Rendered inline it has no
+        // viewport at all: it never enables mouse reporting and ignores
+        // PageUp, and the scrollback the user sees belongs to Rudder — so only
+        // Rudder can move it. Sending keys to an inline worker is why Alt+V
+        // looked dead in a real session (`alt_screen=false wants_mouse=false`
+        // in the walk log) while every direct-spawn test passed, since a
+        // Claude spawned outside Rudder takes the alternate screen.
+        let inline = run
+            .terminal
+            .as_ref()
+            .is_some_and(|terminal| !terminal.uses_alternate_screen_snapshot());
+        // Codex and opencode are launched inline (`--no-alt-screen`), so their
+        // history is Rudder's scrollback and the same walk works, keyed on how
+        // each echoes a user message (`is_question_start`). Only Claude has
+        // the alternate-screen protocol below; a non-Claude worker that took
+        // the alternate screen has nothing Rudder can drive.
+        if backend != Backend::Claude && !inline {
+            return Some(format!(
+                "{key_name} for a {} worker needs its inline view; this one took the alternate screen",
+                backend.as_str()
+            ));
+        }
+        let view_open = !inline && Self::claude_transcript_view_open(run);
+        if jump_to_latest || !inline {
+            // Alt+B always returns to the live bottom, and the key-driven walk
+            // always starts from it.
+            if let Some(terminal) = run.terminal.as_mut() {
+                terminal.reset_scrollback();
+            }
+        }
+        if jump_to_latest {
+            self.cancel_claude_message_nav(run_id);
+            if inline {
+                // reset_scrollback above already put the pane back at the
+                // live bottom; there is nothing to ask the child for.
+                Self::claude_nav_log("Alt+B: inline pane, reset Rudder's scrollback");
+                self.dirty = true;
+                return None;
+            }
+            let bytes = if view_open {
+                CLAUDE_TRANSCRIPT_EXIT_TO_LATEST_BYTES
+            } else {
+                CLAUDE_JUMP_TO_LATEST_BYTES
+            };
+            let result = self.agents[index]
+                .terminal
+                .as_mut()
+                .map(|terminal| terminal.write_input(bytes));
+            if let Some(Err(error)) = result {
+                self.set_run_error(index, error.to_string());
+            }
+            None
+        } else if inline {
+            let run = &mut self.agents[index];
+            let scrolled = run
+                .terminal
+                .as_mut()
+                .map(|terminal| Self::scroll_pane_to_previous_question(backend, terminal))
+                .unwrap_or(0);
+            Self::claude_nav_log(&format!(
+                "Alt+V: inline {} pane, scrolled Rudder's own view up {scrolled} rows to offset {:?}",
+                backend.as_str(),
+                run.terminal.as_ref().map(|terminal| terminal.scrollback())
+            ));
+            let landed_on_question = run.terminal.as_ref().is_some_and(|terminal| {
+                terminal
+                    .visible_lines_snapshot()
+                    .first()
+                    .is_some_and(|line| is_question_start(backend, line))
+            });
+            let kept = run
+                .terminal
+                .as_ref()
+                .map(|terminal| terminal.scrollback_limit())
+                .unwrap_or(0);
+            self.dirty = true;
+            if scrolled == 0 {
+                Some("Alt+V: nothing above — the whole conversation is already on screen".to_string())
+            } else if !landed_on_question {
+                // The walk ran out of history before it found a question. Say
+                // so, rather than leaving a press that visibly moved and then
+                // "did nothing".
+                Some(format!(
+                    "Alt+V: top of the history Rudder kept ({kept} rows); earlier messages are no longer held"
+                ))
+            } else {
+                None
+            }
+        } else if view_open {
+            // The user opened Claude's transcript view by hand; the walk
+            // drives the normal view, so leave that view alone rather than
+            // scroll it.
+            Some(
+                "Alt+V scrolls the normal view — press q to leave the transcript view first"
+                    .to_string(),
+            )
+        } else {
+            self.start_claude_message_nav(run_id);
+            None
         }
     }
 
@@ -5899,6 +6033,11 @@ impl App {
         if is_scroll_mouse_event(mouse.kind) {
             return self.handle_pane_scroll(mouse);
         }
+        // A click is you, back at the dashboard: it counts as having seen
+        // whatever the tab glyph was announcing (see `tab_status_glyph`).
+        if matches!(mouse.kind, MouseEventKind::Down(_)) {
+            self.note_user_activity();
+        }
 
         // Continue an in-progress drag even if the pointer leaves the pane, so a fast
         // drag does not drop the selection. Orchestrator and worker selections are
@@ -6838,18 +6977,18 @@ impl App {
     }
 
     /// Scroll a worker pane's OWN scrollback (Rudder's, not the child's) up
-    /// until the previous message start sits on the top row, and return how
+    /// until the previous question sits on the top row, and return how
     /// many rows that took — 0 when it was already at the top of the history.
     ///
     /// This is the path for a Claude Code worker rendering inline, where
     /// there is nothing to ask the child (see the dispatch comment). It needs
     /// no keystrokes and no repaint waits, so it lands within the keypress
     /// instead of over the next second.
-    fn scroll_pane_to_previous_message(terminal: &mut TerminalPane) -> usize {
-        // Bounded so one press can't walk an enormous history; a message is
-        // far shorter than this, and a press that hits the bound has still
-        // scrolled a long way up.
-        const MAX_ROWS: usize = 4000;
+    fn scroll_pane_to_previous_question(backend: Backend, terminal: &mut TerminalPane) -> usize {
+        // A press walks to the previous question however far up it is; the
+        // pane's own history limit is what really bounds this. The constant is
+        // only a guard against a pane that never stops reporting movement.
+        const MAX_ROWS: usize = 50_000;
         for scrolled in 1..=MAX_ROWS {
             let before = terminal.scrollback();
             terminal.scrollback_by(1);
@@ -6860,7 +6999,7 @@ impl App {
             if terminal
                 .visible_lines_snapshot()
                 .first()
-                .is_some_and(|line| is_claude_message_start(line))
+                .is_some_and(|line| is_question_start(backend, line))
             {
                 return scrolled;
             }
@@ -7013,11 +7152,11 @@ impl App {
                         nav.pages,
                         claude_page_shift(before, &screen),
                         claude_message_start_rows(&screen),
-                        claude_previous_message_row(before, &screen),
+                        claude_previous_question_row(before, &screen),
                         &before[..before.len().min(3)],
                         &screen[..screen.len().min(3)],
                     ));
-                    // A message start on row 0 is ignored, so the walk pages
+                    // A question on row 0 is ignored, so the walk pages
                     // once more. While scrolled, Claude pins the current
                     // prompt to row 0, and a pinned `❯` line looks exactly
                     // like a user message that just came into view — taking
@@ -7025,7 +7164,7 @@ impl App {
                     // One more page tells them apart for free: a pinned line
                     // reads the same before and after, so it is filtered out,
                     // while real content moves down and is aligned as usual.
-                    match claude_previous_message_row(before, &screen).filter(|row| *row > 0) {
+                    match claude_previous_question_row(before, &screen).filter(|row| *row > 0) {
                         Some(row) => {
                             nav.phase = ClaudeNavPhase::Aligning {
                                 target: screen[row].clone(),
@@ -11614,9 +11753,59 @@ It will tend to agree with itself — name another with /gam <provider> <model> 
         if input.is_empty() {
             return;
         }
+        // Name the workspace from a short model-written title, not the first
+        // words of the prompt: "boris-recently-posted-this-i-used-opus-5" says
+        // nothing about the work. The title comes first because the workspace
+        // directory (what the agent runs in, what its UI shows) cannot be
+        // renamed under a live agent. A planner-titled prompt already has one.
+        if let Some(namer) = self.workspace_namer {
+            if rudder_plan_worker_title_from_prompt(input).is_none() && is_git_repo(&self.cwd) {
+                let (tx, rx) = mpsc::channel();
+                let task = input.to_string();
+                thread::spawn(move || {
+                    let _ = tx.send(namer(&task));
+                });
+                self.pending_named_runs.push(PendingNamedRun {
+                    input: input.to_string(),
+                    rx,
+                    started: Instant::now(),
+                });
+                self.notice = Some("naming the new workspace…".to_string());
+                self.dirty = true;
+                return;
+            }
+        }
+        self.launch_single_run_task(input, None);
+    }
+
+    /// Launch the `/run` workers whose workspace names have arrived, or whose
+    /// namer took too long (they fall back to the prompt's own words).
+    fn poll_pending_named_runs(&mut self) {
+        if self.pending_named_runs.is_empty() {
+            return;
+        }
+        let mut ready: Vec<(String, Option<String>)> = Vec::new();
+        self.pending_named_runs.retain(|pending| match pending.rx.try_recv() {
+            Ok(title) => {
+                ready.push((pending.input.clone(), title));
+                false
+            }
+            Err(mpsc::TryRecvError::Empty) if pending.started.elapsed() < WORKSPACE_NAMING_TIMEOUT => true,
+            Err(_) => {
+                ready.push((pending.input.clone(), None));
+                false
+            }
+        });
+        for (input, title) in ready {
+            self.launch_single_run_task(&input, title.as_deref());
+            self.dirty = true;
+        }
+    }
+
+    fn launch_single_run_task(&mut self, input: &str, title: Option<&str>) {
         let before = self.agents.len();
         self.notice = None;
-        self.start_execute_task_node(input, None, None);
+        self.start_execute_task_node(input, title, None);
         let launch_notice = self.notice.clone();
         if self.agents.len() > before {
             let Some(run) = self.agents.last() else {
@@ -15668,6 +15857,10 @@ Files involved: {}
     }
 
     fn set_selected_error(&mut self, message: String) {
+        self.set_run_error(self.selected_agent, message);
+    }
+
+    fn set_run_error(&mut self, index: usize, message: String) {
         // A write that fails because the agent process ALREADY exited cleanly is
         // not a run failure — the process simply finished (common for the
         // non-interactive `claude -p` orchestrator, which prints its plan and
@@ -15676,7 +15869,7 @@ Files involved: {}
         // completion so a finished planner still gets its plan evaluated, and show
         // a gentle notice instead of a hard error.
         let mut clean_exit = false;
-        if let Some(run) = self.agents.get_mut(self.selected_agent) {
+        if let Some(run) = self.agents.get_mut(index) {
             let exited_clean = run
                 .terminal
                 .as_mut()
@@ -17911,6 +18104,7 @@ What to do\n\
         self.drive_claude_message_navs();
         self.maybe_start_queued_reconcile();
         self.poll_task_summary_workers();
+        self.poll_pending_named_runs();
         self.poll_completion_summary_workers();
         self.poll_final_gate();
         // Cross-process CLI stop requests are authoritative and must be consumed
@@ -17969,6 +18163,13 @@ What to do\n\
         let mut context_dirty = false;
         let mut completed_rudder_plans = Vec::new();
         let mut drain_perf: Vec<(Duration, serde_json::Value)> = Vec::new();
+        // A pane mirrored by `rudder attach` is being watched as closely as the
+        // focused one, so it drains every tick too.
+        let attached_ids: HashSet<String> = self
+            .attach_clients
+            .iter()
+            .filter_map(|client| client.run_id.clone())
+            .collect();
         for (index, run) in self.agents.iter_mut().enumerate() {
             let mut changed = false;
             let mut worker_gone_exit: Option<u32> = None;
@@ -17984,6 +18185,7 @@ What to do\n\
                 run.mode == AgentMode::RudderPlan && run.status == AgentStatus::Running;
             let due_to_drain = is_focused
                 || is_streaming_planner
+                || attached_ids.contains(&run.id)
                 || run
                     .last_drain_at
                     .is_none_or(|stamp| now.duration_since(stamp) >= UNFOCUSED_DRAIN_INTERVAL);
@@ -18084,10 +18286,31 @@ What to do\n\
                     // just a repaint (e.g. the resize that fires when you HIGHLIGHT a
                     // finished agent), and flipping done->in-progress is the flicker
                     // the pane suffered from. Require user input after completion.
-                    let user_started_new_turn = post_completion_output_is_new_turn(
+                    let typed_since_done = post_completion_output_is_new_turn(
                         run.last_worker_input_at,
                         run.completed_at,
                     );
+                    // A Claude worker has its UserPromptSubmit hook wired, and THAT is
+                    // what a new turn is. "Typed something and the pane repainted" is
+                    // not: a draft being typed, `/model`, `/help`, any local command
+                    // repaints without starting a turn (measured: `/model` fires no
+                    // hook at all), and no Stop ever ends a turn that never began, so
+                    // the row spun until someone noticed. Backends without a prompt
+                    // hook (Codex's are trust-gated), orchestrators and plain panes
+                    // keep the typed-input reading.
+                    let hooks_say_new_turn = run.backend == Backend::Claude
+                        && !is_orchestrator
+                        && !run.plain_process;
+                    let user_started_new_turn = if hooks_say_new_turn {
+                        let started = signals::read_signal(&run.id)
+                            == Some(signals::SignalState::Working);
+                        if started {
+                            signals::clear_signal(&run.id);
+                        }
+                        started
+                    } else {
+                        typed_since_done
+                    };
                     // Backstop against a false completion: a reappearing busy spinner
                     // ("esc to interrupt") is unambiguous proof the agent is actively
                     // working, so reopen it even without user input — we mis-detected
@@ -18127,6 +18350,24 @@ What to do\n\
                 {
                     run.wait_signal = None;
                 }
+                // You interrupted the turn. Claude prints a receipt and reports
+                // nothing else (no `Stop`, no `idle_prompt`; verified on 2.1.278),
+                // so without this the row spun as "running" for a day after the
+                // turn had ended. Latched like the other waits; the `Working`
+                // signal of your next prompt lifts it.
+                if run.wait_signal.is_none()
+                    && visible_lines
+                        .as_ref()
+                        .is_some_and(|lines| terminal_interrupted_from_lines(run.backend, lines))
+                {
+                    run.wait_signal = Some(WaitSignal::Interrupted);
+                    changed = true;
+                    notify_desktop(DesktopNote {
+                        repo: repo_display_name(&run.cwd),
+                        event: "interrupted \u{b7} waiting for you".to_string(),
+                        task: run.task_summary.trim().to_string(),
+                    });
+                }
                 let chrome_permission = visible_lines
                     .as_ref()
                     .is_some_and(|lines| terminal_needs_permission_from_lines(run.backend, lines));
@@ -18141,11 +18382,29 @@ What to do\n\
                 // mark_run_done). Previously these rang on every detector flicker,
                 // which fired a ping whenever you selected a waiting agent.
                 let needs_user_input = !needs_permission
-                    && (run.wait_signal == Some(WaitSignal::Input)
-                        || visible_lines.as_ref().is_some_and(|lines| {
+                    && (matches!(
+                        run.wait_signal,
+                        Some(WaitSignal::Input | WaitSignal::Interrupted | WaitSignal::Idle)
+                    ) || visible_lines.as_ref().is_some_and(|lines| {
                             terminal_needs_user_input_from_lines(run.backend, lines)
                         }));
                 run.needs_user_input = needs_user_input;
+                // Backstop for a turn that ended with NO signal: nothing fired
+                // (no Stop, no StopFailure, no notification) and the pane has
+                // been silent at its composer for a minute. Lifted like every
+                // other wait: the next prompt's `working` signal or a spinner.
+                if run.wait_signal.is_none()
+                    && !run.needs_permission
+                    && !run.needs_user_input
+                    && !is_orchestrator
+                    && !run.plain_process
+                    && run.last_output_at.elapsed() >= IDLE_WITHOUT_SIGNAL
+                    && terminal_at_idle_prompt(run.backend, &terminal.visible_lines_snapshot())
+                {
+                    run.wait_signal = Some(WaitSignal::Idle);
+                    run.needs_user_input = true;
+                    changed = true;
+                }
                 if run.needs_permission != previous_needs_permission
                     || run.needs_user_input != previous_needs_user_input
                 {
@@ -18516,6 +18775,7 @@ What to do\n\
     }
 
     fn shutdown(&mut self) {
+        self.close_attach_clients("the dashboard quit");
         for run in &mut self.agents {
             if run.terminal.is_some() {
                 if run.backend == Backend::Codex && run.session_id.is_none() {
@@ -18551,6 +18811,9 @@ fn main() -> Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if args.first().is_some_and(|arg| arg == "mouse-test") {
         return run_mouse_test(args.get(1).map(String::as_str).unwrap_or("parsed"));
+    }
+    if args.first().is_some_and(|arg| arg == "attach") {
+        return run_attach_client(&args[1..]);
     }
 
     let mut terminal = setup_terminal()?;
@@ -18936,10 +19199,14 @@ fn run(terminal: &mut Tui) -> Result<()> {
         // status change, cloud info, etc).
         app.poll_agents();
         app.refresh_tab_title();
+        app.service_attach_clients();
         if drain_ready_events(&mut app, MAX_EVENTS_PER_FRAME, &signal_rx)? {
             app.shutdown();
             break;
         }
+        // Second views (view.rs) redraw whenever this one would, plus on their
+        // own input.
+        let shared_changed = app.dirty;
         if app.dirty && app.should_defer_scroll_draw() {
             app.perf.log(
                 "draw_deferred",
@@ -18951,6 +19218,8 @@ fn run(terminal: &mut Tui) -> Result<()> {
         } else if app.take_dirty() {
             let draw_started = Instant::now();
             let mut render_build_us = 0_u64;
+            let local_selected = app.agents.get(app.selected_agent).map(|run| run.id.clone());
+            app.prepare_pane_sizes_for(LOCAL_VIEW, local_selected);
             terminal.draw(|frame| {
                 let render_started = Instant::now();
                 render(frame, &mut app);
@@ -18972,6 +19241,7 @@ fn run(terminal: &mut Tui) -> Result<()> {
                 }),
             );
         }
+        app.render_dashboard_views(shared_changed);
 
         // PTY readers wake this loop as soon as child output arrives, so the timeout is
         // only a backstop for timer-driven state and does not need a planner fast path.
@@ -19600,6 +19870,11 @@ fn is_orchestrator_skill_marker(line: &str) -> bool {
 }
 
 fn handle_event(app: &mut App, event: Event) -> bool {
+    if matches!(event, Event::Key(_) | Event::Paste(_))
+        || matches!(&event, Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Down(_)))
+    {
+        app.note_view_input(LOCAL_VIEW);
+    }
     match event {
         Event::Key(key) if key.kind == KeyEventKind::Press => {
             app.mark_dirty();
@@ -19717,3 +19992,302 @@ fn set_private_file_mode(path: &Path) {
 
 #[cfg(not(unix))]
 fn set_private_file_mode(_path: &Path) {}
+
+// ---------------------------------------------------------------------------
+// `rudder attach`: serving other terminals that mirror an agent pane
+// ---------------------------------------------------------------------------
+impl App {
+    /// Where this dashboard's attach socket lives.
+    fn attach_socket_path(&self) -> PathBuf {
+        self.cwd.join(".rudder").join(ATTACH_SOCKET_NAME)
+    }
+
+    /// Is some attached terminal mirroring this run? Its pane size then
+    /// belongs to that terminal, not to the dashboard's layout (render.rs
+    /// skips its resize), so the history is not wiped every time the
+    /// selection moves on and off the row.
+    pub(crate) fn run_is_attached(&self, run_id: &str) -> bool {
+        self.attach_clients
+            .iter()
+            .any(|client| client.run_id.as_deref() == Some(run_id))
+    }
+
+    /// Bind the socket (once), apply everything attached terminals sent, and
+    /// push a frame to each. Runs every heartbeat; costs nothing with no
+    /// clients beyond a `try_recv`.
+    fn service_attach_clients(&mut self) {
+        if self.attach_server.is_none() && !self.attach_server_failed {
+            match AttachServer::start(self.attach_socket_path(), self.pty_output_waker.clone()) {
+                Ok(server) => self.attach_server = Some(server),
+                Err(error) => {
+                    self.attach_server_failed = true;
+                    Self::claude_nav_log(&format!("attach server not started: {error:#}"));
+                }
+            }
+        }
+        loop {
+            let Some(event) = self.attach_server.as_ref().and_then(AttachServer::try_recv) else {
+                break;
+            };
+            match event {
+                AttachEvent::Connected { id, tx } => {
+                    self.attach_clients.push(AttachClient::new(id, tx));
+                }
+                AttachEvent::Disconnected { id } => {
+                    if self.attach_clients.iter().any(|client| client.id == id) {
+                        self.attach_clients.retain(|client| client.id != id);
+                        self.dirty = true;
+                    }
+                    if self.pane_size_owner == id {
+                        self.note_view_input(LOCAL_VIEW);
+                    }
+                }
+                AttachEvent::Message { id, msg } => self.handle_attach_message(id, msg),
+            }
+        }
+        if self.attach_clients.is_empty() {
+            return;
+        }
+        let mut gone: Vec<u64> = Vec::new();
+        for client in &mut self.attach_clients {
+            let Some(run_id) = client.run_id.clone() else {
+                continue;
+            };
+            match self.agents.iter_mut().find(|run| run.id == run_id) {
+                Some(run) => match run.terminal.as_mut() {
+                    Some(terminal) => {
+                        // The attached terminal owns the pane size.
+                        if client.rows > 0 && client.cols > 0 {
+                            if let Ok(size) = TerminalSize::new(client.rows, client.cols) {
+                                if run.terminal_size != Some(size) && terminal.resize(size).is_ok() {
+                                    run.terminal_size = Some(size);
+                                }
+                            }
+                        }
+                        client.push_frame(terminal);
+                    }
+                    None => {
+                        client.send(&ServerMsg::Bye {
+                            reason: "that agent's terminal is closed".to_string(),
+                        });
+                        gone.push(client.id);
+                    }
+                },
+                None => {
+                    client.send(&ServerMsg::Bye {
+                        reason: "that agent was removed from the dashboard".to_string(),
+                    });
+                    gone.push(client.id);
+                }
+            }
+            if client.is_gone() {
+                gone.push(client.id);
+            }
+        }
+        if !gone.is_empty() {
+            self.attach_clients.retain(|client| !gone.contains(&client.id));
+            self.dirty = true;
+        }
+    }
+
+    fn handle_attach_message(&mut self, id: u64, msg: ClientMsg) {
+        let Some(pos) = self.attach_clients.iter().position(|client| client.id == id) else {
+            return;
+        };
+        match msg {
+            ClientMsg::List => {
+                let agents = self.attach_agent_summaries();
+                self.attach_clients[pos].send(&ServerMsg::Agents { agents });
+            }
+            ClientMsg::Attach {
+                selector,
+                rows,
+                cols,
+            } => match self.resolve_attach_selector(&selector) {
+                Ok(index) => {
+                    let run_id = self.agents[index].id.clone();
+                    let label = attach_label(&self.agents[index]);
+                    let client = &mut self.attach_clients[pos];
+                    client.run_id = Some(run_id.clone());
+                    client.set_size(rows, cols);
+                    client.send(&ServerMsg::Hello {
+                        run_id,
+                        label,
+                        rows,
+                        cols,
+                    });
+                    self.dirty = true;
+                }
+                Err(reason) => {
+                    self.attach_clients[pos].send(&ServerMsg::Bye { reason });
+                }
+            },
+            ClientMsg::Resize { rows, cols } => {
+                if self.attach_clients[pos].dashboard.is_some() {
+                    self.resize_dashboard_view(id, rows, cols);
+                } else {
+                    self.attach_clients[pos].set_size(rows, cols);
+                }
+            }
+            ClientMsg::Dashboard { rows, cols } => {
+                self.open_dashboard_view(id, rows, cols);
+            }
+            ClientMsg::Event { event } => {
+                if self.attach_clients[pos].dashboard.is_none() {
+                    return;
+                }
+                if self.handle_view_event(id, event) {
+                    self.close_attach_client(id, "closed this view; the dashboard and its agents keep running");
+                }
+            }
+            ClientMsg::Input { bytes } => {
+                let Some(index) = self.attached_run_index(pos) else {
+                    return;
+                };
+                let run = &mut self.agents[index];
+                run.last_worker_input_at = Some(Instant::now());
+                let result = run
+                    .terminal
+                    .as_mut()
+                    .map(|terminal| terminal.write_input(&bytes));
+                if let Some(Err(error)) = result {
+                    self.set_run_error(index, error.to_string());
+                }
+            }
+            ClientMsg::Nav { op } => {
+                let Some(index) = self.attached_run_index(pos) else {
+                    return;
+                };
+                let run_id = self.agents[index].id.clone();
+                let notice = match op {
+                    NavOp::PreviousQuestion => self.nav_claude_messages(&run_id, false),
+                    NavOp::Latest => self.nav_claude_messages(&run_id, true),
+                    NavOp::Up | NavOp::Down => {
+                        let rows = if op == NavOp::Up {
+                            ATTACH_WHEEL_ROWS
+                        } else {
+                            -ATTACH_WHEEL_ROWS
+                        };
+                        if let Some(terminal) = self.agents[index].terminal.as_mut() {
+                            terminal.scrollback_by(rows);
+                        }
+                        self.dirty = true;
+                        None
+                    }
+                };
+                if let Some(text) = notice {
+                    self.attach_clients[pos].send(&ServerMsg::Notice { text });
+                }
+            }
+            ClientMsg::Detach => self.close_attach_client(id, "detached"),
+        }
+    }
+
+    fn close_attach_client(&mut self, id: u64, reason: &str) {
+        if let Some(pos) = self.attach_clients.iter().position(|client| client.id == id) {
+            self.attach_clients[pos].send(&ServerMsg::Bye {
+                reason: reason.to_string(),
+            });
+            self.attach_clients.remove(pos);
+            self.dirty = true;
+        }
+        if self.pane_size_owner == id {
+            self.note_view_input(LOCAL_VIEW);
+        }
+    }
+
+    fn attached_run_index(&self, pos: usize) -> Option<usize> {
+        let run_id = self.attach_clients.get(pos)?.run_id.as_deref()?;
+        self.agents.iter().position(|run| run.id == run_id)
+    }
+
+    /// The agents a terminal can attach to: every row with a live pane, in
+    /// dashboard order, numbered from 1 for the picker.
+    fn attach_agent_summaries(&self) -> Vec<AgentSummary> {
+        self.agents
+            .iter()
+            .filter(|run| run.terminal.is_some())
+            .enumerate()
+            .map(|(n, run)| AgentSummary {
+                index: n + 1,
+                run_id: run.id.clone(),
+                label: attach_label(run),
+                status: agent_status_text(run),
+                backend: run.backend.as_str().to_string(),
+            })
+            .collect()
+    }
+
+    /// A run id, a node id, a picker number, or part of the title — as long as
+    /// it names exactly one live pane.
+    fn resolve_attach_selector(&self, selector: &str) -> std::result::Result<usize, String> {
+        let selector = selector.trim();
+        if selector.is_empty() {
+            return Err("which agent? give a run id, node id, number or part of the title".to_string());
+        }
+        let live: Vec<usize> = (0..self.agents.len())
+            .filter(|&index| self.agents[index].terminal.is_some())
+            .collect();
+        if live.is_empty() {
+            return Err("the dashboard has no live agent panes to attach to".to_string());
+        }
+        if let Some(index) = live.iter().copied().find(|&index| self.agents[index].id == selector) {
+            return Ok(index);
+        }
+        if let Some(index) = live
+            .iter()
+            .copied()
+            .find(|&index| self.agents[index].node_id.as_deref() == Some(selector))
+        {
+            return Ok(index);
+        }
+        if let Ok(number) = selector.parse::<usize>() {
+            if let Some(&index) = number.checked_sub(1).and_then(|n| live.get(n)) {
+                return Ok(index);
+            }
+            return Err(format!("no agent numbered {number}; there are {}", live.len()));
+        }
+        let needle = selector.to_lowercase();
+        let matches: Vec<usize> = live
+            .iter()
+            .copied()
+            .filter(|&index| attach_label(&self.agents[index]).to_lowercase().contains(&needle))
+            .collect();
+        match matches.as_slice() {
+            [index] => Ok(*index),
+            [] => Err(format!("no live agent matches {selector:?}")),
+            many => Err(format!(
+                "{selector:?} matches {} agents: {}",
+                many.len(),
+                many.iter()
+                    .map(|&index| attach_label(&self.agents[index]))
+                    .collect::<Vec<_>>()
+                    .join(" · ")
+            )),
+        }
+    }
+
+    fn close_attach_clients(&mut self, reason: &str) {
+        for client in &mut self.attach_clients {
+            client.send(&ServerMsg::Bye {
+                reason: reason.to_string(),
+            });
+        }
+        self.attach_clients.clear();
+        self.attach_server = None;
+    }
+}
+
+/// The name an attached terminal shows for a run: the node id when there is
+/// one, then the task title.
+pub(crate) fn attach_label(run: &AgentRun) -> String {
+    let title = if run.task_summary.trim().is_empty() {
+        short_task(&run.task)
+    } else {
+        run.task_summary.trim().to_string()
+    };
+    match run.node_id.as_deref().filter(|id| !id.trim().is_empty()) {
+        Some(node) => format!("{node} · {title}"),
+        None => title,
+    }
+}

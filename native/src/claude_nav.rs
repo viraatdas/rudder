@@ -25,6 +25,8 @@
 //! change of direction is dropped; a message scrolled past the top slides
 //! under the sticky line (it isn't blanked, unlike in the transcript pager).
 
+use crate::Backend;
+
 /// Footer text Claude Code's fullscreen renderer shows while its transcript
 /// view (Ctrl+O) is open. Alt+V never opens that view any more, but Alt+B
 /// still reads this off the screen to close it with `q` first if the user
@@ -56,7 +58,33 @@ pub(crate) const CLAUDE_TRANSCRIPT_EXIT_TO_LATEST_BYTES: &[u8] = b"q\x1b[1;5F\x1
 /// timestamp header above assistant text are all indented or unmarked and
 /// don't count.
 pub(crate) fn is_claude_message_start(line: &str) -> bool {
-    line.starts_with('⏺') || line.starts_with("❯ ") || line.starts_with("❯\u{a0}")
+    line.starts_with('⏺') || is_claude_question_start(line)
+}
+
+/// Whether a row begins a question: a prompt the user sent (`❯`). This is
+/// what Alt+V stops on, so each press lands on the top of an exchange —
+/// question first, its answer below. Stopping on every `⏺` instead meant
+/// stopping inside an answer at each of its tool calls, which for a worker's
+/// one long turn is a dozen stops that all look alike.
+pub(crate) fn is_claude_question_start(line: &str) -> bool {
+    line.starts_with("❯ ") || line.starts_with("❯\u{a0}")
+}
+
+/// Codex's TUI (0.156, `--no-alt-screen` as Rudder launches it) echoes each
+/// user message into the history as `› <text>`, the same glyph its composer
+/// uses, and answers as `• <text>`. Measured with `live_codex_normal_view_probe`.
+pub(crate) fn is_codex_question_start(line: &str) -> bool {
+    line.starts_with("\u{203a} ")
+}
+
+/// The line a worker's history shows at the top of each exchange, per
+/// backend. opencode's rendering has not been measured, so it accepts both.
+pub(crate) fn is_question_start(backend: Backend, line: &str) -> bool {
+    match backend {
+        Backend::Claude => is_claude_question_start(line),
+        Backend::Codex => is_codex_question_start(line),
+        Backend::Opencode => is_claude_question_start(line) || is_codex_question_start(line),
+    }
 }
 
 /// Where a Claude Code screen's transcript ends and its own chrome begins:
@@ -140,20 +168,21 @@ pub(crate) fn claude_page_shift(before: &[String], after: &[String]) -> Option<u
 }
 
 /// After a page up from `before` to `after`: the row in `after` of the nearest
-/// message start that was above the old top of the screen — the one to scroll
-/// to the top next — or `None` if nothing new begins a message on this page
-/// (page up again).
+/// QUESTION that was above the old top of the screen — the one to scroll to
+/// the top next — or `None` if no question came into view on this page (page
+/// up again).
 ///
 /// "Above the old top" is row < shift, plus row == shift when the old top row
 /// was NOT that message start — it was hidden under the sticky prompt line,
 /// or rendered blank because it was cut off — so it's newly revealed all the
 /// same. A row that reads the same as it did before the page-up (the sticky
 /// prompt itself) is never chosen.
-pub(crate) fn claude_previous_message_row(before: &[String], after: &[String]) -> Option<usize> {
+pub(crate) fn claude_previous_question_row(before: &[String], after: &[String]) -> Option<usize> {
     let shift = claude_page_shift(before, after);
     let revealed = shift.unwrap_or(after.len());
     claude_message_start_rows(after)
         .into_iter()
+        .filter(|&row| is_claude_question_start(&after[row]))
         .filter(|&row| row < revealed || (shift.is_some() && row == revealed))
         .filter(|&row| before.get(row) != Some(&after[row]))
         .filter(|&row| !(row == revealed && before.first() == Some(&after[row])))
@@ -225,43 +254,43 @@ mod tests {
             "⏺ Bash(echo echo)", "  ⎿  echo", "", "⏺ It printed echo.", "",
         ]);
         assert_eq!(claude_page_shift(&before, &after), Some(4));
-        // Nearest newly revealed message start: "⏺ It printed delta." (row 3).
-        // The sticky prompt on row 0 is unchanged and never a candidate.
-        assert_eq!(claude_previous_message_row(&before, &after), Some(3));
+        // Only `⏺` blocks came into view, so the walk pages again; the
+        // pinned prompt on row 0 is unchanged and never a candidate.
+        assert_eq!(claude_previous_question_row(&before, &after), None);
     }
 
     #[test]
-    fn previous_message_includes_the_row_hidden_under_the_sticky_prompt() {
-        // Old row 0 was the sticky prompt; after paging up by 4 the message
-        // that had been sitting under it ("⏺ Bash(echo delta)") is at row 4
-        // — exactly the shift — and IS the nearest previous message.
+    fn previous_question_includes_the_row_hidden_under_the_sticky_prompt() {
+        // Old row 0 was the pinned prompt; after paging up by 4 the question
+        // that had been sitting under it is at row 4 — exactly the shift —
+        // and IS the nearest previous question.
         let before = screen(&[
             "❯ Run these", "  ⎿  delta", "", "⏺ It printed delta.", "", "⏺ Bash(echo echo)", "  ⎿  echo",
         ]);
         let after = screen(&[
-            "❯ Run these", "", "⏺ It printed charlie.", "", "⏺ Bash(echo delta)", "  ⎿  delta", "",
+            "❯ Run these", "", "⏺ It printed charlie.", "", "❯ ask again", "  ⎿  delta", "",
             "⏺ It printed delta.",
         ]);
         assert_eq!(claude_page_shift(&before, &after), Some(4));
-        assert_eq!(claude_previous_message_row(&before, &after), Some(4));
+        assert_eq!(claude_previous_question_row(&before, &after), Some(4));
     }
 
     #[test]
-    fn previous_message_ignores_starts_that_were_already_on_screen() {
-        // A message start that was on the old top row (fully visible, not
-        // under a sticky line) sits exactly at the shift boundary and must
-        // not be chosen again.
-        let before = screen(&["⏺ message 9", "  body 46", "  body 47"]);
-        let after = screen(&["  body 44", "  body 45", "⏺ message 9", "  body 46", "  body 47"]);
+    fn previous_question_ignores_starts_that_were_already_on_screen() {
+        // A question that was on the old top row (fully visible, not under a
+        // pinned line) sits exactly at the shift boundary and must not be
+        // chosen again.
+        let before = screen(&["❯ question 9", "  body 46", "  body 47"]);
+        let after = screen(&["  body 44", "  body 45", "❯ question 9", "  body 46", "  body 47"]);
         assert_eq!(claude_page_shift(&before, &after), Some(2));
-        assert_eq!(claude_previous_message_row(&before, &after), None);
+        assert_eq!(claude_previous_question_row(&before, &after), None);
     }
 
     #[test]
-    fn previous_message_treats_an_unmatched_page_as_all_new() {
+    fn previous_question_treats_an_unmatched_page_as_all_new() {
         let before = screen(&["  body 90", "  body 91"]);
-        let after = screen(&["⏺ message 1", "  body", "⏺ message 2", "  body"]);
-        assert_eq!(claude_previous_message_row(&before, &after), Some(2));
+        let after = screen(&["❯ question 1", "  body", "❯ question 2", "  body"]);
+        assert_eq!(claude_previous_question_row(&before, &after), Some(2));
     }
 
     #[test]
@@ -275,6 +304,8 @@ mod tests {
         assert_eq!(claude_content_end(&rows), 5);
         // The empty input box must never count as a user message.
         assert_eq!(claude_message_start_rows(&rows), vec![0]);
+        assert!(!is_claude_question_start("⏺ the answer"));
+        assert!(is_claude_question_start("❯ a question"));
         // No chrome at all: everything is content.
         let bare = screen(&["⏺ a", "  b"]);
         assert_eq!(claude_content_end(&bare), 2);
