@@ -3962,6 +3962,10 @@ fn styled_rows_become_ansi_with_sgr_only_where_the_style_changes() {
 /// Drive the attach socket exactly as `rudder attach` does, against a real
 /// pane: list, attach, get the pane's rows as a frame, type into it, see the
 /// echo come back, detach.
+/// Generous: the pane is a python3 child in a pty, and a cold CI runner's
+/// first python launch alone has taken longer than 5s (release run 36763776140).
+const ATTACH_TEST_WAIT: u64 = 30;
+
 #[cfg(not(windows))]
 #[test]
 fn an_attached_terminal_mirrors_a_pane_and_types_into_it() {
@@ -4021,8 +4025,8 @@ for line in sys.stdin:
         writer.write_all(line.as_bytes()).expect("send");
     };
     // The dashboard's loop must keep turning while we wait on the socket.
-    let next = |app: &mut App, reader: &mut BufReader<UnixStream>| -> ServerMsg {
-        let deadline = Instant::now() + Duration::from_secs(5);
+    let next = |app: &mut App, reader: &mut BufReader<UnixStream>, step: &str| -> ServerMsg {
+        let deadline = Instant::now() + Duration::from_secs(ATTACH_TEST_WAIT);
         let mut line = String::new();
         loop {
             app.poll_agents();
@@ -4037,12 +4041,12 @@ for line in sys.stdin:
                 }
                 Err(_) => {}
             }
-            assert!(Instant::now() < deadline, "no message within 5s");
+            assert!(Instant::now() < deadline, "no message within {ATTACH_TEST_WAIT}s while waiting for {step}");
         }
     };
 
     send(&ClientMsg::List);
-    match next(&mut app, &mut reader) {
+    match next(&mut app, &mut reader, "the agent list") {
         ServerMsg::Agents { agents } => {
             assert_eq!(agents.len(), 1, "only rows with a live pane: {agents:?}");
             assert_eq!(agents[0].index, 1);
@@ -4057,7 +4061,7 @@ for line in sys.stdin:
         rows: 10,
         cols: 50,
     });
-    match next(&mut app, &mut reader) {
+    match next(&mut app, &mut reader, "hello") {
         ServerMsg::Hello { label, rows, cols, .. } => {
             assert_eq!(label, "Write the parser");
             assert_eq!((rows, cols), (10, 50));
@@ -4070,10 +4074,10 @@ for line in sys.stdin:
     // The frame carries the pane's rows as ANSI text, and the pane has been
     // resized to the attached terminal (it is not the dashboard's selection).
     let mut seen = String::new();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(ATTACH_TEST_WAIT);
     while !seen.contains("ATTACH BANNER ready") {
         assert!(Instant::now() < deadline, "no frame with the banner: {seen:?}");
-        if let ServerMsg::Frame { rows, cols, lines, .. } = next(&mut app, &mut reader) {
+        if let ServerMsg::Frame { rows, cols, lines, .. } = next(&mut app, &mut reader, "the banner frame") {
             assert_eq!((rows, cols), (10, 50));
             for (_, text) in lines {
                 seen.push_str(&text);
@@ -4094,10 +4098,10 @@ for line in sys.stdin:
         bytes: b"hello there\r".to_vec(),
     });
     let mut seen = String::new();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(ATTACH_TEST_WAIT);
     while !seen.contains("echo:hello there") {
         assert!(Instant::now() < deadline, "typed input never echoed back: {seen:?}");
-        if let ServerMsg::Frame { lines, .. } = next(&mut app, &mut reader) {
+        if let ServerMsg::Frame { lines, .. } = next(&mut app, &mut reader, "the echo frame") {
             for (_, text) in lines {
                 seen.push_str(&text);
                 seen.push('\n');
@@ -4113,20 +4117,20 @@ for line in sys.stdin:
     send(&ClientMsg::Nav {
         op: crate::attach::NavOp::PreviousQuestion,
     });
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(ATTACH_TEST_WAIT);
     loop {
         assert!(Instant::now() < deadline, "no notice for ⌥v");
-        if let ServerMsg::Notice { text } = next(&mut app, &mut reader) {
+        if let ServerMsg::Notice { text } = next(&mut app, &mut reader, "the alt-v notice") {
             assert!(text.starts_with("Alt+V:"), "{text}");
             break;
         }
     }
 
     send(&ClientMsg::Detach);
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(ATTACH_TEST_WAIT);
     loop {
         assert!(Instant::now() < deadline, "no bye after detach");
-        if let ServerMsg::Bye { reason } = next(&mut app, &mut reader) {
+        if let ServerMsg::Bye { reason } = next(&mut app, &mut reader, "bye") {
             assert_eq!(reason, "detached");
             break;
         }
