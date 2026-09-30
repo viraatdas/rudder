@@ -3977,14 +3977,11 @@ fn an_attached_terminal_mirrors_a_pane_and_types_into_it() {
     let mut app = App::new();
     app.cwd = repo.clone();
     // A pane that announces itself and then echoes every line typed at it.
-    let script = r#"
-import sys
-print("ATTACH BANNER ready", flush=True)
-for line in sys.stdin:
-    print("echo:" + line.strip(), flush=True)
-"#;
+    // Plain sh, not python: the v2.14.70/71 release runs never saw a python3
+    // pane print anything on the macOS runner.
+    let script = r#"printf 'ATTACH BANNER ready\n'; while IFS= read -r line; do printf 'echo:%s\n' "$line"; done"#;
     let pane = TerminalPane::spawn_shell_or_command(
-        Some(TerminalCommand::with_args("python3", ["-u", "-c", script])),
+        Some(TerminalCommand::with_args("/bin/sh", ["-c", script])),
         TerminalPaneOptions {
             size: TerminalSize { rows: 8, cols: 40 },
             scrollback_lines: 100,
@@ -4041,7 +4038,14 @@ for line in sys.stdin:
                 }
                 Err(_) => {}
             }
-            assert!(Instant::now() < deadline, "no message within {ATTACH_TEST_WAIT}s while waiting for {step}");
+            if Instant::now() >= deadline {
+                let pane = app.agents[0]
+                    .terminal
+                    .as_mut()
+                    .map(|terminal| terminal.visible_lines_snapshot().join("\n"))
+                    .unwrap_or_default();
+                panic!("no message within {ATTACH_TEST_WAIT}s while waiting for {step}; the pane shows:\n{pane}");
+            }
         }
     };
 
