@@ -1821,6 +1821,9 @@ struct App {
     /// scratch (Finder-style "prefill is selected"). Any edit/nav key instead
     /// keeps the name and clears this, so editing-in-place still works.
     rename_prefilled: bool,
+    /// Runs the user named by hand this session. The haiku title for a new
+    /// run lands seconds after it starts and must not replace a typed name.
+    renamed_runs: HashSet<String>,
     diff_summary_cache: HashMap<String, (Instant, Option<String>)>,
     /// Diff summaries still being computed off-thread, so N frames asking for the
     /// same row spawn ONE subprocess rather than one each.
@@ -2913,6 +2916,7 @@ impl App {
             rename_input: None,
             rename_cursor: 0,
             rename_prefilled: false,
+            renamed_runs: HashSet::new(),
             diff_summary_cache: HashMap::new(),
             diff_summary_inflight: HashSet::new(),
             diff_summary_rx: None,
@@ -9786,6 +9790,7 @@ Address the objection directly. If you disagree, say why inside \
         }
         run.task_summary = trimmed.to_string();
         let _ = save_native_run_record(&self.cwd, run);
+        self.renamed_runs.insert(run.id.clone());
         self.notice = Some(format!("renamed to {trimmed}"));
     }
 
@@ -18761,7 +18766,7 @@ What to do\n\
             if !matches!(run.mode, AgentMode::Execute | AgentMode::Main) {
                 continue;
             }
-            if run.task_summary == title {
+            if self.renamed_runs.contains(&run.id) || run.task_summary == title {
                 continue;
             }
             run.task_summary = title;

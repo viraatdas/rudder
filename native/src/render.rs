@@ -290,11 +290,13 @@ pub(crate) fn push_agent_row_with_trailing<'a>(
     } else {
         pane_text_style(focused)
     };
-    let task_label = if agent.is_main() {
-        agent.task_summary.clone()
-    } else if selected && app.rename_input.is_some() {
+    // The rename box comes first: a main row used to take its summary
+    // before this check, so `r` opened an editor nobody could see.
+    let task_label = if selected && app.rename_input.is_some() {
         let buf = app.rename_input.clone().unwrap_or_default();
         format!("✎ {buf}")
+    } else if agent.is_main() {
+        agent.task_summary.clone()
     } else if agent.task_summary.trim().is_empty() {
         summarize_task(&agent.task)
     } else {

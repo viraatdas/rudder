@@ -9362,7 +9362,21 @@ fn a_main_row_renames_like_any_other() {
         app.notice
     );
     app.rename_input = Some("ops copilot".to_string());
+    // The box has to be on screen: a main row used to draw its old summary
+    // over it, so the rename worked but nobody could see what they typed.
+    let screen = render_screen(&mut app, 120, 40);
+    assert!(screen.contains("✎ ops copilot"), "rename box not shown:\n{screen}");
     app.commit_rename();
+    assert_eq!(app.agents[0].task_summary, "ops copilot");
+
+    // The run's haiku title arrives after the user already named it.
+    app.task_summary_tx
+        .send(TaskSummaryResult {
+            run_id: "run-main".to_string(),
+            title: Some("Long-lived main chat".to_string()),
+        })
+        .unwrap();
+    app.poll_task_summary_workers();
     assert_eq!(app.agents[0].task_summary, "ops copilot");
 }
 
