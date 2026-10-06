@@ -39,6 +39,8 @@ auto-updates itself before running when a newer version is available. Set
 
 - Node.js 20 or newer
 - Git
+- [jj (Jujutsu)](https://jj-vcs.github.io): `brew install jj` or `cargo install jj-cli`.
+  Rudder uses it for isolated workspaces and merges; your repo stays plain git.
 - Claude Code and/or Codex installed and logged in
 - macOS, Linux, or another Unix-like terminal
 
