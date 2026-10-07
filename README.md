@@ -11,12 +11,12 @@
 [![Node >=20](https://img.shields.io/badge/node-%3E%3D20-43853d.svg)](https://nodejs.org/)
 [![Website](https://img.shields.io/badge/site-rudder.viraat.dev-111111.svg)](https://rudder.viraat.dev)
 
-Rudder runs coding agents the way they should be used: several at once,
-isolated, reviewable, and easy to merge. It opens a native three-pane dashboard,
-gives isolated tasks their own jj workspace, and runs real Claude Code or Codex
-processes in the worker pane. Plain requests instead get one end-to-end owner in
-the main checkout, so implementation, release, and deployment do not fall between
-separate agents unless you explicitly ask for a DAG.
+Rudder is a TUI for managing coding agents. Run Claude Code, Codex and opencode
+side by side in one native dashboard: every task you type gets its own isolated
+jj workspace, so agents never step on each other. See which agent needs you,
+approve prompts, steer any agent mid-turn, and merge the results back with one
+key. `/main` puts an agent in the main checkout when you want one there, and
+`/plan` turns a bigger goal into a reviewed multi-agent DAG.
 
 > **AI agents and contributors:** this README is for using Rudder. If you are
 > an AI agent (or a human) working on the Rudder codebase itself, read
@@ -56,12 +56,12 @@ rudder doctor
 rudder
 ```
 
-With no arguments, `rudder` opens the dashboard. Type in the bottom input and
-press `Enter` to give the request to a single end-to-end main-checkout agent.
-That agent owns implementation, relevant tests, and any push/deploy/install work
-the request explicitly authorizes. Use `/plan <task>` when you want a reviewed
-multi-agent DAG, `/run <task>` for exactly one isolated mergeable worker with no
-DAG, or `/ask <text>` for a separate one-off main-checkout conversation.
+With no arguments, `rudder` opens the dashboard. Type a task in the bottom input
+and press `Enter`: Rudder starts one worker for it in its own jj workspace. It
+lands in Review when done and merges back with `m`. Use `/main <task>` for an
+agent that works directly in the main checkout (for release, push and deploy
+work), `/gam <task>` to pair a builder with a reviewer from another model, or
+`/plan <task>` when you want a reviewed multi-agent DAG.
 
 If a task needs shared local context like API tokens, private URLs, account ids,
 or environment values, save it with `/share <text>` in the task input. Rudder
@@ -164,6 +164,7 @@ through Review before it can merge.
 | --- | --- |
 | `Option-1` / `Option-2` / `Option-3` | Focus the agents, worker, or task pane |
 | `Option-[` / `Option-]` | Step to the previous / next agent, staying in the pane you are in |
+| `Option-h` | Full screen: the focused pane takes the whole terminal; press again to bring the panes back |
 | `Option-v` / `Option-b` | Previous question in the selected worker / back to its latest message (Claude Code and Codex) |
 | `Cmd-C` | Copy the active Rudder selection |
 | `Ctrl-C` | Quit (asks to confirm if agents are still running) |
@@ -265,16 +266,14 @@ running, Rudder also exposes matching project skills; the orchestrator can write
 | `/fast` | Fast mode for new agents: flagship model at low effort (Claude opus / Codex gpt-5.5); `/model` switches back |
 | `/plan <text>` | Start the orchestrator / DAG planner |
 | `/gam [main] [<model>] <task>` | Generator + adversarial reviewer pair: split panes, the reviewer questions every round, steers the generator mid-turn, and can stop the run; only the generator edits. `^W t` shows the dialogue between them |
-| `/run <task>` | Start one isolated mergeable worker, with no DAG |
-| `/ask <text>` | Start a one-off conversational agent in the main checkout |
 | `/share <text>` | Save gitignored shared context for all agents in `RUDDER_SHARED.md` |
-| `/main` or `/m` | Start a new main-branch agent |
+| `/main [task]` or `/m` | Start an agent in the main checkout instead of its own workspace |
 | `/review-all` | Combine completed workspaces and start a Codex review-all agent |
 | `/merge-all` | Merge all completed workspaces |
 | `/verify` | Re-run the final repository checks after every DAG node is integrated |
 | `/color terminal\|paper` | Choose the native dashboard color mode; `terminal` uses your terminal foreground/background, `paper` restores the white canvas |
 | `/login` | Browser login for Rudder Cloud |
-| `/cloud` | Onload the current workspace or start a fresh cloud worker |
+| `/cloud` | Toggle cloud mode: tasks you type start in Rudder Cloud and keep running when you disconnect (`/cloud off` goes local) |
 | `/cloud list` | List cloud workers |
 | `/help` | Show the keybinding + command cheat sheet |
 
@@ -314,20 +313,19 @@ disable both capabilities so planning cannot cause external side effects.
 
 ## One-Off and Planning
 
-Type a fresh request in the bottom task input. When no plan is active, Rudder
-starts or continues one main-checkout agent as the end-to-end owner. It can inspect,
-edit, test, commit, release, and deploy according to the request and the repository's
-instructions. Rudder does not silently split a plain request across a planner and
-workers, which keeps final delivery ownership unambiguous.
+Type a task in the bottom input and Rudder starts one worker for it in its own
+jj workspace. The same thing happens no matter what else is on screen: a
+standalone worker that touches nothing but its workspace, lands in Review when
+done, and merges back with `m` or `/merge-all`. A slash command Rudder does not
+know is reported as unknown instead of being sent to an agent as a task.
 
-Use `/ask <text>` for a one-off conversational agent in the main checkout, with
-no DAG and no merge step. Use `/run <task>` for exactly one isolated worker that
-lands in Review and merges back with `m` or `/merge-all`. Use `/run main <task>`
-to add another agent in the main checkout itself — several may run there at once
-(they edit the same tree, so they can overwrite each other; rudder says so in the
-activity log rather than stopping you). Use `/plan <text>` when
-you want the orchestrator / DAG path: the read-only planner decomposes the task,
-then separate isolated workers implement its nodes.
+Use `/main <task>` for an agent in the main checkout itself, for work that has to
+happen there (release, push, deploy). Several may run there at once; they edit
+the same tree, so they can overwrite each other, and Rudder says so in the
+activity log rather than stopping you. Use `/plan <text>` when you want the
+orchestrator / DAG path: the read-only planner decomposes the task, then separate
+isolated workers implement its nodes. To change a running plan, talk to that
+orchestrator's own pane.
 
 For planned work, Rudder runs a dedicated Claude Code orchestrator PTY with a DAG
 pane above it. The flow stays inside Rudder: the orchestrator researches
@@ -407,14 +405,14 @@ session, main checkout) instead of forking it into a worker.
 **automatically** as soon as they finish — no per-node confirmation — so
 dependent nodes unblock and the chain keeps flowing (their row shows
 `done · auto-merging`, then `merged locally`; the final gate runs the repo's
-checks after the last node lands). Manually started `/run` workers never
+checks after the last node lands). Workers started from the task bar never
 auto-merge: they wait in Review (`done · press m to merge`) until you merge
 them yourself. There is no `/automerge` command or config flag — this split is
 the behavior.
 
-Planned and `/run` worker tasks run in their own jj workspaces under a sibling
-`.rudder-workspaces` area, so parallel agents never edit the same checkout. Plain
-main-owner and `/ask` agents intentionally run in the main checkout. Run records
+Planned and task-bar workers run in their own jj workspaces under a sibling
+`.rudder-workspaces` area, so parallel agents never edit the same checkout.
+`/main` agents intentionally run in the main checkout. Run records
 live under `.rudder/runs/`. If you quit Rudder, live workers become `paused`, keep
 their workspace/session metadata, and stay listed when you reopen the repo.
 
@@ -486,11 +484,12 @@ rudder cloud workspace attach # migrate all live isolated agents into one cloud 
 rudder sail <name>           # short alias for starting a cloud worker
 ```
 
-Inside the dashboard, `/login` starts browser auth and `/cloud` opens a
-confirmation pane: the default option onloads the current workspace (repo
-snapshot plus selected auth/config) to a Fly worker; press Down to start a fresh
-scratch worker instead. Completed cloud work returns through the same review and
-merge path as local work.
+Inside the dashboard, `/login` starts browser auth and `/cloud` toggles cloud
+mode: while it is on, tasks you type start as workers in Rudder Cloud and keep
+running when this laptop disconnects (`/cloud off` returns to local workers).
+`rudder cloud` from a shell onloads the current workspace (repo snapshot plus
+selected auth/config) so the whole dashboard runs on a cloud machine. Completed
+cloud work returns through the same review and merge path as local work.
 
 Bare `/handoff` moves the **selected agent pane** to Rudder Cloud: the local
 worker is quiesced, its workspace and Claude session upload with the snapshot,
