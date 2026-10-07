@@ -15,6 +15,7 @@ import {
   plantTranscript,
   removeScratch,
   scratchRepo,
+  waitUntil,
 } from "./helpers.mjs";
 
 assertPrerequisites();
@@ -92,7 +93,7 @@ test("two /plan orchestrators survive a process restart", { timeout: 120_000 }, 
   // synchronously); on a slow runner this turns "beta vanished after restart"
   // from a mystery into either a persistence failure here or a restore failure
   // below, whichever it actually is.
-  await session.waitFor(
+  await waitUntil(
     async () => {
       const queue = await fsp
         .readFile(path.join(repo, ".rudder", "plan-queue.json"), "utf8")

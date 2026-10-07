@@ -132,7 +132,7 @@ test("g toggles the nested view", { timeout: 60_000 }, async (t) => {
   const before = await session.screen();
   await session.press("g");
   // The layout must actually change (nest on), then change back (nest off).
-  await session.waitFor(async () => (await session.screen()) !== before, {
+  await session.waitFor((s) => s !== before, {
     timeout: 10_000,
     label: "the screen changing when nest toggles",
   });

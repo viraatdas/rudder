@@ -42,16 +42,16 @@ test("⌥d opens a diff panel with the worker's change set and Esc closes it", {
 
   // ⌥h solos the focused panel: the diff fills the screen, nothing else drawn.
   await session.write(ALT_H);
-  await session.waitFor(async () => {
-    const s = await session.screen();
-    return s.includes("┌ diff") && !s.includes("┌ agents") && !s.includes("┌ worker");
-  }, { timeout: 10_000 });
+  await session.waitFor(
+    (s) => s.includes("┌ diff") && !s.includes("┌ agents") && !s.includes("┌ worker"),
+    { timeout: 10_000, label: "the diff panel alone on screen" },
+  );
   await session.write(ALT_H);
   await session.waitForText("┌ agents", { timeout: 10_000 });
   assert.ok((await session.screen()).includes("┌ diff"), "the split comes back with the panel");
 
   // Esc closes the panel and the worker pane widens again.
   await session.press("Escape");
-  await session.waitFor(async () => !(await session.screen()).includes("┌ diff"), { timeout: 10_000 });
+  await session.waitFor((s) => !s.includes("┌ diff"), { timeout: 10_000, label: "the diff panel closing" });
   assert.ok((await session.screen()).includes("┌ worker"));
 });

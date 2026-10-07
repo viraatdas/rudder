@@ -330,3 +330,19 @@ done
   await fsp.chmod(file, 0o755);
   return { claudeBin: file, stdinLog, nodeCount };
 }
+
+/**
+ * Poll an ASYNC condition (files on disk, not the screen) until it holds.
+ * The harness's `session.waitFor` calls its predicate synchronously, so an
+ * async predicate returns a Promise, which is truthy, and the wait passes
+ * instantly. The restart test did exactly that: on a slow CI disk it killed the
+ * dashboard before the second plan's run.json existed.
+ */
+export async function waitUntil(condition, { timeout = 10_000, interval = 100, label = "condition" } = {}) {
+  const deadline = Date.now() + timeout;
+  for (;;) {
+    if (await condition()) return;
+    if (Date.now() >= deadline) throw new Error(`timed out after ${timeout}ms waiting for ${label}`);
+    await new Promise((resolve) => setTimeout(resolve, interval));
+  }
+}
